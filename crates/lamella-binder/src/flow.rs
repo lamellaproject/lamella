@@ -68,10 +68,12 @@ fn exits(stmt: &BoundStmt, undefined_labels: &BTreeSet<Box<str>>) -> bool {
             else_branch: Some(else_branch),
             ..
         } => exits(then_branch, undefined_labels) && exits(else_branch, undefined_labels),
-        Kind::While { condition, .. } => is_const_true(condition),
-        Kind::For { condition, .. } => condition.as_ref().is_none_or(is_const_true),
+        Kind::While { condition, body } => is_const_true(condition) && !loop_breaks(body),
+        Kind::For {
+            condition, body, ..
+        } => condition.as_ref().is_none_or(is_const_true) && !loop_breaks(body),
         Kind::DoWhile { body, condition } => {
-            exits(body, undefined_labels) || is_const_true(condition)
+            exits(body, undefined_labels) || (is_const_true(condition) && !loop_breaks(body))
         }
         Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
             exits(body, undefined_labels)
@@ -251,7 +253,7 @@ impl UnusedScan {
     fn statement(&mut self, stmt: &BoundStmt) {
         match &stmt.kind {
             BoundStmtKind::Local { ty, declarators } => {
-                let warnable = !ty.is_error();
+                let warnable = !ty.is_error() && !ty.is_void();
                 for declarator in declarators {
                     let initializer = declarator
                         .initializer
@@ -408,6 +410,14 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
             }
         }
         BoundExprKind::ElementAccess { receiver, indices } => {
+            visit_local_uses(receiver, f);
+            for index in indices {
+                visit_local_uses(index, f);
+            }
+        }
+        BoundExprKind::IndexerAccess {
+            receiver, indices, ..
+        } => {
             visit_local_uses(receiver, f);
             for index in indices {
                 visit_local_uses(index, f);
@@ -705,6 +715,14 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
                 collect_field_uses(index, reads, writes);
             }
         }
+        BoundExprKind::IndexerAccess {
+            receiver, indices, ..
+        } => {
+            collect_field_uses(receiver, reads, writes);
+            for index in indices {
+                collect_field_uses(index, reads, writes);
+            }
+        }
         BoundExprKind::ArrayCreation { lengths, elements } => {
             for length in lengths {
                 collect_field_uses(length, reads, writes);
@@ -899,7 +917,17 @@ fn loop_breaks(stmt: &BoundStmt) -> bool {
         | Kind::For { .. }
         | Kind::ForEach { .. }
         | Kind::Switch { .. } => false,
-        Kind::Block(statements) => statements.iter().any(loop_breaks),
+        Kind::Block(statements) => {
+            for statement in statements {
+                if loop_breaks(statement) {
+                    return true;
+                }
+                if always_exits(statement) {
+                    return false;
+                }
+            }
+            false
+        }
         Kind::If {
             then_branch,
             else_branch,
@@ -987,6 +1015,42 @@ fn visit_statements<'a>(stmt: &'a BoundStmt, visit: &mut impl FnMut(&'a BoundStm
             visit_statements(inner, visit);
         }
         _ => {}
+    }
+}
+
+/// Whether a switch SECTION's statement list can complete normally -- control reaching the end of
+/// the section, to fall into the next one (`CS0163`) or out of the switch entirely (`CS8070`).
+///
+/// This cannot reuse [`always_exits`], and the reason is the whole subtlety: a `break` LEAVES A
+/// SWITCH without exiting the method, so it is the commonest way a section legitimately ends and
+/// `exits` deliberately does not count it. `continue` is the same. Everything else defers to
+/// `always_exits`, which is what makes a nested loop or switch behave correctly -- it CAPTURES its
+/// own `break`, so `while (true) { break; }` inside a section lets that section complete (csc
+/// agrees: `CS8070`) while `while (true) { }` does not.
+#[must_use]
+pub fn switch_section_completes(statements: &[BoundStmt]) -> bool {
+    !statements.iter().any(section_transfers)
+}
+
+/// Whether a statement definitely transfers control away from its switch section.
+fn section_transfers(stmt: &BoundStmt) -> bool {
+    use BoundStmtKind as Kind;
+    match &stmt.kind {
+        Kind::Break | Kind::Continue => true,
+        Kind::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } => section_transfers(then_branch) && section_transfers(else_branch),
+        Kind::If { .. } => false,
+        Kind::Block(statements) => statements.iter().any(section_transfers),
+        Kind::Checked(inner) | Kind::Unchecked(inner) | Kind::Labeled { body: inner, .. } => {
+            section_transfers(inner)
+        }
+        Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
+            section_transfers(body)
+        }
+        _ => always_exits(stmt),
     }
 }
 
@@ -1245,24 +1309,27 @@ impl Analyzer<'_> {
             BoundStmtKind::While { condition, body } => {
                 let mut assigned = assigned;
                 self.expression(condition, &mut assigned, span);
-                self.statement_in_loop(body, assigned.clone());
+                let (_, breaks) = self.statement_in_loop(body, assigned.clone());
                 if is_const_true(condition) {
-                    Flow::Exits
+                    Self::after_endless_loop(breaks)
                 } else {
                     Flow::Reaches(assigned)
                 }
             }
-            BoundStmtKind::DoWhile { body, condition } => match self.statement_in_loop(body, assigned) {
-                Flow::Exits => Flow::Exits,
-                Flow::Reaches(mut assigned) => {
-                    self.expression(condition, &mut assigned, span);
-                    if is_const_true(condition) {
-                        Flow::Exits
-                    } else {
-                        Flow::Reaches(assigned)
+            BoundStmtKind::DoWhile { body, condition } => {
+                let (flow, breaks) = self.statement_in_loop(body, assigned);
+                match flow {
+                    Flow::Exits => Self::after_endless_loop(breaks),
+                    Flow::Reaches(mut assigned) => {
+                        self.expression(condition, &mut assigned, span);
+                        if is_const_true(condition) {
+                            Self::after_endless_loop(breaks)
+                        } else {
+                            Flow::Reaches(assigned)
+                        }
                     }
                 }
-            },
+            }
             BoundStmtKind::For {
                 initializer,
                 condition,
@@ -1283,13 +1350,13 @@ impl Analyzer<'_> {
                     }
                     None => true,
                 };
-                self.statement_in_loop(body, assigned.clone());
+                let (_, breaks) = self.statement_in_loop(body, assigned.clone());
                 for iterator in iterators {
                     let mut iterator_set = assigned.clone();
                     self.expression(iterator, &mut iterator_set, span);
                 }
                 if infinite {
-                    Flow::Exits
+                    Self::after_endless_loop(breaks)
                 } else {
                     Flow::Reaches(assigned)
                 }
@@ -1304,7 +1371,7 @@ impl Analyzer<'_> {
                 self.expression(collection, &mut assigned, span);
                 let mut body_set = assigned.clone();
                 body_set.insert(name.clone());
-                self.statement_in_loop(body, body_set);
+                let (_, _breaks) = self.statement_in_loop(body, body_set);
                 Flow::Reaches(assigned)
             }
             BoundStmtKind::Return(value) => {
@@ -1425,11 +1492,24 @@ impl Analyzer<'_> {
     /// loop is captured here and does not leak into an enclosing switch's exit paths.
     /// The captured breaks are discarded -- a loop's endpoint reachability is decided by
     /// its condition, not its breaks (an over-approximation that never rejects).
-    fn statement_in_loop(&mut self, body: &BoundStmt, assigned: Assigned) -> Flow {
+    /// Analyzes a loop body and returns its flow together with the assigned set captured at each
+    /// `break` that targets THIS loop. The frame was pushed and discarded before, which is what
+    /// made an endless loop's exit path invisible: control leaves `while (true)` only through a
+    /// break, so those sets are the only thing that says what is assigned afterwards.
+    fn statement_in_loop(&mut self, body: &BoundStmt, assigned: Assigned) -> (Flow, Vec<Assigned>) {
         self.break_frames.push(Vec::new());
         let flow = self.statement(body, assigned);
-        self.break_frames.pop();
-        flow
+        (flow, self.break_frames.pop().unwrap_or_default())
+    }
+
+    /// Where control lands after an ENDLESS loop: nowhere if nothing breaks out of it, else the
+    /// merge of every break's assigned set -- so only a local assigned before EVERY break survives.
+    fn after_endless_loop(breaks: Vec<Assigned>) -> Flow {
+        let mut after = Flow::Exits;
+        for set in breaks {
+            after = merge(after, Flow::Reaches(set));
+        }
+        after
     }
 
     fn block(&mut self, statements: &[BoundStmt], assigned: Assigned) -> Flow {
@@ -1490,6 +1570,14 @@ impl Analyzer<'_> {
                 }
             }
             BoundExprKind::ElementAccess { receiver, indices } => {
+                self.expression(receiver, assigned, span);
+                for index in indices {
+                    self.expression(index, assigned, span);
+                }
+            }
+            BoundExprKind::IndexerAccess {
+                receiver, indices, ..
+            } => {
                 self.expression(receiver, assigned, span);
                 for index in indices {
                     self.expression(index, assigned, span);
@@ -1578,8 +1666,11 @@ impl Analyzer<'_> {
                 when_false,
             } => {
                 self.expression(condition, assigned, span);
-                self.expression(when_true, assigned, span);
-                self.expression(when_false, assigned, span);
+                let mut if_true = assigned.clone();
+                let mut if_false = assigned.clone();
+                self.expression(when_true, &mut if_true, span);
+                self.expression(when_false, &mut if_false, span);
+                *assigned = if_true.intersection(&if_false).cloned().collect();
             }
             BoundExprKind::Assignment {
                 operator,

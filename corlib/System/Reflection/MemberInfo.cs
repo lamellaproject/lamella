@@ -5,6 +5,8 @@ namespace System.Reflection
     {
         protected MemberInfo() { }
 
+#if LAMELLA_SURFACE_REFLECTION
+
         public virtual string Name
         {
             [Lamella.Runtime.RuntimeProvided] get { return null; }
@@ -43,5 +45,6 @@ namespace System.Reflection
             }
             return false;
         }
+#endif
     }
 }

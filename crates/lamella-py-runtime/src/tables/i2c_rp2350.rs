@@ -1,7 +1,6 @@
 //! The Raspberry Pi RP2350 (Pico 2) I2C0 (a Synopsys DW_apb_i2c) register facts -- transcribed
 //! from the neutral peripheral-table SSOT (sources: the official RP2350 SVD + the official
-//! pico-sdk hardware_i2c). SILICON-VERIFIED via the table-literal driver on a Pico 2 (20/20
-//! address-NACK aborts + a Saleae decode at ~96 kHz). ic_clk is clk_sys, assumed 150 MHz by the
+//! pico-sdk hardware_i2c). ic_clk is clk_sys, assumed 150 MHz by the
 //! serve profile (a live native-USB wire proves the PLL is up), so the counts scale from there.
 
 use crate::i2c::{I2cConfig, I2cConfigError, I2cFacts, I2cOp};

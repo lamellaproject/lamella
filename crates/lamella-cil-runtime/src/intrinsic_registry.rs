@@ -27,6 +27,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     #[cfg(feature = "varargs")]
     entry!(arg_iterator_remaining),
     entry!(array_clear_range),
+    entry!(array_copy_range),
     entry!(array_clone),
     entry!(array_empty),
     entry!(array_get_value),
@@ -131,11 +132,19 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(delegate_remove),
     entry!(dns_resolve_host),
     #[cfg(feature = "float")]
+    entry!(double_parse),
+    #[cfg(feature = "float")]
     entry!(double_to_exponential),
     #[cfg(feature = "float")]
     entry!(double_to_fixed),
     #[cfg(feature = "float")]
     entry!(double_to_string),
+    entry!(drive_filesystems),
+    entry!(drive_format),
+    entry!(drive_kind),
+    entry!(drive_mount_removable),
+    entry!(drive_names),
+    entry!(drive_total_size),
     entry!(enum_format),
     entry!(enum_get_name),
     entry!(enum_get_names),
@@ -149,6 +158,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(environment_tick_count),
     entry!(exception_ctor),
     entry!(exception_get_message),
+    entry!(exception_runtime_message),
     #[cfg(feature = "NETMFv4_4")]
     entry!(field_get_raw_constant),
     #[cfg(feature = "NETMFv4_4")]
@@ -232,11 +242,26 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     #[cfg(feature = "NETMFv4_4")]
     entry!(math_abs_int64),
     #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
+    entry!(math_acos_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
+    entry!(math_asin_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
+    entry!(math_atan2_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
+    entry!(math_atan_f64),
+    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_ceiling_f64),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_cos_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
+    entry!(math_cosh_f64),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_exp_f64),
@@ -245,7 +270,13 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(math_floor_f64),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
+    entry!(math_ieee_remainder_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
     entry!(math_log10_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
+    entry!(math_log_base_f64),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_log_f64),
@@ -281,10 +312,16 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(math_sin_f64),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
+    entry!(math_sinh_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
     entry!(math_sqrt_f64),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_tan_f64),
+    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "math-transcendental")]
+    entry!(math_tanh_f64),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_truncate_f64),
@@ -382,6 +419,11 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(stack_peek),
     #[cfg(feature = "NETMFv4_4")]
     entry!(stack_pop),
+    entry!(storage_is_mounted),
+    entry!(storage_mount_ram),
+    entry!(storage_mount_sd_over_spi),
+    entry!(storage_mount_sd_over_spi_bus),
+    entry!(storage_unmount),
     entry!(string_concat),
     entry!(string_concat3),
     entry!(string_concat_object2),

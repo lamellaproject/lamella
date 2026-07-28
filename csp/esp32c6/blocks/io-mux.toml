@@ -1,9 +1,8 @@
-# BLOCK layout: the ESP32-C6 IO_MUX (per-pin function select;).
-# Transcribed from the retired v0 uart-esp32c6.toml. The per-pin register ARRAY is
+# BLOCK layout: the ESP32-C6 IO_MUX (per-pin function select).
+# The per-pin register ARRAY is
 # GPIO<n> = base + GPIO0 offset + GPIO_STRIDE * n -- the esp-family pin derivation the
-# generator implements, anchored against the retired table's resolved GPIO16/GPIO17
-# addresses. The field layout is shared across pins. MCU_SEL selects the pin's IO_MUX
-# function (the function column); function 0 is each pin's NATIVE signal -- no GPIO
+# generator implements. The field layout is shared across pins. MCU_SEL selects the pin's IO_MUX
+# function (the pin-map function column); function 0 is each pin's NATIVE signal -- no GPIO
 # matrix involved. Matrix routing (U0TXD_OUT/U0RXD_IN signals) is the named growth path
 # when a board binds a non-native pin; nothing consumes it today, so it is not stated.
 
@@ -11,7 +10,7 @@
 kind = "block"
 family = "esp32c6"
 block = "io-mux"
-sources = ["esp-idf v5.3 soc io_mux_reg.h + gpio_sig_map.h via the silicon-proven demo path"]
+sources = ["esp-idf v5.3 soc io_mux_reg.h + gpio_sig_map.h"]
 
 [registers.GPIO0]
 offset = 0x4

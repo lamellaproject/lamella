@@ -1,0 +1,22 @@
+# BLOCK layout: the RP2350 bank-0 pad controls. The per-pin register ARRAY is GPIO<n> = base + GPIO0 offset +
+# GPIO_STRIDE * n (stride 4 beside io-bank0's 8 -- the rp pads derivation).
+#
+# THE RP2350 DELTA from the RP2040: pads reset ISOLATED (ISO, bit 8 set) -- every pin's pad
+# register must be written with ISO clear (+ IE for input-bearing pins) before the pin works.
+# Drivers compose pad words from the field masks (IE for uart/spi pins; IE|PUE|SCHMITT for
+# the open-drain i2c pins; OD with IE/pulls clear for analogue ADC pins).
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "pads-bank0"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet ch 9.11 (pad control)"]
+
+[registers.GPIO0]
+offset = 0x4
+width = 32
+fields = { SLEWFAST = [0, 1], SCHMITT = [1, 1], PDE = [2, 1], PUE = [3, 1], DRIVE = [4, 2], IE = [6, 1], OD = [7, 1], ISO = [8, 1] }
+notes = "The array base pin (GPIO0); per-pin stride is 4. Reset state has ISO set (isolated) and SCHMITT on."
+
+[constants]
+GPIO_STRIDE = 4

@@ -1039,6 +1039,45 @@ impl<'a> Assembly<'a> {
             .filter_map(move |index| self.tables.row(table::CUSTOM_ATTRIBUTE, index).map(|row| row.token(1)))
     }
 
+    /// Whether `parent` carries the custom attribute named `namespace`.`name`.
+    ///
+    /// Attribute presence is asked in several crates that share no dependency but this one -- the
+    /// interpreter's loader binds `[RuntimeProvided]` seams to intrinsics, and the AOT build asks the
+    /// same question of the same metadata. Each grew its own copy of this walk, which is fine until
+    /// the two answer differently. One implementation, so they cannot.
+    ///
+    /// Matches on the declaring type of the attribute's CONSTRUCTOR, which is how an attribute is
+    /// identified in metadata: a `CustomAttribute` row names its ctor, not its type.
+    #[must_use]
+    pub fn has_attribute(&self, parent: Token, namespace: &str, name: &str) -> bool {
+        self.custom_attributes(parent).any(|attribute| {
+            self.resolve_method(attribute.constructor)
+                .and_then(|ctor| ctor.declaring_type)
+                .is_some_and(|declaring| declaring.namespace == namespace && declaring.name == name)
+        })
+    }
+
+    /// Whether `method_token` is a `[Lamella.Runtime.RuntimeProvided]` seam: a method whose body the
+    /// VES supplies, carrying only a placeholder in source.
+    #[must_use]
+    pub fn is_runtime_provided(&self, method_token: Token) -> bool {
+        self.has_attribute(method_token, "Lamella.Runtime", "RuntimeProvidedAttribute")
+    }
+
+    /// Whether `method_token` declares that its COMPILED-OUT DEFAULT IS THE INTENDED ANSWER
+    /// (`[Lamella.Runtime.IntendedDefault]`) -- i.e. a build that does not synthesize this seam is
+    /// still correct.
+    ///
+    /// This is the distinction that lets a toolchain ERROR on an unsynthesized seam whose default is
+    /// a silent wrong answer, while leaving alone the seams whose absence is the truth. An UNMARKED
+    /// `[RuntimeProvided]` method is therefore not "assumed fine" -- it is undeclared, and a
+    /// consumer enforcing this is entitled to refuse it. See the attribute's own source for the
+    /// triage rule, including why intendedness that holds on only one tier does not count.
+    #[must_use]
+    pub fn is_intended_default(&self, method_token: Token) -> bool {
+        self.has_attribute(method_token, "Lamella.Runtime", "IntendedDefaultAttribute")
+    }
+
     pub fn custom_attributes(
         &self,
         parent: Token,

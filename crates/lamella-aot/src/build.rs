@@ -22,7 +22,7 @@ use lamella_token::Token;
 #[cfg(feature = "arm32")]
 use crate::arm32;
 use crate::cil;
-use crate::resolver::MetadataResolver;
+use crate::resolver::{ELEMENT_KIND_REFERENCE, MetadataResolver};
 #[cfg(feature = "riscv32")]
 use crate::riscv32;
 #[cfg(feature = "wasm")]
@@ -56,6 +56,20 @@ pub enum BuildError {
         rid: u32,
         /// The CIL-lowering error.
         error: cil::CilError,
+    },
+    /// Emitted code CALLS a `[RuntimeProvided]` seam this build does not synthesize, whose default is
+    /// not declared `[IntendedDefault]`, and which is not trapped -- so the call would link (a static
+    /// placeholder is exported like any other method) and then answer a constant the caller cannot
+    /// tell from a real result. Refused rather than shipped: an unmarked seam is UNDECLARED, not
+    /// assumed safe, and a build is entitled to say so. Marking the seam, synthesizing it, or gating
+    /// its callers out of the profile all clear it -- silence does not.
+    SilentSeamCallEdge {
+        /// The calling method's readable name (`Namespace.Type::Method`).
+        caller: alloc::string::String,
+        /// The seam's readable name.
+        seam: alloc::string::String,
+        /// How many such edges the build found; the named pair is the first.
+        total: usize,
     },
 }
 
@@ -321,6 +335,92 @@ pub fn build_object_with_corlib(cil: &[u8], corlib: &[u8]) -> Result<Vec<u8>, Bu
     build_object_inner(cil, Some(corlib), &[])
 }
 
+/// As [`build_object_with_corlib`], but the object also CARRIES DWARF for its own code: a
+/// `.debug_line` program plus a `.debug_info`/`.debug_abbrev` compilation unit, relocated against
+/// the object's function symbols so the linker supplies their virtual addresses.
+///
+/// This is the path a DEBUGGABLE DEVICE IMAGE comes from -- link the result and the debugger can map
+/// a device PC to a C# file, line and function. `pdb` is the program's Portable PDB (what `lcsc`
+/// writes beside the assembly); its sequence points are resolved here, up front, so the code
+/// generator never needs the metadata layer.
+#[cfg(feature = "arm32")]
+pub fn build_object_with_corlib_debug(
+    cil: &[u8],
+    corlib: &[u8],
+    pdb: &lamella_metadata::PortablePdb,
+) -> Result<Vec<u8>, BuildError> {
+    let corlib_assembly = Assembly::read(corlib).map_err(|_| BuildError::Parse)?;
+    let references = alloc::vec![&corlib_assembly];
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let entry = find_main(&assembly);
+    let (funcs, maps, fails) = lower_assembly_debug(&assembly, entry, &references);
+    if let Some((rid, error)) = fails.into_iter().next() {
+        return Err(BuildError::LowerCil { rid, error });
+    }
+    let names = object_symbol_names(&assembly, funcs.len());
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let resolver = MetadataResolver::new(&assembly).with_references(&references);
+    let mut descriptors = resolver.type_descriptors();
+    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
+    let statics = assembly_statics(cil, &assembly, true);
+    let qualifiers = crate::resolver::DescQualifiers::default();
+
+    let files: Vec<alloc::string::String> = (0..funcs.len())
+        .map(|rid| pdb.method_document(rid as u32).unwrap_or_default())
+        .collect();
+    let mut display: alloc::vec::Vec<alloc::string::String> =
+        alloc::vec![alloc::string::String::new(); funcs.len()];
+    for type_def in assembly.type_defs() {
+        let type_name = type_def.name().map_or("", |n| n.name);
+        for method in type_def.methods() {
+            if let Some(slot) = display.get_mut(method.rid() as usize) {
+                *slot = alloc::format!("{type_name}.{}", method.name().unwrap_or("?"));
+            }
+        }
+    }
+    let points: Vec<Vec<(u32, u32, u32)>> = (0..funcs.len())
+        .map(|rid| {
+            pdb.sequence_points(rid as u32)
+                .into_iter()
+                .filter(|p| !p.is_hidden)
+                .map(|p| (p.il_offset, p.start_line, p.start_column))
+                .collect()
+        })
+        .collect();
+    let methods: Vec<crate::debugmap::MethodSource> = (0..funcs.len())
+        .map(|i| crate::debugmap::MethodSource {
+            name: display[i].as_str(),
+            file: files[i].as_str(),
+            points: points[i].as_slice(),
+        })
+        .collect();
+    let unit_name = files
+        .iter()
+        .find(|f| !f.is_empty())
+        .map_or("", alloc::string::String::as_str);
+    let debug = crate::debugmap::ObjectDebug {
+        source_maps: &maps,
+        methods: &methods,
+        unit_name,
+        producer: PRODUCER,
+    };
+    arm32::lower_object_vtables_statics_debug(
+        &funcs,
+        &name_refs,
+        &[],
+        &descriptors,
+        &statics,
+        &qualifiers,
+        &debug,
+    )
+    .map(|(bytes, _)| bytes)
+    .map_err(BuildError::LowerArm)
+}
+
+/// The `DW_AT_producer` string stamped into every compilation unit this backend emits.
+#[cfg(feature = "arm32")]
+const PRODUCER: &str = "Lamella AOT";
+
 /// As [`build_object_with_corlib`], but with FURTHER referenced library assemblies -- the
 /// multi-assembly deploy shape (program + corlib + e.g. a BSP or `System.Net.NetworkInformation`).
 /// The whole ordered list `[corlib, libraries...]` flows: the startup chains every reference's
@@ -346,8 +446,9 @@ pub fn build_object_with_libraries(
 /// System.Device sources compiled as ONE program assembly) is the customer: library-grade
 /// surface rides along that the program never calls, gc-sections drops it unreached, and a
 /// reached deferred method faults loud at its exact call site. `wide` targets a Mainline (M33)
-/// part -- a far branch/`adr` relaxes to `B.W`/`ADR.W` rather than deferring; pass `false` for a
-/// v6-M target (byte-identical, the widen fires only for an out-of-reach ref).
+/// part -- a far branch/`adr` relaxes to `B.W`/`ADR.W`; on a v6-M target (`false`) it splices a
+/// literal-pool veneer instead. Either way a far reference ENCODES rather than deferring; the two
+/// paths are byte-identical for a method with no out-of-reach reference.
 #[cfg(feature = "arm32")]
 pub fn build_object_with_libraries_report(
     cil: &[u8],
@@ -387,6 +488,10 @@ fn build_object_core(
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference.iter().chain(library_assemblies.iter()).collect();
     let qualifiers = arm32::DescQualifiers {
+        string: MetadataResolver::new(&assembly)
+            .with_references(&references)
+            .string_type_meta()
+            .map(|m| m.handle.0),
         own: None,
         references: corlib
             .iter()
@@ -395,7 +500,7 @@ fn build_object_core(
             .map(|bytes| alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, bytes)))
             .collect(),
     };
-    let (mut funcs, _maps, cil_fails) = lower_assembly_debug(&assembly, entry, &references);
+    let (mut funcs, _maps, cil_fails, seams) = lower_assembly_seams(&assembly, entry, &references);
     let cil_fail_rows: Vec<(u32, cil::CilError)> = if defer {
         for (rid, _) in &cil_fails {
             funcs[*rid as usize] = deferred_trap_body();
@@ -428,6 +533,39 @@ fn build_object_core(
     let funcs = funcs;
     let names = object_symbol_names(&assembly, funcs.len());
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let display_names = method_display_names(&assembly, funcs.len());
+    let mut silent_edges = silent_seam_call_edges(&assembly, &funcs, &seams, &display_names);
+    let imports = pinvoke_imports(&funcs);
+    let import_names: Vec<&str> = imports.iter().map(|(name, _)| name.as_str()).collect();
+    for (ordinal, reference) in references.iter().enumerate() {
+        for (rid, seam, symbol) in
+            imported_silent_seams(reference, &references[..ordinal], &import_names)
+        {
+            let caller_rid = imports
+                .iter()
+                .find(|(name, _)| *name == symbol)
+                .map_or(0, |(_, caller)| *caller);
+            silent_edges.push(SeamCallEdge {
+                caller_rid,
+                caller: display_names
+                    .get(caller_rid as usize)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| alloc::format!("f{caller_rid}")),
+                seam_rid: rid,
+                seam,
+            });
+        }
+    }
+    if !defer {
+        if let Some(edge) = silent_edges.first() {
+            return Err(BuildError::SilentSeamCallEdge {
+                caller: edge.caller.clone(),
+                seam: edge.seam.clone(),
+                total: silent_edges.len(),
+            });
+        }
+    }
     let resolver = MetadataResolver::new(&assembly).with_references(&references);
     let mut descriptors = resolver.type_descriptors();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
@@ -442,13 +580,7 @@ fn build_object_core(
             &qualifiers,
         )
         .map_err(BuildError::LowerArm)?;
-        return Ok((
-            bytes,
-            LibraryBuildReport {
-                cil_fails: Vec::new(),
-                emit_stubs: Vec::new(),
-            },
-        ));
+        return Ok((bytes, LibraryBuildReport::default()));
     }
     let (bytes, emit_stubs) = arm32::lower_object_vtables_statics_report(
         &funcs,
@@ -460,7 +592,6 @@ fn build_object_core(
         wide,
     )
     .map_err(BuildError::LowerArm)?;
-    let display_names = method_display_names(&assembly, funcs.len());
     let name_of = |rid: usize| {
         display_names
             .get(rid)
@@ -477,6 +608,8 @@ fn build_object_core(
             .into_iter()
             .map(|(index, error)| (index as u32, name_of(index), alloc::format!("{error:?}")))
             .collect(),
+        unsynthesized_seams: unsynthesized_seam_rows(&assembly, &seams, &display_names, &names),
+        silent_seam_edges: silent_edges,
     };
     Ok((bytes, report))
 }
@@ -498,11 +631,47 @@ fn append_reference_descriptors(
     descriptors: &mut Vec<crate::resolver::TypeMeta>,
 ) {
     let mut added: Vec<u32> = Vec::new();
+    let array_base = resolver.system_array_meta();
+    if funcs.iter().any(|f| {
+        f.blocks.iter().flat_map(|b| &b.insts).any(|(_, i)| {
+            matches!(
+                i,
+                Inst::StringLiteral { .. } | Inst::StringConcat { .. } | Inst::IntToString { .. }
+            )
+        })
+    }) {
+        if let Some(meta) = resolver.string_type_meta() {
+            if !descriptors.iter().any(|d| d.handle == meta.handle) {
+                added.push(meta.handle.0);
+                descriptors.push(meta);
+            }
+        }
+    }
     for func in funcs {
         for block in &func.blocks {
             for (_, inst) in &block.insts {
+                if let (Inst::AllocArray { handle, .. }, Some(base)) = (inst, array_base.as_ref()) {
+                    let known = descriptors.iter().any(|d| d.handle == *handle)
+                        || added.contains(&handle.0);
+                    if !known {
+                        added.push(handle.0);
+                        descriptors.push(crate::resolver::TypeMeta {
+                            handle: *handle,
+                            type_tag: 0,
+                            vtable: base.vtable.clone(),
+                            itable: Vec::new(),
+                            base: None,
+                            words: None,
+                            exported: false,
+                        });
+                    }
+                }
                 let handle = match inst {
                     Inst::Alloc { handle, .. } | Inst::TypeDescAddr { handle } => *handle,
+                    Inst::AllocArray {
+                        element: Some(handle),
+                        ..
+                    } => *handle,
                     _ => continue,
                 };
                 let known =
@@ -530,7 +699,7 @@ fn append_reference_descriptors(
     }
 }
 
-/// One assembly's [`crate::stackmaps::AssemblyStatics`] (#15): its region-symbol identity (the
+/// One assembly's [`crate::stackmaps::AssemblyStatics`]: its region-symbol identity (the
 /// fnv1a32 of the CIL bytes -- the SAME hash that prefixes a library object's internal symbols, so
 /// the two views of one assembly agree), its dense region size, and its GLOBAL-roots record rows
 /// -- every ref-typed static field's dense slot (the resolver's [`static_field_slots`] layout; the
@@ -675,6 +844,7 @@ fn build_object_riscv_inner(
         .collect();
     let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
     let qualifiers = crate::resolver::DescQualifiers {
+        string: resolver.string_type_meta().map(|m| m.handle.0),
         own: None,
         references: reference_cils
             .iter()
@@ -819,7 +989,7 @@ fn lower_one_reachable(
 /// library where every method lowers.
 #[cfg(feature = "riscv32")]
 pub fn build_library_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
-    build_library_object_riscv_inner(cil, &[])
+    build_library_object_riscv_inner(cil, &[]).map(|(bytes, _)| bytes)
 }
 
 /// As [`build_library_object_riscv`], but with the library's OWN references (its corlib, a
@@ -832,23 +1002,23 @@ pub fn build_library_object_riscv_with_references(
     cil: &[u8],
     references: &[&[u8]],
 ) -> Result<Vec<u8>, BuildError> {
-    build_library_object_riscv_inner(cil, references)
+    build_library_object_riscv_inner(cil, references).map(|(bytes, _)| bytes)
 }
 
 #[cfg(feature = "riscv32")]
 fn build_library_object_riscv_inner(
     cil: &[u8],
     reference_cils: &[&[u8]],
-) -> Result<Vec<u8>, BuildError> {
+) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let reference_assemblies: Vec<Assembly> = reference_cils
         .iter()
         .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
-    let (funcs, _maps, _fails) = lower_assembly_debug(&assembly, None, &references);
+    let (funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &references);
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
-    let names = library_symbol_names(&assembly, funcs.len(), &prefix);
+    let names = library_symbol_names(&assembly, &references, funcs.len(), &prefix);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let resolver = MetadataResolver::new(&assembly).with_references(&references);
     let mut descriptors = resolver.type_descriptors();
@@ -861,6 +1031,7 @@ fn build_library_object_riscv_inner(
         .collect();
     let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
     let qualifiers = crate::resolver::DescQualifiers {
+        string: resolver.string_type_meta().map(|m| m.handle.0),
         own: Some(alloc::format!(
             "{:08x}",
             lamella_metadata::fnv1a32(0x811c_9dc5, cil)
@@ -870,7 +1041,7 @@ fn build_library_object_riscv_inner(
             .map(|bytes| alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, bytes)))
             .collect(),
     };
-    riscv32::lower_object_library_statics(
+    let (bytes, stubs) = riscv32::lower_object_library_statics_report(
         &funcs,
         &name_refs,
         &[],
@@ -879,7 +1050,47 @@ fn build_library_object_riscv_inner(
         &reference_region_refs,
         &qualifiers,
     )
-    .map_err(BuildError::LowerRiscv)
+    .map_err(BuildError::LowerRiscv)?;
+    let display_names = method_display_names(&assembly, funcs.len());
+    let name_of = |rid: usize| {
+        display_names
+            .get(rid)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| alloc::format!("f{rid}"))
+    };
+    let report = LibraryBuildReport {
+        cil_fails: fails
+            .into_iter()
+            .map(|(rid, error)| (rid, name_of(rid as usize), alloc::format!("{error:?}")))
+            .collect(),
+        emit_stubs: stubs
+            .into_iter()
+            .map(|(index, error)| (index as u32, name_of(index), alloc::format!("{error:?}")))
+            .collect(),
+        unsynthesized_seams: unsynthesized_seam_rows(&assembly, &seams, &display_names, &names),
+        silent_seam_edges: silent_seam_call_edges(&assembly, &funcs, &seams, &display_names),
+    };
+    Ok((bytes, report))
+}
+
+/// As [`build_library_object_riscv`], but ALSO returning the [`LibraryBuildReport`] -- the RISC-V
+/// twin of [`build_library_object_report`]. The object bytes are identical; the report is the
+/// observation that RISC-V previously had no way to make.
+#[cfg(feature = "riscv32")]
+pub fn build_library_object_riscv_report(
+    cil: &[u8],
+) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
+    build_library_object_riscv_inner(cil, &[])
+}
+
+/// As [`build_library_object_riscv_report`], with the library's OWN references attached.
+#[cfg(feature = "riscv32")]
+pub fn build_library_object_riscv_report_with_references(
+    cil: &[u8],
+    references: &[&[u8]],
+) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
+    build_library_object_riscv_inner(cil, references)
 }
 
 /// AOT-lowers a whole assembly as a LINKABLE LIBRARY object (a corlib, a helper library): every public
@@ -892,7 +1103,7 @@ pub fn build_library_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 }
 
 /// As [`build_library_object`], but with the library's OWN referenced assembly (corlib) attached
-/// -- a NON-corlib library (`System.Net.NetworkInformation`, a #15 fixture lib) allocates and
+/// -- a NON-corlib library (`System.Net.NetworkInformation`) allocates and
 /// extends corlib types, so its bodies need corlib's layouts/slot numbering exactly as a program's
 /// do. Without this, every method touching a corlib type (`new object()` in a `.cctor`, a thrown
 /// exception type's ctor) silently falls to the CIL-fail stub list.
@@ -912,9 +1123,11 @@ pub fn build_library_object_with_reference(
 /// set uses (corlib first by convention) -- ordinals are identity.
 ///
 /// `wide` targets a Mainline (M33) part: a far reference relaxes to its wide Thumb-2 form
-/// (`B.W`/`ADR.W`) instead of hard-erroring at the ARMv6-M reach, so a big-branch method
-/// (a Pico2 BSP's `SpiDriver::Configure`) encodes instead of deferring. Pass `false` for a
-/// v6-M target -- it keeps the object byte-identical (the widen fires only for an out-of-reach ref).
+/// (`B.W`/`ADR.W`). On a v6-M target (`false`) it splices a literal-pool veneer instead -- a far
+/// branch becomes a `ldr; add pc; ...; pop {pc}` long branch and a far `adr` a `ldr; add pc`
+/// address computation -- so a big-branch method (a Pico2 BSP's `SpiDriver::Configure`) encodes on
+/// EITHER target rather than deferring. The object is byte-identical to the wide build for a method
+/// with no out-of-reach reference (the veneer/widen fires only for one).
 #[cfg(feature = "arm32")]
 pub fn build_library_object_with_references(
     cil: &[u8],
@@ -928,7 +1141,66 @@ pub fn build_library_object_with_references(
 /// (`Namespace.Type::Method`), and the error text that demoted it.
 pub type LibraryReportEntry = (u32, alloc::string::String, alloc::string::String);
 
-/// What [`build_library_object_report`] observed while building: the two DISTINCT silent-demotion
+/// What a `[RuntimeProvided]` seam that this build did NOT synthesize got emitted as instead. The
+/// two differ in exactly one property that matters: whether reaching it is observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeamDisposition {
+    /// The corlib's own PLACEHOLDER body lowered as written -- `return null`, `return 0`, or nothing
+    /// at all. The method answers a constant and no caller can tell it apart from a real answer, so
+    /// this is the silent-wrong-answer disposition (`TlsNative::SessionFlags` reporting "no
+    /// validation errors" because 0 is also its "clean" encoding).
+    Placeholder,
+    /// A TRAP body: reaching it faults. Not silent, so it needs no build-time refusal -- the fault
+    /// IS the enforcement. `System.Array`'s untyped element primitives take this until they are
+    /// synthesized.
+    Trap,
+}
+
+/// A CALL EDGE from emitted code into a `[RuntimeProvided]` seam this build left as a SILENT
+/// placeholder (no synthesis, no `[IntendedDefault]`, no trap) -- the caller will be told a constant
+/// and cannot tell. This is the edge a strict build refuses over
+/// ([`BuildError::SilentSeamCallEdge`]); an edge into a marked or trapped seam is not one.
+#[derive(Debug, Clone)]
+pub struct SeamCallEdge {
+    /// The METHOD_DEF rid of the calling method.
+    pub caller_rid: u32,
+    /// The caller's readable name (`Namespace.Type::Method`).
+    pub caller: alloc::string::String,
+    /// The METHOD_DEF rid of the seam called.
+    pub seam_rid: u32,
+    /// The seam's readable name.
+    pub seam: alloc::string::String,
+}
+
+/// One `[RuntimeProvided]` seam that reached codegen without a synthesized body -- the third
+/// silent-demotion layer of a [`LibraryBuildReport`], and the set an image's placeholder audit
+/// intersects with the linker's post-`--gc-sections` symbols to answer "which of these does this
+/// program actually reach".
+#[derive(Debug, Clone)]
+pub struct UnsynthesizedSeam {
+    /// The METHOD_DEF rid of the seam.
+    pub rid: u32,
+    /// Its readable name (`Namespace.Type::Method`).
+    pub name: alloc::string::String,
+    /// The SYMBOL this build emits it under, so the row joins directly against a link map or an
+    /// `llvm-nm` listing: the mangled cross-assembly export for an accessible method, else the
+    /// internal `L<hash>.f<rid>` (or a program's `f<rid>`).
+    pub symbol: alloc::string::String,
+    /// Whether the seam declares `[IntendedDefault]` -- its compiled-out default IS the intended
+    /// answer, so a build that does not synthesize it is still correct.
+    pub intended_default: bool,
+    /// What was emitted in place of the missing body.
+    pub disposition: SeamDisposition,
+    /// Whether the lowering FOLDS every `call` to this method into a backend intrinsic
+    /// ([`crate::resolver::folded_intrinsic`]). A folded seam's placeholder body cannot be reached by
+    /// a call, so it is NOT a live silent-wrong-answer even though nothing synthesized it, and
+    /// counting it as one overstates the risk. Scope: this answers for CALLS only -- a seam reached
+    /// through a VIRTUAL slot or through a reference's internals is the linker's reachability
+    /// question, which this flag does not speak to.
+    pub folded_to_intrinsic: bool,
+}
+
+/// What [`build_library_object_report`] observed while building: the THREE distinct silent-demotion
 /// layers a library method can fall through, each previously invisible (finding 4b).
 #[derive(Debug, Default)]
 pub struct LibraryBuildReport {
@@ -940,6 +1212,14 @@ pub struct LibraryBuildReport {
     /// `CodeTooLarge` marks a fixpoint stub (the body lowers alone, the whole object could not
     /// encode with it in).
     pub emit_stubs: Vec<LibraryReportEntry>,
+    /// `[RuntimeProvided]` seams the build did not synthesize. Unlike the two above this is not a
+    /// FAILURE -- the body was never in the assembly to lower -- which is exactly why it stayed
+    /// invisible: the method compiles, links, and answers a constant.
+    pub unsynthesized_seams: Vec<UnsynthesizedSeam>,
+    /// Where this assembly's OWN emitted code calls one of those seams in its silent disposition.
+    /// A seam nobody calls is a gap; a seam somebody calls is a wrong answer in waiting, and this is
+    /// the list that separates them.
+    pub silent_seam_edges: Vec<SeamCallEdge>,
 }
 
 /// As [`build_library_object`], but also returning the [`LibraryBuildReport`] -- the CIL->MIR fail
@@ -985,11 +1265,15 @@ fn build_library_object_inner(
         .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
         .collect::<Result<_, _>>()?;
     let reference_list: Vec<&Assembly> = reference_assemblies.iter().collect();
-    let (funcs, _maps, fails) = lower_assembly_debug(&assembly, None, &reference_list);
+    let (funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &reference_list);
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
-    let names = library_symbol_names(&assembly, funcs.len(), &prefix);
+    let names = library_symbol_names(&assembly, &reference_list, funcs.len(), &prefix);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let qualifiers = arm32::DescQualifiers {
+        string: MetadataResolver::new(&assembly)
+            .with_references(&reference_list)
+            .string_type_meta()
+            .map(|m| m.handle.0),
         own: Some(alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, cil))),
         references: references
             .iter()
@@ -1027,13 +1311,215 @@ fn build_library_object_inner(
             .into_iter()
             .map(|(index, error)| (index as u32, name_of(index), alloc::format!("{error:?}")))
             .collect(),
+        unsynthesized_seams: unsynthesized_seam_rows(&assembly, &seams, &display_names, &names),
+        silent_seam_edges: silent_seam_call_edges(&assembly, &funcs, &seams, &display_names),
     };
     Ok((bytes, report))
 }
 
+/// The [`LibraryBuildReport`] rows for the seams [`lower_assembly_seams`] left unsynthesized: each
+/// named twice -- readably, and by the SYMBOL this build emits it under, so a row joins straight
+/// against a link map (`symbols` is the same rid-indexed list the emission was handed, so the two
+/// cannot disagree). `[IntendedDefault]` is read here rather than in the lowering because it is a
+/// property of the seam's CONTRACT, not of what the backend managed to emit.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn unsynthesized_seam_rows(
+    assembly: &Assembly,
+    seams: &[SeamRow],
+    display_names: &[Option<alloc::string::String>],
+    symbols: &[alloc::string::String],
+) -> Vec<UnsynthesizedSeam> {
+    seams
+        .iter()
+        .map(|(rid, disposition, folded)| UnsynthesizedSeam {
+            folded_to_intrinsic: *folded,
+            rid: *rid,
+            name: display_names
+                .get(*rid as usize)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| alloc::format!("f{rid}")),
+            symbol: symbols
+                .get(*rid as usize)
+                .cloned()
+                .unwrap_or_else(|| alloc::format!("f{rid}")),
+            intended_default: assembly.is_intended_default(Token::new(table::METHOD_DEF, *rid)),
+            disposition: *disposition,
+        })
+        .collect()
+}
+
+/// Every direct CALL EDGE from `funcs` into a seam of `seams` whose disposition is SILENT -- an
+/// unmarked, untrapped placeholder. Both edge kinds a rid names directly are counted: a `call`
+/// ([`Inst::Call`]) and taking the method's ADDRESS ([`Inst::FuncAddr`], a `ldftn` behind a delegate
+/// -- deferring the call does not make the answer less wrong).
+///
+/// SCOPE, and it is a LOWER BOUND rather than the whole answer: this sees the edges a rid names, so
+/// it covers every direct `call`. It does NOT resolve a `callvirt`/interface dispatch back to a
+/// candidate seam -- a slot maps to a method only through a type's descriptor, and an override may
+/// displace it -- and a VIRTUAL seam is a real case, not a hypothetical one: `System.Object::ToString`
+/// is itself an unsynthesized seam, reached through every type's vtable slot rather than by any call
+/// edge. Nor does it see what a caller reaches through a REFERENCE's own internals. Both of those are
+/// decided by the linker's reachability, which is where the census rows' symbols are meant to be
+/// intersected -- this refuses what a single assembly can prove on its own.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn silent_seam_call_edges(
+    assembly: &Assembly,
+    funcs: &[Function],
+    seams: &[SeamRow],
+    display_names: &[Option<alloc::string::String>],
+) -> Vec<SeamCallEdge> {
+    let silent: Vec<u32> = seams
+        .iter()
+        .filter(|(rid, disposition, folded)| {
+            *disposition == SeamDisposition::Placeholder
+                && !*folded
+                && !assembly.is_intended_default(Token::new(table::METHOD_DEF, *rid))
+        })
+        .map(|(rid, ..)| *rid)
+        .collect();
+    if silent.is_empty() {
+        return Vec::new();
+    }
+    let name_of = |rid: u32| {
+        display_names
+            .get(rid as usize)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| alloc::format!("f{rid}"))
+    };
+    let mut edges: Vec<SeamCallEdge> = Vec::new();
+    for (caller_rid, func) in funcs.iter().enumerate() {
+        let caller_rid = caller_rid as u32;
+        for block in &func.blocks {
+            for (_, inst) in &block.insts {
+                let callee = match inst {
+                    Inst::Call { callee, .. } => *callee,
+                    Inst::FuncAddr { func } => *func,
+                    _ => continue,
+                };
+                if callee == caller_rid || !silent.contains(&callee) {
+                    continue;
+                }
+                if edges
+                    .iter()
+                    .any(|e| e.caller_rid == caller_rid && e.seam_rid == callee)
+                {
+                    continue;
+                }
+                edges.push(SeamCallEdge {
+                    caller_rid,
+                    caller: name_of(caller_rid),
+                    seam_rid: callee,
+                    seam: name_of(callee),
+                });
+            }
+        }
+    }
+    edges
+}
+
+/// The CROSS-ASSEMBLY half of the caller audit: every SILENT seam of `reference` that this module's
+/// emitted code calls by symbol. A managed call into another assembly lowers to [`Inst::PInvoke`]
+/// carrying the callee's mangled export symbol ([`crate::resolver::extern_method_symbol`]) -- the
+/// same name the defining library object exports it under, which is exactly why the link SUCCEEDS
+/// and the caller is then told a constant.
+///
+/// Ordered so the expensive question is asked last: the flag tests and the mangle are cheap, and only
+/// a symbol this module actually imports pays for the attribute walk and the synthesis-table lookup.
+/// That matters -- an unconditional `[RuntimeProvided]` walk of a corlib costs ~230 ms in a debug
+/// build, which no program build can afford to spend on every reference.
+///
+/// The export condition it mirrors is [`library_symbol_names`]'s, reduced by what is known here: a
+/// marked method is never `is_plain_instance`, and one this backend synthesizes is not silent, so
+/// what remains is `(static || virtual) && accessible`. A symbol two methods share is DEMOTED to
+/// internal by the library build, so it cannot be a silent path -- the program fails to link instead.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn imported_silent_seams<'a>(
+    reference: &'a Assembly<'a>,
+    reference_refs: &[&'a Assembly<'a>],
+    imports: &[&str],
+) -> Vec<(u32, alloc::string::String, alloc::string::String)> {
+    let mut found: Vec<(u32, alloc::string::String, alloc::string::String)> = Vec::new();
+    if imports.is_empty() {
+        return found;
+    }
+    for type_def in reference.type_defs() {
+        let Some(type_name) = type_def.name() else {
+            continue;
+        };
+        for method in type_def.methods() {
+            if !(method.is_static() || method.is_virtual())
+                || !matches!(method.flags() & 0x7, 0x4..=0x6)
+            {
+                continue;
+            }
+            let Some(method_name) = method.name() else {
+                continue;
+            };
+            let params = method.signature().map(|s| s.parameters).unwrap_or_default();
+            let symbol = crate::resolver::extern_method_symbol(
+                type_name.namespace,
+                type_name.name,
+                method_name,
+                &params,
+                &|token| {
+                    reference
+                        .type_token_name(token)
+                        .map(|n| crate::resolver::joined_full_name(&n))
+                },
+            );
+            if !imports.contains(&symbol.as_str()) {
+                continue;
+            }
+            let token = Token::new(table::METHOD_DEF, method.rid());
+            if !reference.is_runtime_provided(token) || reference.is_intended_default(token) {
+                continue;
+            }
+            let signature = method.signature();
+            if !matches!(
+                synthesized_seam_body(reference, reference_refs, &type_name, &method, &signature),
+                SeamEmission::Placeholder
+            ) {
+                continue;
+            }
+            found.push((
+                method.rid(),
+                alloc::format!(
+                    "{}{}{}::{method_name}",
+                    type_name.namespace,
+                    if type_name.namespace.is_empty() { "" } else { "." },
+                    type_name.name
+                ),
+                symbol,
+            ));
+        }
+    }
+    found
+}
+
+/// Every extern managed symbol `funcs` calls -- the [`Inst::PInvoke`] imports, deduplicated. The
+/// input side of [`imported_silent_seams`].
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn pinvoke_imports(funcs: &[Function]) -> Vec<(alloc::string::String, u32)> {
+    let mut imports: Vec<(alloc::string::String, u32)> = Vec::new();
+    for (caller_rid, func) in funcs.iter().enumerate() {
+        for block in &func.blocks {
+            for (_, inst) in &block.insts {
+                if let Inst::PInvoke { import, .. } = inst {
+                    if !imports.iter().any(|(name, _)| name.as_str() == &**import) {
+                        imports.push((alloc::string::String::from(&**import), caller_rid as u32));
+                    }
+                }
+            }
+        }
+    }
+    imports
+}
+
 /// `rid -> "Namespace.Type::Method"` for every METHOD_DEF row (None for a rid no method occupies
 /// -- the rid-indexed layout keeps gaps as placeholder functions).
-#[cfg(feature = "arm32")]
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
 fn method_display_names(
     assembly: &Assembly,
     count: usize,
@@ -1070,9 +1556,10 @@ fn method_display_names(
 /// (internal). Accessible = Public, Family, or FamORAssem -- a `protected`/`protected internal`
 /// member is exactly what a DERIVED type in another assembly calls (`base.Dispose(disposing)`)
 /// or inherits into its vtable, so exporting only Public left those slots undefined at link.
-#[cfg(feature = "arm32")]
-fn library_symbol_names(
-    assembly: &Assembly,
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn library_symbol_names<'a>(
+    assembly: &'a Assembly<'a>,
+    references: &[&'a Assembly<'a>],
     count: usize,
     prefix: &str,
 ) -> Vec<alloc::string::String> {
@@ -1088,20 +1575,23 @@ fn library_symbol_names(
                 continue;
             }
             let token = Token::new(table::METHOD_DEF, method.rid());
-            let runtime_provided = has_runtime_provided_attribute(assembly, token);
-            let is_synth_reader = runtime_provided
-                && synthesize_runtime_reader(
-                    type_name.namespace,
-                    type_name.name,
-                    method.name(),
-                    method.signature().map(|s| s.parameters.len()).unwrap_or(0),
-                )
-                .is_some();
+            let runtime_provided = assembly.is_runtime_provided(token);
+            let is_synth_seam = runtime_provided
+                && matches!(
+                    synthesized_seam_body(
+                        assembly,
+                        references,
+                        &type_name,
+                        &method,
+                        &method.signature()
+                    ),
+                    SeamEmission::Synthesized(_)
+                );
             let is_plain_instance = !method.is_static()
                 && !method.is_virtual()
                 && !runtime_provided
                 && method.body().is_some();
-            if (method.is_static() || method.is_virtual() || is_synth_reader || is_plain_instance)
+            if (method.is_static() || method.is_virtual() || is_synth_seam || is_plain_instance)
                 && matches!(method.flags() & 0x7, 0x4..=0x6)
             {
                 if let Some(method_name) = method.name() {
@@ -1261,14 +1751,12 @@ fn startup(init: Option<u32>, cctors: &[u32], entry_rid: u32) -> Function {
 }
 
 /// As [`startup`], but also chaining REFERENCE-assembly `.cctor`s (as extern `PInvoke` calls to
-/// the library object's internal `L<hash>.f<rid>` symbols) -- the #15 second half. ORDER:
+/// the library object's internal `L<hash>.f<rid>` symbols). ORDER:
 /// board-init hook, then REFERENCE cctors, then the program's own, then the entry. Reference-FIRST
 /// is the dependency direction: a program `.cctor` may call referenced-assembly surface that reads
 /// referenced statics (`new AutoResetEvent(false)` reaches `WaitHandle.coordinator`), while a
-/// reference `.cctor` cannot name program state at all -- corlib does not know the program. (The
-/// #15 ruling's text sketched program-then-reference; this deliberately runs the defensible eager
-/// order instead, flagged on the board for the lead's ack.) Each call before the entry is void
-/// (its result is a dead placeholder).
+/// reference `.cctor` cannot name program state at all -- corlib does not know the program. Each
+/// call before the entry is void (its result is a dead placeholder).
 fn startup_with_references(
     init: Option<u32>,
     reference_cctors: &[alloc::string::String],
@@ -1343,22 +1831,6 @@ fn find_native_export(assembly: &Assembly, export: &str) -> Option<u32> {
         }
     }
     None
-}
-
-/// Whether `method_token` carries `[Lamella.Runtime.RuntimeProvided]` -- the corlib's marker for a method
-/// whose empty body is a placeholder for a runtime-provided intrinsic. Mirrors the interpreter's
-/// `lamella_load::has_runtime_provided_attribute`: csc emits a REAL empty body (not an implflag), so the
-/// AOT keys on the ATTRIBUTE, and for the readers it can it synthesizes a body ([`synthesize_runtime_reader`])
-/// instead of lowering the placeholder.
-fn has_runtime_provided_attribute(assembly: &Assembly, method_token: Token) -> bool {
-    assembly.custom_attributes(method_token).any(|attribute| {
-        assembly
-            .resolve_method(attribute.constructor)
-            .and_then(|ctor| ctor.declaring_type)
-            .is_some_and(|name| {
-                name.namespace == "Lamella.Runtime" && name.name == "RuntimeProvidedAttribute"
-            })
-    })
 }
 
 /// A synthesized MIR body for a `[RuntimeProvided]` `System.String` / `System.Array` reader, over the
@@ -1603,6 +2075,91 @@ fn synthesize_runtime_reader(
     }
 }
 
+/// A synthesized MIR body for the two `[RuntimeProvided]` seams that make `typeof(T)` real.
+///
+/// `System.Type` is HANDLE-BACKED (the model `corlib/System/Type.cs` documents): `typeof(T)` compiles
+/// to `ldtoken T ; call GetTypeFromHandle`, and `ldtoken` already lowers to the type's CANONICAL
+/// descriptor address (`Inst::TypeDescAddr`). So that address IS the `Type`, which makes
+/// `GetTypeFromHandle(handle)` the IDENTITY -- it retypes the incoming word to a reference and
+/// returns it (`IntToRef` is a pure retype, a no-op at the machine level) -- and makes
+/// `HandleEquals(a, b)` a POINTER COMPARE of the two descriptor addresses.
+/// A descriptor is canonical per type (one symbol, dedup'd strong/weak across assemblies), so pointer
+/// equality IS type identity: `typeof(P) == typeof(P)` holds and two distinct types never collide.
+///
+/// Without these the placeholders lower AS WRITTEN -- `GetTypeFromHandle` returns `null` and
+/// `HandleEquals` returns `false` -- so `typeof(P) == typeof(P)` is silently FALSE on device (the
+/// `[RuntimeProvided]`-compiled-out-returns-default hazard). Both seams are static: no receiver.
+fn synthesize_type_seam(
+    namespace: &str,
+    type_name: &str,
+    method_name: Option<&str>,
+    param_count: usize,
+) -> Option<Function> {
+    if (namespace, type_name) != ("System", "Type") {
+        return None;
+    }
+    match (method_name, param_count) {
+        (Some("GetTypeFromHandle"), 1) => Some(Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::Convert {
+                        value: ValueId(0),
+                        kind: ConvKind::IntToRef,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        }),
+        (Some("HandleEquals"), 2) => Some(Function {
+            params: vec![MirType::ObjectRef, MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: vec![
+                MirType::ObjectRef,
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![
+                    (
+                        ValueId(2),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::Convert {
+                            value: ValueId(1),
+                            kind: ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(4),
+                        Inst::Compare {
+                            op: CmpOp::Eq,
+                            lhs: ValueId(2),
+                            rhs: ValueId(3),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(4)))),
+            }],
+        }),
+        _ => None,
+    }
+}
+
 /// A synthesized MIR body for a `System.Console` output overload. It threads an optional argument
 /// (`param`) -- reinterpreted from an ObjectRef to a raw pointer first when `ref_to_int` (the string
 /// form) -- into a runtime-support value-writer (`writer`), then optionally a trailing newline. So
@@ -1746,6 +2303,279 @@ fn char_to_string_body() -> Function {
     }
 }
 
+/// What the `[RuntimeProvided]` SYNTHESIS TABLE ([`synthesized_seam_body`]) produced for one marked
+/// method. The three cases are what the seam census reports on
+/// ([`LibraryBuildReport::unsynthesized_seams`]), and they differ in one property: whether a caller
+/// can tell the seam is missing.
+enum SeamEmission {
+    /// A real body -- this build backs the seam, and it is not a gap at all.
+    Synthesized(Function),
+    /// A TRAP body: the gap is loud. Reaching it faults instead of answering.
+    Trap(Function),
+    /// Nothing: the assembly's own placeholder body lowers as written, so the seam answers a
+    /// constant and the caller cannot tell.
+    Placeholder,
+}
+
+/// The `System.Console` output overloads: a body that formats + writes the argument over the device
+/// console seam, or `None` for an overload this table does not back (the managed `decimal` forms,
+/// which have real bodies). Routed by the parameter's EXACT signature type -- `int` vs `uint`, `long`
+/// vs `ulong` differ only in signedness, which the MIR type collapses, so the sink symbol is what
+/// distinguishes them.
+///
+/// `Write` and `WriteLine` come in PAIRS, differing only in the trailing newline, and the pairing is
+/// a test rather than a convention: four `Write` overloads were missing here while their `WriteLine`
+/// twins were present, so `Console.Write(true)` and `Console.Write(1L)` compiled to the corlib
+/// placeholder and printed NOTHING -- on the program's primary observable, which is how a user
+/// diagnoses everything else.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn console_seam_body(name: Option<&str>, params: &[SigType]) -> Option<Function> {
+    let s = |sym| Some(sym);
+    match (name, params) {
+    (Some("Write"), [SigType::String]) => Some(console_body(
+        Some(MirType::ObjectRef),
+        true,
+        s("lamella_console_write"),
+        false,
+    )),
+    (Some("WriteLine"), [SigType::String]) => Some(console_body(
+        Some(MirType::ObjectRef),
+        true,
+        s("lamella_console_write"),
+        true,
+    )),
+    (Some("Write"), [SigType::I4]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_i32"),
+        false,
+    )),
+    (Some("WriteLine"), [SigType::I4]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_i32"),
+        true,
+    )),
+    (Some("Write"), [SigType::U4]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_u32"),
+        false,
+    )),
+    (Some("WriteLine"), [SigType::U4]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_u32"),
+        true,
+    )),
+    (Some("Write"), [SigType::Char]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_char"),
+        false,
+    )),
+    (Some("WriteLine"), [SigType::Char]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_char"),
+        true,
+    )),
+    (Some("Write"), [SigType::Boolean]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_bool"),
+        false,
+    )),
+    (Some("WriteLine"), [SigType::Boolean]) => Some(console_body(
+        Some(MirType::I32),
+        false,
+        s("lamella_console_write_bool"),
+        true,
+    )),
+    (Some("Write"), [SigType::I8]) => Some(console_body(
+        Some(MirType::I64),
+        false,
+        s("lamella_console_write_i64"),
+        false,
+    )),
+    (Some("WriteLine"), [SigType::I8]) => Some(console_body(
+        Some(MirType::I64),
+        false,
+        s("lamella_console_write_i64"),
+        true,
+    )),
+    (Some("Write"), [SigType::U8]) => Some(console_body(
+        Some(MirType::I64),
+        false,
+        s("lamella_console_write_u64"),
+        false,
+    )),
+    (Some("WriteLine"), [SigType::U8]) => Some(console_body(
+        Some(MirType::I64),
+        false,
+        s("lamella_console_write_u64"),
+        true,
+    )),
+        _ => None,
+    }
+}
+
+/// THE `[RuntimeProvided]` SYNTHESIS TABLE: the body this backend supplies for a marked method whose
+/// real one lives in the runtime, or [`SeamEmission::Placeholder`] when it supplies none.
+///
+/// Factored out of the lowering loop so it can be asked WITHOUT lowering an assembly -- the caller
+/// audit needs "would this seam be synthesized?" for a REFERENCE's method, and a second copy of the
+/// answer is the one thing that must not exist (a seam the audit thinks is synthesized and the
+/// emission leaves a placeholder is exactly the silent wrong answer the audit is for).
+#[allow(clippy::too_many_lines)]
+fn synthesized_seam_body<'a>(
+    assembly: &'a Assembly<'a>,
+    references: &[&'a Assembly<'a>],
+    type_name: &lamella_metadata::TypeName<'a>,
+    method: &lamella_metadata::Method<'a>,
+    signature: &Option<lamella_metadata::MethodSig>,
+) -> SeamEmission {
+    let params = signature.as_ref().map_or(0, |sig| sig.parameters.len());
+    if let Some(func) = synthesize_runtime_reader(
+        type_name.namespace,
+        type_name.name,
+        method.name(),
+        params,
+    ) {
+        return SeamEmission::Synthesized(func);
+    }
+    if let Some(func) =
+        synthesize_type_seam(type_name.namespace, type_name.name, method.name(), params)
+    {
+        return SeamEmission::Synthesized(func);
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Console") {
+        let params = signature
+            .as_ref()
+            .map(|s| s.parameters.as_slice())
+            .unwrap_or(&[]);
+        if let Some(func) = console_seam_body(method.name(), params) {
+            return SeamEmission::Synthesized(func);
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Double")
+        && method.name() == Some("ToString")
+        && params == 0
+    {
+        return SeamEmission::Synthesized(double_to_string_body());
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Char")
+        && method.name() == Some("ToString")
+        && params == 0
+    {
+        return SeamEmission::Synthesized(char_to_string_body());
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Delegate") && params == 2 {
+        if method.name() == Some("Combine") {
+            return SeamEmission::Synthesized(delegate_combine_body());
+        }
+        if method.name() == Some("Remove") {
+            return SeamEmission::Synthesized(delegate_remove_body());
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("Lamella.Hardware", "Mmio") {
+        let mmio_body = match (method.name(), params) {
+            (Some("Read8"), 1) => Some(mmio_read_body(1)),
+            (Some("Read16"), 1) => Some(mmio_read_body(2)),
+            (Some("Read32"), 1) => Some(mmio_read_body(4)),
+            (Some("Write8"), 2) => Some(mmio_write_body(1)),
+            (Some("Write16"), 2) => Some(mmio_write_body(2)),
+            (Some("Write32"), 2) => Some(mmio_write_body(4)),
+            _ => None,
+        };
+        if let Some(body) = mmio_body {
+            return SeamEmission::Synthesized(body);
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Array") {
+        let core = match (method.name(), params) {
+            (Some("CopyCore"), 5) => Some(array_copy_core_body()),
+            (Some("ClearCore"), 3) => Some(array_clear_core_body()),
+            (Some("get_Rank"), 0) => Some(array_rank_body()),
+            (Some("GetValue"), 1) => Some(array_get_value_body()),
+            (Some("SetValue"), 2) => Some(array_set_value_body()),
+            (Some("Clone"), 0) => Some(array_clone_body()),
+            _ => None,
+        };
+        if let Some(body) = core {
+            return SeamEmission::Synthesized(body);
+        }
+    }
+    if let Some(import) =
+        net_seam_import(type_name.namespace, type_name.name, method.name())
+    {
+        if let Some(sig) = &signature {
+            let param_types: Vec<MirType> =
+                sig.parameters.iter().map(|p| mir_type(p, assembly, references)).collect();
+            return SeamEmission::Synthesized(runtime_seam_body(
+                &param_types,
+                &sig.parameters,
+                !matches!(sig.return_type, SigType::Void),
+                net_seam_folds_buffer(method.name()),
+                import,
+            ));
+        }
+    }
+    if net_seam_deferred(type_name.namespace, type_name.name, method.name()) {
+        if let Some(sig) = &signature {
+            let param_types: Vec<MirType> =
+                sig.parameters.iter().map(|p| mir_type(p, assembly, references)).collect();
+            return SeamEmission::Synthesized(net_deferred_body(&param_types, -2));
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System.Threading", "Thread")
+        && method.name() == Some("StartThread")
+    {
+        if let (Some(sig), Some(entry_rid)) = (
+            &signature,
+            find_method_rid(assembly, "System.Threading", "Thread", "ThreadEntry"),
+        ) {
+            let param_types: Vec<MirType> =
+                sig.parameters.iter().map(|p| mir_type(p, assembly, references)).collect();
+            return SeamEmission::Synthesized(thread_start_body(&param_types, entry_rid));
+        }
+    }
+    if let Some(import) =
+        thread_seam_import(type_name.namespace, type_name.name, method.name())
+    {
+        if let Some(sig) = &signature {
+            let param_types: Vec<MirType> =
+                sig.parameters.iter().map(|p| mir_type(p, assembly, references)).collect();
+            return SeamEmission::Synthesized(runtime_seam_body(
+                &param_types,
+                &sig.parameters,
+                !matches!(sig.return_type, SigType::Void),
+                false,
+                import,
+            ));
+        }
+    }
+    if let Some(import) =
+        monitor_seam_import(type_name.namespace, type_name.name, method.name())
+    {
+        if let Some(sig) = &signature {
+            let param_types: Vec<MirType> =
+                sig.parameters.iter().map(|p| mir_type(p, assembly, references)).collect();
+            return SeamEmission::Synthesized(runtime_seam_body(
+                &param_types,
+                &sig.parameters,
+                !matches!(sig.return_type, SigType::Void),
+                false,
+                import,
+            ));
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Array") {
+        return SeamEmission::Trap(deferred_trap_body());
+    }
+    SeamEmission::Placeholder
+}
+
 /// Lowers an assembly's methods to a `Vec<Function>` keyed by MethodDef row. Index 0 is a trampoline
 /// to `entry` (if any) -- the `main` export -- or a stub. A method that does not lower stays a stub.
 /// `references` are the referenced assemblies (corlib first) for cross-assembly vtable-slot
@@ -1774,6 +2604,35 @@ fn lower_assembly_debug<'a>(
     Vec<cil::CilSourceMap>,
     Vec<(u32, cil::CilError)>,
 ) {
+    let (funcs, maps, fails, _seams) = lower_assembly_seams(assembly, entry, references);
+    (funcs, maps, fails)
+}
+
+/// What [`lower_assembly_seams`] observed: the rid-indexed functions and source maps, the methods
+/// whose CIL did not lower, and the `[RuntimeProvided]` seams nothing synthesized.
+type LoweredAssembly = (
+    Vec<Function>,
+    Vec<cil::CilSourceMap>,
+    Vec<(u32, cil::CilError)>,
+    Vec<SeamRow>,
+);
+
+/// One census row as the lowering decided it: the seam's rid, what was emitted in its place, and
+/// whether every `call` to it is FOLDED to an intrinsic. The fold flag is captured HERE, beside the
+/// synthesis decision, so the report cannot answer differently from the emission -- the same reason
+/// `seams` records the disposition rather than re-deriving it.
+type SeamRow = (u32, SeamDisposition, bool);
+
+/// As [`lower_assembly_debug`], but ALSO returns the `[RuntimeProvided]` seams this build did not
+/// synthesize -- the third silent-demotion layer, alongside the CIL->MIR fails and the object-emit
+/// stubs (see [`LibraryBuildReport`]). A caller that must not ship a silent wrong answer reads this;
+/// [`lower_assembly_debug`] is the thin wrapper for the callers that do not, so their bytes are
+/// unchanged by construction.
+fn lower_assembly_seams<'a>(
+    assembly: &'a Assembly<'a>,
+    entry: Option<u32>,
+    references: &[&'a Assembly<'a>],
+) -> LoweredAssembly {
     let mut methods = Vec::new();
     let mut max_rid = entry.unwrap_or(0);
     for type_def in assembly.type_defs() {
@@ -1797,202 +2656,37 @@ fn lower_assembly_debug<'a>(
     }
     let resolver = MetadataResolver::new(assembly).with_references(references);
     let mut fails: Vec<(u32, cil::CilError)> = Vec::new();
+    let mut seams: Vec<SeamRow> = Vec::new();
     for (rid, method, type_name) in &methods {
         let Some(body) = method.body() else { continue };
         let signature = method.signature();
-        if has_runtime_provided_attribute(assembly, Token::new(table::METHOD_DEF, method.rid())) {
-            if let Some(type_name) = type_name {
-                let params = signature.as_ref().map_or(0, |sig| sig.parameters.len());
-                if let Some(func) = synthesize_runtime_reader(
-                    type_name.namespace,
-                    type_name.name,
-                    method.name(),
-                    params,
-                ) {
+        let folded = type_name.as_ref().is_some_and(|name| {
+            crate::resolver::folded_intrinsic(
+                name.namespace,
+                name.name,
+                method.name(),
+                signature
+                    .as_ref()
+                    .map_or(&[][..], |sig| sig.parameters.as_slice()),
+            )
+            .is_some()
+        });
+        if assembly.is_runtime_provided(Token::new(table::METHOD_DEF, method.rid())) {
+            let emission = type_name.as_ref().map_or(SeamEmission::Placeholder, |name| {
+                synthesized_seam_body(assembly, references, name, method, &signature)
+            });
+            match emission {
+                SeamEmission::Synthesized(func) => {
                     funcs[*rid as usize] = func;
                     continue;
                 }
-                if (type_name.namespace, type_name.name) == ("System", "Console") {
-                    let params = signature
-                        .as_ref()
-                        .map(|s| s.parameters.as_slice())
-                        .unwrap_or(&[]);
-                    let s = |sym| Some(sym);
-                    let body = match (method.name(), params) {
-                        (Some("Write"), [SigType::String]) => Some(console_body(
-                            Some(MirType::ObjectRef),
-                            true,
-                            s("lamella_console_write"),
-                            false,
-                        )),
-                        (Some("WriteLine"), [SigType::String]) => Some(console_body(
-                            Some(MirType::ObjectRef),
-                            true,
-                            s("lamella_console_write"),
-                            true,
-                        )),
-                        (Some("Write"), [SigType::I4]) => Some(console_body(
-                            Some(MirType::I32),
-                            false,
-                            s("lamella_console_write_i32"),
-                            false,
-                        )),
-                        (Some("WriteLine"), [SigType::I4]) => Some(console_body(
-                            Some(MirType::I32),
-                            false,
-                            s("lamella_console_write_i32"),
-                            true,
-                        )),
-                        (Some("WriteLine"), [SigType::U4]) => Some(console_body(
-                            Some(MirType::I32),
-                            false,
-                            s("lamella_console_write_u32"),
-                            true,
-                        )),
-                        (Some("Write"), [SigType::Char]) => Some(console_body(
-                            Some(MirType::I32),
-                            false,
-                            s("lamella_console_write_char"),
-                            false,
-                        )),
-                        (Some("WriteLine"), [SigType::Char]) => Some(console_body(
-                            Some(MirType::I32),
-                            false,
-                            s("lamella_console_write_char"),
-                            true,
-                        )),
-                        (Some("WriteLine"), [SigType::Boolean]) => Some(console_body(
-                            Some(MirType::I32),
-                            false,
-                            s("lamella_console_write_bool"),
-                            true,
-                        )),
-                        (Some("WriteLine"), [SigType::I8]) => Some(console_body(
-                            Some(MirType::I64),
-                            false,
-                            s("lamella_console_write_i64"),
-                            true,
-                        )),
-                        (Some("WriteLine"), [SigType::U8]) => Some(console_body(
-                            Some(MirType::I64),
-                            false,
-                            s("lamella_console_write_u64"),
-                            true,
-                        )),
-                        _ => None,
-                    };
-                    if let Some(func) = body {
-                        funcs[*rid as usize] = func;
-                        continue;
-                    }
-                }
-                if (type_name.namespace, type_name.name) == ("System", "Double")
-                    && method.name() == Some("ToString")
-                    && params == 0
-                {
-                    funcs[*rid as usize] = double_to_string_body();
+                SeamEmission::Trap(func) => {
+                    funcs[*rid as usize] = func;
+                    seams.push((*rid, SeamDisposition::Trap, folded));
                     continue;
                 }
-                if (type_name.namespace, type_name.name) == ("System", "Char")
-                    && method.name() == Some("ToString")
-                    && params == 0
-                {
-                    funcs[*rid as usize] = char_to_string_body();
-                    continue;
-                }
-                if (type_name.namespace, type_name.name) == ("System", "Delegate") && params == 2 {
-                    if method.name() == Some("Combine") {
-                        funcs[*rid as usize] = delegate_combine_body();
-                        continue;
-                    }
-                    if method.name() == Some("Remove") {
-                        funcs[*rid as usize] = delegate_remove_body();
-                        continue;
-                    }
-                }
-                if (type_name.namespace, type_name.name) == ("Lamella.Hardware", "Mmio") {
-                    let mmio_body = match (method.name(), params) {
-                        (Some("Read8"), 1) => Some(mmio_read_body(1)),
-                        (Some("Read16"), 1) => Some(mmio_read_body(2)),
-                        (Some("Read32"), 1) => Some(mmio_read_body(4)),
-                        (Some("Write8"), 2) => Some(mmio_write_body(1)),
-                        (Some("Write16"), 2) => Some(mmio_write_body(2)),
-                        (Some("Write32"), 2) => Some(mmio_write_body(4)),
-                        _ => None,
-                    };
-                    if let Some(body) = mmio_body {
-                        funcs[*rid as usize] = body;
-                        continue;
-                    }
-                }
-                if let Some(import) =
-                    net_seam_import(type_name.namespace, type_name.name, method.name())
-                {
-                    if let Some(sig) = &signature {
-                        let param_types: Vec<MirType> =
-                            sig.parameters.iter().map(|p| mir_type(p, assembly, resolver.references())).collect();
-                        funcs[*rid as usize] = runtime_seam_body(
-                            &param_types,
-                            &sig.parameters,
-                            !matches!(sig.return_type, SigType::Void),
-                            net_seam_folds_buffer(method.name()),
-                            import,
-                        );
-                        continue;
-                    }
-                }
-                if net_seam_deferred(type_name.namespace, type_name.name, method.name()) {
-                    if let Some(sig) = &signature {
-                        let param_types: Vec<MirType> =
-                            sig.parameters.iter().map(|p| mir_type(p, assembly, resolver.references())).collect();
-                        funcs[*rid as usize] = net_deferred_body(&param_types, -2);
-                        continue;
-                    }
-                }
-                if (type_name.namespace, type_name.name) == ("System.Threading", "Thread")
-                    && method.name() == Some("StartThread")
-                {
-                    if let (Some(sig), Some(entry_rid)) = (
-                        &signature,
-                        find_method_rid(assembly, "System.Threading", "Thread", "ThreadEntry"),
-                    ) {
-                        let param_types: Vec<MirType> =
-                            sig.parameters.iter().map(|p| mir_type(p, assembly, resolver.references())).collect();
-                        funcs[*rid as usize] = thread_start_body(&param_types, entry_rid);
-                        continue;
-                    }
-                }
-                if let Some(import) =
-                    thread_seam_import(type_name.namespace, type_name.name, method.name())
-                {
-                    if let Some(sig) = &signature {
-                        let param_types: Vec<MirType> =
-                            sig.parameters.iter().map(|p| mir_type(p, assembly, resolver.references())).collect();
-                        funcs[*rid as usize] = runtime_seam_body(
-                            &param_types,
-                            &sig.parameters,
-                            !matches!(sig.return_type, SigType::Void),
-                            false,
-                            import,
-                        );
-                        continue;
-                    }
-                }
-                if let Some(import) =
-                    monitor_seam_import(type_name.namespace, type_name.name, method.name())
-                {
-                    if let Some(sig) = &signature {
-                        let param_types: Vec<MirType> =
-                            sig.parameters.iter().map(|p| mir_type(p, assembly, resolver.references())).collect();
-                        funcs[*rid as usize] = runtime_seam_body(
-                            &param_types,
-                            &sig.parameters,
-                            !matches!(sig.return_type, SigType::Void),
-                            false,
-                            import,
-                        );
-                        continue;
-                    }
+                SeamEmission::Placeholder => {
+                    seams.push((*rid, SeamDisposition::Placeholder, folded));
                 }
             }
         }
@@ -2018,7 +2712,7 @@ fn lower_assembly_debug<'a>(
             Err(error) => fails.push((*rid, error)),
         }
     }
-    (funcs, maps, fails)
+    (funcs, maps, fails, seams)
 }
 
 /// The embedding ABI's export list: `main` (the entry trampoline at index 0, if there is an entry)
@@ -2148,6 +2842,11 @@ impl MirBuilder {
             false_args: Vec::new(),
         });
     }
+    /// A block that traps if reached -- the answer for a case the body cannot compute rather than
+    /// cannot decline (a `void` seam has no way to say "not me").
+    fn unreachable(&mut self) {
+        self.blocks[self.cur].terminator = Some(Terminator::Unreachable);
+    }
     fn finish(self, ret: Option<MirType>) -> Function {
         Function {
             params: self.value_types[..self.n_params].to_vec(),
@@ -2271,9 +2970,11 @@ pub fn delegate_combine_body() -> Function {
     let list = mb.emit(
         objt,
         Inst::AllocArray {
-            handle: TypeHandle(0),
+            handle: lamella_ir::synthetic_array_handle(ELEMENT_KIND_REFERENCE),
+            element: None,
             length: total,
             element_size: 4,
+            element_kind: ELEMENT_KIND_REFERENCE,
         },
     );
     let listi = mb.emit(i32t, refint(list));
@@ -2530,7 +3231,13 @@ pub fn delegate_remove_body() -> Function {
     mb.at(rebuild);
     let nl = mb.emit(
         objt,
-        Inst::AllocArray { handle: TypeHandle(0), length: new_n, element_size: 4 },
+        Inst::AllocArray {
+            handle: lamella_ir::synthetic_array_handle(ELEMENT_KIND_REFERENCE),
+            element: None,
+            length: new_n,
+            element_size: 4,
+            element_kind: ELEMENT_KIND_REFERENCE,
+        },
     );
     let nli = mb.emit(i32t, refint(nl));
     let ne = mb.emit(i32t, add(nli, four));
@@ -2638,7 +3345,13 @@ pub fn delegate_remove_body() -> Function {
     mb.at(sub_rebuild);
     let nlb = mb.emit(
         objt,
-        Inst::AllocArray { handle: TypeHandle(0), length: new_nb, element_size: 4 },
+        Inst::AllocArray {
+            handle: lamella_ir::synthetic_array_handle(ELEMENT_KIND_REFERENCE),
+            element: None,
+            length: new_nb,
+            element_size: 4,
+            element_kind: ELEMENT_KIND_REFERENCE,
+        },
     );
     let nlib = mb.emit(i32t, refint(nlb));
     let four4 = mb.emit(i32t, c(4));
@@ -2668,6 +3381,1064 @@ pub fn delegate_remove_body() -> Function {
     mb.ret(result2);
 
     mb.finish(Some(objt))
+}
+
+/// `log2` of each element kind's byte width, packed two bits per kind at bit `2*kind` -- the run-time
+/// half of the frozen element-kind code space (`resolver::primitive_element_kind`, mirroring the
+/// interpreter's `PrimKind`). A synthesized `System.Array` body reads word 1 of the array's descriptor
+/// and needs the STRIDE, and the descriptor carries only the kind; two bits reach every width the code
+/// space has (1/2/4/8), so the whole table fits in one immediate and costs a shift and a mask rather
+/// than a nine-way branch chain. Built from the width list here rather than written as a literal, so it
+/// cannot drift from it.
+const ELEMENT_WIDTH_SHIFTS: u32 = {
+    let shifts = [2u32, 0, 0, 1, 1, 2, 3, 2, 3];
+    let mut table = 0u32;
+    let mut kind = 0;
+    while kind < shifts.len() {
+        table |= shifts[kind] << (2 * kind);
+        kind += 1;
+    }
+    table
+};
+
+/// The highest element kind [`ELEMENT_WIDTH_SHIFTS`] describes. Anything above it -- `ELEMENT_KIND_OPAQUE`
+/// (a struct element, whose width word 1 deliberately does not carry) or a code from a future format --
+/// is not stridable here, and a body that met one must decline rather than guess.
+const MAX_STRIDABLE_ELEMENT_KIND: i64 = 8;
+
+/// Emits the common prologue of an untyped `System.Array` seam: from an array reference, the byte-width
+/// SHIFT of its elements, having already branched to `decline` unless the array is a well-formed VECTOR
+/// whose element kind carries a width.
+///
+/// The two guards are what make the rest safe. Word 0 must be exactly `ARRAY_DESC_MARK | 1`: a rank-2+
+/// descriptor is all zeroes today, so reading its word 1 as an element kind would invent a stride, and a
+/// class descriptor's word 0 is a payload size. Word 1 must be a kind the table covers, which excludes
+/// the struct-element arrays whose stride is real but unrepresented. Every kind that passes strides by
+/// exactly the `element_size` the allocation used -- a reference element is 4 and every primitive's size
+/// is `1 << shift` -- so the byte range computed from it is the range the object actually occupies.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn array_element_shift(
+    mb: &mut MirBuilder,
+    array: ValueId,
+    decline: usize,
+) -> (ValueId, ValueId) {
+    let i32t = MirType::I32;
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let base = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: array,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let desc = mb.emit(i32t, Inst::LoadTypeDesc { object: array });
+    let word0 = mb.emit(
+        i32t,
+        Inst::Load {
+            address: desc,
+            width: 4,
+            signed: false,
+        },
+    );
+    #[allow(clippy::cast_possible_wrap)]
+    let mark = (crate::resolver::ARRAY_DESC_MARK | 1) as i32;
+    let vector_mark = mb.emit(i32t, c(i64::from(mark)));
+    let is_vector = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: word0,
+            rhs: vector_mark,
+        },
+    );
+    let kind_block = mb.block();
+    mb.branch(is_vector, kind_block, decline);
+
+    mb.at(kind_block);
+    let four = mb.emit(i32t, c(4));
+    let kind_slot = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: desc,
+            rhs: four,
+        },
+    );
+    let kind = mb.emit(
+        i32t,
+        Inst::Load {
+            address: kind_slot,
+            width: 4,
+            signed: false,
+        },
+    );
+    let max_kind = mb.emit(i32t, c(MAX_STRIDABLE_ELEMENT_KIND));
+    let unstridable = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::UnsignedGt,
+            lhs: kind,
+            rhs: max_kind,
+        },
+    );
+    let shift_block = mb.block();
+    mb.branch(unstridable, decline, shift_block);
+
+    mb.at(shift_block);
+    let table = mb.emit(i32t, c(i64::from(ELEMENT_WIDTH_SHIFTS)));
+    let one = mb.emit(i32t, c(1));
+    let bit = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: kind,
+            rhs: one,
+        },
+    );
+    let field = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::ShrUnsigned,
+            lhs: table,
+            rhs: bit,
+        },
+    );
+    let three = mb.emit(i32t, c(3));
+    let shift = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: field,
+            rhs: three,
+        },
+    );
+    (base, shift)
+}
+
+/// The ELEMENT type's descriptor address, read out of the array descriptor's `element_desc@16` --
+/// having already branched to `decline` if the word is ABSENT.
+///
+/// The word is a REL_DESC: it holds `element_words - desc`, read exactly as `base_ptr@12` is, so the
+/// element descriptor is `desc + word`. 0 means ABSENT -- the emitter lays it wherever it has no
+/// descriptor that can answer for the element -- and the ratified contract says a consumer must refuse
+/// a zero rather than treat it as an address, which is what the branch here is.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn array_element_descriptor(mb: &mut MirBuilder, desc: ValueId, decline: usize) -> ValueId {
+    let i32t = MirType::I32;
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let sixteen = mb.emit(i32t, c(16));
+    let element_slot = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: desc,
+            rhs: sixteen,
+        },
+    );
+    let element_rel = mb.emit(
+        i32t,
+        Inst::Load {
+            address: element_slot,
+            width: 4,
+            signed: false,
+        },
+    );
+    let zero = mb.emit(i32t, c(0));
+    let named = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Ne,
+            lhs: element_rel,
+            rhs: zero,
+        },
+    );
+    let named_block = mb.block();
+    mb.branch(named, named_block, decline);
+
+    mb.at(named_block);
+    mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: desc,
+            rhs: element_rel,
+        },
+    )
+}
+
+/// The byte address of element `index` of the array whose object address is `base`, striding by
+/// `shift`: `base + 4 + (index << shift)`. The `+4` steps over the length word an ObjectRef points at.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn array_element_address(
+    mb: &mut MirBuilder,
+    base: ValueId,
+    index: ValueId,
+    shift: ValueId,
+) -> ValueId {
+    let i32t = MirType::I32;
+    let offset = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: index,
+            rhs: shift,
+        },
+    );
+    let four = mb.emit(
+        i32t,
+        Inst::ConstInt {
+            ty: i32t,
+            value: 4,
+        },
+    );
+    let data = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: base,
+            rhs: four,
+        },
+    );
+    mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: data,
+            rhs: offset,
+        },
+    )
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Array.CopyCore(src, srcIndex, dst, dstIndex,
+/// length)` -- the bulk element move behind `Array.Copy`, and the reason a copy is one operation instead
+/// of one boxed read and one unboxed write per element.
+///
+/// It moves the range VERBATIM, so it only accepts a pair it can move that way, and answers `false` for
+/// anything else -- which is the seam's declared contract, not a shortcut: the managed caller then runs
+/// its own per-element loop, keeping the checked path for array covariance and the widening primitive
+/// conversions. The test for "movable verbatim" is that both arrays have the SAME DESCRIPTOR, one pointer
+/// compare, and it is exactly right: two arrays share a descriptor only when they are the same array
+/// type, which makes the elements identical in representation AND makes a covariant store impossible
+/// (`object[]` and `string[]` have different descriptors, so that pair declines and takes the checked
+/// loop). A widening pair (`int[]` into `long[]`) declines for the same reason.
+///
+/// OVERLAP is handled rather than declined, because the contract says the range moves "as if through a
+/// temporary" and the only source of overlap is one array copied onto itself. `CopyBlock` is a FORWARD
+/// byte loop -- a `memcpy` -- so it is correct only when the destination does not start above the source;
+/// the other direction gets a descending byte loop here. Disjoint ranges are correct either way, so the
+/// single address compare decides without needing to test for overlap.
+///
+/// GC: no allocation and no safepoint, so nothing can move under it. A reference-element move copies
+/// pointers verbatim, which is what an ordinary `stfld` of a reference already does on this backend -- if
+/// a generational collector ever needs a store barrier, this body and `stfld` grow one together.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn array_copy_core_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, i32t, objt, i32t, i32t]);
+    let (src, src_index, dst, dst_index, length) = (
+        params[0], params[1], params[2], params[3], params[4],
+    );
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+
+    let decline = mb.block();
+    let accept = mb.block();
+
+    mb.at(0);
+    let dst_base = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: dst,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let src_desc = mb.emit(i32t, Inst::LoadTypeDesc { object: src });
+    let dst_desc = mb.emit(i32t, Inst::LoadTypeDesc { object: dst });
+    let same_type = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: src_desc,
+            rhs: dst_desc,
+        },
+    );
+    mb.branch(same_type, accept, decline);
+
+    mb.at(decline);
+    let zero = mb.emit(i32t, c(0));
+    mb.ret(zero);
+
+    mb.at(accept);
+    let (base, shift) = array_element_shift(&mut mb, src, decline);
+    let bytes = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: length,
+            rhs: shift,
+        },
+    );
+    let nothing_to_do = mb.block();
+    let move_range = mb.block();
+    let zero2 = mb.emit(i32t, c(0));
+    let empty = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::SignedLe,
+            lhs: bytes,
+            rhs: zero2,
+        },
+    );
+    mb.branch(empty, nothing_to_do, move_range);
+
+    mb.at(nothing_to_do);
+    let one = mb.emit(i32t, c(1));
+    mb.ret(one);
+
+    mb.at(move_range);
+    let src_addr = array_element_address(&mut mb, base, src_index, shift);
+    let dst_addr = array_element_address(&mut mb, dst_base, dst_index, shift);
+    let overlaps_forward = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::UnsignedGt,
+            lhs: dst_addr,
+            rhs: src_addr,
+        },
+    );
+    let backward = mb.block();
+    let forward = mb.block();
+    mb.branch(overlaps_forward, backward, forward);
+
+    mb.at(forward);
+    mb.side(Inst::CopyBlock {
+        dst: dst_addr,
+        src: src_addr,
+        size: bytes,
+    });
+    let ok_forward = mb.emit(i32t, c(1));
+    mb.ret(ok_forward);
+
+    mb.at(backward);
+    let one_b = mb.emit(i32t, c(1));
+    let last = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Sub,
+            lhs: bytes,
+            rhs: one_b,
+        },
+    );
+    let loop_head = mb.block();
+    let latch = mb.block();
+    let done_backward = mb.block();
+    mb.jump(loop_head, alloc::vec![last]);
+
+    let index = mb.enter(loop_head, &[i32t])[0];
+    let src_at = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: src_addr,
+            rhs: index,
+        },
+    );
+    let byte = mb.emit(
+        i32t,
+        Inst::Load {
+            address: src_at,
+            width: 1,
+            signed: false,
+        },
+    );
+    let dst_at = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: dst_addr,
+            rhs: index,
+        },
+    );
+    mb.side(Inst::Store {
+        address: dst_at,
+        value: byte,
+        width: 1,
+    });
+    let one_l = mb.emit(i32t, c(1));
+    let next = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Sub,
+            lhs: index,
+            rhs: one_l,
+        },
+    );
+    let zero_l = mb.emit(i32t, c(0));
+    let more = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::SignedGe,
+            lhs: next,
+            rhs: zero_l,
+        },
+    );
+    mb.branch(more, latch, done_backward);
+
+    mb.at(latch);
+    mb.jump(loop_head, alloc::vec![next]);
+
+    mb.at(done_backward);
+    let ok_backward = mb.emit(i32t, c(1));
+    mb.ret(ok_backward);
+
+    mb.finish(Some(i32t))
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Array.get_Rank` -- the dimension count, which the
+/// array's descriptor carries in the LOW bits of word 0 under [`crate::resolver::ARRAY_DESC_MARK`]. Read
+/// from the mark rather than assumed to be 1, so it stays right when rank-N descriptors are marked; an
+/// UNMARKED descriptor (which is every rank-2+ array today) traps rather than answering 1, because
+/// answering the wrong rank is how a caller ends up indexing a rectangular array as a vector.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn array_rank_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let array = params[0];
+    let trap = mb.block();
+    mb.at(0);
+    let (_, rank) = array_descriptor_rank(&mut mb, array, trap);
+    mb.ret(rank);
+    mb.at(trap);
+    mb.unreachable();
+    mb.finish(Some(i32t))
+}
+
+/// From an array reference: its object address and the RANK its descriptor states, having branched to
+/// `trap` unless word 0 carries [`crate::resolver::ARRAY_DESC_MARK`]. The mark is what makes the rest of
+/// word 0 a rank at all -- on a class descriptor that word is a payload size, and on the rank-2+ array
+/// descriptors emitted today it is zero.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+fn array_descriptor_rank(
+    mb: &mut MirBuilder,
+    array: ValueId,
+    trap: usize,
+) -> (ValueId, ValueId) {
+    let i32t = MirType::I32;
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let base = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: array,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let desc = mb.emit(i32t, Inst::LoadTypeDesc { object: array });
+    let word0 = mb.emit(
+        i32t,
+        Inst::Load {
+            address: desc,
+            width: 4,
+            signed: false,
+        },
+    );
+    #[allow(clippy::cast_possible_wrap)]
+    let mask = c(i64::from(crate::resolver::ARRAY_DESC_MARK_MASK as i32));
+    #[allow(clippy::cast_possible_wrap)]
+    let mark = c(i64::from(crate::resolver::ARRAY_DESC_MARK as i32));
+    let mask_v = mb.emit(i32t, mask);
+    let marked_bits = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: word0,
+            rhs: mask_v,
+        },
+    );
+    let mark_v = mb.emit(i32t, mark);
+    let is_array = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: marked_bits,
+            rhs: mark_v,
+        },
+    );
+    let rank_block = mb.block();
+    mb.branch(is_array, rank_block, trap);
+
+    mb.at(rank_block);
+    let rank = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Sub,
+            lhs: word0,
+            rhs: marked_bits,
+        },
+    );
+    (base, rank)
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Array.GetValue(index)` -- the REFERENCE-element
+/// case, which is the half of it that needs no box: the element IS an `object`, so reading the slot IS
+/// the answer. The split is deliberate: a primitive or struct
+/// element has to be BOXED to be returned as `object`, and boxing against a descriptor known only at RUN
+/// TIME (the array's `element_desc@16`) needs an allocate-with-this-descriptor form the IR does not have.
+///
+/// A PRIMITIVE element is BOXED against the descriptor `element_desc@16` names -- the fifth word's first
+/// consumer, and the reason it exists: the box's type and size are both run-time facts read out of the
+/// array's own descriptor, which is what [`lamella_ir::Inst::AllocDescribed`] was added for. A STRUCT
+/// element still traps, one gate earlier: `ELEMENT_KIND_OPAQUE` carries no width, so the shared
+/// rank-and-kind gate declines it before this body ever asks about a descriptor.
+///
+/// Returning the raw element bits retyped as a reference would hand a caller an integer to dereference,
+/// so every case this cannot answer TRAPS instead.
+///
+/// It also traps on an out-of-range index. .NET throws `IndexOutOfRangeException` there; we do not throw
+/// where .NET throws yet (a known family), and the choice here is only between trapping and reading off
+/// the end of the object, which is not a choice. The check is against the element count the array carries
+/// at its own offset 0 -- the word `newarr` stored and `ldlen` reads.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn array_get_value_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, i32t]);
+    let (array, index) = (params[0], params[1]);
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+
+    let trap = mb.block();
+    mb.at(0);
+    let (base, shift) = array_element_shift(&mut mb, array, trap);
+
+    let length = mb.emit(
+        i32t,
+        Inst::Load {
+            address: base,
+            width: 4,
+            signed: false,
+        },
+    );
+    let in_range = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::UnsignedLt,
+            lhs: index,
+            rhs: length,
+        },
+    );
+    let kind_block = mb.block();
+    mb.branch(in_range, kind_block, trap);
+
+    mb.at(kind_block);
+    let desc = mb.emit(i32t, Inst::LoadTypeDesc { object: array });
+    let four = mb.emit(i32t, c(4));
+    let kind_slot = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: desc,
+            rhs: four,
+        },
+    );
+    let kind = mb.emit(
+        i32t,
+        Inst::Load {
+            address: kind_slot,
+            width: 4,
+            signed: false,
+        },
+    );
+    let reference = mb.emit(i32t, c(i64::from(crate::resolver::ELEMENT_KIND_REFERENCE)));
+    let is_reference = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: kind,
+            rhs: reference,
+        },
+    );
+    let read_block = mb.block();
+    let box_block = mb.block();
+    mb.branch(is_reference, read_block, box_block);
+
+    mb.at(read_block);
+    let addr = array_element_address(&mut mb, base, index, shift);
+    let slot = mb.emit(
+        i32t,
+        Inst::Load {
+            address: addr,
+            width: 4,
+            signed: false,
+        },
+    );
+    let element = mb.emit(
+        objt,
+        Inst::Convert {
+            value: slot,
+            kind: ConvKind::IntToRef,
+        },
+    );
+    mb.ret(element);
+
+    mb.at(box_block);
+    let element_desc = array_element_descriptor(&mut mb, desc, trap);
+    let payload = mb.emit(
+        i32t,
+        Inst::Load {
+            address: element_desc,
+            width: 4,
+            signed: false,
+        },
+    );
+    let one = mb.emit(i32t, c(1));
+    let width = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: one,
+            rhs: shift,
+        },
+    );
+    let agree = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: payload,
+            rhs: width,
+        },
+    );
+    let alloc_block = mb.block();
+    mb.branch(agree, alloc_block, trap);
+
+    mb.at(alloc_block);
+    let boxed = mb.emit(
+        objt,
+        Inst::AllocDescribed {
+            descriptor: element_desc,
+            payload_size: payload,
+        },
+    );
+    let moved_base = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: array,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let source = array_element_address(&mut mb, moved_base, index, shift);
+    let destination = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: boxed,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    mb.side(Inst::CopyBlock {
+        dst: destination,
+        src: source,
+        size: payload,
+    });
+    mb.ret(boxed);
+
+    mb.at(trap);
+    mb.unreachable();
+
+    mb.finish(Some(objt))
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Array.SetValue(value, index)` -- the WRITE half of
+/// the untyped element accessor, and the last live `System.Array` trap row: `Array.Reverse`, `Array.Sort`
+/// and `Array.BinarySearch` are all managed loops over this seam and [`array_get_value_body`], so they
+/// follow it rather than needing bodies of their own.
+///
+/// The mirror image of `GetValue` in every part. The same rank-and-kind gate
+/// ([`array_element_shift`]) and the same unsigned bounds test against the length word decide whether
+/// there is an element at all; the element KIND then decides what the incoming `object` has to be:
+///
+/// - a REFERENCE element takes the reference itself, once the value is shown ASSIGNABLE to the element
+///   type -- a `CastClassScan` from the value's own descriptor to the one `element_desc@16` names, the
+///   same base_ptr@12 walk `castclass`/`isinst` use. `null` is accepted without asking, since it is
+///   assignable to every reference type and has no descriptor to ask about.
+/// - a PRIMITIVE element takes the BOX apart: the value's descriptor must be EXACTLY the element's (a
+///   box carries its type's canonical descriptor, which is how `GetValue`'s box unboxes and passes
+///   `is int`), and then the payload copies in -- the reverse of `GetValue`'s boxing path, behind the
+///   same payload/width agreement guard.
+///
+/// The seam is `void`, so like [`array_clear_core_body`] it has no way to hand a verdict back: the two
+/// outcomes are STORE and TRAP. **That is deliberate, and it is why no managed `throw` sits on top of a
+/// declining return.** The scan cannot answer for an INTERFACE element -- the base_ptr chain carries
+/// classes only, and interface implementation lives in the itable, which is keyed per interface METHOD
+/// and so cannot answer "does this type implement `IFoo`" at all -- so for `IFoo[] a; a.SetValue(impl, 0)`
+/// the scan reads 0 on a store .NET performs. Trapping there says "this runtime could not do it", which
+/// is true. A `bool` decline turned into an `InvalidCastException` by the managed wrapper would instead
+/// say "your program was wrong", which is false, and it would be indistinguishable from the genuinely
+/// non-assignable case. Named as a limitation rather than dressed up as a diagnosis; answering it needs
+/// an interface SET in the descriptor format, which is a ratification, not a body.
+///
+/// Two more cases trap for reasons worth stating, because .NET does something else in each: a WIDENING
+/// primitive store (a boxed `int` into a `long[]`, which .NET converts) declines on the exact-descriptor
+/// test, and a `null` into a primitive element (.NET throws) has no payload to copy. An out-of-range
+/// index traps as `GetValue`'s does -- the known "we do not throw where .NET throws" family, where the
+/// only alternative is writing past the end of the object.
+///
+/// GC: nothing here allocates, so no safepoint lands inside it and the base address taken up front stays
+/// valid -- the opposite of `GetValue`, whose box allocation forces the array address to be recomputed
+/// after it. A reference element is stored as a plain word, exactly as `stfld` of a reference is; if a
+/// generational collector ever needs a store barrier, this body, `stfld` and [`array_copy_core_body`]
+/// grow one together.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn array_set_value_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, objt, i32t]);
+    let (array, value, index) = (params[0], params[1], params[2]);
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+
+    let trap = mb.block();
+    mb.at(0);
+    let (base, shift) = array_element_shift(&mut mb, array, trap);
+
+    let length = mb.emit(
+        i32t,
+        Inst::Load {
+            address: base,
+            width: 4,
+            signed: false,
+        },
+    );
+    let in_range = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::UnsignedLt,
+            lhs: index,
+            rhs: length,
+        },
+    );
+    let kind_block = mb.block();
+    mb.branch(in_range, kind_block, trap);
+
+    mb.at(kind_block);
+    let desc = mb.emit(i32t, Inst::LoadTypeDesc { object: array });
+    let four = mb.emit(i32t, c(4));
+    let kind_slot = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: desc,
+            rhs: four,
+        },
+    );
+    let kind = mb.emit(
+        i32t,
+        Inst::Load {
+            address: kind_slot,
+            width: 4,
+            signed: false,
+        },
+    );
+    let reference = mb.emit(i32t, c(i64::from(crate::resolver::ELEMENT_KIND_REFERENCE)));
+    let is_reference = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: kind,
+            rhs: reference,
+        },
+    );
+    let reference_block = mb.block();
+    let primitive_block = mb.block();
+    mb.branch(is_reference, reference_block, primitive_block);
+
+    mb.at(reference_block);
+    let value_bits = mb.emit(
+        i32t,
+        Inst::Convert {
+            value,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let null = mb.emit(i32t, c(0));
+    let is_null = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: value_bits,
+            rhs: null,
+        },
+    );
+    let null_block = mb.block();
+    let typed_block = mb.block();
+    mb.branch(is_null, null_block, typed_block);
+
+    mb.at(null_block);
+    let null_addr = array_element_address(&mut mb, base, index, shift);
+    mb.side(Inst::Store {
+        address: null_addr,
+        value: value_bits,
+        width: 4,
+    });
+    mb.ret_void();
+
+    mb.at(typed_block);
+    let element_desc = array_element_descriptor(&mut mb, desc, trap);
+    let value_desc = mb.emit(i32t, Inst::LoadTypeDesc { object: value });
+    let assignable = mb.emit(
+        i32t,
+        Inst::CastClassScan {
+            args: alloc::vec![value_desc, element_desc],
+        },
+    );
+    let store_block = mb.block();
+    mb.branch(assignable, store_block, trap);
+
+    mb.at(store_block);
+    let addr = array_element_address(&mut mb, base, index, shift);
+    mb.side(Inst::Store {
+        address: addr,
+        value: value_bits,
+        width: 4,
+    });
+    mb.ret_void();
+
+    mb.at(primitive_block);
+    let box_bits = mb.emit(
+        i32t,
+        Inst::Convert {
+            value,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let no_box = mb.emit(i32t, c(0));
+    let boxed = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Ne,
+            lhs: box_bits,
+            rhs: no_box,
+        },
+    );
+    let unbox_block = mb.block();
+    mb.branch(boxed, unbox_block, trap);
+
+    mb.at(unbox_block);
+    let element_desc_p = array_element_descriptor(&mut mb, desc, trap);
+    let box_desc = mb.emit(i32t, Inst::LoadTypeDesc { object: value });
+    let same_type = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: box_desc,
+            rhs: element_desc_p,
+        },
+    );
+    let size_block = mb.block();
+    mb.branch(same_type, size_block, trap);
+
+    mb.at(size_block);
+    let payload = mb.emit(
+        i32t,
+        Inst::Load {
+            address: element_desc_p,
+            width: 4,
+            signed: false,
+        },
+    );
+    let one = mb.emit(i32t, c(1));
+    let width = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: one,
+            rhs: shift,
+        },
+    );
+    let agree = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: payload,
+            rhs: width,
+        },
+    );
+    let copy_block = mb.block();
+    mb.branch(agree, copy_block, trap);
+
+    mb.at(copy_block);
+    let destination = array_element_address(&mut mb, base, index, shift);
+    mb.side(Inst::CopyBlock {
+        dst: destination,
+        src: box_bits,
+        size: payload,
+    });
+    mb.ret_void();
+
+    mb.at(trap);
+    mb.unreachable();
+
+    mb.finish(None)
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Array.Clone()` -- `ICloneable` on an array: a new
+/// array of the SAME element type and length holding the same elements, shallow (reference elements
+/// shared, value-type elements copied byte for byte), which is .NET's contract.
+///
+/// The untyped `Array` base cannot `newarr` its own element type in managed code, which is why this is a
+/// seam at all -- but the heap array carries that type in its descriptor, so the duplicate is an
+/// allocation against a RUN-TIME descriptor: [`Inst::AllocDescribed`] with the array's OWN descriptor
+/// ([`Inst::LoadTypeDesc`]) and a payload of `4 + length * (1 << shift)`. That is the whole body. It was
+/// blocked on "a variable-size allocation whose type is a run-time fact" having no IR form; `GetValue`'s
+/// boxing half added exactly that form, and the second consumer costs a dozen instructions.
+///
+/// The length word is INSIDE the payload at offset 0 -- the word `newarr` stores and `ldlen` reads -- so
+/// the single `CopyBlock` of the whole payload carries the length and the elements together, and the
+/// clone needs no separate header write.
+///
+/// THE ORDERING IS THE SAME GC ARGUMENT `GetValue` makes, and it bites harder here because BOTH ends move:
+/// allocating can move the source array, so its address is recomputed from the array REFERENCE after the
+/// allocation rather than reused from the integer taken before it. The length and the byte count are
+/// plain integers, so they survive a move; an address does not.
+///
+/// Declines (traps) exactly where the other untyped seams do: a rank-2+ array, and a struct element,
+/// whose `ELEMENT_KIND_OPAQUE` carries no width to compute a payload size from. .NET clones both; this
+/// one cannot size them yet, and sizing a clone wrong means allocating short and copying past the end.
+///
+/// **A VIRTUAL CALL CANNOT REACH IT, AND THE REASON IS NOT IN THIS BODY.** `Clone` is an implicit
+/// `ICloneable` implementation, so it is VIRTUAL, so a call site lowers to a `CallVirtual` that reads a
+/// slot from the receiver's descriptor -- and an ARRAY descriptor is emitted with an EMPTY vtable
+/// (`TypeDescLiteral`'s `vtable` is `[]` at both array-allocation sites). The slot read lands before the
+/// descriptor's words and dispatch jumps to whatever is there. So this is a gap in ARRAY DISPATCH rather
+/// than in this body: every virtual call on an array receiver (`Clone`, `ToString`, `GetHashCode`,
+/// `Equals`, `GetEnumerator`) has nowhere to dispatch through. `GetValue`/`SetValue` are unaffected
+/// because they are NON-virtual, so their `callvirt` devirtualizes to a direct call.
+///
+/// The body is landed rather than held because it is complete and pinned on its own terms, and it starts
+/// working the moment either fix lands: give an array descriptor `System.Array`'s vtable (the emitter
+/// change, and the one that fixes the whole family), or devirtualize a `callvirt` to a FINAL method into
+/// a direct call (sound in general -- a final method has exactly one implementation -- and it fixes only
+/// this member). Neither is in this change; both are named in the census.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn array_clone_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let array = params[0];
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+
+    let trap = mb.block();
+    mb.at(0);
+    let (base, shift) = array_element_shift(&mut mb, array, trap);
+
+    let length = mb.emit(
+        i32t,
+        Inst::Load {
+            address: base,
+            width: 4,
+            signed: false,
+        },
+    );
+    let bytes = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: length,
+            rhs: shift,
+        },
+    );
+    let four = mb.emit(i32t, c(4));
+    let payload = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: bytes,
+            rhs: four,
+        },
+    );
+    let desc = mb.emit(i32t, Inst::LoadTypeDesc { object: array });
+    let clone = mb.emit(
+        objt,
+        Inst::AllocDescribed {
+            descriptor: desc,
+            payload_size: payload,
+        },
+    );
+    let source = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: array,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let destination = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: clone,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    mb.side(Inst::CopyBlock {
+        dst: destination,
+        src: source,
+        size: payload,
+    });
+    mb.ret(clone);
+
+    mb.at(trap);
+    mb.unreachable();
+
+    mb.finish(Some(objt))
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Array.ClearCore(array, index, length)` -- zeroing
+/// an element range to its element default, which for every kind this descriptor scheme can name is a
+/// zeroed byte range (`0` / `0.0` / `false` / `null` are all all-zero bits).
+///
+/// `void`, so unlike [`array_copy_core_body`] it has no way to DECLINE: a range it cannot compute a stride
+/// for -- a rank-2+ array, or a struct element whose width word 1 does not carry -- TRAPS. That is the
+/// honest end of the only two options, since the alternative is returning as though the range were
+/// cleared.
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+#[must_use]
+pub fn array_clear_core_body() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, i32t, i32t]);
+    let (array, index, length) = (params[0], params[1], params[2]);
+
+    let trap = mb.block();
+    mb.at(0);
+    let (base, shift) = array_element_shift(&mut mb, array, trap);
+    let addr = array_element_address(&mut mb, base, index, shift);
+    let bytes = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Shl,
+            lhs: length,
+            rhs: shift,
+        },
+    );
+    let zero = mb.emit(
+        i32t,
+        Inst::ConstInt {
+            ty: i32t,
+            value: 0,
+        },
+    );
+    mb.side(Inst::FillBlock {
+        dst: addr,
+        value: zero,
+        size: bytes,
+    });
+    mb.ret_void();
+
+    mb.at(trap);
+    mb.unreachable();
+
+    mb.finish(None)
 }
 
 /// Maps a `[RuntimeProvided]` `System.Net.Sockets.Socket` / `System.Net.Security.TlsNative` seam static
@@ -2963,6 +4734,384 @@ pub fn runtime_seam_body(
 mod tests {
     use super::*;
 
+    #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+    #[test]
+    fn the_element_width_table_gives_every_kind_its_allocation_stride() {
+        let shift_of =
+            |kind: u32| (ELEMENT_WIDTH_SHIFTS >> (2 * kind)) & 3;
+        for (namespace, name, expected) in [
+            ("System", "SByte", 1u32),
+            ("System", "Byte", 1),
+            ("System", "Boolean", 1),
+            ("System", "Int16", 2),
+            ("System", "UInt16", 2),
+            ("System", "Char", 2),
+            ("System", "Int32", 4),
+            ("System", "UInt32", 4),
+            ("System", "Single", 4),
+            ("System", "Int64", 8),
+            ("System", "UInt64", 8),
+            ("System", "Double", 8),
+        ] {
+            let kind = crate::resolver::primitive_element_kind(namespace, name)
+                .unwrap_or_else(|| panic!("{name} is a frozen primitive"));
+            assert_eq!(
+                1u32 << shift_of(kind),
+                expected,
+                "{name} (kind {kind}) strides by {expected}"
+            );
+        }
+        assert_eq!(1u32 << shift_of(crate::resolver::ELEMENT_KIND_REFERENCE), 4);
+        assert!(
+            i64::from(crate::resolver::ELEMENT_KIND_OPAQUE) > MAX_STRIDABLE_ELEMENT_KIND,
+            "OPAQUE must fall outside the stridable kinds"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn the_array_range_cores_verify_and_lower_and_clear_traps_rather_than_lying() {
+        let copy = array_copy_core_body();
+        lamella_ir::verify(&copy).expect("CopyCore verifies");
+        let clear = array_clear_core_body();
+        lamella_ir::verify(&clear).expect("ClearCore verifies");
+        let rank = array_rank_body();
+        lamella_ir::verify(&rank).expect("get_Rank verifies");
+        crate::arm32::lower_object(
+            &[copy.clone(), clear.clone(), rank],
+            &["Array_CopyCore", "Array_ClearCore", "Array_get_Rank"],
+            &[],
+        )
+        .expect("all three lower on the object path");
+        assert!(
+            copy.blocks
+                .iter()
+                .all(|b| !matches!(b.terminator, Some(Terminator::Unreachable))),
+            "CopyCore answers false instead of trapping"
+        );
+        assert!(
+            clear
+                .blocks
+                .iter()
+                .any(|b| matches!(b.terminator, Some(Terminator::Unreachable))),
+            "ClearCore traps on a range it cannot stride"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn get_value_reads_the_element_kind_and_traps_on_everything_but_a_reference() {
+        let body = array_get_value_body();
+        lamella_ir::verify(&body).expect("GetValue verifies");
+        crate::arm32::lower_object(&[body.clone()], &["Array_GetValue"], &[])
+            .expect("GetValue lowers on the object path");
+        assert!(
+            body.blocks
+                .iter()
+                .any(|b| matches!(b.terminator, Some(Terminator::Unreachable))),
+            "GetValue must trap on an element it cannot answer for"
+        );
+        let insts: Vec<_> = body.blocks.iter().flat_map(|b| &b.insts).collect();
+        let reference = insts
+            .iter()
+            .find(|(_, i)| {
+                matches!(
+                    i,
+                    Inst::ConstInt { value, .. }
+                        if *value == i64::from(crate::resolver::ELEMENT_KIND_REFERENCE)
+                )
+            })
+            .map(|(v, _)| *v)
+            .expect("GetValue names ELEMENT_KIND_REFERENCE");
+        let kind_test = insts
+            .iter()
+            .find(|(_, i)| matches!(i, Inst::Compare { rhs, .. } if *rhs == reference))
+            .map(|(v, _)| *v)
+            .expect("GetValue compares the element kind against REFERENCE");
+        assert!(
+            body.blocks.iter().any(|b| matches!(
+                b.terminator,
+                Some(Terminator::Branch { cond, .. }) if cond == kind_test
+            )),
+            "GetValue must BRANCH on the element-kind test -- an unbranched compare hands an int              back as a reference, which is what dropping this guard does on silicon"
+        );
+
+        let described = insts
+            .iter()
+            .find_map(|(_, i)| match i {
+                Inst::AllocDescribed {
+                    descriptor,
+                    payload_size,
+                } => Some((*descriptor, *payload_size)),
+                _ => None,
+            })
+            .expect("GetValue boxes a primitive element with AllocDescribed");
+        let payload_is_a_load = insts
+            .iter()
+            .any(|(v, i)| *v == described.1 && matches!(i, Inst::Load { .. }));
+        assert!(
+            payload_is_a_load,
+            "the boxed size must be READ from the element descriptor, not assumed"
+        );
+        assert!(
+            insts.iter().any(|(_, i)| matches!(
+                i,
+                Inst::CopyBlock { size, .. } if *size == described.1
+            )),
+            "the element copy must be the size the box was allocated with"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn set_value_checks_assignability_and_never_stores_on_a_verdict_it_did_not_branch_on() {
+        let body = array_set_value_body();
+        lamella_ir::verify(&body).expect("SetValue verifies");
+        crate::arm32::lower_object(&[body.clone()], &["Array_SetValue"], &[])
+            .expect("SetValue lowers on the object path");
+        assert!(
+            body.blocks
+                .iter()
+                .any(|b| matches!(b.terminator, Some(Terminator::Unreachable))),
+            "SetValue must trap on a store it cannot perform"
+        );
+        let insts: Vec<_> = body.blocks.iter().flat_map(|b| &b.insts).collect();
+        let branched_on = |cond: ValueId| {
+            body.blocks.iter().any(|b| matches!(
+                b.terminator,
+                Some(Terminator::Branch { cond: c, .. }) if c == cond
+            ))
+        };
+
+        let scan = insts
+            .iter()
+            .find_map(|(v, i)| match i {
+                Inst::CastClassScan { args } => Some((*v, args.clone())),
+                _ => None,
+            })
+            .expect("SetValue checks assignability with a CastClassScan");
+        assert!(
+            branched_on(scan.0),
+            "SetValue must BRANCH on the assignability scan -- an unbranched scan stores a value of \
+             any type into a reference array, which is what deleting this guard does on silicon"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(v, i)| *v == scan.1[0] && matches!(i, Inst::LoadTypeDesc { .. })),
+            "the scan must start at the VALUE's own descriptor"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(v, i)| *v == scan.1[1] && matches!(i, Inst::Binary { op: BinOp::Add, .. })),
+            "the scan must seek the ELEMENT descriptor, not the array's own"
+        );
+
+        let value_param = body.params.get(1).map(|_| ValueId(1)).expect("SetValue takes a value");
+        let value_bits: Vec<ValueId> = insts
+            .iter()
+            .filter(|(_, i)| {
+                matches!(i, Inst::Convert { value, kind: ConvKind::RefToInt } if *value == value_param)
+            })
+            .map(|(v, _)| *v)
+            .collect();
+        assert_eq!(
+            value_bits.len(),
+            2,
+            "each half takes the value's bits exactly once"
+        );
+        for bits in value_bits {
+            let null_test = insts
+                .iter()
+                .find(|(_, i)| matches!(i, Inst::Compare { lhs, rhs, .. }
+                    if *lhs == bits
+                        && insts.iter().any(|(v, c)| *v == *rhs
+                            && matches!(c, Inst::ConstInt { value: 0, .. }))))
+                .map(|(v, _)| *v)
+                .expect("each half tests the value against null before reading its descriptor");
+            assert!(
+                branched_on(null_test),
+                "SetValue must BRANCH on the null test -- an unbranched one loads a descriptor from \
+                 the word before the heap and scans from whatever it holds"
+            );
+        }
+
+        let reference = insts
+            .iter()
+            .find(|(_, i)| {
+                matches!(
+                    i,
+                    Inst::ConstInt { value, .. }
+                        if *value == i64::from(crate::resolver::ELEMENT_KIND_REFERENCE)
+                )
+            })
+            .map(|(v, _)| *v)
+            .expect("SetValue names ELEMENT_KIND_REFERENCE");
+        let kind_test = insts
+            .iter()
+            .find(|(_, i)| matches!(i, Inst::Compare { rhs, .. } if *rhs == reference))
+            .map(|(v, _)| *v)
+            .expect("SetValue compares the element kind against REFERENCE");
+        assert!(
+            branched_on(kind_test),
+            "SetValue must BRANCH on the element kind -- without it a boxed int's REFERENCE is stored \
+             into an int[] as though it were the integer"
+        );
+
+        let copy = insts
+            .iter()
+            .find_map(|(_, i)| match i {
+                Inst::CopyBlock { src, size, .. } => Some((*src, *size)),
+                _ => None,
+            })
+            .expect("SetValue copies a primitive element's payload in");
+        assert!(
+            insts
+                .iter()
+                .any(|(v, i)| *v == copy.1 && matches!(i, Inst::Load { .. })),
+            "the copied size must be READ from the element descriptor, not assumed -- a constant is \
+             how a `char` would silently take four bytes"
+        );
+        let agreement = insts
+            .iter()
+            .find(|(_, i)| matches!(i, Inst::Compare { lhs, .. } if *lhs == copy.1))
+            .map(|(v, _)| *v)
+            .expect("SetValue compares the payload size against the array's stride");
+        assert!(
+            branched_on(agreement),
+            "SetValue must BRANCH on the payload/width agreement"
+        );
+        let exact = insts
+            .iter()
+            .find(|(_, i)| matches!(
+                i,
+                Inst::Compare { op: CmpOp::Eq, lhs, rhs }
+                    if insts.iter().any(|(v, d)| *v == *lhs && matches!(d, Inst::LoadTypeDesc { .. }))
+                        && insts.iter().any(|(v, d)| *v == *rhs
+                            && matches!(d, Inst::Binary { op: BinOp::Add, .. }))
+            ))
+            .map(|(v, _)| *v)
+            .expect("SetValue compares the box's descriptor against the element's");
+        assert!(
+            branched_on(exact),
+            "SetValue must BRANCH on the exact-descriptor test"
+        );
+
+        assert!(
+            !insts
+                .iter()
+                .any(|(_, i)| crate::regalloc::is_safepoint(i)),
+            "SetValue must not allocate -- a safepoint here would let the array MOVE under the \
+             address computed before it"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn clone_allocates_the_arrays_own_type_at_its_own_size_and_reloads_after_the_safepoint() {
+        let body = array_clone_body();
+        lamella_ir::verify(&body).expect("Clone verifies");
+        crate::arm32::lower_object(&[body.clone()], &["Array_Clone"], &[])
+            .expect("Clone lowers on the object path");
+        assert!(
+            body.blocks
+                .iter()
+                .any(|b| matches!(b.terminator, Some(Terminator::Unreachable))),
+            "Clone must trap on an array it cannot size"
+        );
+        let insts: Vec<_> = body.blocks.iter().flat_map(|b| &b.insts).collect();
+
+        let (descriptor, payload) = insts
+            .iter()
+            .find_map(|(_, i)| match i {
+                Inst::AllocDescribed {
+                    descriptor,
+                    payload_size,
+                } => Some((*descriptor, *payload_size)),
+                _ => None,
+            })
+            .expect("Clone allocates with AllocDescribed");
+        assert!(
+            insts
+                .iter()
+                .any(|(v, i)| *v == descriptor && matches!(i, Inst::LoadTypeDesc { .. })),
+            "the clone must be allocated against the SOURCE array's own descriptor"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(v, i)| *v == payload && matches!(i, Inst::Binary { op: BinOp::Add, .. })),
+            "the clone's payload size must be computed (4 + length * stride), not assumed"
+        );
+        assert!(
+            insts.iter().any(|(_, i)| matches!(
+                i,
+                Inst::CopyBlock { size, .. } if *size == payload
+            )),
+            "the copy must be the size the clone was allocated with"
+        );
+
+        let copy_src = insts
+            .iter()
+            .find_map(|(_, i)| match i {
+                Inst::CopyBlock { src, .. } => Some(*src),
+                _ => None,
+            })
+            .expect("Clone copies the payload");
+        let alloc_block = body
+            .blocks
+            .iter()
+            .find(|b| {
+                b.insts
+                    .iter()
+                    .any(|(_, i)| matches!(i, Inst::AllocDescribed { .. }))
+            })
+            .expect("the allocation is in some block");
+        let alloc_at = alloc_block
+            .insts
+            .iter()
+            .position(|(_, i)| matches!(i, Inst::AllocDescribed { .. }))
+            .expect("the allocation has a position");
+        let src_at = alloc_block
+            .insts
+            .iter()
+            .position(|(v, _)| *v == copy_src)
+            .expect(
+                "the copy's SOURCE must be recomputed in the allocating block -- reusing an address \
+                 taken before the allocation reads the array's OLD location after a collection",
+            );
+        assert!(
+            src_at > alloc_at,
+            "the source address must be taken AFTER the allocation that can move the array"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn every_console_overload_is_synthesized_in_write_writeline_pairs() {
+        for param in [
+            SigType::String,
+            SigType::Char,
+            SigType::I4,
+            SigType::Boolean,
+            SigType::I8,
+            SigType::U4,
+            SigType::U8,
+        ] {
+            for name in ["Write", "WriteLine"] {
+                let f = console_seam_body(Some(name), core::slice::from_ref(&param))
+                    .unwrap_or_else(|| panic!("Console.{name}({param:?}) is not synthesized"));
+                lamella_ir::verify(&f)
+                    .unwrap_or_else(|e| panic!("Console.{name}({param:?}) verify: {e:?}"));
+            }
+        }
+        assert!(
+            console_seam_body(Some("Write"), &[SigType::R8]).is_none(),
+            "Console.Write(double) is managed, not a synthesized seam"
+        );
+    }
+
     #[cfg(feature = "arm32")]
     #[test]
     fn synthesized_string_readers_verify_and_lower() {
@@ -2979,6 +5128,28 @@ mod tests {
         assert!(
             synthesize_runtime_reader("System", "Array", Some("get_Chars"), 1).is_none(),
             "get_Chars synthesizes for String only"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn synthesized_type_seams_verify_and_lower() {
+        for (name, params) in [("GetTypeFromHandle", 1usize), ("HandleEquals", 2usize)] {
+            let f = synthesize_type_seam("System", "Type", Some(name), params)
+                .unwrap_or_else(|| panic!("Type.{name} not synthesized"));
+            lamella_ir::verify(&f).unwrap_or_else(|e| panic!("Type.{name} verify: {e:?}"));
+            crate::arm32::lower(&f).unwrap_or_else(|e| panic!("Type.{name} lower: {e:?}"));
+        }
+        let g = synthesize_type_seam("System", "Type", Some("GetTypeFromHandle"), 1).unwrap();
+        assert_eq!(g.params.len(), 1, "the handle is the single argument");
+        assert_eq!(g.ret, Some(MirType::ObjectRef), "a Type is a reference");
+        assert!(
+            synthesize_type_seam("System", "Type", Some("GetHashCode"), 0).is_none(),
+            "unlisted Type members keep their placeholder body"
+        );
+        assert!(
+            synthesize_type_seam("System", "String", Some("HandleEquals"), 2).is_none(),
+            "the seams are System.Type's alone"
         );
     }
 

@@ -5,7 +5,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use super::{DeviceInfo, Error, Result};
+use super::{Binding, DeviceInfo, Error, Result};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::core::GUID;
@@ -16,7 +16,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows_sys::Win32::Devices::Usb::{
     UsbdPipeTypeBulk, WinUsb_Free, WinUsb_GetDescriptor, WinUsb_GetOverlappedResult,
-    WinUsb_Initialize, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe,
+    WinUsb_AbortPipe, WinUsb_Initialize, WinUsb_ResetPipe, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe,
     WinUsb_SetPipePolicy, WinUsb_WritePipe, USB_DEVICE_DESCRIPTOR_TYPE, USB_INTERFACE_DESCRIPTOR,
     USB_STRING_DESCRIPTOR_TYPE, WINUSB_INTERFACE_HANDLE, WINUSB_PIPE_INFORMATION,
 };
@@ -36,6 +36,13 @@ const DAP_V2_GUID: GUID = GUID {
     data2: 0x293B,
     data3: 0x4663,
     data4: [0xAA, 0x36, 0x1A, 0xAE, 0x46, 0x46, 0x37, 0x76],
+};
+
+const USB_DEVICE_GUID: GUID = GUID {
+    data1: 0xA5DCBF10,
+    data2: 0x6530,
+    data3: 0x11D2,
+    data4: [0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED],
 };
 
 /// Device-interface paths (wide, null-terminated) for an interface-class GUID.
@@ -124,11 +131,17 @@ unsafe fn string_descriptor(wu: WINUSB_INTERFACE_HANDLE, index: u8) -> Option<St
         return None;
     }
     let len = (buf[0] as usize).min(got as usize);
-    let utf16: Vec<u16> = buf[2..len]
+    let payload = &buf[2..len];
+    let utf16: Vec<u16> = payload
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
-    Some(String::from_utf16_lossy(&utf16))
+    let text = String::from_utf16_lossy(&utf16);
+
+    if text.chars().all(|c| c.is_ascii_graphic() || c == ' ') && !text.is_empty() {
+        return Some(text);
+    }
+    Some(payload.iter().map(|byte| format!("{byte:02X}")).collect())
 }
 
 /// The product and serial-number strings of an open WinUSB interface, via its device descriptor
@@ -232,15 +245,119 @@ pub fn enumerate_guid(interface_guid: &str) -> Result<Vec<DeviceInfo>> {
     Ok(out)
 }
 
+/// See [`crate::diagnose`]. Checks the requested interface GUID first, then falls back to the
+/// all-USB-devices interface class -- a hit there with the same vendor/product id means the device
+/// is plugged in but its interface has no driver bound.
+pub fn diagnose(interface_guid: &str, vendor_id: u16, product_id: u16) -> Result<Binding> {
+    let guid = guid_from_str(interface_guid).ok_or_else(|| Error::Os("bad interface GUID".into()))?;
+    let matches = |guid: &GUID| unsafe {
+        iface_paths(guid)
+            .into_iter()
+            .any(|path| vid_pid_from_path(&path) == Some((vendor_id, product_id)))
+    };
+    if matches(&guid) {
+        return Ok(Binding::Bound);
+    }
+    if matches(&USB_DEVICE_GUID) {
+        return Ok(Binding::PresentUnbound);
+    }
+    Ok(Binding::Absent)
+}
+
 pub struct Device {
     h: HANDLE,
     wu: WINUSB_INTERFACE_HANDLE,
     ev: HANDLE,
     ep_out: u8,
     ep_in: u8,
+    /// The device-interface path this handle came from. Kept for diagnostics: on a composite probe
+    /// several interfaces can register the SAME GUID, so "which one did we actually open" is a
+    /// question that comes up and should not need guessing.
+    path: String,
 }
 
 impl Device {
+    /// Clears any stall on both pipes. A failed transfer can leave an endpoint halted, and every
+    /// later transfer then fails for a reason that has nothing to do with what it was trying to do
+    /// -- so a diagnostic that tries several things in a row must reset between them, or it reports
+    /// the wreckage of its first attempt over and over.
+    pub fn reset_pipes(&mut self) {
+        unsafe {
+            WinUsb_ResetPipe(self.wu, self.ep_in);
+            WinUsb_ResetPipe(self.wu, self.ep_out);
+        }
+    }
+
+    /// Clears one named endpoint -- DIAGNOSTIC ONLY, and the reason it exists is that a reset is
+    /// not always harmless.
+    ///
+    /// [`reset_pipes`](Self::reset_pipes) touches the two COMMAND pipes, so when those two are the
+    /// only ones failing, "the reset broke them" and "they were already broken" predict exactly the
+    /// same observation. Being able to reset a *third*, working pipe turns that into an experiment:
+    /// if resetting it makes it fail too, the reset is the cause.
+    pub fn reset_endpoint(&mut self, endpoint: u8) {
+        unsafe {
+            WinUsb_ResetPipe(self.wu, endpoint);
+        }
+    }
+
+    /// A human-readable dump of the interface and every pipe on it -- DIAGNOSTIC ONLY.
+    ///
+    /// When a device opens cleanly but will not carry traffic, the next question is always what we
+    /// are actually attached to: the right interface? the right alternate setting? are the pipes
+    /// the types and sizes expected? Guessing at that from a failing transfer is how a session gets
+    /// spent, so make the descriptor readable instead.
+    pub fn describe_interface(&self) -> String {
+        unsafe {
+            let mut out = String::new();
+            out.push_str(&format!("path: {}", self.path));
+            for alt in 0..8u8 {
+                let mut iface: USB_INTERFACE_DESCRIPTOR = std::mem::zeroed();
+                if WinUsb_QueryInterfaceSettings(self.wu, alt, &mut iface) == 0 {
+                    break;
+                }
+                out.push_str(&format!(
+                    "
+interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
+                    iface.bInterfaceNumber,
+                    iface.bAlternateSetting,
+                    iface.bInterfaceClass,
+                    iface.bInterfaceSubClass,
+                    iface.bInterfaceProtocol,
+                    iface.bNumEndpoints,
+                ));
+                for pipe in 0..iface.bNumEndpoints {
+                    let mut pi: WINUSB_PIPE_INFORMATION = std::mem::zeroed();
+                    if WinUsb_QueryPipe(self.wu, alt, pipe, &mut pi) == 0 {
+                        continue;
+                    }
+                    let kind = match pi.PipeType {
+                        t if t == UsbdPipeTypeBulk => "bulk",
+                        0 => "control",
+                        1 => "isochronous",
+                        3 => "interrupt",
+                        _ => "unknown",
+                    };
+                    out.push_str(&format!(
+                        "
+  pipe {pipe}: id {:#04x} {kind} maxpacket {}",
+                        pi.PipeId, pi.MaximumPacketSize
+                    ));
+                }
+            }
+            out
+        }
+    }
+
+    /// The bulk endpoint addresses negotiated at open time, as `(in, out)`.
+    ///
+    /// Exposed because probing endpoints blindly is not a viable diagnostic: reading an endpoint a
+    /// device does not have can block rather than fail, so a tool that needs to know which pipes
+    /// exist must ask instead of sweep.
+    pub fn endpoints(&self) -> (u8, u8) {
+        (self.ep_in, self.ep_out)
+    }
+
     pub fn open(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
         Self::open_with(&DAP_V2_GUID, vendor_id, product_id, serial)
     }
@@ -257,12 +374,11 @@ impl Device {
                 if vid_pid_from_path(&path) != Some((vendor_id, product_id)) {
                     continue;
                 }
-                if let Some(wanted) = serial {
-                    match instance_id_from_path(&path) {
-                        Some(id) if serial_matches(wanted, &id) => {}
-                        _ => continue,
-                    }
-                }
+                let matched_by_path = match (serial, instance_id_from_path(&path)) {
+                    (None, _) => true,
+                    (Some(wanted), Some(id)) => serial_matches(wanted, &id),
+                    (Some(_), None) => false,
+                };
                 let h = CreateFileW(
                     path.as_ptr(),
                     GENERIC_READ | GENERIC_WRITE,
@@ -280,16 +396,27 @@ impl Device {
                     CloseHandle(h);
                     continue;
                 }
+                if !matched_by_path {
+                    let wanted = serial.expect("only reachable when a serial was requested");
+                    let descriptor_serial = product_and_serial(wu).1;
+                    let ok = descriptor_serial
+                        .as_deref()
+                        .is_some_and(|actual| serial_matches(wanted, actual));
+                    if !ok {
+                        WinUsb_Free(wu);
+                        CloseHandle(h);
+                        continue;
+                    }
+                }
                 let mut iface: USB_INTERFACE_DESCRIPTOR = std::mem::zeroed();
                 WinUsb_QueryInterfaceSettings(wu, 0, &mut iface);
                 let (mut ep_in, mut ep_out) = (0u8, 0u8);
                 for pipe in 0..iface.bNumEndpoints {
                     let mut pi: WINUSB_PIPE_INFORMATION = std::mem::zeroed();
                     if WinUsb_QueryPipe(wu, 0, pipe, &mut pi) != 0 && pi.PipeType == UsbdPipeTypeBulk {
-                        if pi.PipeId & 0x80 != 0 {
-                            ep_in = pi.PipeId;
-                        } else {
-                            ep_out = pi.PipeId;
+                        let slot = if pi.PipeId & 0x80 != 0 { &mut ep_in } else { &mut ep_out };
+                        if *slot == 0 || pi.PipeId < *slot {
+                            *slot = pi.PipeId;
                         }
                     }
                 }
@@ -299,7 +426,8 @@ impl Device {
                     continue;
                 }
                 let ev = CreateEventW(null(), 1, 0, null());
-                return Ok(Device { h, wu, ev, ep_out, ep_in });
+                let opened = String::from_utf16_lossy(&path[..path.len().saturating_sub(1)]);
+                return Ok(Device { h, wu, ev, ep_out, ep_in, path: opened });
             }
         }
         Err(Error::NotFound)
@@ -316,9 +444,27 @@ impl Device {
             let mut n = 0u32;
             if WinUsb_WritePipe(self.wu, endpoint, data.as_ptr(), data.len() as u32, &mut n, &ov) == 0 {
                 if GetLastError() == ERROR_IO_PENDING {
-                    WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 1);
+                    const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
+                    const ERROR_IO_INCOMPLETE: u32 = 996;
+                    let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
+                    loop {
+                        if WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 0) != 0 {
+                            break;
+                        }
+                        let code = GetLastError();
+                        if code != ERROR_IO_INCOMPLETE {
+                            return Err(Error::Os(format!("WinUsb write failed (error {code})")));
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            WinUsb_AbortPipe(self.wu, endpoint);
+                            let _ = WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 1);
+                            return Err(Error::Timeout);
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                 } else {
-                    return Err(Error::Os("WinUsb_WritePipe failed".into()));
+                    let code = GetLastError();
+                    return Err(Error::Os(format!("WinUsb_WritePipe failed (error {code})")));
                 }
             }
             Ok(())
@@ -347,17 +493,29 @@ impl Device {
             if WinUsb_ReadPipe(self.wu, endpoint, buf.as_mut_ptr(), buf.len() as u32, &mut got, &ov) == 0 {
                 let err = GetLastError();
                 if err == ERROR_IO_PENDING {
-                    if WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 1) == 0 {
-                        return if GetLastError() == ERROR_SEM_TIMEOUT {
-                            Err(Error::Timeout)
-                        } else {
-                            Err(Error::Os("WinUsb read failed".into()))
-                        };
+                    const ERROR_IO_INCOMPLETE: u32 = 996;
+                    let deadline = std::time::Instant::now() + timeout;
+                    loop {
+                        if WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 0) != 0 {
+                            break;
+                        }
+                        match GetLastError() {
+                            ERROR_IO_INCOMPLETE => {
+                                if std::time::Instant::now() >= deadline {
+                                    WinUsb_AbortPipe(self.wu, endpoint);
+                                    let _ = WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 1);
+                                    return Err(Error::Timeout);
+                                }
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            ERROR_SEM_TIMEOUT => return Err(Error::Timeout),
+                            code => return Err(Error::Os(format!("WinUsb read failed (error {code})"))),
+                        }
                     }
                 } else if err == ERROR_SEM_TIMEOUT {
                     return Err(Error::Timeout);
                 } else {
-                    return Err(Error::Os("WinUsb_ReadPipe failed".into()));
+                    return Err(Error::Os(format!("WinUsb_ReadPipe failed (error {err})")));
                 }
             }
             Ok(got as usize)

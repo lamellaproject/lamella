@@ -5,7 +5,7 @@
 //! bulk packets over its vendor interface's bulk IN + OUT pipes (WritePipeTO / ReadPipeTO).
 #![allow(non_upper_case_globals, non_snake_case, non_camel_case_types, unsafe_op_in_unsafe_fn)]
 
-use super::{DeviceInfo, Error, Result};
+use super::{Binding, DeviceInfo, Error, Result};
 use core::ffi::c_void;
 use std::os::raw::c_char;
 use std::ptr::{null, null_mut};
@@ -197,6 +197,25 @@ pub struct Device {
 }
 
 impl Device {
+    /// See [`crate::Device::reset_pipes`]. Not implemented on this platform yet.
+    pub fn reset_pipes(&mut self) {}
+
+    pub fn reset_endpoint(&mut self, _endpoint: u8) {}
+
+    /// See [`crate::Device::describe_interface`]. Not implemented on this platform yet.
+    pub fn describe_interface(&self) -> String {
+        format!("endpoints in {:#04x} out {:#04x}", self.ep_in, self.ep_out)
+    }
+
+    /// The bulk endpoint addresses negotiated at open time, as `(in, out)`.
+    ///
+    /// Exposed because probing endpoints blindly is not a viable diagnostic: reading an endpoint a
+    /// device does not have can block rather than fail, so a tool that needs to know which pipes
+    /// exist must ask instead of sweep.
+    pub fn endpoints(&self) -> (u8, u8) {
+        (self.ep_in, self.ep_out)
+    }
+
     pub fn open(vendor_id: u16, product_id: u16, _serial: Option<&str>) -> Result<Self> {
         unsafe {
             let plugin_id = cfuuid(&ID_CFPLUGIN);
@@ -342,6 +361,7 @@ unsafe fn open_vendor_interface(
                     let mut n: u8 = 0;
                     ((**intf).GetNumEndpoints)(intf as *mut c_void, &mut n);
                     let (mut ep_in, mut ep_out) = (0u8, 0u8);
+                    let (mut ep_in_addr, mut ep_out_addr) = (0u8, 0u8);
                     let mut pipes: Vec<(u8, u8)> = Vec::new();
                     for pipe in 1..=n {
                         let (mut dir, mut num, mut tt, mut iv): (u8, u8, u8, u8) = (0, 0, 0, 0);
@@ -351,10 +371,14 @@ unsafe fn open_vendor_interface(
                         {
                             let addr = if dir == kUSBIn { 0x80 | num } else { num };
                             pipes.push((addr, pipe));
-                            if dir == kUSBIn {
-                                ep_in = pipe;
-                            } else if dir == kUSBOut {
-                                ep_out = pipe;
+                            let (slot, slot_addr) = if dir == kUSBIn {
+                                (&mut ep_in, &mut ep_in_addr)
+                            } else {
+                                (&mut ep_out, &mut ep_out_addr)
+                            };
+                            if *slot == 0 || addr < *slot_addr {
+                                *slot = pipe;
+                                *slot_addr = addr;
                             }
                         }
                     }
@@ -522,4 +546,14 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
         }
     }
     Ok(out)
+}
+
+/// See [`crate::diagnose`]. This platform opens USB devices directly, so there is no "bound
+/// driver" state to be in: a device that enumerates is reachable. The analogous local failure is
+/// permissions (a missing udev rule), which shows up as an open error rather than here.
+pub fn diagnose(_interface_guid: &str, vendor_id: u16, product_id: u16) -> Result<Binding> {
+    let present = enumerate()?
+        .into_iter()
+        .any(|device| device.vendor_id == vendor_id && device.product_id == product_id);
+    Ok(if present { Binding::Bound } else { Binding::Absent })
 }

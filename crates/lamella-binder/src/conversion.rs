@@ -57,15 +57,38 @@ pub fn can_cast(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         || is_object(from)
         || is_object(to)
         || enum_cast(model, from, to)
+        || interface_cast(model, from, to)
         || pointer_cast(from, to)
 }
 
-/// Explicit conversions involving pointers (unsafe): any pointer to/from any other pointer,
-/// and a pointer to/from an integer.
+/// Explicit conversions involving pointers (unsafe, 18.4): any pointer to/from any other pointer,
+/// and a pointer to/from an integer type. The integer set is exactly sbyte/byte/short/ushort/int/
+/// uint/long/ulong -- NOT char, floating-point, bool, or decimal, each of which csc rejects
+/// (CS0030). Using `is_numeric` here wrongly accepted `(char)p`/`(float)p` and their inverses.
 fn pointer_cast(from: &TypeSymbol, to: &TypeSymbol) -> bool {
     let from_ptr = matches!(from, TypeSymbol::Pointer(_));
     let to_ptr = matches!(to, TypeSymbol::Pointer(_));
-    (from_ptr && (to_ptr || is_numeric_type(to))) || (to_ptr && (from_ptr || is_numeric_type(from)))
+    (from_ptr && (to_ptr || is_pointer_integer(to)))
+        || (to_ptr && (from_ptr || is_pointer_integer(from)))
+}
+
+/// The integer types a pointer converts to/from (18.4): sbyte/byte/short/ushort/int/uint/long/
+/// ulong. Unlike [`SpecialType::is_integral`], `char` is NOT included -- 18.4 lists only the eight
+/// signed/unsigned integer types.
+fn is_pointer_integer(ty: &TypeSymbol) -> bool {
+    matches!(
+        ty,
+        TypeSymbol::Special(
+            SpecialType::SByte
+                | SpecialType::Byte
+                | SpecialType::Int16
+                | SpecialType::UInt16
+                | SpecialType::Int32
+                | SpecialType::UInt32
+                | SpecialType::Int64
+                | SpecialType::UInt64
+        )
+    )
 }
 
 /// The explicit conversions involving enums (13.2.2): an enum to and from any
@@ -80,6 +103,46 @@ fn is_enum(model: &Model, ty: &TypeSymbol) -> bool {
     model
         .get_by_symbol(ty)
         .is_some_and(|info| info.kind == TypeKind::Enum)
+}
+
+/// The explicit reference conversions that involve an interface (13.2.3). None of these can be
+/// decided at compile time, because the run-time type may implement more than the static type
+/// says: an UNSEALED class casts to any interface (a derived class could implement it), an
+/// interface casts to any unsealed class, and an interface casts to any other interface (one
+/// object may implement both). The conversion is checked at run time -- `castclass` -- which is
+/// the point of allowing it.
+///
+/// A SEALED type is the exception and stays `CS0030`: a `sealed` class, a struct or an enum has
+/// no derived type left to supply the implementation, so if it does not already implement the
+/// interface the cast can never succeed. `converts` has already accepted the cases where it DOES
+/// implement it, so reaching here means it does not.
+fn interface_cast(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    let from_interface = is_interface(model, from);
+    let to_interface = is_interface(model, to);
+    if from_interface && to_interface {
+        return true;
+    }
+    if from_interface {
+        return is_unsealed_class(model, to);
+    }
+    if to_interface {
+        return is_unsealed_class(model, from);
+    }
+    false
+}
+
+fn is_interface(model: &Model, ty: &TypeSymbol) -> bool {
+    model
+        .get_by_symbol(ty)
+        .is_some_and(|info| info.kind == TypeKind::Interface)
+}
+
+/// A class that is not `sealed`, so a type derived from it could still implement an interface it
+/// does not. A struct and an enum are implicitly sealed and answer false.
+fn is_unsealed_class(model: &Model, ty: &TypeSymbol) -> bool {
+    model
+        .get_by_symbol(ty)
+        .is_some_and(|info| info.kind == TypeKind::Class && !info.is_sealed)
 }
 
 fn is_numeric_type(ty: &TypeSymbol) -> bool {
@@ -276,6 +339,43 @@ mod tests {
             &t(SpecialType::Int32),
             &t(SpecialType::Boolean)
         ));
+    }
+
+    #[test]
+    fn pointer_integer_casts_are_exactly_the_eight_integer_types() {
+        let model = Model::new();
+        let ptr = TypeSymbol::Pointer(alloc::boxed::Box::new(t(SpecialType::Byte)));
+        let other_ptr = TypeSymbol::Pointer(alloc::boxed::Box::new(t(SpecialType::Int32)));
+        assert!(can_cast(&model, &ptr, &other_ptr));
+        for integer in [
+            SpecialType::SByte,
+            SpecialType::Byte,
+            SpecialType::Int16,
+            SpecialType::UInt16,
+            SpecialType::Int32,
+            SpecialType::UInt32,
+            SpecialType::Int64,
+            SpecialType::UInt64,
+        ] {
+            assert!(can_cast(&model, &ptr, &t(integer)), "ptr -> {integer:?}");
+            assert!(can_cast(&model, &t(integer), &ptr), "{integer:?} -> ptr");
+        }
+        for rejected in [
+            SpecialType::Char,
+            SpecialType::Single,
+            SpecialType::Double,
+            SpecialType::Decimal,
+            SpecialType::Boolean,
+        ] {
+            assert!(
+                !can_cast(&model, &ptr, &t(rejected)),
+                "ptr -> {rejected:?} is CS0030"
+            );
+            assert!(
+                !can_cast(&model, &t(rejected), &ptr),
+                "{rejected:?} -> ptr is CS0030"
+            );
+        }
     }
 
     #[test]

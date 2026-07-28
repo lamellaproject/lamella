@@ -1,0 +1,55 @@
+# BLOCK layout: the RP2040 PLL (one block, two placed copies: pll_sys + pll_usb).
+# Transcribed from the RP2040 datasheet with the register tables open -- NOT carried across
+# from the RP2350's pll block. The two parts do turn out to agree on every offset and field
+# position here, but reading them independently is what makes that an OBSERVATION rather than
+# an assumption: the same shortcut on the neighbouring nRF families would have been right
+# about offsets and wrong about instance count in the same breath.
+#
+# The power-up order (do NOT reorder) is DRIVER code (it spans resets/clocks/pll blocks):
+# park clk_sys on clk_ref FIRST, then per PLL: reset-cycle -> REFDIV 1 -> FBDIV -> clear
+# PD|VCOPD -> poll LOCK -> PRIM post-dividers -> clear POSTDIVPD, then switch the glitchless
+# mux and confirm in SELECTED. The chosen operating-point values (fbdiv, postdiv1/postdiv2)
+# are PLAN facts in each board.toml (state-and-verify: the plan also states the resulting
+# rates and generation verifies hz == xosc * fbdiv / (p1 * p2)).
+
+[table]
+kind = "block"
+family = "rp2040"
+block = "pll"
+sources = [
+    "RP2040 datasheet 2.18.4 'List of Registers' -- Table 274 (offsets), Table 275 (CS), Table 276 (PWR), Table 277 (FBDIV_INT), Table 278 (PRIM); two independent readings of the same pages agree field for field",
+    "RP2040 datasheet 2.1.2 'Atomic Register Access' (Addr + 0x3000 = atomic bitmask clear on write) for the PWR_CLR alias offset",
+]
+notes = [
+    "Fout = (xosc / REFDIV) * FBDIV / (POSTDIV1 * POSTDIV2); the proven operating point runs REFDIV = 1 (the crystal feeds the VCO directly).",
+    "Datasheet CS constraints: reference clock 5 MHz-800 MHz, feedback divider 16-320, VCO 750 MHz-1600 MHz. The proven 125/48 MHz point runs both VCOs inside that window (1500 MHz and 1200 MHz).",
+    "PWR bits are ACTIVE-HIGH power-downs and all reset to 1: clear PD|VCOPD to power the VCO (then wait LOCK), clear POSTDIVPD after PRIM is programmed. The proven bring-up clears them through the PWR_CLR atomic alias.",
+]
+
+[registers.CS]
+offset = 0x0
+width = 32
+fields = { REFDIV = [0, 6], BYPASS = [8, 1], LOCK = [31, 1] }
+notes = "LOCK is read-only; BYPASS passes the reference clock through instead of the divided VCO (the proven bring-up leaves it clear)."
+
+[registers.PWR]
+offset = 0x4
+width = 32
+fields = { PD = [0, 1], DSMPD = [2, 1], POSTDIVPD = [3, 1], VCOPD = [5, 1] }
+notes = "Active-high power-downs. DSMPD is transcribed for completeness; the datasheet says nothing is achieved by clearing it, and the proven bring-up leaves it alone."
+
+[registers.PWR_CLR]
+offset = 0x3004
+width = 32
+notes = "PWR at the chip's atomic clear-bits alias (+0x3000, 2.1.2): writing a mask clears those power-down bits without a read-modify-write."
+
+[registers.FBDIV_INT]
+offset = 0x8
+width = 32
+notes = "The integer feedback divisor in bits 11:0 (the plan's pll_*_fbdiv chosen value); this PLL has no fractional division. No field row: Table 277 gives the bit range without naming a field, and naming one here would be invention, not transcription."
+
+[registers.PRIM]
+offset = 0xC
+width = 32
+fields = { POSTDIV2 = [12, 3], POSTDIV1 = [16, 3] }
+notes = "Each post divider is 1-7 and resets to 7. The post-divider word generation composes from the plan's chosen values (POSTDIV1 << 16 | POSTDIV2 << 12 -- a composed config word, generated output only)."

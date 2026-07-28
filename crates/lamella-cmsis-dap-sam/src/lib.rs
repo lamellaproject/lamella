@@ -1,6 +1,6 @@
-//! Microchip SAM (Atmel SAM) flash programming over a Lamella CMSIS-DAP debug probe.
+//! Microchip SAM (Atmel SAM) flash programming over a Lamella debug probe.
 
-use lamella_cmsis_dap::{Dap, DapError, Transport};
+use lamella_probe_core::{ProbeError, TargetAccess};
 
 const SAMD21_CTRLA: u32 = 0x4100_4000;
 const SAMD21_CTRLB: u32 = 0x4100_4004;
@@ -24,7 +24,7 @@ pub trait Samd21Debug {
     /// (an armed watchdog defeats a plain halt request; the DSU reset extension defeats a
     /// plain vector catch): catch armed under held `nRESET`, then the cold-plugging
     /// extension released INTO the catch.
-    fn samd21_reset_halt(&mut self) -> Result<(), DapError>;
+    fn samd21_reset_halt(&mut self) -> Result<(), ProbeError>;
 
     /// PARKS the SAM D21 so it executes nothing, without needing the vector catch at all:
     /// a probe `nRESET` pulse lands the core in the DSU cold-plugging reset extension
@@ -32,12 +32,12 @@ pub trait Samd21Debug {
     /// flash programming and pin takeover need, and deterministic where the catch is not
     /// (`DEMCR` does not reliably survive this part's external reset). Falls back to a
     /// plain halt for a probe with no reset line wired. The core stays parked/halted until
-    /// a reset (`Dap::reset_and_run`) or a CRSTEXT release boots it.
-    fn samd21_park(&mut self) -> Result<(), DapError>;
+    /// a reset (`TargetAccess::reset_and_run`) or a CRSTEXT release boots it.
+    fn samd21_park(&mut self) -> Result<(), ProbeError>;
 }
 
-impl<T: Transport> Samd21Debug for Dap<T> {
-    fn samd21_park(&mut self) -> Result<(), DapError> {
+impl<A: TargetAccess> Samd21Debug for A {
+    fn samd21_park(&mut self) -> Result<(), ProbeError> {
         for _ in 0..4 {
             let _ = self.set_reset(true);
             let _ = self.set_reset(false);
@@ -51,10 +51,10 @@ impl<T: Transport> Samd21Debug for Dap<T> {
                 return Ok(());
             }
         }
-        Err(DapError::Timeout("park"))
+        Err(ProbeError::Timeout("park"))
     }
 
-    fn samd21_reset_halt(&mut self) -> Result<(), DapError> {
+    fn samd21_reset_halt(&mut self) -> Result<(), ProbeError> {
         let _ = self.set_reset(true);
         self.arm_reset_catch()?;
         let _ = self.set_reset(false);
@@ -69,37 +69,35 @@ impl<T: Transport> Samd21Debug for Dap<T> {
             }
         }
         let _ = self.disarm_reset_catch();
-        Err(DapError::Timeout("reset catch"))
+        Err(ProbeError::Timeout("reset catch"))
     }
 }
 
-/// SAM D21 (ATSAMD21) flash programming, added to a CMSIS-DAP [`Dap`] probe. Halt the core before
+/// SAM D21 (ATSAMD21) flash programming, added to a CMSIS-DAP [`TargetAccess`] probe. Halt the core before
 /// erasing or writing so it is not fetching from flash during the operation.
 pub trait Samd21Flash {
     /// Erases the flash row (256 bytes) containing `address`, via the NVMCTRL.
-    fn erase_flash_row(&mut self, address: u32) -> Result<(), DapError>;
+    fn erase_flash_row(&mut self, address: u32) -> Result<(), ProbeError>;
     /// Programs consecutive 32-bit `words` to flash from `address`, via the NVMCTRL, one 64-byte
     /// page at a time (the rows must already be erased).
-    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), DapError>;
+    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError>;
 }
 
-impl<T: Transport> Samd21Flash for Dap<T> {
-    fn erase_flash_row(&mut self, address: u32) -> Result<(), DapError> {
+impl<A: TargetAccess> Samd21Flash for A {
+    fn erase_flash_row(&mut self, address: u32) -> Result<(), ProbeError> {
         self.write_word(SAMD21_ADDR, (address & !(SAMD21_ROW - 1)) / 2)?;
         samd21_command(self, SAMD21_CMD_ER)
     }
 
     /// Manual write, per datasheet 22.6.4.3.1: clear the page buffer, fill it through the flash
     /// address space, issue a read-memory barrier, set the page address, then Write-Page.
-    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), DapError> {
+    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
         let ctrlb = self.read_word(SAMD21_CTRLB)?;
         self.write_word(SAMD21_CTRLB, ctrlb | SAMD21_MANW)?;
         for (page, chunk) in words.chunks(SAMD21_PAGE / 4).enumerate() {
             let page_addr = address + (page as u32) * SAMD21_PAGE as u32;
             samd21_command(self, SAMD21_CMD_PBC)?;
-            for (i, &word) in chunk.iter().enumerate() {
-                self.write_word(page_addr + (i as u32) * 4, word)?;
-            }
+            self.write_words(page_addr, chunk)?;
             self.read_word(page_addr)?;
             self.write_word(SAMD21_ADDR, page_addr / 2)?;
             samd21_command(self, SAMD21_CMD_WP)?;
@@ -109,14 +107,14 @@ impl<T: Transport> Samd21Flash for Dap<T> {
 }
 
 /// Issues an NVMCTRL command (CMDEX key + `cmd`) and waits for the controller to be ready.
-fn samd21_command<T: Transport>(dap: &mut Dap<T>, cmd: u32) -> Result<(), DapError> {
-    dap.write_word(SAMD21_CTRLA, SAMD21_CMDEX | cmd)?;
+fn samd21_command<A: TargetAccess>(target: &mut A, cmd: u32) -> Result<(), ProbeError> {
+    target.write_word(SAMD21_CTRLA, SAMD21_CMDEX | cmd)?;
     for _ in 0..1000 {
-        if dap.read_word(SAMD21_INTFLAG)? & 1 != 0 {
+        if target.read_word(SAMD21_INTFLAG)? & 1 != 0 {
             return Ok(());
         }
     }
-    Err(DapError::Timeout("SAMD21 flash controller"))
+    Err(ProbeError::Timeout("SAMD21 flash controller"))
 }
 
 const SAME54_CTRLA: u32 = 0x4100_4000;
@@ -132,19 +130,19 @@ const SAME54_BLOCK: u32 = 8192;
 const SAME54_STATUS_READY: u32 = 1 << 16;
 const SAME54_WMODE_MASK: u32 = 0b11 << 4;
 
-/// SAM D5x/E5x (ATSAME54, ATSAMD51, ...) flash programming, added to a CMSIS-DAP [`Dap`]
+/// SAM D5x/E5x (ATSAME54, ATSAMD51, ...) flash programming, added to a CMSIS-DAP [`TargetAccess`]
 /// probe. Halt the core before erasing or writing so it is not fetching from flash during
 /// the operation.
 pub trait Same54Flash {
     /// Erases the flash block (8 KiB) containing `address`, via the NVMCTRL.
-    fn erase_flash_block(&mut self, address: u32) -> Result<(), DapError>;
+    fn erase_flash_block(&mut self, address: u32) -> Result<(), ProbeError>;
     /// Programs consecutive 32-bit `words` to flash from `address`, via the NVMCTRL, one
     /// 512-byte page at a time (the blocks must already be erased).
-    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), DapError>;
+    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError>;
 }
 
-impl<T: Transport> Same54Flash for Dap<T> {
-    fn erase_flash_block(&mut self, address: u32) -> Result<(), DapError> {
+impl<A: TargetAccess> Same54Flash for A {
+    fn erase_flash_block(&mut self, address: u32) -> Result<(), ProbeError> {
         same54_ready(self)?;
         self.write_word(SAME54_ADDR, address & !(SAME54_BLOCK - 1))?;
         same54_command(self, SAME54_CMD_EB)
@@ -153,16 +151,14 @@ impl<T: Transport> Same54Flash for Dap<T> {
     /// Manual write, per the datasheet's manual-page-write procedure: set WMODE = MAN,
     /// then per page: clear the page buffer, fill it through the flash address space,
     /// set the page address, Write-Page.
-    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), DapError> {
+    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
         let ctrla = self.read_word(SAME54_CTRLA)?;
         self.write_word(SAME54_CTRLA, ctrla & !SAME54_WMODE_MASK)?;
         for (page, chunk) in words.chunks(SAME54_PAGE / 4).enumerate() {
             let page_addr = address + (page as u32) * SAME54_PAGE as u32;
             same54_ready(self)?;
             same54_command(self, SAME54_CMD_PBC)?;
-            for (i, &word) in chunk.iter().enumerate() {
-                self.write_word(page_addr + (i as u32) * 4, word)?;
-            }
+            self.write_words(page_addr, chunk)?;
             self.write_word(SAME54_ADDR, page_addr)?;
             same54_command(self, SAME54_CMD_WP)?;
         }
@@ -171,19 +167,19 @@ impl<T: Transport> Same54Flash for Dap<T> {
 }
 
 /// Polls STATUS.READY (the controller accepts a new command).
-fn same54_ready<T: Transport>(dap: &mut Dap<T>) -> Result<(), DapError> {
+fn same54_ready<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
     for _ in 0..1000 {
-        if dap.read_word(SAME54_INTFLAG)? & SAME54_STATUS_READY != 0 {
+        if target.read_word(SAME54_INTFLAG)? & SAME54_STATUS_READY != 0 {
             return Ok(());
         }
     }
-    Err(DapError::Timeout("SAME54 flash controller ready"))
+    Err(ProbeError::Timeout("SAME54 flash controller ready"))
 }
 
 /// Issues an NVMCTRL command (CMDEX key + `cmd` into CTRLB) and waits for ready.
-fn same54_command<T: Transport>(dap: &mut Dap<T>, cmd: u32) -> Result<(), DapError> {
-    dap.write_word(SAME54_CTRLB, SAME54_CMDEX | cmd)?;
-    same54_ready(dap)
+fn same54_command<A: TargetAccess>(target: &mut A, cmd: u32) -> Result<(), ProbeError> {
+    target.write_word(SAME54_CTRLB, SAME54_CMDEX | cmd)?;
+    same54_ready(target)
 }
 
 /// EEFC0 user-interface base: the controller for the plane in the 0x00400000 window.
@@ -241,12 +237,12 @@ pub struct Sam4sFlashDescriptor {
     pub planes: u32,
 }
 
-/// SAM4S (ATSAM4S / SAM4SD dual-plane) flash programming, added to a CMSIS-DAP [`Dap`]
+/// SAM4S (ATSAM4S / SAM4SD dual-plane) flash programming, added to a CMSIS-DAP [`TargetAccess`]
 /// probe. `eefc` selects the controller ([`SAM4S_EEFC0`] / [`SAM4S_EEFC1`]); page numbers
 /// are relative to that controller's plane. Halt the core before erasing or writing.
 pub trait Sam4sFlash {
     /// Erases 8 pages (4 KiB) starting at `first_page` (a multiple of 8), via EPA.
-    fn sam4s_erase_pages8(&mut self, eefc: u32, first_page: u32) -> Result<(), DapError>;
+    fn sam4s_erase_pages8(&mut self, eefc: u32, first_page: u32) -> Result<(), ProbeError>;
     /// Programs `words` into consecutive pages starting at `first_page` of the plane
     /// mapped at `plane_base` (already erased). Each page's latch buffer is filled
     /// completely -- the tail beyond `words` is padded with the erased value -- because
@@ -258,26 +254,26 @@ pub trait Sam4sFlash {
         plane_base: u32,
         first_page: u32,
         words: &[u32],
-    ) -> Result<(), DapError>;
+    ) -> Result<(), ProbeError>;
     /// The plane's 128 lock bits (bit n = lock region n of 16 pages), via GLB.
-    fn sam4s_lock_bits(&mut self, eefc: u32) -> Result<[u32; 4], DapError>;
+    fn sam4s_lock_bits(&mut self, eefc: u32) -> Result<[u32; 4], ProbeError>;
     /// Clears the lock bit of the region containing `page`, via CLB.
-    fn sam4s_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError>;
+    fn sam4s_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), ProbeError>;
     /// The GPNVM bits (bit 0 = security, 1 = boot mode, 2 = plane swap), via EEFC0 GGPB.
-    fn sam4s_gpnvm_bits(&mut self) -> Result<u32, DapError>;
+    fn sam4s_gpnvm_bits(&mut self) -> Result<u32, ProbeError>;
     /// Sets GPNVM bit `bit`, via EEFC0 SGPB.
-    fn sam4s_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+    fn sam4s_set_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError>;
     /// Clears GPNVM bit `bit`, via EEFC0 CGPB.
-    fn sam4s_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+    fn sam4s_clear_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError>;
     /// The controller's flash descriptor (GETD): the live geometry cross-check.
-    fn sam4s_flash_descriptor(&mut self, eefc: u32) -> Result<Sam4sFlashDescriptor, DapError>;
+    fn sam4s_flash_descriptor(&mut self, eefc: u32) -> Result<Sam4sFlashDescriptor, ProbeError>;
     /// The 128-bit factory unique identifier, via STUI/SPUI. While the sequence is open the
     /// plane's first words read as the identifier area, so the core must be halted.
-    fn sam4s_unique_id(&mut self, eefc: u32, plane_base: u32) -> Result<[u32; 4], DapError>;
+    fn sam4s_unique_id(&mut self, eefc: u32, plane_base: u32) -> Result<[u32; 4], ProbeError>;
 }
 
-impl<T: Transport> Sam4sFlash for Dap<T> {
-    fn sam4s_erase_pages8(&mut self, eefc: u32, first_page: u32) -> Result<(), DapError> {
+impl<A: TargetAccess> Sam4sFlash for A {
+    fn sam4s_erase_pages8(&mut self, eefc: u32, first_page: u32) -> Result<(), ProbeError> {
         assert!(first_page % SAM4S_ERASE_PAGES == 0, "EPA start page must be 8-aligned");
         sam4s_command(self, eefc, SAM4S_CMD_EPA, first_page | SAM4S_EPA_8_PAGES)
     }
@@ -288,7 +284,7 @@ impl<T: Transport> Sam4sFlash for Dap<T> {
         plane_base: u32,
         first_page: u32,
         words: &[u32],
-    ) -> Result<(), DapError> {
+    ) -> Result<(), ProbeError> {
         const PAGE_WORDS: usize = SAM4S_PAGE / 4;
         for (index, chunk) in words.chunks(PAGE_WORDS).enumerate() {
             let page = first_page + index as u32;
@@ -305,7 +301,7 @@ impl<T: Transport> Sam4sFlash for Dap<T> {
         Ok(())
     }
 
-    fn sam4s_lock_bits(&mut self, eefc: u32) -> Result<[u32; 4], DapError> {
+    fn sam4s_lock_bits(&mut self, eefc: u32) -> Result<[u32; 4], ProbeError> {
         sam4s_command(self, eefc, SAM4S_CMD_GLB, 0)?;
         let mut bits = [0u32; 4];
         for word in &mut bits {
@@ -314,27 +310,27 @@ impl<T: Transport> Sam4sFlash for Dap<T> {
         Ok(bits)
     }
 
-    fn sam4s_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError> {
+    fn sam4s_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), ProbeError> {
         sam4s_command(self, eefc, SAM4S_CMD_CLB, page)?;
         sam4s_post_bit_write_dummy_read(self)
     }
 
-    fn sam4s_gpnvm_bits(&mut self) -> Result<u32, DapError> {
+    fn sam4s_gpnvm_bits(&mut self) -> Result<u32, ProbeError> {
         sam4s_command(self, SAM4S_EEFC0, SAM4S_CMD_GGPB, 0)?;
         self.read_word(SAM4S_EEFC0 + SAM4S_FRR)
     }
 
-    fn sam4s_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+    fn sam4s_set_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError> {
         sam4s_command(self, SAM4S_EEFC0, SAM4S_CMD_SGPB, bit)?;
         sam4s_post_bit_write_dummy_read(self)
     }
 
-    fn sam4s_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+    fn sam4s_clear_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError> {
         sam4s_command(self, SAM4S_EEFC0, SAM4S_CMD_CGPB, bit)?;
         sam4s_post_bit_write_dummy_read(self)
     }
 
-    fn sam4s_flash_descriptor(&mut self, eefc: u32) -> Result<Sam4sFlashDescriptor, DapError> {
+    fn sam4s_flash_descriptor(&mut self, eefc: u32) -> Result<Sam4sFlashDescriptor, ProbeError> {
         sam4s_command(self, eefc, SAM4S_CMD_GETD, 0)?;
         Ok(Sam4sFlashDescriptor {
             interface: self.read_word(eefc + SAM4S_FRR)?,
@@ -344,7 +340,7 @@ impl<T: Transport> Sam4sFlash for Dap<T> {
         })
     }
 
-    fn sam4s_unique_id(&mut self, eefc: u32, plane_base: u32) -> Result<[u32; 4], DapError> {
+    fn sam4s_unique_id(&mut self, eefc: u32, plane_base: u32) -> Result<[u32; 4], ProbeError> {
         self.write_word(eefc + SAM4S_FCR, SAM4S_FKEY | SAM4S_CMD_STUI)?;
         for _ in 0..1000 {
             if self.read_word(eefc + SAM4S_FSR)? & SAM4S_FSR_FRDY == 0 {
@@ -356,43 +352,43 @@ impl<T: Transport> Sam4sFlash for Dap<T> {
                 return Ok(id);
             }
         }
-        Err(DapError::Timeout("SAM4S unique-identifier area (FRDY fall after STUI)"))
+        Err(ProbeError::Timeout("SAM4S unique-identifier area (FRDY fall after STUI)"))
     }
 }
 
 /// Issues one EEFC command (key | arg | cmd into FCR) and waits for FRDY, mapping the FSR
 /// error flags: FCMDE = bad key/command, FLOCKE = the command hit a locked region and was
 /// refused, FLERR = the flash's own erase/write verify failed.
-fn sam4s_command<T: Transport>(
-    dap: &mut Dap<T>,
+fn sam4s_command<A: TargetAccess>(
+    target: &mut A,
     eefc: u32,
     cmd: u32,
     arg: u32,
-) -> Result<(), DapError> {
-    dap.write_word(eefc + SAM4S_FCR, SAM4S_FKEY | (arg << 8) | cmd)?;
+) -> Result<(), ProbeError> {
+    target.write_word(eefc + SAM4S_FCR, SAM4S_FKEY | (arg << 8) | cmd)?;
     for _ in 0..4000 {
-        let fsr = dap.read_word(eefc + SAM4S_FSR)?;
+        let fsr = target.read_word(eefc + SAM4S_FSR)?;
         if fsr & SAM4S_FSR_FRDY != 0 {
             if fsr & SAM4S_FSR_FCMDE != 0 {
-                return Err(DapError::Device("SAM4S EEFC command error (FCMDE)"));
+                return Err(ProbeError::Device("SAM4S EEFC command error (FCMDE)"));
             }
             if fsr & SAM4S_FSR_FLOCKE != 0 {
-                return Err(DapError::Device("SAM4S EEFC lock violation (FLOCKE)"));
+                return Err(ProbeError::Device("SAM4S EEFC lock violation (FLOCKE)"));
             }
             if fsr & SAM4S_FSR_FLERR != 0 {
-                return Err(DapError::Device("SAM4S EEFC flash verify failed (FLERR)"));
+                return Err(ProbeError::Device("SAM4S EEFC flash verify failed (FLERR)"));
             }
             return Ok(());
         }
     }
-    Err(DapError::Timeout("SAM4S flash controller (FRDY)"))
+    Err(ProbeError::Timeout("SAM4S flash controller (FRDY)"))
 }
 
 /// SAM4S rev-A erratum "Read Error after a GPNVM or Lock Bit Writing": the first flash
 /// read after SGPB/CGPB/SLB/CLB can return a stale value unless a dummy read at another
 /// address is interposed. One discarded word read satisfies it.
-fn sam4s_post_bit_write_dummy_read<T: Transport>(dap: &mut Dap<T>) -> Result<(), DapError> {
-    dap.read_word(SAM4S_FLASH0_BASE + SAM4S_PAGE as u32)?;
+fn sam4s_post_bit_write_dummy_read<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
+    target.read_word(SAM4S_FLASH0_BASE + SAM4S_PAGE as u32)?;
     Ok(())
 }
 
@@ -404,7 +400,7 @@ pub const SAM3X_EEFC1: u32 = 0x400e_0c00;
 pub const SAM3X_FLASH0_BASE: u32 = 0x0008_0000;
 /// Plane-1 flash window (EEFC1), 256 KB, immediately after plane 0.
 pub const SAM3X_FLASH1_BASE: u32 = 0x000c_0000;
-/// SAM3X flash page size in bytes (the EEFC write granularity); verified by GETD on silicon.
+/// SAM3X flash page size in bytes (the EEFC write granularity).
 pub const SAM3X_PAGE: usize = 256;
 /// Each plane's size in bytes.
 pub const SAM3X_PLANE_SIZE: u32 = 256 * 1024;
@@ -447,13 +443,13 @@ pub struct Sam3xFlashDescriptor {
     pub planes: u32,
 }
 
-/// SAM3X / SAM3A (ATSAM3X8E, ...) flash programming, added to a CMSIS-DAP [`Dap`] probe. `eefc`
+/// SAM3X / SAM3A (ATSAM3X8E, ...) flash programming, added to a CMSIS-DAP [`TargetAccess`] probe. `eefc`
 /// selects the controller ([`SAM3X_EEFC0`] / [`SAM3X_EEFC1`]); page numbers are relative to that
 /// controller's plane, whose flash window is `plane_base` ([`SAM3X_FLASH0_BASE`] /
 /// [`SAM3X_FLASH1_BASE`]). Halt the core before erasing or writing so it is not fetching from flash.
 pub trait Sam3xFlash {
     /// The controller's flash descriptor (GETD): the live geometry cross-check.
-    fn sam3x_flash_descriptor(&mut self, eefc: u32) -> Result<Sam3xFlashDescriptor, DapError>;
+    fn sam3x_flash_descriptor(&mut self, eefc: u32) -> Result<Sam3xFlashDescriptor, ProbeError>;
     /// Programs `words` into consecutive pages starting at `first_page`, via ERASE-AND-WRITE-PAGE:
     /// each page's latch buffer is filled through the plane's flash window and then EWP erases and
     /// writes that page, so no separate erase pass is needed. A partial final page is padded with
@@ -465,25 +461,25 @@ pub trait Sam3xFlash {
         plane_base: u32,
         first_page: u32,
         words: &[u32],
-    ) -> Result<(), DapError>;
+    ) -> Result<(), ProbeError>;
     /// Erases the ENTIRE plane fronted by `eefc` (EA) -- the only bulk erase the SAM3X offers below
     /// whole-plane granularity is the per-page erase folded into [`sam3x_write_flash`](Self::sam3x_write_flash).
-    fn sam3x_erase_all(&mut self, eefc: u32) -> Result<(), DapError>;
+    fn sam3x_erase_all(&mut self, eefc: u32) -> Result<(), ProbeError>;
     /// The plane's lock bits (bit n = lock region n of 16 KB / 64 pages), via GLB. 16 regions per
     /// plane, so the low 16 bits are meaningful.
-    fn sam3x_lock_bits(&mut self, eefc: u32) -> Result<u32, DapError>;
+    fn sam3x_lock_bits(&mut self, eefc: u32) -> Result<u32, ProbeError>;
     /// Clears the lock bit of the region containing `page`, via CLB.
-    fn sam3x_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError>;
+    fn sam3x_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), ProbeError>;
     /// The GPNVM bits (bit 0 = security, bit 1 = boot mode), via EEFC0 GGPB.
-    fn sam3x_gpnvm_bits(&mut self) -> Result<u32, DapError>;
+    fn sam3x_gpnvm_bits(&mut self) -> Result<u32, ProbeError>;
     /// Sets GPNVM bit `bit`, via EEFC0 SGPB.
-    fn sam3x_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+    fn sam3x_set_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError>;
     /// Clears GPNVM bit `bit`, via EEFC0 CGPB.
-    fn sam3x_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+    fn sam3x_clear_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError>;
 }
 
-impl<T: Transport> Sam3xFlash for Dap<T> {
-    fn sam3x_flash_descriptor(&mut self, eefc: u32) -> Result<Sam3xFlashDescriptor, DapError> {
+impl<A: TargetAccess> Sam3xFlash for A {
+    fn sam3x_flash_descriptor(&mut self, eefc: u32) -> Result<Sam3xFlashDescriptor, ProbeError> {
         sam3x_command(self, eefc, SAM3X_CMD_GETD, 0)?;
         Ok(Sam3xFlashDescriptor {
             interface: self.read_word(eefc + SAM3X_FRR)?,
@@ -499,7 +495,7 @@ impl<T: Transport> Sam3xFlash for Dap<T> {
         plane_base: u32,
         first_page: u32,
         words: &[u32],
-    ) -> Result<(), DapError> {
+    ) -> Result<(), ProbeError> {
         const PAGE_WORDS: usize = SAM3X_PAGE / 4;
         for (index, chunk) in words.chunks(PAGE_WORDS).enumerate() {
             let page = first_page + index as u32;
@@ -516,29 +512,29 @@ impl<T: Transport> Sam3xFlash for Dap<T> {
         Ok(())
     }
 
-    fn sam3x_erase_all(&mut self, eefc: u32) -> Result<(), DapError> {
+    fn sam3x_erase_all(&mut self, eefc: u32) -> Result<(), ProbeError> {
         sam3x_command(self, eefc, SAM3X_CMD_EA, 0)
     }
 
-    fn sam3x_lock_bits(&mut self, eefc: u32) -> Result<u32, DapError> {
+    fn sam3x_lock_bits(&mut self, eefc: u32) -> Result<u32, ProbeError> {
         sam3x_command(self, eefc, SAM3X_CMD_GLB, 0)?;
         self.read_word(eefc + SAM3X_FRR)
     }
 
-    fn sam3x_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError> {
+    fn sam3x_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), ProbeError> {
         sam3x_command(self, eefc, SAM3X_CMD_CLB, page)
     }
 
-    fn sam3x_gpnvm_bits(&mut self) -> Result<u32, DapError> {
+    fn sam3x_gpnvm_bits(&mut self) -> Result<u32, ProbeError> {
         sam3x_command(self, SAM3X_EEFC0, SAM3X_CMD_GGPB, 0)?;
         self.read_word(SAM3X_EEFC0 + SAM3X_FRR)
     }
 
-    fn sam3x_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+    fn sam3x_set_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError> {
         sam3x_command(self, SAM3X_EEFC0, SAM3X_CMD_SGPB, bit)
     }
 
-    fn sam3x_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+    fn sam3x_clear_gpnvm(&mut self, bit: u32) -> Result<(), ProbeError> {
         sam3x_command(self, SAM3X_EEFC0, SAM3X_CMD_CGPB, bit)
     }
 }
@@ -546,32 +542,33 @@ impl<T: Transport> Sam3xFlash for Dap<T> {
 /// Issues one EEFC command (key | arg | cmd into FCR) and waits for FRDY, mapping the FSR error
 /// flags: FCMDE = bad key/command, FLOCKE = the command hit a locked region and was refused. (The
 /// SAM3X FSR defines no FLERR verify-error bit.)
-fn sam3x_command<T: Transport>(
-    dap: &mut Dap<T>,
+fn sam3x_command<A: TargetAccess>(
+    target: &mut A,
     eefc: u32,
     cmd: u32,
     arg: u32,
-) -> Result<(), DapError> {
-    dap.write_word(eefc + SAM3X_FCR, SAM3X_FKEY | (arg << 8) | cmd)?;
+) -> Result<(), ProbeError> {
+    target.write_word(eefc + SAM3X_FCR, SAM3X_FKEY | (arg << 8) | cmd)?;
     for _ in 0..4000 {
-        let fsr = dap.read_word(eefc + SAM3X_FSR)?;
+        let fsr = target.read_word(eefc + SAM3X_FSR)?;
         if fsr & SAM3X_FSR_FRDY != 0 {
             if fsr & SAM3X_FSR_FCMDE != 0 {
-                return Err(DapError::Device("SAM3X EEFC command error (FCMDE)"));
+                return Err(ProbeError::Device("SAM3X EEFC command error (FCMDE)"));
             }
             if fsr & SAM3X_FSR_FLOCKE != 0 {
-                return Err(DapError::Device("SAM3X EEFC lock violation (FLOCKE)"));
+                return Err(ProbeError::Device("SAM3X EEFC lock violation (FLOCKE)"));
             }
             return Ok(());
         }
     }
-    Err(DapError::Timeout("SAM3X flash controller (FRDY)"))
+    Err(ProbeError::Timeout("SAM3X flash controller (FRDY)"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lamella_cmsis_dap::proto;
+    use lamella_cmsis_dap::{Dap, proto};
+    use lamella_probe_core::ArmDap;
     use lamella_cmsis_dap::testing::{Mock, echo};
 
     #[test]
@@ -586,11 +583,11 @@ mod tests {
             ack.clone(),
             ready,
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.erase_flash_row(0x0000_0100).unwrap();
-        assert_eq!(&dap.transport().sent[1][4..8], &0x80u32.to_le_bytes());
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.erase_flash_row(0x0000_0100).unwrap();
+        assert_eq!(&target.inner().transport().sent[1][4..8], &0x80u32.to_le_bytes());
         assert_eq!(
-            &dap.transport().sent[3][4..8],
+            &target.inner().transport().sent[3][4..8],
             &0x0000_a502u32.to_le_bytes()
         );
     }
@@ -611,7 +608,7 @@ mod tests {
             ack.clone(),
             ready.clone(),
             ack.clone(),
-            ack.clone(),
+            block_ack(1),
             ack.clone(),
             flash,
             ack.clone(),
@@ -621,15 +618,13 @@ mod tests {
             ack.clone(),
             ready,
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        Samd21Flash::write_flash(&mut dap, 0x0, &[0xcafe_babe]).unwrap();
-        assert_eq!(&dap.transport().sent[3][4..8], &0x80u32.to_le_bytes());
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        Samd21Flash::write_flash(&mut target, 0x0, &[0xcafe_babe]).unwrap();
+        assert_eq!(&target.inner().transport().sent[3][4..8], &0x80u32.to_le_bytes());
+        assert_eq!(target.inner().transport().sent[9][0], proto::cmd::TRANSFER_BLOCK);
+        assert_eq!(&target.inner().transport().sent[9][5..9], &0xcafe_babeu32.to_le_bytes());
         assert_eq!(
-            &dap.transport().sent[9][4..8],
-            &0xcafe_babeu32.to_le_bytes()
-        );
-        assert_eq!(
-            &dap.transport().sent[15][4..8],
+            &target.inner().transport().sent[15][4..8],
             &0x0000_a504u32.to_le_bytes()
         );
     }
@@ -652,11 +647,11 @@ mod tests {
             ack.clone(),
             same54_ready_reply(),
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.erase_flash_block(0x0000_2345).unwrap();
-        assert_eq!(&dap.transport().sent[3][4..8], &0x2000u32.to_le_bytes());
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.erase_flash_block(0x0000_2345).unwrap();
+        assert_eq!(&target.inner().transport().sent[3][4..8], &0x2000u32.to_le_bytes());
         assert_eq!(
-            &dap.transport().sent[5][4..8],
+            &target.inner().transport().sent[5][4..8],
             &0x0000_a501u32.to_le_bytes()
         );
     }
@@ -677,7 +672,7 @@ mod tests {
             ack.clone(),
             same54_ready_reply(),
             ack.clone(),
-            ack.clone(),
+            block_ack(1),
             ack.clone(),
             ack.clone(),
             ack.clone(),
@@ -685,20 +680,18 @@ mod tests {
             ack.clone(),
             same54_ready_reply(),
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        Same54Flash::write_flash(&mut dap, 0x0, &[0xcafe_babe]).unwrap();
-        assert_eq!(&dap.transport().sent[3][4..8], &0x04u32.to_le_bytes());
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        Same54Flash::write_flash(&mut target, 0x0, &[0xcafe_babe]).unwrap();
+        assert_eq!(&target.inner().transport().sent[3][4..8], &0x04u32.to_le_bytes());
         assert_eq!(
-            &dap.transport().sent[7][4..8],
+            &target.inner().transport().sent[7][4..8],
             &0x0000_a515u32.to_le_bytes()
         );
+        assert_eq!(target.inner().transport().sent[11][0], proto::cmd::TRANSFER_BLOCK);
+        assert_eq!(&target.inner().transport().sent[11][5..9], &0xcafe_babeu32.to_le_bytes());
+        assert_eq!(&target.inner().transport().sent[13][4..8], &0x0u32.to_le_bytes());
         assert_eq!(
-            &dap.transport().sent[11][4..8],
-            &0xcafe_babeu32.to_le_bytes()
-        );
-        assert_eq!(&dap.transport().sent[13][4..8], &0x0u32.to_le_bytes());
-        assert_eq!(
-            &dap.transport().sent[15][4..8],
+            &target.inner().transport().sent[15][4..8],
             &0x0000_a503u32.to_le_bytes()
         );
     }
@@ -728,34 +721,33 @@ mod tests {
             ack.clone(),
             sam4s_ready_reply(),
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.sam4s_erase_pages8(SAM4S_EEFC0, 16).unwrap();
-        assert_eq!(&dap.transport().sent[0][4..8], &0x400e_0a04u32.to_le_bytes());
-        assert_eq!(&dap.transport().sent[1][4..8], &0x5a00_1107u32.to_le_bytes());
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.sam4s_erase_pages8(SAM4S_EEFC0, 16).unwrap();
+        assert_eq!(&target.inner().transport().sent[0][4..8], &0x400e_0a04u32.to_le_bytes());
+        assert_eq!(&target.inner().transport().sent[1][4..8], &0x5a00_1107u32.to_le_bytes());
     }
 
     #[test]
     fn sam4s_write_flash_fills_latch_ascending_then_wp() {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let mut replies = Vec::new();
+        let mut replies = vec![ack.clone()];
         for _ in 0..9 {
-            replies.push(ack.clone());
             replies.push(block_ack(14));
         }
-        replies.push(ack.clone());
         replies.push(block_ack(2));
         replies.push(ack.clone());
         replies.push(ack.clone());
         replies.push(ack.clone());
         replies.push(sam4s_ready_reply());
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.sam4s_write_flash(SAM4S_EEFC0, SAM4S_FLASH0_BASE, 3, &[0xcafe_babe]).unwrap();
-        let sent = &dap.transport().sent;
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.sam4s_write_flash(SAM4S_EEFC0, SAM4S_FLASH0_BASE, 3, &[0xcafe_babe]).unwrap();
+        let sent = &target.inner().transport().sent;
         assert_eq!(&sent[0][4..8], &(0x0040_0000u32 + 3 * 512).to_le_bytes());
         assert_eq!(sent[1][0], proto::cmd::TRANSFER_BLOCK);
         assert_eq!(&sent[1][5..9], &0xcafe_babeu32.to_le_bytes());
         assert_eq!(&sent[1][9..13], &0xffff_ffffu32.to_le_bytes());
-        assert_eq!(&sent[21][4..8], &0x5a00_0301u32.to_le_bytes());
+        assert!(sent[2..=10].iter().all(|s| s[0] == proto::cmd::TRANSFER_BLOCK));
+        assert_eq!(&sent[12][4..8], &0x5a00_0301u32.to_le_bytes());
     }
 
     #[test]
@@ -770,9 +762,9 @@ mod tests {
             ack.clone(),
             flash_word,
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.sam4s_set_gpnvm(SAM4S_GPNVM_BOOT_FLASH).unwrap();
-        let sent = &dap.transport().sent;
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.sam4s_set_gpnvm(SAM4S_GPNVM_BOOT_FLASH).unwrap();
+        let sent = &target.inner().transport().sent;
         assert_eq!(&sent[0][4..8], &0x400e_0a04u32.to_le_bytes());
         assert_eq!(&sent[1][4..8], &0x5a00_010bu32.to_le_bytes());
         assert_eq!(&sent[4][4..8], &(0x0040_0000u32 + 512).to_le_bytes());
@@ -800,10 +792,10 @@ mod tests {
             ack.clone(),
             sam4s_ready_reply(),
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        let id = dap.sam4s_unique_id(SAM4S_EEFC0, SAM4S_FLASH0_BASE).unwrap();
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        let id = target.sam4s_unique_id(SAM4S_EEFC0, SAM4S_FLASH0_BASE).unwrap();
         assert_eq!(id, [0x11, 0x22, 0x33, 0x44]);
-        let sent = &dap.transport().sent;
+        let sent = &target.inner().transport().sent;
         assert_eq!(&sent[1][4..8], &0x5a00_000eu32.to_le_bytes());
         assert_eq!(&sent[4][4..8], &0x0040_0000u32.to_le_bytes());
         assert_eq!(&sent[13][4..8], &0x5a00_000fu32.to_le_bytes());
@@ -818,32 +810,32 @@ mod tests {
     #[test]
     fn sam3x_write_flash_fills_latch_ascending_then_ewp() {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let mut replies = Vec::new();
+        let mut replies = vec![ack.clone()];
         for &count in &[14u16, 14, 14, 14, 8] {
-            replies.push(ack.clone());
             replies.push(block_ack(count));
         }
         replies.push(ack.clone());
         replies.push(ack.clone());
         replies.push(ack.clone());
         replies.push(sam4s_ready_reply());
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.sam3x_write_flash(SAM3X_EEFC0, SAM3X_FLASH0_BASE, 3, &[0xcafe_babe]).unwrap();
-        let sent = &dap.transport().sent;
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.sam3x_write_flash(SAM3X_EEFC0, SAM3X_FLASH0_BASE, 3, &[0xcafe_babe]).unwrap();
+        let sent = &target.inner().transport().sent;
         assert_eq!(&sent[0][4..8], &(SAM3X_FLASH0_BASE + 3 * 256).to_le_bytes());
         assert_eq!(sent[1][0], proto::cmd::TRANSFER_BLOCK);
         assert_eq!(&sent[1][5..9], &0xcafe_babeu32.to_le_bytes());
         assert_eq!(&sent[1][9..13], &0xffff_ffffu32.to_le_bytes());
-        assert_eq!(&sent[11][4..8], &0x5a00_0303u32.to_le_bytes());
+        assert!(sent[2..=5].iter().all(|s| s[0] == proto::cmd::TRANSFER_BLOCK));
+        assert_eq!(&sent[7][4..8], &0x5a00_0303u32.to_le_bytes());
     }
 
     #[test]
     fn sam3x_erase_all_targets_the_named_controller() {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
         let replies = vec![ack.clone(), ack.clone(), ack.clone(), sam4s_ready_reply()];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.sam3x_erase_all(SAM3X_EEFC1).unwrap();
-        let sent = &dap.transport().sent;
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.sam3x_erase_all(SAM3X_EEFC1).unwrap();
+        let sent = &target.inner().transport().sent;
         assert_eq!(&sent[0][4..8], &(SAM3X_EEFC1 + 0x04).to_le_bytes());
         assert_eq!(&sent[1][4..8], &0x5a00_0005u32.to_le_bytes());
     }
@@ -852,9 +844,9 @@ mod tests {
     fn sam3x_set_gpnvm_drives_eefc0() {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
         let replies = vec![ack.clone(), ack.clone(), ack.clone(), sam4s_ready_reply()];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.sam3x_set_gpnvm(SAM3X_GPNVM_BOOT_FLASH).unwrap();
-        let sent = &dap.transport().sent;
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.sam3x_set_gpnvm(SAM3X_GPNVM_BOOT_FLASH).unwrap();
+        let sent = &target.inner().transport().sent;
         assert_eq!(&sent[0][4..8], &0x400e_0a04u32.to_le_bytes());
         assert_eq!(&sent[1][4..8], &0x5a00_010bu32.to_le_bytes());
     }
@@ -876,12 +868,12 @@ mod tests {
             ack.clone(),
             frr_word(1),
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        let descriptor = dap.sam3x_flash_descriptor(SAM3X_EEFC0).unwrap();
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        let descriptor = target.sam3x_flash_descriptor(SAM3X_EEFC0).unwrap();
         assert_eq!(
             descriptor,
             Sam3xFlashDescriptor { interface: 0x000f_0640, size: 262_144, page_size: 256, planes: 1 }
         );
-        assert_eq!(&dap.transport().sent[1][4..8], &0x5a00_0000u32.to_le_bytes());
+        assert_eq!(&target.inner().transport().sent[1][4..8], &0x5a00_0000u32.to_le_bytes());
     }
 }

@@ -24,5 +24,9 @@ usbbulk = ["dep:lamella-usbbulk"]
 test-util = []
 
 [dependencies]
+# The probe-neutral seam: this crate supplies the CMSIS-DAP implementation of `DapAccess`, and the
+# MEM-AP / Cortex-M logic above it lives once in `lamella-probe-core::ArmDap`, shared with every
+# other low-level probe family. Dependency-free and below us, so no cycle.
+lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-usbhid = { path = "../lamella-usbhid", optional = true }
 lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }

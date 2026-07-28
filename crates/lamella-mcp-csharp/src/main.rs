@@ -9,8 +9,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 /// The managed corlib bytes the in-process runner (LoopbackLink) executes against: `LAMELLA_CORLIB` if set,
-/// else the committed dev fixture (mirrors `LcscCompiler::discover`). A future rung embeds it via
-/// `include_bytes!` for a fully self-contained binary.
+/// else the committed dev fixture (mirrors `LcscCompiler::discover`).
 fn corlib_bytes() -> Result<Vec<u8>, String> {
     if let Some(path) = std::env::var_os("LAMELLA_CORLIB") {
         return std::fs::read(&path).map_err(|error| format!("LAMELLA_CORLIB: {error}"));

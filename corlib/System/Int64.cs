@@ -93,6 +93,7 @@ namespace System
             return result;
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string s, out long result)
         {
             result = 0;
@@ -124,5 +125,6 @@ namespace System
             result = value;
             return true;
         }
+#endif
     }
 }

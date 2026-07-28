@@ -1,5 +1,5 @@
-# BLOCK layout: the RP2040 subsystem resets block. Transcribed
-# from the retired v0 uart-rp2040.toml. PER-PERIPHERAL reset bit positions are instance
+# BLOCK layout: the RP2040 subsystem resets block.
+# PER-PERIPHERAL reset bit positions are per-instance
 # facts (`reset_bit` in ../instances.toml -- one legal home); this block carries
 # only the register geometry.
 
@@ -7,7 +7,7 @@
 kind = "block"
 family = "rp2040"
 block = "resets"
-sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 2.14 (RESETS) via the silicon-proven rp2040-serve UART path"]
+sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 2.14 (RESETS)"]
 notes = [
     "The chip's atomic register aliases apply: RESET at the CLR alias base (instances row `resets_clr`) is write-1-to-CLEAR -- clearing a bit releases the peripheral's reset.",
 ]
@@ -15,7 +15,7 @@ notes = [
 [registers.RESET]
 offset = 0x0
 width = 32
-notes = "1 = held in reset. Write through the resets_clr alias to release; the fields are the reset_bit rows."
+notes = "1 = held in reset. Write through the resets_clr alias to release; the fields are the instance rows' reset_bit values."
 
 [registers.RESET_DONE]
 offset = 0x8

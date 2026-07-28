@@ -25,6 +25,7 @@ namespace System.Net.Security
         private const int FlagDatesUnchecked = 1;
         private const int FlagChainErrors = 2;
         private const int FlagNameMismatch = 4;
+        private const int FlagReportPresent = 8;
 
         private Stream _inner;
         private bool _leaveInnerStreamOpen;
@@ -78,6 +79,10 @@ namespace System.Net.Security
             Handshake();
             int flags = TlsNative.SessionFlags(_tls);
             SslPolicyErrors errors = SslPolicyErrors.None;
+            if ((flags & FlagReportPresent) == 0)
+            {
+                errors |= SslPolicyErrors.RemoteCertificateChainErrors;
+            }
             if ((flags & (FlagDatesUnchecked | FlagChainErrors)) != 0)
             {
                 errors |= SslPolicyErrors.RemoteCertificateChainErrors;

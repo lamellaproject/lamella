@@ -24,6 +24,7 @@ lamella-elf = { path = "../lamella-elf" }
 
 [dev-dependencies]
 lamella-link = { path = "../lamella-link" }
+lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam" }
 lamella-usbhid = { path = "../lamella-usbhid" }
@@ -36,11 +37,12 @@ default = ["arm32"]
 arm32 = ["dep:lamella-asm-arm32"]
 riscv32 = ["dep:lamella-asm-riscv32"]
 wasm = ["dep:lamella-asm-wasm"]
-# String storage encoding (runtime's seam): UTF-16 by default. These switch the AOT string blob
-# and the op_Equality compare to UTF-8 (drops lone-surrogate parity) or surrogate-preserving
-# WTF-8. String.Length stays the UTF-16 unit count in all three. Mutually exclusive in intent;
-# string-utf8-wtf8 wins if both are set.
-string-utf16 = []
+# String storage encoding (runtime's seam): UTF-16 is the DEFAULT and has no feature of its own.
+# These switch the AOT string blob and the op_Equality compare to UTF-8 (drops lone-surrogate
+# parity) or surrogate-preserving WTF-8. String.Length stays the UTF-16 unit count in all three.
+# Mutually exclusive in intent; string-utf8-wtf8 wins if both are set.
+# UTF-16 is the default and is NOT spelled as a feature: cargo rejects an unknown name outright,
+# which is a louder failure than a knob that does nothing.
 string-utf8 = []
 string-utf8-wtf8 = []
 

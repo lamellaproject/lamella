@@ -1,5 +1,5 @@
 # PIN map: pin x function -> (instance, signal) for the RP2040.
-# PARTIAL, evidence-only: exactly the cells the in-tree boards bind. Function ids are
+# PARTIAL, evidence-only, exactly the cells the board packages bind. Function ids are
 # the datasheet's GPIO-function columns (F1..F9); GP<n> is the bank-less rp-family spelling.
 
 [table]
@@ -7,16 +7,16 @@ kind = "pins"
 family = "rp2040"
 sources = ["RP2040 datasheet 2.19.2 Table 283 (GPIO functions)"]
 
-
+[[pins]]
 pin = "GP0"
 function = "F2"
 instance = "uart0"
 signal = "tx"
-source = "RP2040 datasheet Table 283 (GP0 F2 = UART0 TX); silicon-proven by the rp2040-serve wire + the analyzer decode off the physical pin"
+source = "RP2040 datasheet Table 283 (GP0 F2 = UART0 TX)"
 
-
+[[pins]]
 pin = "GP1"
 function = "F2"
 instance = "uart0"
 signal = "rx"
-source = "RP2040 datasheet Table 283 (GP1 F2 = UART0 RX); silicon-proven by the rp2040-serve wire"
+source = "RP2040 datasheet Table 283 (GP1 F2 = UART0 RX)"

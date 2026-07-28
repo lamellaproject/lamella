@@ -27,6 +27,8 @@ finalizers = ["gc", "lamella-cil-runtime/finalizers"]
 float = ["lamella-cil-runtime/float"]
 # String storage encoding (default off = UTF-16; on = UTF-8). See lamella-cil-runtime.
 string-utf8 = ["lamella-cil-runtime/string-utf8"]
+# WTF-8 string storage (UTF-8's size, UTF-16's surrogate parity). See lamella-cil-runtime.
+string-utf8-wtf8 = ["lamella-cil-runtime/string-utf8-wtf8"]
 # Typed references (mkrefany / refanyval / refanytype). Off by default. See lamella-cil-runtime.
 typed-references = ["lamella-cil-runtime/typed-references"]
 # Varargs (the arglist opcode; shell only). Off by default. See lamella-cil-runtime.
@@ -58,6 +60,26 @@ flash-image = ["lamella-cil-runtime/flash-image"]
 # slice). Default (both off) = on_use lazy decode. See lamella-cil-runtime.
 code-preload = ["lamella-cil-runtime/code-preload"]
 code-in-place = ["lamella-cil-runtime/code-in-place", "flash-image"]
+# The corlib_resolution knob's non-default level -- a composable PEER of code_loading above, not a
+# level of it: code_loading picks how a METHOD BODY is represented, this picks how a submission's
+# corlib MEMBERS are resolved. Default (off) = EAGER: the whole corlib loads into RAM and a
+# submission binds against that resident module -- the host oracle, and right wherever RAM is ample.
+# lazy: resolve each member out of the corlib PE on demand, materializing only what a submission
+# actually reaches, which is a working set of kilobytes where the eager module is hundreds. The two
+# tiers are observationally identical BY DESIGN -- lazy is a strategy, never a
+# semantic -- so a submission must resolve to the same member either way.
+#
+# Lazy is only a win if the corlib PE is FLASH-RESIDENT: resolving out of a RAM copy of the corlib
+# would cost more than the eager module it replaces, i.e. the knob would silently do the opposite of
+# its purpose. Forwarding `flash-image` makes that structural rather than a documented hope, and the
+# `compile_error!` in lib.rs catches a build that turns it back off downstream -- fail the LINK, not
+# the RAM budget.
+corlib-lazy = ["flash-image"]
+
+[dev-dependencies]
+# The FAT backend (with the mkfs formatter) -- so a test can install a real RAM-disk StorageProvider
+# (MemoryBlockDevice + format + FatFs) and prove the mount-provider seam end to end over a real fs.
+lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }
 
 [lints]
 workspace = true

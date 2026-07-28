@@ -96,6 +96,16 @@ pub fn swj_clock(hz: u32) -> [u8; 5] {
 /// driving it low asserts reset (holds the core), high releases it.
 pub const PIN_NRESET: u8 = 1 << 7;
 
+/// The `DAP_SWJ_Pins` bit for SWCLK (TCK on a JTAG wire). Bit 0 in the CMSIS-DAP pin mask.
+pub const PIN_SWCLK: u8 = 1 << 0;
+
+/// The `DAP_SWJ_Pins` bit for SWDIO (TMS on a JTAG wire). Bit 1 in the CMSIS-DAP pin mask.
+///
+/// Useful in diagnostics because SWDIO is the only SWD signal that is BIDIRECTIONAL: driving it
+/// against a target's pull-up and reading the result back tests whether the probe's level shifters
+/// are actually driving, which no amount of reading alone can establish.
+pub const PIN_SWDIO: u8 = 1 << 1;
+
 /// Encodes `DAP_SWJ_Pins`: drive the pins named in `select` to the levels in `output`, then wait up
 /// to `wait_us` microseconds for them to settle (the reply reports the pins' resulting input levels).
 /// Used to release the nRESET a probe may assert on connect, so the core can run / be halted.

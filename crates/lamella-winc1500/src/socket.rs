@@ -114,8 +114,8 @@ pub fn connect_cmd(sock: i8, addr: &SockAddr, ssl_flags: u8, session: u16) -> [u
 /// `tstrConnectReply` (4 bytes): the socket, the firmware's error (0 = connected), and a final
 /// union field -- the app-data offset for send messages on success, an error-source/error-code
 /// pair on failure (19.7 layout). Opcode note: 19.7.3 firmware answers an SSL connect under
-/// [`CMD_SSL_CONNECT`] for success AND failure (silicon-verified both ways: error 0 with a real
-/// offset, and error -12 when the peer cannot complete TLS), while the 19.7.7-era reference
+/// [`CMD_SSL_CONNECT`] for success AND failure (error 0 with a real offset, and error -12 when
+/// the peer cannot complete TLS), while the 19.7.7-era reference
 /// notes later firmware reports successes under [`CMD_CONNECT`] -- a receiver should accept
 /// both opcodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +260,7 @@ impl AcceptReply {
 
 /// `tstrSendReply` (8 bytes): the socket, the byte count the firmware accepted (negative = a
 /// socket error), and the session echo. Opcode note: an SSL socket's ACCEPTED send answers
-/// under plain [`CMD_SEND`] (reply-opcode folding, silicon-verified) -- match send replies by
+/// under plain [`CMD_SEND`] (reply-opcode folding) -- match send replies by
 /// SOCKET, accepting the whole send-opcode trio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendReply {

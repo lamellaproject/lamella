@@ -11,8 +11,16 @@ description = "STMicroelectronics STM32 flash programming over a Lamella CMSIS-D
 workspace = true
 
 [dependencies]
+# The probe-neutral seam. These flash routines are written against `TargetAccess`, so they drive a
+# target through any probe family the seam supports, not just a CMSIS-DAP one.
+lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 
 [dev-dependencies]
+# Real ST-Link access for the examples -- the probe most STM32 boards ship with.
+lamella-stlink = { path = "../lamella-stlink" }
+# Probe discovery, so the same example can also run over CMSIS-DAP and prove the flash path is
+# probe-portable rather than merely claimed to be.
+lamella-probe = { path = "../lamella-probe" }
 # Real-probe HID access for the examples (native USB-HID; e.g. an MCU-Link Pro or Atmel-ICE).
 lamella-usbhid = { path = "../lamella-usbhid" }

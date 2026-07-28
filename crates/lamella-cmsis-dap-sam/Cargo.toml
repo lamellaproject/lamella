@@ -11,6 +11,9 @@ description = "Microchip SAM (ATSAMD21, ...) flash programming over the Lamella 
 workspace = true
 
 [dependencies]
+# The probe-neutral seam. These flash routines are written against `TargetAccess`, so they drive a
+# target through any probe family the seam supports, not just a CMSIS-DAP one.
+lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 
 [dev-dependencies]

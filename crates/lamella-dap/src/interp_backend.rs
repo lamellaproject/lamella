@@ -398,8 +398,7 @@ impl DebugBackend for InterpreterBackend {
         let new_value = match &current {
             Value::Object(reference) if self.vm.heap().as_string(*reference).is_some() => {
                 let text = strip_one_quote_pair(value);
-                let chars: Vec<u16> = text.encode_utf16().collect();
-                Value::Object(self.vm.heap_mut().alloc_string(&chars))
+                Value::Object(self.vm.heap_mut().alloc_text(text))
             }
             _ => parse_value(&current, value)?,
         };

@@ -1,0 +1,19 @@
+# PARTS table for the stm32l476 family. PARTIAL.
+#
+# ram: SRAM1 only (96 KB, RM0351 "96 Kbytes SRAM1 and 32 Kbyte SRAM2 on STM32L47x/L48x") --
+# the row states the CONTIGUOUS bank; the non-contiguous 32 KB SRAM2 at 0x10000000 joins
+# when the schema states banks and something consumes it. flash: 1 MB, consistent with
+# RM0351's "up to 1 Mbyte" line ceiling; the exact order-code confirmation is deferred to
+# the DS10198 memory table.
+
+[table]
+kind = "parts"
+family = "stm32l476"
+
+[[parts]]
+part = "stm32l476rg"
+package = "64-pin (order-code package suffix deferred to DS10198)"
+flash = 0x100000
+ram = 0x18000
+pins = ["PA2-PA3"]
+source = "RM0351 (SRAM1 96 KB / SRAM2 32 KB on L47x; flash up to 1 Mbyte) -- PARTIAL pin list: complete from DS10198 as bindings demand"

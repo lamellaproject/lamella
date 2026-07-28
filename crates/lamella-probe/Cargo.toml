@@ -13,11 +13,13 @@ workspace = true
 [features]
 default = []
 # Also discover CMSIS-DAP v2 probes (a WinUSB vendor-bulk interface) via lamella-usbbulk, not only
-# v1 HID. Off by default: the v1-HID path needs no extra transport, and v2 GUID-agnostic discovery
-# is a separate slice.
+# v1 HID. Off by default: the v1-HID path needs no extra transport.
 usbbulk = ["dep:lamella-usbbulk"]
 
 [dependencies]
+# The probe-neutral seam: examples drive a target through `TargetAccess` rather than through the
+# CMSIS-DAP type, so the same tool works against any probe family the seam supports.
+lamella-probe-core = { path = "../lamella-probe-core" }
 # The probe protocol (Dap<T: Transport>, DapError, DAP_Info). No transport features: this crate
 # supplies its own `Transport` over the concrete USB backends below.
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", default-features = false }

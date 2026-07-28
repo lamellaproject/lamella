@@ -1,0 +1,30 @@
+# INSTANCE map for the SAM E54 family -- identity-first: only the placed block copies
+# appear, bases-only. The E54's per-instance
+# clock routing (MCLK bank enables + GCLK peripheral channels) is richer than the SAMD21's;
+# its record shape is ruled with the family's first generated driver, not guessed here.
+
+[table]
+kind = "instances"
+family = "same54"
+record = ["base"]
+
+[[instances]]
+name = "mclk"
+block = "mclk"
+base = 0x40000800   # AHBMASK at +0x10 (0x40000810), APBCMASK at +0x1C;
+                    # APBBMASK at +0x18
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40001C00   # PCHCTRL[23] at 0x40001CDC = base + 0x80 + 4 * 23
+
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x41012000   # SERCOM2: PB25/PAD0, PB24/PAD1
+
+[[instances]]
+name = "gmac"
+block = "gmac"
+base = 0x42000800   # GMAC: the E54 Ethernet MAC

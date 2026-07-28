@@ -1,0 +1,19 @@
+# PARTS table for the SAM4S family. The pin
+# present-list is EMPTY (identity-first; no binding references a pin yet) and grows from
+# evidence as bindings land.
+#
+# flash = 0x200000 (2 MB): the ATSAM4SD32C is a DUAL-PLANE part -- 2 x 1 MB, one EEFC per
+# plane (eefc0/eefc1). The memory gate below holds the plane arithmetic together rather than
+# pretending the part is 1 MB.
+
+[table]
+kind = "parts"
+family = "sam4s"
+
+[[parts]]
+part = "atsam4sd32c"
+package = "LQFP"
+flash = 0x200000
+ram = 0x28000
+pins = []
+source = "ATSAM4SD32C datasheet (dual-plane 2 x 1 MB flash, 160 KB RAM)"

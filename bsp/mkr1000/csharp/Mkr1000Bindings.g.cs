@@ -7,6 +7,26 @@ namespace Lamella.Generated
 
         public const int BOARD_MODEL = 9;
 
+        public const uint WINC_SPI_SERCOM_BASE = 0x42001000;
+        public const uint WINC_SPI_IRQ = 11;
+        public const uint WINC_SPI_APBC_MASK = 0x10;
+        public const uint WINC_SPI_GCLK_CORE_ID = 22;
+        public const uint WINC_SPI_PMUX_MOSI_REG = 0x41004436;
+        public const uint WINC_SPI_PMUX_MOSI_SHIFT = 0;
+        public const uint WINC_SPI_PINCFG_MOSI_REG = 0x4100444C;
+        public const uint WINC_SPI_PMUX_SCK_REG = 0x41004436;
+        public const uint WINC_SPI_PMUX_SCK_SHIFT = 4;
+        public const uint WINC_SPI_PINCFG_SCK_REG = 0x4100444D;
+        public const uint WINC_SPI_PMUX_MISO_REG = 0x41004437;
+        public const uint WINC_SPI_PMUX_MISO_SHIFT = 4;
+        public const uint WINC_SPI_PINCFG_MISO_REG = 0x4100444F;
+        public const uint WINC_SPI_PMUX_FUNC = 2;
+        public const uint WINC_SPI_DOPO = 0;
+        public const uint WINC_SPI_DIPO = 3;
+        public const uint WINC_SPI_CS_PORT_BASE = 0x41004400;
+        public const uint WINC_SPI_CS_PIN = 14;
+        public const uint WINC_SPI_CS_MASK = 0x4000;
+
         public const uint WINC_RESET_N_PORT_BASE = 0x41004400;
         public const uint WINC_RESET_N_PIN = 27;
         public const uint WINC_RESET_N_MASK = 0x8000000;

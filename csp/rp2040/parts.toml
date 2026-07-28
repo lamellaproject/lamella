@@ -1,20 +1,20 @@
 # PARTS table for the rp2040 family. PARTIAL pin present-list
-# grown from silicon evidence only; complete from the datasheet pinout as bindings
-# demand rows (refuses a binding whose pin is absent here).
+#, grown from silicon evidence only; complete from the datasheet pinout as bindings
+# demand rows (a binding whose pin is absent here refuses).
 #
 # flash = 0: the RP2040 has NO internal flash -- code executes in place from an EXTERNAL QSPI
 # part through the XIP window, so a board's flash size is BOARD truth (its soldered chip),
-# not part truth. The linker-script gate therefore checks RAM against this row; the
-# board-flash cross-check is the posted amendment.
+# not part truth. The linker-script memory gate therefore checks RAM against this row; the
+# board-flash cross-check is the ratified board-memory amendment.
 
 [table]
 kind = "parts"
 family = "rp2040"
 
-
+[[parts]]
 part = "rp2040"
 package = "QFN-56"
 flash = 0
 ram = 0x42000
 pins = ["GP0", "GP1"]
-source = "RP2040 datasheet 2.6 (264 KB SRAM; proven by every serve boot at 0x20000000..0x20042000) + ch 1 (QFN-56, external QSPI flash) -- PARTIAL pin list: complete from the datasheet pinout as bindings demand"
+source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- PARTIAL pin list: complete from the datasheet pinout as bindings demand"

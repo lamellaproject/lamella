@@ -7,15 +7,15 @@ extern crate alloc;
 
 pub mod cil;
 pub mod debugmap;
+pub mod dwarf;
 pub mod resolver;
 pub mod target;
 
 mod regalloc;
 
-#[cfg(any(feature = "arm32", feature = "wasm"))]
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
 mod stringgen;
 
-#[cfg(any(feature = "arm32", feature = "riscv32"))]
 mod stackmaps;
 
 #[cfg(feature = "arm32")]

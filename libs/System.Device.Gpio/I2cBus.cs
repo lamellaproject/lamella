@@ -1,4 +1,6 @@
 // Lamella System.Device.I2c -- the dotnet/iot I2C API, in the System.Device.Gpio assembly.
+using Lamella.Hardware;
+
 namespace System.Device.I2c
 {
     /// <summary>An I2C bus communication channel that hands out per-device channels.</summary>
@@ -17,14 +19,13 @@ namespace System.Device.I2c
         /// releasing the address for a later <see cref="CreateDevice"/>.</summary>
         public abstract void RemoveDevice(int deviceAddress);
 
-        /// <summary>Creates a bus channel for <paramref name="busId"/> over
-        /// <paramref name="driver"/> (the explicit chip binding this tier uses in place of
-        /// a platform registry). The bus owns the driver; devices created from the bus
-        /// share it.</summary>
-        public static I2cBus Create(int busId, I2cDriver driver)
+        /// <summary>Creates a bus channel for <paramref name="busId"/>, over the driver the
+        /// board bound for that bus. Devices created from the bus share it.</summary>
+        /// <exception cref="System.InvalidOperationException">No driver is bound for
+        /// <paramref name="busId"/>.</exception>
+        public static I2cBus Create(int busId)
         {
-            if ((object)driver == null) throw new System.ArgumentNullException("driver");
-            return new DriverI2cBus(busId, driver);
+            return new DriverI2cBus(busId, Buses.ResolveI2c(busId));
         }
 
         /// <summary>Disposes this instance.</summary>

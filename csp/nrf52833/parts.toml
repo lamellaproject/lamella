@@ -1,0 +1,21 @@
+# PARTS table for the nrf52833 family. PARTIAL.
+#
+# part id: the family-generic chip name (the rp2040 precedent -- the vendor's part IS
+# nRF52833; the package variant letters follow from the datasheet when a binding needs them).
+# Sizes are PS-exact: "512 kB flash and 128 kB RAM" (4452_021 v1.7 front matter; the
+# INFO.FLASH/INFO.RAM enumerations state K512/K128).
+
+[table]
+kind = "parts"
+family = "nrf52833"
+
+[[parts]]
+part = "nrf52833"
+package = "aQFN73"
+flash = 0x80000
+ram = 0x20000
+pins = [
+    "P0.08", "P0.11", "P0.15", "P0.16", "P0.19", "P0.21",
+    "P0.22", "P0.24", "P0.28", "P0.30", "P0.31", "P1.05",
+]
+source = "nRF52833 PS 4452_021 v1.7 (512 kB flash / 128 kB RAM; INFO K512/K128). Partial pin list, grown as bindings demand."

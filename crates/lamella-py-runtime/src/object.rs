@@ -7821,8 +7821,8 @@ impl ObjectModel {
     }
 
     /// Selects the target board whose register map the gpio layer drives (`board.LED` resolution + the
-    /// drive/direction/clock registers). Set once by the deployment before running; Orthogonal to the
-    /// MMIO seam (which is host-sim vs on-device).
+    /// drive/direction/clock registers). Set once by the deployment before running.
+    /// Orthogonal to the MMIO seam (which is host-sim vs on-device).
     pub fn set_board(&mut self, board: crate::gpio::Board) {
         self.board = board;
     }

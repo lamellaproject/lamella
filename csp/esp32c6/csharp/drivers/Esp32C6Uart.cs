@@ -1,4 +1,4 @@
-// The ESP32-C6 HP-UART driver, in C# over Lamella.Hardware.Mmio
+// The ESP32-C6 HP-UART driver, in C# over Lamella.Hardware.Mmio -- ONE driver for every HP
 using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;

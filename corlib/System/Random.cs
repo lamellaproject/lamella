@@ -57,16 +57,19 @@ namespace System
             return retVal;
         }
 
+#if LAMELLA_SURFACE_FLOAT
         protected virtual double Sample()
         {
             return InternalSample() * (1.0 / MBIG);
         }
+#endif
 
         public virtual int Next()
         {
             return InternalSample();
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public virtual int Next(int maxValue)
         {
             return (int)(Sample() * maxValue);
@@ -82,5 +85,6 @@ namespace System
         {
             return Sample();
         }
+#endif
     }
 }

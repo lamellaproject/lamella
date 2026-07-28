@@ -5,8 +5,14 @@ namespace Lamella.Generated
     {
         private Samd21PortLayout() { }
 
+        public const uint DIR_OFF = 0x0;
+        public const int DIR_WIDTH = 32;
+        public const uint DIRCLR_OFF = 0x4;
+        public const int DIRCLR_WIDTH = 32;
         public const uint DIRSET_OFF = 0x8;
         public const int DIRSET_WIDTH = 32;
+        public const uint OUT_OFF = 0x10;
+        public const int OUT_WIDTH = 32;
         public const uint OUTCLR_OFF = 0x14;
         public const int OUTCLR_WIDTH = 32;
         public const uint OUTSET_OFF = 0x18;
@@ -18,8 +24,14 @@ namespace Lamella.Generated
         public const uint PINCFG0_OFF = 0x40;
         public const int PINCFG0_WIDTH = 8;
 
+        public const uint DIR_DIR = 0xFFFFFFFF;
+        public const uint DIR_DIR_LSB = 0;
+        public const uint DIRCLR_DIRCLR = 0xFFFFFFFF;
+        public const uint DIRCLR_DIRCLR_LSB = 0;
         public const uint DIRSET_DIRSET = 0xFFFFFFFF;
         public const uint DIRSET_DIRSET_LSB = 0;
+        public const uint OUT_OUT = 0xFFFFFFFF;
+        public const uint OUT_OUT_LSB = 0;
         public const uint OUTCLR_OUTCLR = 0xFFFFFFFF;
         public const uint OUTCLR_OUTCLR_LSB = 0;
         public const uint OUTSET_OUTSET = 0xFFFFFFFF;

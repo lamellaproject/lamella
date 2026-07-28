@@ -199,6 +199,22 @@ pub mod session_flag {
     /// [`super::VerifyMode::Report`] found the peer certificate valid for some name(s) but NOT
     /// the requested hostname. Managed maps this to `RemoteCertificateNameMismatch`.
     pub const NAME_MISMATCH: i32 = 1 << 2;
+    /// This integer IS a trust report the engine produced -- as opposed to the absence of one.
+    ///
+    /// Every other bit is a FINDING, so their absence reads as "nothing to flag", and a clean
+    /// handshake therefore has to be representable as a value with no findings set. That makes plain
+    /// `0` ambiguous in the one direction that matters: it is equally "the engine checked and found
+    /// nothing" and "no engine answered at all". The managed `SslStream` cannot tell those apart, and
+    /// the unsafe reading is the one it would take -- `SslPolicyErrors.None`, which skips the
+    /// no-callback path's fail-closed throw and hands a validation callback a clean bill for a
+    /// certificate nobody inspected.
+    ///
+    /// A backend that produces a report sets this bit even when the report is empty; managed treats
+    /// its ABSENCE as `RemoteCertificateChainErrors`, because a build that cannot obtain a trust
+    /// report must not claim the chain was checked. The seam this defends is
+    /// `TlsNative::SessionFlags`, whose `[RuntimeProvided]` placeholder answers `0` when the
+    /// intrinsic is compiled out -- so the failure is fail-CLOSED rather than fail-open.
+    pub const REPORT_PRESENT: i32 = 1 << 3;
 }
 
 /// The state of a TLS session as the pump advances it. The managed side maps these to the integers
@@ -296,10 +312,15 @@ pub trait TlsBackend: core::fmt::Debug {
     fn peer_cert(&mut self, tls: TlsHandle, out: &mut [u8]) -> usize;
 
     /// The post-handshake [`session_flag`] bits for the session: trust caveats the engine TOLERATED
-    /// under a capability knob (rather than rejecting), which the managed side surfaces. `0` = a clean
-    /// handshake with nothing to flag. Defaults to `0` for a backend with no such tolerances.
+    /// under a capability knob (rather than rejecting), which the managed side surfaces.
+    ///
+    /// A backend that answers at all MUST set [`session_flag::REPORT_PRESENT`], including when it has
+    /// nothing to flag -- managed reads its absence as "no trust report was obtainable" and fails
+    /// closed. So a clean handshake is `REPORT_PRESENT`, not `0`; plain `0` is reserved for "no
+    /// report", which is what an unsynthesized `TlsNative::SessionFlags` placeholder answers.
+    /// Defaults to a clean report for a backend with no such tolerances.
     fn session_flags(&mut self, _tls: TlsHandle) -> i32 {
-        0
+        session_flag::REPORT_PRESENT
     }
 
     /// Like [`TlsBackend::client_config`] but the configuration OFFERS `alpn` (each entry one

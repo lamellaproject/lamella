@@ -121,7 +121,8 @@ impl<T: Transport> WchLink<T> {
 
     /// Flashes `image` to `chip` at `address`, then resets the target so it runs the new image -- the
     /// full WCH-LinkE native fast-program sequence (set family speed, attach, erase, stream the RAM
-    /// flash-loader and the image, reset-and-run, detach).
+    /// flash-loader and the image, reset-and-run, detach). `address` is usually
+    /// [`ChipFlash::code_flash_start`].
     pub fn flash(&mut self, chip: &ChipFlash, image: &[u8], address: u32) -> Result<(), WchError> {
         self.set_speed(chip.riscvchip, proto::SPEED_HIGH)?;
         self.attach()?;

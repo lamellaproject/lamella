@@ -46,6 +46,23 @@ pub const STACKMAP_KIND_PINNED: u16 = 2;
 /// the C# lane; the Python lowering's `PyValue` slots take it).
 pub const STACKMAP_KIND_TAGGED: u16 = 3;
 
+/// The sentinel `ValueType` layout handle marking a one-word ObjectRef CELL: an ADDRESS-taken
+/// reference local, memory-homed so `&local` is a real pointer (a `ref`/`out` reference parameter),
+/// whose word is STILL enumerated as an `ObjectRef` GC root. A reference stored in a bare value-type
+/// cell is invisible to the type-keyed root walk (both the entry zero-init and `method_record_roots`
+/// key on `is_gc_reference()`), so the sentinel lets those two predicates recognize the cell and
+/// treat its word as an object reference. Chosen outside the metadata-token space (no type token is
+/// `0xFFFF_FFFF` -- the table is the high byte, `0x00..=0x2B`) and distinct from a plain scalar
+/// cell's `TypeHandle(0)`. A stack cell never gets a descriptor, so the handle is never looked up for
+/// layout -- `InitStruct`/`FieldLoad`/`FieldStore`/`FieldAddr` are all size/offset-based.
+pub(crate) const REF_CELL_HANDLE: lamella_ir::TypeHandle = lamella_ir::TypeHandle(0xFFFF_FFFF);
+
+/// Whether `ty` is a [`REF_CELL_HANDLE`] reference cell -- a memory-homed reference local whose word
+/// the GC must trace as an object reference. Used by the entry zero-init and the root record builder.
+pub(crate) fn is_ref_cell(ty: MirType) -> bool {
+    matches!(ty, MirType::ValueType { handle, .. } if handle == REF_CELL_HANDLE)
+}
+
 /// The runtime-support seams a green thread can be switched away inside (or a collection can run
 /// inside): the ANCHOR-writing externs. A frame that passes a `RefToInt`-derived raw pointer into
 /// one of these can be parked there arbitrarily long, so the source ObjectRef's slot is emitted
@@ -70,7 +87,7 @@ pub(crate) const ANCHOR_SEAM_EXTERNS: &[&str] = &[
     "lamella_gc_count_roots",
 ];
 
-/// One assembly's static region as the OBJECT path emits it (#15): the linker-placed region
+/// One assembly's static region as the OBJECT path emits it: the linker-placed region
 /// symbol's identity, its byte size, and its GLOBAL-roots (mode 2) stack-map record rows. The
 /// region has NO fixed address -- every `ldsfld`/`stsfld` and the record's base word carry
 /// relocations against `__lamella_statics_<suffix>`, and `lamella-link` places the region in a RAM

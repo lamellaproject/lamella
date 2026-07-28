@@ -5,8 +5,12 @@ namespace Lamella.Runtime
     {
         private Clock() { }
 
-        [Lamella.Runtime.RuntimeProvided] public static void SetTicks(long utcTicks) { }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        public static void SetTicks(long utcTicks) { }
 
-        [Lamella.Runtime.RuntimeProvided] public static bool IsSet() { return false; }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        public static bool IsSet() { return false; }
     }
 }

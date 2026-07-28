@@ -1,10 +1,7 @@
 # The SAM W25 Xplained Pro: carries the ATSAMW25 module (csp/atsamw25/ -- a SAMD21G18A
 # host + WINC1500, module wiring inherited from module.toml). Its EDBG VCP is SERCOM4 on
-# PB10/PB11, pinmux function D -- a MEASURED board fact (SERCOM3 transmitted with nothing
-# crossing the EDBG; a host feeding the VCP wiggles PB11, not PA23). NOTE the provenance
-# correction: SERCOM3/PA22-23 is not "the user guide's error" -- it
-# is the PLAIN D21 XPro's silicon-proven VCP (bsp/samd21-xpro/); the historical note conflated
-# the two boards' user guides.
+# PB10/PB11, pinmux function D: SERCOM3 transmits with nothing crossing the EDBG, and a host
+# feeding the VCP wiggles PB11, not PA23.
 
 [table]
 kind = "board"
@@ -12,18 +9,19 @@ board = "samw25-xpro"
 module = "atsamw25"
 board_model = 6
 sources = [
-    "silicon-proven: samd21-serve uart_init drives SERCOM4/PB10/PB11 on this board every boot; its greeting crosses the EDBG VCP at 115200-8N1 (measured wiring)",
-    "SAM W25 Xplained Pro user guide 42463A (kit identity; VCP table superseded by the measurement above)",
+    "SAM W25 Xplained Pro user guide 42463A (kit identity); the VCP routing is this board's own SERCOM4/PB10/PB11 wiring, which supersedes that guide's VCP table",
 ]
 
-[carrier]
+[[carriers]]
 kind = "edbg-vcp"
 usb_vid = 0x03EB
 usb_pid = 0x2111
 role = "vcp"
 baud = 115200
+plan = "osc8m-8mhz"
+default = true
 
-
+[[bindings]]
 role = "vcp"
 kind = "uart"
 instance = "sercom4"
@@ -32,13 +30,13 @@ gclk_gen = 0
 tx = { pin = "PB10", pad = 2 }
 rx = { pin = "PB11", pad = 3 }
 
-
+[[plans]]
 name = "osc8m-8mhz"
 default = true
 source = "osc8m"
 gclk0_hz = 8000000
 
-
+[[plans]]
 name = "usb-48mhz"
 source = "dfll48m-usb-recovery"
 gclk1_hz = 48000000

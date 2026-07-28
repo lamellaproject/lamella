@@ -74,7 +74,7 @@ impl<S: SpiBus, C: WincControl> Winc1500<S, C> {
     /// Powers the module up and brings the SPI protocol to its CRC-less operating state: the
     /// vendor power-up sequence (CHIP_EN low + RESET_N low, 1 ms; CHIP_EN high, 10 ms; RESET_N
     /// high, then a settle) followed by the protocol-config handshake. After this, registers are
-    /// readable -- the firmware boot (HIF) is a later slice.
+    /// readable. This does NOT boot the firmware (HIF); registers only.
     pub fn start(&mut self) -> Result<(), spi::SpiError> {
         self.ctrl.set_chip_enable(false);
         self.ctrl.set_reset(true);

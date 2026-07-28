@@ -1,7 +1,7 @@
-# The SAMD21 parts table: the orderable parts the in-tree boards carry. Pin lists are
-# PARTIAL present-lists: they carry the silicon-evidenced pins the
-# boards bind today, so validates every current binding; completing each list is a
-# datasheet-open transcription task (DS40001882 ch 5 pinouts).
+# The SAMD21 parts table. Pin lists are PARTIAL present-lists: they carry the pins the
+# boards bind today, so validation covers every current binding; completing each list is a
+# transcription task from the datasheet (DS40001882 ch 5 pinouts), never a
+# from-recall transcription.
 
 [table]
 kind = "parts"
@@ -10,18 +10,18 @@ sources = [
     "SAMD21 datasheet DS40001882: ch 5 (pinouts per package), ch 10 (memories)",
 ]
 
-
+[[parts]]
 part = "atsamd21g18a"
 package = "48-pin"
 flash = 0x40000
 ram = 0x8000
-pins = ["PA12-PA15", "PA22-PA23", "PA27-PA28", "PB09-PB11", "PB22-PB23"]
-source = "DS40001882 ch 5 (48-pin) -- PARTIAL: the listed pins are silicon-evidenced by the W25/Zero/MKR1000 wirings; complete the list from the datasheet before authoring bindings on other pins"
+pins = ["PA06", "PA08", "PA12-PA15", "PA17", "PA21-PA23", "PA27-PA28", "PB09-PB11", "PB22-PB23"]
+source = "DS40001882 ch 5 (48-pin) -- PARTIAL present-list; complete from the datasheet before authoring bindings on other pins. PA06 (48-pin pin 11) and PA17 (48-pin pin 26) added from the ch 7 I/O multiplexing table. PA08 (pin 13) and PA21 (pin 30) added the same way, and cross-checked against the 48-pin package pinout itself -- which is distinguishable from the 64-pin one because the 64-pin carries PB12-PB15 and the 48-pin does not."
 
-
+[[parts]]
 part = "atsamd21j18a"
 package = "64-pin"
 flash = 0x40000
 ram = 0x8000
 pins = ["PA22-PA23"]
-source = "DS40001882 ch 5 (64-pin) -- PARTIAL: silicon-evidenced by the SAM D21 XPro VCP; complete from the datasheet before authoring further XPro bindings"
+source = "DS40001882 ch 5 (64-pin) -- PARTIAL present-list; complete from the datasheet before authoring further bindings."

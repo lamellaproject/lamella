@@ -33,20 +33,24 @@ namespace System
         public int Seconds { get { return (int)((_ticks / TicksPerSecond) % 60); } }
         public int Milliseconds { get { return (int)((_ticks / TicksPerMillisecond) % 1000); } }
 
+#if LAMELLA_SURFACE_FLOAT
         public double TotalDays { get { return (double)_ticks / (double)TicksPerDay; } }
         public double TotalHours { get { return (double)_ticks / (double)TicksPerHour; } }
         public double TotalMinutes { get { return (double)_ticks / (double)TicksPerMinute; } }
         public double TotalSeconds { get { return (double)_ticks / (double)TicksPerSecond; } }
         public double TotalMilliseconds { get { return (double)_ticks / (double)TicksPerMillisecond; } }
+#endif
 
         public TimeSpan Add(TimeSpan ts) { return new TimeSpan(_ticks + ts._ticks); }
         public TimeSpan Subtract(TimeSpan ts) { return new TimeSpan(_ticks - ts._ticks); }
 
+#if LAMELLA_SURFACE_FLOAT
         public static TimeSpan FromMilliseconds(double value) { return new TimeSpan((long)(value * (double)TicksPerMillisecond)); }
         public static TimeSpan FromSeconds(double value) { return new TimeSpan((long)(value * (double)TicksPerSecond)); }
         public static TimeSpan FromMinutes(double value) { return new TimeSpan((long)(value * (double)TicksPerMinute)); }
         public static TimeSpan FromHours(double value) { return new TimeSpan((long)(value * (double)TicksPerHour)); }
         public static TimeSpan FromDays(double value) { return new TimeSpan((long)(value * (double)TicksPerDay)); }
+#endif
 
         public static TimeSpan FromTicks(long value) { return new TimeSpan(value); }
 

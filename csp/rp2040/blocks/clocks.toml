@@ -1,12 +1,11 @@
 # BLOCK layout: the RP2040 clocks block -- the one register the proven UART path touches
-# (; the full CLK_* map grows with its consumers,). Transcribed
-# from the retired v0 uart-rp2040.toml.
+# (the full CLK_* map grows with its consumers).
 
 [table]
 kind = "block"
 family = "rp2040"
 block = "clocks"
-sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 2.15 (clocks) via the silicon-proven rp2040-serve UART path"]
+sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 2.15 (clocks)"]
 notes = [
     "clk_peri is OFF at reset and has no glitchless mux: disable it, select the aux source, then re-enable (safe whatever a resident firmware left configured).",
 ]

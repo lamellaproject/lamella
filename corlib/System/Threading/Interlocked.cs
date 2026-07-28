@@ -8,7 +8,9 @@ namespace System.Threading
 
         public static int Increment(ref int location) { location = location + 1; return location; }
         public static int Decrement(ref int location) { location = location - 1; return location; }
+#if LAMELLA_SURFACE_NETFX_2_0
         public static int Add(ref int location, int value) { location = location + value; return location; }
+#endif
 
         public static int Exchange(ref int location, int value)
         {
@@ -24,6 +26,7 @@ namespace System.Threading
             return original;
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static long Increment(ref long location) { location = location + 1; return location; }
         public static long Decrement(ref long location) { location = location - 1; return location; }
         public static long Add(ref long location, long value) { location = location + value; return location; }
@@ -41,6 +44,7 @@ namespace System.Threading
             if (original == comparand) location = value;
             return original;
         }
+#endif
     }
 }
 #endif

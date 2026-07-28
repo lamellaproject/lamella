@@ -104,10 +104,7 @@ namespace System
 
         public static void Copy(Array sourceArray, Array destinationArray, int length)
         {
-            for (int i = 0; i < length; i++)
-            {
-                destinationArray.SetValue(sourceArray.GetValue(i), i);
-            }
+            Copy(sourceArray, 0, destinationArray, 0, length);
         }
 
         public static void Copy(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
@@ -119,7 +116,9 @@ namespace System
             if (length < 0) throw new ArgumentOutOfRangeException("length");
             if (sourceIndex > sourceArray.Length - length) throw new ArgumentException("sourceArray");
             if (destinationIndex > destinationArray.Length - length) throw new ArgumentException("destinationArray");
-            if ((object)sourceArray == (object)destinationArray && destinationIndex > sourceIndex)
+            if (CopyCore(sourceArray, sourceIndex, destinationArray, destinationIndex, length)) return;
+            bool backward = (object)sourceArray == (object)destinationArray && destinationIndex > sourceIndex;
+            if (backward)
             {
                 for (int i = length - 1; i >= 0; i--)
                     destinationArray.SetValue(sourceArray.GetValue(sourceIndex + i), destinationIndex + i);
@@ -130,6 +129,9 @@ namespace System
                     destinationArray.SetValue(sourceArray.GetValue(sourceIndex + i), destinationIndex + i);
             }
         }
+
+        [Lamella.Runtime.RuntimeProvided]
+        private static bool CopyCore(Array source, int sourceIndex, Array destination, int destinationIndex, int length) { return false; }
 
         public static void Clear(Array array, int index, int length)
         {

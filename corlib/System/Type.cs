@@ -3,6 +3,7 @@ namespace System
 {
     public class Type : System.Reflection.MemberInfo
     {
+#if LAMELLA_SURFACE_REFLECTION
         public string FullName
         {
             [Lamella.Runtime.RuntimeProvided] get { return null; }
@@ -141,6 +142,8 @@ namespace System
             for (int i = 0; i < count; i++) result[i] = GetEvent(names[i]);
             return result;
         }
+
+#endif
 
         [Lamella.Runtime.RuntimeProvided] public static Type GetTypeFromHandle(RuntimeTypeHandle handle) { return null; }
 

@@ -1,4 +1,6 @@
 // Lamella System.Device.Spi -- the dotnet/iot SPI API, in the System.Device.Gpio assembly.
+using Lamella.Hardware;
+
 namespace System.Device.Spi
 {
     /// <summary>The communications channel to a device on a SPI bus.</summary>
@@ -30,14 +32,16 @@ namespace System.Device.Spi
         public abstract void TransferFullDuplex(byte[] writeBuffer, byte[] readBuffer);
 
         /// <summary>Creates a communications channel to the device described by
-        /// <paramref name="settings"/> over <paramref name="driver"/> (the explicit chip
-        /// binding this tier uses in place of a platform registry). Configures the driver
-        /// with a private copy of the settings; the device owns the driver.</summary>
-        public static SpiDevice Create(SpiConnectionSettings settings, SpiDriver driver)
+        /// <paramref name="settings"/>, over the driver the board bound for
+        /// <see cref="SpiConnectionSettings.BusId"/>. Configures that driver with a private copy
+        /// of the settings. The driver is shared by every device on the bus, so disposing this
+        /// device does not dispose it.</summary>
+        /// <exception cref="System.InvalidOperationException">No driver is bound for the
+        /// settings' bus.</exception>
+        public static SpiDevice Create(SpiConnectionSettings settings)
         {
             if ((object)settings == null) throw new System.ArgumentNullException("settings");
-            if ((object)driver == null) throw new System.ArgumentNullException("driver");
-            return new DriverSpiDevice(settings.Clone(), driver);
+            return new DriverSpiDevice(settings.Clone(), Buses.ResolveSpi(settings.BusId), false);
         }
 
         /// <summary>Disposes this instance.</summary>
@@ -56,13 +60,15 @@ namespace System.Device.Spi
     {
         private readonly SpiConnectionSettings _settings;
         private readonly SpiDriver _driver;
+        private readonly bool _ownsDriver;
         private readonly byte[] _oneOut;
         private readonly byte[] _oneIn;
 
-        internal DriverSpiDevice(SpiConnectionSettings settings, SpiDriver driver)
+        internal DriverSpiDevice(SpiConnectionSettings settings, SpiDriver driver, bool ownsDriver)
         {
             _settings = settings;
             _driver = driver;
+            _ownsDriver = ownsDriver;
             _oneOut = new byte[1];
             _oneIn = new byte[1];
             driver.Configure(settings);
@@ -71,6 +77,11 @@ namespace System.Device.Spi
         public override SpiConnectionSettings ConnectionSettings
         {
             get { return _settings.Clone(); }
+        }
+
+        internal uint NativeBusIdentity
+        {
+            get { return _driver.NativeBusIdentity; }
         }
 
         public override void Read(byte[] buffer)
@@ -129,7 +140,7 @@ namespace System.Device.Spi
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            if (disposing && _ownsDriver)
             {
                 _driver.Dispose();
             }

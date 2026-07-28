@@ -29,8 +29,8 @@ public sealed class Samd21Uart
     /// <summary>Brings the bound SERCOM up as a USART at the binding's rate, 8N1 LSB-first:
     /// gates the APB clock, routes the core clock per the binding's composed GCLK word, muxes
     /// the TX/RX pins (RX input buffer ON), configures, then enables -- each enable-protected
-    /// write waiting out its SYNCBUSY bit. Idempotent -- safe over a SERCOM the serve already
-    /// configured.</summary>
+    /// write waiting out its SYNCBUSY bit. Idempotent -- safe over a SERCOM the resident
+    /// firmware already configured.</summary>
     public void Init()
     {
         uint apbcmask = Samd21Instances.PM_BASE + Samd21PmLayout.APBCMASK_OFF;

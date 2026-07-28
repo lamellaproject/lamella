@@ -306,10 +306,56 @@ pub type IntrinsicFn = fn(&mut Vm, &Module, &[Value]) -> Result<Option<Value>, T
 /// `code-preload` decodes it at load and keeps only the image.
 #[cfg(not(feature = "flash-image"))]
 pub type RawCil = Box<[u8]>;
-/// The `flash-image` (XIP) form: a `&'static` borrow of the flash-resident PE, so the raw CIL costs
-/// no RAM. See the owned default above for the full rationale.
+/// The `flash-image` (XIP) form: WHERE the PE lives, decided PER LOAD rather than per build.
+///
+/// A deployed image is flash-resident, so its CIL is borrowed and costs no RAM -- the whole point of
+/// XIP. A REPL delta, though, arrives over the wire INTO RAM, and a build-wide `&'static` obliged
+/// every such load to LEAK its PE simply to manufacture that lifetime. Making residence a property
+/// of the value lets both coexist: the flash arm still borrows, and the RAM arm owns its bytes, so
+/// they are freed with the module that holds them.
 #[cfg(feature = "flash-image")]
-pub type RawCil = &'static [u8];
+#[derive(Clone)]
+pub enum RawCil {
+    /// A borrow of the flash-resident PE (a deployed image): costs no RAM.
+    Flash(&'static [u8]),
+    /// A PE that arrived into RAM (a REPL delta): owned, and dropped with its module.
+    Ram(Box<[u8]>),
+}
+
+#[cfg(feature = "flash-image")]
+impl core::ops::Deref for RawCil {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            RawCil::Flash(bytes) => bytes,
+            RawCil::Ram(bytes) => bytes,
+        }
+    }
+}
+
+#[cfg(feature = "flash-image")]
+impl RawCil {
+    /// The `offset .. offset + len` sub-range, KEEPING the value's residence. A flash borrow narrows
+    /// to a smaller borrow and still costs no RAM. A RAM value COPIES the range out -- which is the
+    /// point: once each method holds its own code bytes, the PE they were cut from (metadata and
+    /// all) can be dropped, so a delta costs its code rather than its whole image.
+    ///
+    /// A range outside the bytes yields an empty borrow, matching how a malformed body degrades
+    /// elsewhere -- the first fetch then traps rather than reading something else's code.
+    fn sub_range(&self, offset: usize, len: usize) -> RawCil {
+        let end = offset.checked_add(len);
+        match self {
+            RawCil::Flash(bytes) => {
+                RawCil::Flash(end.and_then(|end| bytes.get(offset..end)).unwrap_or(&[]))
+            }
+            RawCil::Ram(bytes) => match end.and_then(|end| bytes.get(offset..end)) {
+                Some(range) => RawCil::Ram(range.to_vec().into_boxed_slice()),
+                None => RawCil::Flash(&[]),
+            },
+        }
+    }
+}
 
 /// A managed method's body storage -- the one place the `code_loading` knob changes representation,
 /// chosen at build time so the per-instruction fetch carries no runtime branch and every
@@ -334,10 +380,12 @@ pub struct ManagedBody {
     raw_il: RawCil,
     #[cfg(all(not(feature = "code-preload"), not(feature = "code-in-place")))]
     decoded: OnceCell<MethodBodyImage>,
-    /// The method's instruction bytes in the flash-resident PE (the `code-in-place` XIP form):
-    /// header stripped, decoded per step, never resident.
+    /// The method's instruction bytes (the `code-in-place` XIP form): header stripped, decoded one
+    /// instruction per step. A flash-resident load BORROWS them, so nothing is resident; a RAM load
+    /// (a REPL delta) owns a copy of just this method's code range, which is what lets the delta PE
+    /// it came from -- metadata included -- be freed as soon as loading is done.
     #[cfg(feature = "code-in-place")]
-    code: &'static [u8],
+    code: RawCil,
     /// The method's exception clauses with BYTE-OFFSET regions (the form the file encodes), the
     /// only resident remnant of the body -- empty for the typical unprotected method.
     #[cfg(feature = "code-in-place")]
@@ -364,15 +412,13 @@ impl ManagedBody {
         }
         #[cfg(feature = "code-in-place")]
         {
-            match read_body_layout(raw_il) {
+            match read_body_layout(&raw_il) {
                 Ok(layout) => ManagedBody {
-                    code: raw_il
-                        .get(layout.code_offset..layout.code_offset + layout.code_len)
-                        .unwrap_or(&[]),
+                    code: raw_il.sub_range(layout.code_offset, layout.code_len),
                     handlers: layout.handlers.into_boxed_slice(),
                 },
                 Err(_) => ManagedBody {
-                    code: &[],
+                    code: RawCil::Flash(&[]),
                     handlers: Box::new([]),
                 },
             }
@@ -392,15 +438,15 @@ impl ManagedBody {
             #[cfg(not(feature = "flash-image"))]
             let raw_il: RawCil = Vec::new().into_boxed_slice();
             #[cfg(feature = "flash-image")]
-            let raw_il: RawCil = &[];
+            let raw_il: RawCil = RawCil::Flash(&[]);
             ManagedBody { raw_il, decoded }
         }
         #[cfg(feature = "code-in-place")]
         {
             match write_method_body(&image) {
-                Ok(bytes) => ManagedBody::from_raw(Box::leak(bytes.into_boxed_slice())),
+                Ok(bytes) => ManagedBody::from_raw(RawCil::Ram(bytes.into_boxed_slice())),
                 Err(_) => ManagedBody {
-                    code: &[],
+                    code: RawCil::Flash(&[]),
                     handlers: Box::new([]),
                 },
             }
@@ -423,10 +469,13 @@ impl ManagedBody {
         }
     }
 
-    /// The flash-resident instruction bytes the interpreter decodes per step (byte-offset ip).
+    /// The instruction bytes the interpreter decodes per step (byte-offset ip). Tied to `&self`
+    /// rather than `'static`: the interpreter re-derives this slice from the module on every step,
+    /// so it never needed the longer lifetime, and requiring it is what forced a RAM-resident load
+    /// to leak.
     #[cfg(feature = "code-in-place")]
-    fn code(&self) -> &'static [u8] {
-        self.code
+    fn code(&self) -> &[u8] {
+        &self.code
     }
 
     /// The exception clauses, regions in BYTE offsets -- directly comparable to the byte ip.
@@ -3159,12 +3208,16 @@ impl Module {
         }
     }
 
-    /// The flash-resident instruction bytes of a managed method (the `code-in-place` fetch source:
-    /// decoded one instruction per step, ip in byte offsets), or `None` for an intrinsic or unknown
-    /// method.
+    /// The instruction bytes of a managed method (the `code-in-place` fetch source: decoded one
+    /// instruction per step, ip in byte offsets), or `None` for an intrinsic or unknown method.
+    ///
+    /// Borrowed from the module rather than `'static`. A flash-resident load's bytes do outlive it,
+    /// but a RAM-resident one's (a REPL delta) do not, and demanding `'static` here is what obliged
+    /// such a load to leak its PE. The interpreter re-derives this slice from the module on every
+    /// step, so the shorter lifetime costs it nothing.
     #[must_use]
     #[cfg(feature = "code-in-place")]
-    pub fn method_code_bytes(&self, id: MethodId) -> Option<&'static [u8]> {
+    pub fn method_code_bytes(&self, id: MethodId) -> Option<&[u8]> {
         if let Some(baked) = &self.baked {
             let (kind, _, code_offset, code_len, ..) = self.baked_record(id)?;
             if kind != 0 {
@@ -3721,7 +3774,15 @@ impl Module {
                     | Opcode::ConvR4
                     | Opcode::ConvR8
                     | Opcode::ConvRUn
-                    | Opcode::Ckfinite => !cfg!(feature = "float"),
+                    | Opcode::Ckfinite
+                    | Opcode::LdindR4
+                    | Opcode::LdindR8
+                    | Opcode::StindR4
+                    | Opcode::StindR8
+                    | Opcode::LdelemR4
+                    | Opcode::LdelemR8
+                    | Opcode::StelemR4
+                    | Opcode::StelemR8 => !cfg!(feature = "float"),
                     Opcode::Throw
                     | Opcode::Rethrow
                     | Opcode::Leave
@@ -3791,16 +3852,16 @@ impl Module {
     ) {
         let kept_method =
             |handle_map: &BTreeMap<u64, MethodId>, handle: u64| handle_map.contains_key(&handle);
-        let empty_raw: RawCil = &[];
+        let empty_raw: RawCil = RawCil::Flash(&[]);
         for (id, method) in self.methods.iter_mut().enumerate() {
             if keep_method.get(id).copied().unwrap_or(false) {
                 continue;
             }
             match method {
-                Method::Managed { body, .. } => *body = ManagedBody::from_raw(empty_raw),
+                Method::Managed { body, .. } => *body = ManagedBody::from_raw(empty_raw.clone()),
                 Method::Intrinsic { arg_count, .. } => {
                     *method = Method::Managed {
-                        body: ManagedBody::from_raw(empty_raw),
+                        body: ManagedBody::from_raw(empty_raw.clone()),
                         arg_count: *arg_count,
                     };
                 }
@@ -4216,7 +4277,11 @@ impl Module {
     }
 
     /// The base type of `type_id`, if it has a resolvable one -- the subtype walks' step.
-    fn type_base(&self, type_id: TypeId) -> Option<TypeId> {
+    ///
+    /// Public because the LOADER needs it to answer "is this referenced type a delegate": a
+    /// delegate's `Invoke` has no body, so a cross-assembly `MemberRef` to it cannot be bound by
+    /// the ordinary name lookup and has to be recognized from the parent type's base instead.
+    pub fn type_base(&self, type_id: TypeId) -> Option<TypeId> {
         #[cfg(feature = "code-in-place")]
         if self.baked.is_some() {
             return self.baked_type_record(type_id)?.0.checked_sub(1);
@@ -5044,6 +5109,17 @@ impl Module {
         }
     }
 
+    /// Adds ONE entry to `type_id`'s dispatch map, leaving the rest intact -- the incremental
+    /// counterpart of [`Module::set_sig_methods`]. A lazily-resolved session learns which
+    /// signatures it actually dispatches as it goes, so it tops a type's map up when a later
+    /// submission introduces a new one rather than rebuilding (or over-building) the whole map.
+    pub fn add_sig_method(&mut self, type_id: TypeId, key: &str, method: MethodId) {
+        let interned = self.intern_sig(key);
+        if let Some(info) = self.types.get_mut(type_id as usize) {
+            info.sig_methods.insert(interned, method);
+        }
+    }
+
     /// The method of `type_id` matching `sig_key` -- the `callvirt` target for an
     /// interface or abstract method on a `this` of that runtime type.
     #[must_use]
@@ -5798,8 +5874,8 @@ mod tests {
     }
 
     /// The raw-body bytes of a one-`ret` method, in the shape [`Module::add_method`] takes under
-    /// the active feature set: owned by default, leaked to `'static` under `flash-image` (a test's
-    /// stand-in for a flash slice).
+    /// the active feature set: owned by default, and a RAM-resident value under `flash-image` --
+    /// which no longer has to leak a stand-in for a flash slice to get the lifetime it wanted.
     fn one_ret_raw() -> RawCil {
         use lamella_cil::{Instruction, Opcode, write_method_body};
         let body = MethodBodyImage {
@@ -5816,7 +5892,7 @@ mod tests {
         }
         #[cfg(feature = "flash-image")]
         {
-            Box::leak(bytes)
+            RawCil::Ram(bytes)
         }
     }
 
@@ -5916,7 +5992,7 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        let raw: RawCil = Box::leak(write_method_body(&add_body).expect("encode").into_boxed_slice());
+        let raw: RawCil = RawCil::Ram(write_method_body(&add_body).expect("encode").into_boxed_slice());
         let add = module.add_method(0, raw, 2);
         module.bind_token(0, Token::new(0x06, 1), add);
         let write_line = module.add_intrinsic(

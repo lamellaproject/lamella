@@ -5,10 +5,12 @@ namespace System
     {
         public static readonly bool IsLittleEndian = true;
 
+#if LAMELLA_SURFACE_FLOAT
         [Lamella.Runtime.RuntimeProvided] public static long DoubleToInt64Bits(double value) { return 0; }
         [Lamella.Runtime.RuntimeProvided] public static double Int64BitsToDouble(long value) { return 0; }
-        [Lamella.Runtime.RuntimeProvided] public static int SingleToInt32Bits(float value) { return 0; }
-        [Lamella.Runtime.RuntimeProvided] public static float Int32BitsToSingle(int value) { return 0; }
+        [Lamella.Runtime.RuntimeProvided] internal static int SingleToInt32Bits(float value) { return 0; }
+        [Lamella.Runtime.RuntimeProvided] internal static float Int32BitsToSingle(int value) { return 0; }
+#endif
 
         public static byte[] GetBytes(bool value)
         {
@@ -69,6 +71,7 @@ namespace System
             return GetBytes((long)value);
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public static byte[] GetBytes(float value)
         {
             return GetBytes(SingleToInt32Bits(value));
@@ -78,6 +81,7 @@ namespace System
         {
             return GetBytes(DoubleToInt64Bits(value));
         }
+#endif
 
         public static short ToInt16(byte[] value, int startIndex)
         {
@@ -129,6 +133,7 @@ namespace System
             return (char)ToUInt16(value, startIndex);
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public static float ToSingle(byte[] value, int startIndex)
         {
             return Int32BitsToSingle(ToInt32(value, startIndex));
@@ -138,6 +143,7 @@ namespace System
         {
             return Int64BitsToDouble(ToInt64(value, startIndex));
         }
+#endif
 
         public static string ToString(byte[] value)
         {

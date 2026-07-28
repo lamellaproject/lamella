@@ -28,7 +28,7 @@ pub struct SourceLine {
 /// source-statement run -- exactly where a breakpoint goes.
 #[must_use]
 pub fn source_lines(rid: u32, line_table: &[(u32, u32)], pdb: &PortablePdb) -> Vec<SourceLine> {
-    let mut rows: Vec<SourceLine> = line_table
+    let rows: Vec<SourceLine> = line_table
         .iter()
         .filter_map(|&(addr, cil)| {
             let point = pdb.source_location(rid, cil)?;
@@ -39,6 +39,12 @@ pub fn source_lines(rid: u32, line_table: &[(u32, u32)], pdb: &PortablePdb) -> V
             })
         })
         .collect();
+    coalesce(rows)
+}
+
+/// Sorts by address and drops a row whose (line, column) repeats the previous one, so each surviving
+/// row is the LOWEST address of a source-statement run -- exactly where a breakpoint goes.
+fn coalesce(mut rows: Vec<SourceLine>) -> Vec<SourceLine> {
     rows.sort_by_key(|row| row.addr);
     let mut coalesced: Vec<SourceLine> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -47,6 +53,69 @@ pub fn source_lines(rid: u32, line_table: &[(u32, u32)], pdb: &PortablePdb) -> V
         }
     }
     coalesced
+}
+
+/// One method's source positions, resolved from a Portable PDB AHEAD of lowering: the file it came
+/// from and its sequence points as `(CIL byte offset, line, column)`.
+///
+/// Resolving the PDB up front is what keeps `lamella-metadata` out of the code generators. The
+/// mapping is independent of where code lands, so it can be computed before lowering starts and
+/// handed down; the generator then composes it with the native-offset -> CIL-offset table only it
+/// can produce.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MethodSource<'a> {
+    /// The method's name as a debugger should SHOW it (`Program.Add`), which is not its symbol name
+    /// (`f2` on the object path). The two are independent: a relocation names the symbol by index,
+    /// while `DW_AT_name` is what a human reads. Empty falls back to the symbol name.
+    pub name: &'a str,
+    /// The source file the method lowered from.
+    pub file: &'a str,
+    /// `(CIL byte offset, 1-based line, 1-based column)`, in any order.
+    pub points: &'a [(u32, u32, u32)],
+}
+
+/// Everything a code generator needs to emit DWARF for the object it is building. `None` at the
+/// call site means "no debug info", which is every build that did not ask for it.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectDebug<'a> {
+    /// Method `i`'s [`CilSourceMap`](crate::cil::CilSourceMap) rows, for the LOWERING to thread.
+    pub source_maps: &'a [crate::cil::CilSourceMap],
+    /// Method `i`'s resolved source positions, for the DWARF to name.
+    pub methods: &'a [MethodSource<'a>],
+    /// The compilation unit's name -- conventionally its primary source file.
+    pub unit_name: &'a str,
+    /// The `DW_AT_producer` string.
+    pub producer: &'a str,
+}
+
+/// Composes a method's native-offset -> CIL-offset table with its resolved source positions, and
+/// rebases each row to be relative to `func_start`.
+///
+/// The rebase is what a DWARF line-number sequence needs: the sequence's base address comes from a
+/// relocation against the function's symbol, so its rows advance from the FUNCTION's start, not from
+/// the start of the object that happens to contain it.
+#[must_use]
+pub fn function_rows(
+    line_table: &[(u32, u32)],
+    source: &MethodSource,
+    func_start: u32,
+) -> Vec<SourceLine> {
+    let rows: Vec<SourceLine> = line_table
+        .iter()
+        .filter_map(|&(addr, cil)| {
+            let &(_, line, col) = source
+                .points
+                .iter()
+                .filter(|&&(at, ..)| at <= cil)
+                .max_by_key(|&&(at, ..)| at)?;
+            Some(SourceLine {
+                addr: addr.saturating_sub(func_start),
+                line,
+                col,
+            })
+        })
+        .collect();
+    coalesce(rows)
 }
 
 /// One method's contribution to a whole-image source map: its name, its source file, and the byte

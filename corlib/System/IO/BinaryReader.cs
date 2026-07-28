@@ -96,6 +96,7 @@ namespace System.IO
             return BitConverter.ToUInt64(bytes, 0);
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public virtual float ReadSingle()
         {
             byte[] bytes = ReadExact(4);
@@ -107,6 +108,7 @@ namespace System.IO
             byte[] bytes = ReadExact(8);
             return BitConverter.ToDouble(bytes, 0);
         }
+#endif
 
         private static int Utf8SequenceLength(int lead)
         {
@@ -175,7 +177,7 @@ namespace System.IO
             return trimmed;
         }
 
-        protected int Read7BitEncodedInt()
+        internal int Read7BitEncodedInt()
         {
             int result = 0;
             int shift = 0;

@@ -51,7 +51,10 @@ namespace System
 
         public Guid(string g)
         {
-            Guid parsed = Parse(g);
+            if ((object)g == null) throw new ArgumentNullException("g");
+            Guid parsed;
+            if (!TryParseCore(g, out parsed))
+                throw new FormatException("Guid should contain 32 digits with 4 dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).");
             _a = parsed._a;
             _b = parsed._b;
             _c = parsed._c;
@@ -277,6 +280,7 @@ namespace System
             return true;
         }
 
+#if LAMELLA_SURFACE_NETFX_4_0
         public static Guid Parse(string input)
         {
             if ((object)input == null) throw new ArgumentNullException("input");
@@ -290,6 +294,7 @@ namespace System
         {
             return TryParseCore(input, out result);
         }
+#endif
 
         public bool Equals(Guid g)
         {

@@ -45,6 +45,25 @@ profile-minimal = ["lamella-load/bcl", "lamella-load/exceptions", "lamella-load/
 # pins the load API to Assembly<'static>; run_program then leaks its per-call inputs, matching the
 # one-image-per-process host pattern. The host DRIVER half (send_image / RUN_IMAGE) is unconditional.
 baked-image = ["lamella-load/code-in-place"]
+# The incremental-REPL LIVE-SESSION serve path (serve_one_repl + ReplSessionState): a device holds a
+# persistent interpreter across wire frames and loads a compiled submission DELTA into it, running
+# ONLY the new code (prior submissions never re-execute -- the safety property this path exists for).
+# It loads PE deltas via the loader's load_bootstrap/load_delta, so it is INDEPENDENT of baked-image
+# (composes with it: a session-capable board that is also baked advertises both). Off by default; a
+# session-capable firmware + the host reference runner opt in, over a selected BCL profile. Requires
+# `debug-names`: the session anchors the bootstrap `<repl>.__Repl..ctor` by the qualified name the
+# loader records, so a names-stripped build loads the bootstrap but cannot find its constructor.
+repl-session = ["debug-names"]
+
+# Test-only: drives the real incremental compiler in the repl-session wire test -- emits the session
+# bootstrap and compiles each C# submission into a delta the runner loads over the loopback, the
+# never-skip proof (pure no_std+alloc Rust, no external tooling). The ilasm-fixture test alongside it
+# adds the observable value displays + the reference-survival case.
+[dev-dependencies]
+lamella-assemble = { path = "../lamella-assemble" }
+# The FAT backend (with mkfs) so the baked-deploy e2e test can mount a real RAM FatFs at /sd through
+# the StorageProvider seam -- the host twin of sam4s's device SD boot-mount.
+lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }
 
 [lints]
 workspace = true

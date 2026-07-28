@@ -1,6 +1,9 @@
 //! A host-PC C# REPL on the lamella interpreter, compiled in-process with the project's own compiler (lcsc).
 
-use lamella_load::{DeltaContext, load, load_bootstrap, load_delta, load_library};
+use lamella_load::{
+    DeltaContext, load, load_bootstrap, load_bootstrap_lazy_corlib, load_bootstrap_with_corlib,
+    load_delta, load_delta_with_corlib, load_library,
+};
 use lamella_metadata::Assembly;
 use lamella_cil_runtime::intrinsics::object_to_string;
 use lamella_cil_runtime::{MethodId, Module, ObjectRef, Vm, run};
@@ -310,6 +313,7 @@ pub struct IncrementalSession {
     instance: ObjectRef,
     root_slot: usize,
     compiler: Option<lamella_assemble::Session>,
+    lazy_corlib: Option<Vec<u8>>,
 }
 
 impl IncrementalSession {
@@ -327,7 +331,7 @@ impl IncrementalSession {
     pub fn open(path: &Path) -> Result<IncrementalSession, String> {
         let bytes =
             fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        Self::open_from_bytes(&bytes, None)
+        Self::open_from_bytes(&bytes, None, None, None)
     }
 
     /// Opens an incremental session that drives the COMPILER: it creates a
@@ -346,16 +350,68 @@ impl IncrementalSession {
         let bootstrap = compiler
             .bootstrap()
             .map_err(|error| format!("cannot emit bootstrap: {error:?}"))?;
-        Self::open_from_bytes(&bootstrap, Some(compiler))
+        Self::open_from_bytes(&bootstrap, Some(compiler), None, None)
+    }
+
+    /// Opens a compiler-driven incremental session over a RESIDENT `corlib`: the compiler
+    /// type-checks each submission against it, AND it is loaded beneath the bootstrap so the
+    /// MANAGED corlib members a submission names resolve by name (the eager corlib-resolution tier
+    /// -- see [`load_bootstrap_with_corlib`]). This is the host oracle for corlib-typed submissions
+    /// and the big-memory tier's construction; a constrained tier resolves the same members lazily
+    /// from a flash-resident corlib to the SAME ids (only timing / RAM differ).
+    ///
+    /// # Errors
+    /// Returns `Err` if the compiler's bootstrap cannot be emitted, is not a valid assembly, fails
+    /// to load, declares no `<repl>.__Repl..ctor`, or the constructor traps.
+    pub fn open_compiler_with_corlib(corlib_bytes: &[u8]) -> Result<IncrementalSession, String> {
+        let corlib = Assembly::read(corlib_bytes)
+            .map_err(|error| format!("cannot read corlib metadata: {error:?}"))?;
+        let compiler = lamella_assemble::Session::new(core::slice::from_ref(&corlib));
+        let bootstrap = compiler
+            .bootstrap()
+            .map_err(|error| format!("cannot emit bootstrap: {error:?}"))?;
+        Self::open_from_bytes(&bootstrap, Some(compiler), Some(&corlib), None)
+    }
+
+    /// Opens a compiler-driven incremental session that resolves managed corlib members LAZILY: the
+    /// compiler type-checks each submission against `corlib_bytes`, but no corlib is loaded into RAM
+    /// -- each submission materializes only the members it reaches (and their transitive closure)
+    /// from those bytes ([`load_delta_with_corlib`]). This is the constrained tier's construction; it
+    /// resolves a submission to the SAME ids as [`IncrementalSession::open_compiler_with_corlib`]
+    /// (the eager oracle), only lazily. On the host the bytes are copied on materialization; on a
+    /// device they are a flash-resident `&'static` borrow.
+    ///
+    /// # Errors
+    /// Returns `Err` if the corlib or the compiler's bootstrap cannot be read/emitted, the bootstrap
+    /// fails to load, declares no `<repl>.__Repl..ctor`, or the constructor traps.
+    pub fn open_compiler_lazy_corlib(corlib_bytes: &[u8]) -> Result<IncrementalSession, String> {
+        let corlib = Assembly::read(corlib_bytes)
+            .map_err(|error| format!("cannot read corlib metadata: {error:?}"))?;
+        let compiler = lamella_assemble::Session::new(core::slice::from_ref(&corlib));
+        let bootstrap = compiler
+            .bootstrap()
+            .map_err(|error| format!("cannot emit bootstrap: {error:?}"))?;
+        Self::open_from_bytes(&bootstrap, Some(compiler), None, Some(corlib_bytes))
     }
 
     fn open_from_bytes(
         bytes: &[u8],
         compiler: Option<lamella_assemble::Session>,
+        eager_corlib: Option<&Assembly>,
+        lazy_corlib_bytes: Option<&[u8]>,
     ) -> Result<IncrementalSession, String> {
         let assembly =
             Assembly::read(bytes).map_err(|error| format!("cannot read metadata: {error:?}"))?;
-        let (module, name_index, type_index) = load_bootstrap(&assembly);
+        let (module, name_index, type_index, first_delta_asm) = if let Some(corlib) = eager_corlib {
+            let (module, name_index, type_index) = load_bootstrap_with_corlib(corlib, &assembly);
+            (module, name_index, type_index, 2)
+        } else if lazy_corlib_bytes.is_some() {
+            let (module, name_index, type_index) = load_bootstrap_lazy_corlib(&assembly);
+            (module, name_index, type_index, 2)
+        } else {
+            let (module, name_index, type_index) = load_bootstrap(&assembly);
+            (module, name_index, type_index, 1)
+        };
 
         let ctor = find_method(&module, REPL_CTOR_NAME)
             .ok_or_else(|| format!("bootstrap defines no {REPL_CTOR_NAME}"))?;
@@ -383,10 +439,11 @@ impl IncrementalSession {
         Ok(IncrementalSession {
             vm,
             module,
-            context: DeltaContext::new(type_id, name_index, type_index),
+            context: DeltaContext::new_at(type_id, name_index, type_index, first_delta_asm),
             instance,
             root_slot,
             compiler,
+            lazy_corlib: lazy_corlib_bytes.map(<[u8]>::to_vec),
         })
     }
 
@@ -437,11 +494,60 @@ impl IncrementalSession {
         self.submit_delta_bytes(&delta, "submission")
     }
 
+    /// Loads and runs one ALREADY-COMPILED delta, exactly as a device does when the bytes arrive
+    /// over the wire -- the load-and-run half of [`IncrementalSession::submit_source`], without the
+    /// compile.
+    ///
+    /// Splitting the two matters for measurement. `submit_source` compiles and submits in one call,
+    /// so anything watching the process cannot tell the HOST COMPILER's allocations from the
+    /// loader's -- and the compiler does not exist on the target, which receives bytes. A caller
+    /// driving `lamella_assemble::Session` itself can compile with a probe disarmed and submit with
+    /// it armed, and so measure what the device actually pays.
+    ///
+    /// # Errors
+    /// As [`IncrementalSession::submit_source`], minus the compile diagnostics: `Err` if the delta
+    /// does not load, the instance cannot be grown, or `Submit$N` traps.
+    pub fn submit_bytes(&mut self, delta: &[u8]) -> Result<String, String> {
+        self.submit_delta_bytes(delta, "submission")
+    }
+
+    /// The resident-RAM breakdown of the live session -- the persistent module's
+    /// [`lamella_cil_runtime::Module::heap_report`] PLUS the session's own name indices. A lazy
+    /// session reports ONLY the corlib members its submissions have materialized so far (plus the
+    /// bootstrap and loaded deltas); sampling this before and after a submission isolates what that
+    /// submission costs -- the constrained-tier working-set the `corlib-working-set` example
+    /// measures against the eager whole-corlib tier, and the per-submission split
+    /// `submission-cost` prints.
+    ///
+    /// The index rows were MISSING until they were measured for: they live on the
+    /// [`lamella_load::DeltaContext`], not the module, so reporting the module alone under-stated a
+    /// live session's footprint by everything the session records to resolve one delta's names
+    /// against the next. Nothing there is reclaimable while the session lives, so it belongs in the
+    /// figure the arena budget is checked against.
+    #[must_use]
+    pub fn working_set(&self) -> Vec<(&'static str, usize)> {
+        let mut rows = self.module.heap_report();
+        rows.extend(self.context.heap_report());
+        rows
+    }
+
+    /// The total resident RAM (bytes) the live session holds: the sum over [`Self::working_set`].
+    #[must_use]
+    pub fn working_set_bytes(&self) -> usize {
+        self.working_set().iter().map(|(_, size)| size).sum()
+    }
+
     fn submit_delta_bytes(&mut self, bytes: &[u8], label: &str) -> Result<String, String> {
         let delta =
             Assembly::read(bytes).map_err(|error| format!("cannot read metadata: {error:?}"))?;
-        let info = load_delta(&mut self.module, &mut self.context, &delta)
-            .map_err(|error| format!("cannot load delta {label}: {error}"))?;
+        let info = if let Some(corlib_bytes) = self.lazy_corlib.as_ref() {
+            let corlib = Assembly::read(corlib_bytes)
+                .map_err(|error| format!("cannot read corlib metadata: {error:?}"))?;
+            load_delta_with_corlib(&mut self.module, &mut self.context, &delta, &corlib)
+        } else {
+            load_delta(&mut self.module, &mut self.context, &delta)
+        }
+        .map_err(|error| format!("cannot load delta {label}: {error}"))?;
 
         if !info.new_field_defaults.is_empty() {
             self.vm

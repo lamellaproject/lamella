@@ -146,6 +146,12 @@ fn check_inst(
                 expect(MirType::I32, r, errors);
             }
         }
+        Inst::InterfaceHasTag { descriptor, .. } => {
+            use_value(func, defined, *descriptor, errors);
+            if let Some(rt) = result_ty {
+                expect(MirType::I32, rt, errors);
+            }
+        }
         Inst::Call { args, .. }
         | Inst::CallVirtual { args, .. }
         | Inst::CallInterface { args, .. }
@@ -291,6 +297,16 @@ fn check_inst(
                 expect(MirType::ObjectRef, r, errors);
             }
         }
+        Inst::AllocDescribed {
+            descriptor,
+            payload_size,
+        } => {
+            use_value(func, defined, *descriptor, errors);
+            use_value(func, defined, *payload_size, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
         Inst::AllocLike { proto, .. } => {
             use_value(func, defined, *proto, errors);
             if let Some(r) = result_ty {
@@ -400,7 +416,7 @@ fn check_terminator(
             false_args,
         } => {
             if let Some(cond_ty) = use_value(func, defined, *cond, errors) {
-                if !cond_ty.is_integer() {
+                if cond_ty == MirType::I64 || (!cond_ty.is_integer() && !cond_ty.is_gc_reference()) {
                     expect(MirType::I32, cond_ty, errors);
                 }
             }
@@ -598,6 +614,72 @@ mod tests {
         f.value_types[0] = MirType::I32;
         f.ret = Some(MirType::I32);
         assert!(verify(&f).is_err());
+    }
+
+    #[test]
+    fn a_reference_is_a_valid_branch_condition() {
+        let with_cond = |ty: MirType| Function {
+            params: vec![ty],
+            ret: Some(MirType::I32),
+            value_types: vec![ty, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![
+                BasicBlock {
+                    params: vec![ValueId(0)],
+                    insts: vec![
+                        (
+                            ValueId(1),
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: 1,
+                            },
+                        ),
+                        (
+                            ValueId(2),
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: 0,
+                            },
+                        ),
+                    ],
+                    terminator: Some(Terminator::Branch {
+                        cond: ValueId(0),
+                        if_true: BlockId(1),
+                        true_args: Vec::new(),
+                        if_false: BlockId(2),
+                        false_args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: Vec::new(),
+                    terminator: Some(Terminator::Return(Some(ValueId(1)))),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: Vec::new(),
+                    terminator: Some(Terminator::Return(Some(ValueId(2)))),
+                },
+            ],
+        };
+        assert_eq!(verify(&with_cond(MirType::ObjectRef)), Ok(()));
+        assert_eq!(verify(&with_cond(MirType::ManagedPtr)), Ok(()));
+        assert_eq!(verify(&with_cond(MirType::I32)), Ok(()));
+        assert_eq!(verify(&with_cond(MirType::NativeInt)), Ok(()));
+        assert_eq!(
+            verify(&with_cond(MirType::I64)),
+            Err(vec![VerifyError::TypeMismatch {
+                expected: MirType::I32,
+                found: MirType::I64,
+            }])
+        );
+        assert_eq!(
+            verify(&with_cond(MirType::F64)),
+            Err(vec![VerifyError::TypeMismatch {
+                expected: MirType::I32,
+                found: MirType::F64,
+            }])
+        );
     }
 
     #[test]

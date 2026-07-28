@@ -220,7 +220,13 @@ fn materialize_array(
     let obj = emit(
         values,
         insts,
-        Inst::AllocArray { handle: LIST_TYPE_HANDLE, length, element_size },
+        Inst::AllocArray {
+            handle: list_type_handle(list_element_kind(elem)),
+            element: None,
+            length,
+            element_size,
+            element_kind: list_element_kind(elem),
+        },
         MirType::ObjectRef,
     );
     for (k, &(value, _)) in elems.iter().enumerate() {
@@ -295,7 +301,13 @@ fn materialize_empty_growlist(
     let backing = emit(
         values,
         insts,
-        Inst::AllocArray { handle: LIST_TYPE_HANDLE, length: cap, element_size: elem_size(elem) },
+        Inst::AllocArray {
+            handle: list_type_handle(list_element_kind(elem)),
+            element: None,
+            length: cap,
+            element_size: elem_size(elem),
+            element_kind: list_element_kind(elem),
+        },
         MirType::ObjectRef,
     );
     let len = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 0 }, MirType::I32);
@@ -375,11 +387,32 @@ fn elem_size(elem: MirType) -> u32 {
     }
 }
 
-/// The `TypeHandle` stamped on a typed list's `AllocArray`. A primitive-element array (`list[int]`/
-/// `list[float]`) has no interior references, so the backend emits a minimal all-zero descriptor for
-/// it (no vtable, nothing to trace element-wise) regardless of the handle -- one shared handle is
-/// enough. `list[<obj>]` (PyValue elements) will need a distinct, ref-map-carrying handle later.
-const LIST_TYPE_HANDLE: TypeHandle = TypeHandle(0);
+/// The `TypeHandle` stamped on a typed list's `AllocArray`, derived from what the list HOLDS.
+///
+/// One shared handle was enough while the backend emitted an all-zero descriptor for every
+/// primitive-element array. It stopped being enough when an array descriptor started carrying its
+/// element kind: descriptors are deduplicated by handle, so `list[int]` (4-byte `I4`) and
+/// `list[float]` (8-byte `F8`) sharing one handle would share one descriptor, and whichever the
+/// backend emitted first would describe both -- a collector would then stride an 8-byte list by 4.
+/// Keying the handle by element kind makes that unrepresentable.
+///
+/// `list[<obj>]` (PyValue elements) still needs its own answer: a tagged word is neither a frozen
+/// primitive nor a bare reference, so it wants a kind of its own rather than either of these.
+fn list_type_handle(element_kind: u32) -> TypeHandle {
+    lamella_ir::synthetic_array_handle(element_kind)
+}
+
+/// The array element kind for a typed list's elements -- the frozen primitive codes `I4 = 5` and
+/// `F8 = 8`, mirrored from the backend's element-kind space. Only `I32`/`F64` lists lower today
+/// (both callers reject anything else before reaching here), so an unexpected type takes the
+/// "cannot be described" code rather than a wrong one.
+fn list_element_kind(elem: MirType) -> u32 {
+    match elem {
+        MirType::I32 => 5,
+        MirType::F64 => 8,
+        _ => 0xFF,
+    }
+}
 
 /// The `TypeHandle` stamped on a growable list's HEADER `Alloc`. It MUST differ from
 /// [`LIST_TYPE_HANDLE`]: the backend emits one canonical TypeDesc per handle, so sharing a handle with

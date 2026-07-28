@@ -150,12 +150,22 @@ pub struct Encoder {
     /// copy into a nearer branch-over island (see [`Encoder::island_far_blob`]); an UNMARKED far
     /// `adr` target (a descriptor, whose interior labels a byte copy would not carry) still
     /// hard-errors in [`Encoder::finish`].
-    blobs: Vec<(u32, u32)>,
+    /// `(label, prefix_bytes_before_the_label, len_after_it)` -- see [`Encoder::mark_blob_with_prefix`].
+    blobs: Vec<(u32, u32, u32)>,
+    /// Literal-pool veneers spliced for a far reference on a Baseline (v6-M) target, which has no wide
+    /// branch or `ADR.W`: `(word label, add label, target label, thumb)`. [`Encoder::finish`] fills the
+    /// word at `word label` with `target - add - 4` (`+1` when `thumb`) -- the PC-relative delta the
+    /// veneer's `add rX, pc` adds to that instruction's PC (`add + 4`) to rebuild the target address.
+    /// A far unconditional branch sets `thumb` (the reconstructed address feeds `pop {pc}`, which
+    /// interworks on bit 0); a far `adr` clears it (a plain data address). See
+    /// [`Encoder::veneer_far_unconditional_branch`] and [`Encoder::veneer_far_adr`].
+    veneers: Vec<(u32, u32, u32, bool)>,
     /// Whether the target is a Mainline (wide-Thumb-2) profile -- ARMv7-M / ARMv8-M Mainline, e.g. the
     /// RP2350's Cortex-M33. When set, a far unconditional branch relaxes to `B.W` and a far `adr` to
-    /// `ADR.W` (see [`Encoder::relax`]) rather than the ARMv6-M literal-pool veneer. The object build
-    /// sets it from the target's [`crate::target::Profile`]; the default `false` keeps every existing
-    /// ARMv6-M path byte-identical.
+    /// `ADR.W` (see [`Encoder::relax`]); when clear, a far unconditional branch splices the ARMv6-M
+    /// literal-pool veneer instead. The object build sets it from the target's
+    /// [`crate::target::Profile`]; the default `false` keeps every existing near-reference ARMv6-M path
+    /// byte-identical (the veneer fires only for an out-of-reach branch).
     wide: bool,
 }
 
@@ -395,10 +405,15 @@ impl Encoder {
 
     /// `LSRS Rd, Rm, #imm5` -- logical (zero-filling) shift right by an immediate. 16-bit
     /// encoding T1 (ARMv6-M ARM, LSR (immediate)): `0000 1 imm5 Rm Rd`, i.e. `LSLS` with bit
-    /// 11 set. Low registers; `imm5` in 1..=31 (the ARM encoding reads 0 as a shift of 32,
-    /// which this lowering never emits).
+    /// 11 set. Low registers; `imm5` in 1..=31.
+    ///
+    /// A shift amount of 0 is REFUSED rather than encoded, because the ARM encoding reads 0 as a shift
+    /// of THIRTY-TWO -- so `lsrs r0, r0, #0` zeroes the register instead of leaving it alone. A caller
+    /// computing its shift amount (a nibble extractor stepping 28, 24, ... 0) hits that case, gets a
+    /// zero where it expected the value, and cannot tell: refusing is the only answer that surfaces it.
+    /// [`Self::asrs_imm`] has always refused 0 for the same reason; this is the same guard.
     pub fn lsrs_imm(&mut self, rd: Reg, rm: Reg, imm5: u8) -> Result<(), AssembleError> {
-        if !(rd.is_low() && rm.is_low()) || imm5 > 31 {
+        if !(rd.is_low() && rm.is_low()) || imm5 == 0 || imm5 > 31 {
             return Err(AssembleError::UnencodableOperand);
         }
         self.emit_u16(
@@ -977,12 +992,20 @@ impl Encoder {
     /// Emits a 32-bit data word referring to an external `symbol`, recorded as a
     /// [`Reloc`] for the link step.
     pub fn data_word_symbol(&mut self, symbol: u32) {
+        self.data_word_symbol_addend(symbol, 0);
+    }
+
+    /// As [`Encoder::data_word_symbol`], but with an explicit `addend` -- for a reference whose target
+    /// is a fixed distance INTO the named symbol. A descriptor reference needs it: the symbol spans
+    /// the vtable and the words follow, so a reference to the WORDS of a descriptor this object does
+    /// not lay locally must carry the owner's vtable span itself.
+    pub fn data_word_symbol_addend(&mut self, symbol: u32, addend: i32) {
         let at = self.position();
         self.relocs.push(Reloc {
             at,
             kind: RelocKind::Abs32,
             symbol,
-            addend: 0,
+            addend,
         });
         self.bytes.extend_from_slice(&[0; 4]);
     }
@@ -1046,7 +1069,19 @@ impl Encoder {
     /// An unmarked `adr` target -- a type descriptor, whose interior labels and diffs a byte copy
     /// would not carry -- is never copied and still hard-errors out of reach.
     pub fn mark_blob(&mut self, label: Label, len: u32) {
-        self.blobs.push((label.0, len));
+        self.mark_blob_with_prefix(label, 0, len);
+    }
+
+    /// As [`Encoder::mark_blob`], but the blob carries `prefix` bytes laid BEFORE the label that must
+    /// travel with it when it is islanded.
+    ///
+    /// A string blob's object header is such a prefix: `[obj - 4]` holds the type descriptor, and the
+    /// label is bound at the payload (the unit-count word) because that is the pointer `ldstr` hands
+    /// out. Islanding a blob by copying only `[label, label + len)` would leave the copy's `-4` word
+    /// as whatever preceded it in the island -- a descriptor read from a branch instruction. The
+    /// prefix travels, and its relocations travel with it.
+    pub fn mark_blob_with_prefix(&mut self, label: Label, prefix: u32, len: u32) {
+        self.blobs.push((label.0, prefix, len));
     }
 
     /// Inserts `insert` bytes at byte offset `at`, shifting every later reference -- any bound
@@ -1094,7 +1129,13 @@ impl Encoder {
             if self.wide && self.widen_far_unconditional_branch()? {
                 continue;
             }
+            if !self.wide && self.veneer_far_unconditional_branch()? {
+                continue;
+            }
             if self.wide && self.widen_far_adr()? {
+                continue;
+            }
+            if !self.wide && self.veneer_far_adr()? {
                 continue;
             }
             if self.wide && self.island_far_blob()? {
@@ -1127,6 +1168,141 @@ impl Encoder {
             }
             self.splice_in(at + 2, &[0x00, 0x00, 0x00, 0xBF]);
             self.fixups[idx].1 = RelocKind::ThumbBranch24;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Splices a literal-pool-indirect veneer in place of the first far unconditional branch
+    /// (`ThumbBranch11`, its +/-2 KB reach exceeded) on a Baseline (v6-M) target -- the ARMv6-M
+    /// answer where [`Encoder::widen_far_unconditional_branch`] would emit `B.W` on a Mainline part.
+    /// The M0/M0+ class has no wide branch, so the branch is realized as a computed indirect jump:
+    ///
+    /// ```text
+    ///     sub  sp, #4        ; reserve a slot for the target address    (overwrites the 16-bit `B`)
+    ///     push {r0}          ; save r0 -- the veneer clobbers NO register
+    ///     ldr  r0, [pc, #k]  ; r0 = the PC-relative, Thumb-tagged delta word below
+    ///     add  r0, pc        ; r0 = target | 1  (PC here is this instruction + 4)
+    ///     str  r0, [sp, #4]  ; park the target in the reserved slot
+    ///     pop  {r0}          ; restore r0
+    ///     pop  {pc}          ; branch to the target (POP {PC} interworks on bit 0)
+    ///     .align 4 ; .word delta
+    /// ```
+    ///
+    /// Only the scratch stack is touched and it is left exactly as found, so the veneer is valid at
+    /// EVERY branch site regardless of which registers are live across it -- unlike a `bx`-through-a-
+    /// register form, which would need a register the encoder cannot know is free. The delta is
+    /// position-independent (a same-image relative reference, like [`Encoder::data_word_diff`]), so no
+    /// link-step relocation is needed; [`Encoder::finish`] fills it once relaxation fixes the layout.
+    /// Returns whether one was spliced; the caller re-checks from the top because the splice shifts
+    /// every later reference. Each far branch veneers at most once (the `ThumbBranch11` fixup is
+    /// removed and the veneer's own `ldr` sits a few bytes from its word), so the fixpoint terminates.
+    fn veneer_far_unconditional_branch(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (at, kind, label_id) = self.fixups[idx];
+            if kind != RelocKind::ThumbBranch11 {
+                continue;
+            }
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            let offset = i64::from(target) - (i64::from(at) + 4);
+            if (-2048..=2046).contains(&offset) && offset % 2 == 0 {
+                continue;
+            }
+            self.bytes[at as usize..at as usize + 2].copy_from_slice(&0xB081u16.to_le_bytes());
+            let mut rest = Vec::with_capacity(20);
+            rest.extend_from_slice(&0xB401u16.to_le_bytes());
+            let ldr_site = at + 2 + rest.len() as u32;
+            rest.extend_from_slice(&0x4800u16.to_le_bytes());
+            let add_site = at + 2 + rest.len() as u32;
+            rest.extend_from_slice(&0x4478u16.to_le_bytes());
+            rest.extend_from_slice(&0x9001u16.to_le_bytes());
+            rest.extend_from_slice(&0xBC01u16.to_le_bytes());
+            rest.extend_from_slice(&0xBD00u16.to_le_bytes());
+            let word_pad = (4 - ((at + 2 + rest.len() as u32) & 3)) & 3;
+            rest.resize(rest.len() + word_pad as usize, 0);
+            let word_site = at + 2 + rest.len() as u32;
+            rest.extend_from_slice(&0u32.to_le_bytes());
+            let trailing = (4 - (rest.len() as u32 & 3)) & 3;
+            rest.resize(rest.len() + trailing as usize, 0);
+            self.splice_in(at + 2, &rest);
+            self.fixups.remove(idx);
+            let word_label = self.new_label();
+            let add_label = self.new_label();
+            self.labels[word_label.0 as usize] = Some(word_site);
+            self.labels[add_label.0 as usize] = Some(add_site);
+            self.fixups.push((ldr_site, RelocKind::ThumbLdrLit8, word_label.0));
+            self.veneers.push((word_label.0, add_label.0, label_id, true));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Splices a literal-pool veneer in place of the first far `adr` (a `ThumbLdrLit8` fixup whose
+    /// instruction is a 16-bit `ADR`, its ~1 KB reach exceeded) on a Baseline (v6-M) target -- the
+    /// non-wide answer where [`Encoder::widen_far_adr`] would emit `ADR.W` (and beyond +/-4 KB,
+    /// [`Encoder::island_far_blob`] a copy) on a Mainline part. Configure's `throw new
+    /// ArgumentException("...")` lays its string at the method end; from a big body that `adr` is far.
+    ///
+    /// ```text
+    ///     ldr  Rd, [pc, #k]  ; overwrites the 16-bit `ADR` -- SAME size, so no register is disturbed
+    ///     add  Rd, pc        ; Rd = the datum's address (PC here is this instruction + 4)
+    ///     .align 4 ; .word delta
+    /// ```
+    ///
+    /// `Rd` is the `adr`'s own destination -- the value it defines -- so it is free scratch and the
+    /// veneer needs no save/restore (unlike the branch veneer). Unlike `ADR.W`'s +/-4 KB the computed
+    /// address has unbounded reach, so no blob copy is needed. The `adr` FALLS THROUGH (it is not a
+    /// branch), so the delta word cannot sit in the instruction stream: a short `b over` skips it,
+    /// exactly as [`Encoder::island_far_literal`] skips its copied datum. Returns whether one spliced.
+    fn veneer_far_adr(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (at, kind, label_id) = self.fixups[idx];
+            if kind != RelocKind::ThumbLdrLit8 {
+                continue;
+            }
+            let hw = self
+                .bytes
+                .get(at as usize..at as usize + 2)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            if hw & 0xF800 != 0xA000 {
+                continue;
+            }
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            let pc = (at + 4) & !3u32;
+            if target >= pc && target - pc <= 1020 && (target - pc) % 4 == 0 {
+                continue;
+            }
+            let rd = (hw >> 8) & 7;
+            self.bytes[at as usize..at as usize + 2]
+                .copy_from_slice(&(0x4800 | (rd << 8)).to_le_bytes());
+            let mut rest = Vec::with_capacity(12);
+            let add_site = at + 2 + rest.len() as u32;
+            rest.extend_from_slice(&(0x4478 | rd).to_le_bytes());
+            let b_site = at + 2 + rest.len() as u32;
+            rest.extend_from_slice(&0xE000u16.to_le_bytes());
+            let word_pad = (4 - ((at + 2 + rest.len() as u32) & 3)) & 3;
+            rest.resize(rest.len() + word_pad as usize, 0);
+            let word_site = at + 2 + rest.len() as u32;
+            rest.extend_from_slice(&0u32.to_le_bytes());
+            let trailing = (4 - (rest.len() as u32 & 3)) & 3;
+            rest.resize(rest.len() + trailing as usize, 0);
+            let over = at + 2 + rest.len() as u32;
+            self.splice_in(at + 2, &rest);
+            let word_label = self.new_label();
+            self.labels[word_label.0 as usize] = Some(word_site);
+            let add_label = self.new_label();
+            self.labels[add_label.0 as usize] = Some(add_site);
+            let over_label = self.new_label();
+            self.labels[over_label.0 as usize] = Some(over);
+            self.fixups[idx].2 = word_label.0;
+            self.fixups.push((b_site, RelocKind::ThumbBranch11, over_label.0));
+            self.veneers.push((word_label.0, add_label.0, label_id, false));
             return Ok(true);
         }
         Ok(false)
@@ -1264,8 +1440,8 @@ impl Encoder {
             if kind != RelocKind::ThumbAdrWide {
                 continue;
             }
-            let blob_len = match self.blobs.iter().find(|(id, _)| *id == label_id) {
-                Some(&(_, len)) => len,
+            let (prefix, blob_len) = match self.blobs.iter().find(|(id, ..)| *id == label_id) {
+                Some(&(_, prefix, len)) => (prefix, len),
                 None => continue,
             };
             let target = match self.labels.get(label_id as usize) {
@@ -1277,17 +1453,15 @@ impl Encoder {
             if (-4095..=4095).contains(&delta) {
                 continue;
             }
-            let blob = match self
-                .bytes
-                .get(target as usize..(target + blob_len) as usize)
-            {
+            let from = target - prefix;
+            let blob = match self.bytes.get(from as usize..(target + blob_len) as usize) {
                 Some(b) => b.to_vec(),
                 None => return Err(AssembleError::BranchOutOfRange { at }),
             };
             let carried: Vec<Reloc> = self
                 .relocs
                 .iter()
-                .filter(|r| r.at >= target && r.at < target + blob_len)
+                .filter(|r| r.at >= from && r.at < target + blob_len)
                 .copied()
                 .collect();
             let ins = at + 4;
@@ -1301,12 +1475,12 @@ impl Encoder {
             island.resize(island.len() + trailing as usize, 0);
             let over = ins + island.len() as u32;
             self.splice_in(ins, &island);
-            self.labels[label_id as usize] = Some(copy_site);
+            self.labels[label_id as usize] = Some(copy_site + prefix);
             let over_label = self.new_label();
             self.labels[over_label.0 as usize] = Some(over);
             self.fixups.push((ins, RelocKind::ThumbBranch11, over_label.0));
             for mut r in carried {
-                r.at = copy_site + (r.at - target);
+                r.at = copy_site + (r.at - from);
                 self.relocs.push(r);
             }
             return Ok(true);
@@ -1458,6 +1632,25 @@ impl Encoder {
             let site = at as usize;
             if let Some(slot) = self.bytes.get_mut(site..site + 4) {
                 slot.copy_from_slice(&diff.to_le_bytes());
+            }
+        }
+        for &(word_id, add_id, target_id, thumb) in &self.veneers {
+            let word = match self.labels.get(word_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(word_id))),
+            };
+            let add = match self.labels.get(add_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(add_id))),
+            };
+            let target = match self.labels.get(target_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(target_id))),
+            };
+            let delta = (i64::from(target) - i64::from(add) - 4 + i64::from(thumb)) as u32;
+            let site = word as usize;
+            if let Some(slot) = self.bytes.get_mut(site..site + 4) {
+                slot.copy_from_slice(&delta.to_le_bytes());
             }
         }
         Ok(Assembled {
@@ -1641,16 +1834,44 @@ mod tests {
         assert_eq!(&out.bytes[6..8], &[0xFB, 0xD1]);
     }
 
+    /// Reads the far-`adr` veneer at `at` (`ldr Rd,[pc,#k]; add Rd,pc; b over; .word delta`) and
+    /// returns `(Rd, reconstructed datum address)`: `delta + (add_pc + 4)`, the `add` at `at + 2`. A
+    /// data address, so NO Thumb bit -- the reconstruction lands on the even datum offset exactly.
+    fn decode_adr_veneer(bytes: &[u8], at: usize) -> (u8, i64) {
+        let hw = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        assert_eq!(hw(at) & 0xF800, 0x4800, "ldr Rd, [pc, #k]");
+        let rd = ((hw(at) >> 8) & 7) as u8;
+        assert_eq!(hw(at + 2), 0x4478 | u16::from(rd), "add Rd, pc");
+        assert_eq!(hw(at + 4) & 0xF800, 0xE000, "b over (skips the delta word)");
+        let k = i64::from(hw(at) & 0xFF);
+        let ldr_pc = (at as i64 + 4) & !3;
+        let word_at = (ldr_pc + k * 4) as usize;
+        let delta = i32::from_le_bytes([
+            bytes[word_at],
+            bytes[word_at + 1],
+            bytes[word_at + 2],
+            bytes[word_at + 3],
+        ]);
+        (rd, i64::from(delta) + (at as i64 + 2 + 4))
+    }
+
     #[test]
-    fn branch_out_of_range_is_a_controlled_error() {
+    fn a_far_adr_veneers_without_the_wide_capability() {
         let mut enc = Encoder::new();
         let target = enc.new_label();
-        enc.b(target);
+        enc.adr(Reg::R3, target).unwrap();
         for _ in 0..2500 {
             enc.nop();
         }
         enc.bind_label(target);
-        assert_eq!(enc.finish(), Err(AssembleError::BranchOutOfRange { at: 0 }));
+        enc.emit_word(0xCAFE_F00D);
+        let out = enc.finish().expect("a far adr veneers on a Baseline target, never errors");
+        let target_pos = i64::from(out.label_position(target).unwrap());
+        assert_eq!(
+            decode_adr_veneer(&out.bytes, 0),
+            (Reg::R3.number(), target_pos),
+            "the adr veneer reconstructs the datum address into Rd, no Thumb bit"
+        );
     }
 
     #[test]
@@ -1876,8 +2097,33 @@ mod tests {
         assert_eq!(4 + imm, out.label_position(blob).unwrap(), "ADR.W points at the blob");
     }
 
+    /// Reads the veneer at `at` (spliced in place of a 16-bit `B`) and returns the runtime target its
+    /// `add rX, pc; ...; pop {pc}` reconstructs: `delta_word + (add_pc + 4)`. The seven fixed halfwords
+    /// are `sub sp,#4 / push {r0} / ldr r0,[pc,#k] / add r0,pc / str r0,[sp,#4] / pop {r0} / pop {pc}`.
+    fn decode_veneer_target(bytes: &[u8], at: usize) -> i64 {
+        let hw = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        assert_eq!(hw(at), 0xB081, "sub sp, #4");
+        assert_eq!(hw(at + 2), 0xB401, "push {{r0}}");
+        assert_eq!(hw(at + 4) & 0xF800, 0x4800, "ldr r0, [pc, #k]");
+        assert_eq!((hw(at + 4) >> 8) & 7, 0, "the ldr targets r0");
+        assert_eq!(hw(at + 6), 0x4478, "add r0, pc");
+        assert_eq!(hw(at + 8), 0x9001, "str r0, [sp, #4]");
+        assert_eq!(hw(at + 10), 0xBC01, "pop {{r0}}");
+        assert_eq!(hw(at + 12), 0xBD00, "pop {{pc}}");
+        let k = i64::from(hw(at + 4) & 0xFF);
+        let ldr_pc = ((at as i64 + 4) + 4) & !3;
+        let word_at = (ldr_pc + k * 4) as usize;
+        let delta = i32::from_le_bytes([
+            bytes[word_at],
+            bytes[word_at + 1],
+            bytes[word_at + 2],
+            bytes[word_at + 3],
+        ]);
+        i64::from(delta) + (at as i64 + 6 + 4)
+    }
+
     #[test]
-    fn a_far_unconditional_branch_hard_errors_without_the_wide_capability() {
+    fn a_far_unconditional_branch_veneers_without_the_wide_capability() {
         let mut enc = Encoder::new();
         let target = enc.new_label();
         enc.b(target);
@@ -1886,10 +2132,87 @@ mod tests {
         }
         enc.bind_label(target);
         enc.nop();
-        assert!(matches!(
-            enc.finish(),
-            Err(AssembleError::BranchOutOfRange { .. })
-        ));
+        let out = enc.finish().expect("a far branch veneers on a Baseline target, never errors");
+        let target_pos = i64::from(out.label_position(target).unwrap());
+        assert_eq!(
+            decode_veneer_target(&out.bytes, 0),
+            target_pos | 1,
+            "the veneer reconstructs the target with its Thumb bit set"
+        );
+    }
+
+    #[test]
+    fn a_far_backward_branch_veneers_to_the_earlier_target() {
+        let mut enc = Encoder::new();
+        let target = enc.new_label();
+        enc.bind_label(target);
+        enc.nop();
+        for _ in 0..1500 {
+            enc.nop();
+        }
+        let site = enc.new_label();
+        enc.bind_label(site);
+        enc.b(target);
+        enc.nop();
+        let out = enc.finish().expect("a far backward branch veneers too");
+        let at = out.label_position(site).unwrap() as usize;
+        let target_pos = i64::from(out.label_position(target).unwrap());
+        assert_eq!(decode_veneer_target(&out.bytes, at), target_pos | 1);
+    }
+
+    #[test]
+    fn two_far_branches_both_veneer_and_the_fixpoint_terminates() {
+        let mut enc = Encoder::new();
+        let (a, b) = (enc.new_label(), enc.new_label());
+        let (site_a, site_b) = (enc.new_label(), enc.new_label());
+        enc.bind_label(site_a);
+        enc.b(a);
+        enc.bind_label(site_b);
+        enc.b(b);
+        for _ in 0..1500 {
+            enc.nop();
+        }
+        enc.bind_label(a);
+        enc.nop();
+        enc.bind_label(b);
+        enc.nop();
+        let out = enc.finish().expect("both far branches veneer");
+        assert_eq!(
+            decode_veneer_target(&out.bytes, out.label_position(site_a).unwrap() as usize),
+            i64::from(out.label_position(a).unwrap()) | 1
+        );
+        assert_eq!(
+            decode_veneer_target(&out.bytes, out.label_position(site_b).unwrap() as usize),
+            i64::from(out.label_position(b).unwrap()) | 1
+        );
+    }
+
+    #[test]
+    fn a_far_branch_and_a_far_adr_both_veneer_in_one_pass() {
+        let mut enc = Encoder::new();
+        let (branch_target, str_blob) = (enc.new_label(), enc.new_label());
+        let (b_site, adr_site) = (enc.new_label(), enc.new_label());
+        enc.bind_label(b_site);
+        enc.b(branch_target);
+        enc.bind_label(adr_site);
+        enc.adr(Reg::R2, str_blob).unwrap();
+        for _ in 0..2000 {
+            enc.nop();
+        }
+        enc.bind_label(branch_target);
+        enc.nop();
+        enc.align_to_word();
+        enc.bind_label(str_blob);
+        enc.emit_word(0xABCD_1234);
+        let out = enc.finish().expect("both a far branch and a far adr veneer together");
+        assert_eq!(
+            decode_veneer_target(&out.bytes, out.label_position(b_site).unwrap() as usize),
+            i64::from(out.label_position(branch_target).unwrap()) | 1,
+        );
+        assert_eq!(
+            decode_adr_veneer(&out.bytes, out.label_position(adr_site).unwrap() as usize),
+            (Reg::R2.number(), i64::from(out.label_position(str_blob).unwrap())),
+        );
     }
 
     #[test]
@@ -1994,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn a_far_marked_blob_hard_errors_without_the_wide_capability() {
+    fn a_far_marked_blob_adr_veneers_on_a_baseline_target() {
         let mut enc = Encoder::new();
         let blob = enc.new_label();
         enc.adr(Reg::R0, blob).unwrap();
@@ -2007,10 +2330,14 @@ mod tests {
         enc.emit_word(1);
         enc.emit_u16(0x0041);
         enc.mark_blob(blob, enc.position() - start);
-        assert!(matches!(
-            enc.finish(),
-            Err(AssembleError::BranchOutOfRange { .. })
-        ));
+        let out = enc.finish().expect("a far marked-blob adr veneers on a Baseline target");
+        let (rd, addr) = decode_adr_veneer(&out.bytes, 0);
+        assert_eq!(rd, Reg::R0.number());
+        assert_eq!(
+            addr,
+            i64::from(out.label_position(blob).unwrap()),
+            "the veneer points at the blob at the method end"
+        );
     }
 
     #[test]
@@ -2156,6 +2483,25 @@ mod tests {
     }
 
     #[test]
+    fn the_right_shifts_refuse_a_zero_amount_because_the_encoding_reads_it_as_thirty_two() {
+        assert_eq!(
+            Encoder::new().lsrs_imm(Reg::R0, Reg::R0, 0),
+            Err(AssembleError::UnencodableOperand)
+        );
+        assert_eq!(
+            Encoder::new().asrs_imm(Reg::R0, Reg::R0, 0),
+            Err(AssembleError::UnencodableOperand)
+        );
+        assert!(Encoder::new().lsrs_imm(Reg::R0, Reg::R0, 1).is_ok());
+        assert!(Encoder::new().lsrs_imm(Reg::R0, Reg::R0, 31).is_ok());
+        assert_eq!(
+            Encoder::new().lsrs_imm(Reg::R0, Reg::R0, 32),
+            Err(AssembleError::UnencodableOperand)
+        );
+        assert!(Encoder::new().lsls_imm(Reg::R0, Reg::R0, 0).is_ok());
+    }
+
+    #[test]
     fn add_sp_reg_encodes_the_sp_plus_register_form() {
         let mut enc = Encoder::new();
         enc.add_sp_reg(Reg::R0).unwrap();
@@ -2286,6 +2632,15 @@ mod tests {
         let mut e = Encoder::new();
         let l = e.new_label();
         e.b(l);
+        for _ in 0..2500 {
+            e.nop();
+        }
+        e.bind_label(l);
+        assert!(e.finish().is_ok(), "the far branch veneers rather than failing");
+
+        let mut e = Encoder::new();
+        let l = e.new_label();
+        e.b_cond(Cond::Eq, l);
         for _ in 0..2500 {
             e.nop();
         }

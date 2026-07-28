@@ -5,6 +5,12 @@
 
 extern crate alloc;
 
+#[cfg(all(feature = "corlib-lazy", not(feature = "flash-image")))]
+compile_error!(
+    "corlib_resolution=lazy needs a FLASH-RESIDENT corlib: enable `flash-image` (which `corlib-lazy` \
+     forwards) -- resolving out of a RAM-resident corlib costs more than the eager tier it replaces"
+);
+
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -15,7 +21,7 @@ use lamella_cil::{Opcode, Operand};
 #[cfg(feature = "exceptions")]
 use lamella_cil::EhKind;
 use lamella_metadata::{
-    Assembly, AttrArg, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeName,
+    Assembly, AttrArg, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeDef, TypeName,
     decode_custom_attribute,
 };
 #[cfg(feature = "exceptions")]
@@ -35,7 +41,8 @@ macro_rules! intrinsic {
     };
 }
 use lamella_cil_runtime::intrinsics::{
-    array_clear_range, array_clone, array_empty, array_get_value, array_rank, array_set_value,
+    array_clear_range, array_clone, array_copy_range, array_empty, array_get_value, array_rank,
+    array_set_value,
     boolean_to_string,
     buffer_block_copy, buffer_byte_length, char_to_string, console_write,
     decimal_add, decimal_compare, decimal_divide, decimal_multiply, decimal_remainder,
@@ -51,7 +58,8 @@ use lamella_cil_runtime::intrinsics::{
     enum_format, enum_get_name,
     enum_get_names, enum_get_values, enum_has_flag, enum_is_defined, enum_parse,
     enum_to_string_format, exception_ctor,
-    exception_get_message, int32_to_string, int64_to_string, interlocked_compare_exchange,
+    exception_get_message, exception_runtime_message, int32_to_string, int64_to_string,
+    interlocked_compare_exchange,
     md_array_address, md_array_get,
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
     object_reference_equals, object_to_string,
@@ -75,6 +83,9 @@ use lamella_cil_runtime::intrinsics::{
     tls_exporter_key, tls_drop_key, aead_siv_encrypt, aead_siv_decrypt, aead_import_key,
     fs_open, fs_read, fs_write, fs_seek, fs_length, fs_set_length, fs_flush, fs_close,
     fs_file_exists, fs_dir_exists, fs_delete_file, fs_create_dir, fs_delete_dir, fs_move, fs_list,
+    drive_names, drive_kind, drive_total_size, drive_format, drive_filesystems, drive_mount_removable,
+    storage_mount_ram, storage_mount_sd_over_spi, storage_mount_sd_over_spi_bus, storage_unmount,
+    storage_is_mounted,
     serial_open, serial_read, serial_write, serial_bytes_to_read, serial_bytes_to_write,
     serial_flush, serial_discard_in, serial_discard_out, serial_close,
     marshal_alloc_hglobal, marshal_free_hglobal, marshal_read_byte, marshal_read_int16,
@@ -123,8 +134,8 @@ use lamella_cil_runtime::intrinsics::type_property_custom_attributes;
 #[cfg(feature = "float")]
 use lamella_cil_runtime::intrinsics::{
     console_write_double, console_write_line_double, console_write_line_single, console_write_single,
-    decimal_from_double, decimal_to_double, double_to_exponential, double_to_fixed, double_to_string,
-    single_parse, single_to_exponential, single_to_fixed, single_to_string,
+    decimal_from_double, decimal_to_double, double_parse, double_to_exponential, double_to_fixed,
+    double_to_string, single_parse, single_to_exponential, single_to_fixed, single_to_string,
 };
 #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
 use lamella_cil_runtime::intrinsics::{
@@ -135,8 +146,9 @@ use lamella_cil_runtime::intrinsics::{
 };
 #[cfg(feature = "math-transcendental")]
 use lamella_cil_runtime::intrinsics::{
-    math_cos_f64, math_exp_f64, math_log_f64, math_log10_f64, math_pow_f64, math_sin_f64,
-    math_sqrt_f64, math_tan_f64,
+    math_acos_f64, math_asin_f64, math_atan2_f64, math_atan_f64, math_cos_f64, math_cosh_f64,
+    math_exp_f64, math_ieee_remainder_f64, math_log10_f64, math_log_base_f64, math_log_f64,
+    math_pow_f64, math_sin_f64, math_sinh_f64, math_sqrt_f64, math_tan_f64, math_tanh_f64,
 };
 use lamella_cil_runtime::module::{
     AttrValue, BoxedPrimitive, LoadedAttribute, RawCil, VarargSite, asm_key,
@@ -206,7 +218,26 @@ pub type TypeNameIndex = BTreeMap<String, TypeId>;
 /// defining assembly's storage slot by name, so the program's token and the corlib's own
 /// `FieldDef` token share one slot (the corlib `.cctor` writes it, the program reads it).
 /// Mirrors [`TypeNameIndex`], keyed by `namespace.type.field` instead of `namespace.type`.
-type FieldNameIndex = BTreeMap<String, usize>;
+/// Cross-assembly field resolution by qualified name, for BOTH storage kinds.
+///
+/// A program's `MemberRef` to another assembly's field carries the program's own token, which the
+/// declaring assembly never bound -- so the two are matched by NAME, exactly as methods are. Statics
+/// and instance fields need separate maps because their slots mean different things (a static
+/// storage cell versus an offset within an instance) and a single map would let one answer for the
+/// other.
+#[derive(Default)]
+struct FieldNameIndex {
+    /// Qualified name -> static storage slot.
+    statics: BTreeMap<String, usize>,
+    /// Qualified name -> instance-field slot within its declaring type's layout.
+    instances: BTreeMap<String, u32>,
+}
+
+impl FieldNameIndex {
+    fn new() -> FieldNameIndex {
+        FieldNameIndex::default()
+    }
+}
 
 /// The qualified key (`namespace.name`) for a type, matching across assemblies: a program's
 /// `TypeRef` to a corlib interface computes the same key the corlib's `TypeDef` did.
@@ -225,6 +256,53 @@ fn full_type_name(name: TypeName<'_>) -> String {
     } else {
         alloc::format!("{}.{}", name.namespace, name.name)
     }
+}
+
+/// The `(namespace, name)` a CROSS-ASSEMBLY reference to `type_def` arrives under.
+///
+/// For an ordinary type this is just its own pair. For a NESTED type it is not: a nested
+/// `TypeDef`'s metadata namespace is EMPTY, because its enclosing type lives in `NestedClass`
+/// (II.22.32) rather than in its name. Keying one by that empty namespace makes every same-named
+/// nested type in the assembly share a key -- `Widget.Nested` and `Gadget.Nested` both reduce to
+/// `.Nested` -- so the index silently keeps whichever was walked last.
+///
+/// A reference to a nested type arrives carrying the enclosing chain, so the enclosing type's FULL
+/// name stands in for the namespace here. `Widget.Nested` keys as `Lamella.Checks.Widget` +
+/// `Nested`, which both MATCHES the incoming reference and separates the two -- the collision is
+/// answered by construction rather than by a rule anyone has to remember.
+///
+/// The walk is bounded: a malformed cyclic `NestedClass` cannot spin here.
+fn key_type_name(type_def: &TypeDef<'_>) -> Option<(String, String)> {
+    let own = type_def.name()?;
+    let mut prefix = String::new();
+    let mut current = type_def.enclosing_type();
+    for _ in 0..16 {
+        let Some(outer) = current else { break };
+        let outer_name = outer.name()?;
+        let mut next = String::from(outer_name.name);
+        if !prefix.is_empty() {
+            next.push('.');
+            next.push_str(&prefix);
+        }
+        prefix = next;
+        if !outer_name.namespace.is_empty() {
+            prefix = alloc::format!("{}.{}", outer_name.namespace, prefix);
+            break;
+        }
+        current = outer.enclosing_type();
+    }
+    let namespace = if prefix.is_empty() {
+        String::from(own.namespace)
+    } else {
+        prefix
+    };
+    Some((namespace, String::from(own.name)))
+}
+
+/// [`field_name_key`] over an already-resolved `(namespace, type)` pair -- the form
+/// [`key_type_name`] produces for a nested type, whose namespace is not its own.
+fn field_key(namespace: &str, type_name: &str, field: &str) -> String {
+    alloc::format!("{namespace}.{type_name}.{field}")
 }
 
 /// The qualified key (`namespace.type.field`) for a static field, matching across assemblies:
@@ -327,12 +405,17 @@ fn canonical_sig_type(namespace: &str, name: &str) -> Option<SigType> {
     })
 }
 
-/// The assembly a load entry point reads from. Its PE bytes must outlive the built [`Module`] so the
-/// loader can bind method CIL; by default any borrow will do, but under `flash-image` (XIP) the bytes
-/// must be `'static` -- borrowed straight from the flash-resident image (device flash ROM, or a host
-/// `Box::leak`) so the raw CIL is never copied into RAM (see [`RawCil`]). Baking the `'static` into
-/// this one alias keeps every load signature uniform across both builds; only this definition changes,
-/// so a non-XIP build is byte-identical and the `'pe` parameter simply goes unused under XIP.
+/// The assembly a RESIDENT load entry point reads from -- one whose PE outlives the [`Module`] built
+/// from it, so method CIL can be borrowed in place. By default any borrow will do, but under
+/// `flash-image` (XIP) the bytes must be `'static` -- borrowed straight from the flash-resident image
+/// (device flash ROM, or a host `Box::leak`) so the raw CIL is never copied into RAM (see [`RawCil`]).
+/// Baking the `'static` into this one alias keeps the resident signatures uniform across both builds;
+/// only this definition changes, so a non-XIP build is byte-identical and `'pe` simply goes unused
+/// under XIP.
+///
+/// A load whose PE does NOT outlive the module -- a REPL delta or bootstrap arriving over the wire --
+/// takes a plain [`Assembly`] and a copying [`CilMaterializer`] instead, which is what lets those
+/// bytes be freed after the load. See [`load_delta`].
 #[cfg(not(feature = "flash-image"))]
 pub type SourceAssembly<'pe> = Assembly<'pe>;
 /// The `flash-image` (XIP) form: the PE bytes are `'static` so method CIL can be borrowed from flash.
@@ -340,15 +423,45 @@ pub type SourceAssembly<'pe> = Assembly<'pe>;
 #[cfg(feature = "flash-image")]
 pub type SourceAssembly<'pe> = Assembly<'static>;
 
-/// Materializes one method's raw CIL for [`Module::add_method`]: an owned `Box` copy of the PE bytes
-/// by default, or -- under `flash-image` -- a zero-copy `&'static` borrow of the flash-resident PE.
+/// Decides where one method's raw CIL LIVES, for a load reading a PE that is valid for `'pe`.
+///
+/// Residence is a property of the VALUE, not of the build ([`RawCil`]), so it cannot be settled by a
+/// `cfg` -- one `flash-image` binary loads flash-resident assemblies AND wire-delivered deltas in the
+/// same session. Threading the decision as a function tied to the PE's own lifetime puts the choice
+/// where the evidence is: [`flash_cil`] only type-checks where `'pe` is genuinely `'static`, because a
+/// `fn(&'static [u8]) -> RawCil` cannot be passed where a `fn(&'pe [u8]) -> RawCil` is wanted for a
+/// shorter `'pe`. The compiler, not a comment, is what stops a borrow of freed delta bytes.
+pub type CilMaterializer<'pe> = fn(&'pe [u8]) -> RawCil;
+
+/// Materializes one method's raw CIL for [`Module::add_method`] by BORROWING the PE in place: an
+/// owned `Box` copy by default (no XIP to borrow from), or -- under `flash-image` -- a zero-copy
+/// `&'static` borrow of the flash-resident PE.
+///
+/// The `'static` on the XIP form is what makes this a FLASH residence: it is the proof that the PE
+/// outlives the module, and it can only be supplied by a caller that genuinely holds flash-resident
+/// bytes.
 #[cfg(not(feature = "flash-image"))]
-fn raw_cil(bytes: &[u8]) -> RawCil {
+fn flash_cil(bytes: &[u8]) -> RawCil {
     bytes.to_vec().into_boxed_slice()
 }
 #[cfg(feature = "flash-image")]
-fn raw_cil(bytes: &'static [u8]) -> RawCil {
-    bytes
+fn flash_cil(bytes: &'static [u8]) -> RawCil {
+    RawCil::Flash(bytes)
+}
+
+/// Materializes one method's raw CIL by COPYING it out of the PE, so the module owns its bodies and
+/// the PE can be dropped the moment the load returns. Accepts a borrow of ANY lifetime -- that is the
+/// whole point, and the reason a REPL submission need not leak its delta.
+///
+/// This is what the default (non-XIP) build has always done; under `flash-image` it is the [`RawCil`]
+/// arm that keeps a RAM-delivered body out of the flash-borrow discipline.
+#[cfg(not(feature = "flash-image"))]
+fn ram_cil(bytes: &[u8]) -> RawCil {
+    bytes.to_vec().into_boxed_slice()
+}
+#[cfg(feature = "flash-image")]
+fn ram_cil(bytes: &[u8]) -> RawCil {
+    RawCil::Ram(bytes.to_vec().into_boxed_slice())
 }
 
 /// Builds a runnable [`Program`] from `assembly`.
@@ -373,6 +486,7 @@ pub fn load<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, LoadError> {
     let entry = load_assembly(
         &mut module,
         assembly,
+        flash_cil,
         0,
         &mut index,
         &mut type_index,
@@ -401,6 +515,7 @@ pub fn load_unfrozen<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, Loa
     let entry = load_assembly(
         &mut module,
         assembly,
+        flash_cil,
         0,
         &mut index,
         &mut type_index,
@@ -416,7 +531,22 @@ pub fn load_unfrozen<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, Loa
 /// The REPL emits a `/target:library` session class and invokes a named method by id (never an
 /// entry), so this lets it load that image directly instead of carrying an unused dummy `Main`.
 pub fn load_library<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Module, LoadError> {
-    Ok(load_bootstrap(assembly).0)
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    let _ = load_assembly(
+        &mut module,
+        assembly,
+        flash_cil,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        false,
+    );
+    module.freeze();
+    Ok(module)
 }
 
 /// Loads the incremental-REPL bootstrap library exactly as [`load_library`] does, but also
@@ -425,8 +555,11 @@ pub fn load_library<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Module, LoadE
 /// through [`load_delta`]) can resolve a cross-assembly reference into the bootstrap BY NAME -- a
 /// declared type's base `System.Object::.ctor`, or the `<repl>.__Repl` the delta references. (The
 /// static-field index is internal to one assembly's load and not needed across deltas.)
+///
+/// The bootstrap PE is the one the host emits over the wire, so it is NOT required to outlive the
+/// module: its bodies are copied out ([`ram_cil`]) and the caller may drop the bytes on return.
 #[must_use]
-pub fn load_bootstrap<'pe>(assembly: &SourceAssembly<'pe>) -> (Module, NameIndex, TypeNameIndex) {
+pub fn load_bootstrap<'pe>(assembly: &Assembly<'pe>) -> (Module, NameIndex, TypeNameIndex) {
     let mut module = Module::new();
     let mut index = NameIndex::new();
     let mut type_index = TypeNameIndex::new();
@@ -434,11 +567,53 @@ pub fn load_bootstrap<'pe>(assembly: &SourceAssembly<'pe>) -> (Module, NameIndex
     let _ = load_assembly(
         &mut module,
         assembly,
+        ram_cil,
         0,
         &mut index,
         &mut type_index,
         &mut field_index,
         false,
+    );
+    module.freeze();
+    (module, index, type_index)
+}
+
+/// Like [`load_bootstrap`], but loads a resident `corlib` beneath the bootstrap first, so the
+/// returned name indices resolve the FULL managed BCL surface by name: a later submission delta's
+/// cross-assembly `MemberRef` to a MANAGED corlib method (e.g. `System.String::IsNullOrEmpty` -- a
+/// real IL body, not a `[RuntimeProvided]` intrinsic the [`bind_bcl_calls`] fallback recognizes)
+/// binds to the corlib's [`MethodId`] instead of trapping. This is the EAGER corlib-resolution
+/// tier: the whole corlib is resident in RAM (~1 MiB), which desktop / WASM / roomy MCUs afford; a
+/// constrained tier resolves the same members lazily from a flash-resident corlib instead. corlib
+/// takes asm 0 and the bootstrap asm 1, so submissions start at asm 2 ([`DeltaContext::new_at`]).
+#[must_use]
+pub fn load_bootstrap_with_corlib<'c, 'b>(
+    corlib: &SourceAssembly<'c>,
+    bootstrap: &Assembly<'b>,
+) -> (Module, NameIndex, TypeNameIndex) {
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    load_assembly(
+        &mut module,
+        corlib,
+        flash_cil,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    load_assembly(
+        &mut module,
+        bootstrap,
+        ram_cil,
+        1,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
     );
     module.freeze();
     (module, index, type_index)
@@ -486,9 +661,71 @@ pub struct DeltaContext {
     /// token space and all live deltas resolve simultaneously (the cap is 256 assemblies, the
     /// `u8` range -- [`crate::Module::asm_key`] folds the asm id into the high 32 bits of a u64).
     next_delta_asm: u8,
+    /// Every signature key this session has ever dispatched VIRTUALLY -- from the deltas and from
+    /// the corlib bodies they pulled in. A lazily materialized type's dispatch map is populated for
+    /// these keys ONLY: building the full map instead means materializing every virtual body of the
+    /// type and its base chain, so merely boxing an int would drag in `ToString` and the whole
+    /// format machinery behind it, which costs seconds on a constrained target. Accumulates across
+    /// submissions,
+    /// because a type materialized by one submission may not be dispatched on until a later one.
+    dispatch_keys: BTreeSet<String>,
+    /// The corlib types materialized so far, by (namespace, name). When a submission introduces a
+    /// dispatch key never seen before, these are the maps that must be TOPPED UP with it -- a type
+    /// materialized earlier would otherwise keep the map it was built with and silently miss.
+    corlib_types: Vec<(String, String)>,
+}
+
+/// The dispatch keys in play during one materialization pass, threaded alongside the worklist.
+/// Separate from [`DeltaContext`] so the recursive materializers can hold `&mut` on the context and
+/// still read the key set (and so a re-entrant call sees the same one).
+struct DispatchKeys {
+    /// Every key wanted so far -- the filter a type's dispatch map is built against.
+    wanted: BTreeSet<String>,
+    /// Keys added since the last top-up. A corlib body materialized during this pass can introduce
+    /// a key of its own (`ToUpper`'s internal `sb.ToString()`), so the pass iterates to a fixpoint.
+    fresh: Vec<String>,
+}
+
+impl DispatchKeys {
+    /// Records `key` as dispatched, returning whether it was new.
+    fn want(&mut self, key: String) -> bool {
+        if self.wanted.contains(&key) {
+            return false;
+        }
+        self.fresh.push(key.clone());
+        self.wanted.insert(key);
+        true
+    }
 }
 
 impl DeltaContext {
+    /// The resident RAM (bytes) this context's own name indices hold, per structure -- the
+    /// session-level bookkeeping that is NOT part of the module and therefore does NOT appear in
+    /// [`crate::Module::heap_report`].
+    ///
+    /// Every submission grows these: a delta's `Submit$N` and any type it declares are recorded by
+    /// QUALIFIED NAME so a later delta can resolve them, and names are the persistent contract, so
+    /// nothing here is reclaimable while the session lives. Measuring a live session's footprint
+    /// from the module alone therefore UNDER-REPORTS it, which is why this exists.
+    ///
+    /// Sizes use the same convention as `heap_report`: a `String` key costs its bytes plus a flat
+    /// per-entry allowance for the allocation and the map node.
+    #[must_use]
+    pub fn heap_report(&self) -> Vec<(&'static str, usize)> {
+        let entry = |key: &String| key.len() + 40;
+        alloc::vec![
+            ("session method index", self.index.keys().map(entry).sum::<usize>()),
+            ("session type index", self.type_index.keys().map(entry).sum::<usize>()),
+            (
+                "session field indexes",
+                self.field_slots.keys().map(entry).sum::<usize>()
+                    + self.static_field_index.statics.keys().map(entry).sum::<usize>()
+                    + self.static_field_index.instances.keys().map(entry).sum::<usize>()
+                    + self.instance_field_index.keys().map(entry).sum::<usize>(),
+            ),
+        ]
+    }
+
     /// Opens an incremental-REPL context over the bootstrap's `__Repl` type. `repl_type` is the
     /// global [`crate::TypeId`] of the (initially field-less) `<repl>.__Repl` the bootstrap
     /// loaded; the caller finds it the same way [`load`] anchors a session class -- via the
@@ -499,6 +736,22 @@ impl DeltaContext {
     /// state, and no delta has declared a type yet); each [`load_delta`] grows them.
     #[must_use]
     pub fn new(repl_type: TypeId, index: NameIndex, type_index: TypeNameIndex) -> DeltaContext {
+        DeltaContext::new_at(repl_type, index, type_index, FIRST_DELTA_ASM)
+    }
+
+    /// Like [`DeltaContext::new`], but starts the FIRST submission delta at `first_delta_asm`
+    /// rather than [`FIRST_DELTA_ASM`]. A bootstrap loaded ALONE owns asm 0, so its deltas start
+    /// at 1; a session opened over a resident corlib ([`load_bootstrap_with_corlib`]) puts corlib
+    /// at asm 0 and the bootstrap at asm 1, so its deltas start at 2. The caller passes the
+    /// assembly id one past the last resident image so every delta still gets a distinct token
+    /// space (the cap is 256 assemblies, the `u8` range).
+    #[must_use]
+    pub fn new_at(
+        repl_type: TypeId,
+        index: NameIndex,
+        type_index: TypeNameIndex,
+        first_delta_asm: u8,
+    ) -> DeltaContext {
         DeltaContext {
             repl_type,
             field_slots: BTreeMap::new(),
@@ -506,7 +759,9 @@ impl DeltaContext {
             type_index,
             static_field_index: FieldNameIndex::new(),
             instance_field_index: BTreeMap::new(),
-            next_delta_asm: FIRST_DELTA_ASM,
+            next_delta_asm: first_delta_asm,
+            dispatch_keys: BTreeSet::new(),
+            corlib_types: Vec::new(),
         }
     }
 
@@ -551,15 +806,26 @@ pub enum DeltaError {
     /// A `__Repl` field reference in the delta could not be typed (its `MemberRef` carried no
     /// field signature), so the runtime cannot size a new field for it.
     UntypedFieldRef,
+    /// A `call` / `callvirt` / `newobj` in the delta names a member -- typically a corlib member
+    /// gated out of a constrained tier's resident corlib -- that neither the lazy resolver could
+    /// materialize nor an intrinsic provides. Left unbound it would trap at RUN as an opaque
+    /// `UnresolvedCall`; caught at load, it is a clean REPL error carrying the qualified member name.
+    UnresolvedMember(String),
 }
 
 impl fmt::Display for DeltaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            DeltaError::NoSubmitMethod => "delta defines no Submit$N method",
-            DeltaError::SubmitHasNoBody => "delta Submit$N method has no body",
-            DeltaError::UntypedFieldRef => "delta __Repl field reference has no signature",
-        })
+        match self {
+            DeltaError::NoSubmitMethod => formatter.write_str("delta defines no Submit$N method"),
+            DeltaError::SubmitHasNoBody => formatter.write_str("delta Submit$N method has no body"),
+            DeltaError::UntypedFieldRef => {
+                formatter.write_str("delta __Repl field reference has no signature")
+            }
+            DeltaError::UnresolvedMember(name) => write!(
+                formatter,
+                "cannot resolve {name} -- no such member in the resident corlib, and no intrinsic provides it"
+            ),
+        }
     }
 }
 
@@ -599,7 +865,7 @@ impl fmt::Display for DeltaError {
 pub fn load_delta<'pe>(
     module: &mut Module,
     context: &mut DeltaContext,
-    delta: &SourceAssembly<'pe>,
+    delta: &Assembly<'pe>,
 ) -> Result<DeltaInfo, DeltaError> {
     let mut submit_row: Option<u32> = None;
     let mut method_row: u32 = 0;
@@ -618,6 +884,7 @@ pub fn load_delta<'pe>(
     load_assembly(
         module,
         delta,
+        ram_cil,
         delta_asm,
         &mut context.index,
         &mut context.type_index,
@@ -753,6 +1020,776 @@ fn bind_delta_field(
     Ok(Some(default))
 }
 
+
+/// The assembly id a lazily-materialized corlib occupies -- 0, exactly the slot the EAGER tier gives
+/// corlib, so the bootstrap (asm 1) and submissions (asm 2+) lay out identically either way and a
+/// delta resolves to the same ids under lazy as under eager.
+const LAZY_CORLIB_ASM: u8 = 0;
+
+/// A corlib type's field inputs for materialization: its base token, its instance fields, and its
+/// static fields -- each field paired with its metadata token and zero default value.
+type CorlibTypeFields = (Token, Vec<(Token, Value)>, Vec<(Token, Value)>);
+
+/// Loads the incremental-REPL bootstrap for a LAZY corlib session: the bootstrap takes asm 1,
+/// reserving asm 0 for corlib members materialized on demand ([`load_delta_with_corlib`]). NO corlib
+/// is loaded into RAM here -- only the members a submission actually references get pulled in later,
+/// from a flash-resident corlib. Submissions start at asm 2 ([`DeltaContext::new_at`]).
+#[must_use]
+pub fn load_bootstrap_lazy_corlib<'pe>(
+    bootstrap: &Assembly<'pe>,
+) -> (Module, NameIndex, TypeNameIndex) {
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    load_assembly(
+        &mut module,
+        bootstrap,
+        ram_cil,
+        1,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    module.freeze();
+    (module, index, type_index)
+}
+
+/// Like [`load_delta`], but resolves the submission's references to a MANAGED corlib member (one
+/// with a real IL body -- not a `[RuntimeProvided]` intrinsic the [`bind_bcl_calls`] fallback already
+/// recognizes) against a flash-resident `corlib`, materializing only the members the delta reaches
+/// (and their transitive closure) into the session module first. This is the LAZY corlib-resolution
+/// tier: RAM tracks the working set, not the whole corlib.
+///
+/// # Errors
+/// As [`load_delta`].
+pub fn load_delta_with_corlib<'d, 'c>(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    delta: &Assembly<'d>,
+    corlib: &SourceAssembly<'c>,
+) -> Result<DeltaInfo, DeltaError> {
+    materialize_delta_corlib_refs(module, context, delta, corlib);
+    let delta_asm = context.next_delta_asm;
+    let info = load_delta(module, context, delta)?;
+    if let Some(name) = first_unresolved_call(module, delta, delta_asm) {
+        return Err(DeltaError::UnresolvedMember(name));
+    }
+    Ok(info)
+}
+
+/// The first `call` / `callvirt` / `newobj` MemberRef in any of `delta`'s method bodies that resolves
+/// to NOTHING in `module` after loading -- a member the lazy resolver could not materialize and no
+/// intrinsic provides (a corlib member gated out of a constrained tier is the common case). Returns
+/// its qualified name so the caller can reject the delta LOUDLY at load, rather than let it trap at
+/// run as an opaque `UnresolvedCall`. Only `MemberRef` targets are checked -- a same-delta `MethodDef`
+/// is bound by [`load_assembly`] and never misses -- and a `[DllImport]` P/Invoke target is excluded,
+/// its absence on a device being a distinct expected trap, not a corlib miss.
+fn first_unresolved_call(module: &Module, delta: &Assembly, delta_asm: u8) -> Option<String> {
+    for type_def in delta.type_defs() {
+        for method in type_def.methods() {
+            let Some(body) = method.body() else {
+                continue;
+            };
+            for instruction in body.code.iter() {
+                if !matches!(
+                    instruction.opcode,
+                    Opcode::Call | Opcode::Callvirt | Opcode::Newobj
+                ) {
+                    continue;
+                }
+                let Operand::Token(token) = &instruction.operand else {
+                    continue;
+                };
+                if token.table() != MEMBER_REF {
+                    continue;
+                }
+                if module.resolve(delta_asm, *token).is_some()
+                    || module.pinvoke_target(delta_asm, token.0).is_some()
+                {
+                    continue;
+                }
+                return Some(member_ref_display_name(delta, *token));
+            }
+        }
+    }
+    None
+}
+
+/// A `MemberRef`'s qualified `Namespace.Type::method` name (best-effort) for a REPL diagnostic.
+fn member_ref_display_name(delta: &Assembly, token: Token) -> String {
+    let member = delta.member_ref(token.row());
+    let name = member.as_ref().and_then(|member| member.name()).unwrap_or("<unknown>");
+    match member.as_ref().and_then(|member| delta.type_token_name(member.parent())) {
+        Some(parent) if !parent.namespace.is_empty() => {
+            alloc::format!("{}.{}::{}", parent.namespace, parent.name, name)
+        }
+        Some(parent) => alloc::format!("{}::{}", parent.name, name),
+        None => String::from(name),
+    }
+}
+
+/// Seeds `context`'s name indices with every managed corlib member the `delta` references (and their
+/// transitive corlib closure), pulling each from `corlib` into the module under [`LAZY_CORLIB_ASM`].
+/// After this, the delta's own [`load_delta`] binds those references by name exactly as it would
+/// against an eagerly-loaded corlib. A reference already materialized (its key is in `context.index`)
+/// or naming a NON-corlib type is skipped -- left for [`load_delta`] / the intrinsic fallback.
+fn materialize_delta_corlib_refs<'c>(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    delta: &Assembly,
+    corlib: &SourceAssembly<'c>,
+) {
+    let mut worklist: Vec<u32> = Vec::new();
+    let mut seen: BTreeSet<Token> = BTreeSet::new();
+    let mut type_tokens: Vec<Token> = Vec::new();
+    let mut dispatch =
+        DispatchKeys { wanted: core::mem::take(&mut context.dispatch_keys), fresh: Vec::new() };
+    for type_def in delta.type_defs() {
+        for method in type_def.methods() {
+            let Some(body) = method.body() else {
+                continue;
+            };
+            for instruction in body.code.iter() {
+                let Operand::Token(token) = &instruction.operand else {
+                    continue;
+                };
+                match instruction.opcode {
+                    Opcode::Call | Opcode::Callvirt | Opcode::Newobj => {
+                        if token.table() == MEMBER_REF && seen.insert(*token) {
+                            enqueue_corlib_ref(context, delta, corlib, *token, &mut worklist);
+                        }
+                    }
+                    Opcode::Box
+                    | Opcode::Unbox
+                    | Opcode::UnboxAny
+                    | Opcode::Castclass
+                    | Opcode::Isinst
+                    | Opcode::Newarr
+                    | Opcode::Ldtoken
+                    | Opcode::Constrained
+                    | Opcode::Initobj
+                    | Opcode::Sizeof => {
+                        if seen.insert(*token) {
+                            type_tokens.push(*token);
+                        }
+                    }
+                    _ => {}
+                }
+                if matches!(instruction.opcode, Opcode::Callvirt | Opcode::Ldvirtftn) {
+                    if let Some(key) = delta_callvirt_key(delta, *token) {
+                        dispatch.want(key);
+                    }
+                }
+            }
+        }
+    }
+    let mut corlib_memberrefs: BTreeSet<Token> = BTreeSet::new();
+    for token in type_tokens {
+        let Some(name) = delta.type_token_name(token) else {
+            continue;
+        };
+        if corlib_defines_type(corlib, name) {
+            materialize_corlib_type(
+                module,
+                context,
+                corlib,
+                name,
+                &mut worklist,
+                &mut corlib_memberrefs,
+                &mut dispatch,
+            );
+        }
+    }
+    let mut cursor = 0;
+    loop {
+        while cursor < worklist.len() {
+            let row = worklist[cursor];
+            cursor += 1;
+            materialize_corlib_method_row(
+                module,
+                context,
+                corlib,
+                row,
+                &mut worklist,
+                &mut corlib_memberrefs,
+                &mut dispatch,
+            );
+        }
+        let fresh = core::mem::take(&mut dispatch.fresh);
+        if fresh.is_empty() {
+            break;
+        }
+        top_up_corlib_dispatch_maps(
+            module,
+            context,
+            corlib,
+            &fresh,
+            &mut worklist,
+            &mut corlib_memberrefs,
+            &mut dispatch,
+        );
+        if cursor >= worklist.len() && dispatch.fresh.is_empty() {
+            break;
+        }
+    }
+    context.dispatch_keys = core::mem::take(&mut dispatch.wanted);
+    bind_bcl_calls(
+        corlib,
+        module,
+        LAZY_CORLIB_ASM,
+        &context.index,
+        &context.type_index,
+        true,
+        &corlib_memberrefs,
+    );
+}
+
+/// The dispatch signature key of a `callvirt` / `ldvirtftn` site in `delta` -- the same encoding
+/// [`bind_call_targets`] binds to the site and [`resolve_callvirt`](lamella_cil_runtime) looks up in
+/// the runtime type's map, so the two agree by construction.
+fn delta_callvirt_key(delta: &Assembly, token: Token) -> Option<String> {
+    let (name, params) = match token.table() {
+        MEMBER_REF => {
+            let member = delta.member_ref(token.row())?;
+            let name: String = member.name()?.into();
+            let params = member
+                .method_signature()
+                .map(|signature| signature.parameters)
+                .unwrap_or_default();
+            (name, params)
+        }
+        _ => return None,
+    };
+    Some(sig_encode(delta, &name, &params))
+}
+
+/// Adds `fresh` keys to the dispatch map of every corlib type materialized so far. A type is
+/// materialized with the keys known AT THAT MOMENT, so without this a submission that first
+/// dispatches `Equals` on an `object` boxed several submissions ago would find the box's type
+/// carrying the map it was born with -- and miss, silently, exactly as if the type had never been
+/// materialized at all.
+fn top_up_corlib_dispatch_maps<'c>(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    corlib: &SourceAssembly<'c>,
+    fresh: &[String],
+    worklist: &mut Vec<u32>,
+    corlib_memberrefs: &mut BTreeSet<Token>,
+    dispatch: &mut DispatchKeys,
+) {
+    let wanted: BTreeSet<String> = fresh.iter().cloned().collect();
+    let types = context.corlib_types.clone();
+    for (namespace, type_name) in types {
+        let name = TypeName { namespace: &namespace, name: &type_name };
+        let Some(&type_id) = context.type_index.get(&type_name_key(name)) else {
+            continue;
+        };
+        let added = materialize_corlib_sig_methods(
+            module,
+            context,
+            corlib,
+            name,
+            worklist,
+            corlib_memberrefs,
+            dispatch,
+            &wanted,
+        );
+        for (key, method) in added {
+            module.add_sig_method(type_id, &key, method);
+        }
+    }
+}
+
+/// Whether `corlib` DEFINES a type by this name -- the guard on materializing a type the delta names
+/// by token, so a delta's own declared type (which resolves in the delta, not the corlib) is not
+/// registered as a corlib type and indexed under its name.
+fn corlib_defines_type(corlib: &Assembly, name: TypeName<'_>) -> bool {
+    corlib.type_defs().any(|type_def| {
+        type_def
+            .name()
+            .is_some_and(|n| n.namespace == name.namespace && n.name == name.name)
+    })
+}
+
+/// If `token` (a `MemberRef` in `delta`) names a corlib method not yet materialized, finds its
+/// `MethodDef` row in `corlib` and pushes it onto `worklist`. A reference whose declaring type is not
+/// in corlib, or already materialized, is ignored.
+fn enqueue_corlib_ref(
+    context: &DeltaContext,
+    delta: &Assembly,
+    corlib: &Assembly,
+    token: Token,
+    worklist: &mut Vec<u32>,
+) {
+    let Some(member) = delta.member_ref(token.row()) else {
+        return;
+    };
+    let Some(method_name) = member.name() else {
+        return;
+    };
+    let Some(parent) = delta.type_token_name(member.parent()) else {
+        return;
+    };
+    let signature = member.method_signature();
+    let params: Vec<SigType> = signature
+        .as_ref()
+        .map(|sig| sig.parameters.clone())
+        .unwrap_or_default();
+    let key = name_key(
+        delta,
+        parent.namespace,
+        parent.name,
+        method_name,
+        &params,
+        signature.as_ref().map(|sig| &sig.return_type),
+    );
+    if context.index.contains_key(&key) {
+        return;
+    }
+    if let Some(row) = find_corlib_method_row(corlib, parent.namespace, parent.name, method_name, &key)
+    {
+        worklist.push(row);
+    }
+}
+
+/// Scans `corlib` for the `MethodDef` row of `namespace.type_name::method` whose stable [`name_key`]
+/// (encoded against corlib) equals `key` (encoded against the referencing assembly) -- an O(n) scan,
+/// human-REPL-paced-fine, that a baked sorted name index later turns into a binary search. Returns
+/// the global `MethodDef` row (the token row) so the caller can materialize it.
+fn find_corlib_method_row(
+    corlib: &Assembly,
+    namespace: &str,
+    type_name: &str,
+    method: &str,
+    key: &str,
+) -> Option<u32> {
+    let mut method_row: u32 = 0;
+    for type_def in corlib.type_defs() {
+        let matches_type = type_def
+            .name()
+            .is_some_and(|name| name.namespace == namespace && name.name == type_name);
+        for candidate in type_def.methods() {
+            method_row += 1;
+            if !matches_type || candidate.name() != Some(method) {
+                continue;
+            }
+            let signature = candidate.signature();
+            let params: Vec<SigType> = signature
+                .as_ref()
+                .map(|sig| sig.parameters.clone())
+                .unwrap_or_default();
+            let candidate_key = name_key(
+                corlib,
+                namespace,
+                type_name,
+                method,
+                &params,
+                signature.as_ref().map(|sig| &sig.return_type),
+            );
+            if candidate_key == *key {
+                return Some(method_row);
+            }
+        }
+    }
+    None
+}
+
+/// Resolves a MemberRef in a materialized corlib body to the corlib `MethodDef` row it names, so a
+/// managed sibling accessor / helper materializes in turn. `None` when the target is not a corlib
+/// method -- a `[RuntimeProvided]` accessor still binds via the intrinsic fallback in
+/// [`bind_bcl_calls`], so it needs no materialized row.
+fn corlib_memberref_target_row(corlib: &Assembly, token: Token) -> Option<u32> {
+    let member = corlib.member_ref(token.row())?;
+    let method_name = member.name()?;
+    let parent = corlib.type_token_name(member.parent())?;
+    let signature = member.method_signature();
+    let params: Vec<SigType> = signature
+        .as_ref()
+        .map(|sig| sig.parameters.clone())
+        .unwrap_or_default();
+    let key = name_key(
+        corlib,
+        parent.namespace,
+        parent.name,
+        method_name,
+        &params,
+        signature.as_ref().map(|sig| &sig.return_type),
+    );
+    find_corlib_method_row(corlib, parent.namespace, parent.name, method_name, &key)
+}
+
+/// Materializes the corlib `MethodDef` at `method_row` into the module under [`LAZY_CORLIB_ASM`]:
+/// its declaring type, then the method itself (an intrinsic if `[RuntimeProvided]`, else its managed
+/// IL body borrowed from `corlib`), binding its def token and recording it in `context.index` so both
+/// its own call sites and the referencing delta resolve to it. A managed body's own corlib callees
+/// (further `MethodDef` calls) are pushed onto `worklist` for transitive materialization. Idempotent:
+/// a row whose token is already bound returns immediately.
+fn materialize_corlib_method_row<'c>(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    corlib: &SourceAssembly<'c>,
+    method_row: u32,
+    worklist: &mut Vec<u32>,
+    corlib_memberrefs: &mut BTreeSet<Token>,
+    dispatch: &mut DispatchKeys,
+) {
+    let token = Token::new(METHOD_DEF, method_row);
+    if module.resolve(LAZY_CORLIB_ASM, token).is_some() {
+        return;
+    }
+    let mut row: u32 = 0;
+    for type_def in corlib.type_defs() {
+        let declaring = type_def.name();
+        for method in type_def.methods() {
+            row += 1;
+            if row != method_row {
+                continue;
+            }
+            let Some(declaring) = declaring else {
+                return;
+            };
+            let name: String = method.name().unwrap_or("").into();
+            let signature = method.signature();
+            let return_type = signature.as_ref().map(|sig| sig.return_type.clone());
+            let params: Vec<SigType> = signature
+                .as_ref()
+                .map(|sig| sig.parameters.clone())
+                .unwrap_or_default();
+            let key = name_key(
+                corlib,
+                declaring.namespace,
+                declaring.name,
+                &name,
+                &params,
+                return_type.as_ref(),
+            );
+            let type_id = materialize_corlib_type(
+                module,
+                context,
+                corlib,
+                declaring,
+                worklist,
+                corlib_memberrefs,
+                dispatch,
+            );
+
+            let string_ctor =
+                name == ".ctor" && declaring.namespace == "System" && declaring.name == "String";
+            let runtime_supplied = method.is_runtime_impl()
+                || has_runtime_provided_attribute(corlib, token)
+                || string_ctor;
+            let intrinsic = runtime_supplied
+                .then(|| {
+                    bcl_intrinsic(declaring.namespace, declaring.name, &name, signature.as_ref())
+                })
+                .flatten();
+
+            if let Some((func, intr_id)) = intrinsic {
+                let id = module.add_intrinsic(LAZY_CORLIB_ASM, func, intr_id, arg_count(&method));
+                module.bind_token(LAZY_CORLIB_ASM, token, id);
+                module.set_method_type(id, type_id);
+                context.index.insert(key, id);
+                return;
+            }
+
+            let Some((_, raw_il)) = method.body_and_bytes() else {
+                return;
+            };
+            let id = module.add_method(LAZY_CORLIB_ASM, flash_cil(raw_il), arg_count(&method));
+            module.bind_token(LAZY_CORLIB_ASM, token, id);
+            module.set_method_type(id, type_id);
+            context.index.insert(key, id);
+
+            if let Some(body) = method.body() {
+                for instruction in body.code.iter() {
+                    let Operand::Token(operand) = &instruction.operand else {
+                        continue;
+                    };
+                    if !matches!(
+                        instruction.opcode,
+                        Opcode::Call | Opcode::Callvirt | Opcode::Newobj
+                    ) {
+                        continue;
+                    }
+                    match operand.table() {
+                        METHOD_DEF => worklist.push(operand.row()),
+                        MEMBER_REF => {
+                            corlib_memberrefs.insert(*operand);
+                            if let Some(row) = corlib_memberref_target_row(corlib, *operand) {
+                                worklist.push(row);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if matches!(instruction.opcode, Opcode::Callvirt) {
+                        let target = match operand.table() {
+                            MEMBER_REF => corlib.member_ref(operand.row()).map(|member| {
+                                let target_name: String = member.name().unwrap_or("").into();
+                                let params = member
+                                    .method_signature()
+                                    .map(|signature| signature.parameters)
+                                    .unwrap_or_default();
+                                (target_name, params)
+                            }),
+                            METHOD_DEF => corlib_method_name_params(corlib, operand.row()),
+                            _ => None,
+                        };
+                        if let Some((target_name, params)) = target {
+                            let key = sig_encode(corlib, &target_name, &params);
+                            let argc = u16::try_from(params.len() + 1).unwrap_or(u16::MAX);
+                            module.bind_call_target(LAZY_CORLIB_ASM, *operand, key.clone(), argc);
+                            dispatch.want(key);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+}
+
+/// Registers a corlib type in the session module the first time it is reached, returning its
+/// [`crate::TypeId`]; a type already in `context.type_index` returns its existing id (interning by
+/// name, so a corlib type is ONE session identity across deltas -- a `string` from delta A and one
+/// from delta B share it). Records the canonical `System.String` id so `ldstr` works.
+fn materialize_corlib_type<'c>(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    corlib: &SourceAssembly<'c>,
+    name: TypeName<'_>,
+    worklist: &mut Vec<u32>,
+    corlib_memberrefs: &mut BTreeSet<Token>,
+    dispatch: &mut DispatchKeys,
+) -> TypeId {
+    let key = type_name_key(name);
+    if let Some(&type_id) = context.type_index.get(&key) {
+        return type_id;
+    }
+
+    let mut field_row: u32 = 0;
+    let mut type_row: u32 = 0;
+    let mut found: Option<CorlibTypeFields> = None;
+    for type_def in corlib.type_defs() {
+        type_row += 1;
+        let is_target = type_def
+            .name()
+            .is_some_and(|n| n.namespace == name.namespace && n.name == name.name);
+        let mut own_instance = Vec::new();
+        let mut own_static = Vec::new();
+        for field in type_def.fields() {
+            field_row += 1;
+            if !is_target {
+                continue;
+            }
+            let token = Token::new(FIELD, field_row);
+            if field.is_static() {
+                if !field.is_literal() {
+                    own_static.push((token, default_field_value(field.signature())));
+                }
+            } else {
+                own_instance.push((token, default_field_value(field.signature())));
+            }
+        }
+        if is_target {
+            found = Some((type_def.extends(), own_instance, own_static));
+            break;
+        }
+    }
+
+    let (extends, own_instance, own_static) = match found {
+        Some(found) => found,
+        None => {
+            let type_id = module.add_type(Vec::new());
+            module.bind_type_full_name(type_id, full_type_name(name));
+            context.type_index.insert(key, type_id);
+            return type_id;
+        }
+    };
+
+    let mut base_type: Option<TypeId> = None;
+    let base_defaults: Vec<Value> = if extends.row() != 0 {
+        if let Some(base) = corlib.type_token_name(extends) {
+            let base_id = materialize_corlib_type(
+                module,
+                context,
+                corlib,
+                base,
+                worklist,
+                corlib_memberrefs,
+                dispatch,
+            );
+            base_type = Some(base_id);
+            module.type_field_defaults(base_id).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let base_count = base_defaults.len();
+    let mut full = base_defaults;
+    full.extend(own_instance.iter().map(|(_, default)| default.clone()));
+
+    let type_id = module.add_type(full);
+    if module.string_type_id().is_none() && name.namespace == "System" && name.name == "String" {
+        module.set_string_type_id(type_id);
+    }
+    module.bind_type_full_name(type_id, full_type_name(name));
+    let own_token = Token::new(TYPE_DEF, type_row);
+    module.bind_type_token(LAZY_CORLIB_ASM, own_token, type_id);
+    module.bind_type_name(LAZY_CORLIB_ASM, own_token, name.name.into());
+    if name.namespace == "System" {
+        match name.name {
+            "Object" => module.mark_object_type_token(LAZY_CORLIB_ASM, own_token),
+            "String" => module.mark_string_type_token(LAZY_CORLIB_ASM, own_token),
+            _ => {}
+        }
+    }
+    module.set_type_base(type_id, base_type);
+    let is_value_type = corlib.type_token_name(extends).is_some_and(|base| {
+        base.namespace == "System" && (base.name == "ValueType" || base.name == "Enum")
+    });
+    module.set_type_is_value_type(type_id, is_value_type);
+    context.type_index.insert(key, type_id);
+    for (index, (token, _)) in own_instance.iter().enumerate() {
+        module.bind_field(LAZY_CORLIB_ASM, *token, (base_count + index) as u32);
+    }
+    for (token, default) in &own_static {
+        module.bind_static_field(LAZY_CORLIB_ASM, *token, default.clone());
+    }
+    context.corlib_types.push((name.namespace.into(), name.name.into()));
+    let wanted = dispatch.wanted.clone();
+    let sig_methods = materialize_corlib_sig_methods(
+        module,
+        context,
+        corlib,
+        name,
+        worklist,
+        corlib_memberrefs,
+        dispatch,
+        &wanted,
+    );
+    if !sig_methods.is_empty() {
+        module.set_sig_methods(type_id, sig_methods);
+    }
+    type_id
+}
+
+/// The declared name + parameter types of the corlib method at global `row` (the same numbering
+/// [`materialize_corlib_method_row`] uses), for building a `callvirt` target's signature key.
+fn corlib_method_name_params(corlib: &Assembly, row: u32) -> Option<(String, Vec<SigType>)> {
+    let mut method_row: u32 = 0;
+    for type_def in corlib.type_defs() {
+        for method in type_def.methods() {
+            method_row += 1;
+            if method_row != row {
+                continue;
+            }
+            let name: String = method.name().unwrap_or("").into();
+            let params: Vec<SigType> = method
+                .signature()
+                .as_ref()
+                .map(|signature| signature.parameters.clone())
+                .unwrap_or_default();
+            return Some((name, params));
+        }
+    }
+    None
+}
+
+/// The virtual-dispatch signature map for a materialized corlib type: every virtual method reachable
+/// on it, walking `name`'s base chain with the MOST-DERIVED declaration winning each signature.
+///
+/// `callvirt` needs this because a call site compiled against a BASE declaration must still reach the
+/// derived override at run time. C# lowers `sb.ToString()` inside a corlib body to a call on
+/// `System.Object::ToString`, and [`resolve_callvirt`](lamella_cil_runtime) tries, in order: an
+/// explicit `MethodImpl`, then the static target's VTABLE SLOT, then this signature map. The lazy
+/// tier binds no vtable slots (only the eager `build_vtables` calls `bind_method_slot`), so the slot
+/// branch is skipped and the signature map is the path taken. Without it the call falls through to
+/// the static target -- the `Object::ToString` intrinsic, which renders the declaring type's NAME --
+/// so `"hello".ToUpper()` returned `"System.Text.StringBuilder"` instead of the built string. That
+/// made LAZY disagree with EAGER (which builds real vtables), breaking the observational invariant,
+/// and it failed SILENTLY rather than trapping.
+fn materialize_corlib_sig_methods<'c>(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    corlib: &SourceAssembly<'c>,
+    name: TypeName<'_>,
+    worklist: &mut Vec<u32>,
+    corlib_memberrefs: &mut BTreeSet<Token>,
+    dispatch: &mut DispatchKeys,
+    wanted: &BTreeSet<String>,
+) -> BTreeMap<String, MethodId> {
+    const MAX_BASE_DEPTH: usize = 16;
+    let mut sig: BTreeMap<String, MethodId> = BTreeMap::new();
+    if wanted.is_empty() {
+        return sig;
+    }
+    let mut current: Option<(String, String)> =
+        Some((name.namespace.into(), name.name.into()));
+    for _ in 0..MAX_BASE_DEPTH {
+        let Some((namespace, type_name)) = current.take() else {
+            break;
+        };
+        let mut method_row: u32 = 0;
+        let mut own: Vec<(u32, String, Vec<SigType>)> = Vec::new();
+        let mut extends: Option<Token> = None;
+        for type_def in corlib.type_defs() {
+            let is_target = type_def
+                .name()
+                .is_some_and(|n| n.namespace == namespace && n.name == type_name);
+            for method in type_def.methods() {
+                method_row += 1;
+                if !is_target || method.flags() & METHOD_VIRTUAL == 0 {
+                    continue;
+                }
+                let method_name: String = method.name().unwrap_or("").into();
+                let params: Vec<SigType> = method
+                    .signature()
+                    .as_ref()
+                    .map(|signature| signature.parameters.clone())
+                    .unwrap_or_default();
+                own.push((method_row, method_name, params));
+            }
+            if is_target {
+                extends = Some(type_def.extends());
+                break;
+            }
+        }
+        if extends.is_none() {
+            break;
+        }
+        for (row, method_name, params) in own {
+            let key = sig_encode(corlib, &method_name, &params);
+            if sig.contains_key(&key) {
+                continue;
+            }
+            if !wanted.contains(&key) {
+                continue;
+            }
+            materialize_corlib_method_row(
+                module,
+                context,
+                corlib,
+                row,
+                worklist,
+                corlib_memberrefs,
+                dispatch,
+            );
+            if let Some(id) = module.resolve(LAZY_CORLIB_ASM, Token::new(METHOD_DEF, row)) {
+                sig.insert(key, id);
+            }
+        }
+        current = extends
+            .filter(|token| token.row() != 0)
+            .and_then(|token| corlib.type_token_name(token))
+            .map(|base| (base.namespace.into(), base.name.into()));
+    }
+    sig
+}
+
 /// Loads a managed corlib (assembly 0) and a program (assembly 1) into one [`Module`],
 /// resolving the program's cross-assembly calls to the corlib's methods by name.
 ///
@@ -854,6 +1891,7 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
     load_assembly(
         &mut module,
         corlib,
+        flash_cil,
         0,
         &mut index,
         &mut type_index,
@@ -864,6 +1902,7 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
         load_assembly(
             &mut module,
             library,
+            flash_cil,
             1 + position as u8,
             &mut index,
             &mut type_index,
@@ -874,6 +1913,7 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
     let entry = load_assembly(
         &mut module,
         program,
+        flash_cil,
         1 + libraries.len() as u8,
         &mut index,
         &mut type_index,
@@ -907,9 +1947,15 @@ pub fn load_with_corlib_unfrozen<'c, 'p>(
 /// `MemberRef` is first looked up in `index` (so a call to a corlib-defined method binds to
 /// the corlib's [`MethodId`]); only an unindexed member falls through to a Rust intrinsic.
 /// Every method this assembly defines (managed-body or `runtime`) is inserted into `index`.
+///
+/// `materialize` decides where each method's CIL lives ([`CilMaterializer`]). Taking a plain
+/// [`Assembly`] rather than a [`SourceAssembly`] is what lets a caller load a PE that does NOT
+/// outlive the module -- it must then pass [`ram_cil`], since [`flash_cil`] will not type-check
+/// against a non-`'static` `'pe`.
 fn load_assembly<'pe>(
     module: &mut Module,
-    assembly: &SourceAssembly<'pe>,
+    assembly: &Assembly<'pe>,
+    materialize: CilMaterializer<'pe>,
     asm: u8,
     index: &mut NameIndex,
     type_index: &mut TypeNameIndex,
@@ -927,6 +1973,7 @@ fn load_assembly<'pe>(
     let mut newobj_tokens = BTreeSet::new();
     let mut ldtoken_field_tokens = BTreeSet::new();
     let mut static_field_ref_tokens = BTreeSet::new();
+    let mut instance_field_ref_tokens = BTreeSet::new();
     let mut ldtoken_type_tokens = BTreeSet::new();
     let mut type_test_tokens = BTreeSet::new();
     let mut box_tokens = BTreeSet::new();
@@ -942,6 +1989,7 @@ fn load_assembly<'pe>(
     let mut type_nonvirtuals: Vec<Vec<VirtualMethod>> = Vec::new();
     let mut type_is_value_type: Vec<bool> = Vec::new();
     let mut own_fields: Vec<Vec<(Token, Value)>> = Vec::new();
+    let mut instance_field_keys: BTreeMap<u32, String> = BTreeMap::new();
     let mut method_row: u32 = 0;
     let mut field_row: u32 = 0;
     let mut type_row: u32 = 0;
@@ -959,12 +2007,12 @@ fn load_assembly<'pe>(
             if field.is_static() {
                 if !field.is_literal() {
                     module.bind_static_field(asm, token, default_field_value(field.signature()));
-                    if let (Some(declaring), Some(field_name), Some(slot)) = (
-                        type_def.name(),
-                        field.name(),
-                        module.static_field_slot(asm, token),
-                    ) {
-                        field_index.insert(field_name_key(declaring, field_name), slot);
+                    if let (Some(field_name), Some(slot)) =
+                        (field.name(), module.static_field_slot(asm, token))
+                    {
+                        if let Some((ns, tn)) = key_type_name(&type_def) {
+                            field_index.statics.insert(field_key(&ns, &tn, field_name), slot);
+                        }
                     }
                 } else if is_enum {
                     if let (Some(name), Some(constant)) = (field.name(), field.constant()) {
@@ -989,6 +2037,9 @@ fn load_assembly<'pe>(
                 }
                 continue;
             }
+            if let (Some((ns, tn)), Some(field_name)) = (key_type_name(&type_def), field.name()) {
+                instance_field_keys.insert(token.0, field_key(&ns, &tn, field_name));
+            }
             own.push((token, default_field_value(field.signature())));
         }
         let type_id = module.add_type(Vec::new());
@@ -1002,7 +2053,9 @@ fn load_assembly<'pe>(
             {
                 module.set_string_type_id(type_id);
             }
-            type_index.insert(type_name_key(name), type_id);
+            if let Some((ns, tn)) = key_type_name(&type_def) {
+                type_index.insert(alloc::format!("{ns}.{tn}"), type_id);
+            }
             module.bind_type_name(asm, Token::new(TYPE_DEF, type_row), name.name.into());
             module.bind_type_full_name(type_id, full_type_name(name));
             #[cfg(feature = "NETMFv4_4")]
@@ -1089,16 +2142,9 @@ fn load_assembly<'pe>(
                 let id = module.add_intrinsic(asm, func, intr_id, arg_count(&method));
                 module.bind_token(asm, token, id);
                 module.set_method_type(id, type_id);
-                if let Some(declaring) = type_def.name() {
+                if let Some((ns, tn)) = key_type_name(&type_def) {
                     index.insert(
-                        name_key(
-                            assembly,
-                            declaring.namespace,
-                            declaring.name,
-                            &name,
-                            &params,
-                            return_type.as_ref(),
-                        ),
+                        name_key(assembly, &ns, &tn, &name, &params, return_type.as_ref()),
                         id,
                     );
                 }
@@ -1150,6 +2196,11 @@ fn load_assembly<'pe>(
                         Opcode::Ldtoken if operand.table() == FIELD => {
                             ldtoken_field_tokens.insert(*operand);
                         }
+                        Opcode::Ldfld | Opcode::Stfld | Opcode::Ldflda
+                            if operand.table() == MEMBER_REF =>
+                        {
+                            instance_field_ref_tokens.insert(*operand);
+                        }
                         Opcode::Ldsfld | Opcode::Stsfld | Opcode::Ldsflda
                             if operand.table() == MEMBER_REF =>
                         {
@@ -1193,19 +2244,12 @@ fn load_assembly<'pe>(
                     }
                 }
             }
-            let id = module.add_method(asm, raw_cil(raw_il), arg_count(&method));
+            let id = module.add_method(asm, materialize(raw_il), arg_count(&method));
             module.bind_token(asm, token, id);
             module.set_method_type(id, type_id);
-            if let Some(declaring) = type_def.name() {
+            if let Some((ns, tn)) = key_type_name(&type_def) {
                 index.insert(
-                    name_key(
-                        assembly,
-                        declaring.namespace,
-                        declaring.name,
-                        &name,
-                        &params,
-                        return_type.as_ref(),
-                    ),
+                    name_key(assembly, &ns, &tn, &name, &params, return_type.as_ref()),
                     id,
                 );
             }
@@ -1291,6 +2335,14 @@ fn load_assembly<'pe>(
     );
     bind_field_rva_data(assembly, module, asm, &ldtoken_field_tokens);
     bind_static_field_refs(assembly, module, asm, field_index, &static_field_ref_tokens);
+    bind_instance_field_refs(
+        assembly,
+        module,
+        asm,
+        field_index,
+        type_index,
+        &instance_field_ref_tokens,
+    );
     bind_type_names(assembly, module, asm, type_index, &ldtoken_type_tokens);
     classify_type_test_tokens(assembly, module, asm, type_index, &type_test_tokens);
     bind_type_sizes(assembly, module, asm, &value_type_tokens, &sizeof_tokens);
@@ -1302,6 +2354,8 @@ fn load_assembly<'pe>(
         type_index,
         &type_extends,
         &own_fields,
+        field_index,
+        &instance_field_keys,
     );
     build_vtables(
         module,
@@ -1322,7 +2376,15 @@ fn load_assembly<'pe>(
     );
     bind_call_targets(module, assembly, asm, &callvirt_tokens, &methoddef_sigs);
     bind_explicit_overrides(module, assembly, asm, type_offset);
-    bind_types(module, asm, type_offset, &type_extends, &type_is_value_type);
+    bind_types(
+        assembly,
+        module,
+        asm,
+        type_offset,
+        &type_extends,
+        &type_is_value_type,
+        type_index,
+    );
     bind_interfaces(
         module,
         assembly,
@@ -1430,6 +2492,27 @@ fn bind_bcl_calls(
         if method_name == ".ctor" {
             if let [SigType::Object, SigType::IntPtr] = params {
                 module.mark_delegate_ctor(asm, *token);
+                continue;
+            }
+        }
+
+        if method_name == "Invoke" {
+            let parent_type = match parent.table() {
+                TYPE_DEF => assembly.type_def(parent.row()).and_then(|def| def.name()),
+                TYPE_REF => assembly.type_ref(parent.row()).and_then(|r| r.name()),
+                _ => None,
+            };
+            let declared_by_a_delegate = parent_type
+                .and_then(|parent_type| type_index.get(&type_name_key(parent_type)).copied())
+                .and_then(|type_id| module.type_base(type_id))
+                .is_some_and(|base| {
+                    ["System.MulticastDelegate", "System.Delegate"]
+                        .iter()
+                        .any(|name| type_index.get(*name) == Some(&base))
+                });
+            if declared_by_a_delegate {
+                let count = u16::try_from(params.len()).unwrap_or(u16::MAX);
+                module.mark_delegate_invoke(asm, *token, count);
                 continue;
             }
         }
@@ -1874,6 +2957,34 @@ fn bcl_intrinsic(
             _ => {}
         }
     }
+    if namespace == "System.IO" && type_name == "NativeDrive" {
+        match method {
+            "Names" => return Some(intrinsic!(drive_names)),
+            "Kind" => return Some(intrinsic!(drive_kind)),
+            "TotalSize" => return Some(intrinsic!(drive_total_size)),
+            "Format" => return Some(intrinsic!(drive_format)),
+            "FileSystems" => return Some(intrinsic!(drive_filesystems)),
+            "MountRemovableVolumes" => return Some(intrinsic!(drive_mount_removable)),
+            _ => {}
+        }
+    }
+    if namespace == "Lamella.IO" && type_name == "NativeStorage" {
+        match method {
+            "MountRam" => return Some(intrinsic!(storage_mount_ram)),
+            "MountSdOverSpi" => return Some(intrinsic!(storage_mount_sd_over_spi)),
+            "Unmount" => return Some(intrinsic!(storage_unmount)),
+            "IsMounted" => return Some(intrinsic!(storage_is_mounted)),
+            _ => {}
+        }
+    }
+    if namespace == "nanoFramework.System.IO.FileSystem" && type_name == "NativeSdCard" {
+        match method {
+            "MountSdOverSpiBus" => return Some(intrinsic!(storage_mount_sd_over_spi_bus)),
+            "Unmount" => return Some(intrinsic!(storage_unmount)),
+            "IsMounted" => return Some(intrinsic!(storage_is_mounted)),
+            _ => {}
+        }
+    }
     if namespace == "System.IO.Ports" && type_name == "NativeSerial" {
         match method {
             "Open" => return Some(intrinsic!(serial_open)),
@@ -1932,6 +3043,7 @@ fn bcl_intrinsic(
         },
         ("Exception", ".ctor") => Some(intrinsic!(exception_ctor)),
         ("Exception", "get_Message") => Some(intrinsic!(exception_get_message)),
+        ("Exception", "RuntimeMessage") => Some(intrinsic!(exception_runtime_message)),
         #[cfg(feature = "finalizers")]
         ("GC", "SuppressFinalize") => Some(intrinsic!(suppress_finalize)),
         #[cfg(feature = "finalizers")]
@@ -2024,6 +3136,7 @@ fn bcl_intrinsic(
         ("Array", "GetLength") => Some(intrinsic!(md_array_get_length)),
         ("Array", "get_Rank") => Some(intrinsic!(array_rank)),
         ("Array", "ClearCore") => Some(intrinsic!(array_clear_range)),
+        ("Array", "CopyCore") => Some(intrinsic!(array_copy_range)),
         ("Array", "GetValue") => match parameters_of(signature) {
             [SigType::I4] => Some(intrinsic!(array_get_value)),
             _ => None,
@@ -2063,6 +3176,11 @@ fn bcl_intrinsic(
         #[cfg(feature = "float")]
         ("Double", "ToExponential") => match parameters_of(signature) {
             [SigType::R8, SigType::I4, SigType::Boolean] => Some(intrinsic!(double_to_exponential)),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("Double", "ParseValid") => match parameters_of(signature) {
+            [SigType::String] => Some(intrinsic!(double_parse)),
             _ => None,
         },
         #[cfg(feature = "float")]
@@ -2379,8 +3497,49 @@ fn bind_static_field_refs(
         else {
             continue;
         };
-        if let Some(&slot) = field_index.get(&field_name_key(declaring, field_name)) {
+        if let Some(&slot) = field_index.statics.get(&field_name_key(declaring, field_name)) {
             module.bind_static_field_ref(asm, *token, slot);
+        }
+    }
+}
+
+/// Binds a program's `ldfld`/`stfld`/`ldflda` `MemberRef` to another assembly's INSTANCE field, by
+/// qualified name through `field_index`.
+///
+/// The instance twin of [`bind_static_field_refs`], and it exists for the same reason: the two
+/// assemblies' tokens are unrelated, so only the name can match them. It went unwritten because
+/// nothing needed it -- the corlib and the libraries above it expose behaviour through properties
+/// and methods, and a `MemberRef` to a public FIELD in another assembly first appears with the
+/// compatibility surfaces, whose parameter objects are declared as bare public fields and must stay
+/// that way to be what an app was compiled against.
+fn bind_instance_field_refs(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    field_index: &FieldNameIndex,
+    type_index: &TypeNameIndex,
+    tokens: &BTreeSet<Token>,
+) {
+    for token in tokens {
+        if module.field_slot(asm, *token).is_some() {
+            continue;
+        }
+        let Some(member) = assembly.member_ref(token.row()) else {
+            continue;
+        };
+        if !member.is_field() {
+            continue;
+        }
+        let (Some(declaring), Some(field_name)) =
+            (assembly.type_token_name(member.parent()), member.name())
+        else {
+            continue;
+        };
+        if let Some(&slot) = field_index.instances.get(&field_name_key(declaring, field_name)) {
+            module.bind_field(asm, *token, slot);
+            if let Some(&type_id) = type_index.get(&type_name_key(declaring)) {
+                module.bind_field_type(asm, *token, type_id);
+            }
         }
     }
 }
@@ -3131,6 +4290,8 @@ fn build_field_layouts(
     type_index: &TypeNameIndex,
     extends: &[Token],
     own_fields: &[Vec<(Token, Value)>],
+    field_index: &mut FieldNameIndex,
+    instance_field_keys: &BTreeMap<u32, String>,
 ) {
     let bases: Vec<BaseFields> = (0..extends.len())
         .map(|local| resolve_base_fields(module, assembly, type_offset, type_index, extends, local))
@@ -3140,7 +4301,11 @@ fn build_field_layouts(
         let full = field_layout(local, &bases, own_fields, &mut memo);
         let base_count = full.len() - own_fields[local].len();
         for (index, (token, _)) in own_fields[local].iter().enumerate() {
-            module.bind_field(asm, *token, (base_count + index) as u32);
+            let slot = (base_count + index) as u32;
+            module.bind_field(asm, *token, slot);
+            if let Some(key) = instance_field_keys.get(&token.0) {
+                field_index.instances.insert(key.clone(), slot);
+            }
         }
         module.set_type_field_defaults((type_offset + local) as u32, full);
     }
@@ -3302,15 +4467,192 @@ fn has_flags_attribute(assembly: &Assembly, type_token: Token) -> bool {
 /// (`Console.WriteLine`, `Buffer.BlockCopyInternal`, `Marshal.__ReadByte`, ...). The loader binds
 /// such a method to its [`bcl_intrinsic`] instead of running the placeholder body. Mirrors
 /// [`has_flags_attribute`]; the attribute type is defined by the corlib itself.
+/// What an unbound `[RuntimeProvided]` seam means for a caller that reaches it -- the disposition
+/// the AOT tier's census already reports, answered for the INTERPRETER tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeamDisposition {
+    /// The seam declares `[Lamella.Runtime.IntendedDefault]`: a build that does not implement it is
+    /// still CORRECT, because the default IS the answer (a capability probe that reports absence).
+    Intended,
+    /// The seam declares nothing: its placeholder body answers a constant -- 0, false, null -- that
+    /// the caller cannot tell from a real result. Every row of this kind is a silent wrong answer
+    /// waiting for a caller, and the reason this report exists.
+    Silent,
+}
+
+/// One `[RuntimeProvided]` method this build binds to no intrinsic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundSeam {
+    /// The declaring type's namespace.
+    pub namespace: String,
+    /// The declaring type's name.
+    pub type_name: String,
+    /// The method's name.
+    pub method: String,
+    /// What the absence means -- see [`SeamDisposition`].
+    pub disposition: SeamDisposition,
+}
+
+impl fmt::Display for UnboundSeam {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}.{}::{}",
+            self.namespace, self.type_name, self.method
+        )
+    }
+}
+
+/// Every `[RuntimeProvided]` seam in `assembly` that THIS build binds to no intrinsic, in metadata
+/// order.
+///
+/// # Why this exists
+///
+/// The loader binds a runtime-supplied method to its intrinsic, and where there is none it keeps the
+/// managed placeholder body on purpose -- so a seam with no implementation YET is not dropped from
+/// the type. The cost of that kindness is silence: the method then answers 0 / false / null forever,
+/// and nothing distinguishes it from one that ran. `[IntendedDefault]` is the declaration that the
+/// silence is correct; this report is how the ones with no such declaration become visible instead
+/// of being counted by hand.
+///
+/// # Why it cannot drift from the loader
+///
+/// It asks the same two questions of the same metadata, through the same functions the binding site
+/// calls -- `is_runtime_provided` and [`bcl_intrinsic`], with the same arguments. A seam this
+/// reports as unbound is a seam the loader leaves unbound, by construction rather than by a
+/// parallel rule someone has to keep in step. A separate walk that re-derived either answer would be
+/// the exact shape that let the array-descriptor readers disagree for a month.
+#[must_use]
+pub fn unbound_seams(assembly: &Assembly) -> Vec<UnboundSeam> {
+    let mut seams = Vec::new();
+    let mut method_row: u32 = 0;
+    for type_def in assembly.type_defs() {
+        let declaring = type_def.name();
+        let is_delegate = is_delegate_type(assembly, type_def.extends());
+        for method in type_def.methods() {
+            method_row += 1;
+            let token = Token::new(METHOD_DEF, method_row);
+            if is_delegate {
+                continue;
+            }
+            if !(method.is_runtime_impl() || assembly.is_runtime_provided(token)) {
+                continue;
+            }
+            let Some(declaring) = declaring else { continue };
+            let name = method.name().unwrap_or("");
+            let signature = method.signature();
+            if bcl_intrinsic(
+                declaring.namespace,
+                declaring.name,
+                name,
+                signature.as_ref(),
+            )
+            .is_some()
+            {
+                continue;
+            }
+            seams.push(UnboundSeam {
+                namespace: declaring.namespace.into(),
+                type_name: declaring.name.into(),
+                method: name.into(),
+                disposition: if assembly.is_intended_default(token) {
+                    SeamDisposition::Intended
+                } else {
+                    SeamDisposition::Silent
+                },
+            });
+        }
+    }
+    seams
+}
+
+/// Whether every `[RuntimeProvided]` seam `assembly` declares has an implementation in a runtime
+/// whose registered intrinsic ids are `available` -- the question "is this corlib legal on THAT
+/// board", answered against the board's own listing rather than against this process's features.
+///
+/// # Why it takes an id set instead of reading the local build
+///
+/// [`unbound_seams`] answers for the runtime it is COMPILED INTO, which is exactly right for the
+/// seam-honesty gate and exactly wrong for a host asking about a device. A board's surface arrives
+/// as DATA -- the intrinsic-id listing in its Lamella Link `PROFILE_MANIFEST` -- and no amount of
+/// inspecting the local feature set consults it.
+///
+/// Legality is a SUBSET test, so it is not symmetric: a smaller corlib profile is legal on a richer
+/// firmware and uses less of it; the reverse never holds. The failure it prevents is silent -- the
+/// loader keeps a `[RuntimeProvided]` placeholder when no intrinsic matches, so a corlib demanding
+/// more than the firmware implements does not fail to load, it answers 0 / false / null forever.
+///
+/// # The honesty this cannot provide by itself
+///
+/// [`bcl_intrinsic`] is `#[cfg]`-gated, so a build of THIS crate that lacks a capability cannot
+/// resolve that capability's seams to an id at all. Those land in [`SeamLegality::indeterminate`]
+/// rather than being silently treated as "needs nothing" -- which would UNDER-report the demand and
+/// make an illegal pairing look legal, in the same silent direction as the defect above. **A caller
+/// that gets a non-empty `indeterminate` has not certified anything**; run the query from a
+/// full-surface build, where every seam resolves.
+#[must_use]
+pub fn seam_legality(assembly: &Assembly, available: &BTreeSet<u32>) -> SeamLegality {
+    let mut legality = SeamLegality::default();
+    let mut method_row: u32 = 0;
+    for type_def in assembly.type_defs() {
+        let declaring = type_def.name();
+        let is_delegate = is_delegate_type(assembly, type_def.extends());
+        for method in type_def.methods() {
+            method_row += 1;
+            let token = Token::new(METHOD_DEF, method_row);
+            if is_delegate {
+                continue;
+            }
+            if !(method.is_runtime_impl() || assembly.is_runtime_provided(token)) {
+                continue;
+            }
+            let Some(declaring) = declaring else { continue };
+            let name = method.name().unwrap_or("");
+            let signature = method.signature();
+            let seam = UnboundSeam {
+                namespace: declaring.namespace.into(),
+                type_name: declaring.name.into(),
+                method: name.into(),
+                disposition: if assembly.is_intended_default(token) {
+                    SeamDisposition::Intended
+                } else {
+                    SeamDisposition::Silent
+                },
+            };
+            match bcl_intrinsic(declaring.namespace, declaring.name, name, signature.as_ref()) {
+                Some((_, id)) => {
+                    if !available.contains(&id) {
+                        legality.unmet.push(seam);
+                    }
+                }
+                None => legality.indeterminate.push(seam),
+            }
+        }
+    }
+    legality
+}
+
+/// The verdict of [`seam_legality`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SeamLegality {
+    /// Seams whose intrinsic the runtime does NOT register: the corlib is illegal on it, and every
+    /// one of these would answer a constant rather than fail to load.
+    pub unmet: Vec<UnboundSeam>,
+    /// Seams this build could not resolve to an intrinsic id, because its own `#[cfg]` gates
+    /// compiled the resolver arm out. **Nothing is certified while this is non-empty.**
+    pub indeterminate: Vec<UnboundSeam>,
+}
+
+impl SeamLegality {
+    /// Whether the corlib is legal on that runtime AND this build was able to say so.
+    #[must_use]
+    pub fn is_certified_legal(&self) -> bool {
+        self.unmet.is_empty() && self.indeterminate.is_empty()
+    }
+}
+
 fn has_runtime_provided_attribute(assembly: &Assembly, method_token: Token) -> bool {
-    assembly.custom_attributes(method_token).any(|attribute| {
-        assembly
-            .resolve_method(attribute.constructor)
-            .and_then(|ctor| ctor.declaring_type)
-            .is_some_and(|name| {
-                name.namespace == "Lamella.Runtime" && name.name == "RuntimeProvidedAttribute"
-            })
-    })
+    assembly.is_runtime_provided(method_token)
 }
 
 /// The underlying byte width an enum constant's kind implies (`sbyte`/`byte` = 1,
@@ -3633,21 +4975,51 @@ fn base_type_id(extends: Token, count: usize) -> Option<usize> {
 /// `castclass` / `isinst` can resolve a target type and test the subtype relation at run
 /// time, and a `callvirt` to a value type's own method on a box can auto-unbox `this`.
 fn bind_types(
+    assembly: &Assembly,
     module: &mut Module,
     asm: u8,
     type_offset: usize,
     extends: &[Token],
     is_value_type: &[bool],
+    type_index: &TypeNameIndex,
 ) {
     for local in 0..extends.len() {
         let token = Token::new(TYPE_DEF, (local + 1) as u32);
         let type_id = (type_offset + local) as u32;
         module.bind_type_token(asm, token, type_id);
-        let base =
-            base_type_id(extends[local], extends.len()).map(|base| (type_offset + base) as u32);
+        let base = base_type_id(extends[local], extends.len())
+            .map(|base| (type_offset + base) as u32)
+            .or_else(|| external_base_type_id(assembly, extends[local], type_index));
         module.set_type_base(type_id, base);
         module.set_type_is_value_type(type_id, is_value_type[local]);
     }
+}
+
+/// The id of a base type declared in ANOTHER assembly, resolved by name through the shared
+/// type index.
+///
+/// [`base_type_id`] answers only for a `TypeDef` -- a base in the same assembly -- and returned
+/// `None` for everything else, so a type extending one from another assembly was recorded with NO
+/// BASE AT ALL. The base chain is what `castclass` / `isinst` and the `stelem.ref` covariance check
+/// walk, so the subtype relation simply stopped at every assembly boundary: a covariant store of a
+/// program's driver into a library-typed array was refused, and a library delegate could not be
+/// recognized as one because its base (`System.MulticastDelegate`) is a `TypeRef` into corlib.
+/// Virtual dispatch never noticed, because it goes through the vtable and never walks the chain --
+/// which is why overrides across the boundary always worked and hid this.
+///
+/// Resolution is by NAME, the same lookup the delegate `Invoke` arm uses. Libraries are loaded
+/// before the assemblies that reference them, so the base is already in the index by the time
+/// anything refers to it.
+fn external_base_type_id(
+    assembly: &Assembly,
+    extends: Token,
+    type_index: &TypeNameIndex,
+) -> Option<TypeId> {
+    if extends.table() != TYPE_REF {
+        return None;
+    }
+    let name = assembly.type_ref(extends.row())?.name()?;
+    type_index.get(&type_name_key(name)).copied()
 }
 
 /// Resolves each type's implemented-interface tokens to global [`TypeId`]s and records them
@@ -4194,7 +5566,11 @@ mod extended {
             #[cfg(feature = "math-transcendental")]
             ("Math", "Tan") => math_unary_f64_overload(intrinsic!(math_tan_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Log") => math_unary_f64_overload(intrinsic!(math_log_f64), signature),
+            ("Math", "Log") => match parameters_of(signature) {
+                [SigType::R8] => Some(intrinsic!(math_log_f64)),
+                [SigType::R8, SigType::R8] => Some(intrinsic!(math_log_base_f64)),
+                _ => None,
+            },
             #[cfg(feature = "math-transcendental")]
             ("Math", "Log10") => math_unary_f64_overload(intrinsic!(math_log10_f64), signature),
             #[cfg(feature = "math-transcendental")]
@@ -4202,6 +5578,28 @@ mod extended {
             #[cfg(feature = "math-transcendental")]
             ("Math", "Pow") => match parameters_of(signature) {
                 [SigType::R8, SigType::R8] => Some(intrinsic!(math_pow_f64)),
+                _ => None,
+            },
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "Asin") => math_unary_f64_overload(intrinsic!(math_asin_f64), signature),
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "Acos") => math_unary_f64_overload(intrinsic!(math_acos_f64), signature),
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "Atan") => math_unary_f64_overload(intrinsic!(math_atan_f64), signature),
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "Atan2") => match parameters_of(signature) {
+                [SigType::R8, SigType::R8] => Some(intrinsic!(math_atan2_f64)),
+                _ => None,
+            },
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "Sinh") => math_unary_f64_overload(intrinsic!(math_sinh_f64), signature),
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "Cosh") => math_unary_f64_overload(intrinsic!(math_cosh_f64), signature),
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "Tanh") => math_unary_f64_overload(intrinsic!(math_tanh_f64), signature),
+            #[cfg(feature = "math-transcendental")]
+            ("Math", "IEEERemainder") => match parameters_of(signature) {
+                [SigType::R8, SigType::R8] => Some(intrinsic!(math_ieee_remainder_f64)),
                 _ => None,
             },
             ("Char", "IsDigit") => char_one_arg_overload(intrinsic!(char_is_digit), signature),

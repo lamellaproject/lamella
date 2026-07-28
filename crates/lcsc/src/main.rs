@@ -87,6 +87,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "/normalize-identifiers" | "--normalize-identifiers"
         ) {
             lex.normalization = Normalization::Nfc;
+        } else if matches!(arg.as_str(), "/unsafe" | "/unsafe+" | "--unsafe") {
+            lex.unsafe_code = true;
+        } else if matches!(arg.as_str(), "/unsafe-") {
+            lex.unsafe_code = false;
         } else if matches!(arg.as_str(), "/typedref" | "--typedref") {
             lex.typedref = true;
         } else if matches!(arg.as_str(), "/native-interop" | "--native-interop") {
@@ -129,6 +133,8 @@ usage: lcsc <source.cs>... [options]
   /define:A;B             seed #if preprocessor symbols (9.5.3); ';' or ',' separated, repeatable.
   /debug-                 suppress the Portable PDB (it is emitted by default).
   /normalize-identifiers  fold identifiers to NFC (ECMA-334 9.4.2; off by default, to match csc).
+  /unsafe                 permit unsafe code (pointers, stackalloc, fixed); off by default, as
+                          csc's is. Writing `unsafe` without it is CS0227. Also /unsafe+, /unsafe-.
   /typedref               enable csc's undocumented __makeref/__refvalue/__reftype (not in ECMA-334).
   /native-interop         enable [DllImport] P/Invoke (off by default; pure-managed targets omit it).
   /help, -h, /?           print this help.
@@ -202,13 +208,7 @@ fn compile(options: &Options) -> Result<bool, String> {
         print_diagnostics(source_path, &text, &result.diagnostics);
         return match result.image {
             Some(image) => {
-                std::fs::write(&output, &image)
-                    .map_err(|error| format!("cannot write '{output}': {error}"))?;
-                if let Some(pdb) = result.pdb {
-                    let pdb_path = replace_extension(&output, "pdb");
-                    std::fs::write(&pdb_path, &pdb)
-                        .map_err(|error| format!("cannot write '{pdb_path}': {error}"))?;
-                }
+                publish(&output, &image, result.pdb.as_deref())?;
                 Ok(true)
             }
             None => {
@@ -253,13 +253,7 @@ fn compile(options: &Options) -> Result<bool, String> {
     }
     match result.image {
         Some(image) => {
-            std::fs::write(&output, &image)
-                .map_err(|error| format!("cannot write '{output}': {error}"))?;
-            if let Some(pdb) = result.pdb {
-                let pdb_path = replace_extension(&output, "pdb");
-                std::fs::write(&pdb_path, &pdb)
-                    .map_err(|error| format!("cannot write '{pdb_path}': {error}"))?;
-            }
+            publish(&output, &image, result.pdb.as_deref())?;
             Ok(true)
         }
         None => {
@@ -297,6 +291,46 @@ fn print_diagnostics(path: &str, text: &str, diagnostics: &[Diagnostic]) {
 fn replace_extension(path: &str, extension: &str) -> String {
     let stem = path.rsplit_once('.').map_or(path, |(stem, _)| stem);
     format!("{stem}.{extension}")
+}
+
+/// Writes the emitted assembly (and its PDB, if present) to disk atomically -- each artifact is
+/// staged in a temporary sibling and renamed into place -- so an interrupted or failing write can
+/// never leave a partial `.dll` (or `.pdb`) where the runtime loader or a later compile would pick
+/// it up. The image is published before the PDB: the PDB is a debug adjunct, so an image that lands
+/// even if a following PDB write fails is still a complete, loadable assembly.
+fn publish(output: &str, image: &[u8], pdb: Option<&[u8]>) -> Result<(), String> {
+    write_atomic(output, image).map_err(|error| format!("cannot write '{output}': {error}"))?;
+    if let Some(pdb) = pdb {
+        let pdb_path = replace_extension(output, "pdb");
+        write_atomic(&pdb_path, pdb)
+            .map_err(|error| format!("cannot write '{pdb_path}': {error}"))?;
+    }
+    Ok(())
+}
+
+/// Writes `bytes` to `path` atomically: stage them in a uniquely named temporary file in the SAME
+/// directory (so the rename stays on one volume -- a cross-volume rename is a copy, not atomic),
+/// then rename it over `path`. `fs::rename` replaces the destination atomically on Windows
+/// (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`) and POSIX alike. On any failure the temporary
+/// file is removed and `path` is left exactly as it was.
+fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let temp = format!("{path}.tmp.{}", std::process::id());
+    let staged = stage_temp(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    staged
+}
+
+/// Stages `bytes` into `temp`: create, write, and sync to disk. The file is closed when this
+/// returns, so the caller can rename it -- Windows cannot rename a file it still holds open. The
+/// sync makes the bytes durable before the rename, so a crash cannot surface a zero-length file
+/// under the final path.
+fn stage_temp(temp: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// The final path component (after the last `/` or `\`).
@@ -376,9 +410,44 @@ mod tests {
     }
 
     #[test]
+    fn write_atomic_replaces_in_place_and_leaves_no_temp() {
+        let path = std::env::temp_dir().join(format!("lcsc-atomic-{}.bin", std::process::id()));
+        let path = path.to_str().expect("temp path is valid UTF-8");
+        write_atomic(path, b"first").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"first");
+        write_atomic(path, b"second is longer than first").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"second is longer than first");
+        let temp = format!("{path}.tmp.{}", std::process::id());
+        assert!(!std::path::Path::new(&temp).exists(), "staging temp {temp} should be gone");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn an_absolute_unix_path_is_a_source_file_not_an_option() {
         let options = parse_args(&[String::from("/home/me/Program.cs")]).unwrap();
         assert_eq!(options.sources, ["/home/me/Program.cs"]);
-        assert!(parse_args(&[String::from("/unsafe")]).is_err());
+        let unsafe_options = parse_args(&[String::from("/unsafe"), String::from("a.cs")]).unwrap();
+        assert!(unsafe_options.lex.unsafe_code);
+        assert_eq!(unsafe_options.sources, ["a.cs"]);
+        assert!(parse_args(&[String::from("/nonsense")]).is_err());
+    }
+
+    #[test]
+    fn unsafe_code_is_opt_in_exactly_as_it_is_for_csc() {
+        let parse = |args: &[&str]| {
+            let owned: Vec<String> = args
+                .iter()
+                .map(|arg| String::from(*arg))
+                .chain(core::iter::once(String::from("a.cs")))
+                .collect();
+            parse_args(&owned).unwrap().lex.unsafe_code
+        };
+        assert!(!parse(&[]));
+        assert!(parse(&["/unsafe"]));
+        assert!(parse(&["/unsafe+"]));
+        assert!(parse(&["--unsafe"]));
+        assert!(!parse(&["/unsafe-"]));
+        assert!(!parse(&["/unsafe", "/unsafe-"]));
+        assert!(parse(&["/unsafe-", "/unsafe"]));
     }
 }

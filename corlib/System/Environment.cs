@@ -12,11 +12,15 @@ namespace System
             [Lamella.Runtime.RuntimeProvided] get { return 0; }
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static int ProcessorCount
         {
             [Lamella.Runtime.RuntimeProvided] get { return 0; }
         }
+#endif
 
-        [Lamella.Runtime.RuntimeProvided] public static string GetEnvironmentVariable(string variable) { return null; }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        public static string GetEnvironmentVariable(string variable) { return null; }
     }
 }

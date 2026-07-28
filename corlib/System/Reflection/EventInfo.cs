@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.EventInfo
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public class EventInfo : MemberInfo
@@ -44,3 +45,4 @@ namespace System.Reflection
         public override object[] GetCustomAttributes(bool inherit) { return new object[0]; }
     }
 }
+#endif

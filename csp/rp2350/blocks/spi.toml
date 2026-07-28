@@ -1,0 +1,77 @@
+# BLOCK layout: the RP2350 SPI -- an ARM PrimeCell PL022 SSP.
+# Offsets are instance-base-relative; instance bases live in ../instances.toml.
+#
+# Cross-block bring-up (clk_peri, RESETS, pads, funcsel) is DRIVER code.
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "spi"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet ch 12.3 (SPI)"]
+notes = [
+    "Bit rate = SSPCLK / (CPSDVSR * (1 + SCR)): CPSDVSR is EVEN, 2..254; SCR is 0..255. SSPCLK is clk_peri.",
+    "SSPCR0/SSPCPSR are programmed with the port DISABLED (SSE = 0); enable last.",
+    "LBM (SSPCR1 bit 0) ties the TX shifter to the RX shifter -- the no-hands self-test; the TX pin keeps driving frames while it is set.",
+    "In Motorola SPI mode the PL022 drives the chip-select (spi0_ss_n) itself, framing every 8-bit transfer -- an analyzer can use it as the enable line; multi-byte commands want a GPIO-managed CS instead (a driver runtime choice).",
+    "SSPDR reads pop the RX FIFO; a full-duplex transfer is write-one-poll-RNE-read-one. SSPSR.BSY covers the shift register.",
+    "MSB-first only: the PL022 has no bit-order hardware.",
+]
+
+[registers.SSPCR0]
+offset = 0x0
+width = 32
+fields = { DSS = [0, 4], FRF = [4, 2], SPO = [6, 1], SPH = [7, 1], SCR = [8, 8] }
+notes = "DSS 7 = 8-bit frames; FRF 0 = Motorola SPI; SPO/SPH 0/0 = mode 0."
+
+[registers.SSPCR1]
+offset = 0x4
+width = 32
+fields = { LBM = [0, 1], SSE = [1, 1], MS = [2, 1] }
+notes = "MS 0 = master. Program with SSE 0; set SSE (bit 1) last to enable."
+
+[registers.SSPDR]
+offset = 0x8
+width = 32
+fields = { DATA = [0, 16] }
+
+[registers.SSPSR]
+offset = 0xC
+width = 32
+fields = { TFE = [0, 1], TNF = [1, 1], RNE = [2, 1], RFF = [3, 1], BSY = [4, 1] }
+
+[registers.SSPCPSR]
+offset = 0x10
+width = 32
+fields = { CPSDVSR = [0, 8] }
+notes = "The even prescaler, 2..254."
+
+[constants]
+FIFO_DEPTH = 8
+DSS_8BIT = 7
+
+[parameters]
+cpsdvsr = "The even prescaler: smallest even value 2..254 with SCR = SSPCLK/(CPSDVSR*rate) - 1 in 0..255 -- 1 MHz over 12 MHz: 12 (SCR 0)."
+scr = "SSPCLK / (CPSDVSR * rate) - 1 -- 1 MHz over 12 MHz with CPSDVSR 12: 0."
+tx_byte = "The byte to transmit (full duplex: one RX byte pops per TX byte)."
+
+[[sequences.transfer_byte]]
+op = "poll"
+reg = "SSPSR"
+mask = 0x2
+note = "TNF: TX FIFO has room"
+
+[[sequences.transfer_byte]]
+op = "write"
+reg = "SSPDR"
+value = "$tx_byte"
+
+[[sequences.transfer_byte]]
+op = "poll"
+reg = "SSPSR"
+mask = 0x4
+note = "RNE: the full-duplex reply arrived"
+
+[[sequences.transfer_byte]]
+op = "read"
+reg = "SSPDR"
+mask = 0xFF

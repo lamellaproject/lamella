@@ -1,56 +1,52 @@
 # BOARD binding: the Arduino Due. Board truth ONLY: the role binding,
 # the carrier, and the clock plan. Chip truth lives in csp/sam3x/.
 #
-# The Due is the first sam3x-family board and the first board in the tree whose peripheral clock is
-# NOT its bare oscillator: every other plan states a source rate that IS the routed rate (pico
-# xosc = clk_peri, l476 msi = pclk1, esp32c6 xtal = uart_sclk), so their generator check is an
-# equality. Here the crystal reaches the UART only through PLLA, so mck_hz is a stated rate the
-# generator cannot cross-check against xtal_hz -- see the plan note below. Nothing here is a divisor:
-# the BRGR CD derives from mck_hz and the baud formula.
+# THIS BOARD'S PERIPHERAL CLOCK IS NOT ITS BARE OSCILLATOR. The crystal reaches the UART only
+# through PLLA, so mck_hz is a STATED rate rather than one the generator can cross-check against
+# xtal_hz -- see the plan note below. Nothing here is a divisor: the BRGR CD derives from mck_hz
+# and the block's baud formula.
 
 [table]
 kind = "board"
 board = "arduino-due"
 family = "sam3x"
 part = "atsam3x8e"
-board_model = 15 # lamella_wire::board_model::ARDUINO_DUE
+board_model = 15            # lamella_wire::board_model::ARDUINO_DUE
 sources = [
     "Arduino Due schematic: the programming port's ATmega16U2 bridges the SAM3X UART -- RX0 = PA8, TX0 = PA9; 12 MHz crystal on XIN/XOUT",
-    "silicon-grounded on this bench (sam3x-clock-check via SWD): the running Atmel boot code reads back CKGR_MOR.MOSCSEL = 1 (crystal selected, MOSCXTS = 1), CKGR_PLLAR = 0x200D3F01 (DIVA 1, MULA 13 = x14), PMC_MCKR = 0x00000012 (CSS = PLLA_CLK, PRES = CLK_2, PLLADIV2 = 0) -- the chain below, as the vendor programs it",
+    "the board's resident Atmel boot code programs CKGR_MOR.MOSCSEL = 1 (crystal selected, MOSCXTS = 1), CKGR_PLLAR = 0x200D3F01 (DIVA 1, MULA 13 = x14), PMC_MCKR = 0x00000012 (CSS = PLLA_CLK, PRES = CLK_2, PLLADIV2 = 0) -- the chain below, as the vendor programs it",
     "Atmel-11057 ch 20.3 (SAM-BA boot): the boot ROM allows USB only when the crystal is 12.000 MHz -- this board's native USB port enumerates (VID 0x2341 PID 0x003E), so the part's own ROM has verified the 12 MHz fact",
 ]
 
-[carrier]
-kind = "uart" # the programming port is an EXTERNALLY bridged UART: an on-board
-role = "vcp" # ATmega16U2 does the USB, so the USB identity (0x2341:0x003D) is the
-baud = 115200 # bridge chip's, never the SAM3X's -- no board-fixed identity to state
-                            # for the wire itself (contract sec 1, carrier `uart`). The Due's OTHER
-                            # port is native SAM3X USB and could carry a Link; that is a separate
+[[carriers]]
+kind = "uart"               # the programming port is an EXTERNALLY bridged UART: an on-board
+role = "vcp"                # ATmega16U2 does the USB, so the USB identity (0x2341:0x003D) is the
+baud = 115200               # bridge chip's, never the SAM3X's -- no board-fixed identity to state
+plan = "plla-84mhz"         # for the wire itself (contract sec 1, carrier `uart`). The Due's OTHER
+default = true              # port is native SAM3X USB and could carry a Link; that is a separate
                             # binding when it lands, not this carrier.
 
-
+[[bindings]]
 role = "vcp"
 kind = "uart"
 instance = "uart"
-function = "A" # PIO peripheral A (PIO_ABSR bit 0) -- the reset default, so these pins
-tx = { pin = "PA9" } # need only PDR to leave GPIO. No pads: the SAM3X UART has one fixed
-rx = { pin = "PA8" } # signal per pin, unlike SERCOM's selectable pads.
+function = "A"              # PIO peripheral A (PIO_ABSR bit 0) -- the reset default, so these pins
+tx = { pin = "PA9" }        # need only PDR to leave GPIO. No pads: the SAM3X UART has one fixed
+rx = { pin = "PA8" }        # signal per pin, unlike SERCOM's selectable pads.
 
 # The plan states RATES ONLY: the schema refuses a PLL multiplier or prescaler here, because
 # divisors derive. The chain that carries 12 MHz to 84 MHz -- PLLA DIVA 1, MULA 13 (x14),
-# PMC_MCKR PRES CLK_2, PLLADIV2 0 -- is therefore NOT stated here; lamella-serve-sam3x programs it
-# and cites this plan. That mirrors every other family today (the l476 serve likewise raises its own
-# MSI), and the contract already names the convergence: an operating point "joins as its own plan
-# when the serve converges onto generated facts". Emitting a PLL chain would need the plan schema to
-# carry it and the generator to solve for it under the PLLA's legal output range (an fact this
-# CSP does not yet transcribe) -- @layering's call, raised to them rather than settled here.
-
+# PMC_MCKR PRES CLK_2, PLLADIV2 0 -- is therefore NOT stated here; the firmware that raises the
+# clock programs it and cites this plan. Emitting a PLL chain would need the plan schema to carry
+# it and the generator to solve for it under the PLLA's legal output range, which this family's
+# facts do not yet transcribe.
+[[plans]]
 name = "plla-84mhz"
 default = true
 source = "xtal"
-xtal_hz = 12000000 # the Due's soldered crystal (board fact; ROM-verified per sources)
-mck_hz = 84000000 # the routed master clock this plan reaches, and the rate the UART's
-                            # BRGR CD derives from (baud = MCK / (16 * CD)). It is also the
+xtal_hz = 12000000          # the Due's soldered crystal (board fact; ROM-verified per sources)
+mck_hz = 84000000           # the routed master clock this plan reaches, and the rate the UART's
+                            # BRGR CD derives from (the block's stated formula: baud = MCK / (16 * CD)). It is also the
                             # part's documented fmax, which is what PINS the crystal: the vendor's
                             # own chain multiplies MAINCK by exactly 7 to land here, and no other
                             # rate inside the measured MAINCK bound does that.

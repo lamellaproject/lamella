@@ -11,6 +11,9 @@ description = "Nordic nRF51 flash programming over the Lamella CMSIS-DAP debug s
 workspace = true
 
 [dependencies]
+# The probe-neutral seam. These flash routines are written against `TargetAccess`, so they drive a
+# target through any probe family the seam supports, not just a CMSIS-DAP one.
+lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 lamella-usbhid = { path = "../lamella-usbhid", optional = true }
 

@@ -1,0 +1,22 @@
+# PIN map: pin x function -> (instance, signal) for the STM32F091.
+# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers
+# (AF0..AF7 on the F0) the AFRL/AFRH nibbles select.
+
+[table]
+kind = "pins"
+family = "stm32f091"
+sources = ["STM32F091 datasheet alternate-function table"]
+
+[[pins]]
+pin = "PA2"
+function = "AF1"
+instance = "usart2"
+signal = "tx"
+source = "STM32F091 DS AF table: PA2 AF1 = USART2_TX"
+
+[[pins]]
+pin = "PA3"
+function = "AF1"
+instance = "usart2"
+signal = "rx"
+source = "STM32F091 DS AF table: PA3 AF1 = USART2_RX"

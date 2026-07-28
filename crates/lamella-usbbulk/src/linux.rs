@@ -2,7 +2,7 @@
 //! discovery, `/dev/bus/usb/BBB/DDD` for I/O via the `USBDEVFS_*` ioctls. libc only -- no external
 //! USB crate. The v2 sibling of lamella-usbhid's hidraw backend.
 
-use crate::{DeviceInfo, Error, Result};
+use crate::{Binding, DeviceInfo, Error, Result};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -151,6 +151,25 @@ pub struct Device {
 }
 
 impl Device {
+    /// See [`crate::Device::reset_pipes`]. Not implemented on this platform yet.
+    pub fn reset_pipes(&mut self) {}
+
+    pub fn reset_endpoint(&mut self, _endpoint: u8) {}
+
+    /// See [`crate::Device::describe_interface`]. Not implemented on this platform yet.
+    pub fn describe_interface(&self) -> String {
+        format!("endpoints in {:#04x} out {:#04x}", self.ep_in, self.ep_out)
+    }
+
+    /// The bulk endpoint addresses negotiated at open time, as `(in, out)`.
+    ///
+    /// Exposed because probing endpoints blindly is not a viable diagnostic: reading an endpoint a
+    /// device does not have can block rather than fail, so a tool that needs to know which pipes
+    /// exist must ask instead of sweep.
+    pub fn endpoints(&self) -> (u8, u8) {
+        (self.ep_in, self.ep_out)
+    }
+
     pub fn open(vendor_id: u16, product_id: u16, _serial: Option<&str>) -> Result<Self> {
         let f = scan()
             .into_iter()
@@ -230,4 +249,14 @@ impl Drop for Device {
             libc::ioctl(self.file.as_raw_fd(), USBDEVFS_RELEASEINTERFACE, &iface);
         }
     }
+}
+
+/// See [`crate::diagnose`]. This platform opens USB devices directly, so there is no "bound
+/// driver" state to be in: a device that enumerates is reachable. The analogous local failure is
+/// permissions (a missing udev rule), which shows up as an open error rather than here.
+pub fn diagnose(_interface_guid: &str, vendor_id: u16, product_id: u16) -> Result<Binding> {
+    let present = enumerate()?
+        .into_iter()
+        .any(|device| device.vendor_id == vendor_id && device.product_id == product_id);
+    Ok(if present { Binding::Bound } else { Binding::Absent })
 }

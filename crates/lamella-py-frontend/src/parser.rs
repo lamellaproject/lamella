@@ -1025,8 +1025,8 @@ impl Parser {
     /// A class pattern `Cls(...)` / `pkg.Cls(...)`: the class reference `cls` has been parsed and the
     /// parser is positioned at the `(`. Each argument is a keyword sub-pattern `attr=pattern`; the
     /// subject matches when it is an `isinstance` of `cls` and every named attribute matches its
-    /// sub-pattern. Positional sub-patterns (`Cls(a, b)`) need the class's `__match_args__` -- a
-    /// runtime facility not yet available -- so they are rejected here with a precise message.
+    /// sub-pattern. Positional sub-patterns (`Cls(a, b)`) need the class's `__match_args__`, which
+    /// this runtime does not provide, so they are rejected here with a precise message.
     fn parse_class_pattern(&mut self, cls: Expr) -> Result<MatchPattern, ParseError> {
         self.expect(&Tok::LParen, "'(' opening the class pattern")?;
         let mut positional: Vec<MatchPattern> = Vec::new();

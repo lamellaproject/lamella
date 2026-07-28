@@ -135,10 +135,13 @@ pub trait CallResolver {
     /// the target is unknown or unsupported.
     fn resolve(&self, operand: &Operand) -> Option<CallInfo>;
 
-    /// Resolves an `ldstr`'s operand (a `#US` user-string token) to the string's bytes,
-    /// or `None`. Defaults to `None` for resolvers that handle only calls; the lowering
-    /// adds the newline and NUL terminator semihosting needs.
-    fn user_string(&self, _operand: &Operand) -> Option<Box<[u8]>> {
+    /// Resolves an `ldstr`'s operand (a `#US` user-string token) to the string's UTF-16 CODE UNITS,
+    /// or `None`. Defaults to `None` for resolvers that handle only calls.
+    ///
+    /// Units, not bytes, and not a Rust `String`: the `#US` heap is UTF-16 and so is a managed
+    /// string, so a lone surrogate survives this path intact. Whichever storage encoding a backend
+    /// then chooses is its own decision, made on units it received losslessly.
+    fn user_string(&self, _operand: &Operand) -> Option<Box<[u16]>> {
         None
     }
 
@@ -291,6 +294,18 @@ pub trait CallResolver {
         None
     }
 
+    /// For a `castclass`/`isinst` whose target is an INTERFACE, ONE of that interface's method tags --
+    /// enough to answer "does this object's type implement it", because a type's itable carries an entry
+    /// for every interface method it implements ([`Inst::InterfaceHasTag`]).
+    ///
+    /// `None` for a class target, and `None` for a MARKER interface (no methods), which has no tag to
+    /// test: such a cast keeps the old compare cascade, which for an interface answers a permanent
+    /// false. That is a DECLINE and not a fix, and it is the honest one -- a marker interface's
+    /// implementers are not written down anywhere the object can reach.
+    fn cast_interface_tag(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
     /// The exception tag of a BUILTIN throwable named directly (no token), so a synthesized check
     /// can raise it -- e.g. `System.IndexOutOfRangeException` from an array bounds check. The tag
     /// matches a `catch` that names the same type. Defaults to `None`.
@@ -352,10 +367,23 @@ pub struct ReferenceLayout {
 /// The element of an array a `newarr` allocates: the array type's identity (for its TypeDesc) and
 /// the size in bytes of one element.
 pub struct ArrayElement {
-    /// The array type's identity, for the emitted TypeDesc.
+    /// The array type's identity, for the emitted TypeDesc --
+    /// [`array_handle`](lamella_ir::array_handle) of `element`, so an array and its element type
+    /// never share a descriptor.
     pub handle: TypeHandle,
+    /// The ELEMENT type's identity, qualified to its OWNER (a referenced assembly's type resolves
+    /// to the 0x03 encoding), so the array descriptor's `element_desc@16` names the one canonical
+    /// descriptor for that type rather than minting a second. `None` for an element the metadata
+    /// reader cannot resolve to a type -- a TypeSpec (a nested array or a generic instantiation) --
+    /// which is the same set the element KIND calls opaque.
+    pub element: Option<TypeHandle>,
     /// The size in bytes of one element.
     pub element_size: u32,
+    /// What one element IS, as the array descriptor's word-1 code (see
+    /// [`crate::resolver::ELEMENT_KIND_REFERENCE`]). `element_size` is a compile-time constant
+    /// baked at each access site; this is the same fact carried at RUN TIME, which is what an
+    /// untyped `System.Array` body and a tracing collector need.
+    pub element_kind: u32,
 }
 
 /// A 2-D rectangular-array pseudo-method a `newobj`/`call` names (`int[,]::.ctor`/`Get`/`Set` on an
@@ -461,6 +489,30 @@ fn lower_with_source(
     let (used_args, local_count) = scan_slots(code);
     let arg_count = used_args.max(arg_types.len());
 
+    let mut arg_written = alloc::vec![false; arg_count];
+    let mut arg_addr_taken = alloc::vec![false; arg_count];
+    for inst in code.iter() {
+        if let Operand::Variable(n) = &inst.operand {
+            let n = *n as usize;
+            match inst.opcode {
+                Opcode::Starg | Opcode::StargS if n < arg_count => arg_written[n] = true,
+                Opcode::Ldarga | Opcode::LdargaS if n < arg_count => arg_addr_taken[n] = true,
+                _ => {}
+            }
+        }
+    }
+    let mut promoted_arg: Vec<Option<usize>> = alloc::vec![None; arg_count];
+    let mut promoted_types: Vec<MirType> = Vec::new();
+    for n in 0..arg_count {
+        if arg_written[n]
+            && !arg_addr_taken[n]
+            && matches!(arg_types.get(n), Some(MirType::ObjectRef))
+        {
+            promoted_arg[n] = Some(local_count + promoted_types.len());
+            promoted_types.push(MirType::ObjectRef);
+        }
+    }
+
     let mut mem_elem: Vec<Option<MirType>> = alloc::vec![None; local_count];
     for inst in code.iter() {
         if let (Opcode::Ldloca | Opcode::LdlocaS, Operand::Variable(n)) =
@@ -470,25 +522,34 @@ fn lower_with_source(
                 *slot = local_types
                     .get(*n as usize)
                     .copied()
-                    .filter(|t| is_cell_backable(*t));
+                    .filter(|t| is_cell_backable(*t) || *t == MirType::ObjectRef);
             }
         }
     }
-    let cell_types: Vec<MirType> = (0..local_count)
+    let mut cell_types: Vec<MirType> = (0..local_count)
         .map(|n| match mem_elem[n] {
             Some(elem) => MirType::ValueType {
-                handle: lamella_ir::TypeHandle(0),
+                handle: if elem == MirType::ObjectRef {
+                    crate::stackmaps::REF_CELL_HANDLE
+                } else {
+                    lamella_ir::TypeHandle(0)
+                },
                 size: elem.stack_slot_bytes(),
             },
             None => local_types.get(n).copied().unwrap_or(MirType::I32),
         })
         .collect();
+    cell_types.extend_from_slice(&promoted_types);
+    mem_elem.resize(local_count + promoted_types.len(), None);
+    let local_count = local_count + promoted_types.len();
     let local_types: &[MirType] = &cell_types;
 
     let mut mem_arg: Vec<Option<MirType>> = alloc::vec![None; arg_count];
     for inst in code.iter() {
-        if let (Opcode::Ldarga | Opcode::LdargaS, Operand::Variable(n)) =
-            (inst.opcode, &inst.operand)
+        if let (
+            Opcode::Ldarga | Opcode::LdargaS | Opcode::Starg | Opcode::StargS,
+            Operand::Variable(n),
+        ) = (inst.opcode, &inst.operand)
         {
             if let Some(slot) = mem_arg.get_mut(*n as usize) {
                 *slot = arg_types
@@ -637,13 +698,15 @@ fn lower_with_source(
         .collect();
 
     if preds.first().is_some_and(|entry_preds| !entry_preds.is_empty())
-        && (is_merge(0) || mem_arg.iter().any(|arg| arg.is_some()))
+        && (is_merge(0)
+            || mem_arg.iter().any(|arg| arg.is_some())
+            || promoted_arg.iter().any(|arg| arg.is_some()))
     {
         return Err(CilError::UnsupportedControlFlow);
     }
 
     let mut value_types: Vec<MirType> = Vec::new();
-    let mut strings: Vec<(ValueId, Box<[u8]>)> = Vec::new();
+    let mut strings: Vec<(ValueId, Box<[u16]>)> = Vec::new();
     let args: Vec<ValueId> = (0..arg_count)
         .map(|i| {
             new_value(
@@ -742,6 +805,13 @@ fn lower_with_source(
             }
         };
         locals.resize(local_count, None);
+        if b == 0 {
+            for (n, slot) in promoted_arg.iter().enumerate() {
+                if let Some(idx) = *slot {
+                    locals[idx] = Some(args[n]);
+                }
+            }
+        }
 
         let mut stack: Vec<ValueId> = Vec::new();
         let current_exception = handler_clause[b].and(block_params[b].get(local_count).copied());
@@ -749,6 +819,13 @@ fn lower_with_source(
             stack.push(exception);
         }
         if trap_access[b].is_some() {
+            if !is_merge(b) {
+                if let Some(&pred) = preds[b].first() {
+                    if pred < b {
+                        stack = exit_stack[pred].clone();
+                    }
+                }
+            }
             let operand_count = trap_operand_types(&code[start], widths[start], resolver).len();
             for k in 0..operand_count {
                 stack.push(block_params[b][local_count + k]);
@@ -946,6 +1023,7 @@ fn lower_with_source(
                     &mut last_local_addr,
                     &mem_elem,
                     &arg_cells,
+                    &promoted_arg,
                 )?;
             }
             for _ in before..insts.len() {
@@ -1043,6 +1121,13 @@ fn lower_with_source(
             let block = &mut mir_blocks[block_index];
             block.insts.push((value, zero_inst(ret_ty)));
             block.terminator = Some(Terminator::Return(Some(value)));
+        }
+        for block in mir_blocks.iter_mut() {
+            if matches!(block.terminator, Some(Terminator::Return(None))) {
+                let value = new_value(&mut value_types, ret_ty);
+                block.insts.push((value, zero_inst(ret_ty)));
+                block.terminator = Some(Terminator::Return(Some(value)));
+            }
         }
     }
 
@@ -1407,29 +1492,30 @@ fn apply_value_op(
     local_types: &[MirType],
     args: &[ValueId],
     insts: &mut Vec<(ValueId, Inst)>,
-    strings: &mut Vec<(ValueId, Box<[u8]>)>,
+    strings: &mut Vec<(ValueId, Box<[u16]>)>,
     resolver: &dyn CallResolver,
     last_local_addr: &mut Option<(AddrOf, u32)>,
     mem_elem: &[Option<MirType>],
     arg_cells: &[Option<ValueId>],
+    promoted_arg: &[Option<usize>],
 ) -> Result<(), CilError> {
     match inst.opcode {
         Opcode::Nop => {}
-        Opcode::Ldarg0 => read_arg(arg_cells, value_types, args, stack, insts, 0)?,
-        Opcode::Ldarg1 => read_arg(arg_cells, value_types, args, stack, insts, 1)?,
-        Opcode::Ldarg2 => read_arg(arg_cells, value_types, args, stack, insts, 2)?,
-        Opcode::Ldarg3 => read_arg(arg_cells, value_types, args, stack, insts, 3)?,
+        Opcode::Ldarg0 => read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, 0)?,
+        Opcode::Ldarg1 => read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, 1)?,
+        Opcode::Ldarg2 => read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, 2)?,
+        Opcode::Ldarg3 => read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, 3)?,
         Opcode::LdargS | Opcode::Ldarg => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            read_arg(arg_cells, value_types, args, stack, insts, *n as usize)?;
+            read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, *n as usize)?;
         }
         Opcode::StargS | Opcode::Starg => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            write_arg(arg_cells, value_types, stack, insts, *n as usize)?;
+            write_arg(arg_cells, promoted_arg, value_types, locals, stack, insts, *n as usize)?;
         }
         Opcode::Ldloc0 => read_local(
             mem_elem,
@@ -1626,6 +1712,14 @@ fn apply_value_op(
                 .value_type_size(&inst.operand)
                 .ok_or(CilError::Unsupported(inst.opcode))?;
             push_const(value_types, stack, insts, i64::from(size));
+        }
+        Opcode::Ldtoken => {
+            let handle = resolver
+                .cast_target_chain(&inst.operand)
+                .ok_or(CilError::Unsupported(inst.opcode))?;
+            let result = new_value(value_types, MirType::I32);
+            insts.push((result, Inst::TypeDescAddr { handle }));
+            stack.push(result);
         }
         Opcode::Localloc => {
             let size = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -1866,17 +1960,14 @@ fn apply_value_op(
             insts.push((result, Inst::FillBlock { dst, value, size }));
         }
         Opcode::Ldstr => {
-            let bytes = resolver
+            let utf16 = resolver
                 .user_string(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
-            let utf16: Box<[u16]> = core::str::from_utf8(&bytes)
-                .unwrap_or("")
-                .encode_utf16()
-                .collect::<Vec<u16>>()
-                .into_boxed_slice();
             let value = new_value(value_types, MirType::ObjectRef);
-            insts.push((value, Inst::StringLiteral { utf16 }));
-            strings.push((value, bytes));
+            insts.push((value, Inst::StringLiteral {
+                utf16: utf16.clone(),
+            }));
+            strings.push((value, utf16));
             stack.push(value);
         }
         Opcode::Call | Opcode::Callvirt => {
@@ -2187,13 +2278,13 @@ fn apply_value_op(
                 }
                 CallTarget::Intrinsic(Intrinsic::DebugWriteLine) => {
                     let string_value = *call_args.first().ok_or(CilError::StackUnderflow)?;
-                    let bytes = strings
+                    let units = strings
                         .iter()
                         .rev()
                         .find(|(v, _)| *v == string_value)
                         .map(|(_, b)| b.clone())
                         .ok_or(CilError::UnresolvedCall)?;
-                    let mut text = bytes.into_vec();
+                    let mut text = alloc::string::String::from_utf16_lossy(&units).into_bytes();
                     text.push(b'\n');
                     text.push(0);
                     let result = new_value(value_types, MirType::I32);
@@ -2309,27 +2400,72 @@ fn apply_value_op(
             }
         }
         Opcode::Ldflda => {
-            let (source, offset) = last_local_addr.take().ok_or(CilError::BadOperand)?;
             let field = resolver
                 .field_offset(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
-            *last_local_addr = Some((source, offset + field));
+            match last_local_addr.take() {
+                Some((source, offset)) => {
+                    *last_local_addr = Some((source, offset + field));
+                }
+                None => {
+                    let base = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let addr = new_value(value_types, MirType::ManagedPtr);
+                    insts.push((addr, Inst::FieldAddr { base, offset: field }));
+                    stack.push(addr);
+                }
+            }
         }
-        Opcode::Initobj => {
-            let (AddrOf::Local(n), _) = last_local_addr.take().ok_or(CilError::BadOperand)? else {
-                return Err(CilError::BadOperand);
-            };
-            let size = resolver
-                .value_type_size(&inst.operand)
-                .ok_or(CilError::BadOperand)?;
-            let handle = match &inst.operand {
-                Operand::Token(token) => lamella_ir::TypeHandle(token.0),
-                _ => lamella_ir::TypeHandle(0),
-            };
-            let zeroed = new_value(value_types, MirType::ValueType { handle, size });
-            insts.push((zeroed, Inst::InitStruct));
-            *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
-        }
+        Opcode::Initobj => match last_local_addr.take() {
+            Some((AddrOf::Local(n), _)) => {
+                let size = resolver
+                    .value_type_size(&inst.operand)
+                    .ok_or(CilError::BadOperand)?;
+                let handle = match &inst.operand {
+                    Operand::Token(token) => lamella_ir::TypeHandle(token.0),
+                    _ => lamella_ir::TypeHandle(0),
+                };
+                let zeroed = new_value(value_types, MirType::ValueType { handle, size });
+                insts.push((zeroed, Inst::InitStruct));
+                *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
+            }
+            None => {
+                let addr = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let size = resolver
+                    .value_type_size(&inst.operand)
+                    .or_else(|| {
+                        resolver
+                            .type_operand_mir(&inst.operand)
+                            .map(MirType::stack_slot_bytes)
+                    })
+                    .ok_or(CilError::BadOperand)?;
+                let zero = new_value(value_types, MirType::I32);
+                insts.push((
+                    zero,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                ));
+                let sz = new_value(value_types, MirType::I32);
+                insts.push((
+                    sz,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i64::from(size),
+                    },
+                ));
+                let result = new_value(value_types, MirType::I32);
+                insts.push((
+                    result,
+                    Inst::FillBlock {
+                        dst: addr,
+                        value: zero,
+                        size: sz,
+                    },
+                ));
+            }
+            Some(_) => return Err(CilError::BadOperand),
+        },
         Opcode::Ldfld => {
             let (base, base_offset) = match last_local_addr.take() {
                 Some((source, off)) => (
@@ -2402,8 +2538,10 @@ fn apply_value_op(
                 array,
                 Inst::AllocArray {
                     handle: element.handle,
+                    element: element.element,
                     length,
                     element_size: element.element_size,
+                    element_kind: element.element_kind,
                 },
             ));
             stack.push(array);
@@ -2984,7 +3122,17 @@ fn apply_value_op(
             let chain_target = resolver
                 .cast_target_chain(&inst.operand)
                 .filter(|target| crate::resolver::reference_handle_parts(*target).is_some());
-            let matched = if let Some(target) = chain_target {
+            let matched = if let Some(tag) = resolver.cast_interface_tag(&inst.operand) {
+                let present = new_value(value_types, MirType::I32);
+                insts.push((
+                    present,
+                    Inst::InterfaceHasTag {
+                        descriptor: object_desc,
+                        tag,
+                    },
+                ));
+                present
+            } else if let Some(target) = chain_target {
                 let target_desc = new_value(value_types, MirType::I32);
                 insts.push((target_desc, Inst::TypeDescAddr { handle: target }));
                 let scanned = new_value(value_types, MirType::I32);
@@ -3503,6 +3651,10 @@ enum TrapKind {
     /// `castclass T` for an in-program TypeDef T: walk the object's TypeDesc base_ptr chain for T's
     /// descriptor (the exact base-pointer scan). O(depth), no per-subtype compares -> `InvalidCastException`.
     CastClassChain(TypeHandle),
+    /// `castclass I` for an INTERFACE I: the object's type must IMPLEMENT it, which is an itable lookup
+    /// of one of I's method tags rather than any kind of subtype test -> `InvalidCastException`. NULL
+    /// passes, as it does for every reference cast. See [`lamella_ir::Inst::InterfaceHasTag`].
+    CastInterface(u32),
     /// An integer `div`/`rem`: the divisor (the second operand) being zero -> `DivideByZeroException`.
     DivByZero,
     /// A checked `add.ovf`/`sub.ovf` (and `.un`) whose result overflows -> `OverflowException`.
@@ -3557,6 +3709,9 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
         }
     }
     if opcode == Opcode::Castclass {
+        if let Some(tag) = resolver.cast_interface_tag(&inst.operand) {
+            return Some(TrapKind::CastInterface(tag));
+        }
         let handles = resolver.cast_subtype_handles(&inst.operand);
         if let Some(target) = resolver.cast_target_chain(&inst.operand) {
             if crate::resolver::reference_handle_parts(target).is_some()
@@ -4032,6 +4187,44 @@ fn cmp_value(
     v
 }
 
+/// Weakens a checked reference cast's failure predicate so that NULL PASSES: `mismatch = unmatched AND
+/// object_desc != 0`.
+///
+/// `castclass` on a null reference SUCCEEDS in .NET -- null is a legal value of every reference type --
+/// while `isinst` on it answers false. The two share [`Inst::LoadTypeDesc`], which answers 0 for null,
+/// so `isinst`'s compare cascade gets the right answer for free (0 matches no descriptor) and only the
+/// CAST needs telling that "matched nothing" and "there was nothing to match" are different. Without
+/// this a `(T)null` inside a `try` throws InvalidCastException on a cast .NET performs.
+///
+/// `zero` is the caller's existing 0 constant, reused rather than emitted twice.
+fn null_passes_the_cast(
+    insts: &mut Vec<(ValueId, Inst)>,
+    value_types: &mut Vec<MirType>,
+    object_desc: ValueId,
+    zero: ValueId,
+    unmatched: ValueId,
+) -> ValueId {
+    let described = new_value(value_types, MirType::I32);
+    insts.push((
+        described,
+        Inst::Compare {
+            op: CmpOp::Ne,
+            lhs: object_desc,
+            rhs: zero,
+        },
+    ));
+    let mismatch = new_value(value_types, MirType::I32);
+    insts.push((
+        mismatch,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: unmatched,
+            rhs: described,
+        },
+    ));
+    mismatch
+}
+
 /// Builds the terminator for a block that flows into a may-trap access (the next block): the
 /// synthesized runtime check. `operands` is what the block left on its stack -- `[array, index]` for
 /// an array load, `[array, index, value]` for a store, `[object]` for a field load. By `kind` it
@@ -4164,15 +4357,48 @@ fn build_trap_access_check(
                     value: 0,
                 },
             ));
-            let mismatch = new_value(value_types, MirType::I32);
+            let unmatched = new_value(value_types, MirType::I32);
             insts.push((
-                mismatch,
+                unmatched,
                 Inst::Compare {
                     op: CmpOp::Eq,
                     lhs: matched,
                     rhs: zero,
                 },
             ));
+            let mismatch = null_passes_the_cast(insts, value_types, object_desc, zero, unmatched);
+            (mismatch, "InvalidCastException")
+        }
+        TrapKind::CastInterface(tag) => {
+            let object = operands[0];
+            let object_desc = new_value(value_types, MirType::I32);
+            insts.push((object_desc, Inst::LoadTypeDesc { object }));
+            let present = new_value(value_types, MirType::I32);
+            insts.push((
+                present,
+                Inst::InterfaceHasTag {
+                    descriptor: object_desc,
+                    tag,
+                },
+            ));
+            let zero = new_value(value_types, MirType::I32);
+            insts.push((
+                zero,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ));
+            let unmatched = new_value(value_types, MirType::I32);
+            insts.push((
+                unmatched,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: present,
+                    rhs: zero,
+                },
+            ));
+            let mismatch = null_passes_the_cast(insts, value_types, object_desc, zero, unmatched);
             (mismatch, "InvalidCastException")
         }
         TrapKind::CastClassChain(target) => {
@@ -4196,15 +4422,16 @@ fn build_trap_access_check(
                     value: 0,
                 },
             ));
-            let mismatch = new_value(value_types, MirType::I32);
+            let unmatched = new_value(value_types, MirType::I32);
             insts.push((
-                mismatch,
+                unmatched,
                 Inst::Compare {
                     op: CmpOp::Eq,
                     lhs: matched,
                     rhs: zero,
                 },
             ));
+            let mismatch = null_passes_the_cast(insts, value_types, object_desc, zero, unmatched);
             (mismatch, "InvalidCastException")
         }
         TrapKind::DivByZero => {
@@ -4774,7 +5001,27 @@ fn build_condition(
         ));
         return Ok((cond, target, fallthrough));
     }
-    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let mut value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    if value_types.get(value.index()) == Some(&MirType::I64) {
+        let zero = new_value(value_types, MirType::I64);
+        insts.push((
+            zero,
+            Inst::ConstInt {
+                ty: MirType::I64,
+                value: 0,
+            },
+        ));
+        let nonzero = new_value(value_types, MirType::I32);
+        insts.push((
+            nonzero,
+            Inst::Compare {
+                op: CmpOp::Ne,
+                lhs: value,
+                rhs: zero,
+            },
+        ));
+        value = nonzero;
+    }
     match op {
         Opcode::BrtrueS | Opcode::Brtrue => Ok((value, target, fallthrough)),
         Opcode::BrfalseS | Opcode::Brfalse => Ok((value, fallthrough, target)),
@@ -4833,14 +5080,20 @@ fn push_arg(args: &[ValueId], stack: &mut Vec<ValueId>, index: usize) -> Result<
 /// Pushes the value of argument `index`. A memory-backed primitive argument (its address is taken, so it
 /// lives in an entry-laid one-cell value type) reads its cell with a `FieldLoad` at offset 0, typed by the
 /// argument's declared type; any other argument pushes its incoming SSA value directly ([`push_arg`]).
+#[allow(clippy::too_many_arguments)]
 fn read_arg(
     arg_cells: &[Option<ValueId>],
+    promoted: &[Option<usize>],
     value_types: &mut Vec<MirType>,
     args: &[ValueId],
+    locals: &mut [Option<ValueId>],
     stack: &mut Vec<ValueId>,
     insts: &mut Vec<(ValueId, Inst)>,
     index: usize,
 ) -> Result<(), CilError> {
+    if let Some(pidx) = promoted.get(index).copied().flatten() {
+        return push_local(value_types, locals, stack, insts, pidx);
+    }
     let Some(cell) = arg_cells.get(index).copied().flatten() else {
         return push_arg(args, stack, index);
     };
@@ -4865,11 +5118,16 @@ fn read_arg(
 /// unsupported.
 fn write_arg(
     arg_cells: &[Option<ValueId>],
+    promoted: &[Option<usize>],
     value_types: &mut Vec<MirType>,
+    locals: &mut [Option<ValueId>],
     stack: &mut Vec<ValueId>,
     insts: &mut Vec<(ValueId, Inst)>,
     index: usize,
 ) -> Result<(), CilError> {
+    if let Some(pidx) = promoted.get(index).copied().flatten() {
+        return store_local(value_types, locals, stack, insts, pidx);
+    }
     let Some(cell) = arg_cells.get(index).copied().flatten() else {
         return Err(CilError::Unsupported(Opcode::Starg));
     };
@@ -5456,6 +5714,53 @@ mod control_flow {
 mod tests {
     use super::*;
 
+    /// A checked reference cast must let NULL THROUGH: `castclass` on null SUCCEEDS in .NET, so the
+    /// trap predicate has to be "matched nothing AND there WAS something to match" rather than just
+    /// "matched nothing". [`Inst::LoadTypeDesc`] answers 0 for a null reference, which is what the
+    /// second term reads.
+    ///
+    /// FOLLOWS THE OPERANDS rather than counting instructions: an `And` of the wrong two values would
+    /// satisfy any shape check and still throw InvalidCastException on a cast .NET performs.
+    #[test]
+    fn a_checked_cast_lets_null_through() {
+        let mut value_types = alloc::vec![MirType::I32; 3];
+        let (object_desc, zero, unmatched) = (ValueId(0), ValueId(1), ValueId(2));
+        let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+        let mismatch =
+            null_passes_the_cast(&mut insts, &mut value_types, object_desc, zero, unmatched);
+
+        let (and_lhs, and_rhs) = insts
+            .iter()
+            .find(|(id, _)| *id == mismatch)
+            .and_then(|(_, i)| match i {
+                Inst::Binary {
+                    op: BinOp::And,
+                    lhs,
+                    rhs,
+                } => Some((*lhs, *rhs)),
+                _ => None,
+            })
+            .expect("the failure predicate is an AND");
+        assert!(
+            and_lhs == unmatched || and_rhs == unmatched,
+            "one side must be the match result"
+        );
+        let described = if and_lhs == unmatched { and_rhs } else { and_lhs };
+        let defines = insts
+            .iter()
+            .find(|(id, _)| *id == described)
+            .map(|(_, i)| i)
+            .expect("the other side has a definition");
+        assert!(
+            matches!(
+                defines,
+                Inst::Compare { op: CmpOp::Ne, lhs, rhs }
+                    if *lhs == object_desc && *rhs == zero
+            ),
+            "the other side must be `object_desc != 0` -- the null test itself, got {defines:?}"
+        );
+    }
+
     /// `ldc.i4.s 40 ; ldc.i4.s 2 ; add ; ret`, the CIL of `fn() -> i32 { 40 + 2 }`.
     fn forty_plus_two() -> MethodBodyImage {
         MethodBodyImage {
@@ -5714,8 +6019,8 @@ mod tests {
                     target: CallTarget::Intrinsic(Intrinsic::DebugWriteLine),
                 })
             }
-            fn user_string(&self, _operand: &Operand) -> Option<Box<[u8]>> {
-                Some(b"Hi".to_vec().into_boxed_slice())
+            fn user_string(&self, _operand: &Operand) -> Option<Box<[u16]>> {
+                Some(alloc::vec![0x48u16, 0x69].into_boxed_slice())
             }
         }
         let body = MethodBodyImage {
@@ -5852,6 +6157,271 @@ mod tests {
     }
 
     #[test]
+    fn brtrue_on_a_reference_argument_lowers_and_verifies() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(4)),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Ret),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::ObjectRef], &[]).unwrap();
+        let cond = func
+            .blocks
+            .iter()
+            .find_map(|b| match &b.terminator {
+                Some(Terminator::Branch { cond, .. }) => Some(*cond),
+                _ => None,
+            })
+            .expect("a conditional branch");
+        assert_eq!(func.value_type(cond), Some(MirType::ObjectRef));
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::I32));
+    }
+
+    #[test]
+    fn brtrue_on_a_64_bit_value_consults_both_words() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI8, Operand::Int64(0x1_0000_0000)),
+                Instruction::new(Opcode::Brtrue, Operand::Target(4)),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Ret),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[]).unwrap();
+        let cond = func
+            .blocks
+            .iter()
+            .find_map(|b| match &b.terminator {
+                Some(Terminator::Branch { cond, .. }) => Some(*cond),
+                _ => None,
+            })
+            .expect("a conditional branch");
+        assert_eq!(
+            func.value_type(cond),
+            Some(MirType::I32),
+            "a branch condition must be one word"
+        );
+        let compares_64 = func.blocks.iter().flat_map(|b| &b.insts).any(|(v, i)| {
+            *v == cond
+                && matches!(
+                    i,
+                    Inst::Compare { op: CmpOp::Ne, lhs, .. }
+                        if func.value_type(*lhs) == Some(MirType::I64)
+                )
+        });
+        assert!(
+            compares_64,
+            "the int64 is compared against zero, never truncated to its low word"
+        );
+        assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn initobj_on_an_address_taken_scalar_local_zeroes_the_cell() {
+        use lamella_token::Token;
+        struct NativePrimitive;
+        impl CallResolver for NativePrimitive {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn type_operand_mir(&self, _: &Operand) -> Option<MirType> {
+                Some(MirType::NativeInt)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldloca, Operand::Variable(0)),
+                Instruction::new(Opcode::Initobj, Operand::Token(Token::new(0x02, 1))),
+                Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) =
+            lower_method_typed(&body, &NativePrimitive, &[], &[MirType::NativeInt]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::FillBlock { .. })),
+            "initobj of the memory-backed cell must zero it with a FillBlock"
+        );
+        assert_eq!(func.ret, Some(MirType::NativeInt));
+    }
+
+    #[test]
+    fn ldflda_on_a_reference_this_makes_a_field_address() {
+        use lamella_token::Token;
+        struct FieldAt0;
+        impl CallResolver for FieldAt0 {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(0)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Ldflda, Operand::Token(Token::new(0x04, 1))),
+                Instruction::simple(Opcode::LdindI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &FieldAt0, &[MirType::ObjectRef], &[]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { .. })),
+            "ldflda on a reference base must materialize a FieldAddr pointer"
+        );
+        assert_eq!(func.ret, Some(MirType::I32));
+    }
+
+    #[test]
+    fn ldtoken_of_a_type_pushes_its_descriptor_address() {
+        use lamella_token::Token;
+        struct TypeHandleFor;
+        impl CallResolver for TypeHandleFor {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn cast_target_chain(&self, _: &Operand) -> Option<lamella_ir::TypeHandle> {
+                Some(lamella_ir::TypeHandle(0x0200_0037))
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldtoken, Operand::Token(Token::new(0x02, 55))),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &TypeHandleFor, &[], &[]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks.iter().flat_map(|b| &b.insts).any(|(_, i)| matches!(
+                i,
+                Inst::TypeDescAddr { handle } if *handle == lamella_ir::TypeHandle(0x0200_0037)
+            )),
+            "ldtoken must lower to a TypeDescAddr of the resolved type handle"
+        );
+    }
+
+    #[test]
+    fn ldloca_of_a_reference_local_escaping_to_a_call_lowers() {
+        struct OneArgVoid;
+        impl CallResolver for OneArgVoid {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: false,
+                    result_type: None,
+                    target: CallTarget::Internal(7),
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldloca, Operand::Variable(0)),
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &OneArgVoid, &[], &[MirType::ObjectRef]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { .. })),
+            "ldloca of a memory-homed reference local must materialize a FieldAddr"
+        );
+        assert!(
+            func.value_types
+                .iter()
+                .any(|t| crate::stackmaps::is_ref_cell(*t)),
+            "the reference local must memory-home as a REF_CELL_HANDLE cell"
+        );
+    }
+
+    #[test]
+    fn a_may_trap_access_carries_the_eval_stack_below_its_operands() {
+        struct TrapArray;
+        impl CallResolver for TrapArray {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+                Some(0x8000_0001)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 4,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ldarg2),
+                Instruction::simple(Opcode::LdelemI4),
+                Instruction::simple(Opcode::StelemI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &TrapArray,
+            &[MirType::ObjectRef, MirType::I32, MirType::I32],
+            &[],
+        )
+        .unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
     fn a_predecessorless_block_lowers_to_an_unreachable_trap() {
         let body = MethodBodyImage {
             max_stack: 1,
@@ -5881,6 +6451,33 @@ mod tests {
             trapped,
             "the predecessorless block must lower to an empty Unreachable trap"
         );
+    }
+
+    #[test]
+    fn a_dead_ret_after_a_constant_true_guard_returns_a_placeholder() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::new(Opcode::BrfalseS, Operand::Target(4)),
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::simple(Opcode::Ret),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[]).unwrap();
+        assert_eq!(func.ret, Some(MirType::I32));
+        assert!(
+            func.blocks
+                .iter()
+                .all(|b| !matches!(&b.terminator, Some(Terminator::Return(None)))),
+            "the dead `ret` must carry a placeholder value, not `Return(None)`"
+        );
+        assert!(lamella_ir::verify(&func).is_ok());
     }
 
     #[test]
@@ -5942,8 +6539,8 @@ mod tests {
                     target: CallTarget::Intrinsic(Intrinsic::StringEquals),
                 })
             }
-            fn user_string(&self, _operand: &Operand) -> Option<Box<[u8]>> {
-                Some(b"x".to_vec().into_boxed_slice())
+            fn user_string(&self, _operand: &Operand) -> Option<Box<[u16]>> {
+                Some(alloc::vec![0x78u16].into_boxed_slice())
             }
         }
         let body = MethodBodyImage {
@@ -6354,7 +6951,9 @@ mod tests {
             fn array_element(&self, _: &Operand) -> Option<ArrayElement> {
                 Some(ArrayElement {
                     handle: lamella_ir::TypeHandle(9),
+                    element: None,
                     element_size: 4,
+                    element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
                 })
             }
         }
@@ -6408,7 +7007,9 @@ mod tests {
             fn array_element(&self, _: &Operand) -> Option<ArrayElement> {
                 Some(ArrayElement {
                     handle: lamella_ir::TypeHandle(8),
+                    element: None,
                     element_size: 8,
+                    element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
                 })
             }
         }
@@ -6772,6 +7373,139 @@ mod tests {
             insts
                 .iter()
                 .any(|(_, i)| matches!(i, Inst::Load { width: 4, .. }))
+        );
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn written_back_primitive_arg_is_backed_without_taking_its_address() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+                Instruction::new(Opcode::StargS, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let arg0 = func.blocks[0].params[0];
+        assert!(
+            func.value_types
+                .iter()
+                .any(|t| matches!(t, MirType::ValueType { size: 4, .. }))
+        );
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::InitStruct))
+        );
+        assert!(func.blocks[0].insts.iter().any(
+            |(_, i)| matches!(i, Inst::FieldStore { offset: 0, value, .. } if *value == arg0)
+        ));
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldLoad { offset: 0, .. }))
+        );
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn written_reference_arg_is_promoted_to_a_threaded_local() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::new(Opcode::StargS, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &NoCalls,
+            &[MirType::ObjectRef, MirType::ObjectRef],
+            &[],
+        )
+        .unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            !insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldStore { .. } | Inst::FieldLoad { .. }))
+        );
+        let b_param = func.blocks[0].params[1];
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Some(Terminator::Return(Some(v))) if v == b_param
+        ));
+        assert!(
+            func.value_types
+                .iter()
+                .filter(|t| matches!(t, MirType::ObjectRef))
+                .count()
+                >= 2
+        );
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn written_reference_arg_threads_the_joined_value_through_a_merge() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg2),
+                Instruction::new(Opcode::BrfalseS, Operand::Target(4)),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::new(Opcode::StargS, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &NoCalls,
+            &[MirType::ObjectRef, MirType::ObjectRef, MirType::I32],
+            &[],
+        )
+        .unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let ret_block = func
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Some(Terminator::Return(Some(_)))))
+            .expect("a returning block");
+        let Some(Terminator::Return(Some(ret))) = ret_block.terminator else {
+            unreachable!()
+        };
+        assert!(
+            ret_block.params.contains(&ret),
+            "the return must read a threaded merge parameter, got {ret:?} params {:?}",
+            ret_block.params
+        );
+        assert!(
+            !func.blocks[0].params.contains(&ret),
+            "the merged value must be a fresh merge parameter, not an incoming argument"
         );
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());

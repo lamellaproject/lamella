@@ -150,10 +150,90 @@ pub enum DiagnosticKind {
         /// The target type.
         to: Box<str>,
     },
+    /// `CS0133`: the value of an `enum` member must be a compile-time constant (21.4), so a
+    /// non-constant initializer -- a method call, object creation, an instance member -- is rejected.
+    NonConstantEnumMember {
+        /// The qualified member name, e.g. `E.A`.
+        member: Box<str>,
+    },
     /// `CS0220`: a constant arithmetic operation overflows the result type in a checked context
     /// (14.16), e.g. `int.MaxValue + 1`. Constant expressions are checked by default, so this
     /// fires unless an explicit `unchecked` context suppresses it.
     ConstantOverflowInCheckedContext,
+    /// `CS0221`: a constant CONVERSION (an explicit cast, or a narrowing) overflows the target type
+    /// in a checked context (14.16 / 13.1.7). Constant conversions are checked by default, so this
+    /// fires unless an explicit `unchecked` context suppresses it -- e.g. `checked((byte)300)`.
+    CheckedConstantConversionOverflow {
+        /// The constant value, as rendered.
+        value: Box<str>,
+        /// The target type.
+        to: Box<str>,
+    },
+    /// `CS0677`: a `volatile` field must be of a permitted type (17.4.3) -- a reference type, one of
+    /// byte/sbyte/short/ushort/int/uint/char/float/bool, or an enum with one of those bases. Any
+    /// other type (long, ulong, double, decimal, a struct, an enum with a 64-bit base) is rejected.
+    VolatileFieldType {
+        /// The qualified field name, e.g. `C.field`.
+        field: Box<str>,
+        /// The field's disallowed type, as rendered.
+        ty: Box<str>,
+    },
+    /// `CS0558`: a user-defined operator must be declared `static` and `public` (17.9.1); one
+    /// missing either modifier is rejected.
+    OperatorMustBeStaticAndPublic {
+        /// The operator's signature, as csc names it (`C.operator +(C, C)`).
+        signature: Box<str>,
+    },
+    /// `CS0418`: a class declared both `abstract` and `sealed` is contradictory -- an abstract type
+    /// must be extended, a sealed one cannot be.
+    AbstractTypeSealedOrStatic {
+        /// The offending type's name.
+        type_name: Box<str>,
+    },
+    /// `CS0112`: a `static` member cannot also be `virtual`, `abstract`, or `override` -- static
+    /// members are not part of the virtual dispatch a derived type overrides.
+    StaticMemberCannotBeVirtual {
+        /// The offending inheritance modifier (`virtual` / `abstract` / `override`).
+        modifier: Box<str>,
+    },
+    /// `CS1008`: an enum's underlying type must be one of the eight integer types (21.1); a base
+    /// that resolves to anything else (bool, char, a floating type, a struct) is rejected.
+    EnumUnderlyingTypeExpected,
+    /// `CS1721`: a class may name at most one base class (10.1.4); two class bases in the base list
+    /// are rejected.
+    MultipleClassBases {
+        /// The deriving type's name.
+        type_name: Box<str>,
+        /// The first base class named.
+        first: Box<str>,
+        /// The second base class named.
+        second: Box<str>,
+    },
+    /// `CS0066`: an event's type must be a delegate type (17.7); a non-delegate type is rejected.
+    EventTypeMustBeDelegate {
+        /// The event's qualified name (`C.E`).
+        event: Box<str>,
+    },
+    /// `CS1020`: a two-parameter operator declaration must name a binary-overloadable operator
+    /// (17.9.2), so a unary-only operator (`!`, `~`, `++`, `--`, `true`, `false`) given two
+    /// parameters is rejected.
+    OverloadableBinaryOperatorExpected,
+    /// `CS0578`: the `[Conditional]` attribute (24.4.2) requires a `void`-returning method; a method
+    /// with a non-`void` return type is rejected.
+    ConditionalMethodMustReturnVoid {
+        /// The method's display signature (`C.M()`).
+        method: Box<str>,
+    },
+    /// `CS0509`: a class cannot derive from a `sealed` type (10.1.1.2).
+    DeriveFromSealed {
+        /// The deriving type's name (`C`).
+        derived: Box<str>,
+        /// The sealed base type's name (`B`).
+        base: Box<str>,
+    },
+    /// `CS1527`: a type defined directly in a namespace (10.5) may be `public` or `internal`, but
+    /// not `private`, `protected`, or `protected internal`.
+    NamespaceElementBadAccessibility,
     /// `CS0029`: no implicit conversion exists between two types.
     NoImplicitConversion {
         /// The source type.
@@ -200,6 +280,15 @@ pub enum DiagnosticKind {
     CannotAssignToMethodGroup {
         /// The method group's name.
         name: Box<str>,
+    },
+    /// `CS1656`: an assignment to a local the language owns rather than the body -- a `foreach`
+    /// iteration variable (rebound from the collection each pass, 15.8.4) or a `using` resource
+    /// (disposed on the way out, 15.13). The message names which kind it was.
+    CannotAssignToReadonlyLocal {
+        /// The local's name.
+        name: Box<str>,
+        /// What holds it, as the message quotes it (`foreach iteration variable`).
+        kind: &'static str,
     },
     /// `CS0117`: the type does not contain a definition for the named member.
     MemberNotFound {
@@ -279,7 +368,18 @@ pub enum DiagnosticKind {
     },
     /// `CS0163`: control can fall off the end of a non-empty `switch` section into
     /// the next (C# forbids implicit fall-through).
-    SwitchFallThrough,
+    SwitchFallThrough {
+        /// The offending section's LAST label, rendered as `case 5:` or `default:`.
+        label: Box<str>,
+    },
+    /// `CS8070`: control can fall out of the switch entirely, because the offending
+    /// section is the LAST one and so has no following section to fall into. The
+    /// first-edition rule is the same one behind [`Self::SwitchFallThrough`] (a switch
+    /// section's end point must not be reachable); only the reported code differs.
+    SwitchFallOutFinal {
+        /// The final section's LAST label, rendered as `case 5:` or `default:`.
+        label: Box<str>,
+    },
     /// `CS0128`: a local variable of this name is already declared in this scope.
     DuplicateLocal {
         /// The redeclared name.
@@ -300,6 +400,147 @@ pub enum DiagnosticKind {
         /// The namespace the type is declared in, or `<global namespace>` for the global one.
         namespace: Box<str>,
         /// The duplicated type name.
+        name: Box<str>,
+    },
+    /// `CS0737`: a class member matches an interface member's signature but is not public, so it
+    /// cannot implement it (13.4.4). An implicit implementation is public or it is nothing.
+    InterfaceImplementationNotPublic {
+        /// The class that fails to implement the interface.
+        type_name: Box<str>,
+        /// The interface member left unimplemented (`I.M()`).
+        interface_member: Box<str>,
+        /// The class member that would have implemented it (`C.M()`).
+        member: Box<str>,
+    },
+    /// `CS0738`: a class member matches an interface member's signature and is public, but returns
+    /// a different type, so it implements nothing.
+    InterfaceImplementationReturnType {
+        /// The class that fails to implement the interface.
+        type_name: Box<str>,
+        /// The interface member left unimplemented (`I.M()`).
+        interface_member: Box<str>,
+        /// The class member that would have implemented it (`C.M()`).
+        member: Box<str>,
+        /// The return type the interface requires.
+        return_type: Box<str>,
+    },
+    /// `CS0768`: a constructor reaches itself through a chain of `: this(...)` initializers
+    /// (17.10.1), so no constructor in the chain could ever finish.
+    ConstructorInitializerCycle {
+        /// The constructor, as the message names it (`C.C(int)`).
+        constructor: Box<str>,
+    },
+    /// `CS1674`: a `using` resource whose type does not implement `System.IDisposable` (15.13),
+    /// so there is nothing for the generated `finally` to dispose.
+    UsingRequiresDisposable {
+        /// The resource type, as the message names it.
+        ty: Box<str>,
+    },
+    /// `CS0616`: a type used as an attribute that does not derive from `System.Attribute` (24.2),
+    /// so it is not an attribute class at all.
+    NotAnAttributeClass {
+        /// The type named in the attribute, as the message quotes it.
+        type_name: Box<str>,
+    },
+    /// `CS0579`: the same attribute is applied twice to one target (24.2).
+    DuplicateAttribute {
+        /// The attribute's simple name, as the message quotes it.
+        name: Box<str>,
+    },
+    /// `CS0182`: an attribute argument that is not a constant, a `typeof`, or an array creation.
+    /// An attribute is baked into metadata, so nothing evaluated at run time can supply one.
+    NonConstantAttributeArgument,
+    /// `CS0227`: the source contains `unsafe` but the compilation was not given `/unsafe`. The
+    /// language supports unsafe code in full; a compilation opts IN to containing it, exactly as
+    /// csc requires.
+    UnsafeCodeRequiresOption,
+    /// `CS0133`: a `const` field's initializer is not a constant expression. Its value is baked
+    /// into every use site (17.4.2), so nothing evaluated at run time can supply it.
+    NonConstantFieldInitializer {
+        /// The field, qualified as the message names it (`C.Value`).
+        field: Box<str>,
+    },
+    /// `CS1019`: an operator declared in a unary form takes other than one parameter -- here, a
+    /// conversion operator, which is always unary (17.9.4).
+    OverloadableUnaryOperatorExpected,
+    /// `CS1017`: a `catch` clause after the general one. A general `catch` catches every
+    /// exception (15.10), so a clause behind it could never run.
+    CatchAfterGeneralCatch,
+    /// `CS0556`: a user-defined conversion that neither converts to nor from the type declaring
+    /// it. A conversion operator exists to bridge ITS type and another (17.9.4).
+    ConversionMustInvolveEnclosingType,
+    /// `CS1579`: a `foreach` collection that is not enumerable -- it declares no public
+    /// `GetEnumerator` and is not an array (15.8.4), so the loop has nothing to iterate.
+    ForEachNotEnumerable {
+        /// The collection's type, as the message names it (twice).
+        ty: Box<str>,
+    },
+    /// `CS1536`: a parameter declared `void`. `void` is the absence of a value, so it names no
+    /// storage a parameter could hold -- the same reason a `void` local is `CS1547`.
+    VoidParameter,
+    /// `CS0847`: a rectangular array initializer list has the wrong length -- it disagrees either
+    /// with the written dimension or with the other lists at its level (19.6). The shape is
+    /// rectangular, so every list at one level holds the same count.
+    ArrayInitializerLength {
+        /// The length the list was required to have.
+        length: u64,
+    },
+    /// `CS0153`: a `goto case` outside any `switch`. The target is a case of the enclosing
+    /// switch (15.10), so outside one it names nothing.
+    GotoCaseOutsideSwitch,
+    /// `CS0156`: a bare `throw;` outside a `catch` clause. It re-throws the exception being
+    /// handled (15.9.5), and outside a catch there is none in flight.
+    RethrowOutsideCatch,
+    /// `CS0157`: a `return`, `break` or `continue` that would transfer control out of a
+    /// `finally` block. A finally runs precisely because control is already leaving (15.10).
+    ControlLeavesFinally,
+    /// `CS1537`: two `using` directives in one namespace give the same alias. An alias names one
+    /// type (10.4.1), so the second declares nothing.
+    DuplicateUsingAlias {
+        /// The repeated alias.
+        alias: Box<str>,
+    },
+    /// `CS0020`: a division or remainder by a constant zero. The operation has no value, and it is
+    /// a compile-time fact rather than a run-time one.
+    DivisionByConstantZero,
+    /// `CS0185`: the operand of a `lock` is a value type. A monitor is taken on a reference
+    /// (15.12); boxing a value would lock a fresh box each time and guard nothing.
+    LockRequiresReferenceType {
+        /// The operand's type, as the message names it.
+        ty: Box<str>,
+    },
+    /// `CS0144`: `new` on an abstract class or an interface. Neither can be instantiated
+    /// (14.5.10.1) -- there is no complete implementation to construct.
+    CannotCreateAbstractInstance {
+        /// The abstract type named, as the message spells it.
+        type_name: Box<str>,
+    },
+    /// `CS0515`: a static constructor declares an accessibility modifier. It is never called by
+    /// user code -- the runtime runs it -- so it has no accessibility to declare (17.11).
+    StaticConstructorAccessibility {
+        /// The static constructor, as the message names it (`C.C()`).
+        member: Box<str>,
+    },
+    /// `CS1520`: a member that is not a constructor and declares no return type. A method
+    /// declaration whose name does not repeat the enclosing type's is missing its return type
+    /// (17.5), which is how csc reads it.
+    MethodMustHaveReturnType,
+    /// `CS0527`: a type in a struct's or interface's base list is not an interface. Neither may
+    /// name a base class (11.2, 13.1.3) -- a struct's is always `System.ValueType`.
+    BaseTypeNotInterface {
+        /// The offending base type, as the message names it.
+        base: Box<str>,
+    },
+    /// `CS0574`: a destructor's name does not repeat its class's. A destructor is named for the
+    /// type it finalizes (17.12), so any other name declares nothing.
+    DestructorNameMismatch,
+    /// `CS0575`: a destructor declared somewhere other than a class. Only a class is finalized
+    /// (17.12); a struct has no finalizer slot.
+    DestructorNotInClass,
+    /// `CS0100`: a parameter list declares the same name twice. The parameters of a member share
+    /// one declaration space (10.3), so the second is not a new parameter.
+    DuplicateParameterName {
+        /// The repeated parameter name.
         name: Box<str>,
     },
     /// `CS0102`: the type already contains a definition for this member name.
@@ -351,6 +592,13 @@ pub enum DiagnosticKind {
         /// The minimum C# version, as rendered (e.g. "C# 3.0").
         required: Box<str>,
     },
+    /// `CS8703`: an interface member declares an access modifier. Every interface member is
+    /// implicitly public in C# 1.0 (13.2), so the modifier is not merely redundant -- it is a
+    /// later-version form, and csc gives it its own code because the repair is to delete it.
+    InterfaceMemberModifier {
+        /// The offending modifier, as the message names it.
+        modifier: Box<str>,
+    },
     /// `CS0513`: an `abstract` member is declared in a non-abstract type.
     AbstractMemberInNonAbstractType {
         /// The member's qualified signature (`C.M()`).
@@ -391,6 +639,20 @@ pub enum DiagnosticKind {
     },
     /// `CS0670`: a field is declared with `void` type.
     VoidField,
+    /// `CS1547`: a local variable is declared with `void` type -- `void` is not a
+    /// local-variable-type (15.5.1), so the keyword "cannot be used in this context".
+    VoidLocal,
+    /// `CS0151`: a `switch` governing expression is not an integral type, char, string, or enum
+    /// (15.7.2), and no user-defined implicit conversion reaches one.
+    SwitchGoverningType,
+    /// `CS0236`: a field initializer references an instance member (a non-static field, method, or
+    /// property) of the containing type through the implicit `this` (17.4.5) -- a field initializer
+    /// runs with no instance, so there is no `this` to read it from. A static member, an external
+    /// member, an instance member reached through an explicit object, and a literal are all fine.
+    FieldInitializerReference {
+        /// The referenced member, qualified by its declaring type (`C.first`, `C.M()`).
+        member: Box<str>,
+    },
     /// `CS0231`: a `params` parameter is not the last parameter in the list.
     ParamsNotLast,
     /// `CS0225`: a `params` parameter is not a single-dimensional array.
@@ -433,6 +695,39 @@ pub enum DiagnosticKind {
         /// The base member it cannot override (`B.M()`).
         base: Box<str>,
     },
+    /// `CS0216`: a user-defined operator that must be declared in a PAIR was declared alone.
+    /// `==`/`!=`, `<`/`>`, `<=`/`>=` and `true`/`false` each require their partner (17.9.2),
+    /// so a type cannot support one direction of a comparison without the other.
+    OperatorRequiresMatchingOperator {
+        /// The declared operator's signature (`C.operator ==(C, C)`).
+        operator: Box<str>,
+        /// The partner it requires, as a source symbol (`!=`).
+        partner: &'static str,
+    },
+    /// `CS0155`: a `catch` clause names, or a `throw` throws, a type that does not derive
+    /// from `System.Exception`. Reported only when the type can be PROVEN not to (15.9.5,
+    /// 15.10), so a type this compilation cannot resolve is left alone.
+    CaughtTypeMustBeException,
+    /// `CS0239`: an `override` whose base member is `sealed`. The base slot is overridable
+    /// in principle -- it IS a virtual/override -- but `sealed` closed it (17.5.5), so no
+    /// further derived class may take it.
+    CannotOverrideSealed {
+        /// The overriding method's qualified signature (`D.M()`).
+        method: Box<str>,
+        /// The sealed base member (`B.M()`).
+        base: Box<str>,
+    },
+    /// `CS0507`: an `override` that declares a different accessibility from the member it
+    /// overrides. An override takes the base member's accessibility exactly; it may neither
+    /// widen nor narrow it.
+    OverrideChangesAccess {
+        /// The overriding method's qualified signature (`D.M()`).
+        method: Box<str>,
+        /// The base member's accessibility keyword, as the message quotes it (`public`).
+        access: Box<str>,
+        /// The base member overridden (`B.M()`).
+        base: Box<str>,
+    },
     /// `CS0508`: an `override`'s return type differs from the base member it overrides (C# 1.0
     /// has no covariant return types).
     OverrideReturnTypeMismatch {
@@ -441,6 +736,18 @@ pub enum DiagnosticKind {
         /// The return type the override must have to match the base member.
         return_type: Box<str>,
         /// The base member overridden (`B.M()`).
+        base: Box<str>,
+    },
+    /// `CS1715`: an `override` property or indexer whose TYPE differs from the member it
+    /// overrides. The rule is the return-type rule of `CS0508` one member kind over, and csc
+    /// gives it its own code and wording because a property has a type rather than a return
+    /// type.
+    OverridePropertyTypeMismatch {
+        /// The overriding member's qualified name (`D.P`, `D.this[int]`).
+        property: Box<str>,
+        /// The type the override must have to match the base member.
+        ty: Box<str>,
+        /// The base member overridden (`B.P`).
         base: Box<str>,
     },
     /// `CS0534`: a non-abstract class does not implement an inherited abstract member.
@@ -616,7 +923,20 @@ impl DiagnosticKind {
             DiagnosticKind::TypeNotFound { .. } => 246,
             DiagnosticKind::NameNotFound { .. } => 103,
             DiagnosticKind::ConstantOutOfRange { .. } => 31,
+            DiagnosticKind::NonConstantEnumMember { .. } => 133,
             DiagnosticKind::ConstantOverflowInCheckedContext => 220,
+            DiagnosticKind::CheckedConstantConversionOverflow { .. } => 221,
+            DiagnosticKind::VolatileFieldType { .. } => 677,
+            DiagnosticKind::OperatorMustBeStaticAndPublic { .. } => 558,
+            DiagnosticKind::AbstractTypeSealedOrStatic { .. } => 418,
+            DiagnosticKind::StaticMemberCannotBeVirtual { .. } => 112,
+            DiagnosticKind::EnumUnderlyingTypeExpected => 1008,
+            DiagnosticKind::MultipleClassBases { .. } => 1721,
+            DiagnosticKind::EventTypeMustBeDelegate { .. } => 66,
+            DiagnosticKind::OverloadableBinaryOperatorExpected => 1020,
+            DiagnosticKind::ConditionalMethodMustReturnVoid { .. } => 578,
+            DiagnosticKind::DeriveFromSealed { .. } => 509,
+            DiagnosticKind::NamespaceElementBadAccessibility => 1527,
             DiagnosticKind::NoImplicitConversion { .. } => 29,
             DiagnosticKind::CannotConvertNullToValueType { .. } => 37,
             DiagnosticKind::TypeUsedAsValue { .. } => 119,
@@ -625,6 +945,7 @@ impl DiagnosticKind {
             DiagnosticKind::ConditionalTypeMismatch { .. } => 173,
             DiagnosticKind::NotAssignable => 131,
             DiagnosticKind::CannotAssignToMethodGroup { .. } => 1656,
+            DiagnosticKind::CannotAssignToReadonlyLocal { .. } => 1656,
             DiagnosticKind::MemberNotFound { .. } => 117,
             DiagnosticKind::NoOverloadForArgumentCount { .. } => 1501,
             DiagnosticKind::PredefinedTypeMissing { .. } => 518,
@@ -640,12 +961,41 @@ impl DiagnosticKind {
             DiagnosticKind::MethodGroupToNonDelegate { .. } => 428,
             DiagnosticKind::ConstantExpected => 150,
             DiagnosticKind::DuplicateCaseLabel { .. } => 152,
-            DiagnosticKind::SwitchFallThrough => 163,
+            DiagnosticKind::SwitchFallThrough { .. } => 163,
+            DiagnosticKind::SwitchFallOutFinal { .. } => 8070,
             DiagnosticKind::DuplicateLocal { .. } => 128,
             DiagnosticKind::LocalShadowsEnclosing { .. } => 136,
             DiagnosticKind::IllegalStatementExpression => 201,
             DiagnosticKind::DuplicateTypeInNamespace { .. } => 101,
             DiagnosticKind::DuplicateMember { .. } => 102,
+            DiagnosticKind::DuplicateParameterName { .. } => 100,
+            DiagnosticKind::InterfaceImplementationNotPublic { .. } => 737,
+            DiagnosticKind::InterfaceImplementationReturnType { .. } => 738,
+            DiagnosticKind::ConstructorInitializerCycle { .. } => 768,
+            DiagnosticKind::UsingRequiresDisposable { .. } => 1674,
+            DiagnosticKind::NotAnAttributeClass { .. } => 616,
+            DiagnosticKind::DuplicateAttribute { .. } => 579,
+            DiagnosticKind::NonConstantAttributeArgument => 182,
+            DiagnosticKind::UnsafeCodeRequiresOption => 227,
+            DiagnosticKind::NonConstantFieldInitializer { .. } => 133,
+            DiagnosticKind::OverloadableUnaryOperatorExpected => 1019,
+            DiagnosticKind::CatchAfterGeneralCatch => 1017,
+            DiagnosticKind::ConversionMustInvolveEnclosingType => 556,
+            DiagnosticKind::ForEachNotEnumerable { .. } => 1579,
+            DiagnosticKind::VoidParameter => 1536,
+            DiagnosticKind::ArrayInitializerLength { .. } => 847,
+            DiagnosticKind::GotoCaseOutsideSwitch => 153,
+            DiagnosticKind::RethrowOutsideCatch => 156,
+            DiagnosticKind::ControlLeavesFinally => 157,
+            DiagnosticKind::DuplicateUsingAlias { .. } => 1537,
+            DiagnosticKind::DivisionByConstantZero => 20,
+            DiagnosticKind::LockRequiresReferenceType { .. } => 185,
+            DiagnosticKind::CannotCreateAbstractInstance { .. } => 144,
+            DiagnosticKind::StaticConstructorAccessibility { .. } => 515,
+            DiagnosticKind::MethodMustHaveReturnType => 1520,
+            DiagnosticKind::BaseTypeNotInterface { .. } => 527,
+            DiagnosticKind::DestructorNameMismatch => 574,
+            DiagnosticKind::DestructorNotInClass => 575,
             DiagnosticKind::DuplicateMethod { .. } => 111,
             DiagnosticKind::DuplicateLabel { .. } => 140,
             DiagnosticKind::UndefinedLabel { .. } => 159,
@@ -653,6 +1003,7 @@ impl DiagnosticKind {
             DiagnosticKind::AbstractMethodWithBody { .. } => 500,
             DiagnosticKind::MethodMustHaveBody { .. } => 501,
             DiagnosticKind::FeatureRequiresLaterVersion { .. } => 8022,
+            DiagnosticKind::InterfaceMemberModifier { .. } => 8703,
             DiagnosticKind::AbstractMemberInNonAbstractType { .. } => 513,
             DiagnosticKind::VirtualOrAbstractMemberIsPrivate { .. } => 621,
             DiagnosticKind::ModifierNotValidForItem { .. } => 106,
@@ -661,6 +1012,9 @@ impl DiagnosticKind {
             DiagnosticKind::MemberNamedLikeType { .. } => 542,
             DiagnosticKind::StaticConstructorHasParameters { .. } => 132,
             DiagnosticKind::VoidField => 670,
+            DiagnosticKind::VoidLocal => 1547,
+            DiagnosticKind::SwitchGoverningType => 151,
+            DiagnosticKind::FieldInitializerReference { .. } => 236,
             DiagnosticKind::ParamsNotLast => 231,
             DiagnosticKind::ParamsNotArray => 225,
             DiagnosticKind::InconsistentAccessibility { position, .. } => position.code(),
@@ -670,7 +1024,12 @@ impl DiagnosticKind {
             DiagnosticKind::InterfaceMemberNotImplemented { .. } => 535,
             DiagnosticKind::NoMethodToOverride { .. } => 115,
             DiagnosticKind::CannotOverrideNonVirtual { .. } => 506,
+            DiagnosticKind::CaughtTypeMustBeException => 155,
+            DiagnosticKind::OperatorRequiresMatchingOperator { .. } => 216,
+            DiagnosticKind::CannotOverrideSealed { .. } => 239,
+            DiagnosticKind::OverrideChangesAccess { .. } => 507,
             DiagnosticKind::OverrideReturnTypeMismatch { .. } => 508,
+            DiagnosticKind::OverridePropertyTypeMismatch { .. } => 1715,
             DiagnosticKind::AbstractMemberNotImplemented { .. } => 534,
             DiagnosticKind::CircularBase { .. } => 146,
             DiagnosticKind::CircularConstant { .. } => 110,
@@ -732,9 +1091,60 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::ConstantOverflowInCheckedContext => {
                 write!(f, "The operation overflows at compile time in checked mode")
             }
+            DiagnosticKind::CheckedConstantConversionOverflow { value, to } => write!(
+                f,
+                "Constant value '{value}' cannot be converted to a '{to}' (use 'unchecked' syntax to override)"
+            ),
             DiagnosticKind::ConstantOutOfRange { value, to } => {
                 write!(f, "Constant value '{value}' cannot be converted to a '{to}'")
             }
+            DiagnosticKind::NonConstantEnumMember { member } => {
+                write!(f, "The expression being assigned to '{member}' must be constant")
+            }
+            DiagnosticKind::VolatileFieldType { field, ty } => {
+                write!(f, "'{field}': a volatile field cannot be of the type '{ty}'")
+            }
+            DiagnosticKind::OperatorMustBeStaticAndPublic { signature } => write!(
+                f,
+                "User-defined operator '{signature}' must be declared static and public"
+            ),
+            DiagnosticKind::AbstractTypeSealedOrStatic { type_name } => write!(
+                f,
+                "'{type_name}': an abstract type cannot be sealed or static"
+            ),
+            DiagnosticKind::StaticMemberCannotBeVirtual { modifier } => {
+                write!(f, "A static member cannot be marked as '{modifier}'")
+            }
+            DiagnosticKind::EnumUnderlyingTypeExpected => {
+                write!(f, "Type byte, sbyte, short, ushort, int, uint, long, or ulong expected")
+            }
+            DiagnosticKind::MultipleClassBases {
+                type_name,
+                first,
+                second,
+            } => write!(
+                f,
+                "Class '{type_name}' cannot have multiple base classes: '{first}' and '{second}'"
+            ),
+            DiagnosticKind::EventTypeMustBeDelegate { event } => {
+                write!(f, "'{event}': event must be of a delegate type")
+            }
+            DiagnosticKind::OverloadableBinaryOperatorExpected => {
+                write!(f, "Overloadable binary operator expected")
+            }
+            DiagnosticKind::ConditionalMethodMustReturnVoid { method } => {
+                write!(
+                    f,
+                    "The Conditional attribute is not valid on '{method}' because its return type is not void"
+                )
+            }
+            DiagnosticKind::DeriveFromSealed { derived, base } => {
+                write!(f, "'{derived}': cannot derive from sealed type '{base}'")
+            }
+            DiagnosticKind::NamespaceElementBadAccessibility => write!(
+                f,
+                "Elements defined in a namespace cannot be explicitly declared as private, protected, protected internal, or private protected"
+            ),
             DiagnosticKind::NoImplicitConversion { from, to } => {
                 write!(f, "Cannot implicitly convert type '{from}' to '{to}'")
             }
@@ -771,6 +1181,9 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "Cannot assign to '{name}' because it is a 'method group'"
             ),
+            DiagnosticKind::CannotAssignToReadonlyLocal { name, kind } => {
+                write!(f, "Cannot assign to '{name}' because it is a '{kind}'")
+            }
             DiagnosticKind::MemberNotFound { type_name, member } => write!(
                 f,
                 "'{type_name}' does not contain a definition for '{member}'"
@@ -827,12 +1240,14 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "The label '{label}:' already occurs in this switch statement"
             ),
-            DiagnosticKind::SwitchFallThrough => {
-                write!(
-                    f,
-                    "Control cannot fall through from one case label to another"
-                )
-            }
+            DiagnosticKind::SwitchFallThrough { label } => write!(
+                f,
+                "Control cannot fall through from one case label ('{label}') to another"
+            ),
+            DiagnosticKind::SwitchFallOutFinal { label } => write!(
+                f,
+                "Control cannot fall out of switch from final case label ('{label}')"
+            ),
             DiagnosticKind::DuplicateLocal { name } => write!(
                 f,
                 "A local variable named '{name}' is already defined in this scope"
@@ -856,6 +1271,113 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "The type '{type_name}' already contains a definition for '{member}'"
             ),
+            DiagnosticKind::DuplicateParameterName { name } => {
+                write!(f, "The parameter name '{name}' is a duplicate")
+            }
+            DiagnosticKind::InterfaceImplementationNotPublic {
+                type_name,
+                interface_member,
+                member,
+            } => write!(
+                f,
+                "'{type_name}' does not implement interface member '{interface_member}'. \
+                 '{member}' cannot implement an interface member because it is not public."
+            ),
+            DiagnosticKind::InterfaceImplementationReturnType {
+                type_name,
+                interface_member,
+                member,
+                return_type,
+            } => write!(
+                f,
+                "'{type_name}' does not implement interface member '{interface_member}'. \
+                 '{member}' cannot implement '{interface_member}' because it does not have the \
+                 matching return type of '{return_type}'."
+            ),
+            DiagnosticKind::ConstructorInitializerCycle { constructor } => write!(
+                f,
+                "Constructor '{constructor}' cannot call itself through another constructor"
+            ),
+            DiagnosticKind::UsingRequiresDisposable { ty } => write!(
+                f,
+                "'{ty}': type used in a using statement must implement 'System.IDisposable'."
+            ),
+            DiagnosticKind::NotAnAttributeClass { type_name } => {
+                write!(f, "'{type_name}' is not an attribute class")
+            }
+            DiagnosticKind::DuplicateAttribute { name } => {
+                write!(f, "Duplicate '{name}' attribute")
+            }
+            DiagnosticKind::NonConstantAttributeArgument => write!(
+                f,
+                "An attribute argument must be a constant expression, typeof expression or \
+                 array creation expression of an attribute parameter type"
+            ),
+            DiagnosticKind::UnsafeCodeRequiresOption => {
+                write!(f, "Unsafe code may only appear if compiling with /unsafe")
+            }
+            DiagnosticKind::NonConstantFieldInitializer { field } => {
+                write!(f, "The expression being assigned to '{field}' must be constant")
+            }
+            DiagnosticKind::OverloadableUnaryOperatorExpected => {
+                write!(f, "Overloadable unary operator expected")
+            }
+            DiagnosticKind::CatchAfterGeneralCatch => write!(
+                f,
+                "Catch clauses cannot follow the general catch clause of a try statement"
+            ),
+            DiagnosticKind::ConversionMustInvolveEnclosingType => write!(
+                f,
+                "User-defined conversion must convert to or from the enclosing type"
+            ),
+            DiagnosticKind::ForEachNotEnumerable { ty } => write!(
+                f,
+                "foreach statement cannot operate on variables of type '{ty}' because '{ty}' \
+                 does not contain a public instance or extension definition for 'GetEnumerator'"
+            ),
+            DiagnosticKind::VoidParameter => write!(f, "Invalid parameter type 'void'"),
+            DiagnosticKind::ArrayInitializerLength { length } => {
+                write!(f, "An array initializer of length '{length}' is expected")
+            }
+            DiagnosticKind::GotoCaseOutsideSwitch => {
+                write!(f, "A goto case is only valid inside a switch statement")
+            }
+            DiagnosticKind::RethrowOutsideCatch => write!(
+                f,
+                "A throw statement with no arguments is not allowed outside of a catch clause"
+            ),
+            DiagnosticKind::ControlLeavesFinally => {
+                write!(f, "Control cannot leave the body of a finally clause")
+            }
+            DiagnosticKind::DuplicateUsingAlias { alias } => write!(
+                f,
+                "The using alias '{alias}' appeared previously in this namespace"
+            ),
+            DiagnosticKind::DivisionByConstantZero => write!(f, "Division by constant zero"),
+            DiagnosticKind::LockRequiresReferenceType { ty } => write!(
+                f,
+                "'{ty}' is not a reference type as required by the lock statement"
+            ),
+            DiagnosticKind::CannotCreateAbstractInstance { type_name } => write!(
+                f,
+                "Cannot create an instance of the abstract type or interface '{type_name}'"
+            ),
+            DiagnosticKind::StaticConstructorAccessibility { member } => write!(
+                f,
+                "'{member}': access modifiers are not allowed on static constructors"
+            ),
+            DiagnosticKind::MethodMustHaveReturnType => {
+                write!(f, "Method must have a return type")
+            }
+            DiagnosticKind::BaseTypeNotInterface { base } => {
+                write!(f, "Type '{base}' in interface list is not an interface")
+            }
+            DiagnosticKind::DestructorNameMismatch => {
+                write!(f, "Name of destructor must match name of type")
+            }
+            DiagnosticKind::DestructorNotInClass => {
+                write!(f, "Only class types can contain destructors")
+            }
             DiagnosticKind::DuplicateMethod { type_name, member } => write!(
                 f,
                 "Type '{type_name}' already defines a member called '{member}' \
@@ -877,6 +1399,11 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::MethodMustHaveBody { method } => write!(
                 f,
                 "'{method}' must declare a body because it is not marked abstract, extern, or partial"
+            ),
+            DiagnosticKind::InterfaceMemberModifier { modifier } => write!(
+                f,
+                "The modifier '{modifier}' is not valid for this item in C# 1.0; \
+                 it requires C# 8.0 or greater"
             ),
             DiagnosticKind::FeatureRequiresLaterVersion { feature, required } => write!(
                 f,
@@ -909,6 +1436,17 @@ impl fmt::Display for DiagnosticKind {
                 "'{constructor}': a static constructor must be parameterless"
             ),
             DiagnosticKind::VoidField => write!(f, "Field cannot have void type"),
+            DiagnosticKind::VoidLocal => {
+                write!(f, "Keyword 'void' cannot be used in this context")
+            }
+            DiagnosticKind::SwitchGoverningType => write!(
+                f,
+                "A switch governing type must be sbyte, byte, short, ushort, int, uint, long, ulong, char, string, or an enum type"
+            ),
+            DiagnosticKind::FieldInitializerReference { member } => write!(
+                f,
+                "A field initializer cannot reference the non-static field, method, or property '{member}'"
+            ),
             DiagnosticKind::ParamsNotLast => write!(
                 f,
                 "A params parameter must be the last parameter in a parameter list"
@@ -948,6 +1486,27 @@ impl fmt::Display for DiagnosticKind {
                 "'{method}': cannot override inherited member '{base}' because it is not marked \
                  virtual, abstract, or override"
             ),
+            DiagnosticKind::OperatorRequiresMatchingOperator { operator, partner } => write!(
+                f,
+                "The operator '{operator}' requires a matching operator '{partner}' to also \
+                 be defined"
+            ),
+            DiagnosticKind::CaughtTypeMustBeException => {
+                write!(f, "The type caught or thrown must be derived from System.Exception")
+            }
+            DiagnosticKind::CannotOverrideSealed { method, base } => write!(
+                f,
+                "'{method}': cannot override inherited member '{base}' because it is sealed"
+            ),
+            DiagnosticKind::OverrideChangesAccess {
+                method,
+                access,
+                base,
+            } => write!(
+                f,
+                "'{method}': cannot change access modifiers when overriding '{access}' \
+                 inherited member '{base}'"
+            ),
             DiagnosticKind::OverrideReturnTypeMismatch {
                 method,
                 return_type,
@@ -956,6 +1515,10 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "'{method}': return type must be '{return_type}' to match overridden member \
                  '{base}'"
+            ),
+            DiagnosticKind::OverridePropertyTypeMismatch { property, ty, base } => write!(
+                f,
+                "'{property}': type must be '{ty}' to match overridden member '{base}'"
             ),
             DiagnosticKind::AbstractMemberNotImplemented { type_name, member } => write!(
                 f,
@@ -1132,6 +1695,15 @@ mod tests {
             132
         );
         assert_eq!(DiagnosticKind::VoidField.code(), 670);
+        assert_eq!(DiagnosticKind::VoidLocal.code(), 1547);
+        assert_eq!(DiagnosticKind::SwitchGoverningType.code(), 151);
+        assert_eq!(
+            DiagnosticKind::FieldInitializerReference {
+                member: "C.first".into()
+            }
+            .code(),
+            236
+        );
         assert_eq!(DiagnosticKind::ParamsNotLast.code(), 231);
         assert_eq!(DiagnosticKind::ParamsNotArray.code(), 225);
         assert_eq!(

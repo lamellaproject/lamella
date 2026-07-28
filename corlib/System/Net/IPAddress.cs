@@ -36,12 +36,19 @@ namespace System.Net
         {
             if ((object)ipString == null) throw new ArgumentNullException("ipString");
             IPAddress address;
-            if (!TryParse(ipString, out address))
+            if (!TryParseInternal(ipString, out address))
                 throw new FormatException("An invalid IP address was specified.");
             return address;
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string ipString, out IPAddress address)
+        {
+            return TryParseInternal(ipString, out address);
+        }
+#endif
+
+        internal static bool TryParseInternal(string ipString, out IPAddress address)
         {
             address = null;
             if ((object)ipString == null) return false;

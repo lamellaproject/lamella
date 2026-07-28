@@ -17,7 +17,9 @@ namespace System
             else WriteLine(value.ToString());
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public static void WriteLine(double value) { WriteLine(value.ToString()); }
+#endif
 
 #if LAMELLA_SURFACE_DECIMAL
         public static void WriteLine(decimal value) { WriteLine(value.ToString()); }
@@ -36,7 +38,9 @@ namespace System
             if ((object)value != null) Write(value.ToString());
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public static void Write(double value) { Write(value.ToString()); }
+#endif
 #if LAMELLA_SURFACE_DECIMAL
         public static void Write(decimal value) { Write(value.ToString()); }
 #endif

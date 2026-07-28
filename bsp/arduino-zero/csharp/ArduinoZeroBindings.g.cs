@@ -19,5 +19,15 @@ namespace Lamella.Generated
         public const uint VCP_TXPO = 1;
         public const uint VCP_RXPO = 3;
         public const uint VCP_BAUD_115200_OSC8M_8MHZ = 0xC505;
+
+        public const uint HEADER_I2C_SERCOM_BASE = 0x42001400;
+        public const uint HEADER_I2C_IRQ = 12;
+        public const uint HEADER_I2C_GCLK_CLKCTRL_VALUE = 0x4017;
+        public const uint HEADER_I2C_APBC_MASK = 0x20;
+        public const uint HEADER_I2C_PMUX_REG = 0x4100443B;
+        public const uint HEADER_I2C_PMUX_PAIR = 0x22;
+        public const uint HEADER_I2C_PINCFG_SDA_REG = 0x41004456;
+        public const uint HEADER_I2C_PINCFG_SCL_REG = 0x41004457;
+        public const uint HEADER_I2C_CORE_CLOCK_HZ = 8000000;
     }
 }

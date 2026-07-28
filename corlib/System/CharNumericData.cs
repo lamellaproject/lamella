@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.CharNumericData (internal)
+#if LAMELLA_SURFACE_FLOAT
 namespace System
 {
     internal sealed class CharNumericData
@@ -184,3 +185,4 @@ namespace System
         }
     }
 }
+#endif

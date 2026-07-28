@@ -136,6 +136,13 @@ pub fn method_is_newslot(flags: u32) -> bool {
     flags & method_attr::NEWSLOT != 0
 }
 
+/// Whether a method is `final`: it closes its vtable slot, so no derived class may
+/// override it. On a virtual that also reuses a base slot this is C#'s `sealed override`.
+#[must_use]
+pub fn method_is_final(flags: u32) -> bool {
+    flags & method_attr::FINAL != 0
+}
+
 /// The code-type a method's implementation flags select (II.23.1.11): one of
 /// [`method_impl::IL`], [`method_impl::NATIVE`], or [`method_impl::RUNTIME`].
 #[must_use]

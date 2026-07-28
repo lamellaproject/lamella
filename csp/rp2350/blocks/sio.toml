@@ -1,0 +1,46 @@
+# BLOCK layout: the RP2350 single-cycle IO block's bank-0 GPIO registers -- the CPU's
+# direct pin drive, per the RP2350 datasheet SIO map. Offsets are
+# instance-base-relative (the `sio` instance row at 0xd0000000).
+#
+# The RP2350 SIO interleaves the GP0..31 and GP32..47 banks, so these offsets differ from the
+# RP2040's; the bank-0 (GP0..31) registers below are the evidenced set (the HI-bank
+# rows join with a board that binds a GP32+ pin).
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "sio"
+sources = ["RP2350 datasheet ch 3.1 (SIO GPIO registers, bank 0)"]
+notes = [
+    "OUT/OE have dedicated SET/CLR/XOR views -- atomic bit operations, no read-modify-write.",
+    "A pin reaches the SIO only through IO_BANK0 funcsel 5 with its pad de-isolated (ISO clear) -- the cross-block routing is driver code.",
+]
+
+[registers.GPIO_IN]
+offset = 0x4
+width = 32
+
+[registers.GPIO_OUT_SET]
+offset = 0x18
+width = 32
+
+[registers.GPIO_OUT_CLR]
+offset = 0x20
+width = 32
+
+[registers.GPIO_OUT_XOR]
+offset = 0x28
+width = 32
+notes = "The atomic hardware toggle."
+
+[registers.GPIO_OE]
+offset = 0x30
+width = 32
+
+[registers.GPIO_OE_SET]
+offset = 0x38
+width = 32
+
+[registers.GPIO_OE_CLR]
+offset = 0x40
+width = 32

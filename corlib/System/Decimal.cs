@@ -74,10 +74,12 @@ namespace System
             this.flags = 0;
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public Decimal(double value)
         {
             this = FromDouble(value);
         }
+#endif
 
         private int Scale { get { return (flags >> 16) & 0xFF; } }
 
@@ -98,9 +100,11 @@ namespace System
 
         [Lamella.Runtime.RuntimeProvided] public static int Compare(Decimal d1, Decimal d2) { return 0; }
 
+#if LAMELLA_SURFACE_FLOAT
         [Lamella.Runtime.RuntimeProvided] private static Decimal FromDouble(double value) { return new Decimal(); }
 
         [Lamella.Runtime.RuntimeProvided] private static double ToDouble(Decimal value) { return 0.0; }
+#endif
 
         public static Decimal Add(Decimal d1, Decimal d2) { return d1 + d2; }
         public static Decimal Subtract(Decimal d1, Decimal d2) { return d1 - d2; }
@@ -161,9 +165,11 @@ namespace System
         public static implicit operator Decimal(byte value) { return new Decimal((int)value); }
         public static implicit operator Decimal(short value) { return new Decimal((int)value); }
 
+#if LAMELLA_SURFACE_FLOAT
         public static explicit operator Decimal(double value) { return new Decimal(value); }
 
         public static explicit operator double(Decimal value) { return ToDouble(value); }
+#endif
 
         private static long ToInt64(Decimal value)
         {
@@ -283,10 +289,12 @@ namespace System
             throw new FormatException("Input string was not in a correct format.");
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string s, out Decimal result)
         {
             return TryParseCore(s, out result) == 1;
         }
+#endif
 
         private static int TryParseCore(string s, out Decimal result)
         {

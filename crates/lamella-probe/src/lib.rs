@@ -337,8 +337,8 @@ fn looks_like_probe_hid(d: &lamella_usbhid::DeviceInfo) -> bool {
 /// genuine DAP interface of a composite probe wins before any sibling interface is poked.
 ///
 /// The decisive signal is the CANONICAL CMSIS-DAP v1 HID usage -- vendor-defined usage page `0xFF00`,
-/// usage `0x01` (measured on the bench: the MCU-Link Pro puts its DAP interface there, while its
-/// LPCSIO bridge and trace interfaces sit on `0xFFEA`/`0xFFEB`). Report length is NOT a reliable
+/// usage `0x01`: the MCU-Link Pro puts its DAP interface there, while its LPCSIO bridge and
+/// trace interfaces sit on `0xFFEA`/`0xFFEB`. Report length is NOT a reliable
 /// signal (that DAP interface uses 1024-byte reports, its LPCSIO uses 64).
 fn selection_rank(p: &ProbeInfo) -> u8 {
     let Wire::CmsisDapV1Hid = p.wire else {

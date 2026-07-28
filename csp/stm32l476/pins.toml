@@ -1,0 +1,22 @@
+# PIN map: pin x function -> (instance, signal) for the STM32L476.
+# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers
+# (AF0..AF15) the AFRL/AFRH nibbles select.
+
+[table]
+kind = "pins"
+family = "stm32l476"
+sources = ["STM32L476 datasheet DS10198 alternate-function table"]
+
+[[pins]]
+pin = "PA2"
+function = "AF7"
+instance = "usart2"
+signal = "tx"
+source = "DS10198 AF table: PA2 AF7 = USART2_TX"
+
+[[pins]]
+pin = "PA3"
+function = "AF7"
+instance = "usart2"
+signal = "rx"
+source = "DS10198 AF table: PA3 AF7 = USART2_RX"

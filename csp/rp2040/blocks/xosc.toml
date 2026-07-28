@@ -1,13 +1,13 @@
-# BLOCK layout: the RP2040 crystal oscillator. Transcribed from
-# the retired v0 uart-rp2040.toml (silicon-verified: the proven UART path starts this block on
-# every run; idempotent when the crystal is already running -- a USB-serving firmware requires
-# it). The crystal FREQUENCY is a BOARD fact (the Pico solders 12 MHz): plans state `xosc_hz`.
+# BLOCK layout: the RP2040 crystal oscillator.
+# Enabling this block is idempotent -- safe to re-run when the crystal is already running
+# (e.g. under a resident USB firmware). The crystal FREQUENCY is a BOARD fact (a board
+# solders the crystal, commonly 12 MHz): plans state `xosc_hz`.
 
 [table]
 kind = "block"
 family = "rp2040"
 block = "xosc"
-sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 2.16 (XOSC) via the silicon-proven rp2040-serve UART path"]
+sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 2.16 (XOSC)"]
 
 [registers.CTRL]
 offset = 0x0

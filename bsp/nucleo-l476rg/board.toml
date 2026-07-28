@@ -1,0 +1,34 @@
+# BOARD binding: the ST NUCLEO-L476RG. Board truth ONLY: role
+# bindings, the carrier, and the clock plan. Chip truth lives in csp/stm32l476/.
+
+[table]
+kind = "board"
+board = "nucleo-l476rg"
+family = "stm32l476"
+part = "stm32l476rg"
+board_model = 8             # lamella_wire::board_model::STM32L476
+sources = ["Nucleo-64 user manual UM1724 (ST-LINK VCP = USART2 on PA2/PA3; LD2 = PA5)"]
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge (a vendor carrier kind);
+role = "vcp"                # its fixed USB identity joins evidence-cited when the host
+baud = 115200               # tooling pins the ids when it lands them.
+plan = "msi-4mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart2"
+function = "AF7"
+tx = { pin = "PA2" }
+rx = { pin = "PA3" }
+
+[[plans]]
+name = "msi-4mhz"
+default = true
+source = "msi"
+msi_hz = 4000000            # the L4 reset clock (MSI at 4 MHz, all prescalers 1)
+pclk1_hz = 4000000          # PCLK1 == MSI under reset prescalers -- the generator verifies
+                            # this equality (state-and-verify). Firmware that raises MSI
+                            # for margin states that operating point as its own plan.

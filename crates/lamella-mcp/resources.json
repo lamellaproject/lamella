@@ -1,11 +1,25 @@
 {
   "resources": [
     {
+      "uri": "lamella://bcl",
+      "name": "C# surface",
+      "description": "The C# surface Lamella supports: types, BCL, GPIO.",
+      "mimeType": "text/markdown",
+      "text": "# Lamella C# surface — what you can write today\n\nLamella runs a subset of C# on a small embedded interpreter. A program is a full C# program with a `Main`.\nUse `lamella_check` to compile-check without running, and `lamella_run` to run on the host interpreter.\n\n## Supported today\n- **Types**: `int`, `long`, `uint`, `byte`, `bool`, `char`, `string`, `double`/`float`, arrays (`int[]`, `T[]`),\n  user `class` / `struct`, `enum`.\n- **Control flow**: `if`/`else`, `for`, `while`, `do`, `foreach` (over arrays), `switch`, methods, recursion.\n- **Console**: `System.Console.Write` / `WriteLine` (strings + numerics). `ReadLine` is host-REPL only.\n- **Math**: `System.Math` (`Abs`, `Min`, `Max`, `Sqrt`, `Pow`, `Floor`, …).\n- **String**: concatenation (`+`), `.Length`, indexing, `.Substring`, `.ToString()`, `$\"...\"` interpolation.\n- **Operators**: arithmetic, comparison, logical, bitwise, shifts.\n\n## NOT available yet — these are compile errors\n- `List<T>`, `Dictionary<,>`, LINQ, `StringBuilder`, most of `System.Collections` / `System.Linq`.\n- `async` / `await`, `Task`, threads (host-side only).\n- File / network I/O.\n\nThe corlib surface is growing — when in doubt, write it and run `lamella_check`; the diagnostics tell you what\nis missing. Prefer plain loops + arrays over collections.\n\n## Hardware (GPIO) — for `deploy` / `run_on_device`\nUse the Microsoft **`System.Device.Gpio`** API (namespace `System.Device.Gpio`, NOT `System.Devices`):\n\n```csharp\nusing System.Device.Gpio;\nvar gpio = new GpioController();\ngpio.OpenPin(25, PinMode.Output);\ngpio.Write(25, PinValue.High);\n```\n\nPin numbers are board-specific — see the `lamella://boards` resource. A full blink is in\n`lamella://samples/blink`.\n\n## Workflow\n1. `lamella_check` → fix errors fast (no run).\n2. `lamella_run` → run on the host interpreter (no board).\n3. `lamella_list_devices` → see attached boards; `lamella_identify_device` → confirm which one.\n4. `lamella_run_on_device` (transient) or `lamella_deploy` (persistent) → run on real silicon.\n5. `lamella_debug_launch` + breakpoints/step/stack → source-level debug on the board.\n"
+    },
+    {
       "uri": "lamella://boards",
       "name": "Supported boards",
-      "description": "The dev-board registry: board_model wire values + curated boards.",
+      "description": "The dev-board registry: every board_model wire value and its board name.",
       "mimeType": "text/markdown",
-      "text": "# Supported dev boards\n\nThe `board_model` wire values a board reports over Lamella Link:\n\n| model | board |\n|--:|---|\n| 0 | custom board |\n| 1 | BBC micro:bit v1 |\n| 2 | Raspberry Pi Pico 2 |\n| 3 | SAM4S Xplained Pro |\n| 4 | SAME54 Xplained Pro |\n| 5 | SAMD21 Xplained Pro |\n| 6 | ATSAMW25 Xplained Pro |\n| 7 | STM32F091 Nucleo-64 |\n| 8 | STM32L476 Nucleo |\n| 9 | Arduino MKR1000 |\n| 10 | Raspberry Pi Pico 2 W |\n| 11 | BBC micro:bit v2 |\n| 12 | Arduino Zero |\n| 13 | Raspberry Pi Pico |\n| 14 | Espressif ESP32-C6 |13, USB `1209:0001`\n- **Espressif ESP32-C6** (`esp32c6`, null) — board_model 14\n\nRun `lamella_identify_device` on a connected board to read its `board_model` + chip IDCODE live.\n"
+      "text": ""
+    },
+    {
+      "uri": "lamella://chips",
+      "name": "Supported chips",
+      "description": "The silicon registry: chip families by SW-DP IDCODE, cores, RAM/flash.",
+      "mimeType": "text/markdown",
+      "text": "# Supported silicon (by SW-DP IDCODE)\n\n- **Raspberry Pi RP2350** (`rp2350`) — core dual Cortex-M33 / Hazard3 RISC-V, IDCODE 0x4c013477, 520 KB RAM, flash {\"kind\":\"external-qspi\"} — Flash is EXTERNAL QSPI; package/GPIO is not a register -- from the board, not the silicon.\n- **Nordic Semiconductor nRF51** (`nrf51`) — core Cortex-M0, IDCODE 0x0bb11477, flash {\"pageSizeReg\":268435472,\"pageCountReg\":268435476,\"decode\":\"pageSize*pageCount\"}\n- **Microchip SAM D21** (`samd21`) — core Cortex-M0+, IDCODE 0x0bc11477 — The ATSAMW25 = SAMD21G18 (48-pin) + ATWINC1500 Wi-Fi; the specific SKU is in the DSU DID DEVSEL field.\n- **Nordic Semiconductor nRF52833** (`nrf52833`) — core Cortex-M4F, IDCODE 0x2ba01477, 128 KB RAM, flash {\"pageSizeReg\":268435472,\"pageCountReg\":268435476,\"decode\":\"pageSize*pageCount\"} — BBC micro:bit v2 / v2.1. Cortex-M4F -> shares the 0x2ba01477 DPIDR with STM32 M3/M4 -> ID by the FICR device-id. [idcode runtime-verified; FICR regs + flash size bench-verify.]\n- **STMicroelectronics STM32F0 (F091)** (`stm32f0`) — core Cortex-M0, IDCODE 0x0bb11477, flash {\"sizeReg\":536868812,\"unit\":\"KB\",\"note\":\"STM32F0 flash-size register (u16, KB)\"} — STM32F091 Nucleo-64 = STM32F091RCT6 (256 KB flash, 32 KB SRAM). Shares the Cortex-M0 DPIDR with the nRF51 -> identify by the DBGMCU device-id.\n- **Raspberry Pi RP2040** (`rp2040`) — core dual Cortex-M0+, IDCODE 0x0bc12477, 264 KB RAM, flash {\"kind\":\"external-qspi\"} — Raspberry Pi Pico / Pico H (board_model 13). External QSPI + a stage-2 boot2 at offset 0 (unlike the RP2350, which scans a PICOBIN block). Browser flasher: UF2 blocks MUST be full 256-byte pages -- a short final block leaves the board stuck in BOOTSEL (runtime-sam4s).\n\nSome families share a DPIDR; `identify_device` disambiguates by reading the chip's device-id register.\n"
     },
     {
       "uri": "lamella://samples/hello",
@@ -13,6 +27,13 @@
       "description": "A minimal host-runnable C# program (Console + a loop).",
       "mimeType": "text/x-csharp",
       "text": "class Program {\n    static void Main() {\n        int total = 0;\n        for (int i = 1; i <= 100; i++) total += i;\n        System.Console.WriteLine(\"sum 1..100 = \" + total);\n    }\n}\n"
+    },
+    {
+      "uri": "lamella://samples/blink",
+      "name": "GPIO blink sample",
+      "description": "A System.Device.Gpio blink to deploy / run on a board.",
+      "mimeType": "text/x-csharp",
+      "text": "using System.Device.Gpio;\n\nclass Blink {\n    static void Main() {\n        var gpio = new GpioController();\n        int pin = 25; // Pico 2 onboard LED -- see lamella://boards for your board's pin\n        gpio.OpenPin(pin, PinMode.Output);\n        while (true) {\n            gpio.Write(pin, PinValue.High);\n            for (int i = 0; i < 1000000; i++) { }\n            gpio.Write(pin, PinValue.Low);\n            for (int i = 0; i < 1000000; i++) { }\n        }\n    }\n}\n"
     }
   ]
 }

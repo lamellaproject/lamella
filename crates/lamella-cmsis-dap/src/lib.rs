@@ -221,10 +221,21 @@ impl<T: Transport> Dap<T> {
     }
 
     /// Connects to the target over SWD: select the port, set the clock, then send the
-    /// line-reset and JTAG-to-SWD switch sequence (ADIv5).
+    /// line-reset and JTAG-to-SWD switch sequence (ADIv5). Clocks at 1 MHz; see
+    /// [`connect_swd_at`](Self::connect_swd_at) to choose the rate.
     pub fn connect_swd(&mut self) -> Result<(), DapError> {
+        self.connect_swd_at(1_000_000)
+    }
+
+    /// [`connect_swd`](Self::connect_swd) at a chosen SWCLK frequency.
+    ///
+    /// Worth reaching for on a hand-wired link. Jumper leads with no ground return per signal are
+    /// poor transmission lines, and a target that will not acknowledge at MHz rates often answers
+    /// perfectly at a few hundred kHz -- a failure that looks exactly like bad wiring while the
+    /// wiring is fine.
+    pub fn connect_swd_at(&mut self, clock_hz: u32) -> Result<(), DapError> {
         self.command(&proto::connect(Port::Swd))?;
-        self.command(&proto::swj_clock(1_000_000))?;
+        self.command(&proto::swj_clock(clock_hz))?;
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
         self.command(&proto::swj_sequence(16, &[0x9e, 0xe7]))?;
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
@@ -527,8 +538,19 @@ impl<T: Transport> Dap<T> {
     /// attach; releasing it lets the core run again (or, with halting debug already armed, boot
     /// straight into a halt). Waits up to 100 ms for the line to settle.
     pub fn set_reset(&mut self, assert: bool) -> Result<u8, DapError> {
-        let output = if assert { 0 } else { proto::PIN_NRESET };
-        let reply = self.command(&proto::swj_pins(output, proto::PIN_NRESET, 100_000))?;
+        self.swj_pins(if assert { 0 } else { proto::PIN_NRESET }, proto::PIN_NRESET, 100_000)
+    }
+
+    /// Drives the SWJ pins named in `select` to the levels in `output`, waits up to `wait_us` for
+    /// them to settle, and returns the read-back of ALL pins (`DAP_SWJ_Pins`).
+    /// [`set_reset`](Self::set_reset) is this restricted to nRESET.
+    ///
+    /// The general form matters for diagnostics. Reading pins alone cannot tell a connected line
+    /// from a disconnected one, nor establish that the probe's level shifters are enabled -- for
+    /// that you must DRIVE a line and observe that it moved. Driving SWDIO low against a target's
+    /// pull-up is the test: it succeeds only if the probe is really driving.
+    pub fn swj_pins(&mut self, output: u8, select: u8, wait_us: u32) -> Result<u8, DapError> {
+        let reply = self.command(&proto::swj_pins(output, select, wait_us))?;
         Ok(reply.get(1).copied().unwrap_or(0))
     }
 
@@ -624,6 +646,114 @@ impl<T: Transport> Dap<T> {
             Ack::Ok => Ok(()),
             other => Err(DapError::Ack(other)),
         }
+    }
+}
+
+impl From<Ack> for lamella_probe_core::Ack {
+    fn from(ack: Ack) -> Self {
+        match ack {
+            Ack::Ok => lamella_probe_core::Ack::Ok,
+            Ack::Wait => lamella_probe_core::Ack::Wait,
+            Ack::Fault => lamella_probe_core::Ack::Fault,
+            Ack::NoAck => lamella_probe_core::Ack::NoAck,
+            Ack::Unknown(value) => lamella_probe_core::Ack::Unknown(value),
+        }
+    }
+}
+
+impl From<proto::ProtoError> for lamella_probe_core::ProbeError {
+    fn from(error: proto::ProtoError) -> Self {
+        lamella_probe_core::ProbeError::Protocol(format!("{error:?}"))
+    }
+}
+
+impl From<DapError> for lamella_probe_core::ProbeError {
+    fn from(error: DapError) -> Self {
+        use lamella_probe_core::ProbeError as P;
+        match error {
+            DapError::Transport(e) => P::Transport(e.to_string()),
+            DapError::Proto(e) => P::Protocol(format!("{e:?}")),
+            DapError::Unexpected { expected, got } => {
+                P::Protocol(format!("probe echoed command {got:#04x}, expected {expected:#04x}"))
+            }
+            DapError::Ack(ack) => P::Ack(ack.into()),
+            DapError::Timeout(what) => P::Timeout(what),
+            DapError::Device(what) => P::Device(what),
+        }
+    }
+}
+
+/// The CMSIS-DAP probe as a raw ADIv5 DP/AP accessor -- the low-level seam.
+///
+/// Everything above this (MEM-AP memory access, Cortex-M run control) lives ONCE in
+/// [`lamella_probe_core::ArmDap`] and is shared with every other low-level probe family, so an
+/// FTDI-MPSSE JTAG probe gets it for free by implementing this trait alone.
+impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
+    fn connect(&mut self) -> Result<(), lamella_probe_core::ProbeError> {
+        Ok(self.connect_swd()?)
+    }
+
+    fn read_dp(&mut self, address: u8) -> Result<u32, lamella_probe_core::ProbeError> {
+        Ok(Dap::read_dp(self, address)?)
+    }
+
+    fn write_dp(&mut self, address: u8, value: u32) -> Result<(), lamella_probe_core::ProbeError> {
+        Ok(Dap::write_dp(self, address, value)?)
+    }
+
+    fn read_ap(&mut self, address: u8) -> Result<u32, lamella_probe_core::ProbeError> {
+        Ok(Dap::read_ap(self, address)?)
+    }
+
+    fn write_ap(&mut self, address: u8, value: u32) -> Result<(), lamella_probe_core::ProbeError> {
+        Ok(Dap::write_ap(self, address, value)?)
+    }
+
+    fn set_reset(&mut self, assert: bool) -> Result<u8, lamella_probe_core::ProbeError> {
+        Ok(Dap::set_reset(self, assert)?)
+    }
+
+    /// Streams the values with `DAP_TransferBlock`, chunked to the probe's packet. The MEM-AP's
+    /// 1 KB `TAR` auto-increment window is NOT handled here -- that is the caller's (MEM-AP) concern;
+    /// this is purely "write these values to one AP register in as few round-trips as possible".
+    fn write_ap_block(
+        &mut self,
+        address: u8,
+        values: &[u32],
+    ) -> Result<(), lamella_probe_core::ProbeError> {
+        /// 64-byte packet: 5 header bytes + 14 x 4-byte values.
+        const WORDS_PER_PACKET: usize = 14;
+        for chunk in values.chunks(WORDS_PER_PACKET) {
+            let reply = self.command(&proto::transfer_block_write(proto::ap_write(address), chunk))?;
+            let (done, ack) = proto::parse_block_write(reply)?;
+            if ack != Ack::Ok || done as usize != chunk.len() {
+                return Err(lamella_probe_core::ProbeError::Ack(ack.into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The read counterpart of [`write_ap_block`](Self::write_ap_block).
+    fn read_ap_block(
+        &mut self,
+        address: u8,
+        count: usize,
+    ) -> Result<Vec<u32>, lamella_probe_core::ProbeError> {
+        /// 64-byte reply packet: 4 header bytes + 14 x 4-byte values.
+        const WORDS_PER_PACKET: usize = 14;
+        let mut out = Vec::with_capacity(count);
+        let mut remaining = count;
+        while remaining > 0 {
+            let batch = remaining.min(WORDS_PER_PACKET);
+            let reply =
+                self.command(&proto::transfer_block_read(proto::ap_read(address), batch as u16))?;
+            let (done, ack) = proto::parse_block_read(reply, &mut out)?;
+            if ack != Ack::Ok || done as usize != batch {
+                return Err(lamella_probe_core::ProbeError::Ack(ack.into()));
+            }
+            remaining -= batch;
+        }
+        Ok(out)
     }
 }
 

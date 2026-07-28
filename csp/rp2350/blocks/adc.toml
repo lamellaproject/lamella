@@ -1,0 +1,176 @@
+# BLOCK layout: the RP2350 on-chip SAR ADC (12-bit, one converter, channel-muxed) plus the
+# internal TEMPERATURE SENSOR on the last channel. Offsets are instance-base-relative.
+#
+# THE CLOCKING DELTA from this chip's other blocks: the ADC runs on its OWN clock, clk_adc --
+# not clk_sys (i2c) and not clk_peri (uart/spi). The datasheet requires 48 MHz; the fact rides
+# [facts] below and the board plan's clk_adc_hz must agree (state-and-verify at generation).
+#
+# The family's first [facts]/[[channels]]/[calibration.*] strata: chip/electrical facts as
+# data, so every language skin derives conversions instead of hardcoding. reference_uv is
+# deliberately absent here -- it is BOARD truth (the filtered 3V3
+# rail), so it lives in each board's adc binding and emits per-board (the board-truth correction).
+#
+# Cross-block bring-up (clk_adc generator, RESETS release) and the external-channel pad prep
+# (pads/io -- OD high, IE low, pulls off, funcsel NULL per the official adc_gpio_init) are
+# DRIVER code; the one-shot read_once sequence below is block-local.
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "adc"
+sources = [
+    "RP2350 datasheet ch 12.4 (ADC and Temperature Sensor): register tables 1120-1129, channel maps tables 1118-1119, ENOB table 1438, temp formula + caveats 12.4.6",
+    "raspberrypi/pico-sdk src/rp2_common/hardware_adc adc.h + adc.c (one-shot select/start/ready protocol, adc_gpio_init pad prep, init = reset + EN + READY wait)",
+]
+notes = [
+    "12-bit SAR, one converter muxed over 5 channels on QFN-60/RP2350A or 9 on QFN-80/RP2350B. Precision AS THE DATASHEET STATES IT: ENOB min 9 / typical 9.5 bits (electrical table 1438; the chapter intro quotes 9.2), so the low bits carry noise -- average or accept it.",
+    "One conversion = 96 clk_adc cycles (2 us at 48 MHz; 500 kS/s max). Switching AINSEL needs no settling time.",
+    "One-shot protocol (the official driver's): select AINSEL, set START_ONCE, poll READY high, read RESULT[11:0]. READY is low only while a conversion runs.",
+    "CONVERSION ERRORS: CS.ERR flags the most recent conversion; the datasheet CAUTION says error samples are undefined and must be DISCARDED -- the read sequence re-runs on ERR. ERR_STICKY (write-1-clear) latches any past error.",
+    "Input range 0..ADC_AVDD, but pin voltage is capped by IOVDD (leakage through ESD diodes above it). Input impedance >= 100 kohm (about 1 pF sampling cap); DC sources need no buffer.",
+    "External channels share pins with Bank-0 GPIOs: before sampling, disable the pin's digital functions -- IE low, OD high (datasheet 12.4) -- and the official adc_gpio_init additionally selects funcsel NULL and disables both pulls. The temperature channel needs NO pad prep (internal).",
+    "The temperature sensor's bias is NOT covered by CS.EN: CS.TS_EN powers it separately (+~40 uA on ADC_AVDD).",
+    "FIFO/DMA/free-running (FCS, FIFO, DIV, INT*) are documented as facts for future sequences; read_once below is the one-shot polled protocol (tier-stable), FIFO left disabled (reset state).",
+    "Free-running pacing when used: DIV total period = 1 + INT + FRAC/256 clk_adc cycles per conversion trigger; ignored while a conversion is in progress, so INT >= 96 in practice.",
+]
+
+[registers.CS]
+offset = 0x0
+width = 32
+fields = { EN = [0, 1], TS_EN = [1, 1], START_ONCE = [2, 1], START_MANY = [3, 1], READY = [8, 1], ERR = [9, 1], ERR_STICKY = [10, 1], AINSEL = [12, 4], RROBIN = [16, 9] }
+notes = "EN powers the converter and starts its short internal power-up; READY (RO) goes high when usable and is LOW while a conversion runs. START_ONCE is self-clearing. ERR (RO) = the most recent conversion errored (discard!); ERR_STICKY is write-1-clear. AINSEL is package-corrected (only bonded channels selectable). RROBIN = one bit per channel for free-running rotation (0 = off)."
+
+[registers.RESULT]
+offset = 0x4
+width = 32
+fields = { RESULT = [0, 12] }
+notes = "The most recent conversion, right-justified 12-bit, read-only."
+
+[registers.FCS]
+offset = 0x8
+width = 32
+fields = { EN = [0, 1], SHIFT = [1, 1], ERR = [2, 1], DREQ_EN = [3, 1], EMPTY = [8, 1], FULL = [9, 1], UNDER = [10, 1], OVER = [11, 1], LEVEL = [16, 4], THRESH = [24, 4] }
+notes = "Sample FIFO control: EN writes each result to the FIFO, SHIFT pre-shifts to 8 bits for byte DMA, ERR tags each entry with its conversion-error bit, DREQ_EN raises DMA requests, THRESH sets the DREQ/IRQ level. UNDER/OVER are write-1-clear. Disabled at reset; the one-shot sequence leaves it so."
+
+[registers.FIFO]
+offset = 0xC
+width = 32
+fields = { VAL = [0, 12], ERR = [15, 1] }
+notes = "Reading pops. Bit 15 mirrors the sample's conversion-error flag when FCS.ERR is set (stays at bit 15 even when SHIFTed)."
+
+[registers.DIV]
+offset = 0x10
+width = 32
+fields = { FRAC = [0, 8], INT = [8, 16] }
+notes = "Free-running pacing: trigger period = 1 + INT + FRAC/256 clk_adc cycles (first-order delta-sigma fractional). Writing either field resets the divider. Unused by one-shot."
+
+[registers.INTR]
+offset = 0x14
+width = 32
+fields = { FIFO = [0, 1] }
+notes = "Raw interrupt: FIFO level >= FCS.THRESH. INTE/INTF/INTS complete the standard block."
+
+[registers.INTE]
+offset = 0x18
+width = 32
+fields = { FIFO = [0, 1] }
+
+[registers.INTF]
+offset = 0x1C
+width = 32
+fields = { FIFO = [0, 1] }
+
+[registers.INTS]
+offset = 0x20
+width = 32
+fields = { FIFO = [0, 1] }
+
+# --- Facts as data: every language skin derives from here (chip/electrical truth only --
+#     the board's reference rail lives in each board.toml adc binding) ---
+
+[facts]
+resolution_bits = 12
+min_value = 0
+max_value = 4095
+enob_min = 9
+enob_typical = 9.5
+conversion_clk_adc_cycles = 96
+clk_adc_hz = 48000000
+
+[facts.notes]
+enob = "Stated per the config-envelope discipline: electrical table 1438 gives ENOB min 9 / typical 9.5 bits (the ch 12.4 intro quotes 9.2); the bottom ~2.5 bits of any single sample are noise-grade."
+clk_adc_hz = "The datasheet-REQUIRED conversion clock ('could come from the USB PLL'); the board plan states what its operating point delivers and generation verifies agreement."
+
+# Channel map, QFN-60 / RP2350A (datasheet table 1118). QFN-80 /
+# RP2350B (table 1119): channels 0-7 = GPIO40-47, channel 8 = the temperature sensor.
+
+[[channels]]
+index = 0
+source = "GPIO26"
+
+[[channels]]
+index = 1
+source = "GPIO27"
+
+[[channels]]
+index = 2
+source = "GPIO28"
+
+[[channels]]
+index = 3
+source = "GPIO29"
+
+[[channels]]
+index = 4
+source = "temperature_sensor"
+enable = "CS.TS_EN (bit 1): the sensor's bias source, +~40 uA on ADC_AVDD, deliberately separate from CS.EN"
+
+# The temperature conversion as a DECLARATIVE calibration record (form + integer coefficients;
+# never an expression language). Datasheet 12.4.6, the formula as printed there:
+# T = 27 - (ADC_voltage - 0.706) / 0.001721
+# Integer form both skins use: T_mC = t0_millicelsius + (v_uV - vbe_at_t0_microvolts) * 1000 / slope_microvolts_per_celsius
+# (slope is NEGATIVE, so rising voltage = falling temperature; truncating integer division, the family's pinned rounding.)
+
+[calibration.temperature_sensor]
+channel = 4
+form = "vbe-linear"
+t0_millicelsius = 27000
+vbe_at_t0_microvolts = 706000
+slope_microvolts_per_celsius = -1721
+notes = "TYPICAL values: Vbe and its slope vary over the temperature range AND from device to device -- the datasheet says user calibration may be required for accurate measurements. Reference-voltage error dominates: at 3.3 V a raw 891 reads 20.1 C, at a 1%-low reference the SAME 891 reads 24.3 C -- over 4 C from 1% of reference (the boards' reference_uv note)."
+
+[parameters]
+ainsel_cs = "(channel << 12) | EN | TS_EN: AINSEL plus the power bits kept set -- the one-shot sequence rewrites CS wholesale (RROBIN/START_MANY stay 0), TS_EN riding along costs ~40 uA and keeps the sequence channel-uniform."
+ainsel_start_cs = "the same word with START_ONCE (self-clearing) -- select-then-start as two writes, the official driver's shape."
+
+# --- read_once: one-shot conversion on $channel (the official select/start/ready protocol) ---
+
+[[sequences.read_once]]
+op = "write"
+reg = "CS"
+value = "$ainsel_cs"
+note = "select the mux input (AINSEL needs no settling time)"
+
+[[sequences.read_once]]
+op = "write"
+reg = "CS"
+value = "$ainsel_start_cs"
+note = "START_ONCE: the conversion begins; READY drops while it runs"
+
+[[sequences.read_once]]
+op = "poll"
+reg = "CS"
+mask = 0x100
+note = "READY high again after 96 clk_adc cycles (2 us) -- the official driver polls with no pre-wait"
+
+[[sequences.read_once]]
+op = "read"
+reg = "CS"
+mask = 0x200
+note = "ERR: the datasheet CAUTION -- a flagged sample is undefined, DISCARD it and re-run the sequence"
+
+[[sequences.read_once]]
+op = "read"
+reg = "RESULT"
+mask = 0xFFF
+note = "the 12-bit count; microvolts = value * reference_uv / 4096 (truncating; reference_uv is the BOARD binding's fact)"

@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.NotFiniteNumberException
+#if LAMELLA_SURFACE_FLOAT
 namespace System
 {
     public class NotFiniteNumberException : ArithmeticException
@@ -15,3 +16,4 @@ namespace System
         public double OffendingNumber { get { return _offendingNumber; } }
     }
 }
+#endif

@@ -1,0 +1,27 @@
+[package]
+name = "lamella-sd-spi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A memory-card block device over SPI: the SD/SPI protocol layer and its BlockDevice backend, generic over a board-supplied SPI bus."
+
+[dependencies]
+# The BlockDevice seam this crate implements. `default-features = false` keeps a peripheral crate
+# off the interpreter's BCL/GC/float surface -- the same shape `lamella-net-smoltcp` uses to reach
+# the NetBackend seam in this crate.
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+
+[features]
+default = ["write"]
+# The write path. OFF => a genuinely read-only driver: `write_sectors` refuses with
+# `WriteProtected` and the whole write-data-block routine is compiled out.
+write = []
+# A host-only in-memory card simulator (`sim::SimCard`) that answers the `SdSpiBus` seam at the
+# command level. Non-default and `alloc`-only, so it never enters a device build; enabled by tests
+# and by `lamella-storage` to prove FAT over the driver with no hardware.
+sim = []
+
+[lints]
+workspace = true

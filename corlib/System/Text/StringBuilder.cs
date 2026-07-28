@@ -97,8 +97,10 @@ namespace System.Text
             return Append(value.ToString());
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public StringBuilder AppendLine() { return Append("\r\n"); }
         public StringBuilder AppendLine(string value) { return Append(value).Append("\r\n"); }
+#endif
 
         public StringBuilder Insert(int index, string value)
         {
@@ -172,11 +174,13 @@ namespace System.Text
             return this;
         }
 
+#if LAMELLA_SURFACE_NETFX_4_0
         public StringBuilder Clear()
         {
             _length = 0;
             return this;
         }
+#endif
 
         public override string ToString()
         {

@@ -4,7 +4,8 @@
 //! and the `DebugBackend` trait -- driven here by a `DeviceBackend` over a real probe.
 
 use lamella_aot::build;
-use lamella_cmsis_dap::{Dap, Transport};
+use lamella_cmsis_dap::Dap;
+use lamella_probe_core::{ArmDap, TargetAccess};
 use lamella_cmsis_dap_nrf::Nrf51Flash;
 use lamella_debug_device::DeviceBackend;
 use lamella_metadata::{Assembly, PortablePdb};
@@ -33,9 +34,9 @@ fn main() -> std::io::Result<()> {
 
     let device = Device::open(0x0d28, 0x0204, serial.as_deref())
         .expect("open the DAPLink (CMSIS-DAP) probe");
-    let mut dap = Dap::new(device);
-    flash(&mut dap, &image);
-    let backend = DeviceBackend::new(dap, lines, FLASH_BASE, names, file, entry);
+    let mut probe = ArmDap::new(Dap::new(device));
+    flash(&mut probe, &image);
+    let backend = DeviceBackend::new(probe.into_inner(), lines, FLASH_BASE, names, file, entry);
 
     let mut debugger = lamella_dap::Debugger::with_backend(Box::new(backend));
     lamella_dap::serve_polled(
@@ -46,7 +47,7 @@ fn main() -> std::io::Result<()> {
 }
 
 /// Flashes a raw image to nRF51 flash at address 0 and resets the target to run it.
-fn flash<T: Transport>(dap: &mut Dap<T>, image: &[u8]) {
+fn flash<A: TargetAccess>(target: &mut A, image: &[u8]) {
     let words: Vec<u32> = image
         .chunks(4)
         .map(|c| {
@@ -55,16 +56,16 @@ fn flash<T: Transport>(dap: &mut Dap<T>, image: &[u8]) {
             u32::from_le_bytes(w)
         })
         .collect();
-    dap.connect_swd().expect("connect SWD");
-    dap.read_idcode().expect("read IDCODE");
-    dap.init_mem().expect("init MEM-AP");
-    dap.halt().expect("halt");
+    target.connect().expect("connect SWD");
+    target.read_idcode().expect("read IDCODE");
+    target.init_mem().expect("init MEM-AP");
+    target.halt().expect("halt");
     let pages = (words.len() * 4).div_ceil(0x400);
     for page in 0..pages as u32 {
-        dap.erase_flash_page(page * 0x400).expect("erase page");
+        target.erase_flash_page(page * 0x400).expect("erase page");
     }
-    dap.write_flash(0x0, &words).expect("write flash");
-    dap.reset_and_run().expect("reset and run");
+    target.write_flash(0x0, &words).expect("write flash");
+    target.reset_and_run().expect("reset and run");
 }
 
 /// Builds the flashable image and composes its native offset -> source map and per-method names:

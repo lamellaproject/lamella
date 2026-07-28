@@ -1,0 +1,36 @@
+# BOARD binding: the ST NUCLEO-F091RC. Board truth ONLY: role
+# bindings, the carrier, and the clock plan. Chip truth lives in csp/stm32f091/.
+#
+# The USART2/PA2/PA3/AF1 wiring is the NUCLEO-F091RC ST-LINK VCP mapping, transcribed from
+# the board documentation cited under [table].
+
+[table]
+kind = "board"
+board = "nucleo-f091rc"
+family = "stm32f091"
+part = "stm32f091rc"
+board_model = 7             # lamella_wire::board_model::STM32F091
+sources = ["NUCLEO-F091RC ST-LINK VCP mapping (USART2 on PA2/PA3, AF1)"]
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge (a vendor carrier kind);
+role = "vcp"                # its fixed USB identity joins evidence-cited when the host
+baud = 115200               # tooling pins the ids when it lands them.
+plan = "hsi-8mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart2"
+function = "AF1"
+tx = { pin = "PA2" }
+rx = { pin = "PA3" }
+
+[[plans]]
+name = "hsi-8mhz"
+default = true
+source = "hsi"
+hsi_hz = 8000000            # the F0 reset clock (HSI at 8 MHz, all prescalers 1)
+pclk1_hz = 8000000          # PCLK1 == HSI under reset prescalers -- the generator verifies
+                            # this equality (state-and-verify)

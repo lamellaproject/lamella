@@ -1,0 +1,28 @@
+# BLOCK layout: the RP2350 subsystem resets block. PER-PERIPHERAL reset bit positions are per-instance facts
+# (`reset_bit` in ../instances.toml -- one legal home); this block carries only
+# the register geometry, including the chip's atomic-alias views the bring-ups use.
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "resets"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet ch 7 (RESETS)"]
+notes = [
+    "Every RP2350 peripheral exposes atomic register-access aliases at fixed offsets from the normal view: +0x1000 XOR, +0x2000 set-bits, +0x3000 clear-bits.",
+    "TWO views of the aliases coexist by inheritance: the peripheral release path writes full masks through the `resets_clr` instance row (the rp2040 pattern this family copied), while the PLL reset-cycle uses the RESET_SET/RESET_DONE pair with the alias offset as block geometry. Both derive the same silicon addresses.",
+]
+
+[registers.RESET]
+offset = 0x0
+width = 32
+notes = "1 = held in reset. Write through the resets_clr alias row to release; the fields are the instance rows' reset_bit values."
+
+[registers.RESET_SET]
+offset = 0x2000
+width = 32
+notes = "The atomic write-1-to-SET alias of RESET: writing a bit puts that block INTO reset (the PLL reset-cycle's first edge)."
+
+[registers.RESET_DONE]
+offset = 0x8
+width = 32
+notes = "A released peripheral's bit reads 1 once it is out of reset; it deasserts while the block is held in reset."

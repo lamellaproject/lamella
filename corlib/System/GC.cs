@@ -6,13 +6,17 @@ namespace System
     {
         private GC() { }
 
-        [Lamella.Runtime.RuntimeProvided] public static void Collect() { }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        public static void Collect() { }
 
+#if LAMELLA_SURFACE_NETFX_1_1
         public static void Collect(int generation)
         {
             if (generation < 0) throw new ArgumentOutOfRangeException("generation");
             Collect();
         }
+#endif
 
         public static int MaxGeneration { get { return 0; } }
 
@@ -20,11 +24,17 @@ namespace System
 
         public static void KeepAlive(object obj) { }
 
-        [Lamella.Runtime.RuntimeProvided] public static void SuppressFinalize(object obj) { }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        public static void SuppressFinalize(object obj) { }
 
-        [Lamella.Runtime.RuntimeProvided] public static void ReRegisterForFinalize(object obj) { }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        public static void ReRegisterForFinalize(object obj) { }
 
-        [Lamella.Runtime.RuntimeProvided] public static void WaitForPendingFinalizers() { }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        public static void WaitForPendingFinalizers() { }
     }
 }
 #endif

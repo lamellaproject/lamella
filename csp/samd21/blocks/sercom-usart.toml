@@ -3,9 +3,7 @@
 # or a clock plan. Instance bases/ids live in ../instances.toml;
 # board wiring lives in bsp/<board>/board.toml.
 #
-# Transcribed from the layout half the two retired v0 tables carried identically
-# (the peripheral-table SSOT, silicon-proven on the SAM W25 XPro SERCOM4
-# and the SAM D21 XPro SERCOM3 EDBG VCP paths); widths promoted from their prose notes to data.
+# Register offsets and bit widths are transcribed from the datasheet (ch 26).
 
 [table]
 kind = "block"
@@ -15,7 +13,6 @@ mode = "usart"
 sources = [
     "SAMD21 datasheet DS40001882: SERCOM USART register summary + descriptions (ch 26)",
     "Microchip AT11626 (SAMD21 SERCOM USART)",
-    "silicon-proven via samd21-serve (SERCOM4/W25) and samd21-edbg-serve (SERCOM3/XPro) EDBG VCP paths",
 ]
 notes = [
     "Every write to an enable-protected register (CTRLB, ENABLE, SWRST) must wait SYNCBUSY for that bit before the config is live (26.6.6).",
@@ -77,7 +74,7 @@ notes = "Write to transmit, read to receive (low 8 bits at 8-bit CHSIZE)."
 CTRLA_MODE_USART_INTCLK = 1
 
 [parameters]
-baud = "16x async arithmetic: BAUD = 65536 - (65536 * 16 * baud_hz) / f_core_hz; the shipped rounding adds one (115200 over 8 MHz = 0xC505), which is what the silicon proof ran."
+baud = "16x async arithmetic: BAUD = 65536 - (65536 * 16 * baud_hz) / f_core_hz; the shipped rounding adds one (115200 over 8 MHz = 0xC505)."
 tx_byte = "the byte to transmit (write to DATA once INTFLAG.DRE is set)."
 
 # Block-LOCAL sequences only: every step touches a SERCOM register. Cross-block bring-up

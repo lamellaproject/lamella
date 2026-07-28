@@ -8,17 +8,28 @@ namespace System.Device.Gpio
         private readonly PinNumberingScheme _numbering;
         private readonly bool[] _open;
 
+        /// <summary>Creates a controller over the board's GPIO driver, using logical pin
+        /// numbering.</summary>
+        /// <exception cref="System.InvalidOperationException">No GPIO driver is bound.</exception>
+        public GpioController() : this(PinNumberingScheme.Logical, Lamella.Hardware.Buses.ResolveGpio())
+        {
+        }
+
+        /// <summary>Creates a controller over the board's GPIO driver, using the given numbering
+        /// scheme.</summary>
+        /// <exception cref="System.InvalidOperationException">No GPIO driver is bound.</exception>
+        public GpioController(PinNumberingScheme numberingScheme)
+            : this(numberingScheme, Lamella.Hardware.Buses.ResolveGpio())
+        {
+        }
+
         /// <summary>Creates a controller over <paramref name="driver"/> using the given numbering scheme.</summary>
         public GpioController(PinNumberingScheme numberingScheme, GpioDriver driver)
         {
+            if ((object)driver == null) throw new System.ArgumentNullException("driver");
             _numbering = numberingScheme;
             _driver = driver;
             _open = new bool[driver.PinCount];
-        }
-
-        /// <summary>Creates a controller over <paramref name="driver"/> using logical pin numbering.</summary>
-        public GpioController(GpioDriver driver) : this(PinNumberingScheme.Logical, driver)
-        {
         }
 
         /// <summary>The numbering scheme used to represent pins.</summary>

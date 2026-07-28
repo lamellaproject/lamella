@@ -1,5 +1,5 @@
-# PIN map: pin x function -> (instance, signal) for the ESP32-C6 (the layering contract
-#). PARTIAL, evidence-only. Function ids are IO_MUX MCU_SEL values (F0..F4);
+# PIN map: pin x function -> (instance, signal) for the ESP32-C6.
+# PARTIAL, evidence-only. Function ids are IO_MUX MCU_SEL values (F0..F4);
 # F0 is each pin's NATIVE function. GPIO<n> is the bank-less spelling.
 
 [table]
@@ -7,16 +7,16 @@ kind = "pins"
 family = "esp32c6"
 sources = ["esp-idf v5.3 soc io_mux_reg.h (the IO_MUX function table)"]
 
-
+[[pins]]
 pin = "GPIO16"
 function = "F0"
 instance = "uart0"
 signal = "tx"
-source = "io_mux_reg.h (GPIO16 function 0 = U0TXD); silicon-proven by the greeting through the DevKitC-1 bridge + the J3 analyzer decode"
+source = "io_mux_reg.h (GPIO16 function 0 = U0TXD)"
 
-
+[[pins]]
 pin = "GPIO17"
 function = "F0"
 instance = "uart0"
 signal = "rx"
-source = "io_mux_reg.h (GPIO17 function 0 = U0RXD); silicon-proven by the 10/10 loopback + bridge RX path"
+source = "io_mux_reg.h (GPIO17 function 0 = U0RXD)"

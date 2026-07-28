@@ -40,6 +40,20 @@ pub enum Accessibility {
     Private,
 }
 
+impl Accessibility {
+    /// The C# keyword, spelled as a diagnostic message quotes it.
+    #[must_use]
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            Accessibility::Public => "public",
+            Accessibility::Protected => "protected",
+            Accessibility::Internal => "internal",
+            Accessibility::ProtectedInternal => "protected internal",
+            Accessibility::Private => "private",
+        }
+    }
+}
+
 /// A field of a type (17.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSymbol {
@@ -51,6 +65,9 @@ pub struct FieldSymbol {
     pub is_static: bool,
     /// Whether the field is `readonly` (assignable only in a constructor or initializer).
     pub is_readonly: bool,
+    /// Whether the field is `volatile` (17.4.3): its reads and writes carry the `volatile.`
+    /// prefix so the runtime does not reorder them.
+    pub is_volatile: bool,
     /// The field's accessibility.
     pub accessibility: Accessibility,
     /// The compile-time constant value of a `const` field or enum member (folded at the use
@@ -69,6 +86,17 @@ pub struct PropertySymbol {
     pub is_static: bool,
     /// The property's accessibility.
     pub accessibility: Accessibility,
+    /// Whether the property is declared `virtual` -- its accessors are overridable slots.
+    pub is_virtual: bool,
+    /// Whether the property is `abstract` (its accessors have no body and a concrete derived
+    /// class must override them).
+    pub is_abstract: bool,
+    /// Whether the property is declared `override` -- it replaces a base slot rather than
+    /// introducing a new one.
+    pub is_override: bool,
+    /// Whether the property is declared `sealed` -- an `override` that CLOSES its slot, so no
+    /// further derived class may override it.
+    pub is_sealed: bool,
     /// Whether this declaration provides a `get` accessor. A partially-overridden property may
     /// declare only one accessor and inherit the other, so each accessor is named on the type
     /// that declares it (14.5.4).
@@ -90,6 +118,9 @@ pub struct EventSymbol {
     pub is_static: bool,
     /// The event's accessibility (the visibility of its `add`/`remove` accessors).
     pub accessibility: Accessibility,
+    /// Whether the event is `abstract`: its `add`/`remove` accessors are unimplemented slots a
+    /// concrete derived class must supply.
+    pub is_abstract: bool,
 }
 
 /// A method of a type (17.5), reduced to what overload resolution needs.
@@ -119,6 +150,10 @@ pub struct MethodSymbol {
     /// Whether the method is declared `override` -- it replaces a base `virtual`/`abstract`/
     /// `override` slot rather than introducing a new one.
     pub is_override: bool,
+    /// Whether the method is declared `sealed` -- an `override` that CLOSES its slot, so no
+    /// further derived class may override it. False for a referenced or synthetic method
+    /// (an under-report: a missed sealed slot is a gap, never a false positive).
+    pub is_sealed: bool,
     /// The method's accessibility.
     pub accessibility: Accessibility,
     /// The `[Conditional("SYMBOL")]` symbols (24.4.2): a call to this method is omitted unless
@@ -165,6 +200,14 @@ pub struct TypeInfo {
     /// (CS0050-CS0053). Defaults to `public`; a source type sets it from its modifiers, so a
     /// reference or synthetic type is treated as public (a safe under-report of a non-public one).
     pub accessibility: Accessibility,
+    /// Whether the type is `sealed` (10.1.1.2), for the CS0509 derive-from-sealed check. Defaults to
+    /// `false`; a source type sets it from its modifiers, so a reference or synthetic type is treated
+    /// as non-sealed (a safe under-report -- deriving from an unflagged sealed type is a gap, never a
+    /// false positive).
+    pub is_sealed: bool,
+    /// Whether the type is `abstract` -- it cannot be instantiated. Defaults to `false` for a
+    /// referenced or synthetic type, the same safe under-report as `is_sealed`.
+    pub is_abstract: bool,
 }
 
 impl TypeInfo {
@@ -186,6 +229,8 @@ impl TypeInfo {
             is_external: false,
             assembly: None,
             accessibility: Accessibility::Public,
+            is_sealed: false,
+            is_abstract: false,
         }
     }
 
@@ -244,6 +289,13 @@ impl Model {
     pub fn get(&self, namespace: &str, name: &str) -> Option<&TypeInfo> {
         self.types
             .get(&(String::from(namespace), String::from(name)))
+    }
+
+    /// The type with the given namespace and name, mutably, if present. Used by the constant
+    /// resolution pass to fill a field's folded value once the whole model is collected.
+    pub fn get_mut(&mut self, namespace: &str, name: &str) -> Option<&mut TypeInfo> {
+        self.types
+            .get_mut(&(String::from(namespace), String::from(name)))
     }
 
     /// The number of program entry points declared in THIS compilation (10.1): a `static Main`
@@ -348,8 +400,15 @@ impl Model {
     }
 
     /// Resolves a written base to a class in the model -- the inheritance-chain base.
-    fn resolve_class_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
+    pub fn resolve_class_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
         self.resolve_base_of_kind(base, TypeKind::Class)
+    }
+
+    /// Resolves a written base to a STRUCT in the model. A struct is never a legal base -- it is
+    /// implicitly sealed -- so this exists to NAME one in a diagnostic, which the class-only
+    /// lookup cannot do.
+    pub fn resolve_struct_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
+        self.resolve_base_of_kind(base, TypeKind::Struct)
     }
 
     /// Resolves a written base to an interface in the model -- the `InterfaceImpl` source
@@ -589,6 +648,7 @@ mod tests {
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
             is_readonly: false,
+            is_volatile: false,
             accessibility: Accessibility::Public,
             constant: None,
         });
@@ -602,6 +662,7 @@ mod tests {
             is_virtual: false,
             is_abstract: false,
             is_override: false,
+            is_sealed: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
         });
@@ -615,6 +676,7 @@ mod tests {
             is_virtual: false,
             is_abstract: false,
             is_override: false,
+            is_sealed: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
         });
@@ -628,6 +690,7 @@ mod tests {
             is_virtual: false,
             is_abstract: false,
             is_override: false,
+            is_sealed: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
         });

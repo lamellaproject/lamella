@@ -1,8 +1,11 @@
 //! Binding a whole compilation unit (ECMA-334 1st ed, clause 16).
 
 use crate::bind::{bind_type, parameter_symbol};
-use crate::bound::Binder;
-use crate::declaration::{accessibility_of, collect_into};
+use crate::bound::{Binder, literal_int_value};
+use crate::declaration::{
+    accessibility_of, collect_into, is_constant_form, model_const_values, qualified_type_name,
+    resolve_const_expr,
+};
 use crate::diagnostic::{Diagnostic, DiagnosticKind, SignaturePosition};
 use crate::reference::load_assembly;
 use crate::special::SpecialType;
@@ -13,9 +16,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_metadata::Assembly;
 use lamella_syntax::ast::{
-    CompilationUnit, ConversionDirection, DelegateDecl, Member, Modifier, NamespaceMember,
-    OverloadableOperator, Parameter, ParameterModifier, QualifiedName, TypeDecl, TypeKind,
-    TypeRefKind, UsingDirective, UsingKind,
+    AttributeSection, CompilationUnit, ConversionDirection, DelegateDecl, EnumDecl, Member, Modifier,
+    NamespaceMember, OverloadableOperator, Parameter, ParameterModifier, QualifiedName, TypeDecl,
+    TypeKind, TypeRefKind, UsingDirective, UsingKind,
 };
 use lamella_syntax::span::Span;
 
@@ -33,11 +36,34 @@ pub fn bind_compilation_unit_with_references(
     unit: &CompilationUnit,
     references: &[Assembly],
 ) -> Vec<Diagnostic> {
+    bind_compilation_unit_with_references_and_options(unit, references, false)
+}
+
+/// Like [`bind_compilation_unit_with_references`], but told whether the driver's command line
+/// OMITTED `/unsafe`, in which case any `unsafe` in the source is `CS0227`. Only a caller that
+/// actually parsed options passes `true`; every other entry point leaves the policy unapplied,
+/// because a compilation with no command line behind it has no option to have omitted.
+#[must_use]
+pub fn bind_compilation_unit_with_references_and_options(
+    unit: &CompilationUnit,
+    references: &[Assembly],
+    unsafe_option_missing: bool,
+) -> Vec<Diagnostic> {
     let mut model = Model::new();
     for reference in references {
         load_assembly(&mut model, reference);
     }
-    bind_compilation_unit_with_model(unit, model)
+    collect_into(&mut model, unit);
+    model.canonicalize_signatures();
+    model.link_bases();
+    let mut binder = Binder::with_model(model);
+    binder.set_unsafe_option_missing(unsafe_option_missing);
+    let mut declared_types: DeclaredTypes = DeclaredTypes::new();
+    report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
+    bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
+    report_multiple_entry_points(&mut binder);
+    binder.report_unused_fields();
+    binder.into_diagnostics()
 }
 
 /// Binds `unit` against an already-built reference `model`, into which the unit's
@@ -81,6 +107,12 @@ fn report_duplicate_types(
             NamespaceMember::Namespace(declaration) => {
                 let inner = join_namespace(namespace, &declaration.name);
                 report_duplicate_types(binder, &declaration.members, &inner, declared);
+                if let Some(outermost) = declaration.name.parts.first() {
+                    declared
+                        .entry(String::from(namespace))
+                        .or_default()
+                        .insert(outermost.clone());
+                }
                 continue;
             }
             NamespaceMember::Type(declaration) => (&declaration.name, declaration.span),
@@ -127,6 +159,22 @@ pub fn bind_compilation_units_with_references(
     units: &[CompilationUnit],
     references: &[Assembly],
 ) -> Vec<Vec<Diagnostic>> {
+    bind_compilation_units_with_references_and_options(units, references, false)
+}
+
+/// Like [`bind_compilation_units_with_references`], but told whether the driver's command line
+/// OMITTED `/unsafe` -- the multi-unit twin of
+/// [`bind_compilation_unit_with_references_and_options`].
+///
+/// `/unsafe` is a capability boundary rather than a style flag, so it is enforced over the whole
+/// compilation: every unit is bound with the same policy, and CS0227 does not depend on how many
+/// source files a program is spread across.
+#[must_use]
+pub fn bind_compilation_units_with_references_and_options(
+    units: &[CompilationUnit],
+    references: &[Assembly],
+    unsafe_option_missing: bool,
+) -> Vec<Vec<Diagnostic>> {
     let mut model = Model::new();
     for reference in references {
         load_assembly(&mut model, reference);
@@ -137,6 +185,7 @@ pub fn bind_compilation_units_with_references(
     model.canonicalize_signatures();
     model.link_bases();
     let mut binder = Binder::with_model(model);
+    binder.set_unsafe_option_missing(unsafe_option_missing);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     let mut per_unit: Vec<Vec<Diagnostic>> = units
         .iter()
@@ -165,11 +214,20 @@ fn bind_namespace_body(
     namespace: &str,
 ) {
     let scope = binder.import_scope();
+    let mut aliases: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
     for using in usings {
         match &using.kind {
             UsingKind::Namespace(name) => binder.import_namespace(&dotted(name)),
             UsingKind::Alias { name, target } => {
-                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
+                if !aliases.insert(name) {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::DuplicateUsingAlias { alias: name.clone() },
+                        using.span,
+                    ));
+                }
+                let aliased = TypeSymbol::Named(target.parts.iter().cloned().collect());
+                binder.resolve_named_type(&aliased, target.span);
+                binder.import_alias(name, aliased);
             }
         }
     }
@@ -191,17 +249,176 @@ fn bind_namespace_body(
             NamespaceMember::Delegate(declaration) => {
                 check_delegate_accessibility(binder, namespace, declaration);
             }
-            NamespaceMember::Enum(_) => {}
+            NamespaceMember::Enum(declaration) => {
+                validate_enum_members(binder, namespace, declaration);
+            }
         }
     }
     binder.restore_import_scope(scope);
+}
+
+/// Validates each `enum` member's initializer (21.4): it must be a compile-time constant (CS0133),
+/// and when it folds, its value must fit the enum's underlying integral type (CS0031). A member with
+/// no initializer auto-numbers and is not checked here (an auto-increment overflow is a distinct
+/// rule). A constant-FORM initializer that does not fold (an unresolved name) is left to name
+/// resolution -- this never reports on it, so it cannot false-flag a valid member.
+/// Whether `ty` is one of the eight integer types an enum's underlying type may be (21.1).
+fn is_valid_enum_underlying(ty: &TypeSymbol) -> bool {
+    matches!(
+        ty,
+        TypeSymbol::Special(
+            SpecialType::SByte
+                | SpecialType::Byte
+                | SpecialType::Int16
+                | SpecialType::UInt16
+                | SpecialType::Int32
+                | SpecialType::UInt32
+                | SpecialType::Int64
+                | SpecialType::UInt64
+        )
+    )
+}
+
+fn validate_enum_members(binder: &mut Binder, namespace: &str, declaration: &EnumDecl) {
+    for modifier in &declaration.modifiers {
+        let modifier = match modifier {
+            Modifier::New
+            | Modifier::Public
+            | Modifier::Protected
+            | Modifier::Internal
+            | Modifier::Private
+            | Modifier::Unsafe => continue,
+            Modifier::Abstract => "abstract",
+            Modifier::Sealed => "sealed",
+            Modifier::Static => "static",
+            Modifier::Readonly => "readonly",
+            Modifier::Volatile => "volatile",
+            Modifier::Virtual => "virtual",
+            Modifier::Override => "override",
+            Modifier::Extern => "extern",
+            Modifier::Const => "const",
+        };
+        binder.report(Diagnostic::new(
+            DiagnosticKind::ModifierNotValidForItem {
+                modifier: modifier.into(),
+            },
+            declaration.span,
+        ));
+    }
+    let underlying = declaration
+        .base
+        .as_ref()
+        .map(bind_type)
+        .map(|ty| binder.canonicalize(&ty))
+        .unwrap_or(TypeSymbol::Special(SpecialType::Int32));
+    if let Some(base) = &declaration.base {
+        if !is_valid_enum_underlying(&underlying) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::EnumUnderlyingTypeExpected,
+                base.span,
+            ));
+            return;
+        }
+    }
+    let enum_full = qualified_type_name(namespace, &declaration.name);
+    let mut seen_members: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+    for member in &declaration.members {
+        if !seen_members.insert(&member.name) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::DuplicateMember {
+                    type_name: declaration.name.clone(),
+                    member: member.name.clone(),
+                },
+                member.span,
+            ));
+        }
+    }
+    let values = model_const_values(binder.model());
+    for member in &declaration.members {
+        let Some(initializer) = &member.value else {
+            continue;
+        };
+        if !is_constant_form(initializer) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::NonConstantEnumMember {
+                    member: alloc::format!("{enum_full}.{}", member.name).into(),
+                },
+                initializer.span,
+            ));
+            continue;
+        }
+        if let Some(literal) = resolve_const_expr(initializer, &enum_full, &values) {
+            if let Some(value) = literal_int_value(&literal) {
+                if let Some(rendered) = enum_value_out_of_range(i128::from(value), &underlying) {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::ConstantOutOfRange {
+                            value: rendered,
+                            to: underlying.to_string().into(),
+                        },
+                        initializer.span,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The rendered value if `value` is outside the range of an enum's underlying integral type (21.1
+/// lists the eight integer types), else `None`. It never fires on a value that fits, so it cannot
+/// false-flag a valid member; a non-integral underlying type (an invalid enum) yields `None` here
+/// and is diagnosed elsewhere.
+fn enum_value_out_of_range(value: i128, underlying: &TypeSymbol) -> Option<Box<str>> {
+    let TypeSymbol::Special(target) = underlying else {
+        return None;
+    };
+    let (min, max): (i128, i128) = match target {
+        SpecialType::SByte => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        SpecialType::Byte => (0, i128::from(u8::MAX)),
+        SpecialType::Int16 => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        SpecialType::UInt16 => (0, i128::from(u16::MAX)),
+        SpecialType::Int32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        SpecialType::UInt32 => (0, i128::from(u32::MAX)),
+        SpecialType::Int64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        SpecialType::UInt64 => (0, i128::from(u64::MAX)),
+        _ => return None,
+    };
+    if value < min || value > max {
+        Some(alloc::format!("{value}").into())
+    } else {
+        None
+    }
 }
 
 /// CS0058 / CS0059: a delegate's return type and parameter types must each be at least as
 /// accessible as the delegate itself (10.5.4). The delegate's effective accessibility comes from
 /// its declared modifiers (a top-level delegate defaults to `internal`); an unresolved, reference,
 /// or predefined signature type never fires, so this never false-flags a valid program.
+/// The keyword of a modifier that is not valid on a delegate declaration (CS0106) -- the
+/// inheritance/instance modifiers -- or `None` for a valid one (accessibility, `new`) or a modifier
+/// this conservatively does not flag, so a valid delegate is never rejected.
+fn invalid_delegate_modifier(modifier: &Modifier) -> Option<&'static str> {
+    match modifier {
+        Modifier::Abstract => Some("abstract"),
+        Modifier::Sealed => Some("sealed"),
+        Modifier::Virtual => Some("virtual"),
+        Modifier::Override => Some("override"),
+        Modifier::Static => Some("static"),
+        _ => None,
+    }
+}
+
 fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaration: &DelegateDecl) {
+    validate_parameter_names(binder, &declaration.parameters);
+    for modifier in &declaration.modifiers {
+        if let Some(name) = invalid_delegate_modifier(modifier) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ModifierNotValidForItem {
+                    modifier: name.into(),
+                },
+                declaration.span,
+            ));
+        }
+    }
     let delegate = named_symbol(namespace, &declaration.name);
     let delegate_mask = {
         let model = binder.model();
@@ -235,38 +452,1010 @@ fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaratio
     }
 }
 
-fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
-    let enclosing = named_symbol(namespace, &declaration.name);
-    let mut seen_fields: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
-    let mut duplicate_field_names: alloc::collections::BTreeSet<&str> =
-        alloc::collections::BTreeSet::new();
+/// Validates each `volatile` field's type (17.4.3): it must be a reference type, one of
+/// byte/sbyte/short/ushort/int/uint/char/float/bool, or an enum with one of those underlying
+/// bases. Any other type -- long, ulong, double, decimal, a struct, an enum with a 64-bit base --
+/// is CS0677. Conservative: a pointer or an unresolved type is never flagged, so a valid program
+/// is never rejected.
+fn validate_volatile_fields(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    let type_full = qualified_type_name(namespace, &declaration.name);
     for member in &declaration.members {
-        if let Member::Field { declarators, .. } = member {
+        let Member::Field {
+            modifiers,
+            ty,
+            declarators,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if !modifiers.iter().any(|m| matches!(m, Modifier::Volatile)) {
+            continue;
+        }
+        let field_ty = binder.canonicalize(&bind_type(ty));
+        if is_permitted_volatile_type(binder.model(), &field_ty) {
+            continue;
+        }
+        let rendered = field_ty.to_string();
+        for declarator in declarators {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::VolatileFieldType {
+                    field: alloc::format!("{type_full}.{}", declarator.name).into(),
+                    ty: rendered.clone().into(),
+                },
+                declarator.span,
+            ));
+        }
+    }
+}
+
+/// Whether `ty` is a type a `volatile` field may have (17.4.3). Reference types and the permitted
+/// integer/char/float/bool value types are allowed; a struct or a wider numeric (long, ulong,
+/// double, decimal) is not. Conservative for what the model cannot classify (a pointer, byref,
+/// error, or unresolved named type -> allowed), so the caller never false-flags a valid program.
+fn is_permitted_volatile_type(model: &Model, ty: &TypeSymbol) -> bool {
+    match ty {
+        TypeSymbol::Special(special) => matches!(
+            special,
+            SpecialType::SByte
+                | SpecialType::Byte
+                | SpecialType::Int16
+                | SpecialType::UInt16
+                | SpecialType::Int32
+                | SpecialType::UInt32
+                | SpecialType::Char
+                | SpecialType::Single
+                | SpecialType::Boolean
+                | SpecialType::String
+                | SpecialType::Object
+        ),
+        TypeSymbol::Array { .. } => true,
+        TypeSymbol::Named(_) => match model.get_by_symbol(ty) {
+            Some(info) => match info.kind {
+                crate::symbols::TypeKind::Class
+                | crate::symbols::TypeKind::Interface
+                | crate::symbols::TypeKind::Delegate => true,
+                crate::symbols::TypeKind::Enum => enum_underlying_permitted(info).unwrap_or(true),
+                crate::symbols::TypeKind::Struct => false,
+            },
+            None => true,
+        },
+        TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => true,
+    }
+}
+
+/// Whether an enum's underlying integral base is one a `volatile` field permits
+/// (byte/sbyte/short/ushort/int/uint); `None` when the base cannot be read from the model, so the
+/// caller leaves it unflagged.
+fn enum_underlying_permitted(info: &TypeInfo) -> Option<bool> {
+    let TypeSymbol::Special(special) = info.bases.first()? else {
+        return None;
+    };
+    Some(matches!(
+        special,
+        SpecialType::SByte
+            | SpecialType::Byte
+            | SpecialType::Int16
+            | SpecialType::UInt16
+            | SpecialType::Int32
+            | SpecialType::UInt32
+    ))
+}
+
+/// Validates that each user-defined operator is declared `static` and `public` (17.9.1); one
+/// missing either modifier is CS0558. Scoped to classes and structs (operators elsewhere are a
+/// separate error). The signature is rendered exactly as csc names the operator.
+fn validate_operator_modifiers(binder: &mut Binder, declaration: &TypeDecl) {
+    if !matches!(declaration.kind, TypeKind::Class | TypeKind::Struct) {
+        return;
+    }
+    for member in &declaration.members {
+        let (modifiers, span, signature) = match member {
+            Member::Operator {
+                operator,
+                parameters,
+                modifiers,
+                span,
+                ..
+            } => (
+                modifiers,
+                *span,
+                alloc::format!(
+                    "{}.operator {}({})",
+                    declaration.name,
+                    operator_source_symbol(*operator),
+                    parameter_type_list(parameters)
+                ),
+            ),
+            Member::ConversionOperator {
+                direction,
+                target,
+                parameters,
+                modifiers,
+                span,
+                ..
+            } => {
+                let keyword = match direction {
+                    ConversionDirection::Implicit => "implicit",
+                    ConversionDirection::Explicit => "explicit",
+                };
+                let target_ty = binder.canonicalize(&bind_type(target));
+                (
+                    modifiers,
+                    *span,
+                    alloc::format!(
+                        "{}.{} operator {}({})",
+                        declaration.name,
+                        keyword,
+                        target_ty,
+                        parameter_type_list(parameters)
+                    ),
+                )
+            }
+            _ => continue,
+        };
+        let public_and_static = modifiers.iter().any(|m| matches!(m, Modifier::Public))
+            && modifiers.iter().any(|m| matches!(m, Modifier::Static));
+        if !public_and_static {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::OperatorMustBeStaticAndPublic {
+                    signature: signature.into(),
+                },
+                span,
+            ));
+        }
+    }
+}
+
+/// Validates that no class member is both `static` and `virtual`/`abstract`/`override` (CS0112) --
+/// a static member is not part of virtual dispatch. Scoped to classes (a struct's virtual/abstract
+/// member is the separate CS0106 rule). csc names the offending modifier, not the member.
+fn validate_static_member_modifiers(binder: &mut Binder, declaration: &TypeDecl) {
+    if declaration.kind != TypeKind::Class {
+        return;
+    }
+    for member in &declaration.members {
+        let (modifiers, span) = match member {
+            Member::Method { modifiers, span, .. }
+            | Member::Property { modifiers, span, .. }
+            | Member::Indexer { modifiers, span, .. } => (modifiers, *span),
+            _ => continue,
+        };
+        if !modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
+            continue;
+        }
+        let offending = modifiers.iter().find_map(|m| match m {
+            Modifier::Virtual => Some("virtual"),
+            Modifier::Abstract => Some("abstract"),
+            Modifier::Override => Some("override"),
+            _ => None,
+        });
+        if let Some(modifier) = offending {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::StaticMemberCannotBeVirtual {
+                    modifier: modifier.into(),
+                },
+                span,
+            ));
+        }
+    }
+}
+
+/// Whether an event's type resolves to something that is definitely NOT a delegate (a predefined
+/// type, or a class/struct/interface/enum) -- CS0066. Conservative: an unresolved named type (which
+/// may be a BCL delegate such as `EventHandler`), and array/pointer types, are not flagged, so a
+/// valid event is never rejected.
+fn event_type_is_non_delegate(model: &Model, ty: &TypeSymbol) -> bool {
+    match ty {
+        TypeSymbol::Special(_) => true,
+        TypeSymbol::Named(_) => matches!(
+            model.get_by_symbol(ty).map(|info| info.kind),
+            Some(
+                crate::symbols::TypeKind::Class
+                    | crate::symbols::TypeKind::Struct
+                    | crate::symbols::TypeKind::Interface
+                    | crate::symbols::TypeKind::Enum
+            )
+        ),
+        _ => false,
+    }
+}
+
+/// Validates that every field-like event's type is a delegate (17.7); a non-delegate type is CS0066.
+fn validate_event_types(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    let type_full = qualified_type_name(namespace, &declaration.name);
+    for member in &declaration.members {
+        let Member::EventField {
+            ty, declarators, ..
+        } = member
+        else {
+            continue;
+        };
+        let resolved = binder.resolve_named_type(&bind_type(ty), ty.span);
+        if resolved.is_error() {
+            continue;
+        }
+        let event_ty = binder.canonicalize(&resolved);
+        if event_type_is_non_delegate(binder.model(), &event_ty) {
             for declarator in declarators {
-                if !seen_fields.insert(&declarator.name) {
-                    duplicate_field_names.insert(&declarator.name);
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::EventTypeMustBeDelegate {
+                        event: alloc::format!("{type_full}.{}", declarator.name).into(),
+                    },
+                    declarator.span,
+                ));
+            }
+        }
+    }
+}
+
+/// Whether an overloadable operator can only be unary (17.9.1) -- it takes one operand, so a
+/// two-parameter declaration of one is CS1020. `+` and `-` are dual (unary or binary) and are not
+/// here.
+fn is_unary_only_operator(operator: OverloadableOperator) -> bool {
+    use OverloadableOperator as O;
+    matches!(
+        operator,
+        O::LogicalNot | O::BitwiseNot | O::Increment | O::Decrement | O::True | O::False
+    )
+}
+
+/// Validates user-defined operator arity: a two-parameter declaration must name a
+/// binary-overloadable operator (17.9.2), so a unary-only operator given two parameters is CS1020.
+/// The attribute sections a member carries, for the attribute rules below.
+fn member_attributes(member: &Member) -> Option<&[AttributeSection]> {
+    let attributes = match member {
+        Member::Method { attributes, .. }
+        | Member::Field { attributes, .. }
+        | Member::Property { attributes, .. }
+        | Member::Indexer { attributes, .. }
+        | Member::Constructor { attributes, .. }
+        | Member::Destructor { attributes, .. }
+        | Member::Operator { attributes, .. }
+        | Member::ConversionOperator { attributes, .. }
+        | Member::EventField { attributes, .. }
+        | Member::Event { attributes, .. } => attributes,
+        _ => return None,
+    };
+    Some(attributes)
+}
+
+/// CS0579 / CS0182: the attribute rules that need no knowledge of the attribute CLASS. A section
+/// may not name the same attribute twice (24.2), and every argument must be a compile-time
+/// constant, a `typeof`, or an array creation -- an attribute is baked into metadata, so nothing
+/// evaluated at run time can supply one.
+fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
+    let mut seen: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    for section in attributes {
+        for attribute in &section.attributes {
+            let name = dotted(&attribute.name);
+            let written = TypeSymbol::Named(attribute.name.parts.iter().cloned().collect());
+            let resolved = binder.resolve_named_type_quietly(&written, attribute.span);
+            if !resolved.is_error()
+                && binder.is_provably_not_derived_from_system(&resolved, "Attribute")
+            {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::NotAnAttributeClass {
+                        type_name: name.clone().into(),
+                    },
+                    attribute.span,
+                ));
+            }
+            if !seen.insert(name.clone()) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::DuplicateAttribute {
+                        name: attribute
+                            .name
+                            .parts
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| Box::from("")),
+                    },
+                    attribute.span,
+                ));
+            }
+            for argument in &attribute.arguments {
+                let value = match argument {
+                    lamella_syntax::ast::AttributeArgument::Positional(value) => value,
+                    lamella_syntax::ast::AttributeArgument::Named { value, .. } => value,
+                };
+                if !is_attribute_argument_form(value) {
                     binder.report(Diagnostic::new(
-                        DiagnosticKind::DuplicateMember {
-                            type_name: declaration.name.clone(),
-                            member: declarator.name.clone(),
-                        },
-                        declarator.span,
+                        DiagnosticKind::NonConstantAttributeArgument,
+                        value.span,
                     ));
                 }
             }
         }
     }
-    let mut seen_methods: alloc::vec::Vec<(Box<str>, alloc::vec::Vec<TypeSymbol>)> =
-        alloc::vec::Vec::new();
+}
+
+/// Whether an expression has a form an attribute argument may take (24.2): a constant expression,
+/// a `typeof`, or an array creation. Conservative in the accepting direction -- anything this
+/// cannot classify is left alone -- so an unrecognized-but-valid form is a gap, never a refusal.
+fn is_attribute_argument_form(value: &lamella_syntax::ast::Expr) -> bool {
+    use lamella_syntax::ast::ExprKind;
+    match &value.kind {
+        ExprKind::TypeOf(_) | ExprKind::ArrayCreation { .. } | ExprKind::ArrayInitializer(_) => true,
+        _ => is_constant_form(value),
+    }
+}
+
+/// CS0768: a constructor that reaches ITSELF through a chain of `: this(...)` initializers
+/// (17.10.1). Such a chain would never terminate, so no constructor in the cycle can run. The
+/// graph is keyed by parameter-type list, which is what a `this(...)` call resolves on.
+fn validate_constructor_initializer_cycles(binder: &mut Binder, declaration: &TypeDecl) {
+    let constructors: Vec<(Vec<TypeSymbol>, Option<usize>, Span, &[Parameter])> = declaration
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            Member::Constructor {
+                modifiers,
+                parameters,
+                initializer,
+                span,
+                ..
+            } if !modifiers.iter().any(|m| matches!(m, Modifier::Static)) => {
+                let chains_to = initializer.as_ref().and_then(|init| {
+                    matches!(init.kind, lamella_syntax::ast::ConstructorInitializerKind::This)
+                        .then_some(init.arguments.len())
+                });
+                Some((
+                    parameters.iter().map(parameter_symbol).collect(),
+                    chains_to,
+                    *span,
+                    parameters.as_slice(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    let target_of = |count: usize| {
+        let mut matches = constructors
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, _, parameters))| parameters.len() == count);
+        match (matches.next(), matches.next()) {
+            (Some((index, _)), None) => Some(index),
+            _ => None,
+        }
+    };
+    let mut already_reported = alloc::vec![false; constructors.len()];
+    for start in 0..constructors.len() {
+        if already_reported[start] {
+            continue;
+        }
+        let mut visited = alloc::vec![false; constructors.len()];
+        let mut current = start;
+        loop {
+            if visited[current] {
+                if current == start {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::ConstructorInitializerCycle {
+                            constructor: method_signature(
+                                &declaration.name,
+                                &declaration.name,
+                                constructors[start].3,
+                            ),
+                        },
+                        constructors[start].2,
+                    ));
+                    for (index, seen) in visited.iter().enumerate() {
+                        if *seen {
+                            already_reported[index] = true;
+                        }
+                    }
+                }
+                break;
+            }
+            visited[current] = true;
+            let Some(count) = constructors[current].1 else {
+                break;
+            };
+            let Some(next) = target_of(count) else {
+                break;
+            };
+            current = next;
+        }
+    }
+}
+
+/// CS0227: `unsafe` written in a compilation the driver did not give `/unsafe`. csc gates unsafe
+/// code behind that option and so does lcsc -- the language supports all of it, but a compilation
+/// opts IN to containing it. Reported at each `unsafe` the source writes (the type's own modifier
+/// and each member's), which is where csc reports it too.
+fn validate_unsafe_permitted(binder: &mut Binder, declaration: &TypeDecl) {
+    if !binder.unsafe_option_missing() {
+        return;
+    }
+    let is_unsafe = |modifiers: &[Modifier]| modifiers.iter().any(|m| matches!(m, Modifier::Unsafe));
+    if is_unsafe(&declaration.modifiers) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::UnsafeCodeRequiresOption,
+            declaration.span,
+        ));
+    }
     for member in &declaration.members {
-        if let Member::Method {
-            name,
+        let (modifiers, span) = match member {
+            Member::Method { modifiers, span, .. }
+            | Member::Field { modifiers, span, .. }
+            | Member::Property { modifiers, span, .. }
+            | Member::Indexer { modifiers, span, .. }
+            | Member::Constructor { modifiers, span, .. }
+            | Member::Destructor { modifiers, span, .. }
+            | Member::Operator { modifiers, span, .. }
+            | Member::ConversionOperator { modifiers, span, .. }
+            | Member::EventField { modifiers, span, .. }
+            | Member::Event { modifiers, span, .. } => (modifiers, span),
+            _ => continue,
+        };
+        if is_unsafe(modifiers) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::UnsafeCodeRequiresOption,
+                *span,
+            ));
+        }
+    }
+}
+
+/// CS0133: a `const` field's initializer must be a constant expression (17.4.2) -- its value is
+/// baked into every use site, so it cannot be a call or anything else evaluated at run time. The
+/// same `is_constant_form` test the enum members use, so the two agree on what "constant" means.
+fn validate_const_field_initializers(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    let type_full = qualified_type_name(namespace, &declaration.name);
+    for member in &declaration.members {
+        let Member::Field {
+            modifiers,
+            declarators,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if !modifiers.iter().any(|m| matches!(m, Modifier::Const)) {
+            continue;
+        }
+        for declarator in declarators {
+            let Some(initializer) = &declarator.initializer else {
+                continue;
+            };
+            if !is_constant_form(initializer) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::NonConstantFieldInitializer {
+                        field: alloc::format!("{type_full}.{}", declarator.name).into(),
+                    },
+                    initializer.span,
+                ));
+            }
+        }
+    }
+}
+
+/// A conversion operator's own rules (17.9.4). It exists to bridge ITS OWN type and another, so
+/// one whose source and target are both foreign converts nothing the enclosing type is party to
+/// (`CS0556`). And it is a UNARY form: a second parameter makes it no operator at all, which csc
+/// reports as `CS1019`, the same code a two-parameter unary operator gets.
+fn validate_conversion_operators(binder: &mut Binder, declaration: &TypeDecl) {
+    for member in &declaration.members {
+        let Member::ConversionOperator {
+            target,
             parameters,
-            explicit_interface: None,
+            span,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if parameters.len() != 1 {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::OverloadableUnaryOperatorExpected,
+                *span,
+            ));
+            continue;
+        }
+        let names_enclosing = |ty: &lamella_syntax::ast::TypeRef| {
+            matches!(bind_type(ty), TypeSymbol::Named(parts)
+                if parts.last().is_some_and(|part| **part == *declaration.name))
+        };
+        if !names_enclosing(target) && !names_enclosing(&parameters[0].ty) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ConversionMustInvolveEnclosingType,
+                *span,
+            ));
+        }
+    }
+}
+
+fn validate_operator_arity(binder: &mut Binder, declaration: &TypeDecl) {
+    for member in &declaration.members {
+        if let Member::Operator {
+            operator,
+            parameters,
             span,
             ..
         } = member
         {
+            if parameters.len() == 2 && is_unary_only_operator(*operator) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::OverloadableBinaryOperatorExpected,
+                    *span,
+                ));
+            }
+        }
+    }
+}
+
+/// The operator a pairable operator requires alongside it (17.9.2), or `None` for one that
+/// stands alone. A type cannot support one direction of a comparison without the other, nor
+/// `true` without `false`, because the language uses each pair together.
+fn required_operator_partner(operator: OverloadableOperator) -> Option<OverloadableOperator> {
+    use OverloadableOperator as O;
+    Some(match operator {
+        O::Equality => O::Inequality,
+        O::Inequality => O::Equality,
+        O::LessThan => O::GreaterThan,
+        O::GreaterThan => O::LessThan,
+        O::LessThanOrEqual => O::GreaterThanOrEqual,
+        O::GreaterThanOrEqual => O::LessThanOrEqual,
+        O::True => O::False,
+        O::False => O::True,
+        _ => return None,
+    })
+}
+
+/// Validates that every pairable user-defined operator has its partner declared in the same
+/// type: CS0216. Matches on the operator TOKEN alone, not the signature, which is what csc
+/// does -- a partner with different parameter types still satisfies the requirement here, and
+/// mismatched operand types are a separate diagnosis.
+fn validate_operator_pairs(binder: &mut Binder, declaration: &TypeDecl) {
+    if !matches!(declaration.kind, TypeKind::Class | TypeKind::Struct) {
+        return;
+    }
+    let declared: alloc::vec::Vec<OverloadableOperator> = declaration
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            Member::Operator { operator, .. } => Some(*operator),
+            _ => None,
+        })
+        .collect();
+    for member in &declaration.members {
+        let Member::Operator {
+            operator,
+            parameters,
+            span,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        let Some(partner) = required_operator_partner(*operator) else {
+            continue;
+        };
+        if declared.contains(&partner) {
+            continue;
+        }
+        binder.report(Diagnostic::new(
+            DiagnosticKind::OperatorRequiresMatchingOperator {
+                operator: alloc::format!(
+                    "{}.operator {}({})",
+                    declaration.name,
+                    operator_source_symbol(*operator),
+                    parameter_type_list(parameters)
+                )
+                .into(),
+                partner: operator_source_symbol(partner),
+            },
+            *span,
+        ));
+    }
+}
+
+/// The span of a `[Conditional]` attribute (24.4.2) on a member, matched by name as written
+/// (`Conditional` or the `Attribute`-suffixed form), or `None` if the member carries none. Matches
+/// the name rather than a resolved type, exactly as the call-omission reader does.
+fn conditional_attribute_span(sections: &[AttributeSection]) -> Option<Span> {
+    for section in sections {
+        if section.target.is_some() {
+            continue;
+        }
+        for attribute in &section.attributes {
+            let last = attribute.name.parts.last().map(|part| &**part);
+            if last == Some("Conditional") || last == Some("ConditionalAttribute") {
+                return Some(attribute.span);
+            }
+        }
+    }
+    None
+}
+
+/// Validates that a `[Conditional]` method returns `void` (24.4.2): a conditional call is omitted
+/// wholesale at sites where the symbol is undefined, so a non-`void` return would leave those sites
+/// expecting a value that never arrives -- CS0578. An `override` is a distinct rule (csc's CS0243),
+/// left to that path.
+fn validate_conditional_methods(binder: &mut Binder, declaration: &TypeDecl) {
+    for member in &declaration.members {
+        if let Member::Method {
+            name,
+            return_type,
+            parameters,
+            modifiers,
+            attributes,
+            ..
+        } = member
+        {
+            if modifiers.contains(&Modifier::Override) || bind_type(return_type).is_void() {
+                continue;
+            }
+            if let Some(span) = conditional_attribute_span(attributes) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::ConditionalMethodMustReturnVoid {
+                        method: alloc::format!(
+                            "{}.{}({})",
+                            declaration.name,
+                            name,
+                            parameter_type_list(parameters)
+                        )
+                        .into(),
+                    },
+                    span,
+                ));
+            }
+        }
+    }
+}
+
+/// Validates the modifiers on a type defined directly in a namespace (10.5). Such a type may be
+/// `public` or `internal` but not `private`/`protected` (CS1527), and `new` -- member hiding
+/// (10.2.2) -- is not valid on it (CS0106). A NESTED type is exempt (private and new are both valid
+/// there), so the check keys off the model's `enclosing`, which is `None` only for a top-level type.
+fn validate_top_level_type_modifiers(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    let symbol = named_symbol(namespace, &declaration.name);
+    let is_nested = binder
+        .model()
+        .get_by_symbol(&symbol)
+        .is_some_and(|info| info.enclosing.is_some());
+    if is_nested {
+        return;
+    }
+    if declaration
+        .modifiers
+        .iter()
+        .any(|m| matches!(m, Modifier::Private | Modifier::Protected))
+    {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::NamespaceElementBadAccessibility,
+            declaration.span,
+        ));
+    }
+    if declaration.modifiers.iter().any(|m| matches!(m, Modifier::New)) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::ModifierNotValidForItem {
+                modifier: "new".into(),
+            },
+            declaration.span,
+        ));
+    }
+}
+
+/// The member forms an INTERFACE gained after C# 1.0. In C# 1.0 an interface declares only the
+/// signatures of methods, properties, events and indexers (13.2): every accessor is a bare `;`,
+/// there is no nested type and no operator, and a member carries no access modifier because every
+/// one is implicitly public. Each of those is a later feature, so each is `CS8022` -- except the
+/// modifier, which csc gives its own code (`CS8703`) because the repair is to DELETE it rather
+/// than to raise the language version alone.
+fn validate_interface_members(binder: &mut Binder, declaration: &TypeDecl) {
+    if declaration.kind != TypeKind::Interface {
+        return;
+    }
+    let default_implementation = |binder: &mut Binder, span| {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::FeatureRequiresLaterVersion {
+                feature: "default interface implementation".into(),
+                required: "C# 8.0".into(),
+            },
+            span,
+        ));
+    };
+    for member in &declaration.members {
+        let modifiers = match member {
+            Member::Method { modifiers, .. }
+            | Member::Property { modifiers, .. }
+            | Member::Indexer { modifiers, .. }
+            | Member::EventField { modifiers, .. }
+            | Member::Event { modifiers, .. } => Some(modifiers),
+            _ => None,
+        };
+        if let Some(modifiers) = modifiers {
+            for modifier in modifiers {
+                let name = match modifier {
+                    Modifier::Public => "public",
+                    Modifier::Private => "private",
+                    Modifier::Protected => "protected",
+                    Modifier::Internal => "internal",
+                    _ => continue,
+                };
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::InterfaceMemberModifier {
+                        modifier: name.into(),
+                    },
+                    declaration.span,
+                ));
+            }
+        }
+        match member {
+            Member::Method {
+                body: Some(body), ..
+            } => default_implementation(binder, body.span),
+            Member::Property { getter, setter, .. } | Member::Indexer { getter, setter, .. } => {
+                for accessor in [getter, setter].into_iter().flatten() {
+                    if let Some(body) = &accessor.body {
+                        default_implementation(binder, body.span);
+                    }
+                }
+            }
+            Member::Event { adder, remover, .. } => {
+                for accessor in [adder, remover].into_iter().flatten() {
+                    default_implementation(binder, accessor.span);
+                }
+            }
+            Member::Operator { span, .. } | Member::ConversionOperator { span, .. } => {
+                default_implementation(binder, *span);
+            }
+            Member::NestedType(_) => default_implementation(binder, declaration.span),
+            _ => {}
+        }
+    }
+}
+
+/// A constructor's own declaration rules. A STATIC constructor is run by the runtime and never
+/// called, so an accessibility modifier on it means nothing (`CS0515`, 17.11). And a constructor
+/// is recognized by repeating the enclosing type's name, so one that does not is not a
+/// constructor at all -- csc reads it as a method missing its return type (`CS1520`).
+fn validate_constructors(binder: &mut Binder, declaration: &TypeDecl) {
+    for member in &declaration.members {
+        let Member::Constructor {
+            modifiers,
+            name,
+            parameters,
+            span,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if **name != *declaration.name {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::MethodMustHaveReturnType,
+                *span,
+            ));
+            continue;
+        }
+        if declaration.kind == TypeKind::Struct
+            && parameters.is_empty()
+            && !modifiers.iter().any(|m| matches!(m, Modifier::Static))
+        {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: "parameterless struct constructors".into(),
+                    required: "C# 10.0".into(),
+                },
+                *span,
+            ));
+        }
+        if !modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
+            continue;
+        }
+        if modifiers.iter().any(|m| {
+            matches!(
+                m,
+                Modifier::Public | Modifier::Protected | Modifier::Internal | Modifier::Private
+            )
+        }) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::StaticConstructorAccessibility {
+                    member: method_signature(&declaration.name, &declaration.name, parameters),
+                },
+                *span,
+            ));
+        }
+    }
+}
+
+/// A destructor's own declaration rules (17.12). It is named for the type it finalizes, so a
+/// different name is `CS0574`; only a class has a finalizer, so one declared in a struct is
+/// `CS0575`; and it takes no accessibility or inheritance modifier -- `extern` (and, in an unsafe
+/// context, `unsafe`) are the only ones valid, so any other is `CS0106`.
+fn validate_destructors(binder: &mut Binder, declaration: &TypeDecl) {
+    for member in &declaration.members {
+        let Member::Destructor {
+            modifiers,
+            name,
+            span,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if declaration.kind != TypeKind::Class {
+            binder.report(Diagnostic::new(DiagnosticKind::DestructorNotInClass, *span));
+        } else if **name != *declaration.name {
+            binder.report(Diagnostic::new(DiagnosticKind::DestructorNameMismatch, *span));
+        }
+        for modifier in modifiers {
+            let name = match modifier {
+                Modifier::Extern | Modifier::Unsafe => continue,
+                Modifier::Public => "public",
+                Modifier::Private => "private",
+                Modifier::Protected => "protected",
+                Modifier::Internal => "internal",
+                Modifier::Static => "static",
+                Modifier::Virtual => "virtual",
+                Modifier::Override => "override",
+                Modifier::Abstract => "abstract",
+                Modifier::Sealed => "sealed",
+                Modifier::New => "new",
+                Modifier::Readonly => "readonly",
+                Modifier::Volatile => "volatile",
+                Modifier::Const => "const",
+            };
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ModifierNotValidForItem {
+                    modifier: name.into(),
+                },
+                *span,
+            ));
+        }
+    }
+}
+
+/// CS0100: reports each parameter name a parameter list declares more than once. A member's
+/// parameters share one declaration space (10.3), so the repeat names nothing new -- and the body
+/// could not tell the two apart. Every member kind that takes parameters is covered; the report
+/// lands on the SECOND declaration, as csc's does.
+fn validate_parameter_names(binder: &mut Binder, parameters: &[Parameter]) {
+    let mut seen: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+    for parameter in parameters {
+        if bind_type(&parameter.ty).is_void() {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::VoidParameter,
+                parameter.ty.span,
+            ));
+        }
+        if !seen.insert(&parameter.name) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::DuplicateParameterName {
+                    name: parameter.name.clone(),
+                },
+                parameter.span,
+            ));
+        }
+    }
+}
+
+fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    let enclosing = named_symbol(namespace, &declaration.name);
+    for member in &declaration.members {
+        let parameters = match member {
+            Member::Method { parameters, .. }
+            | Member::Constructor { parameters, .. }
+            | Member::Indexer { parameters, .. }
+            | Member::Operator { parameters, .. } => parameters,
+            _ => continue,
+        };
+        validate_parameter_names(binder, parameters);
+    }
+    validate_volatile_fields(binder, namespace, declaration);
+    validate_operator_modifiers(binder, declaration);
+    validate_operator_arity(binder, declaration);
+    validate_conversion_operators(binder, declaration);
+    validate_const_field_initializers(binder, namespace, declaration);
+    validate_unsafe_permitted(binder, declaration);
+    validate_constructor_initializer_cycles(binder, declaration);
+    validate_attributes(binder, &declaration.attributes);
+    for member in &declaration.members {
+        if let Some(attributes) = member_attributes(member) {
+            validate_attributes(binder, attributes);
+        }
+    }
+    validate_operator_pairs(binder, declaration);
+    validate_conditional_methods(binder, declaration);
+    validate_top_level_type_modifiers(binder, namespace, declaration);
+    validate_static_member_modifiers(binder, declaration);
+    validate_destructors(binder, declaration);
+    validate_constructors(binder, declaration);
+    validate_interface_members(binder, declaration);
+    validate_event_types(binder, namespace, declaration);
+    let mut seen_names: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+    let mut method_names: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+    let mut duplicate_field_names: alloc::collections::BTreeSet<&str> =
+        alloc::collections::BTreeSet::new();
+    for member in &declaration.members {
+        match member {
+            Member::Field { declarators, .. } => {
+                for declarator in declarators {
+                    if !seen_names.insert(&declarator.name)
+                        || method_names.contains(&*declarator.name)
+                    {
+                        duplicate_field_names.insert(&declarator.name);
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::DuplicateMember {
+                                type_name: declaration.name.clone(),
+                                member: declarator.name.clone(),
+                            },
+                            declarator.span,
+                        ));
+                    }
+                }
+            }
+            Member::Property {
+                name,
+                span,
+                explicit_interface: None,
+                ..
+            } => {
+                if !seen_names.insert(name) || method_names.contains(&**name) {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::DuplicateMember {
+                            type_name: declaration.name.clone(),
+                            member: name.clone(),
+                        },
+                        *span,
+                    ));
+                }
+            }
+            Member::EventField { declarators, .. } => {
+                for declarator in declarators {
+                    if !seen_names.insert(&declarator.name)
+                        || method_names.contains(&*declarator.name)
+                    {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::DuplicateMember {
+                                type_name: declaration.name.clone(),
+                                member: declarator.name.clone(),
+                            },
+                            declarator.span,
+                        ));
+                    }
+                }
+            }
+            Member::Method {
+                name,
+                span,
+                explicit_interface: None,
+                ..
+            } => {
+                if seen_names.contains(&**name) {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::DuplicateMember {
+                            type_name: declaration.name.clone(),
+                            member: name.clone(),
+                        },
+                        *span,
+                    ));
+                }
+                method_names.insert(name);
+            }
+            _ => {}
+        }
+    }
+    let mut seen_methods: alloc::vec::Vec<(Box<str>, alloc::vec::Vec<TypeSymbol>)> =
+        alloc::vec::Vec::new();
+    for member in &declaration.members {
+        let named = match member {
+            Member::Method {
+                name,
+                parameters,
+                explicit_interface: None,
+                span,
+                ..
+            } => Some((name.clone(), parameters, span)),
+            Member::Indexer {
+                parameters, span, ..
+            } => Some((Box::from("this"), parameters, span)),
+            _ => None,
+        };
+        if let Some((name, parameters, span)) = named {
             let key = (
                 name.clone(),
                 parameters
@@ -278,12 +1467,39 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 binder.report(Diagnostic::new(
                     DiagnosticKind::DuplicateMethod {
                         type_name: declaration.name.clone(),
-                        member: name.clone(),
+                        member: name,
                     },
                     *span,
                 ));
             } else {
                 seen_methods.push(key);
+            }
+        }
+    }
+    let mut seen_constructors: alloc::vec::Vec<alloc::vec::Vec<TypeSymbol>> = alloc::vec::Vec::new();
+    for member in &declaration.members {
+        if let Member::Constructor {
+            modifiers,
+            parameters,
+            span,
+            ..
+        } = member
+        {
+            if modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
+                continue;
+            }
+            let key: alloc::vec::Vec<TypeSymbol> =
+                parameters.iter().map(parameter_symbol).collect();
+            if seen_constructors.contains(&key) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::DuplicateMethod {
+                        type_name: declaration.name.clone(),
+                        member: declaration.name.clone(),
+                    },
+                    *span,
+                ));
+            } else {
+                seen_constructors.push(key);
             }
         }
     }
@@ -378,6 +1594,81 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             declaration.span,
         ));
     }
+    if declaration.kind == TypeKind::Class
+        && declaration.modifiers.iter().any(|m| matches!(m, Modifier::Abstract))
+        && declaration.modifiers.iter().any(|m| matches!(m, Modifier::Sealed))
+    {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::AbstractTypeSealedOrStatic {
+                type_name: declaration.name.clone(),
+            },
+            declaration.span,
+        ));
+    }
+    if declaration.kind == TypeKind::Class {
+        let written: Vec<TypeSymbol> = declaration.bases.iter().map(bind_type).collect();
+        let class_bases: Vec<TypeSymbol> = {
+            let model = binder.model();
+            written
+                .iter()
+                .filter_map(|base| model.resolve_class_base(base))
+                .collect()
+        };
+        if class_bases.len() > 1 {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::MultipleClassBases {
+                    type_name: declaration.name.clone(),
+                    first: class_bases[0].to_string().into(),
+                    second: class_bases[1].to_string().into(),
+                },
+                declaration.span,
+            ));
+        }
+        let base_candidate = class_bases.first().cloned().or_else(|| {
+            let model = binder.model();
+            written
+                .iter()
+                .find_map(|base| model.resolve_struct_base(base))
+        });
+        if let Some(base) = &base_candidate {
+            let derives_from_sealed = binder
+                .model()
+                .get_by_symbol(base)
+                .is_some_and(|info| info.is_sealed);
+            if derives_from_sealed {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::DeriveFromSealed {
+                        derived: declaration.name.clone(),
+                        base: base.to_string().into(),
+                    },
+                    declaration.span,
+                ));
+            }
+        }
+    }
+    if matches!(declaration.kind, TypeKind::Struct | TypeKind::Interface) {
+        let written: Vec<TypeSymbol> = declaration.bases.iter().map(bind_type).collect();
+        let offenders: Vec<TypeSymbol> = {
+            let model = binder.model();
+            written
+                .iter()
+                .filter(|base| {
+                    model.get_by_symbol(base).is_some_and(|info| {
+                        info.kind != crate::symbols::TypeKind::Interface
+                    })
+                })
+                .cloned()
+                .collect()
+        };
+        for base in offenders {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::BaseTypeNotInterface {
+                    base: base.to_string().into(),
+                },
+                declaration.span,
+            ));
+        }
+    }
     if matches!(declaration.kind, TypeKind::Class | TypeKind::Struct) {
         let type_is_abstract = declaration
             .modifiers
@@ -468,6 +1759,16 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                             &alloc::format!("{}.{}", declaration.name, declarator.name),
                             declarator.span,
                         );
+                    }
+                }
+                Member::Indexer { modifiers, span, .. } => {
+                    if modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::ModifierNotValidForItem {
+                                modifier: "static".into(),
+                            },
+                            *span,
+                        ));
                     }
                 }
                 _ => {}
@@ -900,9 +2201,16 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         }
     }
     binder.enter_type(enclosing.clone());
+    for base in &declaration.bases {
+        binder.resolve_named_type(&bind_type(base), base.span);
+    }
     for member in &declaration.members {
         match member {
-            Member::Field { ty, .. } | Member::Indexer { ty, .. } => {
+            Member::Field { ty, .. }
+            | Member::Indexer { ty, .. }
+            | Member::Method { return_type: ty, .. }
+            | Member::Property { ty, .. }
+            | Member::Operator { return_type: ty, .. } => {
                 binder.resolve_named_type(&bind_type(ty), ty.span);
             }
             _ => {}
@@ -1101,6 +2409,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 ty,
                 declarators,
                 modifiers,
+                span: member_span,
                 ..
             } => {
                 let field_ty = binder.canonicalize(&bind_type(ty));
@@ -1120,10 +2429,17 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                             && declarator.initializer.is_none()
                             && !duplicate_field_names.contains(&*declarator.name);
                         let default_value = default_value_string(binder.model(), &field_ty);
+                        let shared_prefix = Span {
+                            start: member_span.start,
+                            end: declarators
+                                .first()
+                                .map_or(member_span.end, |first| first.span.start),
+                        };
                         binder.record_private_field(
                             &enclosing,
                             &declarator.name,
                             declarator.span,
+                            shared_prefix,
                             eligible_never_used,
                             default_value,
                         );
@@ -1171,6 +2487,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
     check_constant_cycles(binder, declaration);
     binder.check_interface_implementations(&enclosing, declaration);
     binder.check_overrides_have_base(&enclosing, declaration);
+    binder.check_property_overrides_have_base(&enclosing, declaration);
     binder.check_abstract_implementations(&enclosing, declaration);
 }
 
@@ -1419,7 +2736,7 @@ pub(crate) fn method_signature(type_name: &str, method: &str, parameters: &[Para
 /// The comma-separated parameter-type list for an indexer/operator signature message (the `int` in
 /// `C.this[int]`, the `C, int` in `C.operator +(C, int)`). Uses `parameter_symbol`, so a nested
 /// type is under-qualified exactly like a CS0051 method signature.
-fn parameter_type_list(parameters: &[Parameter]) -> String {
+pub(crate) fn parameter_type_list(parameters: &[Parameter]) -> String {
     let mut list = String::new();
     for (index, parameter) in parameters.iter().enumerate() {
         if index > 0 {
@@ -1635,6 +2952,259 @@ mod tests {
     }
 
     #[test]
+    fn a_name_declared_twice_in_one_declaration_space_is_cs0102_or_cs0111() {
+        assert_eq!(
+            sorted_codes("class C { int P { get { return 0; } } int P() { return 0; } }"),
+            [102]
+        );
+        assert_eq!(
+            sorted_codes(
+                "delegate void H(); \
+                 class C { int E { get { return 0; } } event H E; }"
+            ),
+            [102]
+        );
+        assert_eq!(sorted_codes("class C { int F; int F; }"), [102]);
+        assert_eq!(sorted_codes("enum E { A, A }"), [102]);
+        assert_eq!(
+            sorted_codes("class C { int P() { return 0; } int P { get { return 0; } } }"),
+            [102]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { int this[int i] { get { return i; } } \
+                 int this[int i] { get { return i; } } }"
+            ),
+            [111]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void M(int value, int value) { } }"),
+            [100]
+        );
+        assert_eq!(sorted_codes("delegate void H(int a, int a);"), [100]);
+
+        for clean in [
+            "class C { int M() { return 0; } int M(int i) { return i; } }",
+            "class C { int this[int i] { get { return i; } } \
+             int this[string s] { get { return 0; } } }",
+            "class C { int P { get { return 0; } } int this[int i] { get { return i; } } }",
+            "class C { public int F; public int G; static void M(int a, int b) { } }",
+            "enum E { A, B }",
+        ] {
+            assert_eq!(sorted_codes(clean), [], "expected no diagnostic for: {clean}");
+        }
+    }
+
+    /// These need a `System.Attribute` / `System.IDisposable` to exist, so they run against a
+    /// model carrying them -- which is what a real compilation has and what the harness now gives
+    /// lcsc. Both rules are PROVEN-only, so a model without those types reports nothing.
+    #[test]
+    fn attribute_classes_and_using_resources_must_be_what_they_claim() {
+        use crate::symbols::{Model, TypeInfo, TypeKind};
+        fn bcl() -> Model {
+            let mut model = Model::new();
+            model.insert(TypeInfo::new("System", "Object", TypeKind::Class));
+            model.insert(TypeInfo::new("System", "Attribute", TypeKind::Class));
+            model.insert(TypeInfo::new("System", "IDisposable", TypeKind::Interface));
+            model
+        }
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit_with_model(&unit, bcl())
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+
+        assert_eq!(codes("class NotOne { } [NotOne] class C { }"), [616]);
+        assert_eq!(
+            codes("class R { } class C { static void M(R r) { using (R x = r) { } } }"),
+            [1674]
+        );
+        assert_eq!(
+            codes("class A : System.Attribute { } [A, A] class C { }"),
+            [579]
+        );
+        assert_eq!(
+            codes(
+                "class A : System.Attribute { } \
+                 [A(C.V())] class C { public static int V() { return 1; } }"
+            ),
+            [182]
+        );
+
+        assert_eq!(
+            codes("class A : System.Attribute { } [A] class C { }"),
+            []
+        );
+        assert_eq!(
+            codes(
+                "class R : System.IDisposable { public void Dispose() { } } \
+                 class C { static void M(R r) { using (R x = r) { } } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn an_undefined_type_in_declaration_position_is_cs0246() {
+        assert_eq!(
+            sorted_codes("abstract class C { public abstract Missing M(); }"),
+            [246]
+        );
+        assert_eq!(
+            sorted_codes("abstract class C { public abstract Missing P { get; } }"),
+            [246]
+        );
+        assert_eq!(sorted_codes("class C : Missing { }"), [246]);
+        assert_eq!(sorted_codes("using X = Missing.Type; class C { }"), [246]);
+        assert_eq!(sorted_codes("class C { event Missing E; }"), [246]);
+
+        for clean in [
+            "class B { } class C { B M() { return null; } }",
+            "class B { } class C { B P { get { return null; } } }",
+            "class B { } class C : B { }",
+            "delegate void H(); class C { public event H E; }",
+        ] {
+            assert_eq!(sorted_codes(clean), [], "expected no diagnostic for: {clean}");
+        }
+    }
+
+    #[test]
+    fn constructor_chains_attributes_and_foreach_variables() {
+        assert_eq!(
+            sorted_codes("class C { public C() : this(0) { } public C(int v) : this() { } }"),
+            [768]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static void M(int[] vs) { foreach (int v in vs) { v = 1; } } }"
+            ),
+            [1656]
+        );
+
+        for clean in [
+            "class C { public C() : this(0) { } public C(int v) { } }",
+            "class C { static int M(int[] vs) { int t = 0; foreach (int v in vs) { t = v; } return t; } }",
+        ] {
+            assert_eq!(sorted_codes(clean), [], "expected no diagnostic for: {clean}");
+        }
+    }
+
+    #[test]
+    fn unsafe_code_is_cs0227_only_when_the_driver_omitted_the_option() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str, unsafe_option_missing: bool| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit_with_references_and_options(
+                &unit,
+                &[],
+                unsafe_option_missing,
+            )
+            .iter()
+            .map(Diagnostic::code)
+            .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+
+        assert_eq!(codes("unsafe class C { }", true), [227]);
+        assert_eq!(
+            codes("class C { unsafe static void M() { } }", true),
+            [227]
+        );
+        assert_eq!(codes("unsafe class C { }", false), []);
+        assert_eq!(
+            codes("class C { unsafe static void M() { } }", false),
+            []
+        );
+        assert_eq!(codes("class C { static void M() { } }", true), []);
+    }
+
+    #[test]
+    fn interface_and_operator_member_forms_that_are_not_csharp_1() {
+        assert_eq!(
+            sorted_codes("interface I { int M() { return 1; } }"),
+            [8022]
+        );
+        assert_eq!(
+            sorted_codes("interface I { int P { get { return 1; } } }"),
+            [8022]
+        );
+        assert_eq!(sorted_codes("interface I { class N { } }"), [8022]);
+        assert_eq!(sorted_codes("interface I { public int M(); }"), [8703]);
+        assert_eq!(sorted_codes("struct S { public S() { } }"), [8022]);
+        assert_eq!(
+            sorted_codes(
+                "class A { } class B { } \
+                 class C { public static implicit operator A(B v) { return null; } }"
+            ),
+            [556]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static void M() { try { } catch { } catch { } } }"
+            ),
+            [1017]
+        );
+        assert_eq!(
+            sorted_codes("class C { const int V = G(); static int G() { return 1; } }"),
+            [133]
+        );
+
+        for clean in [
+            "interface I { int M(); int P { get; } }",
+            "struct S { public S(int v) { } }",
+            "class A { public static implicit operator int(A v) { return 1; } }",
+            "class C { static void M() { try { } catch { } } }",
+            "class C { const int V = 1 + 2; }",
+        ] {
+            assert_eq!(sorted_codes(clean), [], "expected no diagnostic for: {clean}");
+        }
+    }
+
+    #[test]
+    fn destructor_and_constructor_declaration_rules() {
+        assert_eq!(sorted_codes("class C { ~D() { } }"), [574]);
+        assert_eq!(sorted_codes("struct S { ~S() { } }"), [575]);
+        assert_eq!(sorted_codes("class C { public ~C() { } }"), [106]);
+        assert_eq!(sorted_codes("class C { static ~C() { } }"), [106]);
+        assert_eq!(sorted_codes("class C { D() { } }"), [1520]);
+        assert_eq!(sorted_codes("class C { public static C() { } }"), [515]);
+        assert_eq!(sorted_codes("abstract enum E { A }"), [106]);
+
+        for clean in [
+            "class C { ~C() { } }",
+            "class C { extern ~C(); }",
+            "class C { C() { } }",
+            "class C { static C() { } }",
+            "public enum E { A }",
+        ] {
+            assert_eq!(sorted_codes(clean), [], "expected no diagnostic for: {clean}");
+        }
+    }
+
+    #[test]
+    fn a_base_list_may_name_only_what_can_be_derived_from() {
+        assert_eq!(sorted_codes("struct S { } class C : S { }"), [509]);
+        assert_eq!(sorted_codes("class B { } struct S : B { }"), [527]);
+        assert_eq!(sorted_codes("class B { } interface I : B { }"), [527]);
+
+        for clean in [
+            "interface I { } struct S : I { }",
+            "interface I { } interface J : I { }",
+            "class B { } class D : B { }",
+            "interface I { } class D : I { }",
+        ] {
+            assert_eq!(sorted_codes(clean), [], "expected no diagnostic for: {clean}");
+        }
+    }
+
+    #[test]
     fn predefined_type_with_no_backing_type_is_cs0518() {
         let prelude = "namespace System { public class Object { } public struct Void { } \
              public struct Boolean { } public struct Int32 { } public class String { } \
@@ -1748,6 +3318,157 @@ mod tests {
     }
 
     #[test]
+    fn a_non_permitted_volatile_field_type_is_cs0677() {
+        assert_eq!(sorted_codes("class C { public volatile long a; }"), [677]);
+        assert_eq!(sorted_codes("class C { public volatile ulong a; }"), [677]);
+        assert_eq!(sorted_codes("class C { public volatile double a; }"), [677]);
+        assert_eq!(sorted_codes("class C { public volatile decimal a; }"), [677]);
+        assert_eq!(
+            sorted_codes("struct S { public int x; } class C { public volatile S a; }"),
+            [677]
+        );
+        assert!(sorted_codes("class C { public volatile int a; }").is_empty());
+        assert!(sorted_codes("class C { public volatile bool a; }").is_empty());
+        assert!(sorted_codes("class C { public volatile char a; }").is_empty());
+        assert!(sorted_codes("class C { public volatile float a; }").is_empty());
+        assert!(sorted_codes("class C { public volatile string a; }").is_empty());
+    }
+
+    #[test]
+    fn a_static_indexer_is_cs0106() {
+        assert_eq!(
+            sorted_codes("class C { public static int this[int i] { get { return i; } } }"),
+            [106]
+        );
+        assert!(sorted_codes("class C { public int this[int i] { get { return i; } } }").is_empty());
+    }
+
+    #[test]
+    fn an_operator_that_is_not_public_static_is_cs0558() {
+        assert_eq!(sorted_codes("class C { C operator +(C a, C b) { return a; } }"), [558]);
+        assert_eq!(sorted_codes("class C { public C operator +(C a, C b) { return a; } }"), [558]);
+        assert_eq!(sorted_codes("class C { static C operator +(C a, C b) { return a; } }"), [558]);
+        assert_eq!(sorted_codes("class C { explicit operator int(C c) { return 0; } }"), [558]);
+        assert!(
+            sorted_codes("class C { public static C operator +(C a, C b) { return a; } }").is_empty()
+        );
+    }
+
+    #[test]
+    fn an_abstract_sealed_class_is_cs0418() {
+        assert_eq!(sorted_codes("abstract sealed class C { }"), [418]);
+        assert_eq!(sorted_codes("sealed abstract class C { }"), [418]);
+        assert!(sorted_codes("abstract class C { }").is_empty());
+        assert!(sorted_codes("sealed class C { }").is_empty());
+    }
+
+    #[test]
+    fn a_static_member_marked_virtual_is_cs0112() {
+        assert_eq!(sorted_codes("class C { public static virtual void M() { } }"), [112]);
+        assert!(sorted_codes("class C { public static void M() { } }").is_empty());
+    }
+
+    #[test]
+    fn an_enum_with_a_non_integer_underlying_is_cs1008() {
+        assert_eq!(sorted_codes("enum E : bool { A }"), [1008]);
+        assert_eq!(sorted_codes("enum E : char { A }"), [1008]);
+        assert_eq!(sorted_codes("enum E : string { A }"), [1008]);
+        assert!(sorted_codes("enum E : byte { A }").is_empty());
+        assert!(sorted_codes("enum E : long { A }").is_empty());
+        assert!(sorted_codes("enum E { A }").is_empty());
+    }
+
+    #[test]
+    fn an_invalid_delegate_modifier_is_cs0106() {
+        assert_eq!(sorted_codes("abstract delegate void D();"), [106]);
+        assert_eq!(sorted_codes("sealed delegate void D();"), [106]);
+        assert_eq!(sorted_codes("static delegate void D();"), [106]);
+        assert!(sorted_codes("delegate void D();").is_empty());
+        assert!(sorted_codes("public delegate void D();").is_empty());
+    }
+
+    #[test]
+    fn a_class_with_two_class_bases_is_cs1721() {
+        assert_eq!(sorted_codes("class A { } class B { } class C : A, B { }"), [1721]);
+        assert!(sorted_codes("class A { } interface I { } class C : A, I { }").is_empty());
+        assert!(sorted_codes("class A { } class C : A { }").is_empty());
+    }
+
+    #[test]
+    fn an_event_of_non_delegate_type_is_cs0066() {
+        assert_eq!(sorted_codes("class C { public event int E; }"), [66]);
+        assert_eq!(sorted_codes("class C { public event string E; }"), [66]);
+        assert!(sorted_codes("delegate void D(); class C { public event D E; }").is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_property_is_cs0102() {
+        assert_eq!(
+            sorted_codes(
+                "class C { public int P { get { return 0; } } public int P { get { return 1; } } }"
+            ),
+            [102]
+        );
+        assert!(sorted_codes(
+            "class C { public int P { get { return 0; } } public int Q { get { return 1; } } }"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_constructor_is_cs0111() {
+        assert_eq!(sorted_codes("class C { C(int v) { } C(int v) { } }"), [111]);
+        assert!(sorted_codes("class C { C(int v) { } C(string v) { } }").is_empty());
+        assert!(sorted_codes("class C { C() { } static C() { } }").is_empty());
+    }
+
+    #[test]
+    fn a_unary_only_operator_with_two_parameters_is_cs1020() {
+        assert_eq!(
+            sorted_codes("class C { public static C operator !(C a, C b) { return a; } }"),
+            [1020]
+        );
+        assert_eq!(
+            sorted_codes("class C { public static C operator ~(C a, C b) { return a; } }"),
+            [1020]
+        );
+        assert!(
+            sorted_codes("class C { public static C operator +(C a, C b) { return a; } }").is_empty()
+        );
+        assert!(sorted_codes("class C { public static C operator !(C a) { return a; } }").is_empty());
+    }
+
+    #[test]
+    fn a_conditional_method_with_a_nonvoid_return_is_cs0578() {
+        assert_eq!(
+            sorted_codes(
+                "class C { [System.Diagnostics.Conditional(\"TRACE\")] public static int M() { return 1; } }"
+            ),
+            [578]
+        );
+        assert!(sorted_codes(
+            "class C { [System.Diagnostics.Conditional(\"TRACE\")] public static void M() { } }"
+        )
+        .is_empty());
+        assert!(sorted_codes("class C { public static int M() { return 1; } }").is_empty());
+    }
+
+    #[test]
+    fn deriving_from_a_sealed_class_is_cs0509() {
+        assert_eq!(sorted_codes("sealed class B { } class C : B { }"), [509]);
+        assert!(sorted_codes("class B { } class C : B { }").is_empty());
+    }
+
+    #[test]
+    fn invalid_modifiers_on_a_top_level_type() {
+        assert_eq!(sorted_codes("private class C { }"), [1527]);
+        assert_eq!(sorted_codes("protected class C { }"), [1527]);
+        assert_eq!(sorted_codes("new class C { }"), [106]);
+        assert!(sorted_codes("internal class C { }").is_empty());
+        assert!(sorted_codes("class O { private class N { } }").is_empty());
+    }
+
+    #[test]
     fn field_never_used_is_cs0169() {
         assert_eq!(sorted_codes("class C { private int f; }"), [169]);
         assert_eq!(sorted_codes("class C { int f; }"), [169]);
@@ -1759,6 +3480,13 @@ mod tests {
         assert_eq!(sorted_codes("class C { int f = 5; }"), [414]);
         assert_eq!(sorted_codes("class C { Widget w; }"), [246]);
         assert_eq!(sorted_codes("class C { int f; int f; }"), [102]);
+
+        assert_eq!(sorted_codes("class C { Missing f; }"), [246]);
+        assert_eq!(sorted_codes("class C { volatile long f; }"), [677]);
+        assert_eq!(
+            sorted_codes("class C { int a = Missing.Value, b; int Get() { return a; } }"),
+            [103, 169]
+        );
     }
 
     #[test]
@@ -1845,6 +3573,94 @@ mod tests {
     #[test]
     fn void_field_is_cs0670() {
         assert_eq!(sorted_codes("class C { void x; }"), [670]);
+    }
+
+    #[test]
+    fn void_local_is_cs1547() {
+        assert_eq!(
+            sorted_codes("class C { static void M() { void value; } }"),
+            [1547]
+        );
+    }
+
+    #[test]
+    fn switch_on_a_non_governing_type_is_cs0151() {
+        assert_eq!(
+            sorted_codes("class C { static void M(C value) { switch (value) { default: break; } } }"),
+            [151]
+        );
+        assert!(sorted_codes(
+            "class C { static void M(int x) { switch (x) { default: break; } } }"
+        )
+        .is_empty());
+        assert!(sorted_codes(
+            "enum E { A } class C { static void M(E e) { switch (e) { default: break; } } }"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn field_initializer_referencing_an_instance_member_is_cs0236() {
+        assert_eq!(sorted_codes("class C { int a = 1; int b = a; }"), [236]);
+        assert_eq!(sorted_codes("class C { int a = M(); int M() { return 1; } }"), [236]);
+        assert_eq!(sorted_codes("class C { int a = P; int P { get { return 1; } } }"), [236]);
+        assert_eq!(
+            sorted_codes("class B { public int f = 1; } class C : B { int a = f; }"),
+            [236]
+        );
+        assert_eq!(sorted_codes("class C { int a = 1; static int s = a; }"), [236]);
+        assert_eq!(sorted_codes("class C { int a = 1; const int k = a; }"), [236]);
+
+        assert!(!sorted_codes("class C { static int s = 1; int x = s; }").contains(&236));
+        assert!(
+            !sorted_codes("class C { static int SM() { return 1; } int x = SM(); }").contains(&236)
+        );
+        assert!(!sorted_codes(
+            "class C { static int SP { get { return 1; } } int x = SP; }"
+        )
+        .contains(&236));
+        assert!(!sorted_codes("class C { int x = 1 + 2; }").contains(&236));
+        assert!(!sorted_codes(
+            "class C { static C other; int first = 1; int x = other.first; }"
+        )
+        .contains(&236));
+        assert!(sorted_codes(
+            "class C { static int s = 1; int x = s; int Get() { return x; } }"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn switch_case_label_must_convert_to_the_governing_type() {
+        assert_eq!(
+            sorted_codes("class C { static void M(string x) { switch (x) { case 1: break; } } }"),
+            [29]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void M(byte x) { switch (x) { case 300: break; } } }"),
+            [31]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void M(char x) { switch (x) { case 65: break; } } }"),
+            [266]
+        );
+        assert_eq!(
+            sorted_codes(
+                "enum E { A } class C { static void M(E x) { switch (x) { case 1: break; } } }"
+            ),
+            [266]
+        );
+        for ok in [
+            "class C { static void M(int x) { switch (x) { case 5: break; } } }",
+            "class C { static void M(long x) { switch (x) { case 5: break; } } }",
+            "class C { static void M(byte x) { switch (x) { case 200: break; } } }",
+            "class C { static void M(char x) { switch (x) { case 'a': break; } } }",
+            "class C { static void M(string x) { switch (x) { case \"y\": break; case null: break; } } }",
+            "enum E { A } class C { static void M(E x) { switch (x) { case E.A: break; } } }",
+            "enum E { A } class C { static void M(E x) { switch (x) { case 0: break; } } }",
+        ] {
+            assert!(sorted_codes(ok).is_empty(), "false positive on: {ok}");
+        }
     }
 
     #[test]
@@ -2412,6 +4228,7 @@ mod tests {
                 is_virtual: true,
                 is_abstract: false,
                 is_override: false,
+                is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
             });
@@ -2447,6 +4264,238 @@ mod tests {
             ),
             [115]
         );
+    }
+
+    #[test]
+    fn an_endless_loop_with_a_reachable_break_completes_and_a_conditional_assigns_on_both_arms() {
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+
+        assert_eq!(codes("class C { static int M() { while (true) { break; } } }"), [161]);
+        assert_eq!(codes("class C { static int M() { for (;;) { break; } } }"), [161]);
+        assert_eq!(
+            codes("class C { static int M() { int v; while (true) { break; } return v; } }"),
+            [165]
+        );
+        assert_eq!(codes("class C { static int M() { while (true) { return 1; } } }"), []);
+        assert_eq!(
+            codes("class C { static int M(int x) { while (true) { switch (x) { default: break; } } } }"),
+            []
+        );
+        assert_eq!(codes("class C { static int M() { while (true) { return 1; break; } } }"), [162]);
+
+        assert_eq!(
+            codes("class C { static int M(bool c) { int v; int t = c ? (v = 1) : 0; return v + t; } }"),
+            [165]
+        );
+        assert_eq!(
+            codes("class C { static int M(bool c) { int v; return c ? (v = 1) : v; } }"),
+            [165]
+        );
+        assert_eq!(
+            codes("class C { static int M(bool c) { int v; int t = c ? (v = 1) : (v = 2); return v + t; } }"),
+            []
+        );
+        assert_eq!(
+            codes("class C { static int M(bool c) { int v; return (v = 1) == 1 ? v : v; } }"),
+            []
+        );
+    }
+
+    #[test]
+    fn the_unsafe_gate_covers_every_unit_of_a_multi_file_compilation() {
+        let bind = |sources: &[&str], option_missing: bool| {
+            let units: Vec<_> = sources
+                .iter()
+                .map(|s| parse_compilation_unit(s).unit)
+                .collect();
+            let mut codes: Vec<u16> =
+                bind_compilation_units_with_references_and_options(&units, &[], option_missing)
+                    .iter()
+                    .flatten()
+                    .map(Diagnostic::code)
+                    .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+        const SAFE: &str = "class Main2 { static int Main() { return 42; } }";
+        const UNSAFE: &str = "class Poke { static unsafe void P() { } }";
+
+        assert_eq!(bind(&[UNSAFE], true), [227]);
+        assert_eq!(bind(&[SAFE, UNSAFE], true), [227]);
+        assert_eq!(bind(&[UNSAFE, SAFE], true), [227]);
+        assert_eq!(bind(&[UNSAFE], false), []);
+        assert_eq!(bind(&[SAFE, UNSAFE], false), []);
+        assert_eq!(bind(&[SAFE, "class Other { }"], true), []);
+    }
+
+    #[test]
+    fn a_local_constant_does_not_outlive_its_block() {
+        let codes = |body: &str| {
+            let source = alloc::format!("class C {{ static int M() {{ {body} }} }}");
+            let unit = parse_compilation_unit(&source).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .filter(|code| *code == 103)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+
+        assert_eq!(codes("{ const int hidden = 42; } return hidden;"), [103]);
+        assert_eq!(codes("const int k = 42; return k;"), []);
+        assert_eq!(codes("const int k = 42; { return k; } "), []);
+        assert_eq!(codes("{ const int k = 42; return k; } "), []);
+        assert_eq!(codes("{ const int a = 1; } { const int b = 2; return b; }"), []);
+        assert_eq!(
+            codes("int t = 0; for (int i = 0; i < 2; i++) { const int s = 5; t += s; } return t;"),
+            []
+        );
+    }
+
+    #[test]
+    fn a_compound_assignment_to_an_indexer_is_a_read_modify_write() {
+        const INDEXER: &str = "class C { public int this[int i] { get { return 0; } set { } } \
+                               static C Next() { return null; } ";
+
+        let codes = |body: &str| {
+            let source = alloc::format!("{INDEXER} static void M() {{ {body} }} }}");
+            let unit = parse_compilation_unit(&source).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+
+        assert_eq!(codes("C c = new C(); c[0] += 1;"), []);
+        assert_eq!(
+            codes("C c = new C(); c[0] -= 1; c[0] *= 2; c[0] /= 2; c[0] %= 2;"),
+            []
+        );
+        assert_eq!(
+            codes("C c = new C(); c[0] |= 1; c[0] &= 1; c[0] ^= 1; c[0] <<= 1; c[0] >>= 1;"),
+            []
+        );
+        assert_eq!(codes("C c = new C(); int x = (c[0] += 1); x = x;"), []);
+        assert_eq!(
+            codes("C c = new C(); int k = 1; c[k] += 1; c[k - 1] += 1; c[-k] += 1;"),
+            []
+        );
+
+        assert_eq!(codes("Next()[0] += 1;"), [131]);
+        assert_eq!(codes("C c = new C(); c[c[0]] += 1;"), [131]);
+    }
+
+    #[test]
+    fn a_nested_type_of_a_referenced_type_is_nameable() {
+        use crate::symbols::{Model, TypeInfo, TypeKind};
+
+        let model_with_nested = || {
+            let mut model = Model::new();
+            model.insert(TypeInfo::new("System", "Object", TypeKind::Class));
+            let mut outer = TypeInfo::new("Lib", "Outer", TypeKind::Class);
+            outer.is_external = true;
+            model.insert(outer);
+            let mut nested = TypeInfo::new("Lib.Outer", "Inner", TypeKind::Class);
+            nested.is_external = true;
+            nested.enclosing = Some("Lib.Outer".into());
+            model.insert(nested);
+            model
+        };
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit_with_model(&unit, model_with_nested())
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+
+        assert_eq!(codes("class C { void M(Lib.Outer.Inner x) { } }"), []);
+        assert_eq!(codes("class C { void M(Lib.Outer x) { } }"), []);
+        assert_eq!(codes("using Lib; class C { void M(Outer.Inner x) { } }"), []);
+        assert_eq!(codes("class C { void M(Inner x) { } }"), [246]);
+    }
+
+    #[test]
+    fn cs0507_a_protected_internal_base_takes_a_different_override_spelling_across_assemblies() {
+        use crate::symbols::{Accessibility, MethodSymbol, Model, TypeInfo, TypeKind};
+
+        fn model_with(seam_is_external: bool) -> Model {
+            let mut model = Model::new();
+            let mut object = TypeInfo::new("System", "Object", TypeKind::Class);
+            object.methods.push(MethodSymbol {
+                name: "ToString".into(),
+                return_type: TypeSymbol::Special(SpecialType::String),
+                parameters: Vec::new(),
+                is_static: false,
+                is_params: false,
+                is_vararg: false,
+                is_virtual: true,
+                is_abstract: false,
+                is_override: false,
+                is_sealed: false,
+                accessibility: Accessibility::Public,
+                conditional: Vec::new(),
+            });
+            model.insert(object);
+            let mut seam = TypeInfo::new("", "Seam", TypeKind::Class);
+            seam.is_external = seam_is_external;
+            seam.methods.push(MethodSymbol {
+                name: "Read".into(),
+                return_type: TypeSymbol::Special(SpecialType::Int32),
+                parameters: vec![TypeSymbol::Special(SpecialType::Int32)],
+                is_static: false,
+                is_params: false,
+                is_vararg: false,
+                is_virtual: false,
+                is_abstract: true,
+                is_override: false,
+                is_sealed: false,
+                accessibility: Accessibility::ProtectedInternal,
+                conditional: Vec::new(),
+            });
+            model.insert(seam);
+            model
+        }
+        let codes = |source: &str, seam_is_external: bool| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> =
+                bind_compilation_unit_with_model(&unit, model_with(seam_is_external))
+                    .iter()
+                    .map(Diagnostic::code)
+                    .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+        let drv = |spelling: &str| {
+            format!("class Drv : Seam {{ {spelling} override int Read(int ch) {{ return ch; }} }}")
+        };
+
+        assert_eq!(codes(&drv("protected"), true), []);
+        assert_eq!(codes(&drv("protected internal"), true), [507]);
+        assert_eq!(codes(&drv("public"), true), [507]);
+
+        assert_eq!(codes(&drv("protected internal"), false), []);
+        assert_eq!(codes(&drv("protected"), false), [507]);
+        assert_eq!(codes(&drv("public"), false), [507]);
     }
 
     #[test]
@@ -2499,6 +4548,7 @@ mod tests {
             is_virtual: false,
             is_abstract: false,
             is_override: false,
+            is_sealed: false,
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
         });

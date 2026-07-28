@@ -1,0 +1,19 @@
+[package]
+name = "lamella-stlink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "An ST-Link debug-probe host: the USB command protocol for ST-Link/V2, V2-1 and V3, presented as Lamella's probe-neutral target-access seam."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The probe-neutral seam. An ST-Link is a HIGH-LEVEL probe: it performs the ADIv5 DP/AP layer in its
+# own firmware and exposes memory access and run control directly, so this crate implements
+# `TargetAccess` and never appears at the `DapAccess` layer.
+lamella-probe-core = { path = "../lamella-probe-core" }
+# The USB bulk transport. An ST-Link's debug interface is a vendor-specific bulk endpoint pair.
+lamella-usbbulk = { path = "../lamella-usbbulk" }

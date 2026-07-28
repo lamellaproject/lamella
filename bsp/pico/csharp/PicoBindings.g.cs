@@ -15,5 +15,13 @@ namespace Lamella.Generated
         public const uint UART0_CLK_PERI_HZ = 12000000;
         public const uint UART0_IBRD_115200_XOSC_12MHZ = 6;
         public const uint UART0_FBRD_115200_XOSC_12MHZ = 33;
+
+        public const uint XOSC_HZ_PLL_125_48 = 12000000;
+        public const uint CLK_SYS_HZ_PLL_125_48 = 125000000;
+        public const uint CLK_USB_HZ_PLL_125_48 = 48000000;
+        public const uint PLL_SYS_FBDIV_PLL_125_48 = 125;
+        public const uint PLL_SYS_PRIM_PLL_125_48 = 0x62000;
+        public const uint PLL_USB_FBDIV_PLL_125_48 = 100;
+        public const uint PLL_USB_PRIM_PLL_125_48 = 0x55000;
     }
 }

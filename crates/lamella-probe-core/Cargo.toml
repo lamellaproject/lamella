@@ -1,0 +1,16 @@
+[package]
+name = "lamella-probe-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The probe-neutral debug seam: the ADIv5 DP/AP access trait, the architecture-neutral target-access trait the flash and diagnostic algorithms consume, and the ARM bridge between them."
+
+[lints]
+workspace = true
+
+# Deliberately DEPENDENCY-FREE: this crate is the bottom of the probe stack, so every probe family
+# (CMSIS-DAP, ST-Link, FTDI-MPSSE) and every vendor flash crate can depend on it without a cycle.
+# No transport, no USB, no chip-family deps belong here.
+[dependencies]

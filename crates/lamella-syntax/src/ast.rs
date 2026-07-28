@@ -602,6 +602,9 @@ pub struct EnumDecl {
 /// One member of an [`EnumDecl`] (21.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumMember {
+    /// The attribute sections applied to the member (24.2). An enum member is an attribute
+    /// TARGET like any other declaration, so `[Obsolete] Value` parses.
+    pub attributes: Vec<AttributeSection>,
     /// The member's name.
     pub name: Box<str>,
     /// The constant value expression, if given with `=`.

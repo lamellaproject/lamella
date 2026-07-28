@@ -230,7 +230,8 @@ impl Capabilities {
     /// `0` = unknown (a custom board reports no model; a firmware may not know its ids).
     pub const PROFILE_CHIPID: u32 = 1 << 10;
     /// On-device TELEMETRY / live-signal SCOPE (the `lamella_runner::telemetry` 0x40 message
-    /// range). RESERVED.
+    /// range). RESERVED: no firmware advertises this bit and no host may rely on it. First of
+    /// the reserved 11-31 capability band.
     pub const TELEMETRY: u32 = 1 << 11;
 
     /// Whether this set includes `flag`.
@@ -457,11 +458,26 @@ pub mod board_model {
     pub const ESP32_C6: u16 = 14;
     /// Arduino Due (ATSAM3X8E, Cortex-M3, 2x256 KiB EEFC planes) -- the first `sam3x`-family board.
     pub const ARDUINO_DUE: u16 = 15;
+    /// Adafruit Feather M0 Express (ATSAMD21G18A, Cortex-M0+) -- a `samd21`-family board with no
+    /// on-board debugger and no bridge UART: it is programmed through its own USB bootloader.
+    pub const FEATHER_M0_EXPRESS: u16 = 16;
+    /// Adafruit Feather M0 WiFi (ATSAMD21G18A + an ATWINC1500 on the board) -- the same host MCU
+    /// and bootloader-only deploy path as the Express, wired to the WiFi part the ATSAMW25 module
+    /// integrates. Distinct board: the WINC reaches a different SERCOM on different pads.
+    pub const FEATHER_M0_WIFI: u16 = 17;
+    /// Adafruit Feather RP2040 Adalogger (RP2040, 8 MB flash, microSD, STEMMA QT) -- the first
+    /// `rp2040`-family board that is not a Raspberry Pi one, and the first with an on-board
+    /// microSD slot.
+    pub const FEATHER_RP2040_ADALOGGER: u16 = 18;
+    /// Adafruit Feather M0 Adalogger (ATSAMD21G18A, Cortex-M0+, microSD, no SPI flash) -- the same
+    /// host MCU and bootloader-only deploy path as the Express and the WiFi, distinguished by what
+    /// is soldered beside it: a card slot on SERCOM4 where the Express has 2 MB of SPI flash.
+    pub const FEATHER_M0_ADALOGGER: u16 = 19;
 
-    /// The display name for a `board_model` wire value, or `None` for an unrecognized code. THE ONE canonical
-    /// value -> name map: the JS registry (`engine-sdk/registry.data.mjs`, via a generated `board_models.json`),
-    /// the MCP servers, and the Lamella Link debug backend all DERIVE from this instead of hand-mirroring a
-    /// table.
+    /// The display name for a `board_model` wire value, or `None` for an unrecognized code. This is the one
+    /// canonical value -> name map: every surface that displays a board name derives from it rather than
+    /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
+    /// surfaces picks it up.
     #[must_use]
     pub fn name(model: u16) -> Option<&'static str> {
         Some(match model {
@@ -481,6 +497,10 @@ pub mod board_model {
             PICO => "Raspberry Pi Pico",
             ESP32_C6 => "Espressif ESP32-C6",
             ARDUINO_DUE => "Arduino Due",
+            FEATHER_M0_EXPRESS => "Adafruit Feather M0 Express",
+            FEATHER_M0_WIFI => "Adafruit Feather M0 WiFi",
+            FEATHER_RP2040_ADALOGGER => "Adafruit Feather RP2040 Adalogger",
+            FEATHER_M0_ADALOGGER => "Adafruit Feather M0 Adalogger",
             _ => return None,
         })
     }

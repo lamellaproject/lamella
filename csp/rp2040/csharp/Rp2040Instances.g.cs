@@ -15,8 +15,15 @@ namespace Lamella.Generated
         public const uint PADS_BANK0_BASE = 0x4001C000;
         public const uint PADS_BANK0_RESET_BIT = 8;
         public const uint PADS_BANK0_RESET_MASK = 0x100;
+        public const uint PLL_SYS_BASE = 0x40028000;
+        public const uint PLL_SYS_RESET_BIT = 12;
+        public const uint PLL_SYS_RESET_MASK = 0x1000;
+        public const uint PLL_USB_BASE = 0x4002C000;
+        public const uint PLL_USB_RESET_BIT = 13;
+        public const uint PLL_USB_RESET_MASK = 0x2000;
         public const uint UART0_BASE = 0x40034000;
         public const uint UART0_RESET_BIT = 22;
         public const uint UART0_RESET_MASK = 0x400000;
+        public const uint SIO_BASE = 0xD0000000;
     }
 }

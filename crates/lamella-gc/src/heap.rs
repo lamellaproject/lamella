@@ -325,7 +325,8 @@ impl Heap {
         let resolver = TableResolver {
             type_descs: &self.type_descs,
         };
-        self.top = mark_compact(&mut self.bytes, &resolver, enumerate_roots);
+        let top = self.top;
+        self.top = mark_compact(&mut self.bytes, top, &resolver, enumerate_roots);
     }
 
     /// Collects with the roots taken from a single AOT frame, located through one
@@ -425,14 +426,27 @@ impl Heap {
 /// (to trace and relocate). `for_each_ref_offset` is a callback rather than a returned
 /// slice so the device side reads the inline `ref_offsets` array straight out of the
 /// descriptor with no per-object allocation (the host side stays `alloc`-free here too).
+///
+/// # Why both questions also take the object's first payload word
+///
+/// An ARRAY's footprint is LENGTH-dependent, so its descriptor cannot state it -- the
+/// device array descriptor spends word 0 on a mark plus rank and word 1 on the element
+/// kind, and the length lives at payload offset 0 of the object itself. A resolver that
+/// saw only the header word could not size an array or place its element slots, so both
+/// questions carry `payload_head`: the object's first payload word, which an array
+/// descriptor reads as the element count and a class descriptor ignores. The engine
+/// reads it defensively (0 when the object has no first word), so a zero-payload class
+/// never indexes past the region.
 #[cfg(feature = "gc-collect")]
 pub(crate) trait TypeResolver {
-    /// The payload size, in bytes, of the object whose header holds `header_word`.
-    fn payload_size(&self, header_word: u32) -> u32;
+    /// The payload size, in bytes, of the object whose header holds `header_word` and
+    /// whose first payload word is `payload_head` (an array's element count).
+    fn payload_size(&self, header_word: u32, payload_head: u32) -> u32;
 
     /// Invokes `f` with each byte offset (within the payload) of a reference field of
-    /// the object whose header holds `header_word`.
-    fn for_each_ref_offset(&self, header_word: u32, f: &mut dyn FnMut(u32));
+    /// the object whose header holds `header_word` and whose first payload word is
+    /// `payload_head` (an array's element count).
+    fn for_each_ref_offset(&self, header_word: u32, payload_head: u32, f: &mut dyn FnMut(u32));
 
     /// Invokes `f` with each byte offset (within the payload) of a TAGGED-value slot of
     /// the object whose header holds `header_word` -- traced by tag (see
@@ -452,11 +466,14 @@ pub(crate) struct TableResolver<'a> {
 
 #[cfg(feature = "gc-collect")]
 impl TypeResolver for TableResolver<'_> {
-    fn payload_size(&self, header_word: u32) -> u32 {
+    /// `payload_head` is unread: a host header word is a table index, and the host table
+    /// states every payload size outright (the host heap has no length-dependent form).
+    fn payload_size(&self, header_word: u32, _payload_head: u32) -> u32 {
         self.type_descs[header_word as usize].payload_size
     }
 
-    fn for_each_ref_offset(&self, header_word: u32, f: &mut dyn FnMut(u32)) {
+    /// `payload_head` is unread, for the reason given on [`TableResolver::payload_size`].
+    fn for_each_ref_offset(&self, header_word: u32, _payload_head: u32, f: &mut dyn FnMut(u32)) {
         for &ref_offset in &self.type_descs[header_word as usize].ref_offsets {
             f(ref_offset);
         }
@@ -483,15 +500,23 @@ impl TypeResolver for TableResolver<'_> {
 /// clobbers an unmoved survivor). RELOCATE rewrites every root and every survivor
 /// field through the `old_payload -> new_payload` forwarding map; null stays null. The
 /// freed tail is zeroed so a later allocation never reads stale bytes.
+/// NON-HEAP references are expected and are SKIPPED, not traced. An `ObjectRef` root or
+/// reference field may legitimately hold an address outside this region: a string literal
+/// lowers to a flash/rodata blob and a `Type` is never heap-allocated, so both are real
+/// references that the allocator never handed out. Such a word is left exactly as it is --
+/// tracing it would index the region out of bounds, and relocating it would rewrite a
+/// flash pointer into a heap address. `top` bounds the live region for that test.
 #[cfg(feature = "gc-collect")]
 pub(crate) fn mark_compact<R>(
     bytes: &mut [u8],
+    top: u32,
     resolver: &dyn TypeResolver,
     mut enumerate_roots: R,
 ) -> u32
 where
     R: FnMut(&mut dyn FnMut(&mut Ref)),
 {
+    let is_heap = |reference: Ref| reference.0 >= HEADER_SIZE && reference.0 < top;
     use alloc::collections::{BTreeMap, BTreeSet};
 
     let read_word = |bytes: &[u8], addr: u32| -> u32 {
@@ -501,18 +526,20 @@ where
     let read_field = |bytes: &[u8], reference: Ref, ref_offset: u32| -> Ref {
         Ref(read_word(bytes, reference.0 + ref_offset))
     };
+    let read_head = |bytes: &[u8], reference: Ref| -> u32 { read_word(bytes, reference.0) };
 
     let mut live: BTreeSet<u32> = BTreeSet::new();
     let mut work: Vec<Ref> = Vec::new();
     let mark = |reference: &mut Ref, live: &mut BTreeSet<u32>, work: &mut Vec<Ref>| {
-        if !reference.is_null() && live.insert(reference.0) {
+        if !reference.is_null() && is_heap(*reference) && live.insert(reference.0) {
             work.push(*reference);
         }
     };
     enumerate_roots(&mut |slot| mark(slot, &mut live, &mut work));
     while let Some(object) = work.pop() {
         let header_word = read_word(bytes, object.header_addr());
-        resolver.for_each_ref_offset(header_word, &mut |ref_offset| {
+        let payload_head = read_head(bytes, object);
+        resolver.for_each_ref_offset(header_word, payload_head, &mut |ref_offset| {
             let mut child = read_field(bytes, object, ref_offset);
             mark(&mut child, &mut live, &mut work);
         });
@@ -529,7 +556,8 @@ where
     let mut dest = ALIGN;
     for old_payload in live.iter().copied() {
         let header_word = read_word(bytes, old_payload - HEADER_SIZE);
-        let reserved = align_up(resolver.payload_size(header_word));
+        let payload_head = read_head(bytes, Ref(old_payload));
+        let reserved = align_up(resolver.payload_size(header_word, payload_head));
         let object_size = HEADER_SIZE + reserved;
         let new_payload = dest + HEADER_SIZE;
         forward.insert(old_payload, new_payload);
@@ -542,7 +570,7 @@ where
     }
 
     let relocate = |reference: &mut Ref| {
-        if !reference.is_null() {
+        if !reference.is_null() && is_heap(*reference) {
             *reference = Ref(forward[&reference.0]);
         }
     };
@@ -551,7 +579,10 @@ where
         let new_ref = Ref(new_payload);
         let header_word = read_word(bytes, new_ref.header_addr());
         let mut offsets: Vec<u32> = Vec::new();
-        resolver.for_each_ref_offset(header_word, &mut |ref_offset| offsets.push(ref_offset));
+        let payload_head = read_head(bytes, new_ref);
+        resolver.for_each_ref_offset(header_word, payload_head, &mut |ref_offset| {
+            offsets.push(ref_offset);
+        });
         for ref_offset in offsets {
             let mut child = read_field(bytes, new_ref, ref_offset);
             relocate(&mut child);
@@ -1036,6 +1067,47 @@ mod tests {
 
     #[cfg(feature = "gc-collect")]
     #[test]
+    fn a_non_heap_root_is_skipped_not_traced_or_relocated() {
+        let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
+        let garbage = heap.alloc(1).unwrap();
+        let a = heap.alloc(0).unwrap();
+        let b = heap.alloc(1).unwrap();
+        heap.write_ref_field(a, 0, b);
+        let _ = garbage;
+        let top_before = heap.top();
+
+        let flash_literal = Ref(0x0004_1234);
+        let at_top = Ref(top_before);
+
+        let entry = StackMapEntry { return_pc: 0x100, frame_size: 16, ref_offsets: vec![0, 4, 8] };
+        let maps = StackMapTable::from_entries(vec![entry]);
+        let mut stack = vec![0u8; 32];
+        put_ref(&mut stack, 0, a);
+        put_ref(&mut stack, 4, flash_literal);
+        put_ref(&mut stack, 8, at_top);
+        put_ref(&mut stack, 16, Ref(0x999));
+
+        heap.collect_stack(&mut stack, 0, 0x100, &maps);
+
+        let a_new = get_ref(&stack, 0);
+        assert_ne!(a_new, a, "the surviving heap root actually moved");
+        assert_eq!(a_new, Ref(ALIGN + HEADER_SIZE), "survivors pack from the base");
+        assert_eq!(heap.type_id_of(a_new), 0, "type preserved across the move");
+        assert_eq!(
+            get_ref(&stack, 4),
+            flash_literal,
+            "a flash literal root must survive a collection verbatim"
+        );
+        assert_eq!(
+            get_ref(&stack, 8),
+            at_top,
+            "an address AT the bump pointer is not a payload the allocator handed out"
+        );
+        assert!(heap.top() < top_before, "unrooted garbage was still reclaimed");
+    }
+
+    #[test]
+    #[cfg(feature = "gc-collect")]
     fn stack_walk_with_unmapped_top_pc_collects_with_no_roots() {
         let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
         let a = heap.alloc(0).unwrap();
@@ -1057,5 +1129,78 @@ mod tests {
         assert_eq!(heap.used(), 0);
         let fresh = heap.alloc(0).unwrap();
         assert_eq!(fresh, Ref(ALIGN + HEADER_SIZE));
+    }
+
+    /// A resolver that answers exactly like [`TableResolver`] but RECORDS the `payload_head` it
+    /// was handed for each object. The device path needs that word to be the object's own first
+    /// payload word -- it is where an array keeps its element count -- so this pins the engine's
+    /// half of that contract without restating the device's array arithmetic, which would only
+    /// compare the reader against a replica of itself.
+    #[cfg(feature = "gc-collect")]
+    struct HeadRecordingResolver<'a> {
+        inner: TableResolver<'a>,
+        seen: core::cell::RefCell<Vec<(u32, u32)>>,
+    }
+
+    #[cfg(feature = "gc-collect")]
+    impl TypeResolver for HeadRecordingResolver<'_> {
+        fn payload_size(&self, header_word: u32, payload_head: u32) -> u32 {
+            self.seen.borrow_mut().push((header_word, payload_head));
+            self.inner.payload_size(header_word, payload_head)
+        }
+
+        fn for_each_ref_offset(&self, header_word: u32, payload_head: u32, f: &mut dyn FnMut(u32)) {
+            self.seen.borrow_mut().push((header_word, payload_head));
+            self.inner.for_each_ref_offset(header_word, payload_head, f);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "gc-collect")]
+    fn the_engine_hands_the_resolver_each_object_s_own_first_payload_word() {
+        let descs = vec![
+            TypeDesc { payload_size: 8, ref_offsets: vec![4], tagged_offsets: Vec::new() },
+            TypeDesc { payload_size: 8, ref_offsets: Vec::new(), tagged_offsets: Vec::new() },
+        ];
+        let mut bytes = vec![0u8; 128];
+        let a_payload = ALIGN + HEADER_SIZE;
+        let b_payload = a_payload + 8 + HEADER_SIZE;
+        let put = |bytes: &mut Vec<u8>, at: u32, word: u32| {
+            let at = at as usize;
+            bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        };
+        put(&mut bytes, a_payload - HEADER_SIZE, 0);
+        put(&mut bytes, a_payload, 0x1111);
+        put(&mut bytes, a_payload + 4, b_payload);
+        put(&mut bytes, b_payload - HEADER_SIZE, 1);
+        put(&mut bytes, b_payload, 0x2222);
+        let top = b_payload + 8;
+
+        let resolver = HeadRecordingResolver {
+            inner: TableResolver { type_descs: &descs },
+            seen: core::cell::RefCell::new(Vec::new()),
+        };
+        let mut root = Ref(a_payload);
+        mark_compact(&mut bytes, top, &resolver, |visit| visit(&mut root));
+
+        let seen = resolver.seen.borrow().clone();
+        assert!(seen.len() >= 4, "both objects are visited at mark and at compact: {seen:?}");
+        for (header_word, head) in seen {
+            let expected = if header_word == 0 { 0x1111 } else { 0x2222 };
+            assert_eq!(head, expected, "type {header_word} was handed the wrong payload head");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "gc-collect")]
+    fn a_zero_payload_object_at_the_top_of_the_region_is_never_asked_about() {
+        let descs = vec![TypeDesc { payload_size: 0, ref_offsets: Vec::new(), tagged_offsets: Vec::new() }];
+        let top = ALIGN + HEADER_SIZE;
+        let mut bytes = vec![0u8; top as usize];
+        let mut root = Ref(top);
+        let new_top = mark_compact(&mut bytes, top, &TableResolver { type_descs: &descs }, |visit| {
+            visit(&mut root)
+        });
+        assert_eq!(new_top, ALIGN);
     }
 }

@@ -1,7 +1,7 @@
 # The SAMD21 pin-function map: pin x function -> (instance, signal). PARTIAL and
-# append-only: rows exist for every binding the in-tree boards use,
-# each with its source; grow the table with the boards, never from memory. A binding whose
-# (pin, function) row is missing REFUSES.
+# append-only: rows exist for every binding a board package uses, each with its source;
+# grow the table with the boards, never from recall. A binding whose (pin, function) row
+# is missing REFUSES.
 
 [table]
 kind = "pins"
@@ -10,72 +10,79 @@ sources = [
     "SAMD21 datasheet DS40001882 Table 7-1 (I/O multiplexing and considerations)",
 ]
 
-
+[[pins]]
 pin = "PA12"
 function = "C"
 instance = "sercom2"
 signal = "pad0"
-source = "DS40001882 Table 7-1; silicon-proven by samd21_wifi.rs (WINC MOSI)"
+source = "DS40001882 Table 7-1 (WINC MOSI)"
 
+[[pins]]
+pin = "PA12"                # the SAME pin's other SERCOM: column C is SERCOM, column D is
+function = "D"              # SERCOM-ALT, and PA12 carries a pad0 of each -- so this
+instance = "sercom4"        # row is the SERCOM-ALT alternative to the sercom2 row above.
+signal = "pad0"
+source = "DS40001882D Table 7-1 as printed on page 29. The column HEADERS carry the distinction that matters -- column C is SERCOM and column D is SERCOM-ALT -- and they are what separates this row from the sercom2 one above it, so the two rows can only be told apart by reading the headers alongside the cells. Corroborated by Adafruit ArduinoCore-samd variants/feather_m0/variant.cpp ('MISO: SERCOM4/PAD[0]', PIO_SERCOM_ALT = function D)."
 
+[[pins]]
 pin = "PA13"
 function = "C"
 instance = "sercom2"
 signal = "pad1"
-source = "DS40001882 Table 7-1; silicon-proven by samd21_wifi.rs (WINC SCK)"
+source = "DS40001882 Table 7-1 (WINC SCK)"
 
-
+[[pins]]
 pin = "PA14"
 function = "C"
 instance = "sercom2"
 signal = "pad2"
 source = "DS40001882 Table 7-1 (unused by the module wiring: PA14 stays a soft CS PORT output)"
 
-
+[[pins]]
 pin = "PA15"
 function = "C"
 instance = "sercom2"
 signal = "pad3"
-source = "DS40001882 Table 7-1; silicon-proven by samd21_wifi.rs (WINC MISO)"
+source = "DS40001882 Table 7-1 (WINC MISO)"
 
-
+[[pins]]
 pin = "PA22"
 function = "C"
 instance = "sercom3"
 signal = "pad0"
-source = "DS40001882 Table 7-1 + SAM D21 XPro UG 42220 (EDBG VCP TX); silicon-proven by samd21-edbg-serve"
+source = "DS40001882 Table 7-1"
 
-
+[[pins]]
 pin = "PA23"
 function = "C"
 instance = "sercom3"
 signal = "pad1"
-source = "DS40001882 Table 7-1 + SAM D21 XPro UG 42220 (EDBG VCP RX); silicon-proven by samd21-edbg-serve"
+source = "DS40001882 Table 7-1"
 
-
+[[pins]]
 pin = "PB10"
 function = "D"
 instance = "sercom4"
 signal = "pad2"
-source = "DS40001882 Table 7-1; silicon-proven by samd21-serve on the SAM W25 XPro (EDBG VCP TX, measured -- see the board note)"
+source = "DS40001882 Table 7-1"
 
-
+[[pins]]
 pin = "PB11"
 function = "D"
 instance = "sercom4"
 signal = "pad3"
-source = "DS40001882 Table 7-1; silicon-proven by samd21-serve on the SAM W25 XPro (EDBG VCP RX, measured)"
+source = "DS40001882 Table 7-1"
 
-
+[[pins]]
 pin = "PB22"
 function = "D"
 instance = "sercom5"
 signal = "pad2"
-source = "DS40001882 Table 7-1 + Arduino Zero schematic (EDBG VCP TX); serve-proven by samd21-edbg-serve --features arduino-zero"
+source = "DS40001882 Table 7-1"
 
-
+[[pins]]
 pin = "PB23"
 function = "D"
 instance = "sercom5"
 signal = "pad3"
-source = "DS40001882 Table 7-1 + Arduino Zero schematic (EDBG VCP RX); serve-proven by samd21-edbg-serve --features arduino-zero"
+source = "DS40001882 Table 7-1"

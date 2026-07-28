@@ -1,0 +1,23 @@
+# PIN map: pin x function -> (instance, signal) for the nRF52833.
+# PARTIAL, evidence-only. The nRF has no mux-table functions: a peripheral's
+# PSEL registers claim any GPIO, so the function id here is the claiming block ("twi") and
+# the signal is the PSEL register the pin routes through.
+
+[table]
+kind = "pins"
+family = "nrf52833"
+sources = ["Schematic (I2C_INT: SCL P0.08 / SDA P0.16, 1k pulls R51/R52)"]
+
+[[pins]]
+pin = "P0.08"
+function = "twi"
+instance = "twi0"
+signal = "psel_scl"
+source = "Schematic (I2C_INT SCL); PSEL_SCL = 8 on this pin"
+
+[[pins]]
+pin = "P0.16"
+function = "twi"
+instance = "twi0"
+signal = "psel_sda"
+source = "Schematic (I2C_INT SDA); PSEL_SDA = 16 on this pin"

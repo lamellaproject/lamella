@@ -1,0 +1,74 @@
+# BLOCK layout: the RP2350 clocks block -- the generators its consumers touch
+# (clk_ref/clk_sys glitchless muxes, clk_usb, clk_peri, clk_adc; the full CLK_* map grows
+# with its consumers).
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "clocks"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet ch 8 (clocks: the glitchless-mux SELECTED protocol, per-generator AUXSRC enums)"]
+notes = [
+    "clk_peri has no glitchless mux: disable, select the aux source, re-enable; CLK_PERI_DIV (new on this chip vs the RP2040) resets to divide-by-1 and is written explicitly so the divisor never depends on resident-firmware state.",
+    "clk_adc likewise: AUXSRC glitches when switched -- change it only while ENABLE is clear; ENABLED (read-only, bit 28) reports the generator running. CLK_ADC_DIV resets to /1, so PLL_USB's 48 MHz arrives unscaled.",
+    "clk_ref and clk_sys are GLITCHLESS muxes: write SRC, then poll the one-hot SELECTED bit (1 << SRC). Park clk_sys on clk_ref before reset-cycling PLL_SYS (the 8.6.4 ordering).",
+    "AUXSRC enums are PER GENERATOR: clk_peri 4 = xosc_clksrc; clk_adc 0 = clksrc_pll_usb (3 = xosc); clk_sys aux 0 = clksrc_pll_sys; clk_usb aux 0 = clksrc_pll_usb -- so the CTRL writes for sys/usb need no AUXSRC field write.",
+]
+
+[registers.CLK_REF_CTRL]
+offset = 0x30
+width = 32
+fields = { SRC = [0, 2] }
+
+[registers.CLK_REF_SELECTED]
+offset = 0x38
+width = 32
+notes = "One-hot: bit (1 << SRC) sets when the glitchless mux has switched. XOSC = SRC 2 -> bit 2."
+
+[registers.CLK_SYS_CTRL]
+offset = 0x3C
+width = 32
+fields = { SRC = [0, 1], AUXSRC = [5, 3] }
+notes = "SRC 0 = clk_ref, 1 = the aux mux. AUXSRC 0 = PLL_SYS."
+
+[registers.CLK_SYS_SELECTED]
+offset = 0x44
+width = 32
+notes = "One-hot: bit 0 = clk_ref selected, bit 1 = aux (PLL_SYS) selected."
+
+[registers.CLK_PERI_CTRL]
+offset = 0x48
+width = 32
+fields = { AUXSRC = [5, 3], ENABLE = [11, 1] }
+notes = "AUXSRC 4 = xosc_clksrc (0 clk_sys, 1 pll_sys, 2 pll_usb, 3 rosc, 5/6 gpin)."
+
+[registers.CLK_PERI_DIV]
+offset = 0x4C
+width = 32
+fields = { INT = [16, 2] }
+notes = "New on the RP2350; resets to divide-by-1 (INT = 1). Written explicitly for determinism."
+
+[registers.CLK_USB_CTRL]
+offset = 0x60
+width = 32
+fields = { AUXSRC = [5, 3], ENABLE = [11, 1] }
+
+[registers.CLK_ADC_CTRL]
+offset = 0x6C
+width = 32
+fields = { AUXSRC = [5, 3], KILL = [10, 1], ENABLE = [11, 1], PHASE = [16, 2], NUDGE = [20, 1], ENABLED = [28, 1] }
+notes = "AUXSRC enum: 0 = CLKSRC_PLL_USB (the 48 MHz source), 1 = CLKSRC_PLL_SYS, 2 = ROSC, 3 = XOSC, 4/5 = GPIN0/1. ENABLED (bit 28, RO) reports the generator running."
+
+[registers.CLK_ADC_DIV]
+offset = 0x70
+width = 32
+fields = { INT = [16, 4] }
+notes = "Integer divisor, reset = 1 (0 means max+1). Left at reset: PLL_USB 48 MHz / 1 = the required 48 MHz clk_adc."
+
+[constants]
+CLK_REF_SRC_XOSC = 2
+CLK_REF_XOSC_SELECTED = 0x4
+CLK_SYS_SRC_AUX = 1
+CLK_SYS_REF_SELECTED = 0x1
+CLK_SYS_AUX_SELECTED = 0x2
+CLK_PERI_AUXSRC_XOSC = 4
+CLK_ADC_AUXSRC_PLL_USB = 0

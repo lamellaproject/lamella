@@ -26,7 +26,9 @@ namespace System.Threading
 
         public static Thread CurrentThread { get { return _current; } }
 
+#if LAMELLA_SURFACE_NETFX_1_1
         public int ManagedThreadId { get { return _id == 0 ? 1 : _id + 1; } }
+#endif
 
         public bool IsAlive { get { return true; } }
 
@@ -38,7 +40,9 @@ namespace System.Threading
 
         public static void Sleep(int millisecondsTimeout) { SleepThread(millisecondsTimeout); }
 
+#if LAMELLA_SURFACE_NETFX_4_0
         public static bool Yield() { YieldThread(); return true; }
+#endif
 
         private static void ThreadEntry(ThreadStart start) { start(); }
 

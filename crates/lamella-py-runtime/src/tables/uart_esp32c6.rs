@@ -1,7 +1,6 @@
 //! The Espressif ESP32-C6 HP UART0 register facts -- transcribed from the
 //! neutral peripheral-table SSOT (sources: the official ESP32-C6 SVD + esp-idf v5.3
-//! low-level headers; the numbers below are that table's literals, silicon-verified by the C#
-//! driver bring-up on the DevKitC-1).
+//! low-level headers; the numbers below are that table's literals).
 
 use crate::uart::{UartConfig, UartConfigError, UartFacts, UartOp, UartStatus};
 use crate::uart::{PARITY_EVEN, PARITY_NONE};

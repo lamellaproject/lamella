@@ -27,7 +27,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::NotFound => write!(f, "no matching USB bulk device"),
             Error::Os(msg) => write!(f, "USB error: {msg}"),
-            Error::Timeout => write!(f, "USB bulk read timed out"),
+            Error::Timeout => write!(f, "USB bulk transfer timed out"),
             Error::Unsupported => write!(f, "USB bulk backend not implemented on this platform"),
         }
     }
@@ -67,6 +67,40 @@ pub fn enumerate_interface(interface_guid: &str) -> Result<Vec<DeviceInfo>> {
     imp::enumerate_guid(interface_guid)
 }
 
+/// Whether a device is reachable, and if not, WHY -- the fact a caller needs to tell a user
+/// something actionable instead of "not found".
+///
+/// The distinction is not pedantry. A probe whose vendor ships no MS-OS descriptors (an ST-Link,
+/// for one) enumerates perfectly on the USB bus while its debug interface has NO driver bound, so
+/// it cannot be opened. "Absent" and "present but unbound" then look identical through a plain
+/// open -- both just fail -- yet the remedies could not be more different: plug the thing in
+/// versus install a driver. Reporting the wrong one sends a user hunting the wrong problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    /// Nothing with that vendor/product id is on the USB bus.
+    Absent,
+    /// The device IS on the bus, but no interface is registered under the requested GUID -- on
+    /// Windows, its interface has no (or the wrong) driver bound. This is the case worth a loud,
+    /// specific message: the hardware is fine and one install away from working.
+    PresentUnbound,
+    /// An interface is registered under the requested GUID; the device should be openable. An open
+    /// that still fails from here means something else holds it -- another debugger, typically.
+    Bound,
+}
+
+/// Classifies why a device can or cannot be reached, so a failure can name its own remedy.
+///
+/// Deliberately reports the FACT and not the advice: what to tell the user ("install ST's driver",
+/// "run pnputil") is vendor-specific and belongs to the crate that knows which probe it wanted,
+/// not to a general USB layer. See [`Binding`].
+///
+/// Platform note: the unbound state is a Windows driver-model concept. macOS and Linux open the
+/// device directly, so this reports [`Binding::Bound`] whenever the device is visible; the
+/// analogous failure there is permissions (a missing udev rule), which surfaces as an open error.
+pub fn diagnose(interface_guid: &str, vendor_id: u16, product_id: u16) -> Result<Binding> {
+    imp::diagnose(interface_guid, vendor_id, product_id)
+}
+
 /// An open bulk USB device that exchanges raw packets with a CMSIS-DAP v2 probe.
 pub struct Device(imp::Device);
 
@@ -88,6 +122,44 @@ impl Device {
         serial: Option<&str>,
     ) -> Result<Self> {
         imp::Device::open_guid(interface_guid, vendor_id, product_id, serial).map(Device)
+    }
+
+    /// The bulk endpoint addresses negotiated at open time, as `(in, out)`.
+    ///
+    /// Exposed because probing endpoints blindly is not a viable diagnostic: reading an endpoint a
+    /// device does not have can block rather than fail, so a tool that needs to know which pipes
+    /// exist must ask instead of sweep.
+    pub fn endpoints(&self) -> (u8, u8) {
+        self.0.endpoints()
+    }
+
+    /// Clears any stall on both pipes, so one failed transfer does not contaminate the next.
+    pub fn reset_pipes(&mut self) {
+        self.0.reset_pipes();
+    }
+
+    /// Clears one named endpoint -- DIAGNOSTIC ONLY, and NOT harmless on every device.
+    ///
+    /// [`reset_pipes`](Self::reset_pipes) only ever touches the two command pipes, so when exactly
+    /// those two misbehave there is no way to tell a reset that BROKE them from a reset that merely
+    /// failed to fix them. Resetting a third, known-working pipe distinguishes the two.
+    ///
+    /// A reset is CLEAR_FEATURE(ENDPOINT_HALT) on the wire, and an ST-Link/V3 acknowledges it and
+    /// then stops answering that endpoint altogether -- so use this where a pipe is known to be
+    /// halted, not as a precaution. No-op where the backend has no pipe reset.
+    pub fn reset_endpoint(&mut self, endpoint: u8) {
+        self.0.reset_endpoint(endpoint);
+    }
+
+    /// A human-readable dump of the interface and its pipes -- DIAGNOSTIC ONLY, and the format is
+    /// not stable.
+    ///
+    /// When a device opens cleanly but carries no traffic, the next question is what we are
+    /// actually attached to -- the right interface, the right alternate setting, pipes of the
+    /// expected type and size. Inferring that from a failing transfer is guesswork; read the
+    /// descriptor instead. Currently detailed on Windows; elsewhere it reports the endpoints.
+    pub fn describe_interface(&self) -> String {
+        self.0.describe_interface()
     }
 
     /// Sends one bulk OUT packet (raw -- no report id or padding) on the primary (lowest-address) OUT

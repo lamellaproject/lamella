@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.BindingFlags
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public enum BindingFlags
@@ -13,3 +14,4 @@ namespace System.Reflection
         FlattenHierarchy = 64,
     }
 }
+#endif

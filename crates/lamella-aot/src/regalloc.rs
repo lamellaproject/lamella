@@ -264,6 +264,9 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::LoadTypeDesc { object } => {
                     mark(&mut lo, &mut hi, &mut defined, *object, ip);
                 }
+                Inst::InterfaceHasTag { descriptor, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *descriptor, ip);
+                }
                 Inst::TypeDescAddr { .. } => {}
                 Inst::TypeDescLiteral { .. } => {}
                 Inst::CopyStruct { src } => {
@@ -284,6 +287,13 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::Alloc { .. } => {}
                 Inst::AllocLike { proto, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *proto, ip);
+                }
+                Inst::AllocDescribed {
+                    descriptor,
+                    payload_size,
+                } => {
+                    mark(&mut lo, &mut hi, &mut defined, *descriptor, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *payload_size, ip);
                 }
                 Inst::AllocArray { length, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *length, ip);
@@ -515,6 +525,7 @@ pub(crate) fn is_safepoint(inst: &Inst) -> bool {
             | Inst::InvokeDelegate { .. }
             | Inst::Alloc { .. }
             | Inst::AllocLike { .. }
+            | Inst::AllocDescribed { .. }
             | Inst::AllocArray { .. }
             | Inst::AllocArray2D { .. }
             | Inst::AllocArrayMD { .. }
@@ -658,6 +669,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         }
         Inst::FieldAddr { base, .. } => f(*base),
         Inst::LoadTypeDesc { object } => f(*object),
+        Inst::InterfaceHasTag { descriptor, .. } => f(*descriptor),
         Inst::VirtualFuncAddr { object, .. } => f(*object),
         Inst::TypeDescAddr { .. } => {}
         Inst::TypeDescLiteral { .. } => {}
@@ -672,6 +684,13 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::IntToString { value } => f(*value),
         Inst::Alloc { .. } => {}
         Inst::AllocLike { proto, .. } => f(*proto),
+        Inst::AllocDescribed {
+            descriptor,
+            payload_size,
+        } => {
+            f(*descriptor);
+            f(*payload_size);
+        }
         Inst::AllocArray { length, .. } => f(*length),
         Inst::ArrayLoad { array, index, .. } | Inst::ArrayElemAddr { array, index, .. } => {
             f(*array);

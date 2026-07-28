@@ -9,7 +9,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::device_heap::{DeviceHeap, DeviceTypeDesc};
+use crate::device_heap::{ARRAY_DESC_MARK, ARRAY_DESC_MARK_MASK, DeviceHeap, DeviceTypeDesc};
 use crate::heap::{Heap, Ref, StackMapTable, TypeDesc};
 
 
@@ -255,21 +255,23 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
     sp: u32,
     return_pc: u32,
 ) -> *mut u8 {
-    let _ = payload_size;
     let _ = (sp, return_pc);
     with_device_heap(|heap| {
-        debug_assert_eq!(
-            unsafe { (*type_desc).payload_size },
-            payload_size,
+        debug_assert!(
+            {
+                let word0 = unsafe { (*type_desc).payload_size };
+                word0 & ARRAY_DESC_MARK_MASK == ARRAY_DESC_MARK || word0 == payload_size
+            },
             "lamella_gc_alloc payload_size disagrees with the TypeDesc",
         );
-        if let Some(reference) = unsafe { heap.alloc(type_desc) } {
+        if let Some(reference) = unsafe { heap.alloc(payload_size, type_desc) } {
             return heap.payload_ptr(reference);
         }
         #[cfg(feature = "gc-collect")]
         {
             heap.collect(|_visit| {});
-            unsafe { heap.alloc(type_desc) }.map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
+            unsafe { heap.alloc(payload_size, type_desc) }
+                .map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
         }
         #[cfg(not(feature = "gc-collect"))]
         {
@@ -557,12 +559,21 @@ mod device_abi_tests {
     /// in a separate module from the `GC` tests above).
     static SERIALIZE: Mutex<()> = Mutex::new(());
 
-    /// A backend-shaped descriptor on the host: the wire words `[payload_size, nrefs,
-    /// ref_offsets...]`, leaked so its address is stable (the header stores that address).
+    /// A backend-shaped descriptor on the host, leaked so its address is stable (the header stores
+    /// that address).
+    ///
+    /// The FOUR-word ratified header
+    /// `[payload_size][nrefs][type_tag][base_ptr][ref_offsets...]`, mirroring `riscv32.rs`'s
+    /// `DESC_HEADER_WORDS = 4`. This helper wrote a TWO-word header until the reader was corrected
+    /// to @16 -- at which point it would have had `ref_offset` reading past the end of this very
+    /// allocation, so it is not merely a stale comment. The sibling helper in `device_heap.rs`
+    /// carries the same shape and the same note.
     fn make_desc(payload_size: u32, ref_offsets: &[u32]) -> *const DeviceTypeDesc {
-        let mut words: Vec<u32> = Vec::with_capacity(2 + ref_offsets.len());
+        let mut words: Vec<u32> = Vec::with_capacity(4 + ref_offsets.len());
         words.push(payload_size);
         words.push(ref_offsets.len() as u32);
+        words.push(0x811C_9DC5);
+        words.push(0);
         words.extend_from_slice(ref_offsets);
         let leaked: &'static [u32] = Box::leak(words.into_boxed_slice());
         leaked.as_ptr().cast::<DeviceTypeDesc>()

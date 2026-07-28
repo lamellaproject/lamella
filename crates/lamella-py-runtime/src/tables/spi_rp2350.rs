@@ -1,7 +1,6 @@
 //! The Raspberry Pi RP2350 (Pico 2) SPI0 (an ARM PrimeCell PL022 SSP) register facts --
-//! transcribed from the neutral peripheral-table SSOT (sources: the official RP2350 SVD; the
-//! sequence is silicon-verified on a Pico 2 via the PL022 LBM loopback + a logic-analyzer decode
-//! of 400 frames at 1 MHz mode-0). The SSPCLK is clk_peri, so the crystal/clk_peri bring-up is the
+//! transcribed from the neutral peripheral-table SSOT (sources: the official RP2350 SVD).
+//! The SSPCLK is clk_peri, so the crystal/clk_peri bring-up is the
 //! same first-seven steps as uart_rp2350 (SSPCLK = clk_peri = the 12 MHz crystal).
 
 use crate::spi::{SpiConfig, SpiConfigError, SpiFacts, SpiOp};

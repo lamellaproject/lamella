@@ -1,0 +1,65 @@
+# BOARD binding: the Adafruit Feather M0 Adalogger. Board truth ONLY: the microSD wiring, the
+# on-board indicator, the carrier, and the clock plan. Chip truth lives in csp/samd21/.
+#
+# This variant carries a microSD holder and NO SPI flash. That is what the rows below describe:
+# a card slot on SERCOM4, its chip select and its card-detect switch.
+#
+#
+
+[table]
+kind = "board"
+board = "feather-m0-adalogger"
+family = "samd21"
+part = "atsamd21g18a"
+board_model = 19            # lamella_wire::board_model::FEATHER_M0_ADALOGGER
+sources = [
+    "Adafruit Feather M0 Adalogger guide (product 2796): '#4 - used as the MicroSD card CS (chip select) pin', '#7 - used as the MicroSD card CD (card detect) pin', 'SCK/MOSI/MISO (GPIO 24/23/22) - These are the hardware SPI pins', 'The SD card uses hardware SPI', '#13 - GPIO #13 and is connected to the red LED next to the USB jack'",
+    "Adafruit ArduinoCore-samd variants/feather_m0/variant.cpp pin descriptor table: Arduino D4 = PORTA 8, D7 = PORTA 21, D13 = PORTA 17, and MISO/MOSI/SCK = PORTA 12 / PORTB 10 / PORTB 11, each marked PIO_SERCOM_ALT and commented SERCOM4/PAD[0], PAD[2], PAD[3]. The guide states ARDUINO pin numbers and never names a port pin, so this file is what maps them",
+    "Adafruit ArduinoCore-samd variants/feather_m0/variant.h: PERIPH_SPI = sercom4, PAD_SPI_TX = SPI_PAD_2_SCK_3, PAD_SPI_RX = SERCOM_RX_PAD_0 -- an independent statement of the same SERCOM and pads",
+    "SAMD21 datasheet DS40001882 ch 5 (48-pin package pinout) and ch 7 I/O multiplexing: PA08 (pin 13) and PA21 (pin 30) are present on the 48-pin SAMD21G package",
+]
+
+[[carriers]]
+kind = "native-usb"         # the chip's own USB device controller; like both sibling Feathers
+plan = "osc8m-8mhz"         # there is no on-board debugger and no bridge UART, so there is no
+default = true              # fixed bridge identity to state and no vcp role to bind.
+
+[[bindings]]                # the microSD card's SPI. The guide calls it "hardware SPI" and the
+role = "sd-spi"             # vendor variant file names the instance and the pads.
+kind = "spi"
+instance = "sercom4"
+function = "D"              # SERCOM-ALT (Table 7-1 column D), matching those rows.
+mosi = { pin = "PB10", pad = 2 }
+sck = { pin = "PB11", pad = 3 }
+miso = { pin = "PA12", pad = 0 }
+cs = { pin = "PA08", soft = true }   # Arduino D4. A plain PORT output, not a SERCOM pad: SPI
+                                     # chip select on this part is the software's to drive.
+
+[[plans]]
+name = "osc8m-8mhz"         # the reset oscillator with its prescaler cleared. The board's
+default = true              # 32.768 kHz crystal feeds the DFLL for USB and the RTC; a plan
+source = "osc8m"            # naming that source states a rate only once a consumer derives
+gclk0_hz = 8000000          # a value from it.
+
+[[devices]]                 # the card-detect switch: the slot grounds this line when a card is
+name = "sd-card-detect"     # seated, so it reads LOW with a card present and needs a pull-up.
+kind = "gpio-in"            # It is the one input among the card-slot lines, and the reason a
+pin = "PA21"                # driver can tell "no card" from "a card that will not answer".
+active = "low"
+source = "Adafruit Feather M0 Adalogger guide ('#7 - used as the MicroSD card CD (card detect) pin') + variant.cpp (Arduino D7 = PORTA 21); active-low because the switch grounds the line when a card is inserted"
+
+# THIS BOARD HAS TWO INDICATORS, not one, and the second is not decoration: the vendor put it
+# beside the card slot and suggests exactly the use a storage stack wants.
+[[devices]]                 # the red LED beside the USB jack -- this board's general-purpose
+name = "led"                # blink target.
+kind = "gpio-out"
+pin = "PA17"
+active = "high"
+source = "Adafruit Feather M0 Adalogger guide ('#13 - GPIO #13 and is connected to the red LED next to the USB jack', 'Pin #13 red LED for general purpose blinking') + variant.cpp (Arduino D13 = PORTA 17)"
+
+[[devices]]                 # the green LED beside the CARD SLOT. The guide's own suggested use is
+name = "led-sd"             # card activity, which makes it the one indicator on this board that
+kind = "gpio-out"           # means something specific rather than whatever a program decides.
+pin = "PA06"
+active = "high"
+source = "Adafruit Feather M0 Adalogger guide ('#8 - This pin was also left over, so we tied it to a green LED, its next to the SD card. It might be handy to blink this LED when writing / reading valid data') + variant.cpp (Arduino D8 = PORTA 6)"

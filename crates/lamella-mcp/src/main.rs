@@ -25,8 +25,9 @@ mod debug;
 /// is self-contained; the browser host vendors a byte-identical copy. `tools/list` serves the `tools` array.
 const CONTRACT: &str = include_str!("../tools.json");
 
-/// The MCP RESOURCES (board/chip registry + BCL surface + samples), generated from the engine-sdk registries
-/// (`mcp/gen-resources.mjs`) and vendored byte-identical -- the same set the browser host serves.
+/// The MCP RESOURCES: the chip registry, the C# surface and the samples, as stored text. The board
+/// registry is the exception -- its body is computed by [`boards_resource_text`] from the wire's own
+/// board table, so it cannot fall behind the boards this build knows.
 const RESOURCES: &str = include_str!("../resources.json");
 
 /// The managed corlib bytes the in-process host runner (`LoopbackLink`) executes against: `LAMELLA_CORLIB` if
@@ -61,12 +62,43 @@ fn resources_list() -> Value {
     json!({ "resources": meta })
 }
 
+/// The `lamella://boards` body, COMPUTED from [`lamella_wire::board_model`] rather than stored.
+///
+/// That module is the one canonical value -> name map, so enumerating it here is the difference
+/// between a list that is right and a list that was right when someone last copied it. It also
+/// scales: a board is one row, and the boards a client actually cares about are the ones it can
+/// see, which `lamella_enumerate_devices` and `lamella_identify_device` report live.
+///
+/// The models are contiguous from 0, so the scan stops at the first unrecognized value -- the same
+/// idiom `lamella-wire`'s `board-models-json` example uses to emit the JS registry.
+fn boards_resource_text() -> String {
+    let mut out = String::from(
+        "# Supported dev boards\n\nThe `board_model` wire values a board reports over Lamella Link:\n\n\
+         | model | board |\n|--:|---|\n",
+    );
+    let mut model: u16 = 0;
+    while let Some(name) = lamella_wire::board_model::name(model) {
+        out.push_str(&format!("| {model} | {name} |\n"));
+        model += 1;
+    }
+    out.push_str(
+        "\nRun `lamella_enumerate_devices` to see the boards attached to this machine, and \
+         `lamella_identify_device` on one of them to read its `board_model` and chip IDCODE live.\n",
+    );
+    out
+}
+
 /// The contents for `resources/read`, or `None` if the uri is unknown.
 fn read_resource(uri: &str) -> Option<Value> {
     let parsed = serde_json::from_str::<Value>(RESOURCES).ok()?;
     let items = parsed.get("resources").and_then(Value::as_array)?;
     let r = items.iter().find(|r| r.get("uri").and_then(Value::as_str) == Some(uri))?;
-    Some(json!({ "contents": [{ "uri": r.get("uri"), "mimeType": r.get("mimeType"), "text": r.get("text") }] }))
+    let text = if uri == "lamella://boards" {
+        json!(boards_resource_text())
+    } else {
+        r.get("text").cloned().unwrap_or_else(|| json!(""))
+    };
+    Some(json!({ "contents": [{ "uri": r.get("uri"), "mimeType": r.get("mimeType"), "text": text }] }))
 }
 
 fn text_result(text: String, is_error: bool) -> Value {
@@ -199,7 +231,7 @@ fn compile_and_bake(compiler: &LcscCompiler, code: &str) -> Result<Vec<u8>, Stri
 }
 
 /// Compile a submission and run it ON the device over Lamella Link (BakedSerialLink: bake host-side, the image
-/// crosses the wire, the device interprets it and returns output). Serial targets only for now.
+/// crosses the wire, the device interprets it and returns output). Serial targets only.
 #[cfg(feature = "bake")]
 fn tool_run_on_device(target: &str, code: &str) -> Value {
     if target.starts_with("usb") {
@@ -398,7 +430,7 @@ impl Server {
         match compile_and_bake(&self.check, code) {
             Ok(image) => text_result(
                 format!(
-                    "flash (baked .lmli image): {} bytes\n(RAM / .wasm / per-section budget analysis is not yet available natively -- this is the deployable image size.)",
+                    "flash (baked .lmli image): {} bytes\n(This is the deployable image size; it is not a RAM or per-section budget.)",
                     image.len()
                 ),
                 false,
@@ -526,5 +558,31 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boards resource must be COMPUTED from the wire's board table, not stored beside it.
+    /// A stored copy is a second source of truth, and this one had gone five boards stale before
+    /// anybody read it. Red-proof: serve `resources.json`'s stored `text` again and every board
+    /// past the one it stopped at fails this assertion by name.
+    #[test]
+    fn the_boards_resource_names_every_board_the_wire_knows() {
+        let body = read_resource("lamella://boards").expect("the boards resource exists");
+        let text = body["contents"][0]["text"].as_str().expect("it has text").to_owned();
+
+        let mut model: u16 = 0;
+        while let Some(name) = lamella_wire::board_model::name(model) {
+            assert!(
+                text.contains(&format!("| {model} | {name} |")),
+                "board_model {model} ({name}) is missing from the boards resource -- \
+                 the resource is not deriving from lamella_wire::board_model"
+            );
+            model += 1;
+        }
+        assert!(model > 1, "the scan found no boards at all, so it proves nothing");
     }
 }

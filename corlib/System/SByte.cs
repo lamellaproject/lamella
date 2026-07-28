@@ -17,6 +17,7 @@ namespace System
             return (sbyte)value;
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string s, out sbyte result)
         {
             int value;
@@ -28,6 +29,7 @@ namespace System
             result = 0;
             return false;
         }
+#endif
 
         public bool Equals(sbyte obj) { return this == obj; }
 

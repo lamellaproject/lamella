@@ -117,11 +117,13 @@ namespace System
         public TimeSpan Subtract(DateTime value) { return new TimeSpan(_ticks - value._ticks); }
         public DateTime Subtract(TimeSpan value) { return new DateTime(_ticks - value.Ticks); }
 
+#if LAMELLA_SURFACE_FLOAT
         public DateTime AddDays(double value) { return AddTicks((long)(value * (double)TicksPerDay)); }
         public DateTime AddHours(double value) { return AddTicks((long)(value * (double)TicksPerHour)); }
         public DateTime AddMinutes(double value) { return AddTicks((long)(value * (double)TicksPerMinute)); }
         public DateTime AddSeconds(double value) { return AddTicks((long)(value * (double)TicksPerSecond)); }
         public DateTime AddMilliseconds(double value) { return AddTicks((long)(value * (double)TicksPerMillisecond)); }
+#endif
 
         public DateTime AddMonths(int months)
         {

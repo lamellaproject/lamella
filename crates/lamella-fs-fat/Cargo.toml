@@ -1,0 +1,21 @@
+[package]
+name = "lamella-fs-fat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FAT file-system backend for the interpreter's FsBackend seam: a FAT12/16/32 driver over the BlockDevice seam, provable host-side against an in-memory image with no hardware. VFAT long names and their 8.3 aliases. Errors project onto the FsBackend seam's codes so a device sees files and directories, never a sector."
+
+[dependencies]
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+
+[features]
+# The mkfs formatter (`format::format`): writes a fresh FAT volume onto a block device. Off by
+# default -- most devices mount an already-formatted card and never format one, so the code is not
+# compiled unless a build (or a library that references it) asks for it. A native-capability knob,
+# not a managed-surface symbol.
+format = []
+
+[lints]
+workspace = true

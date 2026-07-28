@@ -1,0 +1,31 @@
+# BLOCK layout: the STM32F091 GPIO port block, the registers a uart binding muxes through
+# (PARTIAL -- MODER/AFRL fields grow as bindings demand
+# them). Values are RM0091-exact. Offsets are instance-base-relative.
+
+[table]
+kind = "block"
+family = "stm32f091"
+block = "gpio"
+sources = [
+    "STM32F0 reference manual RM0091 Rev 10: GPIO MODER/AFRL (8.4.x)",
+]
+notes = [
+    "GPIO config is read-modify-write: MODER holds 2 bits/pin and AFRL 4 bits/pin, so clear a pin's field span before OR-ing the set value.",
+    "AFRL covers pins 0..7; pins 8..15 ride AFRH (offset 0x24) -- AFRH joins this table when a binding first needs it.",
+    "F0 reset leaves PA2/PA3 input (MODER 00), unlike the L4's analog default; the RMW clear-then-set covers both.",
+]
+
+[registers.MODER]
+offset = 0x0
+width = 32
+fields = { MODER2 = [4, 2], MODER3 = [6, 2] }
+notes = "Port mode, 2 bits/pin (PARTIAL: pins 2/3 stated). 10 = alternate function."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { AFSEL2 = [8, 4], AFSEL3 = [12, 4] }
+notes = "Alternate function low (pins 0..7), 4 bits/pin (PARTIAL: pins 2/3 stated)."
+
+[constants]
+MODER_MODE_AF = 2

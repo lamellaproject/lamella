@@ -1,0 +1,66 @@
+# PIN map: pin x function -> (instance, signal) for the RP2350.
+# PARTIAL, evidence-only, exactly the cells the board packages bind. Function ids are
+# the datasheet's GPIO-function columns (F1..F9, SVD-enumerated); GP<n> is the bank-less
+# rp-family spelling. Signals are the SVD's own names -- for the PL022 the master's MOSI is
+# the block's `tx` and MISO its `rx`.
+
+[table]
+kind = "pins"
+family = "rp2350"
+sources = ["raspberrypi/pico-sdk RP2350.svd (GPIO function enumerations)", "RP2350 datasheet ch 9.4 (function table)"]
+
+[[pins]]
+pin = "GP0"
+function = "F2"
+instance = "uart0"
+signal = "tx"
+source = "RP2350.svd (GP0 F2 = UART0 TX)"
+
+[[pins]]
+pin = "GP1"
+function = "F2"
+instance = "uart0"
+signal = "rx"
+source = "RP2350.svd (GP1 F2 = UART0 RX)"
+
+[[pins]]
+pin = "GP4"
+function = "F3"
+instance = "i2c0"
+signal = "sda"
+source = "RP2350.svd (GP4 F3 = I2C0 SDA)"
+
+[[pins]]
+pin = "GP5"
+function = "F3"
+instance = "i2c0"
+signal = "scl"
+source = "RP2350.svd (GP5 F3 = I2C0 SCL)"
+
+[[pins]]
+pin = "GP16"
+function = "F1"
+instance = "spi0"
+signal = "rx"
+source = "RP2350.svd (GP16 F1 = SPI0 RX = the master's MISO)"
+
+[[pins]]
+pin = "GP17"
+function = "F1"
+instance = "spi0"
+signal = "ss_n"
+source = "RP2350.svd (GP17 F1 = SPI0 SS_N, the PL022's hardware chip-select)"
+
+[[pins]]
+pin = "GP18"
+function = "F1"
+instance = "spi0"
+signal = "sclk"
+source = "RP2350.svd (GP18 F1 = SPI0 SCLK)"
+
+[[pins]]
+pin = "GP19"
+function = "F1"
+instance = "spi0"
+signal = "tx"
+source = "RP2350.svd (GP19 F1 = SPI0 TX = the master's MOSI)"

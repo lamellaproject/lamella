@@ -7,7 +7,8 @@ use lamella_ir::{
     BinOp, CmpOp, ConvKind, Function, Inst, MirType, StaticOwner, Terminator, TypeHandle, ValueId,
 };
 
-use crate::resolver::{TypeMeta, VtableEntry, descriptor_symbol};
+use crate::resolver::{ARRAY_DESC_MARK, TypeMeta, VtableEntry, descriptor_symbol};
+use crate::stringgen::CONSOLE_WRITE_BYTES;
 pub use crate::resolver::DescQualifiers;
 pub use crate::stackmaps::AssemblyStatics;
 use crate::stackmaps::{
@@ -29,6 +30,15 @@ pub enum LowerError {
     ControlFlowUnsupported,
     /// The final image could not be assembled (an out-of-range branch).
     CodeTooLarge,
+    /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
+    /// surrogate under `string-utf8`. Refused rather than replaced with U+FFFD -- see
+    /// `stringgen::encode_string_bytes` for why a compiler refuses where the interpreter throws.
+    UnencodableStringUnit {
+        /// The offending UTF-16 code unit.
+        unit: u16,
+        /// Its index in the literal, in UTF-16 code units.
+        index: u32,
+    },
 }
 
 /// The target register profile. `Rv32im` uses all 32 registers + hardware mul/div (QEMU `virt` and
@@ -107,40 +117,122 @@ fn scratch() -> Reg {
     Reg::new(31).unwrap_or(Reg::ZERO)
 }
 
-/// The number of argument REGISTERS a call-like instruction marshals -- so RV32E can reject one that
-/// would spill past a0-a5 into a6/a7. A direct/native/indirect/delegate call passes its `args` in
-/// a0..; a virtual or interface call passes the receiver in a0 and its `args` from a1, so one more.
-fn register_arg_count(inst: &Inst) -> usize {
-    match inst {
-        Inst::Call { args, .. }
-        | Inst::CallNative { args, .. }
-        | Inst::CallIndirect { args, .. }
-        | Inst::InvokeDelegate { args, .. } => args.len(),
-        Inst::CallVirtual { args, .. } | Inst::CallInterface { args, .. } => args.len() + 1,
-        _ => 0,
-    }
+/// `t5` (x30), reserved SOLELY for reaching a frame slot past the 12-bit `lw`/`sw` immediate. Nothing
+/// else in this backend touches x30, which is the point: a far STORE cannot borrow its source
+/// register, and picking a "probably dead" temporary at each of ~200 access sites would be a
+/// per-site judgement call with a silent miscompile as the failure mode. One reserved register makes
+/// the far path uniform instead.
+///
+/// RV32E has no x30 -- and keeps the 2047 frame cap ([`FRAME_IMM_MAX`]), so it never takes the far
+/// path. That is a real limit, not an oversight: the CH32V003 has 2 KB of RAM total, so a frame
+/// larger than the immediate can reach cannot arise there.
+fn far_scratch() -> Reg {
+    Reg::new(30).unwrap_or(Reg::ZERO)
 }
 
-/// The number of argument WORDS a `Call`/`CallNative` must pass on the STACK -- the overflow past the
-/// profile's argument registers (a0-a7 on RV32IM, a0-a5 on RV32E), which [`marshal_call_args`] stores into
-/// the outgoing-args area at the BOTTOM of the caller's spilled frame (`sp+0..`). Mirrors that function's
-/// register packing exactly: a wide (>2-word) value-type argument rides ONE register (its slot ADDRESS, by
-/// reference), an int64/f64/small-struct a register PAIR, a scalar one; and a wide RESULT reserves a0 for
-/// the sret pointer so the explicit arguments start at a1. Returns 0 for a call that fits in registers, or
-/// a non-`Call`/`CallNative` inst -- the dispatch kinds (indirect/virtual/interface/delegate) still cap at
-/// the argument registers (they do not model stack-passed arguments).
+/// The largest frame offset a bare `lw`/`sw` immediate reaches (12-bit signed).
+const FRAME_IMM_MAX: i32 = 2047;
+
+/// `lw rd, off(sp)`, extended past [`FRAME_IMM_MAX`]. The address is assembled in the DESTINATION
+/// register, so a far load needs no scratch at all -- the same trick arm32's `slot_load` uses.
+/// Byte-identical to a bare `lw` for an in-range offset, so converting every site is behaviour-free
+/// for every frame that already fit.
+fn slot_load(enc: &mut Encoder, rd: Reg, off: i32) {
+    if (-2048..=FRAME_IMM_MAX).contains(&off) {
+        enc.lw(rd, Reg::SP, off);
+        return;
+    }
+    enc.li(rd, off);
+    enc.add(rd, rd, Reg::SP);
+    enc.lw(rd, rd, 0);
+}
+
+/// `sw rs, off(sp)`, extended the same way. A store has no spare destination to borrow, so the far
+/// path goes through the reserved [`far_scratch`]. Byte-identical to a bare `sw` in range.
+fn slot_store(enc: &mut Encoder, rs: Reg, off: i32) {
+    if (-2048..=FRAME_IMM_MAX).contains(&off) {
+        enc.sw(rs, Reg::SP, off);
+        return;
+    }
+    let far = far_scratch();
+    enc.li(far, off);
+    enc.add(far, far, Reg::SP);
+    enc.sw(rs, far, 0);
+}
+
+/// The prologue's `addi sp, sp, -frame`, extended past [`FRAME_IMM_MAX`] via [`far_scratch`]. x30 is
+/// dead here by construction: the prologue runs before any value is live, and incoming arguments sit
+/// in a0-a7. Only the frame SIZE reaches the stack-map record, never the prologue's length, so
+/// growing this to three instructions is invisible to the collector's frame hop.
+fn frame_alloc(enc: &mut Encoder, frame: usize) {
+    let bytes = frame as i32;
+    if bytes <= FRAME_IMM_MAX {
+        enc.addi(Reg::SP, Reg::SP, -bytes);
+        return;
+    }
+    let far = far_scratch();
+    enc.li(far, bytes);
+    enc.sub(Reg::SP, Reg::SP, far);
+}
+
+/// The epilogue's `addi sp, sp, +frame`, the twin of [`frame_alloc`]. x30 is dead here too -- the
+/// return value is already in a0 (and a1 for a pair) by this point.
+fn frame_free(enc: &mut Encoder, frame: usize) {
+    let bytes = frame as i32;
+    if bytes <= FRAME_IMM_MAX {
+        enc.addi(Reg::SP, Reg::SP, bytes);
+        return;
+    }
+    let far = far_scratch();
+    enc.li(far, bytes);
+    enc.add(Reg::SP, Reg::SP, far);
+}
+
+/// `addi rd, sp, off` -- a slot's ADDRESS (a value-type field, an sret pointer) -- extended past
+/// [`FRAME_IMM_MAX`] by assembling the offset in `rd` first. No scratch, no memory access.
+fn slot_addr(enc: &mut Encoder, rd: Reg, off: i32) {
+    if (-2048..=FRAME_IMM_MAX).contains(&off) {
+        enc.addi(rd, Reg::SP, off);
+        return;
+    }
+    enc.li(rd, off);
+    enc.add(rd, rd, Reg::SP);
+}
+
+/// The number of argument WORDS a call must pass on the STACK -- the overflow past the profile's argument
+/// registers, which [`marshal_call_args`] stores into the outgoing-args area at the BOTTOM of the caller's
+/// spilled frame (`sp+0..`). Mirrors that function's register packing exactly: a wide (>2-word) value-type
+/// argument rides ONE register (its slot ADDRESS, by reference), an int64/f64/small-struct a register PAIR,
+/// a scalar one. Returns 0 for a call that fits in registers, or for a non-call inst.
+///
+/// EVERY call kind is measured, each at the register index its own lowering starts marshalling from, so the
+/// reservation always covers the real overflow:
+///   - `Call`/`CallNative` -- from a0, unless a wide RESULT reserves a0 for the sret pointer.
+///   - `CallVirtual`/`CallInterface`/`CallIndirect` -- from a0; the receiver is `args[0]` (and an indirect
+///     call's target is a separate field), so no register is reserved ahead of the arguments.
+///   - `InvokeDelegate` -- its args EXCLUDE the receiver: an INSTANCE target puts `this` in a0 and shifts
+///     them to a1, so measure from 1, the widest case. A static target marshals from a0 and fits inside
+///     that same reservation.
+/// The register count comes from the PROFILE, never a literal: a new RISC-V profile changes the data, not
+/// this code.
 fn call_stack_words(
     inst: &Inst,
     result: ValueId,
     value_types: &[MirType],
     profile: RiscvProfile,
 ) -> usize {
-    let args = match inst {
-        Inst::Call { args, .. } | Inst::CallNative { args, .. } => args,
+    let (args, first) = match inst {
+        Inst::Call { args, .. } | Inst::CallNative { args, .. } => {
+            (args, usize::from(value_words(value_types, result) > 2))
+        }
+        Inst::CallVirtual { args, .. }
+        | Inst::CallInterface { args, .. }
+        | Inst::CallIndirect { args, .. } => (args, 0),
+        Inst::InvokeDelegate { args, .. } => (args, 1),
         _ => return 0,
     };
     let regs = arg_reg_count(profile);
-    let mut reg = (value_words(value_types, result) > 2) as usize;
+    let mut reg = first;
     let mut stack = 0usize;
     for &arg in args {
         let words = value_words(value_types, arg);
@@ -388,6 +480,7 @@ fn func_allocates(func: &Function) -> bool {
                 i,
                 Inst::Alloc { .. }
                     | Inst::AllocLike { .. }
+                    | Inst::AllocDescribed { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::AllocArrayMD { .. }
@@ -496,22 +589,50 @@ fn lower_module_inner(
         Some(addr) => AllocSite::Address(addr),
         None => AllocSite::None,
     };
-    lower_module_to_image(funcs, alloc, descriptors, &mut Vec::new(), profile, false, false)
+    lower_module_to_image(
+        funcs,
+        alloc,
+        descriptors,
+        &mut Vec::new(),
+        profile,
+        false,
+        false,
+        None,
+        None,
+    )
         .map(|(bytes, ..)| bytes)
 }
 
+/// A library build's stub report: each function the build emitted as a bare `ret` instead of a body,
+/// as `(function index, the lowering error that forced it)` -- the RISC-V twin of arm32's
+/// [`crate::arm32::LibraryStubReport`].
+///
+/// The tolerant library path stubs an un-lowerable method so one gap does not sink the whole corlib,
+/// and a bare `ret` RETURNS ITS FIRST ARGUMENT -- a silently truthy no-op, not a crash. Without this
+/// list that demotion is invisible: it is exactly how the string markers stayed unlowered on the
+/// RISC-V object path unnoticed. Empty for a program (non-tolerant), where a failure stays fatal.
+pub type LibraryStubReport = alloc::vec::Vec<(usize, LowerError)>;
+
 /// A lowered module: the code bytes, each function's entry offset, the call relocations as `(auipc
 /// offset, callee index)` pairs, the object path's type-descriptor symbols + their
-/// `R_LAMELLA_REL_DESC` relocations (both empty on the flat, non-relocatable path), and each
-/// function's `.lamella_stackmaps` METHOD_SLOTS record material (`None` = a leaf or a stub --
-/// never observed mid-walk, no record).
+/// `R_LAMELLA_REL_DESC` relocations (both empty on the flat, non-relocatable path), each function's
+/// `.lamella_stackmaps` METHOD_SLOTS record material (`None` = a leaf or a stub -- never observed
+/// mid-walk, no record), and the tolerant path's [`LibraryStubReport`].
+/// Per method, `(its code offset within the object, its native-offset -> CIL-offset rows)` -- the
+/// RISC-V twin of [`crate::arm32::MethodLineTables`], carrying raw rows because this target has no
+/// `LineTable` newtype of its own.
+pub type MethodLineTables = Vec<(u32, Vec<(u32, u32)>)>;
+
 type LoweredModule = (
     Vec<u8>,
     Vec<u32>,
     Vec<(u32, u32)>,
     Vec<DescSym>,
     Vec<DescReloc>,
+    Vec<DescReloc>,
     Vec<Option<MethodRecordInfo>>,
+    LibraryStubReport,
+    Vec<Vec<(u32, u32)>>,
 );
 
 /// One function's `.lamella_stackmaps` METHOD_SLOTS record material (the shared format in
@@ -545,6 +666,11 @@ struct DescEmit {
     /// whose base leaves this image). Lays the base_ptr@12 word as a `func`-style diff to the base's
     /// descriptor -- the relative step a `CastClassScan` adds to walk the base chain.
     base: Option<TypeHandle>,
+    /// For an ARRAY descriptor, the ELEMENT type's handle: lays element_desc@16 the same way word 3
+    /// lays the base, so `desc + word` reaches the element type's descriptor WORDS. `None` for a
+    /// class descriptor, and for an array whose element names no descriptor that can be read for a
+    /// payload size -- the word is then 0, which means ABSENT.
+    element: Option<TypeHandle>,
 }
 
 /// The fixed descriptor header word count (`[payload, nrefs, tag, base_ptr]`); ref_offsets and then
@@ -556,6 +682,7 @@ type TypeDescs = Vec<DescEmit>;
 
 /// Lowers a module and also reports each function's byte offset in the image (its entry point) --
 /// the basis for the symbol table when emitting a relocatable object.
+#[allow(clippy::too_many_arguments)]
 fn lower_module_to_image(
     funcs: &[Function],
     alloc: AllocSite,
@@ -564,12 +691,14 @@ fn lower_module_to_image(
     profile: RiscvProfile,
     relocate: bool,
     tolerant: bool,
+    debug: Option<&crate::debugmap::ObjectDebug>,
+    string_handle: Option<u32>,
 ) -> Result<LoweredModule, LowerError> {
     let mut program = funcs.to_vec();
     if !relocate {
         crate::stringgen::lower_string_equals(&mut program);
-        crate::stringgen::lower_string_concat(&mut program);
-        crate::stringgen::lower_int_to_string(&mut program);
+        crate::stringgen::lower_string_concat(&mut program, None);
+        crate::stringgen::lower_int_to_string(&mut program, None);
     }
     let funcs: &[Function] = &program;
     if !tolerant {
@@ -584,12 +713,21 @@ fn lower_module_to_image(
     let mut offsets: Vec<u32> = Vec::with_capacity(funcs.len());
     let mut call_relocs: Vec<(u32, u32)> = Vec::new();
     let mut desc_relocs: Vec<DescReloc> = Vec::new();
+    let mut abs_desc_relocs: Vec<DescReloc> = Vec::new();
+    let string_header: Option<u32> = string_handle.filter(|_| relocate);
     let mut type_descs: TypeDescs = Vec::new();
     let mut type_desc_labels: Vec<(TypeHandle, Label)> = Vec::new();
     let mut method_records: Vec<Option<MethodRecordInfo>> = Vec::with_capacity(funcs.len());
+    let mut stub_report: LibraryStubReport = Vec::new();
+    let mut method_lines: Vec<Vec<(u32, u32)>> = Vec::with_capacity(funcs.len());
     for (index, func) in funcs.iter().enumerate() {
         enc.bind_label(func_labels[index]);
         offsets.push(enc.position());
+        let source_map = debug
+            .and_then(|d| d.source_maps.get(index))
+            .map(|m| m.0.as_slice())
+            .unwrap_or(&[]);
+        let mut lines: Vec<(u32, u32)> = Vec::new();
         if tolerant {
             let mut scratch = Encoder::new();
             let scratch_labels: Vec<Label> =
@@ -599,9 +737,12 @@ fn lower_module_to_image(
             let mut s_desc_labels: Vec<(TypeHandle, Label)> = Vec::new();
             let mut s_call_relocs: Vec<(u32, u32)> = Vec::new();
             let mut s_desc_relocs: Vec<DescReloc> = Vec::new();
+            let mut s_abs_desc_relocs: Vec<DescReloc> = Vec::new();
             let mut s_externs = externs.clone();
-            let lowered = lamella_ir::verify(func).is_ok()
-                && lower_function(
+            let lowered = if lamella_ir::verify(func).is_err() {
+                Err(LowerError::NotWellFormed)
+            } else {
+                lower_function(
                     &mut scratch,
                     func,
                     &scratch_labels,
@@ -613,10 +754,19 @@ fn lower_module_to_image(
                     profile,
                     &mut s_call_relocs,
                     &mut s_desc_relocs,
+                    &mut s_abs_desc_relocs,
+                    string_header,
                     relocate,
+                    source_map,
+                    &mut Vec::new(),
                 )
-                .is_ok();
-            if lowered {
+                .map(|_| ())
+            };
+            if let Err(error) = lowered {
+                stub_report.push((index, error));
+                enc.ret();
+                method_records.push(None);
+            } else {
                 method_records.push(
                     lower_function(
                         &mut enc,
@@ -630,13 +780,14 @@ fn lower_module_to_image(
                         profile,
                         &mut call_relocs,
                         &mut desc_relocs,
+                        &mut abs_desc_relocs,
+                        string_header,
                         relocate,
+                        source_map,
+                        &mut lines,
                     )
                     .expect("a method that lowered in the dry run lowers for real"),
                 );
-            } else {
-                enc.ret();
-                method_records.push(None);
             }
         } else {
             method_records.push(lower_function(
@@ -651,13 +802,39 @@ fn lower_module_to_image(
                 profile,
                 &mut call_relocs,
                 &mut desc_relocs,
+                &mut abs_desc_relocs,
+                string_header,
                 relocate,
+                source_map,
+                &mut lines,
             )?);
+        }
+        method_lines.push(lines);
+    }
+    if let Some(handle) = string_header.filter(|_| !abs_desc_relocs.is_empty()) {
+        let handle = TypeHandle(handle);
+        if !type_desc_labels.iter().any(|(h, _)| *h == handle) {
+            if let Some(words) = descriptors
+                .iter()
+                .find(|m| m.handle == handle)
+                .and_then(|m| m.words.as_deref())
+            {
+                let label = enc.new_label();
+                type_descs.push(DescEmit {
+                    label,
+                    vtable: descriptor_vtable(descriptors, handle, externs),
+                    words: words.to_vec(),
+                    itable: descriptor_itable(descriptors, handle, externs),
+                    base: descriptors.iter().find(|m| m.handle == handle).and_then(|m| m.base),
+                    element: None,
+                });
+                type_desc_labels.push((handle, label));
+            }
         }
     }
     if tolerant {
         for meta in descriptors {
-            let Some(words) = meta.words.as_deref() else {
+            let Some(words) = meta.words.as_deref().filter(|_| meta.exported) else {
                 continue;
             };
             let vtable = descriptor_vtable(descriptors, meta.handle, externs);
@@ -671,6 +848,7 @@ fn lower_module_to_image(
                         words,
                         itable,
                         base: meta.base,
+                        element: None,
                     };
                 }
                 None => {
@@ -681,11 +859,62 @@ fn lower_module_to_image(
                         words,
                         itable,
                         base: meta.base,
+                        element: None,
                     });
                     type_desc_labels.push((meta.handle, label));
                 }
             }
         }
+    }
+    let mut arrayi = 0;
+    while arrayi < type_descs.len() {
+        let Some(element) = type_descs[arrayi].element else {
+            arrayi += 1;
+            continue;
+        };
+        let elements_are_references =
+            type_descs[arrayi].words.get(1) == Some(&crate::resolver::ELEMENT_KIND_REFERENCE);
+        let laid = |labels: &[(TypeHandle, Label)]| labels.iter().position(|(h, _)| *h == element);
+        if laid(&type_desc_labels).is_none()
+            && crate::resolver::reference_handle_parts(element).is_none()
+        {
+            let meta = descriptors.iter().find(|d| d.handle == element);
+            match meta.and_then(|m| m.words.as_deref()) {
+                Some(words) => {
+                    let label = enc.new_label();
+                    type_descs.push(DescEmit {
+                        label,
+                        vtable: descriptor_vtable(descriptors, element, externs),
+                        words: words.to_vec(),
+                        itable: descriptor_itable(descriptors, element, externs),
+                        base: meta.and_then(|m| m.base),
+                        element: None,
+                    });
+                    type_desc_labels.push((element, label));
+                }
+                None if elements_are_references => {
+                    let label = enc.new_label();
+                    type_descs.push(DescEmit {
+                        label,
+                        vtable: Vec::new(),
+                        words: alloc::vec![0, 0, descriptor_tag(descriptors, element), 0],
+                        itable: Vec::new(),
+                        base: meta.and_then(|m| m.base),
+                        element: None,
+                    });
+                    type_desc_labels.push((element, label));
+                }
+                None => type_descs[arrayi].element = None,
+            }
+        }
+        if !elements_are_references {
+            if let Some(pos) = laid(&type_desc_labels) {
+                if type_descs[pos].words.first().copied().unwrap_or(0) == 0 {
+                    type_descs[arrayi].element = None;
+                }
+            }
+        }
+        arrayi += 1;
     }
     let desc_syms = emit_descriptors(
         &mut enc,
@@ -700,7 +929,17 @@ fn lower_module_to_image(
         .finish()
         .map(|assembled| assembled.bytes)
         .map_err(|_| LowerError::CodeTooLarge)?;
-    Ok((bytes, offsets, call_relocs, desc_syms, desc_relocs, method_records))
+    Ok((
+        bytes,
+        offsets,
+        call_relocs,
+        desc_syms,
+        desc_relocs,
+        abs_desc_relocs,
+        method_records,
+        stub_report,
+        method_lines,
+    ))
 }
 
 /// Lowers a module into an ELF32 relocatable object: each function becomes a global `STT_FUNC`
@@ -750,7 +989,41 @@ pub fn lower_object_profile(
         &DescQualifiers::default(),
         profile,
         false,
+        None,
     )
+    .map(|(bytes, ..)| bytes)
+}
+
+/// As [`lower_object_profile_statics`], but the object also CARRIES DWARF for its own code -- the
+/// RISC-V twin of [`crate::arm32::lower_object_vtables_statics_debug`].
+///
+/// `debug` supplies both halves: the `CilSourceMap` rows the LOWERING threads, and the resolved
+/// source positions the DWARF names. The generator itself is target-independent; only the
+/// relocation type differs (`R_RISCV_32` where ARM uses `R_ARM_ABS32`). Passing a `debug` with no
+/// methods produces byte-identical output to [`lower_object_profile_statics`].
+#[allow(clippy::too_many_arguments)]
+pub fn lower_object_profile_statics_debug(
+    funcs: &[Function],
+    names: &[&str],
+    externs: &[&str],
+    descriptors: &[TypeMeta],
+    statics: Option<&AssemblyStatics>,
+    profile: RiscvProfile,
+    debug: &crate::debugmap::ObjectDebug,
+) -> Result<(Vec<u8>, MethodLineTables), LowerError> {
+    lower_object_relocatable(
+        funcs,
+        names,
+        externs,
+        descriptors,
+        statics,
+        &[],
+        &DescQualifiers::default(),
+        profile,
+        false,
+        Some(debug),
+    )
+    .map(|(bytes, _, lines)| (bytes, lines))
 }
 
 /// As [`lower_object_profile`], with the assembly's statics record ([`AssemblyStatics`]: region
@@ -778,7 +1051,9 @@ pub fn lower_object_profile_statics(
         &DescQualifiers::default(),
         profile,
         false,
+        None,
     )
+    .map(|(bytes, ..)| bytes)
 }
 
 /// As [`lower_object_profile_statics`], with the ORDERED reference-assembly statics regions
@@ -810,7 +1085,9 @@ pub fn lower_object_profile_statics_references(
         qualifiers,
         profile,
         false,
+        None,
     )
+    .map(|(bytes, ..)| bytes)
 }
 
 /// The RISC-V twin of arm32 [`crate::arm32::lower_object_library`]: lowers a LIBRARY object (corlib) with
@@ -833,7 +1110,42 @@ pub fn lower_object_library(
         &DescQualifiers::default(),
         RiscvProfile::Rv32im,
         true,
+        None,
     )
+    .map(|(bytes, ..)| bytes)
+}
+
+/// As [`lower_object_library_statics`], but ALSO returning the [`LibraryStubReport`] -- every method
+/// the tolerant path demoted to a bare `ret`, and why.
+///
+/// The object bytes are IDENTICAL to [`lower_object_library_statics`]'s; the report is observation
+/// only. It exists because a stub is a SILENT demotion -- a bare `ret` returns its first argument, so
+/// a stubbed predicate reads as `true` and a stubbed getter as a plausible value, indistinguishable
+/// from a real answer at the call site. RISC-V collected no such list until now, which is precisely
+/// how the string markers stayed unlowered on this backend's object path unnoticed. The arm32 twin is
+/// [`crate::arm32::lower_object_library_vtables_report`].
+pub fn lower_object_library_statics_report(
+    funcs: &[Function],
+    names: &[&str],
+    externs: &[&str],
+    descriptors: &[TypeMeta],
+    statics: Option<&AssemblyStatics>,
+    reference_statics: &[&str],
+    qualifiers: &DescQualifiers,
+) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
+    lower_object_relocatable(
+        funcs,
+        names,
+        externs,
+        descriptors,
+        statics,
+        reference_statics,
+        qualifiers,
+        RiscvProfile::Rv32im,
+        true,
+        None,
+    )
+    .map(|(bytes, report, _)| (bytes, report))
 }
 
 /// As [`lower_object_library`], with the library's statics region attached (see
@@ -860,7 +1172,9 @@ pub fn lower_object_library_statics(
         qualifiers,
         RiscvProfile::Rv32im,
         true,
+        None,
     )
+    .map(|(bytes, ..)| bytes)
 }
 
 /// The shared relocatable-object lowering for [`lower_object_profile`] (a program, `tolerant == false` --
@@ -877,10 +1191,23 @@ fn lower_object_relocatable(
     qualifiers: &DescQualifiers,
     profile: RiscvProfile,
     tolerant: bool,
-) -> Result<Vec<u8>, LowerError> {
+    debug: Option<&crate::debugmap::ObjectDebug>,
+) -> Result<(Vec<u8>, LibraryStubReport, MethodLineTables), LowerError> {
     let mut extern_names: Vec<alloc::string::String> =
         externs.iter().map(|s| (*s).into()).collect();
-    let program: Vec<Function> = funcs
+    let mut expanded: Vec<Function> = funcs.to_vec();
+    crate::stringgen::lower_string_equals(&mut expanded);
+    crate::stringgen::lower_string_concat(&mut expanded, qualifiers.string);
+    crate::stringgen::lower_int_to_string(&mut expanded, qualifiers.string);
+    crate::stringgen::lower_write_int(&mut expanded);
+    let owned_names: Vec<alloc::string::String> = names
+        .iter()
+        .map(|s| alloc::string::String::from(*s))
+        .chain((names.len()..expanded.len()).map(|i| alloc::format!("__lamella_strgen_{i}")))
+        .collect();
+    let names: Vec<&str> = owned_names.iter().map(|s| s.as_str()).collect();
+    let names = names.as_slice();
+    let program: Vec<Function> = expanded
         .iter()
         .map(|f| rewrite_pinvoke(f, &mut extern_names))
         .collect();
@@ -889,16 +1216,27 @@ fn lower_object_relocatable(
     } else {
         AllocSite::None
     };
-    let (mut text, offsets, call_relocs, desc_syms, desc_relocs, method_records) =
-        lower_module_to_image(
-            &program,
-            alloc,
-            descriptors,
-            &mut extern_names,
-            profile,
-            true,
-            tolerant,
-        )?;
+    let (
+        mut text,
+        offsets,
+        call_relocs,
+        desc_syms,
+        desc_relocs,
+        abs_desc_relocs,
+        method_records,
+        stub_report,
+        method_lines,
+    ) = lower_module_to_image(
+        &program,
+        alloc,
+        descriptors,
+        &mut extern_names,
+        profile,
+        true,
+        tolerant,
+        debug,
+        qualifiers.string,
+    )?;
     let method_records: Vec<(usize, MethodRecordInfo)> = method_records
         .into_iter()
         .enumerate()
@@ -955,6 +1293,7 @@ fn lower_object_relocatable(
     }
     let mut undef_desc_handles: Vec<u32> = desc_relocs
         .iter()
+        .chain(abs_desc_relocs.iter())
         .filter(|&&(_, target, _)| target & DESC_SYMBOL_FLAG != 0)
         .map(|&(_, target, _)| target & !DESC_SYMBOL_FLAG)
         .filter(|handle| !desc_index.iter().any(|(h, _, _)| h == handle))
@@ -1056,7 +1395,15 @@ fn lower_object_relocatable(
             addend: 0,
         })
         .collect();
-    for &(offset, target, addend) in &desc_relocs {
+    for (&(offset, target, addend), kind) in desc_relocs
+        .iter()
+        .map(|r| (r, lamella_elf::riscv::R_LAMELLA_REL_DESC))
+        .chain(
+            abs_desc_relocs
+                .iter()
+                .map(|r| (r, lamella_elf::riscv::R_RISCV_32)),
+        )
+    {
         let (symbol, final_addend) = if target & DESC_SYMBOL_FLAG != 0 {
             let handle = target & !DESC_SYMBOL_FLAG;
             match desc_index.iter().copied().find(|(h, _, _)| *h == handle) {
@@ -1090,7 +1437,7 @@ fn lower_object_relocatable(
         relocations.push(lamella_elf::Relocation {
             offset,
             symbol,
-            kind: lamella_elf::riscv::R_LAMELLA_REL_DESC,
+            kind,
             addend: final_addend,
         });
     }
@@ -1157,12 +1504,115 @@ fn lower_object_relocatable(
             addend: 0,
         });
     }
-    Ok(lamella_elf::write_relocatable_object(
-        lamella_elf::Machine::RiscV,
-        &text,
-        &symbols,
-        &relocations,
-    ))
+    let line_tables: MethodLineTables = method_lines
+        .iter()
+        .enumerate()
+        .map(|(index, rows)| (offsets.get(index).copied().unwrap_or(0), rows.clone()))
+        .collect();
+
+    let object = match debug {
+        Some(dbg) => {
+            let described: Vec<(usize, Vec<crate::debugmap::SourceLine>)> = line_tables
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (start, rows))| {
+                    let source = dbg.methods.get(index)?;
+                    let composed = crate::debugmap::function_rows(rows, source, *start);
+                    (!composed.is_empty()).then_some((index, composed))
+                })
+                .collect();
+            let functions: Vec<crate::dwarf::FunctionLines> = described
+                .iter()
+                .map(|(index, rows)| crate::dwarf::FunctionLines {
+                    name: match dbg.methods[*index].name {
+                        "" => names[*index],
+                        display => display,
+                    },
+                    file: dbg.methods[*index].file,
+                    rows,
+                    code_size: symbols[*index].size,
+                })
+                .collect();
+            if functions.is_empty() {
+                lamella_elf::write_relocatable_object(
+                    lamella_elf::Machine::RiscV,
+                    &text,
+                    &symbols,
+                    &relocations,
+                )
+            } else {
+                let first = described[0].0;
+                let last = described[described.len() - 1].0;
+                let span = Some(offsets[last] + symbols[last].size - offsets[first]);
+                let line = crate::dwarf::line_program(&functions);
+                let (info, abbrev) =
+                    crate::dwarf::compilation_unit(dbg.unit_name, dbg.producer, span, &functions);
+                let generated = [line, info, abbrev];
+                let first_section_symbol = symbols.len() as u32;
+                for i in 0..generated.len() {
+                    symbols.push(lamella_elf::Symbol {
+                        name: "",
+                        value: 0,
+                        size: 0,
+                        binding: lamella_elf::Binding::Local,
+                        kind: lamella_elf::SymbolType::Section,
+                        section: lamella_elf::SymbolSection::InSection(i as u32),
+                    });
+                }
+                let debug_relocs: Vec<Vec<lamella_elf::Relocation>> = generated
+                    .iter()
+                    .map(|section| {
+                        let code = section.code_relocs.iter().map(|(at, function)| {
+                            lamella_elf::Relocation {
+                                offset: *at,
+                                symbol: described[*function].0 as u32,
+                                kind: lamella_elf::riscv::R_RISCV_32,
+                                addend: 0,
+                            }
+                        });
+                        let cross = section.section_relocs.iter().map(|(at, target)| {
+                            lamella_elf::Relocation {
+                                offset: *at,
+                                symbol: first_section_symbol
+                                    + generated
+                                        .iter()
+                                        .position(|s| s.name == *target)
+                                        .unwrap_or(0) as u32,
+                                kind: lamella_elf::riscv::R_RISCV_32,
+                                addend: 0,
+                            }
+                        });
+                        code.chain(cross).collect()
+                    })
+                    .collect();
+                let sections: Vec<lamella_elf::Section> = generated
+                    .iter()
+                    .enumerate()
+                    .map(|(i, section)| lamella_elf::Section {
+                        name: section.name,
+                        flags: 0,
+                        addralign: 1,
+                        data: &section.data,
+                        relocations: &debug_relocs[i],
+                    })
+                    .collect();
+                lamella_elf::write_relocatable_object_with_sections(
+                    lamella_elf::Machine::RiscV,
+                    &text,
+                    &symbols,
+                    &relocations,
+                    &sections,
+                )
+            }
+        }
+        None => lamella_elf::write_relocatable_object(
+            lamella_elf::Machine::RiscV,
+            &text,
+            &symbols,
+            &relocations,
+        ),
+    };
+    Ok((object, stub_report, line_tables))
 }
 
 /// Lowers one function into `enc`: a prologue that allocates a frame and saves the callee-saved
@@ -1183,7 +1633,11 @@ fn lower_function(
     profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
     desc_relocs: &mut Vec<DescReloc>,
+    abs_desc_relocs: &mut Vec<DescReloc>,
+    string_header: Option<u32>,
     relocate: bool,
+    source_map: &[Vec<u32>],
+    line_table: &mut Vec<(u32, u32)>,
 ) -> Result<Option<MethodRecordInfo>, LowerError> {
     let pool = allocatable(profile);
     let value_count = func.value_types.len();
@@ -1217,13 +1671,15 @@ fn lower_function(
     let has_string_literal = func.blocks.iter().any(|b| {
         b.insts
             .iter()
-            .any(|(_, i)| matches!(i, Inst::StringLiteral { .. }))
+            .any(|(_, i)| matches!(i, Inst::StringLiteral { .. } | Inst::SemihostWrite { .. }))
     });
     let has_stack_call = func.blocks.iter().any(|b| {
         b.insts
             .iter()
             .any(|(r, i)| call_stack_words(i, *r, &func.value_types, profile) > 0)
     });
+    let has_stack_params =
+        func.blocks[func.entry.index()].params.len() > arg_reg_count(profile);
     let has_statics = relocate
         && func.blocks.iter().any(|b| {
             b.insts.iter().any(|(_, i)| {
@@ -1242,6 +1698,7 @@ fn lower_function(
         || has_dispatch
         || has_string_literal
         || has_stack_call
+        || has_stack_params
         || has_statics
         || has_homeless_ref
     {
@@ -1257,7 +1714,11 @@ fn lower_function(
             profile,
             relocs,
             desc_relocs,
+            abs_desc_relocs,
+            string_header,
             relocate,
+            source_map,
+            line_table,
         );
     }
     let reg = |v: ValueId| pool[v.index()];
@@ -1270,15 +1731,15 @@ fn lower_function(
     let frame = (saved * 4).div_ceil(16) * 16;
 
     if frame > 0 {
-        enc.addi(Reg::SP, Reg::SP, -(frame as i32));
+        frame_alloc(enc, frame);
     }
     let mut offset = 0i32;
     if has_calls {
-        enc.sw(Reg::RA, Reg::SP, offset);
+        slot_store(enc, Reg::RA, offset);
         offset += 4;
     }
     for &r in used {
-        enc.sw(r, Reg::SP, offset);
+        slot_store(enc, r, offset);
         offset += 4;
     }
     let entry = &func.blocks[func.entry.index()];
@@ -1297,7 +1758,10 @@ fn lower_function(
     for (index, block) in func.blocks.iter().enumerate() {
         enc.bind_label(block_labels[index]);
 
-        for (result, inst) in &block.insts {
+        for (inst_pos, (result, inst)) in block.insts.iter().enumerate() {
+            if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
+                line_table.push((enc.position(), cil));
+            }
             lower_inst(
                 enc,
                 &reg,
@@ -1310,6 +1774,9 @@ fn lower_function(
             )?;
         }
 
+        if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
+            line_table.push((enc.position(), cil));
+        }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
                 if let Some(v) = value {
@@ -1317,15 +1784,15 @@ fn lower_function(
                 }
                 let mut offset = 0i32;
                 if has_calls {
-                    enc.lw(Reg::RA, Reg::SP, offset);
+                    slot_load(enc, Reg::RA, offset);
                     offset += 4;
                 }
                 for &r in used {
-                    enc.lw(r, Reg::SP, offset);
+                    slot_load(enc, r, offset);
                     offset += 4;
                 }
                 if frame > 0 {
-                    enc.addi(Reg::SP, Reg::SP, frame as i32);
+                    frame_free(enc, frame);
                 }
                 enc.ret();
             }
@@ -1701,6 +2168,7 @@ fn method_record_roots(
             MirType::ObjectRef => STACKMAP_KIND_OBJECT_REF,
             MirType::ManagedPtr => STACKMAP_KIND_MANAGED_PTR,
             MirType::PyValue => STACKMAP_KIND_TAGGED,
+            _ if crate::stackmaps::is_ref_cell(*ty) => STACKMAP_KIND_OBJECT_REF,
             _ => continue,
         };
         roots.push(((offsets[v] / 4) as u16) | (kind << 14));
@@ -1729,17 +2197,12 @@ fn lower_function_spilled(
     profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
     desc_relocs: &mut Vec<DescReloc>,
+    abs_desc_relocs: &mut Vec<DescReloc>,
+    string_header: Option<u32>,
     relocate: bool,
+    source_map: &[Vec<u32>],
+    line_table: &mut Vec<(u32, u32)>,
 ) -> Result<Option<MethodRecordInfo>, LowerError> {
-    let max_args = arg_reg_count(profile);
-    let arg_overflow = func.blocks[func.entry.index()].params.len() > max_args
-        || func.blocks.iter().flat_map(|b| &b.insts).any(|(_, inst)| {
-            !matches!(inst, Inst::Call { .. } | Inst::CallNative { .. })
-                && register_arg_count(inst) > max_args
-        });
-    if arg_overflow {
-        return Err(LowerError::ControlFlowUnsupported);
-    }
     let saves_scratch = matches!(profile, RiscvProfile::Rv32ec);
     let has_calls = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(r, i)| {
@@ -1748,6 +2211,7 @@ fn lower_function_spilled(
                 Inst::Call { .. }
                     | Inst::Alloc { .. }
                     | Inst::AllocLike { .. }
+                    | Inst::AllocDescribed { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::AllocArrayMD { .. }
@@ -1756,6 +2220,7 @@ fn lower_function_spilled(
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
                     | Inst::CallNative { .. }
+                    | Inst::SemihostWrite { .. }
             ) || matches!(
                 i,
                 Inst::Binary { op, .. }
@@ -1796,7 +2261,11 @@ fn lower_function_spilled(
         + invokes_delegate as i32 * 8) as usize)
         .div_ceil(16)
         * 16;
-    if frame > 2047 {
+    let frame_ceiling = match profile {
+        RiscvProfile::Rv32im => 32 * 1024,
+        RiscvProfile::Rv32ec => FRAME_IMM_MAX as usize,
+    };
+    if frame > frame_ceiling {
         return Err(LowerError::TooManyValues);
     }
     let has_safepoint = func
@@ -1813,55 +2282,66 @@ fn lower_function_spilled(
     });
     let slot = |v: ValueId| offsets[v.index()];
     let mut string_blobs: Vec<(Label, Vec<u16>)> = Vec::new();
+    let mut byte_blobs: Vec<(Label, Vec<u8>)> = Vec::new();
     let mut desc_ptr_pool: Vec<(TypeHandle, Label)> = Vec::new();
     let mut func_ptr_pool: Vec<(u32, Label)> = Vec::new();
     let mut statics_ptr_pool: Vec<((u32, i32), Label)> = Vec::new();
 
     if frame > 0 {
-        enc.addi(Reg::SP, Reg::SP, -(frame as i32));
+        frame_alloc(enc, frame);
     }
     if has_calls {
-        enc.sw(Reg::RA, Reg::SP, ra_off);
+        slot_store(enc, Reg::RA, ra_off);
     }
     if saves_scratch {
-        enc.sw(spilled_scratch(profile), Reg::SP, scratch_off);
+        slot_store(enc, spilled_scratch(profile), scratch_off);
     }
     let entry = &func.blocks[func.entry.index()];
     let mut arg_index = 0usize;
     if returns_sret {
-        enc.sw(Reg::A0, Reg::SP, sret_off);
+        slot_store(enc, Reg::A0, sret_off);
         arg_index = 1;
     }
+    let mut stack_word = 0i32;
     for &param in &entry.params {
         let words = value_words(&func.value_types, param);
         if words > 2 {
-            if arg_index >= arg_reg_count(profile) {
-                return Err(LowerError::ControlFlowUnsupported);
-            }
-            let ptr = arg_reg(arg_index).ok_or(LowerError::ControlFlowUnsupported)?;
+            let ptr = if arg_index < arg_reg_count(profile) {
+                let register = arg_reg(arg_index).ok_or(LowerError::ControlFlowUnsupported)?;
+                arg_index += 1;
+                register
+            } else {
+                let off = frame as i32 + stack_word * 4;
+                slot_load(enc, Reg::T1, off);
+                stack_word += 1;
+                Reg::T1
+            };
             for w in 0..slot_words(&func.value_types, param) as i32 {
                 enc.lw(Reg::T0, ptr, w * 4);
-                enc.sw(Reg::T0, Reg::SP, slot(param) + w * 4);
+                slot_store(enc, Reg::T0, slot(param) + w * 4);
             }
-            arg_index += 1;
             continue;
         }
         for w in 0..words {
-            if arg_index >= arg_reg_count(profile) {
-                return Err(LowerError::ControlFlowUnsupported);
+            if arg_index < arg_reg_count(profile) {
+                let arg = arg_reg(arg_index).ok_or(LowerError::ControlFlowUnsupported)?;
+                slot_store(enc, arg, slot(param) + w as i32 * 4);
+                arg_index += 1;
+            } else {
+                let off = frame as i32 + stack_word * 4;
+                slot_load(enc, Reg::T0, off);
+                slot_store(enc, Reg::T0, slot(param) + w as i32 * 4);
+                stack_word += 1;
             }
-            let arg = arg_reg(arg_index).ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.sw(arg, Reg::SP, slot(param) + w as i32 * 4);
-            arg_index += 1;
         }
     }
 
     if relocate && has_safepoint {
         for (v, ty) in func.value_types.iter().enumerate() {
-            if (ty.is_gc_reference() || ty.is_tagged_value())
+            if (ty.is_gc_reference() || ty.is_tagged_value() || crate::stackmaps::is_ref_cell(*ty))
                 && !entry.params.contains(&ValueId(v as u32))
             {
-                enc.sw(Reg::ZERO, Reg::SP, offsets[v]);
+                slot_store(enc, Reg::ZERO, offsets[v]);
             }
         }
     }
@@ -1873,7 +2353,10 @@ fn lower_function_spilled(
 
     for (index, block) in func.blocks.iter().enumerate() {
         enc.bind_label(block_labels[index]);
-        for (result, inst) in &block.insts {
+        for (inst_pos, (result, inst)) in block.insts.iter().enumerate() {
+            if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
+                line_table.push((enc.position(), cil));
+            }
             lower_inst_spilled(
                 enc,
                 &slot,
@@ -1886,6 +2369,7 @@ fn lower_function_spilled(
                 type_descs,
                 type_desc_labels,
                 &mut string_blobs,
+                &mut byte_blobs,
                 &mut desc_ptr_pool,
                 &mut func_ptr_pool,
                 &mut statics_ptr_pool,
@@ -1896,32 +2380,35 @@ fn lower_function_spilled(
                 mc_off,
             )?;
         }
+        if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
+            line_table.push((enc.position(), cil));
+        }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
                 if let Some(v) = value {
                     let words = value_words(&func.value_types, *v);
                     if words > 2 {
-                        enc.lw(Reg::T0, Reg::SP, sret_off);
+                        slot_load(enc, Reg::T0, sret_off);
                         for w in 0..slot_words(&func.value_types, *v) as i32 {
-                            enc.lw(Reg::T1, Reg::SP, slot(*v) + w * 4);
+                            slot_load(enc, Reg::T1, slot(*v) + w * 4);
                             enc.sw(Reg::T1, Reg::T0, w * 4);
                         }
                         enc.mv(Reg::A0, Reg::T0);
                     } else {
-                        enc.lw(Reg::A0, Reg::SP, slot(*v));
+                        slot_load(enc, Reg::A0, slot(*v));
                         if words >= 2 {
-                            enc.lw(Reg::A1, Reg::SP, slot(*v) + 4);
+                            slot_load(enc, Reg::A1, slot(*v) + 4);
                         }
                     }
                 }
                 if has_calls {
-                    enc.lw(Reg::RA, Reg::SP, ra_off);
+                    slot_load(enc, Reg::RA, ra_off);
                 }
                 if saves_scratch {
-                    enc.lw(spilled_scratch(profile), Reg::SP, scratch_off);
+                    slot_load(enc, spilled_scratch(profile), scratch_off);
                 }
                 if frame > 0 {
-                    enc.addi(Reg::SP, Reg::SP, frame as i32);
+                    frame_free(enc, frame);
                 }
                 enc.ret();
             }
@@ -1934,8 +2421,8 @@ fn lower_function_spilled(
                     return Err(LowerError::ControlFlowUnsupported);
                 }
                 for (p, a) in params.iter().zip(args) {
-                    enc.lw(Reg::T0, Reg::SP, slot(*a));
-                    enc.sw(Reg::T0, Reg::SP, slot(*p));
+                    slot_load(enc, Reg::T0, slot(*a));
+                    slot_store(enc, Reg::T0, slot(*p));
                 }
                 enc.j(block_labels[target.index()]);
             }
@@ -1951,7 +2438,7 @@ fn lower_function_spilled(
                 }
                 let true_label = block_labels[if_true.index()];
                 let false_label = block_labels[if_false.index()];
-                enc.lw(Reg::T0, Reg::SP, slot(*cond));
+                slot_load(enc, Reg::T0, slot(*cond));
                 enc.branch(BranchCond::Ne, Reg::T0, Reg::ZERO, true_label);
                 enc.j(false_label);
             }
@@ -1980,6 +2467,7 @@ fn lower_function_spilled(
                         .iter()
                         .find(|d| d.handle == base)
                         .and_then(|d| d.base),
+                    element: None,
                 });
                 type_desc_labels.push((base, label));
             }
@@ -2002,12 +2490,30 @@ fn lower_function_spilled(
         enc.emit_word(0);
     }
     for (label, units) in &string_blobs {
+        if let Some(handle) = string_header {
+            abs_desc_relocs.push((enc.position(), DESC_SYMBOL_FLAG | handle, 0));
+            enc.emit_word(0);
+        }
         enc.bind_label(*label);
-        enc.emit_word(units.len() as u32);
-        for pair in units.chunks(2) {
-            let lo = u32::from(pair[0]);
-            let hi = pair.get(1).map_or(0, |&u| u32::from(u));
-            enc.emit_word(lo | (hi << 16));
+        let blob = crate::stringgen::string_blob_bytes(units).map_err(|e| {
+            LowerError::UnencodableStringUnit {
+                unit: e.unit,
+                index: e.index,
+            }
+        })?;
+        enc.emit_bytes(&blob);
+        for _ in 0..((4 - (blob.len() % 4)) % 4) {
+            enc.emit_bytes(&[0]);
+        }
+    }
+    for (label, bytes) in &byte_blobs {
+        enc.bind_label(*label);
+        for word in bytes.chunks(4) {
+            let mut packed = 0u32;
+            for (i, &b) in word.iter().enumerate() {
+                packed |= u32::from(b) << (8 * i);
+            }
+            enc.emit_word(packed);
         }
     }
     Ok(method_record)
@@ -2029,6 +2535,7 @@ fn lower_inst_spilled(
     type_descs: &mut TypeDescs,
     type_desc_labels: &mut Vec<(TypeHandle, Label)>,
     string_blobs: &mut Vec<(Label, Vec<u16>)>,
+    byte_blobs: &mut Vec<(Label, Vec<u8>)>,
     desc_ptr_pool: &mut Vec<(TypeHandle, Label)>,
     func_ptr_pool: &mut Vec<(u32, Label)>,
     statics_ptr_pool: &mut Vec<((u32, i32), Label)>,
@@ -2043,25 +2550,25 @@ fn lower_inst_spilled(
     match inst {
         Inst::ConstInt { ty, value } => {
             enc.li(t0, *value as i32);
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
             if matches!(ty, MirType::I64 | MirType::F64) {
                 enc.li(t0, (*value >> 32) as i32);
-                enc.sw(t0, Reg::SP, slot(result) + 4);
+                slot_store(enc, t0, slot(result) + 4);
             }
         }
         Inst::Widen { value, signed } => {
-            enc.lw(t0, Reg::SP, slot(*value));
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_load(enc, t0, slot(*value));
+            slot_store(enc, t0, slot(result));
             if *signed {
                 enc.srai(t0, t0, 31);
             } else {
                 enc.li(t0, 0);
             }
-            enc.sw(t0, Reg::SP, slot(result) + 4);
+            slot_store(enc, t0, slot(result) + 4);
         }
         Inst::Truncate { value } => {
-            enc.lw(t0, Reg::SP, slot(*value));
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_load(enc, t0, slot(*value));
+            slot_store(enc, t0, slot(result));
         }
         Inst::Binary { op, lhs, rhs } => {
             if is_i64(value_types, result) {
@@ -2077,14 +2584,14 @@ fn lower_inst_spilled(
                         Reg::new(12).unwrap_or(Reg::ZERO),
                         Reg::new(13).unwrap_or(Reg::ZERO),
                     );
-                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
-                    enc.lw(Reg::A1, Reg::SP, slot(*lhs) + 4);
-                    enc.lw(a2, Reg::SP, slot(*rhs));
-                    enc.lw(a3, Reg::SP, slot(*rhs) + 4);
+                    slot_load(enc, Reg::A0, slot(*lhs));
+                    slot_load(enc, Reg::A1, slot(*lhs) + 4);
+                    slot_load(enc, a2, slot(*rhs));
+                    slot_load(enc, a3, slot(*rhs) + 4);
                     let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
                     emit_call(enc, func_labels, relocs, relocate, target)?;
-                    enc.sw(Reg::A0, Reg::SP, slot(result));
-                    enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+                    slot_store(enc, Reg::A0, slot(result));
+                    slot_store(enc, Reg::A1, slot(result) + 4);
                 } else {
                     emit_i64_binary(enc, slot, *op, result, *lhs, *rhs, profile)?;
                 }
@@ -2100,30 +2607,30 @@ fn lower_inst_spilled(
                         Reg::new(12).unwrap_or(Reg::ZERO),
                         Reg::new(13).unwrap_or(Reg::ZERO),
                     );
-                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
-                    enc.lw(Reg::A1, Reg::SP, slot(*lhs) + 4);
-                    enc.lw(a2, Reg::SP, slot(*rhs));
-                    enc.lw(a3, Reg::SP, slot(*rhs) + 4);
+                    slot_load(enc, Reg::A0, slot(*lhs));
+                    slot_load(enc, Reg::A1, slot(*lhs) + 4);
+                    slot_load(enc, a2, slot(*rhs));
+                    slot_load(enc, a3, slot(*rhs) + 4);
                     let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
                     emit_call(enc, func_labels, relocs, relocate, target)?;
-                    enc.sw(Reg::A0, Reg::SP, slot(result));
-                    enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+                    slot_store(enc, Reg::A0, slot(result));
+                    slot_store(enc, Reg::A1, slot(result) + 4);
                 } else {
-                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
-                    enc.lw(Reg::A1, Reg::SP, slot(*rhs));
+                    slot_load(enc, Reg::A0, slot(*lhs));
+                    slot_load(enc, Reg::A1, slot(*rhs));
                     let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
                     emit_call(enc, func_labels, relocs, relocate, target)?;
-                    enc.sw(Reg::A0, Reg::SP, slot(result));
+                    slot_store(enc, Reg::A0, slot(result));
                 }
             } else if matches!(profile, RiscvProfile::Rv32ec) && is_soft_int_binop(*op) {
-                enc.lw(Reg::A0, Reg::SP, slot(*lhs));
-                enc.lw(Reg::A1, Reg::SP, slot(*rhs));
+                slot_load(enc, Reg::A0, slot(*lhs));
+                slot_load(enc, Reg::A1, slot(*rhs));
                 let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, soft_int_routine(*op));
                 emit_call(enc, func_labels, relocs, relocate, target)?;
-                enc.sw(Reg::A0, Reg::SP, slot(result));
+                slot_store(enc, Reg::A0, slot(result));
             } else {
-                enc.lw(t0, Reg::SP, slot(*lhs));
-                enc.lw(t1, Reg::SP, slot(*rhs));
+                slot_load(enc, t0, slot(*lhs));
+                slot_load(enc, t1, slot(*rhs));
                 match op {
                     BinOp::Add => enc.add(t0, t0, t1),
                     BinOp::Sub => enc.sub(t0, t0, t1),
@@ -2139,7 +2646,7 @@ fn lower_inst_spilled(
                     BinOp::ShrSigned => enc.sra(t0, t0, t1),
                     BinOp::ShrUnsigned => enc.srl(t0, t0, t1),
                 }
-                enc.sw(t0, Reg::SP, slot(result));
+                slot_store(enc, t0, slot(result));
             }
         }
         Inst::Compare { op, lhs, rhs } => {
@@ -2157,23 +2664,23 @@ fn lower_inst_spilled(
                         Reg::new(12).unwrap_or(Reg::ZERO),
                         Reg::new(13).unwrap_or(Reg::ZERO),
                     );
-                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
-                    enc.lw(Reg::A1, Reg::SP, slot(*lhs) + 4);
-                    enc.lw(a2, Reg::SP, slot(*rhs));
-                    enc.lw(a3, Reg::SP, slot(*rhs) + 4);
+                    slot_load(enc, Reg::A0, slot(*lhs));
+                    slot_load(enc, Reg::A1, slot(*lhs) + 4);
+                    slot_load(enc, a2, slot(*rhs));
+                    slot_load(enc, a3, slot(*rhs) + 4);
                 } else {
-                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
-                    enc.lw(Reg::A1, Reg::SP, slot(*rhs));
+                    slot_load(enc, Reg::A0, slot(*lhs));
+                    slot_load(enc, Reg::A1, slot(*rhs));
                 }
                 let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, &name);
                 emit_call(enc, func_labels, relocs, relocate, target)?;
                 materialize_compare(enc, t0, Reg::A0, Reg::ZERO, result_op);
-                enc.sw(t0, Reg::SP, slot(result));
+                slot_store(enc, t0, slot(result));
             } else {
-                enc.lw(t0, Reg::SP, slot(*lhs));
-                enc.lw(t1, Reg::SP, slot(*rhs));
+                slot_load(enc, t0, slot(*lhs));
+                slot_load(enc, t1, slot(*rhs));
                 materialize_compare(enc, t2, t0, t1, *op);
-                enc.sw(t2, Reg::SP, slot(result));
+                slot_store(enc, t2, slot(result));
             }
         }
         Inst::Convert { value, kind } => {
@@ -2181,38 +2688,38 @@ fn lower_inst_spilled(
                 if !relocate {
                     return Err(LowerError::Unsupported);
                 }
-                enc.lw(Reg::A0, Reg::SP, slot(*value));
+                slot_load(enc, Reg::A0, slot(*value));
                 if src_words >= 2 {
-                    enc.lw(Reg::A1, Reg::SP, slot(*value) + 4);
+                    slot_load(enc, Reg::A1, slot(*value) + 4);
                 }
                 let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
                 emit_call(enc, func_labels, relocs, relocate, target)?;
-                enc.sw(Reg::A0, Reg::SP, slot(result));
+                slot_store(enc, Reg::A0, slot(result));
                 if dst_words >= 2 {
-                    enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+                    slot_store(enc, Reg::A1, slot(result) + 4);
                 }
             } else {
-                enc.lw(t0, Reg::SP, slot(*value));
+                slot_load(enc, t0, slot(*value));
                 emit_convert(enc, t0, t0, *kind)?;
-                enc.sw(t0, Reg::SP, slot(result));
+                slot_store(enc, t0, slot(result));
             }
         }
         Inst::CopyBlock { dst, src, size } => {
-            enc.lw(t0, Reg::SP, slot(*dst));
-            enc.lw(t1, Reg::SP, slot(*src));
-            enc.lw(t2, Reg::SP, slot(*size));
+            slot_load(enc, t0, slot(*dst));
+            slot_load(enc, t1, slot(*src));
+            slot_load(enc, t2, slot(*size));
             emit_copy_block(enc, t0, t1, t2, profile);
         }
         Inst::FillBlock { dst, value, size } => {
-            enc.lw(t0, Reg::SP, slot(*dst));
-            enc.lw(t1, Reg::SP, slot(*value));
-            enc.lw(t2, Reg::SP, slot(*size));
+            slot_load(enc, t0, slot(*dst));
+            slot_load(enc, t1, slot(*value));
+            slot_load(enc, t2, slot(*size));
             emit_fill_block(enc, t0, t1, t2);
         }
         Inst::StaticLoad { owner, offset } => {
             emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
             enc.lw(t0, t0, 0);
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
         }
         Inst::StaticStore {
             owner,
@@ -2220,7 +2727,7 @@ fn lower_inst_spilled(
             value,
         } => {
             emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
-            enc.lw(t1, Reg::SP, slot(*value));
+            slot_load(enc, t1, slot(*value));
             enc.sw(t1, t0, 0);
         }
         Inst::AllocArray2D {
@@ -2239,13 +2746,14 @@ fn lower_inst_spilled(
                         words: alloc::vec![*element_size, 0, 0],
                         itable: Vec::new(),
                         base: None,
+                        element: None,
                     });
                     type_desc_labels.push((*handle, l));
                     l
                 }
             };
-            enc.lw(t0, Reg::SP, slot(*dim0));
-            enc.lw(t1, Reg::SP, slot(*dim1));
+            slot_load(enc, t0, slot(*dim0));
+            slot_load(enc, t1, slot(*dim1));
             emit_soft_mul32(enc, t2, t0, t1, scratch, profile);
             if element_size.is_power_of_two() {
                 enc.slli(t2, t2, element_size.trailing_zeros());
@@ -2260,11 +2768,11 @@ fn lower_inst_spilled(
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
             enc.bind_label(ok);
-            enc.lw(t0, Reg::SP, slot(*dim0));
+            slot_load(enc, t0, slot(*dim0));
             enc.sw(t0, Reg::A0, 0);
-            enc.lw(t0, Reg::SP, slot(*dim1));
+            slot_load(enc, t0, slot(*dim1));
             enc.sw(t0, Reg::A0, 4);
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::Array2DLoad {
             array,
@@ -2273,21 +2781,28 @@ fn lower_inst_spilled(
             element_size,
             signed,
         } => {
-            if !matches!(*element_size, 1 | 2 | 4) {
+            if !matches!(*element_size, 1 | 2 | 4 | 8) {
                 return Err(LowerError::Unsupported);
             }
-            enc.lw(t0, Reg::SP, slot(*array));
-            enc.lw(t1, Reg::SP, slot(*index0));
-            enc.lw(t2, Reg::SP, slot(*index1));
+            slot_load(enc, t0, slot(*array));
+            slot_load(enc, t1, slot(*index0));
+            slot_load(enc, t2, slot(*index1));
             emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
             match (*element_size, *signed) {
                 (1, true) => enc.lb(t0, scratch, 0),
                 (1, false) => enc.lbu(t0, scratch, 0),
                 (2, true) => enc.lh(t0, scratch, 0),
                 (2, false) => enc.lhu(t0, scratch, 0),
+                (8, _) => {
+                    enc.lw(t0, scratch, 0);
+                    slot_store(enc, t0, slot(result));
+                    enc.lw(t0, scratch, 4);
+                    slot_store(enc, t0, slot(result) + 4);
+                    return Ok(());
+                }
                 _ => enc.lw(t0, scratch, 0),
             }
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
         }
         Inst::Array2DStore {
             array,
@@ -2296,17 +2811,22 @@ fn lower_inst_spilled(
             value,
             element_size,
         } => {
-            if !matches!(*element_size, 1 | 2 | 4) {
+            if !matches!(*element_size, 1 | 2 | 4 | 8) {
                 return Err(LowerError::Unsupported);
             }
-            enc.lw(t0, Reg::SP, slot(*array));
-            enc.lw(t1, Reg::SP, slot(*index0));
-            enc.lw(t2, Reg::SP, slot(*index1));
+            slot_load(enc, t0, slot(*array));
+            slot_load(enc, t1, slot(*index0));
+            slot_load(enc, t2, slot(*index1));
             emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
-            enc.lw(t0, Reg::SP, slot(*value));
+            slot_load(enc, t0, slot(*value));
             match *element_size {
                 1 => enc.sb(t0, scratch, 0),
                 2 => enc.sh(t0, scratch, 0),
+                8 => {
+                    enc.sw(t0, scratch, 0);
+                    slot_load(enc, t0, slot(*value) + 4);
+                    enc.sw(t0, scratch, 4);
+                }
                 _ => enc.sw(t0, scratch, 0),
             }
         }
@@ -2330,14 +2850,15 @@ fn lower_inst_spilled(
                         words: alloc::vec![*element_size, 0, 0],
                         itable: Vec::new(),
                         base: None,
+                        element: None,
                     });
                     type_desc_labels.push((*handle, l));
                     l
                 }
             };
-            enc.lw(t0, Reg::SP, slot(dims[0]));
+            slot_load(enc, t0, slot(dims[0]));
             for d in &dims[1..] {
-                enc.lw(t1, Reg::SP, slot(*d));
+                slot_load(enc, t1, slot(*d));
                 enc.mul(t0, t0, t1);
             }
             if element_size.is_power_of_two() {
@@ -2354,10 +2875,10 @@ fn lower_inst_spilled(
             enc.ebreak();
             enc.bind_label(ok);
             for (k, d) in dims.iter().enumerate() {
-                enc.lw(t0, Reg::SP, slot(*d));
+                slot_load(enc, t0, slot(*d));
                 enc.sw(t0, Reg::A0, 4 * k as i32);
             }
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::ArrayMDLoad {
             array,
@@ -2365,19 +2886,26 @@ fn lower_inst_spilled(
             element_size,
             signed,
         } => {
-            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4) {
+            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4 | 8) {
                 return Err(LowerError::Unsupported);
             }
-            enc.lw(t0, Reg::SP, slot(*array));
+            slot_load(enc, t0, slot(*array));
             emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
             match (*element_size, *signed) {
                 (1, true) => enc.lb(t0, t1, 0),
                 (1, false) => enc.lbu(t0, t1, 0),
                 (2, true) => enc.lh(t0, t1, 0),
                 (2, false) => enc.lhu(t0, t1, 0),
+                (8, _) => {
+                    enc.lw(t0, t1, 0);
+                    slot_store(enc, t0, slot(result));
+                    enc.lw(t0, t1, 4);
+                    slot_store(enc, t0, slot(result) + 4);
+                    return Ok(());
+                }
                 _ => enc.lw(t0, t1, 0),
             }
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
         }
         Inst::ArrayMDStore {
             array,
@@ -2385,15 +2913,20 @@ fn lower_inst_spilled(
             value,
             element_size,
         } => {
-            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4) {
+            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4 | 8) {
                 return Err(LowerError::Unsupported);
             }
-            enc.lw(t0, Reg::SP, slot(*array));
+            slot_load(enc, t0, slot(*array));
             emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
-            enc.lw(t0, Reg::SP, slot(*value));
+            slot_load(enc, t0, slot(*value));
             match *element_size {
                 1 => enc.sb(t0, t1, 0),
                 2 => enc.sh(t0, t1, 0),
+                8 => {
+                    enc.sw(t0, t1, 0);
+                    slot_load(enc, t0, slot(*value) + 4);
+                    enc.sw(t0, t1, 4);
+                }
                 _ => enc.sw(t0, t1, 0),
             }
         }
@@ -2402,7 +2935,7 @@ fn lower_inst_spilled(
             width,
             signed,
         } => {
-            enc.lw(t0, Reg::SP, slot(*address));
+            slot_load(enc, t0, slot(*address));
             match (*width, *signed) {
                 (1, true) => enc.lb(t1, t0, 0),
                 (1, false) => enc.lbu(t1, t0, 0),
@@ -2410,15 +2943,15 @@ fn lower_inst_spilled(
                 (2, false) => enc.lhu(t1, t0, 0),
                 _ => enc.lw(t1, t0, 0),
             }
-            enc.sw(t1, Reg::SP, slot(result));
+            slot_store(enc, t1, slot(result));
         }
         Inst::Store {
             address,
             value,
             width,
         } => {
-            enc.lw(t0, Reg::SP, slot(*address));
-            enc.lw(t1, Reg::SP, slot(*value));
+            slot_load(enc, t0, slot(*address));
+            slot_load(enc, t1, slot(*value));
             match *width {
                 1 => enc.sb(t1, t0, 0),
                 2 => enc.sh(t1, t0, 0),
@@ -2429,16 +2962,16 @@ fn lower_inst_spilled(
             let ptr = is_pointer(value_types, *base);
             if let Some((full_words, rem)) = value_type_copy_extent(value_types, result) {
                 if ptr {
-                    enc.lw(t0, Reg::SP, slot(*base));
+                    slot_load(enc, t0, slot(*base));
                 }
                 for w in 0..full_words {
                     let foff = *offset + w * 4;
                     if ptr {
                         enc.lw(t1, t0, field_offset(foff)?);
                     } else {
-                        enc.lw(t1, Reg::SP, slot(*base) + foff as i32);
+                        slot_load(enc, t1, slot(*base) + foff as i32);
                     }
-                    enc.sw(t1, Reg::SP, slot(result) + (w * 4) as i32);
+                    slot_store(enc, t1, slot(result) + (w * 4) as i32);
                 }
                 for k in 0..rem {
                     let at = full_words * 4 + k;
@@ -2450,12 +2983,12 @@ fn lower_inst_spilled(
                     enc.sb(t1, Reg::SP, slot(result) + at as i32);
                 }
             } else if ptr {
-                enc.lw(t0, Reg::SP, slot(*base));
+                slot_load(enc, t0, slot(*base));
                 enc.lw(t1, t0, field_offset(*offset)?);
-                enc.sw(t1, Reg::SP, slot(result));
+                slot_store(enc, t1, slot(result));
             } else {
-                enc.lw(t1, Reg::SP, slot(*base) + *offset as i32);
-                enc.sw(t1, Reg::SP, slot(result));
+                slot_load(enc, t1, slot(*base) + *offset as i32);
+                slot_store(enc, t1, slot(result));
             }
         }
         Inst::FieldStore {
@@ -2466,15 +2999,15 @@ fn lower_inst_spilled(
             let ptr = is_pointer(value_types, *base);
             if let Some((full_words, rem)) = value_type_copy_extent(value_types, *value) {
                 if ptr {
-                    enc.lw(t0, Reg::SP, slot(*base));
+                    slot_load(enc, t0, slot(*base));
                 }
                 for w in 0..full_words {
                     let foff = *offset + w * 4;
-                    enc.lw(t1, Reg::SP, slot(*value) + (w * 4) as i32);
+                    slot_load(enc, t1, slot(*value) + (w * 4) as i32);
                     if ptr {
                         enc.sw(t1, t0, field_offset(foff)?);
                     } else {
-                        enc.sw(t1, Reg::SP, slot(*base) + foff as i32);
+                        slot_store(enc, t1, slot(*base) + foff as i32);
                     }
                 }
                 for k in 0..rem {
@@ -2487,12 +3020,12 @@ fn lower_inst_spilled(
                     }
                 }
             } else if ptr {
-                enc.lw(t0, Reg::SP, slot(*base));
-                enc.lw(t1, Reg::SP, slot(*value));
+                slot_load(enc, t0, slot(*base));
+                slot_load(enc, t1, slot(*value));
                 enc.sw(t1, t0, field_offset(*offset)?);
             } else {
-                enc.lw(t1, Reg::SP, slot(*value));
-                enc.sw(t1, Reg::SP, slot(*base) + *offset as i32);
+                slot_load(enc, t1, slot(*value));
+                slot_store(enc, t1, slot(*base) + *offset as i32);
             }
         }
         Inst::FieldLoadNarrow {
@@ -2502,9 +3035,9 @@ fn lower_inst_spilled(
             signed,
         } => {
             if is_pointer(value_types, *base) {
-                enc.lw(t0, Reg::SP, slot(*base));
+                slot_load(enc, t0, slot(*base));
             } else {
-                enc.addi(t0, Reg::SP, slot(*base));
+                slot_addr(enc, t0, slot(*base));
             }
             let off = field_offset(*offset)?;
             match (*size, *signed) {
@@ -2514,7 +3047,7 @@ fn lower_inst_spilled(
                 (2, true) => enc.lh(t1, t0, off),
                 _ => return Err(LowerError::Unsupported),
             }
-            enc.sw(t1, Reg::SP, slot(result));
+            slot_store(enc, t1, slot(result));
         }
         Inst::FieldStoreNarrow {
             base,
@@ -2523,11 +3056,11 @@ fn lower_inst_spilled(
             size,
         } => {
             if is_pointer(value_types, *base) {
-                enc.lw(t0, Reg::SP, slot(*base));
+                slot_load(enc, t0, slot(*base));
             } else {
-                enc.addi(t0, Reg::SP, slot(*base));
+                slot_addr(enc, t0, slot(*base));
             }
-            enc.lw(t1, Reg::SP, slot(*value));
+            slot_load(enc, t1, slot(*value));
             let off = field_offset(*offset)?;
             match *size {
                 1 => enc.sb(t1, t0, off),
@@ -2537,26 +3070,26 @@ fn lower_inst_spilled(
         }
         Inst::FieldAddr { base, offset } => {
             if is_pointer(value_types, *base) {
-                enc.lw(t0, Reg::SP, slot(*base));
+                slot_load(enc, t0, slot(*base));
                 enc.addi(t1, t0, field_offset(*offset)?);
             } else {
-                enc.addi(t1, Reg::SP, slot(*base) + *offset as i32);
+                slot_addr(enc, t1, slot(*base) + *offset as i32);
             }
-            enc.sw(t1, Reg::SP, slot(result));
+            slot_store(enc, t1, slot(result));
         }
         Inst::InitStruct => {
             let words = slot_words(value_types, result);
             enc.li(t0, 0);
             for w in 0..words {
-                enc.sw(t0, Reg::SP, slot(result) + (w * 4) as i32);
+                slot_store(enc, t0, slot(result) + (w * 4) as i32);
             }
         }
         Inst::CopyStruct { src } => {
             let words = slot_words(value_types, result);
             for w in 0..words {
                 let off = (w * 4) as i32;
-                enc.lw(t0, Reg::SP, slot(*src) + off);
-                enc.sw(t0, Reg::SP, slot(result) + off);
+                slot_load(enc, t0, slot(*src) + off);
+                slot_store(enc, t0, slot(result) + off);
             }
         }
         Inst::ArrayLoad {
@@ -2568,8 +3101,8 @@ fn lower_inst_spilled(
             if !matches!(*element_size, 1 | 2 | 4 | 8) {
                 return Err(LowerError::Unsupported);
             }
-            enc.lw(t0, Reg::SP, slot(*array));
-            enc.lw(t1, Reg::SP, slot(*index));
+            slot_load(enc, t0, slot(*array));
+            slot_load(enc, t1, slot(*index));
             emit_element_address(enc, t0, t1, *element_size, profile);
             match (*element_size, *signed) {
                 (1, true) => enc.lb(t2, scratch, 4),
@@ -2578,14 +3111,14 @@ fn lower_inst_spilled(
                 (2, false) => enc.lhu(t2, scratch, 4),
                 (8, _) => {
                     enc.lw(t2, scratch, 4);
-                    enc.sw(t2, Reg::SP, slot(result));
+                    slot_store(enc, t2, slot(result));
                     enc.lw(t2, scratch, 8);
-                    enc.sw(t2, Reg::SP, slot(result) + 4);
+                    slot_store(enc, t2, slot(result) + 4);
                     return Ok(());
                 }
                 _ => enc.lw(t2, scratch, 4),
             }
-            enc.sw(t2, Reg::SP, slot(result));
+            slot_store(enc, t2, slot(result));
         }
         Inst::ArrayStore {
             array,
@@ -2596,17 +3129,17 @@ fn lower_inst_spilled(
             if !matches!(*element_size, 1 | 2 | 4 | 8) {
                 return Err(LowerError::Unsupported);
             }
-            enc.lw(t0, Reg::SP, slot(*array));
-            enc.lw(t1, Reg::SP, slot(*index));
+            slot_load(enc, t0, slot(*array));
+            slot_load(enc, t1, slot(*index));
             emit_element_address(enc, t0, t1, *element_size, profile);
             if *element_size == 8 {
-                enc.lw(t2, Reg::SP, slot(*value));
+                slot_load(enc, t2, slot(*value));
                 enc.sw(t2, scratch, 4);
-                enc.lw(t2, Reg::SP, slot(*value) + 4);
+                slot_load(enc, t2, slot(*value) + 4);
                 enc.sw(t2, scratch, 8);
                 return Ok(());
             }
-            enc.lw(t2, Reg::SP, slot(*value));
+            slot_load(enc, t2, slot(*value));
             match *element_size {
                 1 => enc.sb(t2, scratch, 4),
                 2 => enc.sh(t2, scratch, 4),
@@ -2618,11 +3151,11 @@ fn lower_inst_spilled(
             index,
             element_size,
         } => {
-            enc.lw(t0, Reg::SP, slot(*array));
-            enc.lw(t1, Reg::SP, slot(*index));
+            slot_load(enc, t0, slot(*array));
+            slot_load(enc, t1, slot(*index));
             emit_element_address(enc, t0, t1, *element_size, profile);
             enc.addi(t2, scratch, 4);
-            enc.sw(t2, Reg::SP, slot(result));
+            slot_store(enc, t2, slot(result));
         }
         Inst::Alloc {
             handle,
@@ -2658,13 +3191,13 @@ fn lower_inst_spilled(
                 enc.sw(t0, Reg::A0, 0);
                 enc.addi(Reg::A0, Reg::A0, 4);
             }
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::AllocLike {
             proto,
             payload_size,
         } => {
-            enc.lw(t0, Reg::SP, slot(*proto));
+            slot_load(enc, t0, slot(*proto));
             enc.lw(Reg::A1, t0, -4);
             enc.li(Reg::A0, (*payload_size + 4) as i32);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
@@ -2672,16 +3205,35 @@ fn lower_inst_spilled(
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
             enc.bind_label(ok);
-            enc.lw(t0, Reg::SP, slot(*proto));
+            slot_load(enc, t0, slot(*proto));
             enc.lw(t1, t0, -4);
             enc.sw(t1, Reg::A0, 0);
             enc.addi(Reg::A0, Reg::A0, 4);
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
+        }
+        Inst::AllocDescribed {
+            descriptor,
+            payload_size,
+        } => {
+            slot_load(enc, Reg::A1, slot(*descriptor));
+            slot_load(enc, Reg::A0, slot(*payload_size));
+            enc.addi(Reg::A0, Reg::A0, 4);
+            emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
+            let ok = enc.new_label();
+            enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
+            enc.ebreak();
+            enc.bind_label(ok);
+            slot_load(enc, t0, slot(*descriptor));
+            enc.sw(t0, Reg::A0, 0);
+            enc.addi(Reg::A0, Reg::A0, 4);
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::AllocArray {
             handle,
+            element,
             length,
             element_size,
+            element_kind,
         } => {
             let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                 Some((_, l)) => *l,
@@ -2689,16 +3241,23 @@ fn lower_inst_spilled(
                     let l = enc.new_label();
                     type_descs.push(DescEmit {
                         label: l,
-                        vtable: Vec::new(),
-                        words: alloc::vec![*element_size, 0],
+                        vtable: descriptor_vtable(descriptors, *handle, externs),
+                        words: alloc::vec![
+                            ARRAY_DESC_MARK | 1,
+                            *element_kind,
+                            element.map_or(0, |e| descriptor_tag(descriptors, e)),
+                            0,
+                            0,
+                        ],
                         itable: Vec::new(),
                         base: None,
+                        element: *element,
                     });
                     type_desc_labels.push((*handle, l));
                     l
                 }
             };
-            enc.lw(t0, Reg::SP, slot(*length));
+            slot_load(enc, t0, slot(*length));
             if element_size.is_power_of_two() {
                 enc.slli(t0, t0, element_size.trailing_zeros());
             } else {
@@ -2712,13 +3271,13 @@ fn lower_inst_spilled(
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
             enc.bind_label(ok);
-            enc.lw(t0, Reg::SP, slot(*length));
+            slot_load(enc, t0, slot(*length));
             enc.sw(t0, Reg::A0, 0);
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::Call { callee, args } => {
             let first = emit_sret_arg(enc, slot, value_types, result);
-            marshal_call_args(enc, slot, value_types, args, first, profile)?;
+            marshal_call_args(enc, slot, value_types, args, first, profile, spilled_scratch(profile))?;
             emit_call(enc, func_labels, relocs, relocate, *callee)?;
             if first == 0 {
                 store_call_result(enc, slot, value_types, result);
@@ -2729,7 +3288,7 @@ fn lower_inst_spilled(
                 return Err(LowerError::Unsupported);
             }
             let first = emit_sret_arg(enc, slot, value_types, result);
-            marshal_call_args(enc, slot, value_types, args, first, profile)?;
+            marshal_call_args(enc, slot, value_types, args, first, profile, spilled_scratch(profile))?;
             emit_call(
                 enc,
                 func_labels,
@@ -2760,38 +3319,32 @@ fn lower_inst_spilled(
                     .ok_or(LowerError::ControlFlowUnsupported)?;
                 enc.la(t0, label);
             }
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
         }
         Inst::CallIndirect { target, args, .. } => {
-            enc.lw(scratch, Reg::SP, slot(*target));
-            for (i, &arg) in args.iter().enumerate() {
-                let r = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(r, Reg::SP, slot(arg));
-            }
+            slot_load(enc, scratch, slot(*target));
+            marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.jalr(Reg::RA, scratch, 0);
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::InvokeDelegate { delegate, args, .. } => {
-            if args.len() > 7 {
-                return Err(LowerError::ControlFlowUnsupported);
-            }
             let mloop = enc.new_label();
             let multi = enc.new_label();
             let dispatch = enc.new_label();
             let static_call = enc.new_label();
             let do_call = enc.new_label();
             let mdone = enc.new_label();
-            enc.sw(Reg::ZERO, Reg::SP, mc_off);
+            slot_store(enc, Reg::ZERO, mc_off);
             enc.bind_label(mloop);
-            enc.lw(t0, Reg::SP, slot(*delegate));
+            slot_load(enc, t0, slot(*delegate));
             enc.lw(t1, t0, 8);
             enc.branch(BranchCond::Ne, t1, Reg::ZERO, multi);
-            enc.lw(t2, Reg::SP, mc_off);
+            slot_load(enc, t2, mc_off);
             enc.branch(BranchCond::Ne, t2, Reg::ZERO, mdone);
             enc.j(dispatch);
             enc.bind_label(multi);
             enc.lw(t2, t1, 0);
-            enc.lw(t0, Reg::SP, mc_off);
+            slot_load(enc, t0, mc_off);
             enc.branch(BranchCond::GeU, t0, t2, mdone);
             enc.slli(t0, t0, 2);
             enc.add(t0, t1, t0);
@@ -2801,26 +3354,20 @@ fn lower_inst_spilled(
             enc.lw(t1, t0, 0);
             enc.branch(BranchCond::Eq, t1, Reg::ZERO, static_call);
             enc.mv(Reg::A0, t1);
-            for (i, &arg) in args.iter().enumerate() {
-                let r = arg_reg(i + 1).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(r, Reg::SP, slot(arg));
-            }
+            marshal_call_args(enc, slot, value_types, args, 1, profile, t0)?;
             enc.j(do_call);
             enc.bind_label(static_call);
-            for (i, &arg) in args.iter().enumerate() {
-                let r = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(r, Reg::SP, slot(arg));
-            }
+            marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.bind_label(do_call);
             enc.jalr(Reg::RA, scratch, 0);
-            enc.sw(Reg::A0, Reg::SP, mc_off + 4);
-            enc.lw(t0, Reg::SP, mc_off);
+            slot_store(enc, Reg::A0, mc_off + 4);
+            slot_load(enc, t0, mc_off);
             enc.addi(t0, t0, 1);
-            enc.sw(t0, Reg::SP, mc_off);
+            slot_store(enc, t0, mc_off);
             enc.j(mloop);
             enc.bind_label(mdone);
-            enc.lw(Reg::A0, Reg::SP, mc_off + 4);
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_load(enc, Reg::A0, mc_off + 4);
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::CallVirtual {
             slot: vslot, args, ..
@@ -2831,21 +3378,18 @@ fn lower_inst_spilled(
                 .and_then(|x| x.checked_add(4))
                 .filter(|&o| o <= 2047)
                 .ok_or(LowerError::Unsupported)?;
-            enc.lw(t0, Reg::SP, slot(receiver));
+            slot_load(enc, t0, slot(receiver));
             enc.lw(t0, t0, -4);
             enc.lw(t1, t0, -(entry_off as i32));
             enc.add(scratch, t0, t1);
-            for (i, &arg) in args.iter().enumerate() {
-                let r = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(r, Reg::SP, slot(arg));
-            }
+            marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.jalr(Reg::RA, scratch, 0);
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::CallInterface { tag, args, .. } => {
             let receiver = *args.first().ok_or(LowerError::ControlFlowUnsupported)?;
             enc.li(Reg::A0, *tag as i32);
-            enc.lw(t0, Reg::SP, slot(receiver));
+            slot_load(enc, t0, slot(receiver));
             enc.lw(t0, t0, -4);
             enc.lw(t1, t0, 4);
             enc.slli(t1, t1, 2);
@@ -2868,12 +3412,9 @@ fn lower_inst_spilled(
             enc.bind_label(found);
             enc.lw(scratch, t1, 4);
             enc.add(scratch, t0, scratch);
-            for (i, &arg) in args.iter().enumerate() {
-                let r = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(r, Reg::SP, slot(arg));
-            }
+            marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.jalr(Reg::RA, scratch, 0);
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            slot_store(enc, Reg::A0, slot(result));
         }
         Inst::VirtualFuncAddr {
             object,
@@ -2884,16 +3425,19 @@ fn lower_inst_spilled(
                 .and_then(|x| x.checked_add(4))
                 .filter(|&o| o <= 2047)
                 .ok_or(LowerError::Unsupported)?;
-            enc.lw(t0, Reg::SP, slot(*object));
+            slot_load(enc, t0, slot(*object));
             enc.lw(t0, t0, -4);
             enc.lw(t1, t0, -(entry_off as i32));
             enc.add(t0, t0, t1);
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
         }
         Inst::LoadTypeDesc { object } => {
-            enc.lw(t0, Reg::SP, slot(*object));
+            let not_null = enc.new_label();
+            slot_load(enc, t0, slot(*object));
+            enc.branch(BranchCond::Eq, t0, Reg::ZERO, not_null);
             enc.lw(t0, t0, -4);
-            enc.sw(t0, Reg::SP, slot(result));
+            enc.bind_label(not_null);
+            slot_store(enc, t0, slot(result));
         }
         Inst::TypeDescAddr { handle } => {
             let desc_label = descriptor_label(
@@ -2907,17 +3451,18 @@ fn lower_inst_spilled(
                 externs,
             );
             emit_desc_words_addr(enc, t0, t1, *handle, desc_label, desc_ptr_pool, relocate);
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
         }
         Inst::CastClassScan { args } => {
             let start = *args.first().ok_or(LowerError::ControlFlowUnsupported)?;
             let target = *args.get(1).ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.lw(t0, Reg::SP, slot(start));
-            enc.lw(t1, Reg::SP, slot(target));
+            slot_load(enc, t0, slot(start));
+            slot_load(enc, t1, slot(target));
             let search = enc.new_label();
             let found = enc.new_label();
             let miss = enc.new_label();
             let done = enc.new_label();
+            enc.branch(BranchCond::Eq, t0, Reg::ZERO, miss);
             enc.bind_label(search);
             enc.branch(BranchCond::Eq, t0, t1, found);
             enc.lw(t2, t0, 12);
@@ -2930,7 +3475,41 @@ fn lower_inst_spilled(
             enc.bind_label(miss);
             enc.li(t0, 0);
             enc.bind_label(done);
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
+        }
+        Inst::InterfaceHasTag { descriptor, tag } => {
+            let miss = enc.new_label();
+            let found = enc.new_label();
+            let search = enc.new_label();
+            let done = enc.new_label();
+            slot_load(enc, t0, slot(*descriptor));
+            enc.branch(BranchCond::Eq, t0, Reg::ZERO, miss);
+            enc.lw(t1, t0, 0);
+            enc.srli(t1, t1, 24);
+            enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
+            enc.branch(BranchCond::Eq, t1, t2, miss);
+            enc.lw(t1, t0, 4);
+            enc.slli(t1, t1, 2);
+            enc.addi(t1, t1, 16);
+            enc.add(t1, t0, t1);
+            enc.lw(t2, t1, 0);
+            enc.branch(BranchCond::Eq, t2, Reg::ZERO, miss);
+            enc.addi(t1, t1, 4);
+            let scratch_tag = scratch;
+            enc.li(scratch_tag, *tag as i32);
+            enc.bind_label(search);
+            enc.lw(t0, t1, 0);
+            enc.branch(BranchCond::Eq, t0, scratch_tag, found);
+            enc.addi(t1, t1, 8);
+            enc.addi(t2, t2, -1);
+            enc.branch(BranchCond::Ne, t2, Reg::ZERO, search);
+            enc.bind_label(miss);
+            enc.li(t0, 0);
+            enc.j(done);
+            enc.bind_label(found);
+            enc.li(t0, 1);
+            enc.bind_label(done);
+            slot_store(enc, t0, slot(result));
         }
         Inst::StringLiteral { utf16 } => {
             let label = match string_blobs
@@ -2945,9 +3524,42 @@ fn lower_inst_spilled(
                 }
             };
             enc.la(t0, label);
-            enc.sw(t0, Reg::SP, slot(result));
+            slot_store(enc, t0, slot(result));
         }
-        _ => return Err(LowerError::Unsupported),
+        Inst::PInvoke { .. }
+        | Inst::StringEquals { .. }
+        | Inst::StringConcat { .. }
+        | Inst::IntToString { .. } => return Err(LowerError::Unsupported),
+        Inst::TypeDescLiteral { .. } => return Err(LowerError::Unsupported),
+        Inst::SemihostWrite { text } => {
+            if !relocate {
+                return Err(LowerError::Unsupported);
+            }
+            let bytes: &[u8] = match text.split_last() {
+                Some((0, head)) => head,
+                _ => text,
+            };
+            let label = match byte_blobs.iter().find(|(_, b)| b.as_slice() == bytes) {
+                Some((l, _)) => *l,
+                None => {
+                    let l = enc.new_label();
+                    byte_blobs.push((l, bytes.to_vec()));
+                    l
+                }
+            };
+            enc.la(Reg::A0, label);
+            enc.li(Reg::A1, bytes.len() as i32);
+            let symbol = intern_extern(externs, CONSOLE_WRITE_BYTES);
+            emit_call(
+                enc,
+                func_labels,
+                relocs,
+                relocate,
+                EXTERN_SYMBOL_FLAG | symbol,
+            )?;
+        }
+        Inst::WriteInt { .. } => return Err(LowerError::Unsupported),
+        Inst::PyIntrinsic { .. } => return Err(LowerError::Unsupported),
     }
     Ok(())
 }
@@ -2968,55 +3580,55 @@ fn emit_i64_binary(
     let (t0, t1, t2, carry) = (Reg::T0, Reg::T1, Reg::T2, spilled_scratch(profile));
     match op {
         BinOp::Add => {
-            enc.lw(t0, Reg::SP, slot(lhs));
-            enc.lw(t1, Reg::SP, slot(rhs));
+            slot_load(enc, t0, slot(lhs));
+            slot_load(enc, t1, slot(rhs));
             enc.add(t2, t0, t1);
             enc.sltu(carry, t2, t0);
-            enc.sw(t2, Reg::SP, slot(result));
-            enc.lw(t0, Reg::SP, slot(lhs) + 4);
-            enc.lw(t1, Reg::SP, slot(rhs) + 4);
+            slot_store(enc, t2, slot(result));
+            slot_load(enc, t0, slot(lhs) + 4);
+            slot_load(enc, t1, slot(rhs) + 4);
             enc.add(t0, t0, t1);
             enc.add(t0, t0, carry);
-            enc.sw(t0, Reg::SP, slot(result) + 4);
+            slot_store(enc, t0, slot(result) + 4);
         }
         BinOp::Sub => {
-            enc.lw(t0, Reg::SP, slot(lhs));
-            enc.lw(t1, Reg::SP, slot(rhs));
+            slot_load(enc, t0, slot(lhs));
+            slot_load(enc, t1, slot(rhs));
             enc.sltu(carry, t0, t1);
             enc.sub(t2, t0, t1);
-            enc.sw(t2, Reg::SP, slot(result));
-            enc.lw(t0, Reg::SP, slot(lhs) + 4);
-            enc.lw(t1, Reg::SP, slot(rhs) + 4);
+            slot_store(enc, t2, slot(result));
+            slot_load(enc, t0, slot(lhs) + 4);
+            slot_load(enc, t1, slot(rhs) + 4);
             enc.sub(t0, t0, t1);
             enc.sub(t0, t0, carry);
-            enc.sw(t0, Reg::SP, slot(result) + 4);
+            slot_store(enc, t0, slot(result) + 4);
         }
         BinOp::And | BinOp::Or | BinOp::Xor => {
             for off in [0i32, 4] {
-                enc.lw(t0, Reg::SP, slot(lhs) + off);
-                enc.lw(t1, Reg::SP, slot(rhs) + off);
+                slot_load(enc, t0, slot(lhs) + off);
+                slot_load(enc, t1, slot(rhs) + off);
                 match op {
                     BinOp::And => enc.and(t0, t0, t1),
                     BinOp::Or => enc.or(t0, t0, t1),
                     _ => enc.xor(t0, t0, t1),
                 }
-                enc.sw(t0, Reg::SP, slot(result) + off);
+                slot_store(enc, t0, slot(result) + off);
             }
         }
         BinOp::Mul => {
             let acc = arg_reg(0).ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.lw(t0, Reg::SP, slot(lhs));
-            enc.lw(t1, Reg::SP, slot(rhs));
+            slot_load(enc, t0, slot(lhs));
+            slot_load(enc, t1, slot(rhs));
             enc.mul(t2, t0, t1);
-            enc.sw(t2, Reg::SP, slot(result));
+            slot_store(enc, t2, slot(result));
             enc.mulhu(t2, t0, t1);
-            enc.lw(acc, Reg::SP, slot(rhs) + 4);
+            slot_load(enc, acc, slot(rhs) + 4);
             enc.mul(acc, t0, acc);
             enc.add(t2, t2, acc);
-            enc.lw(acc, Reg::SP, slot(lhs) + 4);
+            slot_load(enc, acc, slot(lhs) + 4);
             enc.mul(acc, acc, t1);
             enc.add(t2, t2, acc);
-            enc.sw(t2, Reg::SP, slot(result) + 4);
+            slot_store(enc, t2, slot(result) + 4);
         }
         BinOp::Shl | BinOp::ShrSigned | BinOp::ShrUnsigned => {
             emit_i64_shift(enc, slot, op, result, lhs, rhs, profile)?;
@@ -3043,9 +3655,9 @@ fn emit_i64_shift(
     let (lo, hi, sh, tmp) = (Reg::T0, Reg::T1, Reg::T2, spilled_scratch(profile));
     let lo_out = arg_reg(0).ok_or(LowerError::ControlFlowUnsupported)?;
     let hi_out = arg_reg(1).ok_or(LowerError::ControlFlowUnsupported)?;
-    enc.lw(lo, Reg::SP, slot(lhs));
-    enc.lw(hi, Reg::SP, slot(lhs) + 4);
-    enc.lw(sh, Reg::SP, slot(rhs));
+    slot_load(enc, lo, slot(lhs));
+    slot_load(enc, hi, slot(lhs) + 4);
+    slot_load(enc, sh, slot(rhs));
     let ge32 = enc.new_label();
     let small = enc.new_label();
     let store = enc.new_label();
@@ -3098,8 +3710,8 @@ fn emit_i64_shift(
         _ => return Err(LowerError::Unsupported),
     }
     enc.bind_label(store);
-    enc.sw(lo_out, Reg::SP, slot(result));
-    enc.sw(hi_out, Reg::SP, slot(result) + 4);
+    slot_store(enc, lo_out, slot(result));
+    slot_store(enc, hi_out, slot(result) + 4);
     Ok(())
 }
 
@@ -3120,18 +3732,18 @@ fn emit_i64_compare(
     let hi0 = arg_reg(0).ok_or(LowerError::ControlFlowUnsupported)?;
     let hi1 = arg_reg(1).ok_or(LowerError::ControlFlowUnsupported)?;
     if matches!(op, CmpOp::Eq | CmpOp::Ne) {
-        enc.lw(t0, Reg::SP, slot(lhs));
-        enc.lw(t1, Reg::SP, slot(rhs));
+        slot_load(enc, t0, slot(lhs));
+        slot_load(enc, t1, slot(rhs));
         enc.xor(t0, t0, t1);
-        enc.lw(t2, Reg::SP, slot(lhs) + 4);
-        enc.lw(tmp, Reg::SP, slot(rhs) + 4);
+        slot_load(enc, t2, slot(lhs) + 4);
+        slot_load(enc, tmp, slot(rhs) + 4);
         enc.xor(t2, t2, tmp);
         enc.or(t0, t0, t2);
         match op {
             CmpOp::Eq => enc.sltiu(t0, t0, 1),
             _ => enc.sltu(t0, Reg::ZERO, t0),
         }
-        enc.sw(t0, Reg::SP, slot(result));
+        slot_store(enc, t0, slot(result));
         return Ok(());
     }
     let (a, b, hi_signed, negate) = match op {
@@ -3145,15 +3757,15 @@ fn emit_i64_compare(
         CmpOp::UnsignedLe => (rhs, lhs, false, true),
         CmpOp::Eq | CmpOp::Ne => unreachable!("handled above"),
     };
-    enc.lw(hi0, Reg::SP, slot(a) + 4);
-    enc.lw(hi1, Reg::SP, slot(b) + 4);
+    slot_load(enc, hi0, slot(a) + 4);
+    slot_load(enc, hi1, slot(b) + 4);
     if hi_signed {
         enc.slt(t2, hi0, hi1);
     } else {
         enc.sltu(t2, hi0, hi1);
     }
-    enc.lw(t0, Reg::SP, slot(a));
-    enc.lw(t1, Reg::SP, slot(b));
+    slot_load(enc, t0, slot(a));
+    slot_load(enc, t1, slot(b));
     enc.sltu(tmp, t0, t1);
     enc.xor(hi0, hi0, hi1);
     enc.sltiu(hi0, hi0, 1);
@@ -3162,7 +3774,7 @@ fn emit_i64_compare(
     if negate {
         enc.xori(t2, t2, 1);
     }
-    enc.sw(t2, Reg::SP, slot(result));
+    slot_store(enc, t2, slot(result));
     Ok(())
 }
 
@@ -3344,6 +3956,38 @@ fn emit_descriptors(
                     }
                     _ => enc.emit_word(0),
                 }
+            } else if idx == 4 && desc.element.is_some() {
+                let element = desc.element.expect("the arm tested it");
+                let element_in_object = type_desc_labels.iter().any(|(h, _)| *h == element);
+                match element_in_object {
+                    true if relocate => {
+                        desc_relocs.push((enc.position(), DESC_SYMBOL_FLAG | element.0, 16));
+                        enc.emit_word(0);
+                    }
+                    true => {
+                        let label = type_desc_labels
+                            .iter()
+                            .find(|(h, _)| *h == element)
+                            .map(|(_, l)| *l)
+                            .expect("element descriptor present");
+                        enc.emit_word_diff(desc.label, label);
+                    }
+                    false if relocate
+                        && crate::resolver::reference_handle_parts(element).is_some() =>
+                    {
+                        let vtable_bytes = descriptors
+                            .iter()
+                            .find(|m| m.handle == element)
+                            .map_or(0, |m| m.vtable.len() as i32 * 4);
+                        desc_relocs.push((
+                            enc.position(),
+                            DESC_SYMBOL_FLAG | element.0,
+                            vtable_bytes + 16,
+                        ));
+                        enc.emit_word(0);
+                    }
+                    false => enc.emit_word(0),
+                }
             } else {
                 enc.emit_word(w);
             }
@@ -3504,6 +4148,7 @@ fn descriptor_label(
             .iter()
             .find(|d| d.handle == handle)
             .and_then(|d| d.base),
+        element: None,
     });
     type_desc_labels.push((handle, label));
     label
@@ -3588,8 +4233,12 @@ fn value_words(value_types: &[MirType], value: ValueId) -> u32 {
 /// registers per [`value_words`] -- an int64 / small value type spans a pair. Arguments PAST the profile's
 /// registers (a0-a7 on RV32IM, a0-a5 on RV32E) spill to the STACK: the caller reserves an outgoing-args
 /// area at the BOTTOM of its spilled frame (`sp+0..`, sized by [`call_stack_words`]), so each overflow word
-/// lands at `sp + 4*k` -- exactly where the callee reads it at `sp + its_frame + 4*k`. Loaded through the
-/// spilled scratch register (the arguments live in memory slots, so no register-source hazard).
+/// lands at `sp + 4*k` -- exactly where the callee reads it at `sp + its_frame + 4*k`.
+///
+/// `scratch` is the register overflow words are shuttled through (the arguments live in memory slots,
+/// so there is no register-source hazard). A direct `Call`/`CallNative` passes the spilled scratch; a
+/// DISPATCH call must pass a different one, because by this point it is already holding its resolved
+/// target in the spilled scratch and would otherwise marshal over its own callee address.
 fn marshal_call_args(
     enc: &mut Encoder,
     slot: &impl Fn(ValueId) -> i32,
@@ -3597,9 +4246,9 @@ fn marshal_call_args(
     args: &[ValueId],
     first: usize,
     profile: RiscvProfile,
+    scratch: Reg,
 ) -> Result<(), LowerError> {
     let regs = arg_reg_count(profile);
-    let scratch = spilled_scratch(profile);
     let mut reg = first;
     let mut stack_word = 0i32;
     for &arg in args {
@@ -3607,11 +4256,11 @@ fn marshal_call_args(
         if words > 2 {
             if reg < regs {
                 let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.addi(target, Reg::SP, slot(arg));
+                slot_addr(enc, target, slot(arg));
                 reg += 1;
             } else {
-                enc.addi(scratch, Reg::SP, slot(arg));
-                enc.sw(scratch, Reg::SP, stack_word * 4);
+                slot_addr(enc, scratch, slot(arg));
+                slot_store(enc, scratch, stack_word * 4);
                 stack_word += 1;
             }
             continue;
@@ -3619,11 +4268,11 @@ fn marshal_call_args(
         for w in 0..words {
             if reg < regs {
                 let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(target, Reg::SP, slot(arg) + w as i32 * 4);
+                slot_load(enc, target, slot(arg) + w as i32 * 4);
                 reg += 1;
             } else {
-                enc.lw(scratch, Reg::SP, slot(arg) + w as i32 * 4);
-                enc.sw(scratch, Reg::SP, stack_word * 4);
+                slot_load(enc, scratch, slot(arg) + w as i32 * 4);
+                slot_store(enc, scratch, stack_word * 4);
                 stack_word += 1;
             }
         }
@@ -3639,9 +4288,9 @@ fn store_call_result(
     value_types: &[MirType],
     result: ValueId,
 ) {
-    enc.sw(Reg::A0, Reg::SP, slot(result));
+    slot_store(enc, Reg::A0, slot(result));
     if value_words(value_types, result) >= 2 {
-        enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+        slot_store(enc, Reg::A1, slot(result) + 4);
     }
 }
 
@@ -3656,7 +4305,7 @@ fn emit_sret_arg(
     result: ValueId,
 ) -> usize {
     if value_words(value_types, result) > 2 {
-        enc.addi(Reg::A0, Reg::SP, slot(result));
+        slot_addr(enc, Reg::A0, slot(result));
         1
     } else {
         0
@@ -3767,7 +4416,7 @@ fn emit_md_element_address(
     element_size: u32,
 ) {
     let n = indices.len();
-    enc.lw(out, Reg::SP, slot(indices[0]));
+    slot_load(enc, out, slot(indices[0]));
     enc.lw(tmp, base, 0);
     let ok = enc.new_label();
     enc.branch(BranchCond::LtU, out, tmp, ok);
@@ -3776,7 +4425,7 @@ fn emit_md_element_address(
     for (k, &idx) in indices.iter().enumerate().skip(1) {
         enc.lw(tmp, base, 4 * k as i32);
         enc.mul(out, out, tmp);
-        enc.lw(tmp2, Reg::SP, slot(idx));
+        slot_load(enc, tmp2, slot(idx));
         let okk = enc.new_label();
         enc.branch(BranchCond::LtU, tmp2, tmp, okk);
         enc.ebreak();
@@ -3829,6 +4478,117 @@ fn emit_fill_block(enc: &mut Encoder, dst: Reg, value: Reg, size: Reg) {
 mod tests {
     use super::*;
     use lamella_ir::{BasicBlock, BlockId};
+
+    #[test]
+    fn an_array_descriptor_lays_a_full_four_word_header() {
+        let func = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 3,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::AllocArray {
+                            handle: lamella_ir::synthetic_array_handle(8),
+                            element: None,
+                            length: ValueId(0),
+                            element_size: 8,
+                            element_kind: 8,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let bytes = lower_module_gc(&[func], 0x2000_0000)
+            .expect("the riscv GC path lowers an AllocArray");
+        let at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        let words: Vec<u32> = (0..bytes.len() / 4).map(|i| at(i * 4)).collect();
+        assert!(
+            words
+                .windows(4)
+                .any(|w| w[0] == ARRAY_DESC_MARK | 1 && w[1] == 8 && w[3] == 0),
+            "no array descriptor with the ratified header [MARK|rank@0][element_kind@4][tag@8][base_ptr@12]"
+        );
+        let mark = words
+            .iter()
+            .position(|&w| w == ARRAY_DESC_MARK | 1)
+            .expect("the array descriptor is present");
+        assert!(
+            mark + 3 < words.len(),
+            "the header must be followed by its full four words, not truncated at the stream's end"
+        );
+        assert_eq!(words[mark + 1], 8, "element_kind@4");
+        assert_eq!(words[mark + 3], 0, "base_ptr@12 is 0 for a base-less array");
+    }
+
+    #[test]
+    fn an_array_descriptor_lays_element_desc_at_offset_16() {
+        let handle = lamella_ir::TypeHandle(0x0200_0004);
+        let func = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32, MirType::ObjectRef, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 3,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Alloc {
+                            handle,
+                            payload_size: 12,
+                            ref_offsets: alloc::vec![].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::AllocArray {
+                            handle: lamella_ir::array_handle(handle),
+                            element: Some(handle),
+                            length: ValueId(0),
+                            element_size: 4,
+                            element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let bytes = lower_module_gc(&[func], 0x2000_0000)
+            .expect("the riscv GC path lowers an Alloc beside an AllocArray");
+        let at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        let words: Vec<u32> = (0..bytes.len() / 4).map(|i| at(i * 4)).collect();
+        let mark = words
+            .iter()
+            .position(|&w| w == ARRAY_DESC_MARK | 1)
+            .expect("the array descriptor is present");
+        let edge = words[mark + 4];
+        assert_ne!(edge, 0, "element_desc@16 must name the element, not read absent");
+        let element = (mark as i32 * 4).wrapping_add(edge as i32) as usize / 4;
+        assert_eq!(
+            words[element], 12,
+            "element_desc must land on the element type's WORDS -- its payload size"
+        );
+        assert_eq!(words[element + 1], 0, "and its nrefs, the word after");
+    }
 
     #[test]
     fn rv32e_register_model_stays_within_x0_x15() {
@@ -4205,6 +4965,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reference_cell_is_recorded_as_an_object_ref_root() {
+        let main = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![
+                MirType::ValueType {
+                    handle: crate::stackmaps::REF_CELL_HANDLE,
+                    size: 4,
+                },
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::InitStruct),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let obj = lamella_elf::read_object(
+            &lower_object(&[main, record_leaf()], &["main", "g"], &[], &[]).unwrap(),
+        )
+        .unwrap();
+        let rec = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_smrec_main")
+            .expect("main gets a method record");
+        let bytes = &obj.text[rec.value as usize..(rec.value + rec.size) as usize];
+        let (_, _, mode, _, _, roots) = decode_stackmap_record(bytes);
+        assert_eq!(mode, STACKMAP_MODE_METHOD_SLOTS);
+        assert_eq!(roots.len(), 1, "the ref cell is the only reference-bearing slot");
+        assert_eq!(
+            roots[0] >> 14,
+            STACKMAP_KIND_OBJECT_REF,
+            "the REF_CELL_HANDLE cell must be enumerated as an ObjectRef root, not skipped"
+        );
+    }
+
     /// The MEMORY-HOMING gate, pinned: an ObjectRef LIVE ACROSS a call must take the all-spilled
     /// path (its record then enumerates the slot); the SAME shape with the ref DEAD across the
     /// call keeps the register path and gets a HOP-ONLY record (no roots, `ra` at word 0). A ref
@@ -4433,10 +5241,11 @@ mod tests {
         assert_eq!(target.size, 12, "the sized reference drives the RAM layout");
     }
 
-    /// The N-reference descriptor-identity scheme on riscv (the ARM slice-2 twin, same shared
+    /// The N-reference descriptor-identity scheme on riscv (the ARM twin, same shared
     /// `descriptor_symbol`): a LIBRARY's own descriptor and a PROGRAM's reference-owned emission
     /// of the SAME type produce ONE symbol (`__lamella_typedesc_<ownerhash>_<token>`, weak in the
-    /// library, strong in the program -- the dedupe that preserves identity-by-address).
+    /// library, strong in the program -- the dedupe that preserves identity-by-address), and the
+    /// unqualified raw-token name appears in NEITHER object.
     #[test]
     fn descriptor_symbols_qualify_by_owner_across_the_link() {
         let alloc_fn = |handle: u32| Function {
@@ -4458,6 +5267,7 @@ mod tests {
             }],
         };
         let lib_qualifiers = DescQualifiers {
+            string: None,
             own: Some("0bd4d82a".into()),
             references: Vec::new(),
         };
@@ -4476,6 +5286,7 @@ mod tests {
         .expect("read the library object");
         let reference_handle = (crate::resolver::REFERENCE_HANDLE_TABLE << 24) | (1 << 20) | 5;
         let prog_qualifiers = DescQualifiers {
+            string: None,
             own: None,
             references: vec!["aaaaaaaa".into(), "0bd4d82a".into()],
         };
@@ -5458,6 +6269,76 @@ mod tests {
     }
 
     #[test]
+    fn call_stack_words_measures_every_call_kind_at_its_own_start_register() {
+        let i32t = MirType::I32;
+        let n = ValueId;
+        let types = vec![i32t; 12];
+        let args: Vec<ValueId> = (0..8).map(n).collect();
+        let words = |inst: &Inst, profile| call_stack_words(inst, n(9), &types, profile);
+        let virtual_call = Inst::CallVirtual {
+            slot: 0,
+            args: args.clone(),
+            returns_value: true,
+        };
+        let interface_call = Inst::CallInterface {
+            tag: 1,
+            args: args.clone(),
+            returns_value: true,
+        };
+        let delegate = Inst::InvokeDelegate {
+            delegate: n(0),
+            args: args.clone(),
+            returns_value: true,
+        };
+        assert_eq!(
+            words(&virtual_call, RiscvProfile::Rv32im),
+            0,
+            "a virtual call's eight words (receiver included) fill a0-a7 exactly"
+        );
+        assert_eq!(words(&interface_call, RiscvProfile::Rv32im), 0);
+        assert_eq!(
+            words(&delegate, RiscvProfile::Rv32im),
+            1,
+            "an instance delegate reserves a0 for `this`, so its eighth argument spills"
+        );
+        assert_eq!(
+            words(&delegate, RiscvProfile::Rv32ec),
+            3,
+            "RV32E: a0 = this and a1-a5 take five, so three of the eight spill"
+        );
+        assert_eq!(words(&virtual_call, RiscvProfile::Rv32ec), 2);
+    }
+
+    #[test]
+    fn a_function_declaring_more_params_than_argument_registers_lowers() {
+        let i32t = MirType::I32;
+        let n = ValueId;
+        let params: Vec<ValueId> = (0..9).map(n).collect();
+        let sum = Function {
+            params: vec![i32t; 9],
+            ret: Some(i32t),
+            value_types: vec![i32t; 11],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: params.clone(),
+                insts: vec![(
+                    n(9),
+                    Inst::Binary {
+                        op: BinOp::Add,
+                        lhs: n(0),
+                        rhs: n(8),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(n(9)))),
+            }],
+        };
+        assert!(
+            lower_module(&[sum]).is_ok(),
+            "a nine-parameter function lowers, reading its overflow from the caller's frame"
+        );
+    }
+
+    #[test]
     fn lowers_virtual_dispatch_with_a_vtable() {
         let i32t = MirType::I32;
         let n = ValueId;
@@ -5508,6 +6389,7 @@ mod tests {
                 itable: Vec::new(),
                 base: None,
                 words: None,
+                exported: true,
             },
             TypeMeta {
                 handle: TypeHandle(2),
@@ -5516,6 +6398,7 @@ mod tests {
                 itable: Vec::new(),
                 base: Some(TypeHandle(1)),
                 words: None,
+                exported: true,
             },
         ];
         let funcs = [main, leaf(4), leaf(2)];
@@ -5552,6 +6435,7 @@ mod tests {
             itable: Vec::new(),
             base: None,
             words: None,
+            exported: true,
         }];
         let name = alloc::format!("{}7", lamella_elf::TYPE_DESC_PREFIX);
         let binding_of = |object: &[u8]| {
@@ -5628,6 +6512,7 @@ mod tests {
             itable: vec![(tag, VtableEntry::Func(1))],
             base: None,
             words: None,
+            exported: true,
         }];
         assert!(
             lower_module_gc_with_descriptors(&[main, area], 0x8000_0004, &descriptors).is_ok(),
@@ -5726,6 +6611,7 @@ mod tests {
                 itable: Vec::new(),
                 base: None,
                 words: None,
+                exported: true,
             },
             TypeMeta {
                 handle: TypeHandle(2),
@@ -5734,6 +6620,7 @@ mod tests {
                 itable: Vec::new(),
                 base: Some(TypeHandle(1)),
                 words: None,
+                exported: true,
             },
             TypeMeta {
                 handle: TypeHandle(3),
@@ -5742,6 +6629,7 @@ mod tests {
                 itable: Vec::new(),
                 base: Some(TypeHandle(2)),
                 words: None,
+                exported: true,
             },
         ];
         assert!(
@@ -5804,6 +6692,464 @@ mod tests {
             }),
             "an R_RISCV_CALL_PLT relocation names `triple`"
         );
+    }
+
+    /// A function with `n` I32 values -- `n * 4` bytes of frame, so it crosses the 12-bit `lw`/`sw`
+    /// immediate somewhere past 512 values.
+    fn wide_frame_func(n: usize) -> Function {
+        let insts = (0..n)
+            .map(|i| {
+                (
+                    ValueId(i as u32),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i as i64,
+                    },
+                )
+            })
+            .collect();
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32; n],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts,
+                terminator: Some(Terminator::Return(Some(ValueId(n as u32 - 1)))),
+            }],
+        }
+    }
+
+    #[test]
+    fn lowers_eight_byte_two_d_and_rank_n_elements() {
+        let i64t = MirType::I64;
+        let i32t = MirType::I32;
+        let n = ValueId;
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(i64t),
+            value_types: vec![i32t, MirType::ObjectRef, i64t, i64t, MirType::ObjectRef, i64t],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (n(0), Inst::ConstInt { ty: i32t, value: 2 }),
+                    (
+                        n(1),
+                        Inst::AllocArray2D {
+                            handle: TypeHandle(0),
+                            dim0: n(0),
+                            dim1: n(0),
+                            element_size: 8,
+                        },
+                    ),
+                    (
+                        n(2),
+                        Inst::ConstInt {
+                            ty: i64t,
+                            value: 0x1122_3344_5566_7788,
+                        },
+                    ),
+                    (
+                        n(3),
+                        Inst::Array2DStore {
+                            array: n(1),
+                            index0: n(0),
+                            index1: n(0),
+                            value: n(2),
+                            element_size: 8,
+                        },
+                    ),
+                    (
+                        n(5),
+                        Inst::Array2DLoad {
+                            array: n(1),
+                            index0: n(0),
+                            index1: n(0),
+                            element_size: 8,
+                            signed: true,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(5)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            lower_object(&[func], &["m"], &[], &[]).is_ok(),
+            "an 8-byte 2D element lowers"
+        );
+    }
+
+    #[test]
+    fn rv32im_lowers_a_frame_past_the_load_store_immediate() {
+        let func = wide_frame_func(600);
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            lower_object(&[func], &["wide"], &[], &[]).is_ok(),
+            "a frame past the immediate lowers via the far-access path"
+        );
+    }
+
+    #[test]
+    fn a_small_frame_stays_on_the_bare_immediate() {
+        let func = wide_frame_func(8);
+        let bytes = lower_object(&[func], &["narrow"], &[], &[]).expect("lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read back");
+        let has_sp_add = obj.text.chunks(4).any(|w| {
+            w.len() == 4 && {
+                let inst = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                inst & 0x7f == 0x33 && (inst >> 12) & 7 == 0 && (inst >> 20) & 0x1f == 2
+                    && (inst >> 25) == 0
+            }
+        });
+        assert!(!has_sp_add, "a small frame emits no far-access fixup");
+    }
+
+    #[test]
+    fn rv32e_keeps_the_immediate_sized_frame_cap() {
+        let func = wide_frame_func(600);
+        assert!(
+            lower_object_profile(&[func], &["wide"], &[], &[], RiscvProfile::Rv32ec).is_err(),
+            "RV32E still refuses a frame past the immediate"
+        );
+    }
+
+    #[test]
+    fn library_stub_report_names_the_demoted_method() {
+        let good = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let bad = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: Vec::new(),
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&bad).is_err(), "the fixture is malformed");
+        let (bytes, report) = lower_object_library_statics_report(
+            &[good, bad],
+            &["good", "bad"],
+            &[],
+            &[],
+            None,
+            &[],
+            &DescQualifiers::default(),
+        )
+        .expect("a library build TOLERATES an un-lowerable method");
+        assert!(!bytes.is_empty(), "the object still builds");
+        assert_eq!(
+            report.len(),
+            1,
+            "exactly one method demoted -- the good one is not reported"
+        );
+        assert_eq!(report[0].0, 1, "the report names the stubbed method's index");
+        assert!(matches!(report[0].1, LowerError::NotWellFormed));
+    }
+
+    #[test]
+    fn a_program_build_reports_no_stubs() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 1,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert!(lower_object(&[main], &["main"], &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn semihost_write_calls_the_console_seam() {
+        let main = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::SemihostWrite {
+                        text: b"hi\n\0".to_vec().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        assert!(lamella_ir::verify(&main).is_ok());
+        let bytes = lower_object(&[main], &["main"], &[], &[]).expect("the semihost write lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let seam = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "lamella_console_write_bytes")
+            .expect("the console seam symbol is present");
+        assert!(
+            !seam.defined,
+            "the seam is an undefined extern the linker resolves against runtime-support"
+        );
+        assert!(
+            obj.relocations.iter().any(|r| {
+                r.kind == lamella_elf::riscv::R_RISCV_CALL_PLT
+                    && obj.symbols.get(r.symbol as usize).map(|s| s.name.as_str())
+                        == Some("lamella_console_write_bytes")
+            }),
+            "an R_RISCV_CALL_PLT relocation names the console seam"
+        );
+        let text = &obj.text;
+        assert!(
+            text.windows(3).any(|w| w == b"hi\n"),
+            "the byte blob is laid after the code"
+        );
+        let li_a1_3 = 0x0030_0593u32;
+        assert!(
+            text.chunks(4).any(|w| w.len() == 4
+                && u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == li_a1_3),
+            "the seam is passed length 3 (\"hi\\n\"), the NUL terminator stripped"
+        );
+    }
+
+    #[test]
+    fn repeated_semihost_writes_lay_one_blob_per_distinct_text() {
+        let write = |t: &[u8]| Inst::SemihostWrite {
+            text: t.to_vec().into_boxed_slice(),
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32; 3],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), write(b"aa\0")),
+                    (ValueId(1), write(b"bb\0")),
+                    (ValueId(2), write(b"aa\0")),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let bytes = lower_object(&[main], &["main"], &[], &[]).expect("lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let text = &obj.text;
+        assert!(text.windows(2).any(|w| w == b"aa"), "the first blob is laid");
+        assert!(text.windows(2).any(|w| w == b"bb"), "the second blob is laid");
+        assert_eq!(
+            text.windows(2).filter(|w| *w == b"aa").count(),
+            1,
+            "the repeated text is deduplicated to ONE blob"
+        );
+        let seam_relocs = obj
+            .relocations
+            .iter()
+            .filter(|r| {
+                obj.symbols.get(r.symbol as usize).map(|s| s.name.as_str())
+                    == Some("lamella_console_write_bytes")
+            })
+            .count();
+        assert_eq!(seam_relocs, 3, "all three writes call the seam");
+    }
+
+    /// The emitted OBJECT must carry the literal in THIS BUILD's storage encoding. Asserting on the
+    /// shared blob builder alone would not catch what this is here for: this backend used to pack
+    /// UTF-16 units two per word right here, so `--features riscv32,string-utf8` was accepted and
+    /// silently produced a UTF-16 image. The check has to be on the bytes the backend emits.
+    #[test]
+    fn the_emitted_object_carries_the_literal_in_this_builds_storage_tier() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::StringLiteral {
+                            utf16: vec![0x48u16, 0x69].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let bytes = lower_object(&[main], &["main"], &[], &[]).expect("a string literal lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let expected = crate::stringgen::string_blob_bytes(&[0x48, 0x69])
+            .expect("\"Hi\" encodes in every tier");
+        assert!(
+            obj.text
+                .windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "the object must contain the literal blob for this tier ({expected:02x?})"
+        );
+    }
+
+    /// A string LITERAL must carry the object header every consumer reads at `[obj - 4]`, and this
+    /// pins the three things that make the word mean what it says -- each of which fails SILENTLY.
+    ///
+    /// It is a unit test rather than a QEMU run because what can go wrong here is an ADDRESS, not a
+    /// control flow: the s28 rule says the addend turns on whether the descriptor has a local copy,
+    /// and getting it wrong lands the word on the descriptor's VTABLE instead of its WORDS -- which
+    /// reads as a plausible descriptor and is not one. So the assertions are: the relocation is
+    /// ABSOLUTE (`R_RISCV_32`, not the relative `R_LAMELLA_REL_DESC` every other descriptor reference
+    /// here uses -- `[obj - 4]` is read by code holding only the object pointer, with no second term
+    /// to add a delta to); its addend is 0; and the descriptor it names is DEFINED IN THIS OBJECT,
+    /// which is the premise that makes an addend of 0 correct rather than accidentally right.
+    #[test]
+    fn a_string_literal_carries_an_absolute_header_naming_the_string_descriptor() {
+        let handle = 7u32;
+        let descriptors = vec![TypeMeta {
+            handle: TypeHandle(handle),
+            type_tag: 0x5151_5151,
+            vtable: Vec::new(),
+            itable: Vec::new(),
+            base: None,
+            words: Some(alloc::vec![8, 0, 0x5151_5151, 0].into_boxed_slice()),
+            exported: true,
+        }];
+        let qualifiers = DescQualifiers {
+            string: Some(handle),
+            ..DescQualifiers::default()
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::StringLiteral {
+                            utf16: alloc::vec![0x48u16, 0x69].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let bytes = lower_object_profile_statics_references(
+            &[main],
+            &["main"],
+            &[],
+            &descriptors,
+            None,
+            &[],
+            &qualifiers,
+            RiscvProfile::Rv32im,
+        )
+        .expect("a string literal lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let name = alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle);
+        let index = obj
+            .symbols
+            .iter()
+            .position(|s| s.name == name)
+            .expect("the literal's header names System.String's descriptor, so it must be emitted");
+        assert!(
+            obj.symbols[index].defined,
+            "the descriptor must be DEFINED here -- an undefined one would need the owner's vtable \
+             span in the addend instead of 0"
+        );
+        let header = obj
+            .relocations
+            .iter()
+            .find(|r| r.symbol == index as u32 && r.kind == lamella_elf::riscv::R_RISCV_32)
+            .expect("the header word carries an ABSOLUTE reference to the descriptor");
+        assert_eq!(
+            header.addend, 0,
+            "a locally laid descriptor resolves through desc_index, which adds its own vtable span"
+        );
+        let blob =
+            crate::stringgen::string_blob_bytes(&[0x48, 0x69]).expect("\"Hi\" encodes in every tier");
+        let at = obj
+            .text
+            .windows(blob.len())
+            .position(|w| w == blob.as_slice())
+            .expect("the literal blob is in the object");
+        assert_eq!(
+            header.offset as usize + 4,
+            at,
+            "the header is the word IMMEDIATELY before the payload -- that is what `[obj - 4]` means"
+        );
+    }
+
+    #[test]
+    fn semihost_write_saves_the_return_address() {
+        let main = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::SemihostWrite {
+                        text: b"x\0".to_vec().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let bytes = lower_object(&[main], &["main"], &[], &[]).expect("lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let text = &obj.text;
+        let saves_ra = text.chunks(4).any(|w| {
+            w.len() == 4 && {
+                let inst = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                inst & 0x7f == 0x23 && (inst >> 12) & 7 == 2 && (inst >> 20) & 0x1f == 1
+            }
+        });
+        assert!(saves_ra, "the frame saves `ra` for the console-seam call");
     }
 
     #[test]
@@ -5918,5 +7264,90 @@ mod tests {
             }],
         };
         assert_eq!(lower(&func), Err(LowerError::Unsupported));
+    }
+
+    #[test]
+    fn the_object_path_emits_dwarf_without_moving_a_byte_of_code() {
+        let body = |v: i64| Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: v,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let funcs = [body(1), body(2)];
+        let names = ["first", "second"];
+        let maps = [
+            crate::cil::CilSourceMap(vec![vec![7]]),
+            crate::cil::CilSourceMap(vec![vec![7]]),
+        ];
+        let points = [(7u32, 11u32, 5u32)];
+        let sources = [
+            crate::debugmap::MethodSource { name: "T.first", file: "t.cs", points: &points },
+            crate::debugmap::MethodSource { name: "T.second", file: "t.cs", points: &points },
+        ];
+        let debug = crate::debugmap::ObjectDebug {
+            source_maps: &maps,
+            methods: &sources,
+            unit_name: "t.cs",
+            producer: "test",
+        };
+        let (with_debug, lines) = lower_object_profile_statics_debug(
+            &funcs,
+            &names,
+            &[],
+            &[],
+            None,
+            RiscvProfile::Rv32im,
+            &debug,
+        )
+        .expect("the debug object path lowers");
+        let plain =
+            lower_object_profile_statics(&funcs, &names, &[], &[], None, RiscvProfile::Rv32im)
+                .expect("the plain object path lowers");
+
+        let with_obj = lamella_elf::read_object(&with_debug).unwrap();
+        let plain_obj = lamella_elf::read_object(&plain).unwrap();
+        assert_eq!(with_obj.text, plain_obj.text, "debug info must not move a byte of code");
+        assert!(plain_obj.sections.is_empty(), "the plain build carries no debug sections");
+        let emitted: Vec<&str> = with_obj.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(emitted, [".debug_line", ".debug_info", ".debug_abbrev"]);
+
+        assert_eq!(lines.len(), 2);
+        for (index, name) in names.iter().enumerate() {
+            let (offset, rows) = &lines[index];
+            assert!(!rows.is_empty(), "{name} has no rows");
+            let sym = with_obj
+                .symbols
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("no {name} symbol"));
+            assert_eq!(*offset, sym.value, "{name}'s rows sit where its symbol says");
+        }
+        assert_ne!(lines[0].0, lines[1].0, "the two functions sit at different offsets");
+
+        let line_section = with_obj
+            .sections
+            .iter()
+            .find(|s| s.name == ".debug_line")
+            .expect("no .debug_line");
+        assert_eq!(line_section.relocations.len(), 2, "one set_address per function");
+        assert!(
+            line_section
+                .relocations
+                .iter()
+                .all(|r| r.kind == lamella_elf::riscv::R_RISCV_32),
+            "a carried-section relocation must be R_RISCV_32 on this target"
+        );
     }
 }

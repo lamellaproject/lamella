@@ -546,6 +546,7 @@ fn emit_statement(
         }
         BoundStmtKind::Local { declarators, .. } => {
             for declarator in declarators {
+                frame.rebind_decl(stmt.span, &declarator.name);
                 if let Some(initializer) = &declarator.initializer {
                     let value_type_new = matches!(
                         &initializer.kind,
@@ -669,6 +670,7 @@ fn emit_statement(
             init,
             body,
         } => {
+            frame.rebind_decl(stmt.span, name);
             if matches!(&init.ty, TypeSymbol::Pointer(_)) {
                 let slot =
                     frame.reserve_pinned_local(&TypeSymbol::ByRef(Box::new(element.clone())));
@@ -857,6 +859,7 @@ fn emit_statement(
             }
             let array = frame.reserve_local(&collection.ty);
             let index = frame.reserve_local(&TypeSymbol::Special(SpecialType::Int32));
+            frame.rebind_decl(stmt.span, name);
 
             emit_expression(collection, frame, tokens, out)?;
             out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array)));
@@ -1001,6 +1004,9 @@ fn emit_try(
     for catch in catches {
         let handler_start = out.len() as u32;
         labels.points.push((handler_start, Some(catch.span)));
+        if let Some(name) = catch.name.as_deref() {
+            frame.rebind_decl(catch.span, name);
+        }
         match catch.name.as_deref().and_then(|name| frame.slot(name)) {
             Some(Slot::Local(slot)) => {
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
@@ -1180,6 +1186,16 @@ fn emit_statement_expression(
             if let BoundExprKind::ElementAccess { receiver, indices } = &target.kind {
                 return crate::expr::emit_element_store(
                     &target.ty, receiver, indices, value, false, frame, tokens, out,
+                );
+            }
+            if let BoundExprKind::IndexerAccess {
+                receiver,
+                indices,
+                setter,
+            } = &target.kind
+            {
+                return crate::expr::emit_indexer_store(
+                    receiver, indices, setter, value, false, frame, tokens, out,
                 );
             }
             if let BoundExprKind::Dereference { operand } = &target.kind {

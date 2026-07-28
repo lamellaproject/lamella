@@ -63,6 +63,15 @@ pub struct LinkedImage {
     pub entry_offset: u32,
     /// Every defined symbol, as `(name, offset within text)`.
     pub symbols: Vec<(String, u32)>,
+    /// The combined, relocated NON-ALLOCATED sections, as `(name, bytes)` in first-seen order --
+    /// today the DWARF `.debug_*` family. Each input object's same-named contributions are
+    /// concatenated (at their required alignment) and relocated in place, so a debugger reading the
+    /// result sees one coherent set of debug sections for the whole image.
+    ///
+    /// Empty unless some input object carried debug info, so an ordinary image is untouched. These
+    /// bytes are NOT part of [`Self::text`]: they occupy no target memory and are never loaded --
+    /// they belong in the debug artifact a host-side debugger opens, alongside the flashed image.
+    pub debug_sections: Vec<(String, Vec<u8>)>,
 }
 
 /// Links `objects` into one image, with `entry` naming the start symbol. Each object's `.text` is
@@ -207,8 +216,10 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         binding: Binding::Local,
         kind: SymbolType::NoType,
         defined: false,
+        section: None,
     });
     let mut index_of: BTreeMap<String, u32> = BTreeMap::new();
+    let mut debug_index_of: BTreeMap<(String, u32), u32> = BTreeMap::new();
     for &i in &kept {
         let s = &obj.symbols[i];
         let start = s.value & !1;
@@ -229,6 +240,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
             binding: s.binding,
             kind: s.kind,
             defined: true,
+            section: None,
         });
     }
 
@@ -255,6 +267,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                     binding: Binding::Global,
                     kind: target.kind,
                     defined: false,
+                    section: None,
                 });
                 index_of.insert(target.name.clone(), i);
                 i
@@ -269,13 +282,80 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         });
     }
 
+    let mut sections = obj.sections.clone();
+    for sec in &mut sections {
+        let mut kept_relocs: Vec<ParsedRelocation> = Vec::new();
+        for r in &sec.relocations {
+            let Some(target) = obj.symbols.get(r.symbol as usize) else {
+                continue;
+            };
+            let remapped = match target.section {
+                Some(_) => Some((target.value, target.section)),
+                None if target.defined => remap_text_offset(&ranges, target.value & !1)
+                    .map(|v| (v | (target.value & 1), None)),
+                None => Some((target.value, None)),
+            };
+            let Some((value, section)) = remapped else {
+                if let Some(slot) = sec
+                    .data
+                    .get_mut(r.offset as usize..r.offset as usize + 4)
+                {
+                    slot.fill(0);
+                }
+                continue;
+            };
+            let key = (target.name.clone(), r.symbol);
+            let idx = match debug_index_of.get(&key) {
+                Some(&i) => i,
+                None => {
+                    let i = symbols.len() as u32;
+                    symbols.push(lamella_elf::ParsedSymbol {
+                        name: target.name.clone(),
+                        value,
+                        size: target.size,
+                        binding: match target.defined {
+                            true => Binding::Local,
+                            false => Binding::Global,
+                        },
+                        kind: target.kind,
+                        defined: target.defined,
+                        section,
+                    });
+                    debug_index_of.insert(key, i);
+                    i
+                }
+            };
+            kept_relocs.push(ParsedRelocation {
+                offset: r.offset,
+                symbol: idx,
+                kind: r.kind,
+                addend: r.addend,
+                implicit_addend: r.implicit_addend,
+            });
+        }
+        sec.relocations = kept_relocs;
+    }
+
     Object {
         machine: obj.machine,
         text,
         text_align: obj.text_align.max(4),
         symbols,
         relocations,
+        sections,
     }
+}
+
+/// Maps a pre-trim `.text` offset to its post-trim one, or `None` if the byte was dropped. `ranges`
+/// holds `(old_start, old_end, new_start)` per kept symbol; the SMALLEST covering range wins, for
+/// the same reason it does when relocations are remapped -- an enclosing symbol must not capture an
+/// offset that belongs to an inner one.
+fn remap_text_offset(ranges: &[(u32, u32, u32)], old: u32) -> Option<u32> {
+    ranges
+        .iter()
+        .filter(|(a, b, _)| old >= *a && old < *b)
+        .min_by_key(|(a, b, _)| b - a)
+        .map(|(a, _, new_start)| new_start + (old - a))
 }
 
 fn link_with_base(
@@ -337,6 +417,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         binding: Binding::Local,
         kind: SymbolType::NoType,
         defined: false,
+        section: None,
     });
     symbols.push(lamella_elf::ParsedSymbol {
         name: String::from(STACKMAP_START_SYMBOL),
@@ -345,6 +426,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         binding: Binding::Global,
         kind: SymbolType::NoType,
         defined: true,
+        section: None,
     });
     symbols.push(lamella_elf::ParsedSymbol {
         name: String::from(STACKMAP_END_SYMBOL),
@@ -353,6 +435,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         binding: Binding::Global,
         kind: SymbolType::NoType,
         defined: true,
+        section: None,
     });
     let mut relocations: Vec<ParsedRelocation> = Vec::with_capacity(names.len());
     for (i, name) in names.into_iter().enumerate() {
@@ -370,6 +453,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
             binding: Binding::Global,
             kind: SymbolType::NoType,
             defined: false,
+            section: None,
         });
     }
     Some(Object {
@@ -378,6 +462,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         text_align: 4,
         symbols,
         relocations,
+        sections: Vec::new(),
     })
 }
 
@@ -554,13 +639,109 @@ fn link_with_base_inner(
         }
     }
 
+    let debug_sections = link_carried_sections(objects, &bases, machine, text_base, &defined)?;
+
     let entry_offset =
         resolve(&defined, entry).ok_or_else(|| LinkError::MissingEntry(String::from(entry)))?;
     Ok(LinkedImage {
         text,
         entry_offset,
         symbols: defined.into_iter().map(|(n, a, _)| (n, a)).collect(),
+        debug_sections,
     })
+}
+
+/// Concatenates every object's carried (non-allocated) sections by NAME and relocates within the
+/// result -- the DWARF passthrough. Returns `(name, bytes)` in first-seen order; an empty vec when
+/// no input carries debug info, which is the ordinary case and costs one `is_empty` check.
+///
+/// The whole subtlety here is that TWO address spaces are in play, exactly as DWARF 5 s7.3.1
+/// describes. A reference from `.debug_info` to `.debug_abbrev` must resolve to "that contribution
+/// to the combined `.debug_abbrev` section" -- a section-relative offset, with no load address in it,
+/// because a debug section is never loaded. A reference to a function (`DW_AT_low_pc`, a
+/// `DW_OP_addr`) must resolve to a location in the program's VIRTUAL address space -- so it, and
+/// only it, takes `text_base`. Getting these two confused yields debug info that looks plausible and
+/// points at nothing, so the alloc/non-alloc distinction is carried explicitly below rather than
+/// inferred.
+fn link_carried_sections(
+    objects: &[Object],
+    bases: &[u32],
+    machine: Machine,
+    text_base: Option<u32>,
+    defined: &[Defined],
+) -> Result<Vec<(String, Vec<u8>)>, LinkError> {
+    if objects.iter().all(|o| o.sections.is_empty()) {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut placed: BTreeMap<(usize, usize), (usize, u32)> = BTreeMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            let out_i = match out.iter().position(|(n, _)| *n == sec.name) {
+                Some(i) => i,
+                None => {
+                    out.push((sec.name.clone(), Vec::new()));
+                    out.len() - 1
+                }
+            };
+            let data = &mut out[out_i].1;
+            align_to(data, sec.addralign);
+            placed.insert((oi, si), (out_i, data.len() as u32));
+            data.extend_from_slice(&sec.data);
+        }
+    }
+
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            let (out_i, contrib) = placed[&(oi, si)];
+            for r in &sec.relocations {
+                let abs32 = match machine {
+                    Machine::Arm => arm::R_ARM_ABS32,
+                    Machine::RiscV => riscv::R_RISCV_32,
+                };
+                if r.kind != abs32 {
+                    return Err(LinkError::UnsupportedRelocation(r.kind));
+                }
+                let sym = &obj.symbols[r.symbol as usize];
+                let (target, allocated) = match sym.section {
+                    Some(csi) => {
+                        let (_, base) = placed[&(oi, csi as usize)];
+                        (base + sym.value, false)
+                    }
+                    None if sym.defined && (sym.name.is_empty() || sym.binding == Binding::Local) => {
+                        (bases[oi] + normalized_value(machine, sym.value), true)
+                    }
+                    None => {
+                        let (addr, _) = resolve_sym(defined, &sym.name)
+                            .ok_or_else(|| LinkError::UndefinedSymbol(sym.name.clone()))?;
+                        (addr, true)
+                    }
+                };
+                let site = contrib + r.offset;
+                let data = &mut out[out_i].1;
+                let addend = relocation_addend(data, machine, site, r);
+                let base = match allocated {
+                    true => i64::from(text_base.ok_or(LinkError::AbsoluteNeedsBase)?),
+                    false => 0,
+                };
+                encode_abs32_at(data, site, base + i64::from(target) + addend)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Writes a 32-bit little-endian word into a carried section at `site`. Unlike the code path's
+/// [`apply_abs32`] this takes the fully-resolved value (the caller has already decided whether a
+/// load address belongs in it) and never applies a Thumb bit: a DWARF address names a location, not
+/// a branch target, so the interworking bit would corrupt every odd-valued offset it touched.
+fn encode_abs32_at(data: &mut [u8], site: u32, value: i64) -> Result<(), LinkError> {
+    let slot = data
+        .get_mut(site as usize..site as usize + 4)
+        .ok_or(LinkError::RelocationOutOfRange(site))?;
+    slot.copy_from_slice(&(value as u32).to_le_bytes());
+    Ok(())
 }
 
 /// On ARM, a Thumb function carries the Thumb bit in its symbol value's low bit (our backend +
@@ -951,6 +1132,7 @@ fn link_gc_inner(
         text,
         entry_offset,
         symbols: defined.into_iter().map(|(n, a, _)| (n, a)).collect(),
+        debug_sections: Vec::new(),
     })
 }
 
@@ -1259,9 +1441,107 @@ mod tests {
     use super::*;
     use alloc::vec;
     use lamella_elf::{
-        ArchiveMember, Binding, Machine, Relocation, Symbol, SymbolSection, SymbolType, arm,
-        read_object, write_relocatable_object,
+        ArchiveMember, Binding, Machine, Relocation, Section, Symbol, SymbolSection, SymbolType,
+        arm, read_object, write_relocatable_object, write_relocatable_object_with_sections,
     };
+
+    /// What a carried-section relocation points at: a function in the loaded image, or another
+    /// carried section (named by the nameless `STT_SECTION` symbol a real toolchain emits).
+    enum DTarget {
+        Code(&'static str),
+        Section(&'static str),
+    }
+
+    /// Builds an object with carried DWARF sections by EMITTING one and reading it back -- so every
+    /// test below exercises the writer, the reader, and the linker together, in the shape a real
+    /// toolchain object takes. (It was hand-built before the writer could emit carried sections.)
+    ///
+    /// Cross-section references are made through NAMELESS `STT_SECTION` symbols, exactly as LLVM
+    /// emits them, which is the case a name-keyed linker structurally cannot resolve.
+    fn debug_obj(
+        machine: Machine,
+        text: &[u8],
+        funcs: &[(&str, u32, u32)],
+        debug: &[(&str, &[u8], &[(u32, DTarget)])],
+    ) -> Object {
+        let abs32 = match machine {
+            Machine::Arm => arm::R_ARM_ABS32,
+            Machine::RiscV => riscv::R_RISCV_32,
+        };
+        let mut symbols: Vec<Symbol> = funcs
+            .iter()
+            .map(|&(name, value, size)| Symbol {
+                name,
+                value,
+                size,
+                binding: Binding::Global,
+                kind: SymbolType::Func,
+                section: SymbolSection::Text,
+            })
+            .collect();
+        let section_syms = symbols.len() as u32;
+        for i in 0..debug.len() {
+            symbols.push(Symbol {
+                name: "",
+                value: 0,
+                size: 0,
+                binding: Binding::Local,
+                kind: SymbolType::Section,
+                section: SymbolSection::InSection(i as u32),
+            });
+        }
+        let relocs: Vec<Vec<Relocation>> = debug
+            .iter()
+            .map(|&(_, _, rs)| {
+                rs.iter()
+                    .map(|(offset, target)| Relocation {
+                        offset: *offset,
+                        symbol: match target {
+                            DTarget::Code(n) => {
+                                funcs.iter().position(|&(f, _, _)| f == *n).unwrap() as u32
+                            }
+                            DTarget::Section(n) => {
+                                section_syms
+                                    + debug.iter().position(|&(dn, _, _)| dn == *n).unwrap() as u32
+                            }
+                        },
+                        kind: abs32,
+                        addend: 0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let sections: Vec<Section> = debug
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, data, _))| Section {
+                name,
+                flags: 0,
+                addralign: 1,
+                data,
+                relocations: &relocs[i],
+            })
+            .collect();
+        read_object(&write_relocatable_object_with_sections(
+            machine, text, &symbols, &[], &sections,
+        ))
+        .expect("an emitted object with carried sections reads back")
+    }
+
+    /// Reads the 32-bit little-endian word a carried section holds at `offset`.
+    fn debug_word(image: &LinkedImage, name: &str, offset: usize) -> u32 {
+        let (_, data) = image
+            .debug_sections
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("no {name} in the linked image"));
+        u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ])
+    }
 
     fn obj(text: &[u8], syms: &[Symbol], relocs: &[Relocation]) -> Object {
         read_object(&write_relocatable_object(
@@ -2365,5 +2645,148 @@ mod tests {
             addr("g"),
             "address-taken functions must keep distinct identities"
         );
+    }
+
+
+    /// Two objects that each carry `.debug_info` + `.debug_abbrev`, the second's contributions
+    /// landing at NON-ZERO offsets -- the case that separates a real concatenation from a naive
+    /// "copy the first one and hope" pass. `dead` is unreferenced by any code, so a `--gc-sections`
+    /// link strips it while the plain link keeps it.
+    fn debug_pair() -> [Object; 2] {
+        [
+            debug_obj(
+                Machine::RiscV,
+                &[0u8; 8],
+                &[("_start", 0, 4), ("dead", 4, 4)],
+                &[
+                    (
+                        ".debug_info",
+                        &[0u8; 12],
+                        &[
+                            (0, DTarget::Section(".debug_abbrev")),
+                            (4, DTarget::Code("_start")),
+                            (8, DTarget::Code("dead")),
+                        ],
+                    ),
+                    (".debug_abbrev", &[0xAAu8; 8], &[]),
+                ],
+            ),
+            debug_obj(
+                Machine::RiscV,
+                &[0u8; 4],
+                &[("helper", 0, 4)],
+                &[
+                    (
+                        ".debug_info",
+                        &[0u8; 4],
+                        &[(0, DTarget::Section(".debug_abbrev"))],
+                    ),
+                    (".debug_abbrev", &[0xBBu8; 4], &[]),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn carried_debug_sections_concatenate_by_name_across_objects() {
+        let image = link_at_base(&debug_pair(), "_start", 0x2000).unwrap();
+        let named = |n: &str| {
+            image
+                .debug_sections
+                .iter()
+                .find(|(s, _)| s == n)
+                .map(|(_, d)| d.clone())
+                .unwrap()
+        };
+        assert_eq!(named(".debug_info").len(), 12 + 4);
+        let abbrev = named(".debug_abbrev");
+        assert_eq!(abbrev.len(), 8 + 4);
+        assert_eq!(&abbrev[..8], &[0xAA; 8], "first object's bytes lead");
+        assert_eq!(&abbrev[8..], &[0xBB; 4], "second object's follow");
+    }
+
+    #[test]
+    fn a_debug_reference_to_another_debug_section_is_section_relative() {
+        let image = link_at_base(&debug_pair(), "_start", 0x2000).unwrap();
+        assert_eq!(debug_word(&image, ".debug_info", 0), 0);
+        assert_eq!(debug_word(&image, ".debug_info", 12), 8);
+    }
+
+    #[test]
+    fn a_debug_reference_to_code_carries_the_load_address() {
+        let image = link_at_base(&debug_pair(), "_start", 0x2000).unwrap();
+        assert_eq!(debug_word(&image, ".debug_info", 4), 0x2000);
+        assert_eq!(debug_word(&image, ".debug_info", 8), 0x2004);
+    }
+
+    #[test]
+    fn a_debug_address_never_takes_the_thumb_bit() {
+        let obj = debug_obj(
+            Machine::Arm,
+            &[0u8; 4],
+            &[("_start", 1, 4)],
+            &[(".debug_info", &[0u8; 4], &[(0, DTarget::Code("_start"))])],
+        );
+        let image = link_at_base(&[obj], "_start", 0x2000).unwrap();
+        assert_eq!(debug_word(&image, ".debug_info", 0), 0x2000);
+    }
+
+    #[test]
+    fn an_object_without_debug_info_produces_no_debug_sections() {
+        let objects = [obj(&[0x13, 0x05, 0xa0, 0x02], &[func("_start", 0, 4)], &[])];
+        let image = link_at_base(&objects, "_start", 0x2000).unwrap();
+        assert!(image.debug_sections.is_empty());
+    }
+
+    #[test]
+    fn gc_sections_does_not_keep_a_function_alive_through_a_debug_reference() {
+        let kept = garbage_collect(&debug_pair(), "_start");
+        let names: Vec<&str> = kept
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"_start"), "the entry survives");
+        assert!(
+            !names.contains(&"dead"),
+            "a debug reference must not resurrect dead code"
+        );
+    }
+
+    #[test]
+    fn gc_sections_tombstones_a_debug_reference_to_stripped_code() {
+        let image = link_at_base_gc(&debug_pair(), "_start", 0x2000).unwrap();
+        assert_eq!(debug_word(&image, ".debug_info", 4), 0x2000);
+        assert_eq!(debug_word(&image, ".debug_info", 8), 0);
+    }
+
+    #[test]
+    fn gc_sections_remaps_a_debug_reference_to_code_that_moved() {
+        let mut objects = [debug_obj(
+            Machine::RiscV,
+            &[0u8; 12],
+            &[("_start", 0, 4), ("dead", 4, 4), ("keep", 8, 4)],
+            &[(
+                ".debug_info",
+                &[0u8; 8],
+                &[(0, DTarget::Code("_start")), (4, DTarget::Code("keep"))],
+            )],
+        )];
+        let keep = objects[0]
+            .symbols
+            .iter()
+            .position(|s| s.name == "keep")
+            .expect("the fixture defines `keep`") as u32;
+        objects[0].relocations.push(ParsedRelocation {
+            offset: 0,
+            symbol: keep,
+            kind: riscv::R_RISCV_32,
+            addend: 0,
+            implicit_addend: false,
+        });
+        let image = link_at_base_gc(&objects, "_start", 0x2000).unwrap();
+        assert_eq!(debug_word(&image, ".debug_info", 0), 0x2000, "entry first");
+        assert_eq!(debug_word(&image, ".debug_info", 4), 0x2004);
     }
 }

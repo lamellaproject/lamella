@@ -65,6 +65,13 @@ pub struct LexOptions {
     /// predates it is rejected with a `Feature requires C# N` diagnostic instead of munching as
     /// the 1.0 tokens it would otherwise split into (so the error names the feature, not `=` `>`).
     pub version: LanguageVersion,
+    /// Whether unsafe code is permitted -- csc's `/unsafe`. **Off by default, as csc's is**: an
+    /// `unsafe` modifier or block written without it is `CS0227`. The knob does not change what is
+    /// PARSED (unsafe C# is fully implemented; the v1 scope is all of C# including unsafe), only
+    /// whether the compilation is allowed to contain it, which is a command-line policy rather
+    /// than a language rule. A host that parses no command line -- a test harness, an in-process
+    /// compile -- sets it explicitly for what it is compiling.
+    pub unsafe_code: bool,
     /// Whether unmanaged native interop is enabled: `[DllImport]` P/Invoke (an `ImplMap`), and later
     /// explicit `[StructLayout]`/`[FieldOffset]` and `[MarshalAs]`. Off by default -- pure-managed
     /// code (and the NETMFv4_4 profile) does not need it, so a constrained target stays free of an

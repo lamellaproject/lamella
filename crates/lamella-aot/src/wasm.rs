@@ -35,6 +35,15 @@ pub enum LowerError {
     /// (merges pass their parameters on `Jump` edges instead), an entry block whose parameters do
     /// not match the signature, or an internal structuring inconsistency.
     ControlFlowUnsupported,
+    /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
+    /// surrogate under `string-utf8`. Refused rather than replaced with U+FFFD -- see
+    /// `stringgen::encode_string_bytes` for why a compiler refuses where the interpreter throws.
+    UnencodableStringUnit {
+        /// The offending UTF-16 code unit.
+        unit: u16,
+        /// Its index in the literal, in UTF-16 code units.
+        index: u32,
+    },
 }
 
 /// Lowers a single [`Function`] to a WebAssembly module's bytes -- a one-function module exporting
@@ -85,10 +94,10 @@ fn lower_module_inner(
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
     let mut program: Vec<Function> = funcs.to_vec();
-    let strings = layout_strings(&mut program);
+    let strings = layout_strings(&mut program)?;
     crate::stringgen::lower_string_equals(&mut program);
-    crate::stringgen::lower_string_concat(&mut program);
-    crate::stringgen::lower_int_to_string(&mut program);
+    crate::stringgen::lower_string_concat(&mut program, None);
+    crate::stringgen::lower_int_to_string(&mut program, None);
 
     for func in &program {
         if lamella_ir::verify(func).is_err() {
@@ -237,7 +246,7 @@ struct StringLayout {
 
 /// Interns each `StringLiteral` to a `[u32 length][UTF-16LE]` blob at an offset from [`STRING_BASE`],
 /// rewriting the instruction to a constant `ObjectRef` pointer, and returns the segments + heap base.
-fn layout_strings(program: &mut [Function]) -> StringLayout {
+fn layout_strings(program: &mut [Function]) -> Result<StringLayout, LowerError> {
     let mut interned: Vec<(Vec<u16>, u32)> = Vec::new();
     let mut segments: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut next = STRING_BASE as u32;
@@ -249,7 +258,7 @@ fn layout_strings(program: &mut [Function]) -> StringLayout {
                     let offset = match interned.iter().find(|(c, _)| *c == units) {
                         Some((_, offset)) => *offset,
                         None => {
-                            let blob = string_blob(&units);
+                            let blob = string_blob(&units)?;
                             let offset = next;
                             next = (next + blob.len() as u32).next_multiple_of(4);
                             interned.push((units, offset));
@@ -265,20 +274,23 @@ fn layout_strings(program: &mut [Function]) -> StringLayout {
             }
         }
     }
-    StringLayout {
+    Ok(StringLayout {
         segments,
         heap_base: i64::from(next.next_multiple_of(8)),
-    }
+    })
 }
 
-/// Builds a string blob: the UTF-16 unit count as a little-endian `u32`, then the UTF-16LE units.
-fn string_blob(utf16: &[u16]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(4 + utf16.len() * 2);
-    blob.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
-    for &unit in utf16 {
-        blob.extend_from_slice(&unit.to_le_bytes());
-    }
-    blob
+/// Builds a string blob in this build's storage encoding -- the unit count as a little-endian `u32`,
+/// then either the UTF-16LE units or a byte length and the UTF-8/WTF-8 bytes.
+///
+/// Delegates to the ONE place that owns the layout rather than spelling it out again: this function
+/// used to hardcode UTF-16, so a `--features wasm,string-utf8` build was accepted and silently
+/// produced a UTF-16 image.
+fn string_blob(utf16: &[u16]) -> Result<Vec<u8>, LowerError> {
+    crate::stringgen::string_blob_bytes(utf16).map_err(|e| LowerError::UnencodableStringUnit {
+        unit: e.unit,
+        index: e.index,
+    })
 }
 
 /// The WebAssembly function type for `func`: its MIR parameter and return types mapped to value
@@ -307,6 +319,7 @@ fn uses_memory(funcs: &[Function]) -> bool {
                 inst,
                 Inst::Alloc { .. }
                     | Inst::AllocLike { .. }
+                    | Inst::AllocDescribed { .. }
                     | Inst::AllocArray { .. }
                     | Inst::InitStruct
                     | Inst::CopyStruct { .. }
@@ -1268,9 +1281,15 @@ fn lower_inst(
         }
         Inst::LoadTypeDesc { object } => {
             body.local_get(local(*object));
+            body.i32_eqz();
+            body.if_(BlockType::Value(ValType::I32));
+            body.i32_const(0);
+            body.else_();
+            body.local_get(local(*object));
             body.i32_const(4);
             body.i32_sub();
             body.i32_load(MemArg::new(4, 0));
+            body.end();
             body.local_set(local(result));
         }
         Inst::InitStruct => {
@@ -1443,6 +1462,50 @@ fn lower_inst(
                 body.local_set(local(result));
             }
         }
+        Inst::InterfaceHasTag { descriptor, tag } => {
+            let ptr = body.add_local(ValType::I32);
+            let count = body.add_local(ValType::I32);
+            let present = body.add_local(ValType::I32);
+            body.i32_const(0);
+            body.local_set(present);
+            body.local_get(local(*descriptor));
+            body.if_(BlockType::Empty);
+            body.local_get(local(*descriptor));
+            body.i32_load(MemArg::new(4, 8));
+            body.local_set(count);
+            body.local_get(local(*descriptor));
+            body.i32_const(12);
+            body.i32_add();
+            body.local_set(ptr);
+            body.loop_(BlockType::Empty);
+            body.local_get(count);
+            body.i32_eqz();
+            body.if_(BlockType::Empty);
+            body.else_();
+            body.local_get(ptr);
+            body.i32_load(MemArg::new(4, 0));
+            body.i32_const(*tag as i32);
+            body.i32_eq();
+            body.if_(BlockType::Empty);
+            body.i32_const(1);
+            body.local_set(present);
+            body.else_();
+            body.local_get(ptr);
+            body.i32_const(8);
+            body.i32_add();
+            body.local_set(ptr);
+            body.local_get(count);
+            body.i32_const(1);
+            body.i32_sub();
+            body.local_set(count);
+            body.br(3);
+            body.end();
+            body.end();
+            body.end();
+            body.end();
+            body.local_get(present);
+            body.local_set(local(result));
+        }
         Inst::CallInterface {
             tag,
             args,
@@ -1596,6 +1659,10 @@ fn lower_inst(
             let res = body.add_local(ValType::I32);
             body.local_get(local(start));
             body.local_set(cur);
+            body.i32_const(0);
+            body.local_set(res);
+            body.local_get(cur);
+            body.if_(BlockType::Empty);
             body.loop_(BlockType::Empty);
             body.local_get(cur);
             body.local_get(local(target));
@@ -1614,6 +1681,7 @@ fn lower_inst(
             body.local_set(res);
             body.else_();
             body.br(2);
+            body.end();
             body.end();
             body.end();
             body.end();
@@ -2493,8 +2561,10 @@ mod tests {
                         ValueId(1),
                         Inst::AllocArray {
                             handle: lamella_ir::TypeHandle(1),
+                            element: None,
                             length: ValueId(0),
                             element_size: 4,
+                            element_kind: 5,
                         },
                     ),
                     (ValueId(2), cint(20)),
@@ -2706,6 +2776,7 @@ mod tests {
             itable: Vec::new(),
             base: None,
             words: None,
+            exported: true,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the callvirt lowers to WASM");
@@ -2775,6 +2846,7 @@ mod tests {
             itable: alloc::vec![(TAG, crate::resolver::VtableEntry::Func(1))],
             base: None,
             words: None,
+            exported: true,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the interface call lowers to WASM");
@@ -2831,6 +2903,7 @@ mod tests {
                 itable: Vec::new(),
                 base: Some(lamella_ir::TypeHandle(1)),
                 words: None,
+                exported: true,
             },
             TypeMeta {
                 handle: lamella_ir::TypeHandle(1),
@@ -2839,6 +2912,7 @@ mod tests {
                 itable: Vec::new(),
                 base: None,
                 words: None,
+                exported: true,
             },
         ];
         let bytes = lower_module_with_exports(&[main], &[("main", 0)], &descriptors)
@@ -2910,6 +2984,7 @@ mod tests {
             itable: Vec::new(),
             base: None,
             words: None,
+            exported: true,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the void callvirt lowers to WASM");
@@ -3133,6 +3208,40 @@ mod tests {
         let bytes = lower(&string_length()).expect("a string literal lowers to WASM");
         assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
         assert!(bytes.len() > 16);
+    }
+
+    /// The emitted MODULE must carry the literal in THIS BUILD's storage encoding, so the check
+    /// is on the bytes the backend actually emits rather than on `string_blob_bytes`.
+    #[test]
+    fn the_emitted_module_carries_the_literal_in_this_builds_storage_tier() {
+        let text: alloc::boxed::Box<[u16]> = "Hi".encode_utf16().collect::<Vec<u16>>().into();
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (ValueId(0), Inst::StringLiteral { utf16: text }),
+                    (
+                        ValueId(1),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let bytes = lower(&func).expect("a string literal lowers to WASM");
+        let expected = crate::stringgen::string_blob_bytes(&[0x48, 0x69])
+            .expect("\"Hi\" encodes in every tier");
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected.as_slice()),
+            "the module must contain the literal blob for this tier ({expected:02x?})"
+        );
     }
 
     #[test]

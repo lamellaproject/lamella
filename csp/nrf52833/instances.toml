@@ -1,0 +1,30 @@
+# INSTANCE map: where each nRF52833 block copy sits. The nRF
+# needs no clock-gate or reset records: peripherals are powered at reset and select their
+# personality through their own ENABLE registers, so the record is bases only (the esp32c6
+# shape). Port rows follow the port<n> normalization (Nordic's "P0" -> `port0`,
+# matching samd21's porta/portb), which is what the shared control-line and pin derivations
+# key on. twi0 SHARES peripheral ID 3 with SPI0/SPIM0/SPIS0/TWIM0/TWIS0 -- one base, the
+# ENABLE value selects the personality (the twi block's notes).
+
+[table]
+kind = "instances"
+family = "nrf52833"
+record = ["base"]
+sources = [
+    "Nordic nRF52833 Product Specification 4452_021 v1.7: instantiation table (TWI0 0x40003000, shared ID 3) + GPIO P0 0x50000000, P1 0x50000300",
+]
+
+[[instances]]
+name = "twi0"
+block = "twi"
+base = 0x40003000
+
+[[instances]]
+name = "port0"
+block = "gpio"
+base = 0x50000000
+
+[[instances]]                # this part carries a SECOND GPIO port; the deprecated combined
+name = "port1"               # "GPIO" instance at 0x50000000 is not modelled -- the two ports
+block = "gpio"               # are the addressable truth (PS instantiation table).
+base = 0x50000300

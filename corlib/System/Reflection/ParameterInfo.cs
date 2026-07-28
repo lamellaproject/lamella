@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.ParameterInfo
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public class ParameterInfo
@@ -51,3 +52,4 @@ namespace System.Reflection
         }
     }
 }
+#endif

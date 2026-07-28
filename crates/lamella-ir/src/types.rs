@@ -8,6 +8,59 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeHandle(pub u32);
 
+/// The table byte reserved for arrays a FRONT END synthesizes, which have no metadata token of
+/// their own -- a string blob, a delegate's entry list, a Python list's backing store. A handle
+/// otherwise carries a metadata type token (TypeRef `0x01` / TypeDef `0x02`) or the backend's
+/// reference-owned encoding (`0x03`), so `0x04` can never alias a real type. It stays under bit 27,
+/// where the backends' symbol flags begin.
+pub const SYNTHETIC_ARRAY_HANDLE_TABLE: u32 = 0x04;
+
+/// The reserved handle for a synthesized array whose elements are `element_kind` -- the identity a
+/// front end stamps on an [`Inst::AllocArray`](crate::Inst::AllocArray) it invents.
+///
+/// The kind IS the identity, so two synthesized arrays collide exactly when they agree about their
+/// elements. That is not a convenience: a descriptor is deduplicated BY HANDLE -- one
+/// `__lamella_typedesc_<handle>` per handle per image -- so two arrays sharing a handle share one
+/// descriptor, and whichever the backend emits first decides the element kind for both. That was
+/// harmless while an array's descriptor was an all-zero hole. It stopped being harmless when the
+/// descriptor started carrying the kind: a UTF-16 string blob sharing the delegate list's handle
+/// would be described as an array of REFERENCES, and a collector tracing it would walk code units
+/// as pointers. Deriving the handle from the kind makes that unrepresentable rather than a rule
+/// every call site has to remember.
+#[must_use]
+pub const fn synthetic_array_handle(element_kind: u32) -> TypeHandle {
+    TypeHandle((SYNTHETIC_ARRAY_HANDLE_TABLE << 24) | element_kind)
+}
+
+/// How far [`array_handle`] lifts a class-identity table byte to reach the array's own: `0x01` ->
+/// `0x05`, `0x02` -> `0x06`, `0x03` -> `0x07`. Those three bytes are RESERVED for array identities
+/// and are the last the encoding has -- everything must stay under bit 27, where the backends'
+/// symbol flags begin (a handle rides the low bits of a descriptor reference word).
+pub const ARRAY_HANDLE_TABLE_OFFSET: u32 = 0x04;
+
+/// The handle identifying the rank-1 ARRAY whose elements are `element` -- `T[]`, given `T`.
+///
+/// An array needs an identity of its OWN because a descriptor is deduplicated BY HANDLE. While an
+/// array's handle was its element's token, `int[]` and a boxed `int` were one handle, so one
+/// `__lamella_typedesc_*` had to serve both and whichever the backend laid first decided the
+/// other's shape -- and an array descriptor cannot name its element type at all if the name it
+/// would use is its own. The transform lifts a class-identity table byte (TypeRef `0x01`, TypeDef
+/// `0x02`, the backend's reference-owned `0x03`) by [`ARRAY_HANDLE_TABLE_OFFSET`]. That is a
+/// BIJECTION on the class-identity space, so two different element types can never name one array,
+/// and it needs no side table to stay stable across an assembly boundary: both sides derive the
+/// same array handle from the same element identity.
+///
+/// A handle that is ALREADY an array identity (a synthetic `0x04`) or that names no class
+/// descriptor at all (a TypeSpec -- a nested array or a generic instantiation) is its own array
+/// handle: there is no class descriptor for it to collide with.
+#[must_use]
+pub const fn array_handle(element: TypeHandle) -> TypeHandle {
+    match element.0 >> 24 {
+        0x01..=0x03 => TypeHandle(element.0 + (ARRAY_HANDLE_TABLE_OFFSET << 24)),
+        _ => element,
+    }
+}
+
 /// The type of a MIR value: one of the CLI's stack types (ECMA-335 III.1.1), plus
 /// the Python frontend's tagged [`MirType::PyValue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

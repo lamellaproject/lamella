@@ -164,10 +164,12 @@ extern "C" fn lamella_entropy_poll(output: *mut u8, len: usize) -> c_int {
 /// The pool size. On a device: one session's record buffers (16 KiB in + 4 KiB out) +
 /// ssl/x509 state + bignum churn peak, with working headroom for a FULL chain
 /// verification -- parsing the peer's chain and the matching root plus the ECDSA/RSA
-/// verify bignums peaks well past the AcceptAny bench's footprint. An embedder wanting 
-/// concurrent sessions grows this and its RAM budget together. On a HOST the pool is 
-/// roomier: the conformance tests run sessions in parallel test threads, and host RAM is 
-/// not the scarce resource the pool exists to discipline.
+/// verify bignums peaks well past the AcceptAny bench's footprint (32 KiB served
+/// AcceptAny but starved SystemRoots/Report verification into alloc-fail handshake
+/// aborts on the E54). An embedder wanting concurrent sessions grows this and its RAM
+/// budget together. On a HOST the pool is roomier: the conformance tests run sessions in
+/// parallel test threads, and host RAM is not the scarce resource the pool exists to
+/// discipline.
 const POOL_BYTES: usize = if cfg!(target_os = "none") { 48 * 1024 } else { 128 * 1024 };
 
 /// Block granularity and payload alignment: every block size is a multiple of this, and
@@ -662,7 +664,7 @@ impl TlsBackend for MbedTlsDevice {
         if session.report && session.established {
             flags |= unsafe { lam_tls_report_flags(session.shim) };
         }
-        flags
+        session_flag::REPORT_PRESENT | flags
     }
 
     fn close(&mut self, tls: TlsHandle) {

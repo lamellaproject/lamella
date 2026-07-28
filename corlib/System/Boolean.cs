@@ -31,6 +31,7 @@ namespace System
             throw new FormatException("String was not recognized as a valid Boolean.");
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string value, out bool result)
         {
             result = false;
@@ -44,6 +45,7 @@ namespace System
             if (len == 5 && MatchesIgnoreCase(value, start, FalseString)) { result = false; return true; }
             return false;
         }
+#endif
 
         public bool Equals(bool obj) { return this == obj; }
 

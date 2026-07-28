@@ -1,0 +1,27 @@
+# BLOCK layout: the RP2350 user IO bank (function select per pin).
+# The per-pin register ARRAY is GPIO<n>_CTRL =
+# base + GPIO0_CTRL offset + GPIO_CTRL_STRIDE * n -- the rp-family pin derivation.
+#
+# The function-select values are the SVD-enumerated mux columns this family's consumers bind
+# (grown evidence-first): F1 = SPI, F2 = UART, F3 = I2C, F5 = SIO (the GPIO driver's
+# route), NULL = no digital function (the ADC's analogue pad prep).
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "io-bank0"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet ch 9 (GPIO)"]
+
+[registers.GPIO0_CTRL]
+offset = 0x4
+width = 32
+fields = { FUNCSEL = [0, 5] }
+notes = "The array base pin (GPIO0). Per-pin CTRL stride is 8 (GPIOn_CTRL = 0x04 + 8*n); STATUS sits at each pin's +0x00."
+
+[constants]
+GPIO_CTRL_STRIDE = 8
+FUNCSEL_SPI = 1
+FUNCSEL_UART = 2
+FUNCSEL_I2C = 3
+FUNCSEL_SIO = 5
+FUNCSEL_NULL = 0x1F

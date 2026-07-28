@@ -13,7 +13,7 @@ use crate::symbols::{
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
     AttributeArgument, AttributeSection, BinaryOperator, CompilationUnit, Expr, ExprKind, Literal,
@@ -80,6 +80,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     ty: enum_ty.clone(),
                     is_static: true,
                     is_readonly: false,
+                    is_volatile: false,
                     accessibility: Accessibility::Public,
                     constant: Some(integer_literal(value)),
                 });
@@ -103,6 +104,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 is_virtual: false,
                 is_abstract: false,
                 is_override: false,
+                is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
             });
@@ -138,7 +140,7 @@ fn nested_member_name(member: &NamespaceMember) -> Option<&str> {
 }
 
 /// Joins a namespace (possibly empty) and a simple name into a dotted full name.
-fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
+pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
     if namespace.is_empty() {
         alloc::string::String::from(name)
     } else {
@@ -350,11 +352,248 @@ pub(crate) fn fold_const_binary(
     Some(integer_literal(value))
 }
 
+/// A `const` field awaiting model-aware resolution: its containing type's full name, its own name,
+/// and its initializer expression (borrowed from the AST).
+struct ConstDecl<'a> {
+    type_full: String,
+    name: &'a str,
+    init: &'a Expr,
+}
+
+/// Model-aware, dependency-ordered constant resolution (14.15). A second pass that folds the
+/// `const` fields the declaration-order pass in [`type_info`] left unresolved -- a FORWARD reference
+/// (`const A = B; const B = 42;`) or a QUALIFIED reference (`const A = Other.Value;`), each of which
+/// needs the whole model rather than only the earlier same-type consts that pass can see. It is
+/// STRICTLY ADDITIVE: it fills a field only when its constant is still `None` and its initializer
+/// folds to a value against the fully collected model -- so it can neither change a value the first
+/// pass already resolved nor fold a non-constant initializer. A reference cycle simply never makes
+/// progress, so those fields stay `None` (a runtime field, as today) and the loop terminates. Enum
+/// members are excluded: their unresolved case is auto-numbering, a separate concern.
+pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
+    let mut pending: Vec<ConstDecl> = Vec::new();
+    for unit in units {
+        for member in &unit.members {
+            collect_const_field_decls(member, "", &mut pending);
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let mut values = model_const_values(model);
+    loop {
+        let mut progress = false;
+        for decl in &pending {
+            let key = (decl.type_full.clone(), decl.name.to_string());
+            if values.contains_key(&key) {
+                continue;
+            }
+            if let Some(literal) = resolve_const_expr(decl.init, &decl.type_full, &values) {
+                values.insert(key, literal);
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    for decl in &pending {
+        let Some(literal) = values.get(&(decl.type_full.clone(), decl.name.to_string())) else {
+            continue;
+        };
+        let (namespace, name) = split_type_full(&decl.type_full);
+        if let Some(info) = model.get_mut(&namespace, name) {
+            if let Some(field) = info.fields.iter_mut().find(|field| &*field.name == decl.name) {
+                if field.constant.is_none() {
+                    field.constant = Some(literal.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Collects the `const` fields (with initializers) declared in `member`, descending namespaces and
+/// nested types, each keyed by its containing type's full name.
+fn collect_const_field_decls<'a>(
+    member: &'a NamespaceMember,
+    namespace: &str,
+    out: &mut Vec<ConstDecl<'a>>,
+) {
+    match member {
+        NamespaceMember::Namespace(declaration) => {
+            let inner = join_namespace(namespace, &declaration.name);
+            for nested in &declaration.members {
+                collect_const_field_decls(nested, &inner, out);
+            }
+        }
+        NamespaceMember::Type(declaration) => {
+            let full = qualified_type_name(namespace, &declaration.name);
+            for member in &declaration.members {
+                match member {
+                    Member::Field {
+                        modifiers,
+                        declarators,
+                        ..
+                    } if modifiers.iter().any(|m| matches!(m, Modifier::Const)) => {
+                        for declarator in declarators {
+                            if let Some(init) = &declarator.initializer {
+                                out.push(ConstDecl {
+                                    type_full: full.clone(),
+                                    name: &declarator.name,
+                                    init,
+                                });
+                            }
+                        }
+                    }
+                    Member::NestedType(nested) => collect_const_field_decls(nested, &full, out),
+                    _ => {}
+                }
+            }
+        }
+        NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
+    }
+}
+
+/// Folds a constant expression against `values` -- the constants collected across the whole model --
+/// so a simple name resolves to a `const`/enum member of `containing`, and a qualified `Type.Member`
+/// resolves against the named type. Mirrors [`fold_const`]'s operator/cast/conditional handling.
+pub(crate) fn resolve_const_expr(
+    expr: &Expr,
+    containing: &str,
+    values: &BTreeMap<(String, String), Literal>,
+) -> Option<Literal> {
+    match &expr.kind {
+        ExprKind::Literal(literal) => Some(literal.clone()),
+        ExprKind::Parenthesized(inner) => resolve_const_expr(inner, containing, values),
+        ExprKind::Name(name) => values
+            .get(&(containing.to_string(), name.to_string()))
+            .cloned(),
+        ExprKind::MemberAccess { receiver, name } => {
+            let type_full = dotted_name(receiver)?;
+            values.get(&(type_full, name.to_string())).cloned()
+        }
+        ExprKind::Unary { operator, operand } => {
+            fold_const_unary(*operator, &resolve_const_expr(operand, containing, values)?)
+        }
+        ExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => fold_const_binary(
+            *operator,
+            &resolve_const_expr(left, containing, values)?,
+            &resolve_const_expr(right, containing, values)?,
+        ),
+        ExprKind::Cast { target, operand } => {
+            let operand = resolve_const_expr(operand, containing, values)?;
+            match bind_type(target) {
+                TypeSymbol::Special(special) => {
+                    coerce_constant(literal_int_value(&operand)?, special)
+                }
+                _ => None,
+            }
+        }
+        ExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => match resolve_const_expr(condition, containing, values)? {
+            Literal::Boolean(true) => resolve_const_expr(when_true, containing, values),
+            Literal::Boolean(false) => resolve_const_expr(when_false, containing, values),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The dotted name of a chain of simple-name/member-access expressions (`A`, `A.B`, `A.B.C`), or
+/// `None` for anything else -- used to read the type name out of a qualified constant reference.
+fn dotted_name(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(name.to_string()),
+        ExprKind::MemberAccess { receiver, name } => {
+            Some(alloc::format!("{}.{}", dotted_name(receiver)?, name))
+        }
+        _ => None,
+    }
+}
+
+/// Splits a type's full name into its model key: the namespace-or-enclosing-type prefix and the
+/// simple name (`Ns.Sub.T` -> (`Ns.Sub`, `T`); `T` -> (``, `T`)).
+fn split_type_full(full: &str) -> (String, &str) {
+    match full.rsplit_once('.') {
+        Some((prefix, name)) => (String::from(prefix), name),
+        None => (String::new(), full),
+    }
+}
+
+/// Every folded constant in the model, keyed by (containing type's full name, member name) -- const
+/// fields AND enum members. The lookup table the model-aware constant folder resolves names against.
+pub(crate) fn model_const_values(model: &Model) -> BTreeMap<(String, String), Literal> {
+    let mut values: BTreeMap<(String, String), Literal> = BTreeMap::new();
+    let keys: Vec<(String, String)> = model
+        .type_keys()
+        .map(|(namespace, name)| (String::from(namespace), String::from(name)))
+        .collect();
+    for (namespace, name) in &keys {
+        let Some(info) = model.get(namespace, name) else {
+            continue;
+        };
+        let full = qualified_type_name(namespace, name);
+        for field in &info.fields {
+            if let Some(literal) = &field.constant {
+                values.insert((full.clone(), field.name.to_string()), literal.clone());
+            }
+        }
+    }
+    values
+}
+
+/// Whether `expr` is a constant-expression FORM (14.15): built only from literals, names, member
+/// accesses, and the constant operators / casts / conditionals -- never a method call, object
+/// creation, element access, increment, or other form that can never be a compile-time constant. A
+/// `true` result does NOT prove it folds (a name may be unresolved -- that is a separate CS0103); a
+/// `false` result means the SHAPE alone rules it out, so the use site is non-constant.
+pub(crate) fn is_constant_form(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) | ExprKind::Name(_) | ExprKind::PredefinedType(_) => true,
+        ExprKind::Parenthesized(inner) => is_constant_form(inner),
+        ExprKind::MemberAccess { receiver, .. } => is_constant_form(receiver),
+        ExprKind::Unary { operator, operand } => {
+            matches!(
+                operator,
+                UnaryOperator::Plus
+                    | UnaryOperator::Minus
+                    | UnaryOperator::Not
+                    | UnaryOperator::Complement
+            ) && is_constant_form(operand)
+        }
+        ExprKind::Binary { left, right, .. } => is_constant_form(left) && is_constant_form(right),
+        ExprKind::Cast { operand, .. } => is_constant_form(operand),
+        ExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            is_constant_form(condition)
+                && is_constant_form(when_true)
+                && is_constant_form(when_false)
+        }
+        _ => false,
+    }
+}
+
 /// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
 /// methods.
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     let mut info = TypeInfo::new(namespace, &declaration.name, map_kind(declaration.kind));
     info.accessibility = accessibility_of(&declaration.modifiers);
+    info.is_sealed = declaration.modifiers.iter().any(|m| matches!(m, Modifier::Sealed))
+        || matches!(declaration.kind, SyntaxTypeKind::Struct);
+    info.is_abstract = declaration
+        .modifiers
+        .iter()
+        .any(|m| matches!(m, Modifier::Abstract))
+        || matches!(declaration.kind, SyntaxTypeKind::Interface);
     info.bases = declaration.bases.iter().map(bind_type).collect();
     if matches!(declaration.kind, SyntaxTypeKind::Struct) {
         info.bases.push(named_symbol("System", "ValueType"));
@@ -402,6 +641,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         ty: field_ty.clone(),
                         is_static,
                         is_readonly: modifiers.iter().any(|m| matches!(m, Modifier::Readonly)),
+                        is_volatile: modifiers.iter().any(|m| matches!(m, Modifier::Volatile)),
                         accessibility,
                         constant,
                     });
@@ -422,6 +662,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         ty: field_ty.clone(),
                         is_static,
                         is_readonly: false,
+                        is_volatile: false,
                         accessibility,
                         constant: None,
                     });
@@ -430,6 +671,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         ty: field_ty.clone(),
                         is_static,
                         accessibility,
+                        is_abstract: is_abstract_member(modifiers, info.kind),
                     });
                 }
             }
@@ -444,6 +686,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
                 accessibility: access(modifiers),
+                is_abstract: is_abstract_member(modifiers, info.kind),
             }),
             Member::Method {
                 modifiers,
@@ -467,6 +710,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_virtual: is_virtual(modifiers),
                 is_abstract: is_abstract_member(modifiers, info.kind),
                 is_override: is_override(modifiers),
+                is_sealed: is_sealed_member(modifiers),
                 accessibility: match explicit_interface {
                     Some(_) => Accessibility::Private,
                     None => access(modifiers),
@@ -488,6 +732,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_virtual: false,
                 is_abstract: false,
                 is_override: false,
+                is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
             }),
@@ -506,6 +751,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_virtual: false,
                 is_abstract: false,
                 is_override: false,
+                is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
             }),
@@ -521,6 +767,10 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
                 accessibility: access(modifiers),
+                is_virtual: is_virtual(modifiers),
+                is_abstract: is_abstract_member(modifiers, info.kind),
+                is_override: is_override(modifiers),
+                is_sealed: is_sealed_member(modifiers),
                 has_getter: getter.is_some(),
                 has_setter: setter.is_some(),
             }),
@@ -538,6 +788,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let indexer_is_virtual = is_virtual(modifiers);
                 let indexer_is_abstract = is_abstract_member(modifiers, info.kind);
                 let indexer_is_override = is_override(modifiers);
+                let indexer_is_sealed = is_sealed_member(modifiers);
                 if getter.is_some() {
                     info.methods.push(MethodSymbol {
                         name: "get_Item".into(),
@@ -549,6 +800,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         is_virtual: indexer_is_virtual,
                         is_abstract: indexer_is_abstract,
                         is_override: indexer_is_override,
+                        is_sealed: indexer_is_sealed,
                         accessibility,
                         conditional: Vec::new(),
                     });
@@ -566,6 +818,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         is_virtual: indexer_is_virtual,
                         is_abstract: indexer_is_abstract,
                         is_override: indexer_is_override,
+                        is_sealed: indexer_is_sealed,
                         accessibility,
                         conditional: Vec::new(),
                     });
@@ -616,6 +869,7 @@ fn constructor(
         is_virtual: false,
         is_abstract: false,
         is_override: false,
+        is_sealed: false,
         accessibility,
         conditional: Vec::new(),
     }
@@ -686,6 +940,12 @@ fn is_virtual(modifiers: &[Modifier]) -> bool {
 
 fn is_override(modifiers: &[Modifier]) -> bool {
     modifiers.contains(&Modifier::Override)
+}
+
+/// Whether a member is declared `sealed`. On a member this only ever accompanies `override`
+/// (17.5.5): it CLOSES the slot, so no further derived class may override it.
+fn is_sealed_member(modifiers: &[Modifier]) -> bool {
+    modifiers.contains(&Modifier::Sealed)
 }
 
 /// Whether a member declared with `modifiers` in a type of `kind` is abstract: an `abstract`

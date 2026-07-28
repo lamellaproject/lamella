@@ -1,5 +1,6 @@
 //! Traps: controlled execution failures reported instead of panicking.
 
+use crate::object::UnencodableChar;
 use core::fmt;
 use lamella_cil::Opcode;
 use lamella_token::Token;
@@ -64,6 +65,28 @@ pub enum Trap {
     OutOfMemory,
     /// An exception propagated out of the entry method with no matching handler.
     UnhandledException,
+    /// A `System.String` could not be constructed because the build's string storage cannot
+    /// hold one of its code units -- a lone surrogate on the well-formed UTF-8 tier (the
+    /// `System.Text.EncoderFallbackException` site). Carries the offending unit and its
+    /// UTF-16-unit index, which is what the message names.
+    EncoderFallback {
+        /// The code unit that could not be encoded.
+        char_unknown: u16,
+        /// Its position in the input, in UTF-16 code units.
+        index: u32,
+    },
+}
+
+impl From<UnencodableChar> for Trap {
+    /// Lifts the heap encoder's refusal to the trap the interpreter raises, so a string
+    /// allocation propagates with a plain `?` at every construction site rather than each one
+    /// deciding what an unencodable unit means.
+    fn from(refusal: UnencodableChar) -> Self {
+        Trap::EncoderFallback {
+            char_unknown: refusal.char_unknown,
+            index: refusal.index,
+        }
+    }
 }
 
 impl fmt::Display for Trap {
@@ -104,6 +127,13 @@ impl fmt::Display for Trap {
             Trap::CallStackOverflow => f.write_str("call stack overflow"),
             Trap::OutOfMemory => f.write_str("out of memory"),
             Trap::UnhandledException => f.write_str("unhandled exception"),
+            Trap::EncoderFallback {
+                char_unknown,
+                index,
+            } => write!(
+                f,
+                "code unit U+{char_unknown:04X} at index {index} cannot be encoded by this build's string storage"
+            ),
         }
     }
 }

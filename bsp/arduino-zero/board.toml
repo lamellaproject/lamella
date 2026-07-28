@@ -1,7 +1,7 @@
 # The Arduino Zero: a plain ATSAMD21G18A board whose on-board EDBG bridges the Lamella
 # Link over a virtual COM port. Its EDBG VCP is SERCOM5 on PB22/PB23, pinmux function D --
-# the third distinct VCP SERCOM across the family's four boards (the case that broke the
-# chip-named scheme).
+# the third distinct VCP SERCOM across the family's boards, which is why the binding is
+# stated per board rather than per chip.
 
 [table]
 kind = "board"
@@ -11,16 +11,17 @@ part = "atsamd21g18a"
 board_model = 12
 sources = [
     "Arduino Zero schematic: EDBG VCP = SERCOM5, PB22 (PAD2) TX / PB23 (PAD3) RX, function D",
-    "serve-proven: samd21-edbg-serve --features arduino-zero selects exactly this SERCOM5/PB22-PB23 path",
 ]
 
-[carrier]
+[[carriers]]
 kind = "edbg-vcp"
 usb_vid = 0x03EB
 role = "vcp"
 baud = 115200
+plan = "osc8m-8mhz"
+default = true
 
-
+[[bindings]]
 role = "vcp"
 kind = "uart"
 instance = "sercom5"
@@ -29,7 +30,16 @@ gclk_gen = 0
 tx = { pin = "PB22", pad = 2 }
 rx = { pin = "PB23", pad = 3 }
 
+[[bindings]]               # the board's dedicated SDA/SCL header pins beside AREF (D20/D21) --
+role = "header-i2c"        # NOT A4/A5, which are not I2C on this board. SERCOM3 is free for
+kind = "i2c"               # it because this board's VCP rides SERCOM5.
+instance = "sercom3"
+function = "C"
+gclk_gen = 0
+sda = { pin = "PA22" }     # I2C fixes SDA to pad0 and SCL to pad1, so unlike a uart binding
+scl = { pin = "PA23" }     # there is no pad routing for a board to choose -- hence no pads here.
 
+[[plans]]
 name = "osc8m-8mhz"
 default = true
 source = "osc8m"

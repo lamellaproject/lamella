@@ -107,7 +107,7 @@ pub(crate) enum RegOp {
 /// it via `ObjectModel::set_board`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Board {
-    /// STM32F4 GPIO port C (ST RM0090) -- the first blinky's target and the default.
+    /// STM32F4 GPIO port C (ST RM0090).
     #[default]
     Stm32f4,
     /// Raspberry Pi RP2350 (Pico 2), driving GPIO through the single-cycle IO block (SIO).

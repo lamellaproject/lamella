@@ -1212,11 +1212,13 @@ impl Parser {
         loop {
             if self.current_punctuator() == Some(Punctuator::CloseBrace)
                 || matches!(self.current().kind, TokenKind::EndOfFile)
-                || !matches!(self.current().kind, TokenKind::Identifier(_))
+                || !(matches!(self.current().kind, TokenKind::Identifier(_))
+                    || self.current_punctuator() == Some(Punctuator::OpenBracket))
             {
                 break;
             }
             let member_start = self.current().span.start;
+            let member_attributes = self.parse_attribute_sections();
             let (member_name, mut member_end) = self.expect_identifier();
             let value = if self.eat(Punctuator::Equals) {
                 let value = self.parse_expression();
@@ -1226,6 +1228,7 @@ impl Parser {
                 None
             };
             members.push(EnumMember {
+                attributes: member_attributes,
                 name: member_name,
                 value,
                 span: Span::new(member_start, member_end),

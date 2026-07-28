@@ -1,0 +1,19 @@
+# BOARD binding: the SAM4S Xplained Pro -- identity-first. Board truth only: the identity,
+# the part, and the carrier. NO peripheral bindings yet (the SAM4S family has no generated
+# driver); the vcp binding + its pin rows (UART1, PB2 URXD1 / PB3 UTXD1, peripheral A)
+# land here with the family's driver.
+
+[table]
+kind = "board"
+board = "sam4s-xpro"
+family = "sam4s"
+part = "atsam4sd32c"
+board_model = 3             # lamella_wire::board_model::SAM4S_XPLAINED_PRO
+sources = ["SAM4S Xplained Pro board identity via the on-board EDBG bridge"]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG bridge's VCP.
+baud = 115200               # the bridge's wire rate (BRGR CD 65 at the 120 MHz operating
+                            # point realizes 115385, in tolerance)
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.

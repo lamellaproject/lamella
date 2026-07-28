@@ -460,7 +460,7 @@ fn string_arg_chars(vm: &Vm, arg: Option<&Value>) -> Result<Vec<u16>, Trap> {
 pub fn string_concat(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let mut chars = string_arg_chars(vm, args.first())?;
     chars.extend_from_slice(&string_arg_chars(vm, args.get(1))?);
-    let reference = vm.heap_mut().alloc_string(&chars);
+    let reference = vm.heap_mut().alloc_string(&chars)?;
     Ok(Some(Value::Object(reference)))
 }
 
@@ -469,7 +469,7 @@ pub fn string_concat(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Op
 /// `ldstr`) of the same characters returns the SAME object. The managed wrapper guards null.
 pub fn string_intern(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let chars = string_arg_chars(vm, args.first())?;
-    let reference = vm.heap_mut().intern_string(&chars);
+    let reference = vm.heap_mut().intern_string(&chars)?;
     Ok(Some(Value::Object(reference)))
 }
 
@@ -614,7 +614,7 @@ pub fn string_substring(
         .ok()
         .filter(|&start| start <= chars.len())
         .ok_or(Trap::ArgumentOutOfRange(0))?;
-    let reference = vm.heap_mut().alloc_string(&chars[start..]);
+    let reference = vm.heap_mut().alloc_string(&chars[start..])?;
     Ok(Some(Value::Object(reference)))
 }
 
@@ -641,7 +641,7 @@ pub fn string_substring_len(
         .checked_add(count)
         .filter(|&end| end <= chars.len())
         .ok_or(Trap::ArgumentOutOfRange(1))?;
-    let reference = vm.heap_mut().alloc_string(&chars[start..end]);
+    let reference = vm.heap_mut().alloc_string(&chars[start..end])?;
     Ok(Some(Value::Object(reference)))
 }
 
@@ -681,7 +681,7 @@ pub fn string_create_from_chars(
         }
         None => return Err(Trap::ArgumentOutOfRange(2)),
     };
-    let reference = vm.heap_mut().alloc_string(&units);
+    let reference = vm.heap_mut().alloc_string(&units)?;
     Ok(Some(Value::Object(reference)))
 }
 
@@ -755,7 +755,7 @@ pub fn string_concat3(
     let mut chars = string_arg_chars(vm, args.first())?;
     chars.extend_from_slice(&string_arg_chars(vm, args.get(1))?);
     chars.extend_from_slice(&string_arg_chars(vm, args.get(2))?);
-    let reference = vm.heap_mut().alloc_string(&chars);
+    let reference = vm.heap_mut().alloc_string(&chars)?;
     Ok(Some(Value::Object(reference)))
 }
 
@@ -974,7 +974,7 @@ mod extended {
             .iter()
             .map(|&unit| ascii_upper(unit))
             .collect();
-        let reference = vm.heap_mut().alloc_string(&upper);
+        let reference = vm.heap_mut().alloc_string(&upper)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -991,7 +991,7 @@ mod extended {
             .iter()
             .map(|&unit| ascii_lower(unit))
             .collect();
-        let reference = vm.heap_mut().alloc_string(&lower);
+        let reference = vm.heap_mut().alloc_string(&lower)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -1015,7 +1015,7 @@ mod extended {
             }
             None => &[],
         };
-        let reference = vm.heap_mut().alloc_string(trimmed);
+        let reference = vm.heap_mut().alloc_string(trimmed)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -1040,7 +1040,7 @@ mod extended {
             .iter()
             .map(|&unit| if unit == from { to } else { unit })
             .collect();
-        let reference = vm.heap_mut().alloc_string(&replaced);
+        let reference = vm.heap_mut().alloc_string(&replaced)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -1074,7 +1074,7 @@ mod extended {
             }
             out
         };
-        let reference = vm.heap_mut().alloc_string(&replaced);
+        let reference = vm.heap_mut().alloc_string(&replaced)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -1518,12 +1518,12 @@ mod extended {
         let mut start = 0;
         for (index, &unit) in chars.iter().enumerate() {
             if unit == separator {
-                let part = vm.heap_mut().alloc_string(&chars[start..index]);
+                let part = vm.heap_mut().alloc_string(&chars[start..index])?;
                 parts.push(Value::Object(part));
                 start = index + 1;
             }
         }
-        let last = vm.heap_mut().alloc_string(&chars[start..]);
+        let last = vm.heap_mut().alloc_string(&chars[start..])?;
         parts.push(Value::Object(last));
         let array = vm.heap_mut().alloc_array(parts);
         Ok(Some(Value::Object(array)))
@@ -1559,7 +1559,7 @@ mod extended {
                 }
             }
         }
-        let joined = vm.heap_mut().alloc_string(&result);
+        let joined = vm.heap_mut().alloc_string(&result)?;
         Ok(Some(Value::Object(joined)))
     }
 
@@ -1666,6 +1666,143 @@ mod extended {
         args: &[Value],
     ) -> Result<Option<Value>, Trap> {
         Ok(Some(Value::Float(libm::exp(arg_f64(args)?))))
+    }
+
+    /// `System.Math.Asin(double)`: the arc sine in radians, via `libm`. NaN when `|d| > 1`, matching .NET.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_asin_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        Ok(Some(Value::Float(libm::asin(arg_f64(args)?))))
+    }
+
+    /// `System.Math.Acos(double)`: the arc cosine in radians, via `libm`. NaN when `|d| > 1`.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_acos_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        Ok(Some(Value::Float(libm::acos(arg_f64(args)?))))
+    }
+
+    /// `System.Math.Atan(double)`: the arc tangent in radians (`-pi/2..pi/2`), via `libm`.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_atan_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        Ok(Some(Value::Float(libm::atan(arg_f64(args)?))))
+    }
+
+    /// `System.Math.Atan2(double y, double x)`: the angle of the vector `(x, y)`, via `libm`. The
+    /// argument order is `(y, x)` -- .NET passes the y coordinate first.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_atan2_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let (y, x) = two_f64(args)?;
+        Ok(Some(Value::Float(libm::atan2(y, x))))
+    }
+
+    /// `System.Math.Sinh(double)`: the hyperbolic sine, via `libm`.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_sinh_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        Ok(Some(Value::Float(libm::sinh(arg_f64(args)?))))
+    }
+
+    /// `System.Math.Cosh(double)`: the hyperbolic cosine, via `libm`.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_cosh_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        Ok(Some(Value::Float(libm::cosh(arg_f64(args)?))))
+    }
+
+    /// `System.Math.Tanh(double)`: the hyperbolic tangent, via `libm`.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_tanh_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        Ok(Some(Value::Float(libm::tanh(arg_f64(args)?))))
+    }
+
+    /// `System.Math.IEEERemainder(double x, double y)`: the IEEE 754-1985 (section 5.1) remainder
+    /// `x - y * round(x / y)` with round-half-to-even, via `libm::remainder`. NaN when `y` is zero.
+    /// This is a DIFFERENT operation from the CIL `rem` / C# `%` operator (a truncated remainder).
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_ieee_remainder_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let (x, y) = two_f64(args)?;
+        Ok(Some(Value::Float(libm::remainder(x, y))))
+    }
+
+    /// `System.Math.Log(double a, double newBase)`: the base-`newBase` logarithm. Applies .NET's
+    /// documented special-case table before dividing -- a NaN operand returns that NaN, `newBase == 1`
+    /// is NaN, and `a != 1` with `newBase` zero or +infinity is NaN; every other row falls out of
+    /// `ln(a) / ln(newBase)` (a negative `a` or `newBase` yields NaN through the libm logs).
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "math-transcendental")]
+    pub fn math_log_base_f64(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let (a, new_base) = two_f64(args)?;
+        let value = if a.is_nan() {
+            a
+        } else if new_base.is_nan() {
+            new_base
+        } else if new_base == 1.0 {
+            f64::NAN
+        } else if a != 1.0 && (new_base == 0.0 || new_base == f64::INFINITY) {
+            f64::NAN
+        } else {
+            libm::log(a) / libm::log(new_base)
+        };
+        Ok(Some(Value::Float(value)))
     }
 
     /// Whether a UTF-16 code unit is an ASCII decimal digit (`0..9`).
@@ -1928,7 +2065,7 @@ mod extended {
             out.extend_from_slice(&chars);
             out
         };
-        let reference = vm.heap_mut().alloc_string(&result);
+        let reference = vm.heap_mut().alloc_string(&result)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -1951,7 +2088,7 @@ mod extended {
         if chars.len() < width {
             chars.resize(width, pad);
         }
-        let reference = vm.heap_mut().alloc_string(&chars);
+        let reference = vm.heap_mut().alloc_string(&chars)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -1979,7 +2116,7 @@ mod extended {
         out.extend_from_slice(&chars[..index]);
         out.extend_from_slice(&value);
         out.extend_from_slice(&chars[index..]);
-        let reference = vm.heap_mut().alloc_string(&out);
+        let reference = vm.heap_mut().alloc_string(&out)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -2015,7 +2152,7 @@ mod extended {
             None => {}
             Some(_) => return Err(Trap::TypeMismatch(Opcode::Call)),
         }
-        let reference = vm.heap_mut().alloc_string(&out);
+        let reference = vm.heap_mut().alloc_string(&out)?;
         Ok(Some(Value::Object(reference)))
     }
 
@@ -2577,6 +2714,30 @@ pub fn exception_ctor(
     Ok(None)
 }
 
+/// `System.Exception.RuntimeMessage`: the message of an exception the RUNTIME raised, or NULL for
+/// one managed code constructed. `this` is the exception.
+///
+/// The null matters and is not a "not found" placeholder: it is what tells corlib's `Message` to
+/// fall through to its own `_message` field. A runtime-raised exception carries no field storage,
+/// so the two cases have to be distinguishable -- an empty string here would make every managed
+/// exception's message read as `""`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not an object reference.
+pub fn exception_runtime_message(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(this)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    Ok(Some(match vm.exception_message(this) {
+        Some(message) => Value::Object(message),
+        None => Value::Null,
+    }))
+}
+
 /// `System.Exception.get_Message`: the stored message string, or an empty string if
 /// none was given (`Message` is conventionally non-null). `this` is the exception.
 ///
@@ -2592,15 +2753,14 @@ pub fn exception_get_message(
     };
     let message = match vm.exception_message(this) {
         Some(message) => message,
-        None => vm.heap_mut().alloc_string(&[]),
+        None => vm.heap_mut().alloc_text(""),
     };
     Ok(Some(Value::Object(message)))
 }
 
 /// Allocates a `System.String` holding `text` and returns it as a value.
 fn alloc_str(vm: &mut Vm, text: &str) -> Value {
-    let chars: Vec<u16> = text.encode_utf16().collect();
-    Value::Object(vm.heap_mut().alloc_string(&chars))
+    Value::Object(vm.heap_mut().alloc_text(text))
 }
 
 /// The `this` of a 32-bit value-type `ToString`: the `Int32` directly (a managed
@@ -2655,7 +2815,7 @@ pub fn char_to_string(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let value = int32_self(vm, args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    let reference = vm.heap_mut().alloc_string(&[value as u16]);
+    let reference = vm.heap_mut().alloc_string(&[value as u16])?;
     Ok(Some(Value::Object(reference)))
 }
 
@@ -2874,6 +3034,31 @@ pub fn single_to_exponential(
     Ok(Some(alloc_str(vm, &format_exponential(f64::from(value), precision, upper))))
 }
 
+/// `System.Double::ParseValid(string)`: the numeric conversion behind the managed `Double.Parse` /
+/// `TryParse`, which have ALREADY validated the format (so the only work left is the
+/// decimal-to-nearest-double rounding managed C# cannot do without `unsafe`). Recognizes the .NET
+/// specials (`NaN` / `[+-]Infinity`, case-insensitively, after trimming) and otherwise rounds the
+/// decimal with Rust's `f64` parser -- matching .NET's invariant rounding. Malformed input cannot
+/// reach here (the managed validator gates it), but a stray case still traps rather than guessing.
+/// The `f32` twin is [`single_parse`].
+///
+/// # Errors
+/// [`Trap::InvalidArgument`] if the (already-validated) text somehow does not parse;
+/// [`Trap::TypeMismatch`] for a non-string argument.
+#[cfg(feature = "float")]
+pub fn double_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let text = String::from_utf16(&chars).map_err(|_| Trap::InvalidArgument)?;
+    let trimmed = text.trim();
+    let value = match trimmed.to_ascii_lowercase().as_str() {
+        "nan" => f64::NAN,
+        "infinity" | "+infinity" => f64::INFINITY,
+        "-infinity" => f64::NEG_INFINITY,
+        _ => trimmed.parse::<f64>().map_err(|_| Trap::InvalidArgument)?,
+    };
+    Ok(Some(Value::Float(value)))
+}
+
 /// `System.Single::ParseValid(string)`: the numeric conversion behind the managed `Single.Parse` /
 /// `TryParse`, which have ALREADY validated the format (so the only work left is the
 /// decimal-to-nearest-single rounding managed C# cannot do without `unsafe`). Recognizes the .NET
@@ -2956,8 +3141,7 @@ pub fn string_concat_object2(
 ) -> Result<Option<Value>, Trap> {
     let mut text = object_text(vm, module, args.first());
     text.push_str(&object_text(vm, module, args.get(1)));
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let reference = vm.heap_mut().alloc_string(&units);
+    let reference = vm.heap_mut().alloc_text(&text);
     Ok(Some(Value::Object(reference)))
 }
 
@@ -2974,8 +3158,7 @@ pub fn string_concat_object3(
     let mut text = object_text(vm, module, args.first());
     text.push_str(&object_text(vm, module, args.get(1)));
     text.push_str(&object_text(vm, module, args.get(2)));
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let reference = vm.heap_mut().alloc_string(&units);
+    let reference = vm.heap_mut().alloc_text(&text);
     Ok(Some(Value::Object(reference)))
 }
 
@@ -3939,12 +4122,9 @@ pub fn fs_open(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<V
     ) else {
         return Ok(Some(Value::Int32(crate::fs::FsError::InvalidPath.code())));
     };
-    let code = match vm.fs_backend() {
-        Some(backend) => match backend.open(&path, mode, access) {
-            Ok(handle) => handle as i32,
-            Err(error) => error.code(),
-        },
-        None => crate::fs::FsError::Io.code(),
+    let code = match vm.mounts().open(&path, mode, access) {
+        Ok(handle) => handle as i32,
+        Err(error) => error.code(),
     };
     Ok(Some(Value::Int32(code)))
 }
@@ -3973,18 +4153,15 @@ pub fn fs_read(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<V
     };
     let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
     let code = {
-        let (heap, backend) = vm.heap_and_fs();
-        let Some(backend) = backend else {
-            return Ok(Some(Value::Int32(crate::fs::FsError::Io.code())));
-        };
+        let (heap, mounts) = vm.heap_and_mounts();
         match heap.array_u8_slice_mut(array, offset, count) {
-            Some(segment) => match backend.read(handle, segment) {
+            Some(segment) => match mounts.read(handle, segment) {
                 Ok(n) => n as i32,
                 Err(error) => error.code(),
             },
             None => {
                 let mut buf = alloc::vec![0u8; count];
-                match backend.read(handle, &mut buf) {
+                match mounts.read(handle, &mut buf) {
                     Ok(n) => {
                         for (i, &byte) in buf.iter().take(n).enumerate() {
                             heap.array_set(array, offset + i, Value::Int32(i32::from(byte)));
@@ -4015,12 +4192,9 @@ pub fn fs_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<
     };
     let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
     let code = {
-        let (heap, backend) = vm.heap_and_fs();
-        let Some(backend) = backend else {
-            return Ok(Some(Value::Int32(crate::fs::FsError::Io.code())));
-        };
+        let (heap, mounts) = vm.heap_and_mounts();
         match heap.array_u8_slice(array, offset, count) {
-            Some(segment) => match backend.write(handle, segment) {
+            Some(segment) => match mounts.write(handle, segment) {
                 Ok(n) => n as i32,
                 Err(error) => error.code(),
             },
@@ -4032,7 +4206,7 @@ pub fn fs_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<
                     };
                     *slot = byte as u8;
                 }
-                match backend.write(handle, &buf) {
+                match mounts.write(handle, &buf) {
                     Ok(n) => n as i32,
                     Err(error) => error.code(),
                 }
@@ -4055,12 +4229,9 @@ pub fn fs_seek(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<V
     let Some(&Value::Int32(origin)) = args.get(2) else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
-    let code = match vm.fs_backend() {
-        Some(backend) => match backend.seek(handle, offset, origin) {
-            Ok(position) => position,
-            Err(error) => i64::from(error.code()),
-        },
-        None => i64::from(crate::fs::FsError::Io.code()),
+    let code = match vm.mounts().seek(handle, offset, origin) {
+        Ok(position) => position,
+        Err(error) => i64::from(error.code()),
     };
     Ok(Some(Value::Int64(code)))
 }
@@ -4071,12 +4242,9 @@ pub fn fs_seek(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<V
 /// [`Trap::TypeMismatch`] on a malformed handle.
 pub fn fs_length(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let handle = fs_handle_arg(args, 0)?;
-    let code = match vm.fs_backend() {
-        Some(backend) => match backend.length(handle) {
-            Ok(length) => length,
-            Err(error) => i64::from(error.code()),
-        },
-        None => i64::from(crate::fs::FsError::Io.code()),
+    let code = match vm.mounts().length(handle) {
+        Ok(length) => length,
+        Err(error) => i64::from(error.code()),
     };
     Ok(Some(Value::Int64(code)))
 }
@@ -4095,10 +4263,7 @@ pub fn fs_set_length(
     let Some(&Value::Int64(length)) = args.get(1) else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
-    let code = match vm.fs_backend() {
-        Some(backend) => fs_unit_code(backend.set_length(handle, length)),
-        None => crate::fs::FsError::Io.code(),
-    };
+    let code = fs_unit_code(vm.mounts().set_length(handle, length));
     Ok(Some(Value::Int32(code)))
 }
 
@@ -4108,10 +4273,7 @@ pub fn fs_set_length(
 /// [`Trap::TypeMismatch`] on a malformed handle.
 pub fn fs_flush(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let handle = fs_handle_arg(args, 0)?;
-    let code = match vm.fs_backend() {
-        Some(backend) => fs_unit_code(backend.flush(handle)),
-        None => crate::fs::FsError::Io.code(),
-    };
+    let code = fs_unit_code(vm.mounts().flush(handle));
     Ok(Some(Value::Int32(code)))
 }
 
@@ -4121,9 +4283,7 @@ pub fn fs_flush(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<
 /// [`Trap::TypeMismatch`] on a malformed handle.
 pub fn fs_close(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let handle = fs_handle_arg(args, 0)?;
-    if let Some(backend) = vm.fs_backend() {
-        backend.close(handle);
-    }
+    vm.mounts().close(handle);
     Ok(None)
 }
 
@@ -4138,7 +4298,7 @@ pub fn fs_file_exists(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    let exists = vm.fs_backend().is_some_and(|backend| backend.file_exists(&path));
+    let exists = vm.mounts().file_exists(&path);
     Ok(Some(Value::Int32(i32::from(exists))))
 }
 
@@ -4152,7 +4312,7 @@ pub fn fs_dir_exists(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    let exists = vm.fs_backend().is_some_and(|backend| backend.dir_exists(&path));
+    let exists = vm.mounts().dir_exists(&path);
     Ok(Some(Value::Int32(i32::from(exists))))
 }
 
@@ -4167,10 +4327,7 @@ pub fn fs_delete_file(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    let code = match vm.fs_backend() {
-        Some(backend) => fs_unit_code(backend.delete_file(&path)),
-        None => crate::fs::FsError::Io.code(),
-    };
+    let code = fs_unit_code(vm.mounts().delete_file(&path));
     Ok(Some(Value::Int32(code)))
 }
 
@@ -4185,10 +4342,7 @@ pub fn fs_create_dir(
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    let code = match vm.fs_backend() {
-        Some(backend) => fs_unit_code(backend.create_dir(&path)),
-        None => crate::fs::FsError::Io.code(),
-    };
+    let code = fs_unit_code(vm.mounts().create_dir(&path));
     Ok(Some(Value::Int32(code)))
 }
 
@@ -4206,10 +4360,7 @@ pub fn fs_delete_dir(
     let Some(&Value::Int32(recursive)) = args.get(1) else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
-    let code = match vm.fs_backend() {
-        Some(backend) => fs_unit_code(backend.delete_dir(&path, recursive != 0)),
-        None => crate::fs::FsError::Io.code(),
-    };
+    let code = fs_unit_code(vm.mounts().delete_dir(&path, recursive != 0));
     Ok(Some(Value::Int32(code)))
 }
 
@@ -4221,10 +4372,7 @@ pub fn fs_delete_dir(
 pub fn fs_move(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let from = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
     let to = string_value(vm, args.get(1)).ok_or(Trap::TypeMismatch(Opcode::Call))?;
-    let code = match vm.fs_backend() {
-        Some(backend) => fs_unit_code(backend.move_entry(&from, &to)),
-        None => crate::fs::FsError::Io.code(),
-    };
+    let code = fs_unit_code(vm.mounts().move_entry(&from, &to));
     Ok(Some(Value::Int32(code)))
 }
 
@@ -4240,23 +4388,169 @@ pub fn fs_list(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<V
     let Some(&Value::Int32(dirs_only)) = args.get(1) else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
-    let entries = match vm.fs_backend() {
-        Some(backend) => match backend.list_dir(&path) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(Some(Value::Null)),
-        },
-        None => return Ok(Some(Value::Null)),
+    let entries = match vm.mounts().list_dir(&path) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(Some(Value::Null)),
     };
     let mut names: Vec<Value> = Vec::new();
     for entry in entries {
         if entry.is_dir == (dirs_only != 0) {
-            let chars: Vec<u16> = entry.name.encode_utf16().collect();
-            let name = vm.heap_mut().alloc_string(&chars);
+            let name = vm.heap_mut().alloc_text(&entry.name);
             names.push(Value::Object(name));
         }
     }
     let array = vm.heap_mut().alloc_array(names);
     Ok(Some(Value::Object(array)))
+}
+
+/// Allocates a managed `string[]` from owned Rust strings -- the shape `DriveInfo.GetDrives` /
+/// `GetFileSystems` return across the seam.
+fn alloc_string_array(vm: &mut Vm, names: Vec<String>) -> Value {
+    let mut values: Vec<Value> = Vec::with_capacity(names.len());
+    for name in names {
+        let handle = vm.heap_mut().alloc_text(&name);
+        values.push(Value::Object(handle));
+    }
+    Value::Object(vm.heap_mut().alloc_array(values))
+}
+
+/// The managed `System.IO.DriveInfo` (nanoFramework tier, in the compat assembly) drives these
+/// [RuntimeProvided] `NativeDrive` statics over the mount table ([`crate::mount::MountTable`]) -- the
+/// SAME table the file family routes through, so a drive IS a mount and its name IS its prefix. Same
+/// sentinel discipline: a byte count / handle is `>= 0`, a failure is a negative [`crate::fs::FsError`]
+/// the managed layer maps to its exception.
+///
+/// `NativeDrive.Names()`: the verbatim name of every mounted drive, for `DriveInfo.GetDrives`.
+pub fn drive_names(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    let names = vm.mounts().drive_names();
+    Ok(Some(alloc_string_array(vm, names)))
+}
+
+/// `NativeDrive.Kind(string name)`: the [`crate::mount::DriveType`] code of the mount, or `Unknown`
+/// (0) if there is none -- `DriveInfo.DriveType`.
+pub fn drive_kind(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let name = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let code = vm
+        .mounts()
+        .drive_type_of(&name)
+        .unwrap_or(crate::mount::DriveType::Unknown)
+        .code();
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeDrive.TotalSize(string name)`: the mount's capacity in bytes, or `0` if it is unmounted or
+/// its backend cannot report -- `DriveInfo.TotalSize` (nano shows 0, it does not throw here).
+pub fn drive_total_size(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let name = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let size = vm.mounts().total_size_of(&name).unwrap_or(0);
+    Ok(Some(Value::Int64(i64::try_from(size).unwrap_or(i64::MAX))))
+}
+
+/// `NativeDrive.Format(string name, string fileSystem, uint parameter)`: reformats the mount;
+/// `0`, or a negative sentinel (Unsupported -> NotSupportedException, InvalidPath -> ArgumentException,
+/// Io -> IOException) -- `DriveInfo.Format`.
+pub fn drive_format(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let name = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let file_system = string_value(vm, args.get(1)).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let Some(&Value::Int32(parameter)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let code = fs_unit_code(vm.mounts().reformat(&name, &file_system, parameter as u32));
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeDrive.FileSystems()`: the format names this build can create -- `DriveInfo.GetFileSystems`.
+pub fn drive_filesystems(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let names: Vec<String> = vm.filesystems().iter().cloned().collect();
+    Ok(Some(alloc_string_array(vm, names)))
+}
+
+/// `NativeDrive.MountRemovableVolumes()`: triggers the BSP auto-mount pass -- `DriveInfo.Mount-
+/// RemovableVolumes`. A no-op returning `0` until the auto-mount knob lands, so a nano app compiles
+/// and runs unmodified today.
+pub fn drive_mount_removable(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let _ = vm;
+    Ok(None)
+}
+
+/// `NativeStorage.MountRam(string mountPoint, int sizeBytes)`: mounts a fresh RAM-backed volume; `0`
+/// or a negative sentinel (Unsupported -> NotSupportedException if no provider, InvalidPath, Io).
+pub fn storage_mount_ram(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let prefix = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let Some(&Value::Int32(size)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let code = fs_unit_code(vm.mount_ram(&prefix, size.max(0) as u64));
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeStorage.MountSdOverSpi(string mountPoint, int busIdentity, int chipSelect)`: brings up the
+/// SD card on the named bus and mounts its FAT volume; `0` or a negative sentinel (Unsupported ->
+/// NotSupportedException when no provider, no SD-over-SPI support, or no bus by that identity).
+///
+/// `busIdentity` crosses as an `i32` because the managed tier has no unsigned argument at this rung;
+/// it is REINTERPRETED, not converted, so a register base with the top bit set (an address at or
+/// above 2 GiB, which several chips use) survives the crossing intact rather than clamping.
+pub fn storage_mount_sd_over_spi(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let prefix = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let Some(&Value::Int32(bus_identity)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(chip_select)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let code = fs_unit_code(vm.mount_sd_over_spi(&prefix, bus_identity as u32, chip_select));
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSdCard.MountSdOverSpiBus(string mountPoint, int spiBus, int chipSelect)`: the
+/// nanoFramework-shaped mount, whose bus is named by NUMBER. Same sentinels as its register-base
+/// sibling; the two namespaces stay apart down to the provider.
+pub fn storage_mount_sd_over_spi_bus(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let prefix = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let Some(&Value::Int32(bus_number)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(chip_select)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let code = fs_unit_code(vm.mount_sd_over_spi_bus(&prefix, bus_number as u32, chip_select));
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeStorage.Unmount(string mountPoint)`: removes the mount; `1` if one was removed, else `0`
+/// (a stale handle on it then reports Io).
+pub fn storage_unmount(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let prefix = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let removed = vm.unmount(&prefix).unwrap_or(false);
+    Ok(Some(Value::Int32(i32::from(removed))))
+}
+
+/// `NativeStorage.IsMounted(string mountPoint)`: whether a mount exists at that exact prefix.
+pub fn storage_is_mounted(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let prefix = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let mounted = vm.mounts().drive_type_of(&prefix).is_some();
+    Ok(Some(Value::Int32(i32::from(mounted))))
 }
 
 
@@ -5263,8 +5557,7 @@ pub fn enum_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
         .and_then(|value| module.enum_value_name_resolved(token, value));
     match name {
         Some(name) => {
-            let chars: Vec<u16> = name.encode_utf16().collect();
-            Ok(Some(Value::Object(vm.heap_mut().alloc_string(&chars))))
+            Ok(Some(Value::Object(vm.heap_mut().alloc_text(name))))
         }
         None => Ok(Some(Value::Null)),
     }
@@ -5280,8 +5573,7 @@ pub fn enum_get_names(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Op
     let members = module.enum_members_by_handle(token).unwrap_or_default();
     let mut elements: Vec<Value> = Vec::with_capacity(members.len());
     for (_, name) in members {
-        let chars: Vec<u16> = name.encode_utf16().collect();
-        elements.push(Value::Object(vm.heap_mut().alloc_string(&chars)));
+        elements.push(Value::Object(vm.heap_mut().alloc_text(&name)));
     }
     let array = vm.heap_mut().alloc_array(elements);
     Ok(Some(Value::Object(array)))
@@ -5329,8 +5621,7 @@ pub fn enum_format(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Optio
     let value = enum_arg_value(vm, args.get(1)).unwrap_or(0);
     let format = string_value(vm, args.get(2)).unwrap_or_default();
     let text = format_enum(module, token, value, &format);
-    let chars: Vec<u16> = text.encode_utf16().collect();
-    Ok(Some(Value::Object(vm.heap_mut().alloc_string(&chars))))
+    Ok(Some(Value::Object(vm.heap_mut().alloc_text(&text))))
 }
 
 /// `System.Enum.HasFlag(Enum flag)`: whether every bit set in `flag` is also set in the receiver --
@@ -5366,8 +5657,7 @@ pub fn enum_to_string_format(
     };
     let format = string_value(vm, args.get(1)).unwrap_or_default();
     let text = format_enum(module, token, value, &format);
-    let chars: Vec<u16> = text.encode_utf16().collect();
-    Ok(Some(Value::Object(vm.heap_mut().alloc_string(&chars))))
+    Ok(Some(Value::Object(vm.heap_mut().alloc_text(&text))))
 }
 
 /// Renders `value` of the enum named by `token` per a single-letter `format` ("G"/"D"/"X"/"F",
@@ -5438,6 +5728,52 @@ pub fn array_clear_range(vm: &mut Vm, _module: &Module, args: &[Value]) -> Resul
         vm.heap_mut().clear_range(array, index as usize, length as usize);
     }
     Ok(None)
+}
+
+/// `Array.CopyCore(source, sourceIndex, destination, destinationIndex, length)`: move an element
+/// RANGE between two arrays in their stored representation, answering whether the move was made. A
+/// packed primitive range moves as one contiguous byte range, so a bulk copy costs one operation
+/// rather than one per element -- and, unlike the untyped `GetValue`/`SetValue` seam it replaces,
+/// it boxes nothing.
+///
+/// A `false` answer means the core declined the pair -- a mismatched element representation, a
+/// covariant store needing a per-element type check, or a range outside either array -- and the
+/// managed `Array.Copy` then runs its untyped element seam instead. Declining costs speed, never
+/// correctness.
+///
+/// # Errors
+/// Returns [`Trap::TypeMismatch`] unless the arguments are (array, int, array, int, int).
+pub fn array_copy_range(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(source)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(source_index)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(destination)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(destination_index)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(length)) = args.get(4) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    if source_index < 0 || destination_index < 0 || length < 0 {
+        return Ok(Some(Value::Int32(0)));
+    }
+    let moved = vm.heap_mut().copy_range(
+        source,
+        source_index as usize,
+        destination,
+        destination_index as usize,
+        length as usize,
+    );
+    Ok(Some(Value::Int32(i32::from(moved))))
 }
 
 /// `Environment.get_TickCount()`: the monotonic millisecond count as `int` (the host clock seam),
@@ -6642,7 +6978,7 @@ pub fn field_get_raw_constant(
                 None => primitive,
             }
         }
-        FieldConstant::Str(units) => Value::Object(vm.heap_mut().alloc_string(&units)),
+        FieldConstant::Str(units) => Value::Object(vm.heap_mut().alloc_string(&units)?),
         FieldConstant::Null => Value::Null,
     };
     Ok(Some(raw))
@@ -6831,8 +7167,14 @@ pub fn constructor_invoke(
 /// int, the representation `typeof` yields), or null. The float arms are present only with the
 /// `float` feature; an `R4`/`R8` argument on a no-float build materializes as null (no corpus
 /// uses one).
-fn materialize_attr_value(vm: &mut Vm, value: &AttrValue) -> Value {
-    match value {
+///
+/// # Errors
+///
+/// Propagates the string-storage refusal for a `Str` argument: an attribute's string comes
+/// from metadata the program wrote, so on the well-formed UTF-8 tier it can name a code unit
+/// that tier cannot hold, exactly as a literal can.
+fn materialize_attr_value(vm: &mut Vm, value: &AttrValue) -> Result<Value, Trap> {
+    Ok(match value {
         AttrValue::Int { value, wide } => {
             if *wide {
                 Value::Int64(*value)
@@ -6846,15 +7188,17 @@ fn materialize_attr_value(vm: &mut Vm, value: &AttrValue) -> Value {
         AttrValue::R8(number) => Value::Float(*number),
         #[cfg(not(feature = "float"))]
         AttrValue::R4(_) | AttrValue::R8(_) => Value::Null,
-        AttrValue::Str(units) => Value::Object(vm.heap_mut().alloc_string(units)),
+        AttrValue::Str(units) => Value::Object(vm.heap_mut().alloc_string(units)?),
         AttrValue::Type(handle) => Value::NativeInt(*handle as i64),
         AttrValue::Array(elements) => {
-            let values: Vec<Value> =
-                elements.iter().map(|element| materialize_attr_value(vm, element)).collect();
+            let values: Vec<Value> = elements
+                .iter()
+                .map(|element| materialize_attr_value(vm, element))
+                .collect::<Result<Vec<Value>, Trap>>()?;
             Value::Object(vm.heap_mut().alloc_array(values))
         }
         AttrValue::Null => Value::Null,
-    }
+    })
 }
 
 /// Instantiates one custom attribute: allocates the attribute type's instance, runs its
@@ -6874,16 +7218,16 @@ fn instantiate_attribute(
     let mut ctor_args = Vec::with_capacity(attribute.positional.len() + 1);
     ctor_args.push(Value::Object(instance));
     for argument in &attribute.positional {
-        ctor_args.push(materialize_attr_value(vm, argument));
+        ctor_args.push(materialize_attr_value(vm, argument)?);
     }
     Session::new(module, attribute.ctor, ctor_args)?.run(module, vm)?;
     for (slot, value) in &attribute.named_fields {
-        let materialized = materialize_attr_value(vm, value);
+        let materialized = materialize_attr_value(vm, value)?;
         vm.heap_mut()
             .set_instance_field(instance, *slot, materialized);
     }
     for (setter, value) in &attribute.named_properties {
-        let materialized = materialize_attr_value(vm, value);
+        let materialized = materialize_attr_value(vm, value)?;
         Session::new(module, *setter, alloc::vec![Value::Object(instance), materialized])?
             .run(module, vm)?;
     }

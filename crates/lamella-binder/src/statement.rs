@@ -9,6 +9,7 @@ use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
     CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind, SwitchLabel,
@@ -187,6 +188,24 @@ pub enum BoundSwitchLabel {
     Default,
 }
 
+/// Render a section label as the fall-through diagnostics quote it: `case 5:`,
+/// `case "hi":`, `case null:` or `default:`.
+///
+/// A label written as anything but a decimal literal -- `case K:`, `case 0x10:`,
+/// `case E.B:` -- renders as its FOLDED VALUE, because the binder holds bound labels
+/// and not source text. The reported code is unaffected; only the quoted text differs
+/// from the oracle's, and closing that needs source access threaded to the binder.
+fn switch_label_text(label: &BoundSwitchLabel) -> Box<str> {
+    match label {
+        BoundSwitchLabel::Case(value) => format!("case {value}:").into(),
+        BoundSwitchLabel::CaseString(text) => {
+            format!("case \"{}\":", String::from_utf16_lossy(text)).into()
+        }
+        BoundSwitchLabel::CaseNull => Box::from("case null:"),
+        BoundSwitchLabel::Default => Box::from("default:"),
+    }
+}
+
 /// A bound `catch` clause (15.10): the caught type, the bound exception variable
 /// (in the handler's scope), and the handler body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +291,12 @@ impl Binder {
             }
             StmtKind::Return(value) => {
                 let value = value.as_ref().map(|expr| self.bind_expression(expr));
+                if self.return_leaves_finally() {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ControlLeavesFinally,
+                        stmt.span,
+                    ));
+                }
                 self.check_return(value.as_ref(), stmt.span);
                 let value = value.map(|v| self.convert_to_return_type(v));
                 BoundStmtKind::Return(value)
@@ -298,20 +323,34 @@ impl Binder {
                 let collection = self.bind_expression(collection);
                 let element_type = self.resolve_named_type(&bind_type(ty), ty.span);
                 let single_dimension_array = matches!(collection.ty, TypeSymbol::Array { rank: 1, .. });
+                self.enter_readonly_local(name, "foreach iteration variable");
                 let enumerable = if single_dimension_array {
                     None
                 } else {
                     self.bind_for_each_enumerable(ty.span, &element_type, name, collection.clone(), body)
                 };
                 if let Some(desugared) = enumerable {
+                    self.exit_readonly_local();
                     desugared
                 } else {
+                    if !single_dimension_array
+                        && !collection.ty.is_error()
+                        && !matches!(collection.ty, TypeSymbol::Array { .. })
+                    {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::ForEachNotEnumerable {
+                                ty: format!("{}", collection.ty).into(),
+                            },
+                            stmt.span,
+                        ));
+                    }
                     self.enter_scope();
                     self.declare_local(name, element_type.clone());
                     self.enter_loop();
                     let body = Box::new(self.bind_statement(body));
                     self.exit_loop();
                     self.exit_scope();
+                    self.exit_readonly_local();
                     BoundStmtKind::ForEach {
                         name: name.clone(),
                         element_type,
@@ -323,17 +362,42 @@ impl Binder {
             StmtKind::Break => {
                 if !self.in_loop_or_switch() {
                     self.report(Diagnostic::new(DiagnosticKind::NoEnclosingLoop, stmt.span));
+                } else if self.jump_leaves_finally() {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ControlLeavesFinally,
+                        stmt.span,
+                    ));
                 }
                 BoundStmtKind::Break
             }
             StmtKind::Continue => {
                 if !self.in_loop() {
                     self.report(Diagnostic::new(DiagnosticKind::NoEnclosingLoop, stmt.span));
+                } else if self.jump_leaves_finally() {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ControlLeavesFinally,
+                        stmt.span,
+                    ));
                 }
                 BoundStmtKind::Continue
             }
             StmtKind::Throw(value) => {
-                BoundStmtKind::Throw(value.as_ref().map(|expr| self.bind_expression(expr)))
+                let bound = value.as_ref().map(|expr| self.bind_expression(expr));
+                if value.is_none() && !self.in_catch() {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::RethrowOutsideCatch,
+                        stmt.span,
+                    ));
+                }
+                if let (Some(operand), Some(expr)) = (&bound, value.as_ref()) {
+                    if self.is_provably_not_exception(&operand.ty) {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::CaughtTypeMustBeException,
+                            expr.span,
+                        ));
+                    }
+                }
+                BoundStmtKind::Throw(bound)
             }
             StmtKind::Switch {
                 expression,
@@ -342,6 +406,22 @@ impl Binder {
                 let switch_span = expression.span;
                 let expression = self.bind_expression(expression);
                 let expression = self.coerce_switch_governing(expression);
+                if matches!(expression.ty, TypeSymbol::Special(SpecialType::Boolean)) {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::FeatureRequiresLaterVersion {
+                            feature: "switch on boolean type".into(),
+                            required: "C# 2.0".into(),
+                        },
+                        switch_span,
+                    ));
+                } else if !expression.ty.is_error()
+                    && !self.is_switch_governing_type(&expression.ty)
+                {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::SwitchGoverningType,
+                        switch_span,
+                    ));
+                }
                 self.enter_scope();
                 self.enter_switch();
                 let mut seen_values: Vec<i64> = Vec::new();
@@ -349,10 +429,10 @@ impl Binder {
                 let mut seen_null = false;
                 let mut seen_default = false;
                 let mut bound_sections = Vec::with_capacity(sections.len());
-                for section in sections {
+                for (index, section) in sections.iter().enumerate() {
                     let mut labels = Vec::with_capacity(section.labels.len());
                     for label in &section.labels {
-                        let bound = self.bind_switch_label(label);
+                        let bound = self.bind_switch_label(label, &expression.ty);
                         let duplicate = match &bound {
                             BoundSwitchLabel::Case(value) if seen_values.contains(value) => {
                                 Some(format!("case {value}").into())
@@ -400,11 +480,17 @@ impl Binder {
                         .iter()
                         .map(|statement| self.bind_statement(statement))
                         .collect();
-                    if !statements.is_empty() && statements.iter().all(is_straight_line) {
-                        self.report(Diagnostic::new(
-                            DiagnosticKind::SwitchFallThrough,
-                            section_anchor(section, switch_span),
-                        ));
+                    if !statements.is_empty() && crate::flow::switch_section_completes(&statements) {
+                        let label = labels
+                            .last()
+                            .map(switch_label_text)
+                            .unwrap_or_else(|| Box::from("default:"));
+                        let kind = if index + 1 == sections.len() {
+                            DiagnosticKind::SwitchFallOutFinal { label }
+                        } else {
+                            DiagnosticKind::SwitchFallThrough { label }
+                        };
+                        self.report(Diagnostic::new(kind, section_anchor(section, switch_span)));
                     }
                     bound_sections.push(BoundSwitchSection { labels, statements });
                 }
@@ -421,10 +507,26 @@ impl Binder {
                 finally_block,
             } => BoundStmtKind::Try {
                 body: Box::new(self.bind_statement(body)),
-                catches: catches.iter().map(|catch| self.bind_catch(catch)).collect(),
-                finally: finally_block
-                    .as_ref()
-                    .map(|block| Box::new(self.bind_statement(block))),
+                catches: {
+                    if let Some(index) = catches
+                        .iter()
+                        .position(|catch| catch.exception_type.is_none())
+                    {
+                        for later in &catches[index + 1..] {
+                            self.report(Diagnostic::new(
+                                DiagnosticKind::CatchAfterGeneralCatch,
+                                later.span,
+                            ));
+                        }
+                    }
+                    catches.iter().map(|catch| self.bind_catch(catch)).collect()
+                },
+                finally: finally_block.as_ref().map(|block| {
+                    self.enter_finally();
+                    let bound = Box::new(self.bind_statement(block));
+                    self.exit_finally();
+                    bound
+                }),
             },
             StmtKind::Lock { expression, body } => self.bind_lock(expression, body),
             StmtKind::Using { resource, body } => self.bind_using(resource, body),
@@ -462,6 +564,12 @@ impl Binder {
                 BoundStmtKind::Goto(name.clone())
             }
             StmtKind::Goto(lamella_syntax::ast::GotoTarget::Case(expr)) => {
+                if !self.in_switch() {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::GotoCaseOutsideSwitch,
+                        stmt.span,
+                    ));
+                }
                 if let ExprKind::Literal(Literal::String(text)) = &expr.kind {
                     BoundStmtKind::GotoCaseString(text.clone())
                 } else {
@@ -484,12 +592,13 @@ impl Binder {
 
     /// Binds a `switch` label: a `case` constant to its value, or `default`. A
     /// non-constant case is `CS0150`, recovered as `case 0`.
-    fn bind_switch_label(&mut self, label: &SwitchLabel) -> BoundSwitchLabel {
+    fn bind_switch_label(&mut self, label: &SwitchLabel, governing: &TypeSymbol) -> BoundSwitchLabel {
         match label {
             SwitchLabel::Default => BoundSwitchLabel::Default,
             SwitchLabel::Case(expr) => {
                 let bound = self.bind_expression(expr);
                 self.record_case_label_uses(&bound);
+                self.check_assignable(&bound, governing, expr.span);
                 match crate::bound::constant_literal_value(&bound) {
                     Some(Literal::String(text)) => BoundSwitchLabel::CaseString(text),
                     Some(Literal::Null) => BoundSwitchLabel::CaseNull,
@@ -523,17 +632,89 @@ impl Binder {
         constant_int_value(&bound)
     }
 
+    /// Whether `ty` can be PROVEN not to derive from `System.Exception` -- which makes a
+    /// `catch` or `throw` of it CS0155.
+    ///
+    /// Conservative in ONE direction. An unresolved type, or a class whose base chain leaves
+    /// this compilation, answers false, so an exception type we cannot see is never falsely
+    /// flagged; the cost is missing it. A primitive, `string` or `object` is decided outright
+    /// -- `object` is `Exception`'s BASE, not its descendant -- and a struct, enum, interface
+    /// or delegate cannot derive from a class at all.
+    /// Whether `ty` can be PROVEN not to derive from `System.<name>` -- the same conservative walk
+    /// [`Self::is_provably_not_exception`] makes, generalized so the attribute rule can reuse it.
+    /// A chain that leaves this compilation answers false ("cannot prove"), so an unresolvable
+    /// base never manufactures a diagnostic.
+    pub(crate) fn is_provably_not_derived_from_system(&self, ty: &TypeSymbol, name: &str) -> bool {
+        let Some(mut current) = self.model().get_by_symbol(ty) else {
+            return false;
+        };
+        if current.kind != crate::symbols::TypeKind::Class {
+            return true;
+        }
+        for _ in 0..64 {
+            if &*current.namespace == "System" && &*current.name == name {
+                return false;
+            }
+            match &current.base {
+                None | Some(TypeSymbol::Special(_)) => return true,
+                Some(base) => match self.model().get_by_symbol(base) {
+                    Some(next) => current = next,
+                    None => return false,
+                },
+            }
+        }
+        false
+    }
+
+    pub(crate) fn is_provably_not_exception(&self, ty: &TypeSymbol) -> bool {
+        match ty {
+            TypeSymbol::Error => return false,
+            TypeSymbol::Special(SpecialType::Null) => return false,
+            TypeSymbol::Special(_) => return true,
+            _ => {}
+        }
+        let Some(mut current) = self.model().get_by_symbol(ty) else {
+            return false;
+        };
+        if current.kind != crate::symbols::TypeKind::Class {
+            return true;
+        }
+        for _ in 0..64 {
+            if &*current.namespace == "System" && &*current.name == "Exception" {
+                return false;
+            }
+            match &current.base {
+                None | Some(TypeSymbol::Special(_)) => return true,
+                Some(base) => match self.model().get_by_symbol(base) {
+                    Some(next) => current = next,
+                    None => return false,
+                },
+            }
+        }
+        false
+    }
+
     fn bind_catch(&mut self, catch: &CatchClause) -> BoundCatch {
         let exception_type = catch
             .exception_type
             .as_ref()
             .map(|ty| self.resolve_named_type(&bind_type(ty), ty.span));
+        if let (Some(resolved), Some(written)) = (&exception_type, &catch.exception_type) {
+            if self.is_provably_not_exception(resolved) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::CaughtTypeMustBeException,
+                    written.span,
+                ));
+            }
+        }
         self.enter_scope();
         if let Some(name) = &catch.name {
             let ty = exception_type.clone().unwrap_or(TypeSymbol::Error);
             self.declare_local(name, ty);
         }
+        self.enter_catch();
         let body = Box::new(self.bind_statement(&catch.body));
+        self.exit_catch();
         self.exit_scope();
         BoundCatch {
             exception_type,
@@ -760,6 +941,13 @@ impl Binder {
             span,
         };
         let held = self.bind_expression(expression);
+        if !held.ty.is_error() && self.is_value_type(&held.ty) {
+            let ty = format!("{}", held.ty).into();
+            self.report(Diagnostic::new(
+                DiagnosticKind::LockRequiresReferenceType { ty },
+                span,
+            ));
+        }
         let held = self.convert(held, &object_ty);
         let lock_decl = BoundStmt {
             kind: BoundStmtKind::Local {
@@ -791,6 +979,32 @@ impl Binder {
     /// if (__d != null) __d.Dispose(); } }`. A declaration's resources are disposed in reverse
     /// (nested-using order); an expression resource is held in a temp. The `as`+null-check form
     /// is conformant (a null resource is a no-op), like the foreach `Dispose` (15.8.4).
+    /// Reports `CS1674` when `ty` provably does not implement `System.IDisposable`. Conservative
+    /// in the same direction as the exception rule: a type that does not resolve, or one whose
+    /// interface list this compilation cannot see in full, reports nothing rather than accusing
+    /// code it cannot check.
+    fn check_disposable(&mut self, ty: &TypeSymbol, span: Span) {
+        if ty.is_error() || !matches!(ty, TypeSymbol::Named(_)) {
+            return;
+        }
+        if self.model().get_by_symbol(ty).is_none() {
+            return;
+        }
+        let implements = self.transitive_interfaces(ty).iter().any(|interface| {
+            self.model()
+                .get_by_symbol(interface)
+                .is_some_and(|info| &*info.namespace == "System" && &*info.name == "IDisposable")
+        });
+        if !implements {
+            self.report(Diagnostic::new(
+                DiagnosticKind::UsingRequiresDisposable {
+                    ty: format!("{ty}").into(),
+                },
+                span,
+            ));
+        }
+    }
+
     fn bind_using(&mut self, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {
         self.enter_scope();
         let mut resource_decls: alloc::vec::Vec<BoundStmt> = Vec::new();
@@ -798,10 +1012,12 @@ impl Binder {
         match resource {
             UsingResource::Declaration { ty, declarators } => {
                 let resource_ty = self.resolve_named_type(&bind_type(ty), ty.span);
+                self.check_disposable(&resource_ty, ty.span);
                 let kind = self.bind_local(ty, declarators);
                 resource_decls.push(BoundStmt { kind, span: ty.span });
                 for declarator in declarators {
                     resources.push((declarator.name.clone(), resource_ty.clone()));
+                    self.enter_readonly_local(&declarator.name, "using variable");
                 }
             }
             UsingResource::Expression(expression) => {
@@ -827,6 +1043,9 @@ impl Binder {
             }
         }
         let bound_body = self.bind_statement(body);
+        for _ in 0..resources.len() {
+            self.exit_readonly_local();
+        }
         self.exit_scope();
 
         let span = body.span;
@@ -1013,6 +1232,9 @@ impl Binder {
 
     fn bind_local(&mut self, ty: &TypeRef, declarators: &[VariableDeclarator]) -> BoundStmtKind {
         let declared = self.resolve_named_type(&bind_type(ty), ty.span);
+        if declared.is_void() {
+            self.report(Diagnostic::new(DiagnosticKind::VoidLocal, ty.span));
+        }
         let mut bound = Vec::with_capacity(declarators.len());
         for declarator in declarators {
             if self.local_in_current_scope(&declarator.name) {
@@ -1032,7 +1254,7 @@ impl Binder {
             }
             let initializer = declarator.initializer.as_ref().map(|expr| {
                 if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
-                    let (lengths, elements) = match self.bind_rectangular_array(expr, &declared) {
+                    let (lengths, elements) = match self.bind_rectangular_array(expr, &declared, &[]) {
                         Some(rectangular) => rectangular,
                         None => (Vec::new(), self.bind_array_initializer(expr, &declared)),
                     };
@@ -1159,17 +1381,6 @@ fn is_statement_expression(kind: &BoundExprKind) -> bool {
     )
 }
 
-/// Whether a statement passes control straight through to the next (no jump, no
-/// branching). A section built only of these reaches its endpoint, so it falls
-/// through (CS0163); anything else is left uncertain to avoid a false positive.
-fn is_straight_line(stmt: &BoundStmt) -> bool {
-    match &stmt.kind {
-        BoundStmtKind::Local { .. } | BoundStmtKind::Expression(_) | BoundStmtKind::Empty => true,
-        BoundStmtKind::Block(statements) => statements.iter().all(is_straight_line),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,11 +1399,30 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_section_whose_endpoint_is_reachable_falls_through() {
+
+        assert_eq!(codes("switch (1) { case 0: if (1 > 0) break; }"), [8070]);
+        assert_eq!(codes("switch (1) { case 0: break; }"), []);
+        assert_eq!(codes("switch (1) { case 0: { break; } }"), []);
+        assert_eq!(codes("switch (1) { case 0: if (1 > 0) break; else break; }"), []);
+        assert_eq!(codes("switch (1) { case 0: case 1: break; }"), []);
+        assert_eq!(codes("switch (1) { case 0: while (true) { } }"), []);
+        assert_eq!(codes("switch (1) { case 0: while (true) { break; } }"), [8070]);
+        assert_eq!(codes("switch (1) { case 0: goto case 1; case 1: break; }"), []);
+    }
+
+    #[test]
     fn well_typed_locals_and_conditions_are_clean() {
         assert_eq!(codes("int x = 1;"), []);
         assert_eq!(codes("long n = 1;"), []);
         assert_eq!(codes("while (true) ;"), []);
         assert_eq!(codes("{ int x = 1; int y = x + 2; }"), []);
+    }
+
+    #[test]
+    fn switch_on_bool_is_gated_as_a_post_1_0_feature() {
+        assert_eq!(codes("{ bool b = true; switch (b) { case true: break; } }"), [8022]);
+        assert_eq!(codes("{ int n = 1; switch (n) { case 1: break; } }"), []);
     }
 
     #[test]
@@ -1250,7 +1480,7 @@ mod tests {
         );
         assert_eq!(codes("try { } catch { }"), []);
         assert_eq!(codes("{ int x = true; }"), [29]);
-        assert_eq!(codes("{ int n = 1; lock (n) { int m = n; } }"), []);
+        assert_eq!(codes("{ int n = 1; lock (n) { int m = n; } }"), [185]);
         assert_eq!(codes("using (int r = 5) { int s = r; }"), []);
         assert_eq!(codes("checked { int v = 1; }"), []);
         assert_eq!(codes("done: ;"), []);
@@ -1271,7 +1501,7 @@ mod tests {
         assert_eq!(codes("for (int i = 0; i; i = i + 1) ;"), [29]);
         assert_eq!(codes("do ; while (1);"), [29]);
         assert_eq!(codes("while (true) break;"), []);
-        assert_eq!(codes("throw;"), []);
+        assert_eq!(codes("throw;"), [156]);
         assert_eq!(
             codes("for (int i = 0; i < 3; i = i + 1) { int j = i; }"),
             []

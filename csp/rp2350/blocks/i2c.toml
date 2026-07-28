@@ -1,0 +1,453 @@
+# BLOCK layout: the RP2350 I2C -- a Synopsys DW_apb_i2c (NOT a PrimeCell: no loopback bit,
+# so the no-hands self-test is the NACK-abort probe). Offsets are instance-base-relative.
+#
+# THE CLOCKING DELTA from this chip's UART/SPI blocks: ic_clk is clk_sys, not clk_peri --
+# there is no per-block clock mux to re-source from the crystal. The SCL count formulas are
+# DRIVER math per the official pico-sdk driver ([parameters] below); counts derive from the
+# plan's clk_sys_hz, never baked blind.
+#
+# Cross-block bring-up (RESETS release, pads, funcsel) is DRIVER code; the
+# configure sequence below is the BLOCK-LOCAL tail of the init (every step an i2c
+# register; the enable-window protocol is the transcribed truth).
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "i2c"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "raspberrypi/pico-sdk src/rp2_common/hardware_i2c/i2c.c (init + baud + transfer protocol)"]
+notes = [
+    "Official baud math (pico-sdk i2c.c): period = (clk_sys + baud/2) / baud; LCNT = period*3/5; HCNT = period - LCNT; SPKLEN = LCNT < 16 ? 1 : LCNT/16; SDA_HOLD = clk_sys*3/10000000 + 1 below 1 MHz (the 300 ns I2C hold), clk_sys*3/25000000 + 1 at 1 MHz+. Constraints: 8 <= HCNT,LCNT <= 65535 and SDA_HOLD <= LCNT-2.",
+    "Baud coverage at 150 MHz: floor ~1.4 kHz (the 16-bit LCNT ceiling), ceiling 1 MHz fast-mode-plus.",
+    "The official driver programs FAST mode always (IC_CON.SPEED = 2 + the FS_SCL count pair), 100 kHz standard speed included -- the SPEED field only selects which count registers time the bus.",
+    "IC_CON and the count/hold/spike registers are writable ONLY while IC_ENABLE = 0; IC_TAR likewise latches while disabled -- hence the disable/retarget/enable dance per address change.",
+    "TX_EMPTY_CTRL (IC_CON bit 8) redefines RAW_INTR_STAT.TX_EMPTY as 'FIFO empty AND the shift register finished' -- the write-completion poll (needs IC_TX_TL = 0 so empty means EMPTY).",
+    "The NACK protocol: an unacknowledged address/data aborts the transfer, auto-generates the STOP, flushes AND HOLDS the TX FIFO, and latches the cause in IC_TX_ABRT_SOURCE (bit 0 = the ADDRESS drew no ack, bit 3 = a DATA byte drew no ack -- the phase distinction the family NACK contract names). READING IC_CLR_TX_ABRT clears the source and releases the FIFO hold; every IC_CLR_* register reads as 0.",
+    "The block drives SDA/SCL open-drain through its funcsel; the pads keep SCHMITT on (slow rising edges want the hysteresis) + PUE for the internal pull-ups -- enough to idle a no-slave bus high; a real multi-device bus wants proper external pull-ups.",
+    "7-bit addressing: 0x00-0x07 and 0x78-0x7F are reserved by the I2C spec -- a scanner walks 0x08..0x77.",
+]
+
+[registers.IC_CON]
+offset = 0x0
+width = 32
+fields = { MASTER_MODE = [0, 1], SPEED = [1, 2], IC_RESTART_EN = [5, 1], IC_SLAVE_DISABLE = [6, 1], TX_EMPTY_CTRL = [8, 1] }
+notes = "master | fast-mode counts (SPEED 2) | restarts allowed | slave off | TX_EMPTY redefined as completion = the 0x165 config word. Writable only while disabled."
+
+[registers.IC_TAR]
+offset = 0x4
+width = 32
+fields = { IC_TAR = [0, 10] }
+notes = "The 7-bit target address sits in the low bits; latches only while IC_ENABLE = 0."
+
+[registers.IC_DATA_CMD]
+offset = 0x10
+width = 32
+fields = { DAT = [0, 8], CMD = [8, 1], STOP = [9, 1], RESTART = [10, 1] }
+notes = "One FIFO word carries data + framing: CMD 0 = write the byte, 1 = clock a read; STOP ends the transfer after this byte; RESTART issues a repeated start before it. Reading IC_DATA_CMD pops the RX FIFO."
+
+[registers.IC_FS_SCL_HCNT]
+offset = 0x1C
+width = 32
+fields = { IC_FS_SCL_HCNT = [0, 16] }
+notes = "SCL high count in ic_clk cycles (the FAST-mode pair times ALL rates here, per the official driver)."
+
+[registers.IC_FS_SCL_LCNT]
+offset = 0x20
+width = 32
+fields = { IC_FS_SCL_LCNT = [0, 16] }
+
+[registers.IC_RAW_INTR_STAT]
+offset = 0x34
+width = 32
+fields = { TX_EMPTY = [4, 1], TX_ABRT = [6, 1], STOP_DET = [9, 1] }
+notes = "The unmasked status: TX_EMPTY = write completion (under TX_EMPTY_CTRL), TX_ABRT = the transfer aborted (NACK etc.), STOP_DET = the bus reached STOP."
+
+[registers.IC_RX_TL]
+offset = 0x38
+width = 32
+fields = { RX_TL = [0, 8] }
+
+[registers.IC_TX_TL]
+offset = 0x3C
+width = 32
+fields = { TX_TL = [0, 8] }
+notes = "0 so TX_EMPTY means fully drained (the official init's watermark)."
+
+[registers.IC_CLR_TX_ABRT]
+offset = 0x54
+width = 32
+fields = { CLR_TX_ABRT = [0, 1] }
+notes = "READ to clear IC_TX_ABRT_SOURCE + the TX_ABRT status + release the held TX FIFO; always reads 0."
+
+[registers.IC_CLR_STOP_DET]
+offset = 0x60
+width = 32
+fields = { CLR_STOP_DET = [0, 1] }
+notes = "READ to clear STOP_DET."
+
+[registers.IC_ENABLE]
+offset = 0x6C
+width = 32
+fields = { ENABLE = [0, 1], ABORT = [1, 1] }
+
+[registers.IC_STATUS]
+offset = 0x70
+width = 32
+fields = { ACTIVITY = [0, 1], TFNF = [1, 1], TFE = [2, 1], RFNE = [3, 1], MST_ACTIVITY = [5, 1] }
+
+[registers.IC_TXFLR]
+offset = 0x74
+width = 32
+fields = { TXFLR = [0, 5] }
+
+[registers.IC_RXFLR]
+offset = 0x78
+width = 32
+fields = { RXFLR = [0, 5] }
+notes = "RX FIFO fill count -- nonzero means a read landed."
+
+[registers.IC_SDA_HOLD]
+offset = 0x7C
+width = 32
+fields = { IC_SDA_TX_HOLD = [0, 16], IC_SDA_RX_HOLD = [16, 8] }
+notes = "TX hold = the I2C 300 ns SDA hold after SCL falls, in ic_clk cycles."
+
+[registers.IC_TX_ABRT_SOURCE]
+offset = 0x80
+width = 32
+fields = { ABRT_7B_ADDR_NOACK = [0, 1], ABRT_TXDATA_NOACK = [3, 1], ARB_LOST = [12, 1], TX_FLUSH_CNT = [23, 9] }
+notes = "WHY the last transfer aborted; 0 = it was acknowledged. Cleared by reading IC_CLR_TX_ABRT."
+
+[registers.IC_ENABLE_STATUS]
+offset = 0x9C
+width = 32
+fields = { IC_EN = [0, 1] }
+
+[registers.IC_FS_SPKLEN]
+offset = 0xA0
+width = 32
+fields = { IC_FS_SPKLEN = [0, 8] }
+notes = "The spike-suppression length in ic_clk cycles (applies to SS/FS/FS+ alike)."
+
+[constants]
+FIFO_DEPTH = 16
+SPEED_FAST = 2
+
+[parameters]
+hcnt = "period - lcnt, where period = (clk_sys + baud/2) / baud -- 100 kHz at 150 MHz: period 1500, hcnt 600."
+lcnt = "period * 3 / 5 -- 100 kHz at 150 MHz: 900."
+spklen = "lcnt < 16 ? 1 : lcnt / 16 -- 100 kHz at 150 MHz: 56. The realized SCL rate lands slightly UNDER the request (the controller adds fixed spike/sync cycles), never above."
+sda_hold = "clk_sys * 3 / 10000000 + 1 below 1 MHz -- at 150 MHz: 46."
+con = "The composed IC_CON word: MASTER_MODE | SPEED fast | IC_RESTART_EN | IC_SLAVE_DISABLE | TX_EMPTY_CTRL -- 0x165, composed from the field masks."
+addr = "The 7-bit target address (0x08..0x77 usable)."
+tx_stop_cmd = "0x200 | (byte & 0xFF): the data byte with the STOP flag riding IC_DATA_CMD bit 9."
+tx_cmd = "byte & 0xFF, with 0x200 (STOP) added on the transaction's final byte."
+tx_nostop = "byte & 0xFF with NO stop bit: leaves the transaction open (write_then_read's write phase)."
+rx_cmd = "0x100 (CMD = clock a read), with 0x200 (STOP) added on the final command -> 0x300."
+rx_restart_cmd = "0x100 with 0x400 (RESTART) on the FIRST read command and 0x200 (STOP) on the last: 0x500 / 0x100 / 0x300 (0x700 when one command is both first and last)."
+
+# --- configure: the BLOCK-LOCAL tail of the init (counts from the pico-sdk formulas
+#     against the plan's clk_sys; the cross-block head -- RESETS/pads/funcsel -- is driver code) ---
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x0
+note = "configuration window: CON/counts/hold/spike latch only while disabled"
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_CON"
+value = "$con"
+note = "master | fast-mode counts | restart en | slave off | TX_EMPTY = completion (0x165)"
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_RX_TL"
+value = 0x0
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_TX_TL"
+value = 0x0
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_FS_SCL_HCNT"
+value = "$hcnt"
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_FS_SCL_LCNT"
+value = "$lcnt"
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_FS_SPKLEN"
+value = "$spklen"
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_SDA_HOLD"
+value = "$sda_hold"
+
+[[sequences.configure]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x1
+
+# One-byte master write (the address probe): START + addr + byte + STOP, or the NACK abort.
+
+[[sequences.write_byte]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x0
+note = "retarget window"
+
+[[sequences.write_byte]]
+op = "write"
+reg = "IC_TAR"
+value = "$addr"
+
+[[sequences.write_byte]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x1
+
+[[sequences.write_byte]]
+op = "write"
+reg = "IC_DATA_CMD"
+value = "$tx_stop_cmd"
+note = "the transfer starts when the command lands in the empty FIFO"
+
+[[sequences.write_byte]]
+op = "poll"
+reg = "IC_RAW_INTR_STAT"
+mask = 0x10
+note = "TX_EMPTY under TX_EMPTY_CTRL: the shift register finished -- asserted on success AND after an abort (the FIFO flush empties it)"
+
+[[sequences.write_byte]]
+op = "read"
+reg = "IC_TX_ABRT_SOURCE"
+note = "0 = the byte was acknowledged; bit 0 = ABRT_7B_ADDR_NOACK, the empty-bus outcome"
+
+[[sequences.write_byte]]
+op = "read"
+reg = "IC_CLR_TX_ABRT"
+note = "only when the source was nonzero: clears it + releases the flushed-FIFO hold"
+
+[[sequences.write_byte]]
+op = "poll"
+reg = "IC_RAW_INTR_STAT"
+mask = 0x200
+note = "STOP_DET: the bus reached STOP -- the hardware STOPs by itself after an abort too"
+
+[[sequences.write_byte]]
+op = "read"
+reg = "IC_CLR_STOP_DET"
+
+# Multi-byte master write: START + addr + N bytes + STOP, or the abort. The TX FIFO is 16 deep,
+# so each byte waits for room (IC_STATUS.TFNF) before landing -- the transfer is ONE bus
+# transaction regardless of count (STOP rides only the final byte's command word).
+
+[[sequences.write]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x0
+note = "retarget window"
+
+[[sequences.write]]
+op = "write"
+reg = "IC_TAR"
+value = "$addr"
+
+[[sequences.write]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x1
+
+[[sequences.write]]
+op = "poll"
+reg = "IC_STATUS"
+mask = 0x2
+note = "PER BYTE: TFNF -- room in the TX FIFO (16 deep)"
+
+[[sequences.write]]
+op = "write"
+reg = "IC_DATA_CMD"
+value = "$tx_cmd"
+note = "PER BYTE: the data byte; the LAST byte carries STOP (bit 9)"
+
+[[sequences.write]]
+op = "poll"
+reg = "IC_RAW_INTR_STAT"
+mask = 0x10
+note = "after the final byte: TX_EMPTY under TX_EMPTY_CTRL = the shift register finished (success AND abort both empty the FIFO)"
+
+[[sequences.write]]
+op = "read"
+reg = "IC_TX_ABRT_SOURCE"
+note = "0 = every byte acknowledged; bit 0 = the ADDRESS drew no ack, bit 3 = a DATA byte drew no ack -- the phase distinction the family NACK contract names"
+
+[[sequences.write]]
+op = "read"
+reg = "IC_CLR_TX_ABRT"
+note = "only when the source was nonzero"
+
+[[sequences.write]]
+op = "poll"
+reg = "IC_RAW_INTR_STAT"
+mask = 0x200
+note = "STOP_DET -- the hardware STOPs by itself after an abort too"
+
+[[sequences.write]]
+op = "read"
+reg = "IC_CLR_STOP_DET"
+
+# Multi-byte master read: START + addr + R, N clocked bytes + STOP, or the abort. Commands and
+# pops run in LOCKSTEP (issue one read command, pop its byte, repeat) -- a strict, simple subset
+# of the official driver's windowed feeding that can never overflow the 16-deep RX FIFO.
+
+[[sequences.read]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x0
+
+[[sequences.read]]
+op = "write"
+reg = "IC_TAR"
+value = "$addr"
+
+[[sequences.read]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x1
+
+[[sequences.read]]
+op = "poll"
+reg = "IC_STATUS"
+mask = 0x2
+note = "PER BYTE: TFNF before the command lands"
+
+[[sequences.read]]
+op = "write"
+reg = "IC_DATA_CMD"
+value = "$rx_cmd"
+note = "PER BYTE: CMD (bit 8) clocks one byte from the target; the LAST command carries STOP"
+
+[[sequences.read]]
+op = "read"
+reg = "IC_RAW_INTR_STAT"
+mask = 0x40
+note = "PER BYTE, loop with the next read: TX_ABRT set = the transfer aborted (address NACK on the first byte) -- read IC_CLR_TX_ABRT, map IC_TX_ABRT_SOURCE, give up"
+
+[[sequences.read]]
+op = "read"
+reg = "IC_RXFLR"
+note = "PER BYTE, loop: nonzero = the byte landed"
+
+[[sequences.read]]
+op = "read"
+reg = "IC_DATA_CMD"
+mask = 0xFF
+note = "PER BYTE: pops the received byte"
+
+# Write-then-read joined by a REPEATED START (the register-read shape every addressable device
+# speaks): the write bytes go WITHOUT stop, then the FIRST read command carries RESTART
+# (IC_DATA_CMD bit 10) so the controller issues Sr + addr + R instead of STOP + START --
+# IC_CON.IC_RESTART_EN permits it.
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x0
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "IC_TAR"
+value = "$addr"
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x1
+
+[[sequences.write_then_read]]
+op = "poll"
+reg = "IC_STATUS"
+mask = 0x2
+note = "PER WRITE BYTE: TFNF"
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "IC_DATA_CMD"
+value = "$tx_nostop"
+note = "PER WRITE BYTE: the data byte, NO stop bit -- the transaction stays open for the repeated start"
+
+[[sequences.write_then_read]]
+op = "poll"
+reg = "IC_STATUS"
+mask = 0x2
+note = "PER READ BYTE: TFNF"
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "IC_DATA_CMD"
+value = "$rx_restart_cmd"
+note = "PER READ BYTE: CMD (bit 8); the FIRST read command adds RESTART (bit 10) = the repeated start; the LAST adds STOP"
+
+[[sequences.write_then_read]]
+op = "read"
+reg = "IC_RAW_INTR_STAT"
+mask = 0x40
+note = "PER READ BYTE, loop: TX_ABRT = aborted -- the source's bit 0 (address) vs bit 3 (write-phase data) names the failing phase"
+
+[[sequences.write_then_read]]
+op = "read"
+reg = "IC_RXFLR"
+note = "PER READ BYTE, loop: nonzero = landed"
+
+[[sequences.write_then_read]]
+op = "read"
+reg = "IC_DATA_CMD"
+mask = 0xFF
+note = "PER READ BYTE: pop"
+
+# One-byte master read (the scanner's probe): START + addr + R, one clocked byte + STOP, or the abort.
+
+[[sequences.read_byte]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x0
+
+[[sequences.read_byte]]
+op = "write"
+reg = "IC_TAR"
+value = "$addr"
+
+[[sequences.read_byte]]
+op = "write"
+reg = "IC_ENABLE"
+value = 0x1
+
+[[sequences.read_byte]]
+op = "write"
+reg = "IC_DATA_CMD"
+value = 0x300
+note = "CMD (read) | STOP: clock one byte from the target"
+
+[[sequences.read_byte]]
+op = "read"
+reg = "IC_RAW_INTR_STAT"
+mask = 0x40
+note = "loop with the next read: TX_ABRT set = the address NACKed -- read IC_CLR_TX_ABRT and give up"
+
+[[sequences.read_byte]]
+op = "read"
+reg = "IC_RXFLR"
+note = "loop: nonzero = the byte landed"
+
+[[sequences.read_byte]]
+op = "read"
+reg = "IC_DATA_CMD"
+mask = 0xFF
+note = "pops the received byte from the RX FIFO"

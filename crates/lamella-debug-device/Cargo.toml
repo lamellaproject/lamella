@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 lamella-debug-backend = { path = "../lamella-debug-backend" }
+lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 
 # The device DAP server binary links the adapter + wire protocol WITHOUT the interpreter,

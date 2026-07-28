@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.PropertyInfo
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public class PropertyInfo : MemberInfo
@@ -57,3 +58,4 @@ namespace System.Reflection
         }
     }
 }
+#endif

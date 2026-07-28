@@ -1,8 +1,8 @@
 //! The DEVICE networking backend for the interpreter's [`NetBackend`] seam: `smoltcp` (a
 //! pure-Rust, `no_std` TCP/IP stack) over any [`smoltcp::phy::Device`] -- a board's Ethernet
-//! MAC driver on hardware, `smoltcp`'s loopback device in tests. The device twin of
-//! `lamella-net-host`: the same non-blocking socket vocabulary, with `smoltcp`'s poll-driven
-//! interface as the readiness reactor instead of the OS poller.
+//! MAC driver on hardware, `smoltcp`'s loopback device in tests. The device twin of the HOST
+//! backend: the same non-blocking socket vocabulary, with `smoltcp`'s poll-driven interface as
+//! the readiness reactor instead of the OS poller.
 
 #![no_std]
 #![forbid(unsafe_code)]

@@ -7,7 +7,9 @@ namespace System.Diagnostics
         {
         }
 
-        [Lamella.Runtime.RuntimeProvided] private static void DebugWrite(string message) { }
+        [Lamella.Runtime.RuntimeProvided]
+        [Lamella.Runtime.IntendedDefault]
+        private static void DebugWrite(string message) { }
 
         public override void Write(string message)
         {

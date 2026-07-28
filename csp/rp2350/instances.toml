@@ -1,0 +1,92 @@
+# INSTANCE map: where each RP2350 block copy sits + its reset-release bit
+# (reset bits are per-instance bus-gate facts).
+# `resets_clr` is the chip's atomic write-1-to-CLEAR
+# alias of `resets` (base + 0x3000); the SET view rides the resets block's RESET_SET offset.
+# `sio` is the single-cycle IO block (the CPU-direct GPIO drive; processor-attached, never
+# through RESETS). -1 = not applicable.
+# Rows are added evidence-first, uart1 (0x40078000), spi1 (0x40088000), i2c1
+# (0x40098000) join when a binding first needs them, verified against the RP2350 datasheet.
+
+[table]
+kind = "instances"
+family = "rp2350"
+record = ["base", "reset_bit"]
+sources = ["raspberrypi/pico-sdk RP2350.svd (bases)", "RP2350 datasheet ch 7 (RESETS bits), ch 2.2 (address map)"]
+
+[[instances]]
+name = "xosc"
+block = "xosc"
+base = 0x40048000
+reset_bit = -1
+
+[[instances]]
+name = "clocks"
+block = "clocks"
+base = 0x40010000
+reset_bit = -1
+
+[[instances]]
+name = "resets"
+block = "resets"
+base = 0x40020000
+reset_bit = -1
+
+[[instances]]
+name = "resets_clr"
+block = "resets"
+base = 0x40023000
+reset_bit = -1
+
+[[instances]]
+name = "io_bank0"
+block = "io-bank0"
+base = 0x40028000
+reset_bit = 6
+
+[[instances]]
+name = "pads_bank0"
+block = "pads-bank0"
+base = 0x40038000
+reset_bit = 9
+
+[[instances]]
+name = "sio"
+block = "sio"
+base = 0xd0000000
+reset_bit = -1
+
+[[instances]]
+name = "pll_sys"
+block = "pll"
+base = 0x40050000
+reset_bit = 14
+
+[[instances]]
+name = "pll_usb"
+block = "pll"
+base = 0x40058000
+reset_bit = 15
+
+[[instances]]
+name = "uart0"
+block = "uart"
+base = 0x40070000
+reset_bit = 26
+
+[[instances]]
+name = "spi0"
+block = "spi"
+base = 0x40080000
+reset_bit = 18
+
+[[instances]]
+name = "i2c0"
+block = "i2c"
+base = 0x40090000
+reset_bit = 4
+
+[[instances]]
+name = "adc"
+block = "adc"
+base = 0x400a0000
+reset_bit = 0

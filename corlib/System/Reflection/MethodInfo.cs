@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.MethodInfo
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public class MethodInfo : MethodBase
@@ -16,3 +17,4 @@ namespace System.Reflection
         }
     }
 }
+#endif

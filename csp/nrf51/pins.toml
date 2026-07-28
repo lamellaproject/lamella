@@ -1,0 +1,29 @@
+# PIN map for the nRF51 family: pin x function -> (instance, signal).
+# PARTIAL, evidence-only. This part has NO mux-table functions: a peripheral claims a GPIO
+# through its own PSEL register, so any pin can carry any block's signal and the "function" id
+# here is the claiming block ("twi") while the signal names the PSEL register the pin routes
+# through. A row therefore records which signal a pin is USED for, plus the electrical fact
+# that the pin exists as general-purpose I/O -- it is not a mux capability, because on this
+# part there is no mux to have a capability in.
+
+[table]
+kind = "pins"
+family = "nrf51"
+sources = [
+    "nRF51 Series Reference Manual v3.0, ch. 14 GPIO and ch. 28.2: pin routing is by the peripheral's PSELSCL/PSELSDA registers rather than a per-pin function table",
+    "nRF51822 PS v3.4 section 3.7 (one GPIO port of up to 32 I/Os depending on package) and the QFN pin assignment table, which lists P0.00 and P0.30 as general purpose I/O",
+]
+
+[[pins]]
+pin = "P0.00"
+function = "twi"
+instance = "twi0"
+signal = "psel_scl"
+source = "nRF51822 PS v3.4 QFN pin assignment (pin 4, general purpose I/O); PSELSCL takes the plain pin number, so this pin routes as 0"
+
+[[pins]]
+pin = "P0.30"
+function = "twi"
+instance = "twi0"
+signal = "psel_sda"
+source = "nRF51822 PS v3.4 QFN pin assignment (pin 3, general purpose I/O); PSELSDA takes the plain pin number, so this pin routes as 30"

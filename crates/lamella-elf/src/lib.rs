@@ -108,6 +108,12 @@ pub enum SymbolType {
     NoType,
     /// `STT_FUNC` -- a function entry point.
     Func,
+    /// `STT_SECTION` -- names a SECTION rather than a location inside one. Its `st_name` is 0 (the
+    /// name lives in the section header, not the string table), which is why a purely name-keyed
+    /// linker cannot resolve DWARF: LLVM emits every `.debug_*` cross-section reference against one
+    /// of these. `llvm-readelf` DISPLAYS a name for them -- synthesized from the section headers --
+    /// so they look name-addressable in a dump when they are not.
+    Section,
 }
 
 /// The prefix on a canonical type-descriptor's data symbol name (`__lamella_typedesc_<handle>`). The AOT
@@ -167,6 +173,62 @@ pub const STACKMAP_START_SYMBOL: &str = "__lamella_stackmaps_start";
 /// The symbol just past the gathered stack-map pointer table (see [`STACKMAP_START_SYMBOL`]).
 pub const STACKMAP_END_SYMBOL: &str = "__lamella_stackmaps_end";
 
+/// The section-name prefix of the DWARF debug family (`.debug_info`, `.debug_abbrev`, `.debug_str`,
+/// `.debug_line`, ...). A section so named is CARRIED through the link -- kept as itself, with its
+/// own bytes and its own relocations -- instead of being merged into [`Object::text`] or dropped.
+///
+/// Matching by PREFIX rather than an enumerated list is deliberate: it covers the whole DWARF 5
+/// family, the split-DWARF `.dwo` variants, vendor extensions, and whatever a later DWARF version
+/// adds, with no code change. Debug sections are not `SHF_ALLOC`, so they cost the target no memory;
+/// they exist only in the linked artifact a debugger reads.
+pub const DEBUG_SECTION_PREFIX: &str = ".debug_";
+
+/// One section carried through the link verbatim rather than merged into the code blob -- today the
+/// DWARF `.debug_*` family (see [`DEBUG_SECTION_PREFIX`]), as [`read_object`] parsed it.
+///
+/// A carried section has its OWN address space, which is what distinguishes it from `.text`/`.rodata`
+/// (those merge into one blob at one load address). The linker concatenates same-named contributions
+/// across objects and relocates within the result, so a reference from `.debug_info` to `.debug_abbrev`
+/// resolves to "that contribution to the combined section" while a reference to a function resolves to
+/// its virtual address -- the two-address-space rule DWARF 5 s7.3.1 lays out.
+///
+/// The WRITER's counterpart is [`Section`], which borrows its bytes and names its relocations'
+/// symbols by the index they have in the writer's `symbols` slice.
+#[derive(Debug, Clone)]
+pub struct ParsedSection {
+    /// The section name (e.g. `.debug_info`), which is also what the linker groups contributions by.
+    pub name: String,
+    /// `sh_flags` -- carried so the linker can reproduce the section's character in an output object.
+    pub flags: u32,
+    /// `sh_addralign` (at least 1); the alignment this contribution needs in the combined section.
+    pub addralign: u32,
+    /// The section's bytes.
+    pub data: Vec<u8>,
+    /// The section's own relocations, with `offset` relative to THIS section (not to `.text`).
+    pub relocations: Vec<ParsedRelocation>,
+}
+
+/// One section to EMIT beside `.text` -- the writer's counterpart to [`ParsedSection`], and how the
+/// AOT backend hands its own DWARF to [`write_relocatable_object_with_sections`].
+///
+/// `relocations` are relative to THIS section and name their symbols by index into the writer's
+/// `symbols` slice, the same space `.text`'s relocations use -- so one symbol serves a `.debug_info`
+/// reference to a function and a `.debug_line` reference to the same function alike.
+#[derive(Debug, Clone, Copy)]
+pub struct Section<'a> {
+    /// The section name (e.g. `.debug_info`). A name under [`DEBUG_SECTION_PREFIX`] is what makes
+    /// [`read_object`] carry it back rather than merge or drop it.
+    pub name: &'a str,
+    /// `sh_flags`. 0 for a debug section: NOT `SHF_ALLOC`, so it costs the target no memory.
+    pub flags: u32,
+    /// `sh_addralign` (at least 1).
+    pub addralign: u32,
+    /// The section's bytes.
+    pub data: &'a [u8],
+    /// The section's own relocations, `offset` relative to this section's start.
+    pub relocations: &'a [Relocation],
+}
+
 /// Where a symbol is defined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolSection {
@@ -174,6 +236,14 @@ pub enum SymbolSection {
     Text,
     /// Undefined here -- the linker resolves it from another object (`SHN_UNDEF`).
     Undefined,
+    /// Defined in one of the emitted [`Section`]s, by its index into the writer's `sections` slice;
+    /// the symbol's `value` is an offset within THAT section.
+    ///
+    /// This is the handle a DWARF cross-section reference resolves through: `.debug_info` naming
+    /// `.debug_abbrev` is section-relative, in an address space with no load address in it at all
+    /// (DWARF 5 s7.3.1). A symbol here must not be given `.text`'s space by mistake -- that is
+    /// exactly the confusion that yields debug info which looks plausible and points at nothing.
+    InSection(u32),
 }
 
 /// One symbol to place in `.symtab`.
@@ -218,12 +288,57 @@ const REL_SIZE: usize = 8;
 /// and `relocations` in `.rela.text`. `machine` sets `e_machine`; output is little-endian. A
 /// relocation's `symbol` indexes the `symbols` slice (the writer maps it to the final symbol-table
 /// index). Pass an empty `relocations` for a leaf object with no external references.
+///
+/// Emits no sections beyond `.text`; see [`write_relocatable_object_with_sections`] to emit DWARF
+/// alongside it. Every object without debug info goes through here, so its bytes are unchanged by
+/// the existence of that path.
 pub fn write_relocatable_object(
     machine: Machine,
     text: &[u8],
     symbols: &[Symbol],
     relocations: &[Relocation],
 ) -> Vec<u8> {
+    write_relocatable_object_with_sections(machine, text, symbols, relocations, &[])
+}
+
+/// As [`write_relocatable_object`], plus `sections` emitted beside `.text` -- the DWARF the AOT
+/// backend generates for its own code.
+///
+/// Each section keeps its own bytes and its own relocations (in a `.rela.<name>` of its own), and a
+/// [`SymbolSection::InSection`] symbol lets one section reference another. That is the whole
+/// mechanism DWARF needs: `.debug_info` names `.debug_abbrev` through a section symbol, and names a
+/// FUNCTION through an ordinary `.text` symbol, and the linker keeps those two in the separate
+/// address spaces DWARF 5 s7.3.1 requires.
+///
+/// With an empty `sections` the output is byte-for-byte what [`write_relocatable_object`] has always
+/// produced -- the layout below degenerates to the original five-or-six-section one rather than
+/// reproducing it, so the two cannot drift apart.
+pub fn write_relocatable_object_with_sections(
+    machine: Machine,
+    text: &[u8],
+    symbols: &[Symbol],
+    relocations: &[Relocation],
+    sections: &[Section],
+) -> Vec<u8> {
+    let has_rela = !relocations.is_empty();
+    let mut next_idx = if has_rela { 3u32 } else { 2 };
+    let mut sec_idx: Vec<u32> = Vec::with_capacity(sections.len());
+    let mut sec_rela_idx: Vec<Option<u32>> = Vec::with_capacity(sections.len());
+    for sec in sections {
+        sec_idx.push(next_idx);
+        next_idx += 1;
+        if sec.relocations.is_empty() {
+            sec_rela_idx.push(None);
+        } else {
+            sec_rela_idx.push(Some(next_idx));
+            next_idx += 1;
+        }
+    }
+    let symtab_idx = next_idx;
+    let strtab_idx = symtab_idx + 1;
+    let shstrtab_idx = (strtab_idx + 1) as u16;
+    let section_count = shstrtab_idx + 1;
+
     let local_count = symbols
         .iter()
         .filter(|s| s.binding == Binding::Local)
@@ -253,9 +368,14 @@ pub fn write_relocatable_object(
             .iter()
             .filter(|s| (s.binding == Binding::Local) == want_local)
         {
-            let st_name = strtab.len() as u32;
-            strtab.extend_from_slice(sym.name.as_bytes());
-            strtab.push(0);
+            let st_name = if sym.name.is_empty() {
+                0
+            } else {
+                let at = strtab.len() as u32;
+                strtab.extend_from_slice(sym.name.as_bytes());
+                strtab.push(0);
+                at
+            };
             let bind: u8 = match sym.binding {
                 Binding::Local => 0,
                 Binding::Global => 1,
@@ -264,30 +384,23 @@ pub fn write_relocatable_object(
             let typ: u8 = match sym.kind {
                 SymbolType::NoType => 0,
                 SymbolType::Func => 2,
+                SymbolType::Section => 3,
             };
             let st_info = (bind << 4) | (typ & 0xf);
             let st_shndx = match sym.section {
                 SymbolSection::Text => TEXT_SHNDX,
                 SymbolSection::Undefined => SHN_UNDEF,
+                SymbolSection::InSection(i) => sec_idx[i as usize] as u16,
             };
             symtab.extend_from_slice(&sym_entry(st_name, sym.value, sym.size, st_info, st_shndx));
         }
     }
 
-    let mut rela: Vec<u8> = Vec::new();
-    for r in relocations {
-        let r_info = (final_index[r.symbol as usize] << 8) | (r.kind & 0xff);
-        push_u32(&mut rela, r.offset);
-        push_u32(&mut rela, r_info);
-        push_u32(&mut rela, r.addend as u32);
-    }
-
-    let has_rela = !relocations.is_empty();
-    let rela_idx = 2u32;
-    let symtab_idx = if has_rela { 3 } else { 2 };
-    let strtab_idx = symtab_idx + 1;
-    let shstrtab_idx = (strtab_idx + 1) as u16;
-    let section_count = if has_rela { 6u16 } else { 5 };
+    let rela = encode_rela(relocations, &final_index);
+    let sec_rela: Vec<Vec<u8>> = sections
+        .iter()
+        .map(|s| encode_rela(s.relocations, &final_index))
+        .collect();
 
     let mut shstrtab: Vec<u8> = alloc::vec![0];
     let text_name = add_name(&mut shstrtab, ".text");
@@ -296,6 +409,20 @@ pub fn write_relocatable_object(
     } else {
         0
     };
+    let mut sec_name: Vec<u32> = Vec::with_capacity(sections.len());
+    let mut sec_rela_name: Vec<u32> = Vec::with_capacity(sections.len());
+    for (i, sec) in sections.iter().enumerate() {
+        sec_name.push(add_name(&mut shstrtab, sec.name));
+        sec_rela_name.push(if sec_rela_idx[i].is_some() {
+            let at = shstrtab.len() as u32;
+            shstrtab.extend_from_slice(b".rela");
+            shstrtab.extend_from_slice(sec.name.as_bytes());
+            shstrtab.push(0);
+            at
+        } else {
+            0
+        });
+    }
     let symtab_name = add_name(&mut shstrtab, ".symtab");
     let strtab_name = add_name(&mut shstrtab, ".strtab");
     let shstrtab_name = add_name(&mut shstrtab, ".shstrtab");
@@ -305,6 +432,18 @@ pub fn write_relocatable_object(
     let rela_off = align4(cursor);
     if has_rela {
         cursor = rela_off + rela.len() as u32;
+    }
+    let mut sec_off: Vec<u32> = Vec::with_capacity(sections.len());
+    let mut sec_rela_off: Vec<u32> = Vec::with_capacity(sections.len());
+    for (i, sec) in sections.iter().enumerate() {
+        let at = align_up(cursor, sec.addralign.max(1));
+        sec_off.push(at);
+        cursor = at + sec.data.len() as u32;
+        let rela_at = align4(cursor);
+        sec_rela_off.push(rela_at);
+        if sec_rela_idx[i].is_some() {
+            cursor = rela_at + sec_rela[i].len() as u32;
+        }
     }
     let symtab_off = align4(cursor);
     let strtab_off = symtab_off + symtab.len() as u32;
@@ -333,6 +472,14 @@ pub fn write_relocatable_object(
         pad_to(&mut out, rela_off);
         out.extend_from_slice(&rela);
     }
+    for (i, sec) in sections.iter().enumerate() {
+        pad_to(&mut out, sec_off[i]);
+        out.extend_from_slice(sec.data);
+        if sec_rela_idx[i].is_some() {
+            pad_to(&mut out, sec_rela_off[i]);
+            out.extend_from_slice(&sec_rela[i]);
+        }
+    }
     pad_to(&mut out, symtab_off);
     out.extend_from_slice(&symtab);
     out.extend_from_slice(&strtab);
@@ -345,6 +492,7 @@ pub fn write_relocatable_object(
             name: text_name,
             typ: 1,
             flags: 0x2 | 0x4,
+            addr: 0,
             offset: text_off,
             size: text.len() as u32,
             link: 0,
@@ -360,6 +508,7 @@ pub fn write_relocatable_object(
                 name: rela_name,
                 typ: 4,
                 flags: 0,
+                addr: 0,
                 offset: rela_off,
                 size: rela.len() as u32,
                 link: symtab_idx,
@@ -369,12 +518,47 @@ pub fn write_relocatable_object(
             },
         );
     }
+    for (i, sec) in sections.iter().enumerate() {
+        push_shdr(
+            &mut out,
+            &Shdr {
+                name: sec_name[i],
+                typ: 1,
+                flags: sec.flags,
+                addr: 0,
+                offset: sec_off[i],
+                size: sec.data.len() as u32,
+                link: 0,
+                info: 0,
+                addralign: sec.addralign.max(1),
+                entsize: 0,
+            },
+        );
+        if sec_rela_idx[i].is_some() {
+            push_shdr(
+                &mut out,
+                &Shdr {
+                    name: sec_rela_name[i],
+                    typ: 4,
+                    flags: 0,
+                    addr: 0,
+                    offset: sec_rela_off[i],
+                    size: sec_rela[i].len() as u32,
+                    link: symtab_idx,
+                    info: sec_idx[i],
+                    addralign: 4,
+                    entsize: RELA_SIZE as u32,
+                },
+            );
+        }
+    }
     push_shdr(
         &mut out,
         &Shdr {
             name: symtab_name,
             typ: 2,
             flags: 0,
+            addr: 0,
             offset: symtab_off,
             size: symtab.len() as u32,
             link: strtab_idx,
@@ -389,6 +573,7 @@ pub fn write_relocatable_object(
             name: strtab_name,
             typ: 3,
             flags: 0,
+            addr: 0,
             offset: strtab_off,
             size: strtab.len() as u32,
             link: 0,
@@ -403,6 +588,7 @@ pub fn write_relocatable_object(
             name: shstrtab_name,
             typ: 3,
             flags: 0,
+            addr: 0,
             offset: shstrtab_off,
             size: shstrtab.len() as u32,
             link: 0,
@@ -411,7 +597,19 @@ pub fn write_relocatable_object(
             entsize: 0,
         },
     );
-    let _ = rela_idx;
+    out
+}
+
+/// Encodes a run of relocations as `Elf32_Rela` entries: `r_offset`, `r_info` = (symbol << 8) | type,
+/// `r_addend`. `final_index` maps a caller-facing symbol index to its post-reorder symtab index.
+fn encode_rela(relocations: &[Relocation], final_index: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(relocations.len() * RELA_SIZE);
+    for r in relocations {
+        let r_info = (final_index[r.symbol as usize] << 8) | (r.kind & 0xff);
+        push_u32(&mut out, r.offset);
+        push_u32(&mut out, r_info);
+        push_u32(&mut out, r.addend as u32);
+    }
     out
 }
 
@@ -457,6 +655,135 @@ pub fn write_executable_arm_thumb_with_heap(
         true,
         Some((heap_offset, heap_size)),
     )
+}
+
+/// Emits an `ET_EXEC` like [`write_executable`], but WITH a section table carrying the linked
+/// `.debug_*` sections -- the artifact a debugger opens.
+///
+/// This is the outlet for the linker's DWARF passthrough: `lamella_link::LinkedImage` comes back
+/// with the debug sections concatenated and relocated, and until they are written into a container
+/// with section headers, nothing can read them. The loaded image is UNAFFECTED -- the `PT_LOAD`
+/// segment still covers only the headers plus `.text`, so the debug bytes ride along in the file
+/// and cost the target nothing. Flash the same `.text`; hand a debugger this.
+///
+/// `debug` is `(section name, bytes)`, taken straight from `LinkedImage::debug_sections`.
+/// `entry_thumb` sets `e_entry`'s low bit, as [`write_executable_arm_thumb`] does.
+///
+/// No `.symtab` is emitted. DWARF already carries the function names and addresses a source-level
+/// debugger needs, and a PARTIAL symbol table would be worse than none on ARM: correct disassembly
+/// depends on the `$t`/`$a` mapping symbols, which are per-object locals the linker does not retain.
+pub fn write_debuggable_executable(
+    machine: Machine,
+    text: &[u8],
+    entry_offset: u32,
+    base: u32,
+    entry_thumb: bool,
+    debug: &[(&str, &[u8])],
+) -> Vec<u8> {
+    const PHDR_SIZE: u32 = 32;
+    let text_off = EHDR_SIZE + PHDR_SIZE;
+    let loaded = text_off + text.len() as u32;
+    let entry = (base + text_off + entry_offset) | entry_thumb as u32;
+
+    let mut shstrtab: Vec<u8> = alloc::vec![0];
+    let text_name = add_name(&mut shstrtab, ".text");
+    let debug_names: Vec<u32> = debug
+        .iter()
+        .map(|(n, _)| add_name(&mut shstrtab, n))
+        .collect();
+    let shstrtab_name = add_name(&mut shstrtab, ".shstrtab");
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&[0x7f, b'E', b'L', b'F']);
+    out.extend_from_slice(&[1, 1, 1, 0]);
+    out.extend_from_slice(&[0u8; 8]);
+    push_u16(&mut out, 2);
+    push_u16(&mut out, machine.e_machine());
+    push_u32(&mut out, 1);
+    push_u32(&mut out, entry);
+    push_u32(&mut out, EHDR_SIZE);
+    let e_shoff_at = out.len();
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u16(&mut out, EHDR_SIZE as u16);
+    push_u16(&mut out, PHDR_SIZE as u16);
+    push_u16(&mut out, 1);
+    push_u16(&mut out, SHDR_SIZE);
+    push_u16(&mut out, debug.len() as u16 + 3);
+    push_u16(&mut out, debug.len() as u16 + 2);
+    push_u32(&mut out, 1);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, base);
+    push_u32(&mut out, base);
+    push_u32(&mut out, loaded);
+    push_u32(&mut out, loaded);
+    push_u32(&mut out, 0x4 | 0x1);
+    push_u32(&mut out, 0x1000);
+
+    out.extend_from_slice(text);
+    let mut debug_at: Vec<u32> = Vec::with_capacity(debug.len());
+    for (_, data) in debug {
+        let at = align4(out.len() as u32);
+        pad_to(&mut out, at);
+        debug_at.push(at);
+        out.extend_from_slice(data);
+    }
+    let shstrtab_off = align4(out.len() as u32);
+    pad_to(&mut out, shstrtab_off);
+    out.extend_from_slice(&shstrtab);
+    let shoff = align4(out.len() as u32);
+    pad_to(&mut out, shoff);
+    out[e_shoff_at..e_shoff_at + 4].copy_from_slice(&shoff.to_le_bytes());
+
+    push_shdr(&mut out, &Shdr::null());
+    push_shdr(
+        &mut out,
+        &Shdr {
+            name: text_name,
+            typ: 1,
+            flags: 0x2 | 0x4,
+            addr: base + text_off,
+            offset: text_off,
+            size: text.len() as u32,
+            link: 0,
+            info: 0,
+            addralign: 4,
+            entsize: 0,
+        },
+    );
+    for (i, (_, data)) in debug.iter().enumerate() {
+        push_shdr(
+            &mut out,
+            &Shdr {
+                name: debug_names[i],
+                typ: 1,
+                flags: 0,
+                addr: 0,
+                offset: debug_at[i],
+                size: data.len() as u32,
+                link: 0,
+                info: 0,
+                addralign: 1,
+                entsize: 0,
+            },
+        );
+    }
+    push_shdr(
+        &mut out,
+        &Shdr {
+            name: shstrtab_name,
+            typ: 3,
+            flags: 0,
+            addr: 0,
+            offset: shstrtab_off,
+            size: shstrtab.len() as u32,
+            link: 0,
+            info: 0,
+            addralign: 1,
+            entsize: 0,
+        },
+    );
+    out
 }
 
 fn write_executable_impl(
@@ -517,6 +844,11 @@ fn align4(x: u32) -> u32 {
     (x + 3) & !3
 }
 
+/// Rounds `x` up to a multiple of `align`, which must be a power of two and at least 1.
+fn align_up(x: u32, align: u32) -> u32 {
+    x.div_ceil(align) * align
+}
+
 fn pad_to(v: &mut Vec<u8>, off: u32) {
     while (v.len() as u32) < off {
         v.push(0);
@@ -549,11 +881,13 @@ fn sym_entry(
     e
 }
 
-/// The fields of one `Elf32_Shdr` we set (`sh_addr` is always 0 in a relocatable object).
+/// The fields of one `Elf32_Shdr` we set. `addr` is 0 in a relocatable object (nothing is placed
+/// yet) and in any non-allocated section; an executable's `.text` carries its load address there.
 struct Shdr {
     name: u32,
     typ: u32,
     flags: u32,
+    addr: u32,
     offset: u32,
     size: u32,
     link: u32,
@@ -568,6 +902,7 @@ impl Shdr {
             name: 0,
             typ: 0,
             flags: 0,
+            addr: 0,
             offset: 0,
             size: 0,
             link: 0,
@@ -582,7 +917,7 @@ fn push_shdr(v: &mut Vec<u8>, s: &Shdr) {
     push_u32(v, s.name);
     push_u32(v, s.typ);
     push_u32(v, s.flags);
-    push_u32(v, 0);
+    push_u32(v, s.addr);
     push_u32(v, s.offset);
     push_u32(v, s.size);
     push_u32(v, s.link);
@@ -623,6 +958,15 @@ pub struct ParsedSymbol {
     pub kind: SymbolType,
     /// Whether the symbol is defined here (`st_shndx != SHN_UNDEF`).
     pub defined: bool,
+    /// For a symbol defined in a CARRIED section ([`Section`]), its index into [`Object::sections`],
+    /// with [`Self::value`] an offset within that section. `None` for a symbol in the merged code
+    /// blob (where `value` is a [`Object::text`] offset), an undefined symbol, or an absolute one.
+    ///
+    /// This is what makes DWARF relocatable at all: a `.debug_*` relocation names its target with a
+    /// nameless `STT_SECTION` symbol (`st_name` is 0 -- the section's name lives in the section
+    /// header, not the string table), so a purely NAME-keyed linker cannot resolve it. The section
+    /// index is the only handle such a symbol has.
+    pub section: Option<u32>,
 }
 
 /// A relocation parsed from an object's `.rela.text` (explicit addend) or `.rel.text` (implicit).
@@ -656,6 +1000,10 @@ pub struct Object {
     pub symbols: Vec<ParsedSymbol>,
     /// The `.text` relocations.
     pub relocations: Vec<ParsedRelocation>,
+    /// Sections carried through the link rather than merged into [`Self::text`] -- today the DWARF
+    /// `.debug_*` family (see [`Section`]). Empty for an object with no debug info, which is every
+    /// object the AOT backend emits today, so the code path costs nothing when it is not in use.
+    pub sections: Vec<ParsedSection>,
 }
 
 fn rd_u16(bytes: &[u8], o: usize) -> Result<u16, ElfError> {
@@ -749,6 +1097,33 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     }
     let symtab_i = symtab_i.ok_or(ElfError::MissingSymbolTable)?;
 
+    let mut sections: Vec<ParsedSection> = Vec::new();
+    let mut carried_of: Vec<Option<u32>> = Vec::new();
+    carried_of.resize(e_shnum, None);
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..e_shnum {
+        let name = sec_name(i)?;
+        if sh(i, SH_TYPE)? != 1
+            || sh(i, SH_FLAGS)? & SHF_ALLOC != 0
+            || !name.starts_with(DEBUG_SECTION_PREFIX)
+        {
+            continue;
+        }
+        let off = sh(i, SH_OFFSET)? as usize;
+        let size = sh(i, SH_SIZE)? as usize;
+        carried_of[i] = Some(sections.len() as u32);
+        sections.push(ParsedSection {
+            name: String::from(name),
+            flags: sh(i, SH_FLAGS)?,
+            addralign: sh(i, SH_ADDRALIGN)?.max(1),
+            data: bytes
+                .get(off..off + size)
+                .ok_or(ElfError::Truncated)?
+                .to_vec(),
+            relocations: Vec::new(),
+        });
+    }
+
     let strtab_off = sh(sh(symtab_i, SH_LINK)? as usize, SH_OFFSET)? as usize;
     let symtab_off = sh(symtab_i, SH_OFFSET)? as usize;
     let symtab_size = sh(symtab_i, SH_SIZE)? as usize;
@@ -765,16 +1140,20 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             2 => Binding::Weak,
             _ => Binding::Local,
         };
-        let kind = if st_info & 0xf == 2 {
-            SymbolType::Func
-        } else {
-            SymbolType::NoType
+        let kind = match st_info & 0xf {
+            2 => SymbolType::Func,
+            3 => SymbolType::Section,
+            _ => SymbolType::NoType,
         };
-        let rebase = section_base
-            .get(st_shndx as usize)
-            .copied()
-            .flatten()
-            .unwrap_or(0);
+        let carried = carried_of.get(st_shndx as usize).copied().flatten();
+        let rebase = match carried {
+            Some(_) => 0,
+            None => section_base
+                .get(st_shndx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(0),
+        };
         symbols.push(ParsedSymbol {
             name: String::from(rd_cstr(bytes, strtab_off + st_name)?),
             value: st_value + rebase,
@@ -782,6 +1161,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             binding,
             kind,
             defined: st_shndx != SHN_UNDEF,
+            section: carried,
         });
     }
 
@@ -792,12 +1172,13 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             9 => true,
             _ => continue,
         };
-        let Some(target_base) = section_base
-            .get(sh(ri, SH_INFO)? as usize)
-            .copied()
-            .flatten()
-        else {
-            continue;
+        let applies_to = sh(ri, SH_INFO)? as usize;
+        let target = match section_base.get(applies_to).copied().flatten() {
+            Some(base) => RelocTarget::Text(base),
+            None => match carried_of.get(applies_to).copied().flatten() {
+                Some(idx) => RelocTarget::Carried(idx),
+                None => continue,
+            },
         };
         let off = sh(ri, SH_OFFSET)? as usize;
         let size = sh(ri, SH_SIZE)? as usize;
@@ -805,8 +1186,12 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         for r in 0..size / entsize {
             let base = off + r * entsize;
             let r_info = rd_u32(bytes, base + 4)?;
-            relocations.push(ParsedRelocation {
-                offset: rd_u32(bytes, base)? + target_base,
+            let parsed = ParsedRelocation {
+                offset: rd_u32(bytes, base)?
+                    + match target {
+                        RelocTarget::Text(b) => b,
+                        RelocTarget::Carried(_) => 0,
+                    },
                 symbol: r_info >> 8,
                 kind: r_info & 0xff,
                 addend: if implicit {
@@ -815,7 +1200,11 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
                     rd_u32(bytes, base + 8)? as i32
                 },
                 implicit_addend: implicit,
-            });
+            };
+            match target {
+                RelocTarget::Text(_) => relocations.push(parsed),
+                RelocTarget::Carried(idx) => sections[idx as usize].relocations.push(parsed),
+            }
         }
     }
 
@@ -825,7 +1214,16 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         text_align,
         symbols,
         relocations,
+        sections,
     })
+}
+
+/// What a relocation section applies to: the merged code blob (at the given rebase offset) or a
+/// carried section (by its [`Object::sections`] index).
+#[derive(Clone, Copy)]
+enum RelocTarget {
+    Text(u32),
+    Carried(u32),
 }
 
 /// One object member of an archive: its name and the parsed object.
@@ -919,6 +1317,10 @@ fn resolve_ar_name(raw: &[u8], long_names: &[u8]) -> Result<String, ElfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sh_addr`'s byte offset in an `Elf32_Shdr`. Only the tests read it: a relocatable object's
+    /// is always 0, so the parser has no use for it.
+    const SH_ADDR: usize = 12;
 
     #[test]
     fn emits_a_well_formed_relocatable_object() {
@@ -1143,5 +1545,217 @@ mod tests {
             read_archive(b"not an ar").unwrap_err(),
             ElfError::NotArchive
         );
+    }
+
+    #[test]
+    fn write_debuggable_executable_carries_debug_sections_outside_the_load_segment() {
+        let text = [0x2a, 0x20, 0x70, 0x47];
+        let info = [0x11u8; 7];
+        let abbrev = [0x22u8; 5];
+        let exe = write_debuggable_executable(
+            Machine::Arm,
+            &text,
+            0,
+            0x1_0000,
+            true,
+            &[(".debug_info", &info), (".debug_abbrev", &abbrev)],
+        );
+        assert_eq!(u16::from_le_bytes([exe[16], exe[17]]), 2);
+        assert_eq!(u16::from_le_bytes([exe[18], exe[19]]), 40);
+        assert_eq!(u16::from_le_bytes([exe[48], exe[49]]), 5);
+        assert_eq!(u16::from_le_bytes([exe[50], exe[51]]), 4);
+        assert_eq!(
+            u32::from_le_bytes([exe[24], exe[25], exe[26], exe[27]]),
+            (0x1_0000 + 84) | 1
+        );
+
+        let p_filesz = u32::from_le_bytes([exe[68], exe[69], exe[70], exe[71]]);
+        let p_memsz = u32::from_le_bytes([exe[72], exe[73], exe[74], exe[75]]);
+        assert_eq!(p_filesz, 84 + text.len() as u32);
+        assert_eq!(p_memsz, p_filesz);
+        assert!(exe.len() as u32 > p_filesz, "debug data follows the segment");
+
+        let shoff = u32::from_le_bytes([exe[32], exe[33], exe[34], exe[35]]) as usize;
+        let shdr = |i: usize, field: usize| {
+            let o = shoff + i * SHDR_SIZE as usize + field;
+            u32::from_le_bytes([exe[o], exe[o + 1], exe[o + 2], exe[o + 3]])
+        };
+        let shstrtab_off = shdr(4, SH_OFFSET) as usize;
+        let name_of = |i: usize| rd_cstr(&exe, shstrtab_off + shdr(i, SH_NAME) as usize).unwrap();
+
+        assert_eq!(name_of(1), ".text");
+        assert_eq!(shdr(1, SH_FLAGS), 0x2 | 0x4);
+        assert_eq!(shdr(1, SH_ADDR), 0x1_0000 + 84);
+
+        for (i, (name, data)) in [(".debug_info", &info[..]), (".debug_abbrev", &abbrev[..])]
+            .iter()
+            .enumerate()
+        {
+            let si = 2 + i;
+            assert_eq!(name_of(si), *name);
+            assert_eq!(shdr(si, SH_FLAGS), 0, "{name} must not be SHF_ALLOC");
+            assert_eq!(shdr(si, SH_ADDR), 0, "{name} must have no address");
+            assert_eq!(shdr(si, SH_SIZE) as usize, data.len());
+            let off = shdr(si, SH_OFFSET) as usize;
+            assert_eq!(&exe[off..off + data.len()], *data, "{name} bytes round-trip");
+        }
+    }
+
+    #[test]
+    fn emitted_debug_sections_round_trip_through_the_reader() {
+        let text = [0x13, 0x05, 0xa0, 0x02, 0x67, 0x80, 0x00, 0x00];
+        let abbrev = [0x11u8, 0x22, 0x33];
+        let info = [0u8; 8];
+        let info_relocs = [
+            Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: riscv::R_RISCV_32,
+                addend: 0,
+            },
+            Relocation {
+                offset: 4,
+                symbol: 0,
+                kind: riscv::R_RISCV_32,
+                addend: 0,
+            },
+        ];
+        let symbols = [
+            Symbol {
+                name: "answer",
+                value: 0,
+                size: text.len() as u32,
+                binding: Binding::Global,
+                kind: SymbolType::Func,
+                section: SymbolSection::Text,
+            },
+            Symbol {
+                name: "",
+                value: 0,
+                size: 0,
+                binding: Binding::Local,
+                kind: SymbolType::Section,
+                section: SymbolSection::InSection(0),
+            },
+        ];
+        let sections = [
+            Section {
+                name: ".debug_abbrev",
+                flags: 0,
+                addralign: 1,
+                data: &abbrev,
+                relocations: &[],
+            },
+            Section {
+                name: ".debug_info",
+                flags: 0,
+                addralign: 1,
+                data: &info,
+                relocations: &info_relocs,
+            },
+        ];
+        let obj = read_object(&write_relocatable_object_with_sections(
+            Machine::RiscV,
+            &text,
+            &symbols,
+            &[],
+            &sections,
+        ))
+        .expect("an object with emitted debug sections reads back");
+
+        assert_eq!(obj.text, text, ".text is untouched by the debug sections");
+        let names: Vec<&str> = obj.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, [".debug_abbrev", ".debug_info"]);
+        assert_eq!(obj.sections[0].data, abbrev);
+        assert_eq!(obj.sections[1].data, info);
+        assert!(
+            obj.sections[0].relocations.is_empty(),
+            "a section with no relocations gets no .rela"
+        );
+
+        let relocs = &obj.sections[1].relocations;
+        assert_eq!(relocs.len(), 2);
+        assert_eq!(relocs[0].offset, 0);
+        assert_eq!(relocs[1].offset, 4);
+
+        let to_abbrev = &obj.symbols[relocs[0].symbol as usize];
+        assert_eq!(to_abbrev.name, "", "a section symbol is nameless");
+        assert_eq!(to_abbrev.kind, SymbolType::Section);
+        assert_eq!(to_abbrev.section, Some(0), "it names `.debug_abbrev`");
+        assert!(to_abbrev.defined);
+
+        let to_code = &obj.symbols[relocs[1].symbol as usize];
+        assert_eq!(to_code.name, "answer");
+        assert_eq!(to_code.kind, SymbolType::Func);
+        assert_eq!(
+            to_code.section, None,
+            "a code symbol is not in a carried section"
+        );
+    }
+
+    #[test]
+    fn a_section_without_relocations_does_not_shift_the_others_indices() {
+        let first_relocs = [Relocation {
+            offset: 0,
+            symbol: 0,
+            kind: arm::R_ARM_ABS32,
+            addend: 0,
+        }];
+        let last_relocs = [Relocation {
+            offset: 4,
+            symbol: 0,
+            kind: arm::R_ARM_ABS32,
+            addend: 0,
+        }];
+        let data = [0u8; 8];
+        let sections = [
+            Section {
+                name: ".debug_info",
+                flags: 0,
+                addralign: 1,
+                data: &data,
+                relocations: &first_relocs,
+            },
+            Section {
+                name: ".debug_abbrev",
+                flags: 0,
+                addralign: 1,
+                data: &data,
+                relocations: &[],
+            },
+            Section {
+                name: ".debug_line",
+                flags: 0,
+                addralign: 1,
+                data: &data,
+                relocations: &last_relocs,
+            },
+        ];
+        let obj = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0u8; 4],
+            &[Symbol {
+                name: "f",
+                value: 0,
+                size: 4,
+                binding: Binding::Global,
+                kind: SymbolType::Func,
+                section: SymbolSection::Text,
+            }],
+            &[],
+            &sections,
+        ))
+        .expect("an object with a relocation-free middle section reads back");
+        let by_name = |n: &str| {
+            obj.sections
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap_or_else(|| panic!("no {n}"))
+        };
+        assert_eq!(by_name(".debug_info").relocations.len(), 1);
+        assert_eq!(by_name(".debug_info").relocations[0].offset, 0);
+        assert!(by_name(".debug_abbrev").relocations.is_empty());
+        assert_eq!(by_name(".debug_line").relocations.len(), 1);
+        assert_eq!(by_name(".debug_line").relocations[0].offset, 4);
     }
 }

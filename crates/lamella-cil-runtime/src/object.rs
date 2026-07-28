@@ -31,17 +31,46 @@ impl ObjectRef {
 /// The in-heap representation of a `System.String`'s code units, chosen by the string
 /// storage encoding. UTF-16 by default (O(1) indexing, lone surrogates free); the
 /// `string-utf8` feature switches to UTF-8 (~half the size for ASCII text, at O(n) UTF-16
-/// indexing). Either way the [`Heap::as_string`] seam presents .NET UTF-16 semantics.
-/// (The surrogate-preserving WTF-8 tier is future.)
-#[cfg(not(feature = "string-utf8"))]
+/// indexing) and `string-utf8-wtf8` to WTF-8 (the same size, and a lone surrogate survives
+/// too). Either way the [`Heap::as_string`] seam presents .NET UTF-16 semantics.
+///
+/// # Why three tiers and not two
+///
+/// The two byte tiers are not a refinement of each other, they trade opposite guarantees.
+/// `string-utf8` guarantees the backing bytes are ALWAYS valid UTF-8, so a UTF-8-native
+/// consumer (a socket write, an `LPUTF8Str` marshal) needs no validation pass -- and pays
+/// for it by being unable to hold a lone surrogate. `string-utf8-wtf8` holds every String
+/// the UTF-16 tier can and is byte-identical to UTF-8 for well-formed text, so egress is a
+/// copy in the normal case -- but its bytes are not guaranteed valid UTF-8, so the consumer
+/// needs the check the other tier makes unnecessary. Neither dominates; they are picked per
+/// build, and `string-utf8-wtf8` wins when both are set (matching `lamella-aot`, so the
+/// interpreter previews the tier an AOT build of the same profile would use).
+#[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
 type StrStore = Box<[u16]>;
-#[cfg(feature = "string-utf8")]
+#[cfg(any(feature = "string-utf8", feature = "string-utf8-wtf8"))]
 type StrStore = Box<[u8]>;
 
+/// A code unit the storage tier cannot hold, and where it sat: the encoder's refusal.
+///
+/// Only the well-formed UTF-8 tier ever produces one, and only for a lone surrogate. The two
+/// fields are named for the `System.Text.EncoderFallbackException` properties they become --
+/// `CharUnknown` and `Index` -- and `index` counts UTF-16 CODE UNITS, not scalars, which is
+/// what .NET reports (a lone surrogate after one supplementary character is at index 2, not 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnencodableChar {
+    /// The code unit that could not be encoded (a lone surrogate).
+    pub char_unknown: u16,
+    /// Its position in the input, counted in UTF-16 code units.
+    pub index: u32,
+}
+
 /// Encodes UTF-16 code units into the backing [`StrStore`] (UTF-16: the units verbatim).
-#[cfg(not(feature = "string-utf8"))]
-fn encode_string(units: &[u16]) -> StrStore {
-    units.into()
+///
+/// Infallible on this tier: `System.String`'s value space IS the input's, so there is nothing
+/// to reject. The `Result` is the seam's shape, not this tier's -- see the `string-utf8` twin.
+#[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
+fn encode_string(units: &[u16]) -> Result<StrStore, UnencodableChar> {
+    Ok(units.into())
 }
 
 /// Decodes little-endian UTF-16 bytes (the `ldstr` pool's on-disk shape) into code units.
@@ -52,34 +81,157 @@ fn decode_le_units(bytes: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-/// Encodes UTF-16 code units into UTF-8 bytes; a lone surrogate (unrepresentable in
-/// well-formed UTF-8) re-encodes to U+FFFD -- the well-formed tier's one parity gap.
-#[cfg(feature = "string-utf8")]
-fn encode_string(units: &[u16]) -> StrStore {
+/// Encodes UTF-16 code units into UTF-8 bytes, REFUSING a lone surrogate rather than losing it.
+///
+/// This tier's `System.String` has a strictly smaller value space than .NET's: a lone surrogate
+/// has no well-formed UTF-8 form, so it cannot be stored. The refusal becomes
+/// `System.Text.EncoderFallbackException` -- .NET's established spelling for "this character
+/// could not be encoded into the target encoding", and an `ArgumentException` subclass, so a
+/// `catch (ArgumentException)` written against desktop .NET still fires.
+///
+/// It throws rather than substituting U+FFFD even though `Encoding.UTF8`'s DEFAULT fallback
+/// does substitute, because the operation here is not `GetBytes` -- it is String CONSTRUCTION,
+/// and desktop .NET never loses data doing that. A silent U+FFFD would make the two byte tiers
+/// differ by a wrong answer instead of by a raised error. `string-utf8-wtf8` is the tier that
+/// does not have to choose.
+#[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
+fn encode_string(units: &[u16]) -> Result<StrStore, UnencodableChar> {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4];
+    let mut index = 0u32;
     for scalar in core::char::decode_utf16(units.iter().copied()) {
-        let scalar = scalar.unwrap_or(core::char::REPLACEMENT_CHARACTER);
-        bytes.extend_from_slice(scalar.encode_utf8(&mut buf).as_bytes());
+        match scalar {
+            Ok(scalar) => {
+                bytes.extend_from_slice(scalar.encode_utf8(&mut buf).as_bytes());
+                index += scalar.len_utf16() as u32;
+            }
+            Err(unpaired) => {
+                return Err(UnencodableChar {
+                    char_unknown: unpaired.unpaired_surrogate(),
+                    index,
+                });
+            }
+        }
     }
-    bytes.into_boxed_slice()
+    Ok(bytes.into_boxed_slice())
 }
 
 /// Decodes the backing [`StrStore`] to UTF-16 code units, .NET `String` semantics
 /// (UTF-16: borrowed verbatim).
-#[cfg(not(feature = "string-utf8"))]
+#[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
 pub(crate) fn decode_string(store: &StrStore) -> Cow<'_, [u16]> {
     Cow::Borrowed(store)
 }
 
 /// Decodes UTF-8 bytes to UTF-16 code units (a supplementary scalar becomes a surrogate
 /// pair, so `String.Length` stays the UTF-16 unit count).
-#[cfg(feature = "string-utf8")]
+#[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
 pub(crate) fn decode_string(store: &StrStore) -> Cow<'_, [u16]> {
     let mut units = Vec::new();
     let mut buf = [0u16; 2];
     for scalar in core::str::from_utf8(store).unwrap_or("").chars() {
         units.extend_from_slice(scalar.encode_utf16(&mut buf));
+    }
+    Cow::Owned(units)
+}
+
+/// Appends `code` to `out` in UTF-8's byte form. Shared by the WTF-8 encoder; split out so
+/// the surrogate decision above it reads as the one thing that distinguishes the tier.
+#[cfg(feature = "string-utf8-wtf8")]
+fn push_code_point(code: u32, out: &mut Vec<u8>) {
+    if code < 0x80 {
+        out.push(code as u8);
+    } else if code < 0x800 {
+        out.push(0xC0 | (code >> 6) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else if code < 0x1_0000 {
+        out.push(0xE0 | (code >> 12) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else {
+        out.push(0xF0 | (code >> 18) as u8);
+        out.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    }
+}
+
+/// Encodes UTF-16 code units into WTF-8 bytes.
+///
+/// A well-formed surrogate PAIR combines to its supplementary code point and takes FOUR bytes
+/// -- that is what makes this WTF-8 and not CESU-8, and it is why the output is byte-identical
+/// to UTF-8 for every well-formed string. Anything else, including a LONE surrogate, encodes as
+/// its own code point: `U+D800` becomes `ED A0 80`, which is ill-formed UTF-8 on purpose and is
+/// exactly the parity `string-utf8` cannot offer.
+///
+/// Infallible: this tier holds every String the UTF-16 tier can, so it never refuses one.
+#[cfg(feature = "string-utf8-wtf8")]
+fn encode_string(units: &[u16]) -> Result<StrStore, UnencodableChar> {
+    let mut bytes = Vec::new();
+    let mut i = 0;
+    while i < units.len() {
+        let unit = u32::from(units[i]);
+        let code = if (0xD800..=0xDBFF).contains(&unit)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&u32::from(units[i + 1]))
+        {
+            let low = u32::from(units[i + 1]);
+            i += 2;
+            0x1_0000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+        } else {
+            i += 1;
+            unit
+        };
+        push_code_point(code, &mut bytes);
+    }
+    Ok(bytes.into_boxed_slice())
+}
+
+/// Decodes WTF-8 bytes to UTF-16 code units, the inverse of [`encode_string`].
+///
+/// `core::str::from_utf8` CANNOT be used here: it rejects the encoded-surrogate form this tier
+/// exists to store, so routing through `&str` would turn every lone surrogate into an error and
+/// lose precisely the data the tier preserves. A code point below `0x1_0000` -- surrogate range
+/// included -- comes back as one unit; a supplementary one splits back into its pair, so
+/// `String.Length` stays the UTF-16 unit count.
+///
+/// The store is produced by [`encode_string`], so its shape is an invariant rather than input:
+/// a byte sequence that could not have come from there yields `U+FFFD` and resynchronizes,
+/// which keeps a corrupted heap from being read as an unbounded loop or a panic.
+#[cfg(feature = "string-utf8-wtf8")]
+pub(crate) fn decode_string(store: &StrStore) -> Cow<'_, [u16]> {
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < store.len() {
+        let lead = store[i];
+        let (mut code, width) = if lead < 0x80 {
+            (u32::from(lead), 1)
+        } else if lead & 0xE0 == 0xC0 {
+            (u32::from(lead & 0x1F), 2)
+        } else if lead & 0xF0 == 0xE0 {
+            (u32::from(lead & 0x0F), 3)
+        } else if lead & 0xF8 == 0xF0 {
+            (u32::from(lead & 0x07), 4)
+        } else {
+            units.push(0xFFFD);
+            i += 1;
+            continue;
+        };
+        if i + width > store.len() {
+            units.push(0xFFFD);
+            break;
+        }
+        for continuation in &store[i + 1..i + width] {
+            code = (code << 6) | u32::from(continuation & 0x3F);
+        }
+        i += width;
+        if code < 0x1_0000 {
+            units.push(code as u16);
+        } else {
+            let supplementary = code - 0x1_0000;
+            units.push(0xD800 + (supplementary >> 10) as u16);
+            units.push(0xDC00 + (supplementary & 0x3FF) as u16);
+        }
     }
     Cow::Owned(units)
 }
@@ -489,13 +641,39 @@ impl Heap {
     /// computed string: concat, ToString, StringBuilder). The units are encoded into the
     /// heap's [`StrStore`] (the seam where UTF-8 / WTF-8 storage drops in). Literals go
     /// through [`Heap::intern_string`] instead.
-    pub fn alloc_string(&mut self, chars: &[u16]) -> ObjectRef {
-        self.alloc(Object::Str(encode_string(chars)))
+    ///
+    /// # Errors
+    ///
+    /// [`UnencodableChar`] when the tier cannot hold one of the units -- only the well-formed
+    /// UTF-8 tier refuses, and only a lone surrogate. The caller turns it into the managed
+    /// `System.Text.EncoderFallbackException`. Text of Rust provenance cannot hit this and
+    /// should use [`Heap::alloc_text`], whose argument type rules it out.
+    pub fn alloc_string(&mut self, chars: &[u16]) -> Result<ObjectRef, UnencodableChar> {
+        Ok(self.alloc(Object::Str(encode_string(chars)?)))
+    }
+
+    /// Allocates a `System.String` from Rust text.
+    ///
+    /// Infallible BY THE ARGUMENT TYPE, on every tier: a `&str` is well-formed UTF-8, so its
+    /// UTF-16 form contains no lone surrogate and no tier's encoder can refuse it. This is the
+    /// path for text the RUNTIME produced -- a fault message, a type name, a formatted number
+    /// -- as opposed to units of program provenance, which go through [`Heap::alloc_string`]
+    /// and can be refused. It also skips the round trip through UTF-16 on the byte tiers.
+    pub fn alloc_text(&mut self, text: &str) -> ObjectRef {
+        #[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
+        let store: StrStore = text.encode_utf16().collect::<Vec<u16>>().into_boxed_slice();
+        #[cfg(any(feature = "string-utf8", feature = "string-utf8-wtf8"))]
+        let store: StrStore = text.as_bytes().into();
+        self.alloc(Object::Str(store))
     }
 
     /// Allocates a fresh string given as little-endian UTF-16 BYTES (the frozen `ldstr`
     /// pool's shape -- a flash slice needs no alignment to be read this way).
-    pub fn alloc_string_le(&mut self, bytes: &[u8]) -> ObjectRef {
+    ///
+    /// # Errors
+    ///
+    /// As [`Heap::alloc_string`].
+    pub fn alloc_string_le(&mut self, bytes: &[u8]) -> Result<ObjectRef, UnencodableChar> {
         let units = decode_le_units(bytes);
         self.alloc_string(&units)
     }
@@ -504,17 +682,25 @@ impl Heap {
     /// III.4.16 -- every `ldstr` of the same character sequence yields the SAME object,
     /// across modules. Interned strings stay live across collections (the table is a
     /// strong root) and relocate with the survivors.
-    pub fn intern_string(&mut self, chars: &[u16]) -> ObjectRef {
+    /// # Errors
+    ///
+    /// As [`Heap::alloc_string`] -- a literal the tier cannot hold is refused at its FIRST
+    /// `ldstr` and never enters the pool, so the refusal does not depend on interning order.
+    pub fn intern_string(&mut self, chars: &[u16]) -> Result<ObjectRef, UnencodableChar> {
         if let Some(&existing) = self.intern.get(chars) {
-            return existing;
+            return Ok(existing);
         }
-        let reference = self.alloc_string(chars);
+        let reference = self.alloc_string(chars)?;
         self.intern.insert(chars.to_vec(), reference);
-        reference
+        Ok(reference)
     }
 
     /// [`Heap::intern_string`] over little-endian UTF-16 bytes (the `ldstr` pool's shape).
-    pub fn intern_string_le(&mut self, bytes: &[u8]) -> ObjectRef {
+    ///
+    /// # Errors
+    ///
+    /// As [`Heap::intern_string`].
+    pub fn intern_string_le(&mut self, bytes: &[u8]) -> Result<ObjectRef, UnencodableChar> {
         let units = decode_le_units(bytes);
         self.intern_string(&units)
     }
@@ -640,8 +826,8 @@ impl Heap {
         }
     }
 
-    /// The type id of the instance at `reference`, if it is an instance (the basis
-    /// for virtual dispatch once that lands).
+    /// The type id of the instance at `reference`, if it is an instance -- the basis a virtual
+    /// dispatch resolves through.
     #[must_use]
     pub fn type_of(&self, reference: ObjectRef) -> Option<u32> {
         match self.get(reference)? {
@@ -992,6 +1178,131 @@ impl Heap {
                     true
                 }
             },
+            _ => false,
+        }
+    }
+
+    /// Moves `length` elements from `source[source_index]` to `destination[destination_index]`
+    /// in their STORED representation (`System.Array.Copy`): a packed primitive range moves as one
+    /// contiguous byte range, a boxed-slot range slot by slot. Overlapping ranges within a single
+    /// array move as if through a temporary, so a self-copy in either direction is correct.
+    ///
+    /// Returns `false` having copied NOTHING when the pair cannot be moved verbatim: two different
+    /// element representations (a widening copy, or a packed array against a boxed-slot one), a
+    /// covariant store that needs a per-element type check, a non-array operand, or a range outside
+    /// either array. `Array.Copy` answers a `false` by running its untyped element seam, which
+    /// handles those cases one element at a time -- so declining is always safe, never lossy.
+    ///
+    /// Two primitive arrays must agree on their element kind EXACTLY. The same-width signed/unsigned
+    /// interchange the CLR permits (`int[]` to `uint[]`) is bit-identical and would be sound to move,
+    /// but distinguishing it from the same-width pairs that are NOT interchangeable (`int[]` against
+    /// `float[]`, which must not be reinterpreted) needs the element-compatibility relation the
+    /// interpreter holds, not the storage kind. Those pairs keep the untyped seam: correct, just not
+    /// accelerated.
+    pub fn copy_range(
+        &mut self,
+        source: ObjectRef,
+        source_index: usize,
+        destination: ObjectRef,
+        destination_index: usize,
+        length: usize,
+    ) -> bool {
+        let (Some(source_end), Some(destination_end)) = (
+            source_index.checked_add(length),
+            destination_index.checked_add(length),
+        ) else {
+            return false;
+        };
+        match (self.get(source), self.get(destination)) {
+            (
+                Some(Object::Array { store: from, .. }),
+                Some(Object::Array { store: into, .. }),
+            ) if source_end <= from.len() && destination_end <= into.len() => {}
+            _ => return false,
+        }
+        if length == 0 {
+            return true;
+        }
+        if source == destination {
+            let Some(Object::Array { store, .. }) = self.objects.get_mut(source.0 as usize) else {
+                return false;
+            };
+            match store {
+                ArrayStorage::Packed { bytes, kind } => {
+                    let width = kind.byte_width();
+                    bytes.copy_within(
+                        source_index * width..source_end * width,
+                        destination_index * width,
+                    );
+                }
+                ArrayStorage::Values(elements) => {
+                    if destination_index > source_index {
+                        for offset in (0..length).rev() {
+                            let value = elements[source_index + offset].clone();
+                            elements[destination_index + offset] = value;
+                        }
+                    } else {
+                        for offset in 0..length {
+                            let value = elements[source_index + offset].clone();
+                            elements[destination_index + offset] = value;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        let source_slot = source.0 as usize;
+        let destination_slot = destination.0 as usize;
+        let (source_object, destination_object) = if source_slot < destination_slot {
+            let (before, from_destination) = self.objects.split_at_mut(destination_slot);
+            (&mut before[source_slot], &mut from_destination[0])
+        } else {
+            let (before, from_source) = self.objects.split_at_mut(source_slot);
+            (&mut from_source[0], &mut before[destination_slot])
+        };
+        let (
+            Object::Array {
+                store: source_store,
+                element_type: source_element,
+            },
+            Object::Array {
+                store: destination_store,
+                element_type: destination_element,
+            },
+        ) = (source_object, destination_object)
+        else {
+            return false;
+        };
+        match (source_store, destination_store) {
+            (
+                ArrayStorage::Packed {
+                    bytes: source_bytes,
+                    kind: source_kind,
+                },
+                ArrayStorage::Packed {
+                    bytes: destination_bytes,
+                    kind: destination_kind,
+                },
+            ) => {
+                if source_kind != destination_kind {
+                    return false;
+                }
+                let width = source_kind.byte_width();
+                destination_bytes[destination_index * width..destination_end * width]
+                    .copy_from_slice(&source_bytes[source_index * width..source_end * width]);
+                true
+            }
+            (
+                ArrayStorage::Values(source_elements),
+                ArrayStorage::Values(destination_elements),
+            ) => {
+                if *destination_element != 0 && *destination_element != *source_element {
+                    return false;
+                }
+                destination_elements[destination_index..destination_end]
+                    .clone_from_slice(&source_elements[source_index..source_end]);
+                true
+            }
             _ => false,
         }
     }
@@ -1599,8 +1910,8 @@ mod gc_tests {
     #[test]
     fn collect_reclaims_unreachable_and_relocates_live() {
         let mut heap = Heap::new();
-        let kept = heap.alloc_string(&[b'a' as u16]);
-        let _garbage = heap.alloc_string(&[b'x' as u16]);
+        let kept = heap.alloc_text("a");
+        let _garbage = heap.alloc_text("x");
         let root = heap.alloc_instance(7, alloc::vec![Value::Object(kept)]);
         assert_eq!(heap.object_count(), 3);
 
@@ -1622,15 +1933,15 @@ mod gc_tests {
     #[test]
     fn interned_strings_survive_collection_and_relocate() {
         let mut heap = Heap::new();
-        let _garbage = heap.alloc_string(&[b'x' as u16]);
-        let interned = heap.intern_string(&[b'i' as u16]);
-        assert_eq!(heap.intern_string(&[b'i' as u16]), interned);
-        assert_ne!(heap.alloc_string(&[b'i' as u16]), interned);
+        let _garbage = heap.alloc_text("x");
+        let interned = heap.intern_string(&[b'i' as u16]).expect("ASCII");
+        assert_eq!(heap.intern_string(&[b'i' as u16]), Ok(interned));
+        assert_ne!(heap.alloc_text("i"), interned);
 
         heap.collect(|_visit| {});
 
         assert_eq!(heap.object_count(), 1);
-        let relocated = heap.intern_string(&[b'i' as u16]);
+        let relocated = heap.intern_string(&[b'i' as u16]).expect("ASCII");
         assert_eq!(heap.object_count(), 1);
         assert_eq!(heap.as_string(relocated).as_deref(), Some(&[b'i' as u16][..]));
     }
@@ -1638,7 +1949,7 @@ mod gc_tests {
     #[test]
     fn weak_cell_does_not_keep_its_target_alive_and_is_cleared() {
         let mut heap = Heap::new();
-        let target = heap.alloc_string(&[b'w' as u16]);
+        let target = heap.alloc_text("w");
         let cell = heap.alloc_weak(Value::Object(target));
         let mut roots = alloc::vec![Value::Object(cell)];
         heap.collect(|visit| roots.iter_mut().for_each(visit));
@@ -1654,8 +1965,8 @@ mod gc_tests {
     #[test]
     fn weak_cell_forwards_a_target_that_survives_via_a_strong_root() {
         let mut heap = Heap::new();
-        let _garbage = heap.alloc_string(&[b'x' as u16]);
-        let target = heap.alloc_string(&[b'k' as u16]);
+        let _garbage = heap.alloc_text("x");
+        let target = heap.alloc_text("k");
         let cell = heap.alloc_weak(Value::Object(target));
         let keeper = heap.alloc_instance(3, alloc::vec![Value::Object(target)]);
         let mut roots = alloc::vec![Value::Object(cell), Value::Object(keeper)];
@@ -1684,7 +1995,7 @@ mod gc_tests {
     #[test]
     fn packed_array_relocates_with_bytes_intact_and_element_pointers_forwarded() {
         let mut heap = Heap::new();
-        let _garbage = heap.alloc_string(&[b'x' as u16]);
+        let _garbage = heap.alloc_text("x");
         let array = heap.alloc_packed_array(PrimKind::U1, 4, 0);
         assert!(heap.array_set(array, 2, Value::Int32(0xAB)));
         let mut roots = alloc::vec![Value::ByRef(Location::Element {
@@ -1708,11 +2019,147 @@ mod gc_tests {
 mod tests {
     use super::*;
 
+    /// The WTF-8 byte forms, taken from the encoding rules rather than from our own encoder --
+    /// an expectation produced by the thing under test proves only that it is self-consistent.
+    /// `U+D800` is the case the whole tier exists for: `1101 1000 0000 0000` laid into the
+    /// three-byte frame `1110xxxx 10xxxxxx 10xxxxxx` gives `ED A0 80`, which is ill-formed
+    /// UTF-8 and well-formed WTF-8.
+    #[cfg(feature = "string-utf8-wtf8")]
+    const WTF8_VECTORS: &[(&[u16], &[u8])] = &[
+        (&[0x0041], &[0x41]),
+        (&[0x00E9], &[0xC3, 0xA9]),
+        (&[0x20AC], &[0xE2, 0x82, 0xAC]),
+        (&[0xD83D, 0xDE00], &[0xF0, 0x9F, 0x98, 0x80]),
+        (&[0xD800], &[0xED, 0xA0, 0x80]),
+        (&[0xDFFF], &[0xED, 0xBF, 0xBF]),
+    ];
+
+    /// Encoding is byte-exact against the hand-derived vectors, in both directions.
+    ///
+    /// The supplementary row is the one that separates WTF-8 from CESU-8: a well-formed pair
+    /// must combine into FOUR bytes, not encode as two three-byte surrogates. A CESU-8 encoder
+    /// passes every other row here and fails that one.
+    #[cfg(feature = "string-utf8-wtf8")]
+    #[test]
+    fn wtf8_encodes_and_decodes_the_spec_vectors() {
+        for (units, bytes) in WTF8_VECTORS {
+            let encoded = encode_string(units).expect("WTF-8 refuses nothing");
+            assert_eq!(&encoded[..], *bytes, "encoding {units:04X?}");
+            assert_eq!(&decode_string(&encoded)[..], *units, "decoding {bytes:02X?}");
+        }
+    }
+
+    /// The property the tier is FOR: a lone surrogate survives storage. Under `string-utf8` this
+    /// same construction is REFUSED, so this test is what distinguishes the two byte tiers rather
+    /// than merely exercising one -- `well_formed_utf8_refuses_a_lone_surrogate` is its inverse,
+    /// and the two together are why neither tier is a refinement of the other.
+    #[cfg(feature = "string-utf8-wtf8")]
+    #[test]
+    fn wtf8_round_trips_a_lone_surrogate_through_the_heap() {
+        let mut heap = Heap::new();
+        let mixed = [0x0048u16, 0xD800, 0x0069];
+        let reference = heap.alloc_string(&mixed).expect("WTF-8 refuses nothing");
+        assert_eq!(heap.as_string(reference).as_deref(), Some(&mixed[..]));
+    }
+
+    /// A supplementary character occupies TWO UTF-16 units after the round trip, so
+    /// `String.Length` keeps .NET's semantics on a tier that stores one code point.
+    #[cfg(feature = "string-utf8-wtf8")]
+    #[test]
+    fn wtf8_keeps_utf16_length_semantics() {
+        let mut heap = Heap::new();
+        let reference = heap
+            .alloc_string(&[0xD83D, 0xDE00])
+            .expect("a well-formed pair is representable");
+        assert_eq!(heap.as_string(reference).unwrap().len(), 2);
+        assert_eq!(encode_string(&[0xD83D, 0xDE00]).unwrap().len(), 4);
+    }
+
+    /// A byte sequence [`encode_string`] could not have produced must not hang or panic the
+    /// decoder -- a corrupted heap should read as replacement characters, not as a crash.
+    #[cfg(feature = "string-utf8-wtf8")]
+    #[test]
+    fn wtf8_decoder_resynchronizes_on_bytes_it_could_not_have_written() {
+        let store: StrStore = vec![0x80, 0x41, 0xE2, 0x82].into_boxed_slice();
+        let units = decode_string(&store);
+        assert_eq!(&units[..], &[0xFFFD, 0x0041, 0xFFFD]);
+    }
+
+    /// The well-formed tier's parity gap, PINNED rather than described in a comment: a lone
+    /// surrogate cannot be stored here, so the construction is REFUSED. It used to come back as
+    /// U+FFFD, which is what this test asserted; the replacement was silent data loss at String
+    /// construction, and this is the assertion that changed when it stopped.
+    ///
+    /// The refusal reports the unit and its position, because those become the managed
+    /// `EncoderFallbackException`'s `CharUnknown` and `Index`.
+    #[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
+    #[test]
+    fn well_formed_utf8_refuses_a_lone_surrogate() {
+        let mut heap = Heap::new();
+        assert_eq!(
+            heap.alloc_string(&[0x0048, 0xD800, 0x0069]),
+            Err(UnencodableChar {
+                char_unknown: 0xD800,
+                index: 1,
+            })
+        );
+        assert_eq!(heap.object_count(), 0);
+    }
+
+    /// The refusal's index counts UTF-16 CODE UNITS, not scalars: the lone surrogate here sits at
+    /// unit 2 and scalar 1, because the supplementary character before it occupies two units.
+    /// .NET reports 2 (measured against `Encoding.GetBytes` under `EncoderExceptionFallback`), and
+    /// the two numbers only diverge once a supplementary character precedes the offending one --
+    /// which is why the simpler case above cannot catch this being wrong.
+    #[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
+    #[test]
+    fn the_refusal_index_counts_utf16_units_not_scalars() {
+        let mut heap = Heap::new();
+        assert_eq!(
+            heap.alloc_string(&[0xD83D, 0xDE00, 0xD800]),
+            Err(UnencodableChar {
+                char_unknown: 0xD800,
+                index: 2,
+            })
+        );
+    }
+
+    /// A lone LOW surrogate is refused too, and reports itself rather than the high half: the
+    /// encoder has no pair to report and `CharUnknown` is the unit it actually met.
+    #[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
+    #[test]
+    fn well_formed_utf8_refuses_a_lone_low_surrogate() {
+        let mut heap = Heap::new();
+        assert_eq!(
+            heap.alloc_string(&[0xDFFF]),
+            Err(UnencodableChar {
+                char_unknown: 0xDFFF,
+                index: 0,
+            })
+        );
+    }
+
+    /// The refusal is about the STORAGE, not about surrogates as such: a well-formed pair encodes
+    /// to its four-byte code point and is accepted. Without this, "refuses a lone surrogate" would
+    /// pass equally well for an encoder that refused every surrogate unit it saw.
+    #[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
+    #[test]
+    fn well_formed_utf8_accepts_a_surrogate_pair() {
+        let mut heap = Heap::new();
+        let reference = heap
+            .alloc_string(&[0x0048, 0xD83D, 0xDE00, 0x0069])
+            .expect("a well-formed pair is representable");
+        assert_eq!(
+            heap.as_string(reference).as_deref(),
+            Some(&[0x0048u16, 0xD83D, 0xDE00, 0x0069][..])
+        );
+    }
+
     #[test]
     fn allocated_objects_are_distinct_and_retrievable() {
         let mut heap = Heap::new();
-        let a = heap.alloc_string(&[b'h' as u16, b'i' as u16]);
-        let b = heap.alloc_string(&[b'y' as u16, b'o' as u16]);
+        let a = heap.alloc_text("hi");
+        let b = heap.alloc_text("yo");
         assert_ne!(a, b);
         assert_eq!(
             heap.as_string(a).as_deref(),
@@ -1728,13 +2175,13 @@ mod tests {
     fn object_budget_reports_at_and_over_the_ceiling() {
         let mut heap = Heap::new();
         assert!(!heap.at_budget());
-        heap.alloc_string(&[b'a' as u16]);
+        heap.alloc_text("a");
         assert!(!heap.at_budget());
         heap.set_object_budget(Some(2));
         assert!(!heap.at_budget());
-        heap.alloc_string(&[b'b' as u16]);
+        heap.alloc_text("b");
         assert!(heap.at_budget());
-        heap.alloc_string(&[b'c' as u16]);
+        heap.alloc_text("c");
         assert!(heap.at_budget());
         heap.set_object_budget(None);
         assert!(!heap.at_budget());
@@ -1750,7 +2197,7 @@ mod tests {
         assert!(heap.set_instance_field(object, 0, Value::Int32(42)));
         assert_eq!(heap.instance_field(object, 0), Some(Value::Int32(42)));
         assert!(!heap.set_instance_field(object, 9, Value::Int32(1)));
-        let text = heap.alloc_string(&[b'x' as u16]);
+        let text = heap.alloc_text("x");
         assert_eq!(heap.type_of(text), None);
         assert!(!heap.set_instance_field(text, 0, Value::Int32(1)));
     }
@@ -1769,6 +2216,94 @@ mod tests {
         assert_eq!(heap.array_get(array, 512), None);
         assert_eq!(heap.array_rank(array), Some(1));
         assert_eq!(heap.array_dimension(array, 0), Some(512));
+    }
+
+    #[test]
+    fn copy_range_moves_a_packed_range_between_two_arrays() {
+        let mut heap = Heap::new();
+        let source = heap.alloc_packed_array(PrimKind::I4, 5, 7);
+        let destination = heap.alloc_packed_array(PrimKind::I4, 5, 7);
+        for index in 0..5 {
+            assert!(heap.array_set(source, index, Value::Int32(10 * (index as i32 + 1))));
+        }
+        assert!(heap.copy_range(source, 1, destination, 0, 3));
+        assert_eq!(heap.array_get(destination, 0), Some(Value::Int32(20)));
+        assert_eq!(heap.array_get(destination, 1), Some(Value::Int32(30)));
+        assert_eq!(heap.array_get(destination, 2), Some(Value::Int32(40)));
+        assert_eq!(heap.array_get(destination, 3), Some(Value::Int32(0)));
+        assert_eq!(heap.array_get(source, 1), Some(Value::Int32(20)));
+    }
+
+    #[test]
+    fn copy_range_moves_an_overlapping_range_as_if_through_a_temporary() {
+        let mut heap = Heap::new();
+        let right = heap.alloc_packed_array(PrimKind::I4, 5, 7);
+        for index in 0..5 {
+            assert!(heap.array_set(right, index, Value::Int32(index as i32 + 1)));
+        }
+        assert!(heap.copy_range(right, 0, right, 1, 4));
+        for (index, expected) in [1, 1, 2, 3, 4].iter().enumerate() {
+            assert_eq!(heap.array_get(right, index), Some(Value::Int32(*expected)));
+        }
+        let left = heap.alloc_packed_array(PrimKind::I4, 5, 7);
+        for index in 0..5 {
+            assert!(heap.array_set(left, index, Value::Int32(index as i32 + 1)));
+        }
+        assert!(heap.copy_range(left, 1, left, 0, 4));
+        for (index, expected) in [2, 3, 4, 5, 5].iter().enumerate() {
+            assert_eq!(heap.array_get(left, index), Some(Value::Int32(*expected)));
+        }
+    }
+
+    #[test]
+    fn copy_range_declines_what_it_cannot_move_verbatim() {
+        let mut heap = Heap::new();
+        let ints = heap.alloc_packed_array(PrimKind::I4, 4, 7);
+        let bytes = heap.alloc_packed_array(PrimKind::U1, 4, 8);
+        let slots = heap.alloc_array(alloc::vec![
+            Value::Int32(1),
+            Value::Int32(2),
+            Value::Int32(3),
+            Value::Int32(4)
+        ]);
+        assert!(heap.array_set(ints, 0, Value::Int32(9)));
+        assert!(!heap.copy_range(ints, 0, bytes, 0, 4));
+        assert!(!heap.copy_range(bytes, 0, ints, 0, 4));
+        assert!(!heap.copy_range(ints, 0, slots, 0, 4));
+        assert!(!heap.copy_range(slots, 0, ints, 0, 4));
+        assert_eq!(heap.array_get(bytes, 0), Some(Value::Int32(0)));
+        assert_eq!(heap.array_get(slots, 0), Some(Value::Int32(1)));
+    }
+
+    #[test]
+    fn copy_range_declines_a_range_past_either_end_without_copying() {
+        let mut heap = Heap::new();
+        let source = heap.alloc_packed_array(PrimKind::I4, 4, 7);
+        let destination = heap.alloc_packed_array(PrimKind::I4, 4, 7);
+        for index in 0..4 {
+            assert!(heap.array_set(source, index, Value::Int32(index as i32 + 1)));
+        }
+        assert!(!heap.copy_range(source, 2, destination, 0, 3));
+        assert!(!heap.copy_range(source, 0, destination, 2, 3));
+        assert!(!heap.copy_range(source, 1, destination, 0, usize::MAX));
+        assert_eq!(heap.array_get(destination, 0), Some(Value::Int32(0)));
+        assert!(heap.copy_range(source, 0, destination, 0, 0));
+        assert_eq!(heap.array_get(destination, 0), Some(Value::Int32(0)));
+    }
+
+    #[test]
+    fn copy_range_moves_reference_slots_but_declines_a_covariant_destination() {
+        let mut heap = Heap::new();
+        let source = heap.alloc_typed_array(alloc::vec![Value::Int32(1), Value::Int32(2)], 42);
+        let same_type = heap.alloc_typed_array(alloc::vec![Value::Null, Value::Null], 42);
+        let other_type = heap.alloc_typed_array(alloc::vec![Value::Null, Value::Null], 99);
+        let untracked = heap.alloc_array(alloc::vec![Value::Null, Value::Null]);
+        assert!(heap.copy_range(source, 0, same_type, 0, 2));
+        assert_eq!(heap.array_get(same_type, 1), Some(Value::Int32(2)));
+        assert!(!heap.copy_range(source, 0, other_type, 0, 2));
+        assert_eq!(heap.array_get(other_type, 0), Some(Value::Null));
+        assert!(heap.copy_range(source, 0, untracked, 0, 2));
+        assert_eq!(heap.array_get(untracked, 0), Some(Value::Int32(1)));
     }
 
     #[test]

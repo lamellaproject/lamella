@@ -1,6 +1,6 @@
-//! Nordic nRF51 flash programming over a Lamella CMSIS-DAP debug probe.
+//! Nordic nRF51 flash programming over a Lamella debug probe.
 
-use lamella_cmsis_dap::{Dap, DapError, Transport};
+use lamella_probe_core::{ProbeError, TargetAccess};
 
 const NVMC_READY: u32 = 0x4001_e400;
 const NVMC_CONFIG: u32 = 0x4001_e504;
@@ -9,18 +9,18 @@ const NVMC_REN: u32 = 0;
 const NVMC_WEN: u32 = 1;
 const NVMC_EEN: u32 = 2;
 
-/// nRF51 flash programming, added to a CMSIS-DAP [`Dap`] probe. Halt the core before erasing or
+/// nRF51 flash programming, added to a CMSIS-DAP [`TargetAccess`] probe. Halt the core before erasing or
 /// writing so it is not fetching from flash during the operation.
 pub trait Nrf51Flash {
     /// Erases the flash page containing `address` (nRF51 pages are 1 KB) via the NVMC.
-    fn erase_flash_page(&mut self, address: u32) -> Result<(), DapError>;
+    fn erase_flash_page(&mut self, address: u32) -> Result<(), ProbeError>;
     /// Programs consecutive 32-bit `words` to flash starting at `address`, via the NVMC. The target
     /// pages must already be erased.
-    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), DapError>;
+    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError>;
 }
 
-impl<T: Transport> Nrf51Flash for Dap<T> {
-    fn erase_flash_page(&mut self, address: u32) -> Result<(), DapError> {
+impl<A: TargetAccess> Nrf51Flash for A {
+    fn erase_flash_page(&mut self, address: u32) -> Result<(), ProbeError> {
         self.write_word(NVMC_CONFIG, NVMC_EEN)?;
         nvmc_wait(self)?;
         self.write_word(NVMC_ERASEPAGE, address & !0x3ff)?;
@@ -28,7 +28,7 @@ impl<T: Transport> Nrf51Flash for Dap<T> {
         self.write_word(NVMC_CONFIG, NVMC_REN)
     }
 
-    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), DapError> {
+    fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
         self.write_word(NVMC_CONFIG, NVMC_WEN)?;
         nvmc_wait(self)?;
         for (i, &word) in words.iter().enumerate() {
@@ -40,13 +40,13 @@ impl<T: Transport> Nrf51Flash for Dap<T> {
 }
 
 /// Polls the NVMC READY register until the controller is idle.
-fn nvmc_wait<T: Transport>(dap: &mut Dap<T>) -> Result<(), DapError> {
+fn nvmc_wait<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
     for _ in 0..1000 {
-        if dap.read_word(NVMC_READY)? & 1 != 0 {
+        if target.read_word(NVMC_READY)? & 1 != 0 {
             return Ok(());
         }
     }
-    Err(DapError::Timeout("flash controller"))
+    Err(ProbeError::Timeout("flash controller"))
 }
 
 /// Outcome of a successful flash deploy.
@@ -64,7 +64,7 @@ pub struct FlashReport {
 #[derive(Debug)]
 pub enum FlashError {
     /// A probe / debug-access error.
-    Dap(DapError),
+    Probe(ProbeError),
     /// Opening the probe failed (only from the `microbit` helper).
     ProbeOpen(String),
     /// A programmed word did not read back: flash verify failed at `word` (flash byte `word * 4`).
@@ -75,17 +75,17 @@ pub enum FlashError {
     },
 }
 
-impl From<DapError> for FlashError {
-    fn from(e: DapError) -> Self {
-        FlashError::Dap(e)
+impl From<ProbeError> for FlashError {
+    fn from(e: ProbeError) -> Self {
+        FlashError::Probe(e)
     }
 }
 
-/// Connect to the nRF51 over an open `dap`, erase the pages `image` spans, program it at `base`, verify
+/// Connect to the nRF51 over an open `target`, erase the pages `image` spans, program it at `base`, verify
 /// it word-for-word, and reset to run it -- the whole deploy dance (connect / halt / erase / write /
 /// verify / reset) in one call instead of ~20 lines. The image is zero-padded up to a 32-bit word.
-pub fn flash_and_run<T: Transport>(
-    dap: &mut Dap<T>,
+pub fn flash_and_run<A: TargetAccess>(
+    target: &mut A,
     base: u32,
     image: &[u8],
 ) -> Result<FlashReport, FlashError> {
@@ -98,18 +98,18 @@ pub fn flash_and_run<T: Transport>(
         })
         .collect();
 
-    dap.connect_swd()?;
-    let idcode = dap.read_idcode()?;
-    dap.init_mem()?;
-    dap.halt()?;
+    target.connect()?;
+    let idcode = target.read_idcode()?;
+    target.init_mem()?;
+    target.halt()?;
 
     let pages = (words.len() * 4).div_ceil(0x400);
     for page in 0..pages as u32 {
-        dap.erase_flash_page(base + page * 0x400)?;
+        target.erase_flash_page(base + page * 0x400)?;
     }
-    dap.write_flash(base, &words)?;
+    target.write_flash(base, &words)?;
     for (i, &expected) in words.iter().enumerate() {
-        let got = dap.read_word(base + i as u32 * 4)?;
+        let got = target.read_word(base + i as u32 * 4)?;
         if got != expected {
             return Err(FlashError::Verify {
                 word: i,
@@ -118,7 +118,7 @@ pub fn flash_and_run<T: Transport>(
             });
         }
     }
-    dap.reset_and_run()?;
+    target.reset_and_run()?;
     Ok(FlashReport {
         idcode,
         bytes: image.len(),
@@ -132,14 +132,15 @@ pub fn flash_and_run<T: Transport>(
 pub fn flash_microbit(image: &[u8]) -> Result<FlashReport, FlashError> {
     let device = lamella_usbhid::Device::open(0x0d28, 0x0204, None)
         .map_err(|e| FlashError::ProbeOpen(format!("{e:?}")))?;
-    let mut dap = Dap::new(device);
-    flash_and_run(&mut dap, 0x0, image)
+    let mut target = lamella_probe_core::ArmDap::new(lamella_cmsis_dap::Dap::new(device));
+    flash_and_run(&mut target, 0x0, image)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lamella_cmsis_dap::proto;
+    use lamella_cmsis_dap::{Dap, proto};
+    use lamella_probe_core::ArmDap;
     use lamella_cmsis_dap::testing::{Mock, echo};
 
     #[test]
@@ -158,11 +159,11 @@ mod tests {
             ack.clone(),
             ack,
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.erase_flash_page(0x0003_f000).unwrap();
-        assert_eq!(&dap.transport().sent[1][4..8], &2u32.to_le_bytes());
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.erase_flash_page(0x0003_f000).unwrap();
+        assert_eq!(&target.inner().transport().sent[1][4..8], &2u32.to_le_bytes());
         assert_eq!(
-            &dap.transport().sent[5][4..8],
+            &target.inner().transport().sent[5][4..8],
             &0x0003_f000u32.to_le_bytes()
         );
     }
@@ -183,11 +184,11 @@ mod tests {
             ack.clone(),
             ack,
         ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.write_flash(0x0003_f000, &[0xcafe_babe]).unwrap();
-        assert_eq!(&dap.transport().sent[1][4..8], &1u32.to_le_bytes());
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        target.write_flash(0x0003_f000, &[0xcafe_babe]).unwrap();
+        assert_eq!(&target.inner().transport().sent[1][4..8], &1u32.to_le_bytes());
         assert_eq!(
-            &dap.transport().sent[5][4..8],
+            &target.inner().transport().sent[5][4..8],
             &0xcafe_babeu32.to_le_bytes()
         );
     }

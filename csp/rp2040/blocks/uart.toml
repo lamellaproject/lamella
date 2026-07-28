@@ -1,18 +1,15 @@
 # BLOCK layout: the RP2040 UART -- an ARM PrimeCell PL011.
-# Transcribed from the retired v0 table (uart-rp2040.toml), whose values were SILICON-VERIFIED
-# via the old samples/pico/Rp2040Uart.cs on a Pico H: a 10/10 byte round-trip through the
-# PL011's LBE loopback and a logic analyzer's Async Serial decode of the greeting off GP0.
 # Offsets are instance-base-relative; instance bases live in ../instances.toml.
 #
 # Cross-block bring-up (XOSC start, clk_peri switch, RESETS release, IO_BANK0 funcsel) is
 # DRIVER code per language, not sequence data; only block-local sequences ride
-# here. The retired table's cross-block `init` sequence lives on as the driver's Init.
+# here.
 
 [table]
 kind = "block"
 family = "rp2040"
 block = "uart"
-sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 4.2 (UART) via the silicon-proven rp2040-serve UART path"]
+sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 4.2 (UART)"]
 notes = [
     "The PL011 latches UARTIBRD/UARTFBRD only on a UARTLCR_H write: always write IBRD, FBRD, then LCR_H, in that order.",
     "Control-register reprogramming (e.g. loopback) is done disabled: wait for FR.BUSY clear, write UARTCR = 0, then the new value.",

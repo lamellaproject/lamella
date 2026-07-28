@@ -29,12 +29,12 @@ pub use bound::{
     ConvertingStep, MethodReference, SubmissionBinding, bind_expression, literal_int_value,
 };
 pub use conversion::has_implicit_conversion;
-pub use declaration::{collect_into, collect_model, collect_types};
+pub use declaration::{collect_into, collect_model, collect_types, resolve_constants};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment, switch_section_reachability};
 pub use program::{
-    bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references,
-    bind_compilation_units_with_references,
+    bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references, bind_compilation_unit_with_references_and_options,
+    bind_compilation_units_with_references, bind_compilation_units_with_references_and_options,
 };
 pub use reference::load_assembly;
 pub use resolve::{TypeTable, resolve_type};

@@ -91,6 +91,7 @@ namespace System.IO
             _stream.Write(bytes, 0, 8);
         }
 
+#if LAMELLA_SURFACE_FLOAT
         public virtual void Write(float value)
         {
             byte[] bytes = BitConverter.GetBytes(value);
@@ -102,6 +103,7 @@ namespace System.IO
             byte[] bytes = BitConverter.GetBytes(value);
             _stream.Write(bytes, 0, 8);
         }
+#endif
 
         public virtual void Write(string value)
         {
@@ -132,7 +134,7 @@ namespace System.IO
             _stream.Write(encoded, 0, encoded.Length);
         }
 
-        protected void Write7BitEncodedInt(int value)
+        internal void Write7BitEncodedInt(int value)
         {
             uint v = (uint)value;
             while (v >= 0x80)

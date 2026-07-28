@@ -1,6 +1,5 @@
 //! The Raspberry Pi RP2350 (Pico 2) UART0 (an ARM PrimeCell PL011) register facts -- transcribed
-//! from the neutral peripheral-table SSOT (sources: the official RP2350 SVD; the
-//! sequence is silicon-verified on a Pico 2 via the PL011 LBE loopback + a logic-analyzer decode).
+//! from the neutral peripheral-table SSOT (sources: the official RP2350 SVD).
 //! The same PL011 block as the RP2040, so the shapes match uart_rp2040; the RP2350 deltas are the
 //! block bases, the RESETS bit positions, the explicit CLK_PERI_DIV, and the pads' reset ISOLATION
 //! latch (each console pin's pad must be de-isolated before it works).

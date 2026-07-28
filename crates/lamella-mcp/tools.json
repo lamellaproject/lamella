@@ -1,10 +1,10 @@
 {
-  "$comment": "CANONICAL Lamella MCP tool contract. ONE source of truth for tools/list, consumed by BOTH hosts: the native Rust server (include_str!) and the in-browser host in Lamella Code (vendors a byte-identical copy, like the wasm blobs). Keep them identical -- the vendor step checks the hash. Tool DESCRIPTIONS are AI-facing; annotations follow MCP: readOnlyHint (no side effects), destructiveHint (may overwrite / hard to undo), openWorldHint (touches external hardware). Hardware-mutating tools are gated behind the server's --allow-device flag; a read-only server still exposes compile/run/enumerate.",
+  "$comment": "The canonical Lamella MCP tool contract: the one source of truth for tools/list, embedded by the server rather than assembled at run time. Tool DESCRIPTIONS are AI-facing; annotations follow MCP: readOnlyHint (no side effects), destructiveHint (may overwrite / hard to undo), openWorldHint (touches external hardware). Hardware-mutating tools are gated behind the server's --allow-device flag; a read-only server still exposes compile/run/enumerate.",
   "tools": [
     {
       "name": "lamella_check",
       "title": "Check (compile only)",
-      "description": "Compile-CHECK a Lamella program WITHOUT running it -- returns diagnostics only. Fast iteration on errors before you run or deploy.",
+      "description": "Compile-CHECK a Lamella program WITHOUT running it -- returns diagnostics only. Fast iteration on errors before you run or deploy. C# or Python.",
       "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The program source." }, "language": { "type": "string", "enum": ["csharp", "python"], "default": "csharp" } }, "required": ["code"] },
       "annotations": { "readOnlyHint": true, "openWorldHint": false }
     },
@@ -102,7 +102,7 @@
     {
       "name": "lamella_debug_locals",
       "title": "Debug: locals",
-      "description": "Return the local variables (and arguments) in scope at a stack frame, by name and value. Read-only.",
+      "description": "Return the local variables (and arguments) in scope at a stack frame, by name and value. Read-only. Reports that no locals are available on a target that does not supply them.",
       "inputSchema": { "type": "object", "properties": { "session": { "type": "string" }, "frame": { "type": "integer", "default": 0, "description": "Frame index (0 = innermost)." } }, "required": ["session"] },
       "annotations": { "readOnlyHint": true, "openWorldHint": true }
     },

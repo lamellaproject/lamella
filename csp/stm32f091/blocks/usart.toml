@@ -1,0 +1,99 @@
+# BLOCK layout: the STM32F091 USART (the same "new" ST USART IP as the STM32L476), asynchronous
+# use. The two lines share this block's register MAP and every field declared here, but they
+# are NOT bit-for-bit identical: the L4 implements CR3.UCESM at bit 23 where the F0 reserves
+# it, and reserves three further positions on some L4 parts (see the notes). Reuse across ST
+# lines is therefore sound for the DECLARED subset and must be re-checked per line when a new
+# field is declared. Values are RM0091-exact. Offsets are instance-base-relative; bases + RCC
+# routing live in ../instances.toml. Every register is 32-bit word-accessible.
+#
+# Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language;
+# only block-local sequences ride here.
+
+[table]
+kind = "block"
+family = "stm32f091"
+block = "usart"
+sources = [
+    "STM32F0 reference manual RM0091 Rev 10: USART register map + descriptions (section 27.8)",
+    "cross-line comparison against RM0351 Rev 11 section 40.8: the declared fields agree in both lines; the whole register sections do not",
+]
+notes = [
+    "NOT bit-for-bit identical to the L4's USART, though every field declared in these files agrees: RM0351 implements CR3.UCESM at bit 23 where RM0091 reserves it, and defines CR3.TCBGTIE (24), ISR.TCBGT (25) and ICR.TCBGTCF (7) which RM0091 reserves -- those three exist only on STM32L49x/L4Ax, not on the L476 itself, so UCESM is the one position that separates F091 from L476.",
+    "8N1 = CR1.M[1:0] = 00 (8 data bits), CR2.STOP = 00 (1 stop bit), CR1.PCE = 0 (no parity), CR1.OVER8 = 0 (16x). All are reset values, so CR1 = UE | TE | RE is a complete 8N1 config.",
+    "M/OVER8/PS can only be written while UE = 0, but their 8N1 values are the reset values, so no separate disabled-write is needed.",
+    "TX: poll ISR.TXE (data register empty), write the byte to TDR. RX: poll ISR.RXNE, read RDR. ISR.TC = transmission complete (shift register drained). Same ISR bit layout as the L476.",
+]
+
+[registers.CR1]
+offset = 0x0
+width = 32
+fields = { UE = [0, 1], UESM = [1, 1], RE = [2, 1], TE = [3, 1], IDLEIE = [4, 1], RXNEIE = [5, 1], TCIE = [6, 1], TXEIE = [7, 1], PEIE = [8, 1], PS = [9, 1], PCE = [10, 1], WAKE = [11, 1], M0 = [12, 1], OVER8 = [15, 1], M1 = [28, 1] }
+notes = "UE = USART enable, TE/RE = transmitter/receiver enable. Word length M[1:0] = {M1(28), M0(12)}: 00 = 8 data bits. OVER8 0 = 16x oversampling. PCE 0 = no parity."
+
+[registers.CR2]
+offset = 0x4
+width = 32
+fields = { STOP = [12, 2] }
+notes = "STOP[1:0]: 00 = 1 stop bit, 10 = 2 stop bits. Reset 00 = 8N1's one stop bit."
+
+[registers.CR3]
+offset = 0x8
+width = 32
+fields = { EIE = [0, 1], HDSEL = [3, 1], DMAR = [6, 1], DMAT = [7, 1], RTSE = [8, 1], CTSE = [9, 1] }
+notes = "Flow/DMA control. 0 for a basic polled 8N1 (no RTS/CTS, no DMA, no half-duplex)."
+
+[registers.BRR]
+offset = 0xC
+width = 32
+fields = { BRR = [0, 16] }
+notes = "Baud rate. With OVER8 = 0, BRR = USARTDIV = round(fck / baud). fck is the SELECTED USART kernel clock, not a fixed one: RM0091 6.4.13 lets each USART take PCLK, SYSCLK, HSI or LSE, with PCLK the reset default. Which one a board actually runs is a plan fact, and the divisor derives from that -- this block states the arithmetic only. (This device family calls its single APB clock PCLK; PCLK1 is L4 vocabulary.)"
+
+[registers.ISR]
+offset = 0x1C
+width = 32
+fields = { PE = [0, 1], FE = [1, 1], NF = [2, 1], ORE = [3, 1], IDLE = [4, 1], RXNE = [5, 1], TC = [6, 1], TXE = [7, 1], BUSY = [16, 1], TEACK = [21, 1], REACK = [22, 1] }
+notes = "Status. TXE = TDR empty (room to write), TC = transmission complete, RXNE = RDR has a received byte. Reset 0x020000C0."
+
+[registers.ICR]
+offset = 0x20
+width = 32
+fields = { PECF = [0, 1], FECF = [1, 1], NCF = [2, 1], ORECF = [3, 1], IDLECF = [4, 1], TCCF = [6, 1] }
+notes = "Interrupt flag clear, write-1-to-clear the matching ISR flag."
+
+[registers.RDR]
+offset = 0x24
+width = 32
+fields = { RDR = [0, 9] }
+notes = "Receive data (read). Low 8 bits at 8-bit word length; bit 8 is the 9th data/parity bit."
+
+[registers.TDR]
+offset = 0x28
+width = 32
+fields = { TDR = [0, 9] }
+notes = "Transmit data (write once TXE = 1). Low 8 bits at 8-bit word length."
+
+[parameters]
+baud = "16x oversampling (OVER8 = 0): BRR = round(f_pclk1 / baud). The rate comes from the board plan; the divisor is generated."
+tx_byte = "the byte to transmit (write to TDR once ISR.TXE is set)."
+
+[[sequences.tx_byte]]
+op = "poll"
+reg = "ISR"
+mask = 0x80
+note = "TXE: the transmit data register has room"
+
+[[sequences.tx_byte]]
+op = "write"
+reg = "TDR"
+value = "$tx_byte"
+
+[[sequences.rx_poll]]
+op = "poll"
+reg = "ISR"
+mask = 0x20
+note = "RXNE: a byte has been received"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "RDR"
+mask = 0xFF

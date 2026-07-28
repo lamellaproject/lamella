@@ -1,0 +1,46 @@
+# BLOCK layout: the RP2350 PLL (one block, two placed copies:
+# pll_sys + pll_usb).
+#
+# The 8.6.4 power-up order (do NOT reorder) is DRIVER code (it spans
+# resets/clocks/pll blocks): park clk_sys on clk_ref FIRST, then per PLL: reset-cycle ->
+# REFDIV 1 -> FBDIV -> clear PD|VCOPD -> poll LOCK -> PRIM post-dividers -> clear POSTDIVPD,
+# then switch the glitchless mux and confirm in SELECTED. The chosen operating-point values
+# (fbdiv, postdiv1/postdiv2) are PLAN facts in each board.toml (state-and-verify: the plan
+# also states the resulting rates and generation verifies hz == xosc * fbdiv / (p1 * p2)).
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "pll"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet 8.6 (PLL: register map, the 8.6.4 power-up order)"]
+notes = [
+    "Fout = (xosc / REFDIV) * FBDIV / (POSTDIV1 * POSTDIV2); the operating points run REFDIV = 1 (the crystal feeds the VCO directly).",
+    "PWR bits are ACTIVE-HIGH power-downs: clear PD|VCOPD to power the VCO (then wait LOCK), clear POSTDIVPD after PRIM is programmed. Both clears go through the PWR_CLR atomic alias.",
+]
+
+[registers.CS]
+offset = 0x0
+width = 32
+fields = { REFDIV = [0, 6], LOCK = [31, 1] }
+
+[registers.PWR]
+offset = 0x4
+width = 32
+fields = { PD = [0, 1], POSTDIVPD = [3, 1], VCOPD = [5, 1] }
+notes = "Active-high power-downs (the fields the power-up sequence drives)."
+
+[registers.PWR_CLR]
+offset = 0x3004
+width = 32
+notes = "PWR at the chip's atomic clear-bits alias (+0x3000): writing a mask clears those power-down bits."
+
+[registers.FBDIV_INT]
+offset = 0x8
+width = 32
+notes = "The integer feedback divisor (the plan's pll_*_fbdiv chosen value)."
+
+[registers.PRIM]
+offset = 0xC
+width = 32
+fields = { POSTDIV2 = [12, 3], POSTDIV1 = [16, 3] }
+notes = "The post-divider word generation composes from the plan's chosen values (POSTDIV1 << 16 | POSTDIV2 << 12 -- a composed config word, generated output only)."

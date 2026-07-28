@@ -10,7 +10,9 @@ use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use lamella_metadata::flags::{method_is_abstract, method_is_newslot, method_is_virtual};
+use lamella_metadata::flags::{
+    method_is_abstract, method_is_final, method_is_newslot, method_is_virtual,
+};
 use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, ConstantValue, SigType, TypeName};
 use lamella_syntax::ast::Literal;
@@ -28,6 +30,19 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly) {
     }
 }
 
+/// The full dotted name of the type `type_def` is nested in, walking outward through the
+/// `NestedClass` chain (II.22.32) so a doubly-nested `A.B.C` reports `A.B`. `None` when the type is
+/// not nested, or when the chain does not resolve.
+fn enclosing_full_name(type_def: &lamella_metadata::TypeDef) -> Option<Box<str>> {
+    let outer = type_def.enclosing_type()?;
+    let TypeName { namespace, name } = outer.name()?;
+    Some(match enclosing_full_name(&outer) {
+        Some(grandparent) => alloc::format!("{grandparent}.{name}").into(),
+        None if namespace.is_empty() => name.into(),
+        None => alloc::format!("{namespace}.{name}").into(),
+    })
+}
+
 fn type_info(
     assembly: &Assembly,
     type_def: &lamella_metadata::TypeDef,
@@ -38,9 +53,15 @@ fn type_info(
     if name == "<Module>" {
         return None;
     }
-    if type_def.is_nested() {
-        return None;
-    }
+    let (namespace, enclosing) = if type_def.is_nested() {
+        match enclosing_full_name(type_def) {
+            None => return None,
+            Some(outer) => (outer.clone(), Some(outer)),
+        }
+    } else {
+        (Box::from(namespace), None)
+    };
+    let namespace: &str = &namespace;
     let extends = type_def.extends();
     let base = (!extends.is_nil())
         .then(|| token_type_symbol(assembly, extends))
@@ -59,6 +80,7 @@ fn type_info(
 
     let mut info = TypeInfo::new(namespace, name, kind);
     info.is_external = true;
+    info.enclosing = enclosing;
     info.assembly = assembly.assembly_name().map(Box::from);
     if let Some(base) = base {
         info.bases.push(base.clone());
@@ -79,6 +101,7 @@ fn type_info(
                 is_static: field.flags() & 0x0010 != 0
                     && (field.flags() & 0x0040 == 0 || constant.is_some()),
                 is_readonly: field.flags() & 0x0020 != 0,
+                is_volatile: false,
                 accessibility: member_accessibility(field.flags()),
                 constant,
             });
@@ -104,6 +127,7 @@ fn type_info(
             is_virtual: method_is_virtual(method.flags()),
             is_abstract: method_is_abstract(method.flags()),
             is_override: method_is_virtual(method.flags()) && !method_is_newslot(method.flags()),
+            is_sealed: method_is_final(method.flags()),
             accessibility: member_accessibility(method.flags()),
             conditional: conditional.get(&method.rid()).cloned().unwrap_or_default(),
         };
@@ -124,6 +148,10 @@ fn type_info(
                     ty,
                     is_static: symbol.is_static,
                     accessibility: Accessibility::Public,
+                    is_virtual: symbol.is_virtual,
+                    is_abstract: symbol.is_abstract,
+                    is_override: symbol.is_override,
+                    is_sealed: symbol.is_sealed,
                     has_getter: method_name.starts_with("get_"),
                     has_setter: method_name.starts_with("set_"),
                 });
@@ -141,6 +169,7 @@ fn type_info(
                     ty,
                     is_static: symbol.is_static,
                     accessibility: symbol.accessibility,
+                    is_abstract: symbol.is_abstract,
                 });
             }
         }
@@ -153,13 +182,17 @@ fn type_info(
     Some(info)
 }
 
-/// Maps a referenced member's access flags (the low 3 bits, II.23.1.5 / II.23.1.10) to an
-/// accessibility. Only `internal` (Assembly / FamANDAssem) is read -- it is enforced across
-/// assemblies as CS0122; every other level stays Public, so existing public/protected BCL
-/// access is unchanged (we model neither cross-assembly protected nor InternalsVisibleTo).
+/// Maps a referenced member's access flags (the low 3 bits) to an accessibility, over the full
+/// `MemberAccess` mask (II.23.1.5 / II.23.1.10). `FamANDAssem` maps to the most restrictive
+/// answer, since it is inaccessible from another assembly whatever the reference says.
 fn member_accessibility(flags: u32) -> Accessibility {
     match flags & 0x0007 {
-        0x0002 | 0x0003 => Accessibility::Internal,
+        0x0000 => Accessibility::Private,
+        0x0001 => Accessibility::Private,
+        0x0002 => Accessibility::Private,
+        0x0003 => Accessibility::Internal,
+        0x0004 => Accessibility::Protected,
+        0x0005 => Accessibility::ProtectedInternal,
         _ => Accessibility::Public,
     }
 }

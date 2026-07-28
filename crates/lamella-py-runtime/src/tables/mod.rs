@@ -5,6 +5,7 @@
 //! dispatch arm, never an edit inside the core.
 
 pub(crate) mod gpio_rp2350;
+pub(crate) mod gpio_stm32f4;
 pub(crate) mod uart_esp32c6;
 pub(crate) mod uart_rp2040;
 pub(crate) mod uart_rp2350;

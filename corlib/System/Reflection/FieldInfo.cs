@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.FieldInfo
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public class FieldInfo : MemberInfo
@@ -27,3 +28,4 @@ namespace System.Reflection
         [Lamella.Runtime.RuntimeProvided] public object GetRawConstantValue() { return null; }
     }
 }
+#endif

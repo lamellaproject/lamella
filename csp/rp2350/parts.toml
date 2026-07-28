@@ -1,0 +1,23 @@
+# PARTS table for the rp2350 family. PARTIAL pin present-list; complete from the datasheet
+# pinout as bindings demand rows (a binding whose pin is absent here refuses).
+#
+# flash = 0: the RP2350 has NO internal flash -- code executes in place from an EXTERNAL QSPI
+# part through the XIP window, so a board's flash size is BOARD truth (its soldered chip,
+# the board [memory] record). GATE-PINNED as the permanent floor.
+#
+# ram = 0x80000 (512 KB): the CONTIGUOUS eight-bank striped window at 0x20000000..0x2007ffff.
+# The chip's total is 520 kB in 10 banks -- eight 64 kB banks plus two 4 kB banks above the
+# watermark (RP2350 datasheet 4.2) -- the two 4 kB banks are DOCUMENTED-EXCLUDED until the
+# schema states banks.
+
+[table]
+kind = "parts"
+family = "rp2350"
+
+[[parts]]
+part = "rp2350a"
+package = "QFN-60"
+flash = 0
+ram = 0x80000
+pins = ["GP0-GP1", "GP4-GP5", "GP16-GP19", "GP23-GP29"]
+source = "RP2350 datasheet 4.2 (520 kB SRAM = 8 x 64 kB striped to 0x2007ffff + 2 x 4 kB; this row states the contiguous 512 KB window) + ch 1 (QFN-60/RP2350A, external QSPI flash) -- PARTIAL pin list: GP0/1 uart, GP4/5 i2c, GP16-19 spi, GP23-25 + GP29 the wireless-module control lines a board may wire, GP26-29 the ADC channel pads (adc block channel map). Complete from the datasheet pinout as bindings demand"

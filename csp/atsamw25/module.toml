@@ -1,6 +1,6 @@
 # The ATSAMW25 module CSP: a SAMD21G18A host MCU + an ATWINC1500 WiFi module in one
 # orderable package, with FIXED internal wiring -- identical on every board that carries the
-# module (SAM W25 XPro, Arduino MKR1000). Module wiring is neither samd21 truth nor per-board
+# module. Module wiring is neither samd21 truth nor per-board
 # truth; it lives exactly once, here. Boards name
 # `module = "atsamw25"` and inherit these bindings.
 
@@ -11,14 +11,13 @@ family = "samd21"
 part = "atsamd21g18a"
 sources = [
     "ATSAMW25 datasheet (module-internal WINC wiring)",
-    "silicon-proven: samd21_wifi.rs drives exactly this SERCOM2/PA12-PA15 path on the SAM W25 XPro and the MKR1000 (identical module-internal wiring, per the serve's own feature notes)",
 ]
 notes = [
     "SERCOM2 in SPI-master mode reaches the WINC: DOPO 0 (DO = pad0, SCK = pad1), DIPO 3 (DI = pad3); PA14 stays a PORT output as a SOFT chip select (its PMUXEN off).",
     "SERCOM2 core clock: GCLK generator 1 (DFLL48M) under the usb-48mhz plan (12 MHz SPI at BAUD 1), generator 0 otherwise (4 MHz off the 8 MHz OSC8M).",
 ]
 
-
+[[bindings]]
 role = "winc-spi"
 kind = "spi"
 instance = "sercom2"

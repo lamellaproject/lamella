@@ -9,7 +9,7 @@ namespace Lamella.Boards
         public static readonly int BoardModel = Samw25XproBindings.BOARD_MODEL;
 
         /// <summary>The EDBG virtual-COM UART (SERCOM4, PB10 TX / PB11 RX, 115200-8N1 under
-        /// the osc8m-8mhz plan), ready for <c>Init</c>.</summary>
+        /// the osc8m-8mhz plan), ready for <c>Init()</c>.</summary>
         public Samd21Uart CreateVcpUart()
         {
             return new Samd21Uart(new Samd21SercomUsartBinding(

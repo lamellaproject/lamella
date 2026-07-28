@@ -121,8 +121,9 @@ impl UsbTransport {
     }
 
     /// Open the Lamella Link board matching `vid`/`pid` AND -- when several boards share the id
-    /// pair -- a case-insensitive substring of its USB serial number (the F427 reports
-    /// `F427-0001`; an RP2350 reports its 16-hex-digit chip id). `None` opens the first match.
+    /// pair -- a case-insensitive substring of its USB serial number (an RP2350 reports its
+    /// 16-hex-digit chip id; what a board reports is its firmware's choice). `None` opens the
+    /// first match.
     ///
     /// # Errors
     /// [`TransportError::Carrier`] if no matching device is present or it cannot be opened.
@@ -500,7 +501,7 @@ mod usb_target_tests {
 
     #[test]
     fn lone_token_is_always_a_serial() {
-        assert_eq!(parse_usb_target("usb:F427-0001"), (0x1209, 0x0001, Some("F427-0001".into())));
+        assert_eq!(parse_usb_target("usb:BOARD-0001"), (0x1209, 0x0001, Some("BOARD-0001".into())));
         assert_eq!(parse_usb_target("usb:E46341"), (0x1209, 0x0001, Some("E46341".into())));
         assert_eq!(parse_usb_target("usb:7B53"), (0x1209, 0x0001, Some("7B53".into())));
     }

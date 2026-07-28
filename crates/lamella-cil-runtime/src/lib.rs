@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod block;
 #[cfg(feature = "exceptions")]
 pub mod exception;
 pub mod fs;
@@ -14,6 +15,7 @@ pub mod intrinsic_registry;
 pub mod intrinsics;
 pub mod memory;
 pub mod module;
+pub mod mount;
 pub mod net;
 pub mod object;
 pub mod reactor;
@@ -27,12 +29,13 @@ pub mod value;
 pub use exception::{exception_tag, tag_is_exact, tag_is_subtype};
 pub use interp::{
     CodeLocation, FrameView, NamedValue, PInvokeArg, PInvokeHostFn, Session, Status, Stop,
-    StopReason, Vm, run, run_method,
+    StopReason, Vm, run, run_method, run_serviced,
 };
 pub use module::{
     CastElem, CastPrim, IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn,
     PInvokeTarget, TypeId, asm_key, baked_image_checksum,
 };
-pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind};
+pub use mount::{DriveType, MountTable, StorageProvider};
+pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind, UnencodableChar};
 pub use trap::Trap;
 pub use value::{Location, Value};

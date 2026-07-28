@@ -1,0 +1,8 @@
+# PIN map for the SAM4S family: pin x function -> (instance, signal). EMPTY on purpose --
+# identity-first, and no board.toml binds a peripheral yet. Rows follow the sam3x shape
+# ((P<port><line>, function letter) -> (instance, signal)) when the first binding demands
+# them; the uart1 pin mux (PB2/PB3 peripheral A) becomes the first two rows then.
+
+[table]
+kind = "pins"
+family = "sam4s"

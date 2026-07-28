@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Single
+#if LAMELLA_SURFACE_FLOAT
 namespace System
 {
     public struct Single : IComparable, IFormattable
@@ -85,6 +86,7 @@ namespace System
             return ParseValid(s);
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string s, out float result)
         {
             result = 0f;
@@ -92,6 +94,7 @@ namespace System
             result = ParseValid(s);
             return true;
         }
+#endif
 
         private static bool ParseValidate(string s)
         {
@@ -218,3 +221,4 @@ namespace System
         }
     }
 }
+#endif

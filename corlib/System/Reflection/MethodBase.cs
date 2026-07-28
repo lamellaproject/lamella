@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.MethodBase
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public class MethodBase : MemberInfo
@@ -35,3 +36,4 @@ namespace System.Reflection
         public bool IsAbstract { [Lamella.Runtime.RuntimeProvided] get { return false; } }
     }
 }
+#endif

@@ -1,8 +1,8 @@
 # The SAMD21 PORT block: the pin-mux and pin-config machinery, one PORT group per port
 # letter (the porta/portb instance rows carry the group bases). PMUX and PINCFG are PER-PIN
 # ARRAYS: the offsets below are the n = 0 element; element addresses derive as
-# PMUX[n] = group_base + 0x30 + n (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
-# PINCFG[p] = group_base + 0x40 + p (p = the pin index within the group)
+#   PMUX[n]   = group_base + 0x30 + n        (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
+#   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved
 # addresses through their bindings.
 
@@ -12,18 +12,38 @@ family = "samd21"
 block = "port"
 sources = [
     "SAMD21 datasheet DS40001882: PORT PMUX/PINCFG (ch 23)",
+    "SAMD21 datasheet DS40001882 ch 23.8 register descriptions, each section stating its own offset: 23.8.1 DIR 0x00, 23.8.2 DIRCLR 0x04, 23.8.3 DIRSET 0x08, 23.8.4 DIRTGL 0x0C, 23.8.5 OUT 0x10, 23.8.6 OUTCLR 0x14, 23.8.7 OUTSET 0x18, 23.8.8 OUTTGL 0x1C, 23.8.9 IN 0x20",
 ]
 notes = [
     "PMUX[n] covers pins 2n (PMUXE, low nibble) and 2n+1 (PMUXO, high nibble); function values A..H = 0..7.",
     "PINCFG: PMUXEN hands the pin to the muxed function; INEN enables the input buffer (required for any pin the peripheral READS -- an RX line, MISO).",
     "DIRSET/OUTSET/OUTCLR/IN are the raw GPIO word registers (group-base-relative), used by soft chip-selects and module control pins.",
+    "THESE OFFSETS COME FROM THE PER-REGISTER SECTIONS IN 23.8, which state each one in prose, and NOT from the register-summary table in 23.7. The two disagree: read off the summary, the sequence comes out as DIRCLR 0x08 / DIRSET 0x0C / OUT 0x18, every entry shifted by one register. The offsets stated here (DIRSET 0x08, OUTCLR 0x14, OUTSET 0x18, IN 0x20) are the 23.8 values. Anyone re-deriving them should use 23.8 as well, and should expect the summary table to contradict it.",
 ]
+
+[registers.DIR]
+offset = 0x00
+width = 32
+fields = { DIR = [0, 32] }
+notes = "The direction word, readable: 1 = output. A driver reporting a pin's CURRENT mode reads this rather than shadowing it, so a pin another driver configured is described honestly."
+
+[registers.DIRCLR]
+offset = 0x04
+width = 32
+fields = { DIRCLR = [0, 32] }
+notes = "Write 1s to make pins INPUTS -- the half of the direction pair DIRSET lacked. A general-purpose GPIO driver needs it to return a pin to input; the UART driver that authored this block only ever made outputs."
 
 [registers.DIRSET]
 offset = 0x08
 width = 32
 fields = { DIRSET = [0, 32] }
 notes = "Write 1s to make pins outputs."
+
+[registers.OUT]
+offset = 0x10
+width = 32
+fields = { OUT = [0, 32] }
+notes = "The output drive level, readable. Load-bearing beyond writing a level: with PINCFG.PULLEN set on an INPUT pin, this bit SELECTS THE PULL DIRECTION (1 = pull-up, 0 = pull-down), so a driver offering InputPullUp/InputPullDown cannot be written without it."
 
 [registers.OUTCLR]
 offset = 0x14
@@ -55,7 +75,7 @@ width = 8
 fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
 
-# Function-letter values for PMUX nibbles (family-wide; the pin rows name letters).
+# Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
 [constants]
 FUNC_A = 0
 FUNC_B = 1

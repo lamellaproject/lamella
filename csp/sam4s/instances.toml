@@ -1,0 +1,45 @@
+# INSTANCE map for the SAM4S family -- identity-first: ONLY the placed block copies a current
+# binding references, with the sam3x-shaped record: the peripheral id is one number serving as
+# both the PMC clock-gate bit and the NVIC line; system controllers (PMC, EEFC) have no id
+# (-1 emits nothing). Block layouts arrive with the family's first generated driver.
+
+[table]
+kind = "instances"
+family = "sam4s"
+record = ["base", "pid"]
+
+[[instances]]
+name = "uart1"
+block = "uart"
+base = 0x400E0800
+pid = 9
+
+[[instances]]
+name = "pmc"
+block = "pmc"
+base = 0x400E0400   # PMC_SCER at the block base; PCER1 +0x100
+pid = -1
+
+[[instances]]
+name = "piob"
+block = "pio"
+base = 0x400E1000
+pid = 12
+
+[[instances]]
+name = "pioc"
+block = "pio"
+base = 0x400E1200
+pid = 13
+
+[[instances]]
+name = "eefc0"
+block = "eefc"
+base = 0x400E0A00   # plane-0 flash controller
+pid = -1
+
+[[instances]]
+name = "eefc1"
+block = "eefc"
+base = 0x400E0C00   # plane-1 flash controller
+pid = -1

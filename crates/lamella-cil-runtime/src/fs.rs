@@ -37,6 +37,10 @@ pub enum FsError {
     InvalidPath,
     /// Any other I/O failure (media gone, hardware error) (managed: `IOException`).
     Io,
+    /// The backend or the build does not support the operation -- e.g. `Format` on a build without
+    /// the `format` capability, or a backend that cannot report its capacity (managed:
+    /// `NotSupportedException`).
+    Unsupported,
 }
 
 impl FsError {
@@ -54,6 +58,7 @@ impl FsError {
             FsError::NotEmpty => -7,
             FsError::InvalidPath => -8,
             FsError::Io => -9,
+            FsError::Unsupported => -10,
         }
     }
 }
@@ -191,6 +196,35 @@ pub trait FsBackend: core::fmt::Debug {
     /// The entries of the directory at `path`, in the backend's order (the managed layer
     /// does not sort; .NET's order is unspecified too).
     fn list_dir(&mut self, path: &str) -> FsResult<Vec<DirEntry>>;
+
+    /// The volume's total capacity in bytes -- the managed `DriveInfo.TotalSize`. A backend that
+    /// cannot report it returns [`FsError::Unsupported`] (the managed layer then shows `0`). Default:
+    /// unsupported.
+    fn total_size(&mut self) -> FsResult<u64> {
+        Err(FsError::Unsupported)
+    }
+
+    /// The volume's UNUSED capacity in bytes -- the managed `DriveInfo.TotalFreeSpace`. A backend
+    /// that cannot count it returns [`FsError::Unsupported`]. Default: unsupported.
+    ///
+    /// Unsupported is the only honest default, and it has to travel all the way out: a free-space
+    /// figure that quietly reads 0 is indistinguishable from a volume with nothing left on it, so a
+    /// caller deciding whether to write would decide wrong. The managed layer raises rather than
+    /// showing a number nobody measured.
+    fn free_space(&mut self) -> FsResult<u64> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Reformats the WHOLE volume (DESTRUCTIVE) -- the managed `DriveInfo.Format`. `fs_hint` is
+    /// "FAT12" / "FAT16" / "FAT32", or bare "FAT" for auto-by-size; `param` is a backend tuning knob
+    /// (FAT: sectors-per-cluster, `0` = auto). The default is [`FsError::Unsupported`] so a backend --
+    /// or a build compiled without the format capability -- reports it cleanly rather than silently
+    /// doing nothing. An unrecognized `fs_hint` is [`FsError::InvalidPath`] (managed
+    /// `ArgumentException`).
+    fn reformat(&mut self, fs_hint: &str, param: u32) -> FsResult<()> {
+        let _ = (fs_hint, param);
+        Err(FsError::Unsupported)
+    }
 }
 
 /// A boxed file-system backend, as the [`crate::interp::Vm`] stores it.

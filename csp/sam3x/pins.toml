@@ -1,26 +1,25 @@
-# The SAM3X pin-function map: pin x function -> (instance, signal). PARTIAL and append-only
-# rows exist for every binding the in-tree boards use, each with its
-# source; grow the table with the boards, never from memory. A binding whose (pin, function) row is
-# missing REFUSES.
+# The SAM3X pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for every binding a board package uses, each with its source; grow the table
+# with the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
 
 [table]
 kind = "pins"
 family = "sam3x"
 sources = [
     "SAM3X/A datasheet Atmel-11057C: UART signal multiplexing (URXD = PA8, UTXD = PA9, on peripheral A) + PIO peripheral A/B selection (ch 31)",
-    "Arduino Due schematic: RX0 = PA8, TX0 = PA9 (the Serial / programming-port UART via the ATmega16U2)",
+    "Schematic: RX0 = PA8, TX0 = PA9 (the programming-port UART)",
 ]
 
-
+[[pins]]
 pin = "PA8"
 function = "A"
 instance = "uart"
 signal = "urxd"
-source = "Atmel-11057: URXD = PA8, peripheral A; Arduino Due RX0. PIO_ABSR peripheral A is the reset default (bit 0)."
+source = "Atmel-11057: URXD = PA8, peripheral A (schematic RX0). PIO_ABSR peripheral A is the reset default (bit 0)."
 
-
+[[pins]]
 pin = "PA9"
 function = "A"
 instance = "uart"
 signal = "utxd"
-source = "Atmel-11057: UTXD = PA9, peripheral A; Arduino Due TX0. PIO_ABSR peripheral A is the reset default (bit 0)."
+source = "Atmel-11057: UTXD = PA9, peripheral A (schematic TX0). PIO_ABSR peripheral A is the reset default (bit 0)."

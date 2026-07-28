@@ -1,0 +1,43 @@
+# INSTANCE map for the nRF51 family -- identity-first: ONLY the blocks a binding
+# places appear here. nRF peripherals need no clock-gate or
+# reset records (each block owns an ENABLE register), so the record is bases-only, exactly
+# the nrf52833 shape. The full instance set + block layouts arrive with the family's first
+# generated driver.
+
+[table]
+kind = "instances"
+family = "nrf51"
+record = ["base"]
+
+[[instances]]
+name = "port0"      # the single GPIO port. This part has ONE (31 pins); the nRF52833's second
+block = "gpio"      # port is a later-generation addition and nothing here should assume it.
+base = 0x50000000   # nRF51822 PS v3.4 instantiation table, confirmed by nRF51 Series RM v3.0
+                    # Table 74. The PS deliberately carries no register offsets (it defers
+                    # register interfaces to the RM); those live in blocks/gpio.toml.
+
+[[instances]]
+name = "twi0"
+block = "twi"
+base = 0x40003000   # TWI0, nRF51 Series RM v3.0 Table 259. Peripheral ID follows the base
+                    # (10.1.1: ID = (base - 0x40000000) >> 12), so this is ID 3 -- shared with
+                    # the serial-peripheral personality at the same address, which is why a
+                    # bring-up disables the block before selecting TWI. TWI1 at 0x40004000 is
+                    # not placed here: this file is identity-first, so an instance joins when a
+                    # binding uses it.
+
+[[instances]]
+name = "uart0"
+block = "uart"
+base = 0x40002000   # UART0 (IRQ line 2)
+
+[[instances]]
+name = "timer0"
+block = "timer"
+base = 0x40008000   # TIMER0 (IRQ line 8)
+
+[[instances]]
+name = "nvmc"
+block = "nvmc"
+base = 0x4001E000   # NVMC flash controller: READY +0x400, CONFIG +0x504,
+                    # ERASEPAGE +0x508 all sit on this block base (1 KB pages)

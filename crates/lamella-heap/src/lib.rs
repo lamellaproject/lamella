@@ -173,6 +173,36 @@ impl Heap {
     fn carved(&self) -> usize {
         self.frontier as usize - self.base as usize
     }
+
+    /// Bytes sitting on the per-class free lists: already reclaimed and reusable, but invisible
+    /// to [`Heap::frontier_free`] because the frontier never retreats.
+    ///
+    /// The distinction is not academic once the frontier is fully carved. At that point
+    /// `frontier_free` is 0 FOREVER, however much has since been freed -- so a caller that asks
+    /// only the frontier concludes the heap is permanently full while the whole of a dropped
+    /// REPL session sits reusable on these lists.
+    ///
+    /// Reusability is per CLASS, not global: this allocator never splits or coalesces, so these
+    /// bytes satisfy a request only in their own class. Treat the total as an upper bound on what
+    /// is actually available to any particular allocation pattern.
+    ///
+    /// O(free blocks) -- it walks every class list. Intended for a between-submissions probe or a
+    /// diagnostic, never a hot path.
+    #[must_use]
+    pub fn free_list_bytes(&self) -> usize {
+        let mut total = 0;
+        let mut index = 0;
+        while index < CLASS_COUNT {
+            let size = class_size(index);
+            let mut node = self.classes[index];
+            while !node.is_null() {
+                total += size;
+                node = unsafe { (*node).next };
+            }
+            index += 1;
+        }
+        total
+    }
 }
 
 unsafe impl Send for Heap {}
@@ -233,6 +263,13 @@ impl LockedHeap {
     #[must_use]
     pub fn carved_lockfree(&self) -> usize {
         self.carved.load(Ordering::Relaxed)
+    }
+
+    /// Bytes on the per-class free lists (takes the lock). See [`Heap::free_list_bytes`] --
+    /// including the caveat that these are reusable only within their own class.
+    #[must_use]
+    pub fn free_list_bytes(&self) -> usize {
+        self.with(|heap| heap.free_list_bytes())
     }
 }
 
@@ -378,5 +415,50 @@ mod tests {
         assert_eq!(class_for(17), Some(1));
         assert_eq!(class_for(top), Some(CLASS_COUNT - 1));
         assert_eq!(class_for(top + 1), None);
+    }
+
+    #[test]
+    fn a_fully_carved_heap_still_reports_its_reclaimed_bytes() {
+        let (h, region, layout) = heap(64 * 1024);
+        let l = Layout::from_size_align(256, 8).unwrap();
+        let mut live = Vec::new();
+        loop {
+            let p = unsafe { h.alloc(l) };
+            if p.is_null() {
+                break;
+            }
+            live.push(p);
+        }
+        assert!(live.len() > 1, "the region held many blocks");
+        assert!(h.frontier_free() < 256, "the frontier is carved out");
+        assert_eq!(h.free_list_bytes(), 0, "nothing freed yet");
+
+        let freed = live.len();
+        for p in live.drain(..) {
+            unsafe { h.dealloc(p, l) };
+        }
+
+        assert_eq!(h.frontier_free(), 0, "the frontier NEVER retreats -- this is the trap");
+        assert_eq!(
+            h.free_list_bytes(),
+            freed * 256,
+            "every freed block is accounted for, exactly, at its class size"
+        );
+
+        let reused = unsafe { h.alloc(l) };
+        assert!(!reused.is_null(), "a fully-carved heap still serves from its free lists");
+        assert_eq!(h.free_list_bytes(), (freed - 1) * 256, "the reuse is reflected");
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn free_list_bytes_counts_the_class_size_not_the_request() {
+        let (h, region, layout) = heap(64 * 1024);
+        let l = Layout::from_size_align(17, 8).unwrap();
+        let p = unsafe { h.alloc(l) };
+        assert!(!p.is_null());
+        unsafe { h.dealloc(p, l) };
+        assert_eq!(h.free_list_bytes(), class_size(class_for(17).unwrap()));
+        free_region(region, layout);
     }
 }

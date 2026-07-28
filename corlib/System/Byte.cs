@@ -17,6 +17,7 @@ namespace System
             return (byte)value;
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string s, out byte result)
         {
             int value;
@@ -28,6 +29,7 @@ namespace System
             result = 0;
             return false;
         }
+#endif
 
         public bool Equals(byte obj) { return this == obj; }
 

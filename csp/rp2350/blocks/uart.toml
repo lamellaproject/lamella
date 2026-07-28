@@ -1,0 +1,86 @@
+# BLOCK layout: the RP2350 UART -- an ARM PrimeCell PL011, register-identical to the
+# RP2040's. Offsets are instance-base-relative;
+# instance bases live in ../instances.toml.
+#
+# Cross-block bring-up (XOSC start, clk_peri switch + divider, RESETS release, pad
+# de-isolation, IO_BANK0 funcsel) is DRIVER code per language, not
+# sequence data; only block-local sequences ride here.
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "uart"
+sources = ["raspberrypi/pico-sdk RP2350.svd", "RP2350 datasheet ch 12.1 (UART)"]
+notes = [
+    "The PL011 latches UARTIBRD/UARTFBRD only on a UARTLCR_H write: always write IBRD, FBRD, then LCR_H, in that order.",
+    "Control-register reprogramming (e.g. loopback) is done disabled: wait for FR.BUSY clear, write UARTCR = 0, then the new value.",
+    "Config envelope: baud = uartclk / (16 * (IBRD + FBRD/64)) with 16-bit IBRD >= 1 -- at the 12 MHz crystal ~11.5 Bd floor to 750 kBd ceiling; parity none/even/odd via PEN/EPS (LCR_H). The reference sequence is 115200-8N1.",
+]
+
+[registers.UARTDR]
+offset = 0x0
+width = 32
+fields = { DATA = [0, 8] }
+notes = "Write queues one TX byte; read pops one RX byte (bits 11..8 carry error flags)."
+
+[registers.UARTFR]
+offset = 0x18
+width = 32
+fields = { BUSY = [3, 1], RXFE = [4, 1], TXFF = [5, 1], TXFE = [7, 1] }
+notes = "BUSY covers the shift register: it clears only when the line is fully idle."
+
+[registers.UARTIBRD]
+offset = 0x24
+width = 32
+fields = { BAUD_DIVINT = [0, 16] }
+
+[registers.UARTFBRD]
+offset = 0x28
+width = 32
+fields = { BAUD_DIVFRAC = [0, 6] }
+notes = "divisor = IBRD + FBRD/64 sixteenths of the UART clock: divisor = uartclk / (16 * baud)."
+
+[registers.UARTLCR_H]
+offset = 0x2C
+width = 32
+fields = { FEN = [4, 1], WLEN = [5, 2], STP2 = [3, 1], EPS = [2, 1], PEN = [1, 1], SPS = [7, 1] }
+notes = "WLEN 3 = 8 data bits; writing this register latches IBRD/FBRD. Parity select: PEN enables, EPS 1 = even / 0 = odd, SPS = stick parity."
+
+[registers.UARTCR]
+offset = 0x30
+width = 32
+fields = { UARTEN = [0, 1], LBE = [7, 1], TXE = [8, 1], RXE = [9, 1] }
+notes = "LBE feeds UARTTXD back to UARTRXD (the no-hands self-test)."
+
+[constants]
+FIFO_DEPTH = 32
+WLEN_8BIT = 3
+
+[parameters]
+ibrd = "uartclk / (16 * baud), integer part -- 115200 over the 12 MHz crystal: 6."
+fbrd = "round(64 * fractional part) -- 115200 over the 12 MHz crystal: 33 (actual 115108, -0.08%)."
+tx_byte = "The byte to transmit."
+
+[[sequences.tx_byte]]
+op = "poll"
+reg = "UARTFR"
+mask = 0x20
+want = 0
+note = "TXFF clear = FIFO has room"
+
+[[sequences.tx_byte]]
+op = "write"
+reg = "UARTDR"
+value = "$tx_byte"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "UARTFR"
+mask = 0x10
+note = "RXFE set = nothing waiting"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "UARTDR"
+mask = 0xFF
+note = "pops one byte when RXFE was clear"

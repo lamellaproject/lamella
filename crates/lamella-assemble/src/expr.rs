@@ -6,7 +6,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_binder::{
-    BoundExpr, BoundExprKind, ConversionKind, FieldReference, SpecialType, TypeSymbol,
+    BoundExpr, BoundExprKind, ConversionKind, FieldReference, MethodReference, SpecialType,
+    TypeSymbol,
 };
 use lamella_cil::{Instruction, Opcode, Operand};
 use lamella_syntax::ast::{BinaryOperator, Literal, PostfixOperator, UnaryOperator};
@@ -74,7 +75,8 @@ pub(crate) fn split_vararg_arguments(
 }
 
 /// A variable argument's type as the call-site signature records it: its static type,
-/// with the null literal folded to `object` (csc's `1C` in the oracle blob) and a
+/// with the null literal folded to `object` (`ELEMENT_TYPE_OBJECT`, `0x1C`) -- the literal has
+/// no type of its own and the signature must record one a callee can bind against -- and a
 /// `ref`/`out` element as a byref of its referent.
 pub(crate) fn vararg_extra_symbol(extra: &BoundExpr) -> TypeSymbol {
     if matches!(extra.kind, BoundExprKind::Ref { .. }) {
@@ -372,6 +374,11 @@ pub fn emit_expression(
             BoundExprKind::ElementAccess { receiver, indices } => {
                 emit_element_store(&target.ty, receiver, indices, value, true, frame, tokens, out)
             }
+            BoundExprKind::IndexerAccess {
+                receiver,
+                indices,
+                setter,
+            } => emit_indexer_store(receiver, indices, setter, value, true, frame, tokens, out),
             BoundExprKind::PropertyAccess {
                 receiver,
                 setter_declaring_type,
@@ -1017,9 +1024,15 @@ fn emit_field_load(
         .field(&field.declaring_type, &field.name)
         .ok_or(EmitError::Unsupported("field outside this module"))?;
     if field.is_static {
+        if field.is_volatile {
+            out.push(Instruction::simple(Opcode::Volatile));
+        }
         out.push(Instruction::new(Opcode::Ldsfld, Operand::Token(token)));
     } else {
         emit_field_receiver(field, receiver, frame, tokens, out)?;
+        if field.is_volatile {
+            out.push(Instruction::simple(Opcode::Volatile));
+        }
         out.push(Instruction::new(Opcode::Ldfld, Operand::Token(token)));
     }
     Ok(())
@@ -1072,12 +1085,18 @@ pub(crate) fn emit_field_store(
     let kept = if field.is_static {
         emit_expression(value, frame, tokens, out)?;
         let kept = keep_assigned(leave, &value.ty, frame, out);
+        if field.is_volatile {
+            out.push(Instruction::simple(Opcode::Volatile));
+        }
         out.push(Instruction::new(Opcode::Stsfld, Operand::Token(token)));
         kept
     } else {
         emit_field_receiver(field, receiver, frame, tokens, out)?;
         emit_expression(value, frame, tokens, out)?;
         let kept = keep_assigned(leave, &value.ty, frame, out);
+        if field.is_volatile {
+            out.push(Instruction::simple(Opcode::Volatile));
+        }
         out.push(Instruction::new(Opcode::Stfld, Operand::Token(token)));
         kept
     };
@@ -1169,6 +1188,46 @@ pub(crate) fn emit_property_store(
     Ok(())
 }
 
+/// Lowers an indexer write `obj[indices] = value`: the receiver, the indices, then the value,
+/// then a call to the resolved `set_` accessor. Mirrors [`emit_property_store`] with the index
+/// arguments pushed between the receiver and the value. `leave` keeps the assigned value on the
+/// stack (the assignment used as an expression, 14.14) via the same dup-to-temp/reload as the
+/// other stores -- exactly csc's `dup; stloc; callvirt set_Item; ldloc`.
+pub(crate) fn emit_indexer_store(
+    receiver: &BoundExpr,
+    indices: &[BoundExpr],
+    setter: &MethodReference,
+    value: &BoundExpr,
+    leave: bool,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let value_type_receiver = is_value_type(&receiver.ty, tokens);
+    if value_type_receiver {
+        emit_value_type_receiver(receiver, frame, tokens, out)?;
+    } else {
+        emit_expression(receiver, frame, tokens, out)?;
+    }
+    for index in indices {
+        emit_expression(index, frame, tokens, out)?;
+    }
+    emit_expression(value, frame, tokens, out)?;
+    let kept = keep_assigned(leave, &value.ty, frame, out);
+    let token = tokens
+        .method(&setter.declaring_type, &setter.name, &setter.parameters)
+        .ok_or(EmitError::Unsupported("indexer setter outside this module"))?;
+    let is_base = matches!(receiver.kind, BoundExprKind::Base);
+    let opcode = if value_type_receiver || is_base {
+        Opcode::Call
+    } else {
+        Opcode::Callvirt
+    };
+    out.push(Instruction::new(opcode, Operand::Token(token)));
+    load_kept(kept, out);
+    Ok(())
+}
+
 /// The `get_`/`set_` accessor method name for a property.
 pub(crate) fn accessor_name(prefix: &str, property: &str) -> String {
     let mut name = String::from(prefix);
@@ -1207,6 +1266,10 @@ fn emit_cast(
                 SpecialType::UInt64 | SpecialType::Int64 => Opcode::ConvU8,
                 SpecialType::UInt32 => Opcode::ConvU4,
                 SpecialType::Int32 => Opcode::ConvI4,
+                SpecialType::SByte => Opcode::ConvI1,
+                SpecialType::Byte => Opcode::ConvU1,
+                SpecialType::Int16 => Opcode::ConvI2,
+                SpecialType::UInt16 => Opcode::ConvU2,
                 _ => return Err(EmitError::Unsupported("this pointer cast is not lowered")),
             };
             out.push(Instruction::simple(opcode));

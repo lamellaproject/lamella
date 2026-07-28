@@ -263,9 +263,8 @@ impl ImageBuilder {
 
     /// Records a referenced assembly's identity (version + full public key, empty if unsigned) by
     /// simple name, from the reference the unit compiled against. An `AssemblyRef` emitted for that
-    /// name then carries this identity instead of a `Version=#.0.0.0, PublicKeyToken=null` default,
-    /// so an external consumer (csc alongside the same reference pack) reconciles it rather than
-    /// demanding a phantom assembly (CS0012).
+    /// name carries this identity, so a consumer resolving the reference sees the assembly the
+    /// unit was actually built against.
     pub fn set_assembly_identity(
         &mut self,
         name: &str,

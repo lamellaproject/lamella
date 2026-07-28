@@ -1,7 +1,6 @@
 //! The Raspberry Pi RP2040 UART0 (an ARM PrimeCell PL011) register facts -- transcribed from
-//! the neutral peripheral-table SSOT (sources: the official RP2040 SVD + the
-//! datasheet sections the silicon-proven rp2040-serve UART path cites; the sequence is
-//! silicon-verified on a Pico H via loopback + a logic-analyzer decode).
+//! the neutral peripheral-table SSOT (sources: the official RP2040 SVD + the RP2040
+//! datasheet's PL011 sections).
 
 use crate::uart::{UartConfig, UartConfigError, UartFacts, UartOp, UartStatus};
 use crate::uart::{PARITY_EVEN, PARITY_ODD};

@@ -35,19 +35,23 @@ namespace System
             if (specifier == 'x') return Hex(value, nibbles, precision, false);
             if (specifier == 'N' || specifier == 'n') return Fixed(value, precision < 0 ? 2 : precision, true);
             if (specifier == 'F' || specifier == 'f') return Fixed(value, precision < 0 ? 2 : precision, false);
+#if LAMELLA_SURFACE_FLOAT
             if (specifier == 'E' || specifier == 'e' || specifier == 'C' || specifier == 'c' || specifier == 'P' || specifier == 'p')
             {
                 return FormatScaled(value, specifier, precision);
             }
+#endif
             throw new FormatException("Format specifier was invalid.");
         }
 
+#if LAMELLA_SURFACE_FLOAT
         private static string FormatScaled(long value, char specifier, int precision)
         {
             if (specifier == 'E' || specifier == 'e') return System.Double.ToExponential((double)value, precision < 0 ? 6 : precision, specifier == 'E');
             if (specifier == 'C' || specifier == 'c') return System.Double.Currency((double)value, precision < 0 ? 2 : precision);
             return System.Double.Percent((double)value, precision < 0 ? 2 : precision);
         }
+#endif
 
         private static bool IsLetter(char c)
         {
@@ -170,6 +174,7 @@ namespace System
             internal bool Grouping;
             internal int MaxFrac;
             internal int MinFrac;
+            internal int Scale;
         }
 
         private static CustomShape ParseCustom(string format, bool negative, bool isZero)
@@ -205,6 +210,19 @@ namespace System
             int dot = middle.IndexOf('.');
             string intRegion = (dot < 0) ? middle : middle.Substring(0, dot);
             string fracRegion = (dot < 0) ? "" : middle.Substring(dot + 1);
+            int end = intRegion.Length;
+            while (end > 0 && intRegion[end - 1] == ',') { shape.Scale = shape.Scale + 1; end = end - 1; }
+            intRegion = intRegion.Substring(0, end);
+            if (dot < 0)
+            {
+                int lead = 0;
+                while (lead < shape.Suffix.Length && shape.Suffix[lead] == ',')
+                {
+                    shape.Scale = shape.Scale + 1;
+                    lead = lead + 1;
+                }
+                if (lead > 0) shape.Suffix = shape.Suffix.Substring(lead);
+            }
             shape.MinInt = CountChar(intRegion, '0');
             shape.Grouping = intRegion.IndexOf(',') >= 0;
             shape.MaxFrac = CountPlaceholders(fracRegion);
@@ -218,14 +236,17 @@ namespace System
             if (!shape.HasPlaces) return EmitLiterals(shape.Section);
             long m = negMag;
             if (shape.Percent) m = m * 100;
+            for (int s = 0; s < shape.Scale; s++) m = (m - 500) / 1000;
             return AssembleCustom(shape, MagnitudeDecimal(m), Zeros(shape.MaxFrac));
         }
 
+#if LAMELLA_SURFACE_FLOAT
         internal static string CustomFloat(string format, bool negative, double magnitude)
         {
             CustomShape shape = ParseCustom(format, negative, magnitude == 0.0);
             if (!shape.HasPlaces) return EmitLiterals(shape.Section);
             double m = shape.Percent ? magnitude * 100.0 : magnitude;
+            for (int s = 0; s < shape.Scale; s++) m = m / 1000.0;
             string fixedText = System.Double.ToFixed(m, shape.MaxFrac);
             int fdot = fixedText.IndexOf('.');
             string intDigits;
@@ -234,6 +255,7 @@ namespace System
             else { intDigits = fixedText.Substring(0, fdot); fracDigits = fixedText.Substring(fdot + 1); }
             return AssembleCustom(shape, intDigits, fracDigits);
         }
+#endif
 
         private static string AssembleCustom(CustomShape shape, string intDigits, string fracDigits)
         {
@@ -271,16 +293,36 @@ namespace System
             return sb.ToString();
         }
 
+        private static bool SectionBreakAt(string format, int i, ref int skip)
+        {
+            char c = format[i];
+            if (c == '\\') { skip = 2; return false; }
+            if (c == '\'' || c == '"')
+            {
+                int j = i + 1;
+                while (j < format.Length && format[j] != c) j = j + 1;
+                skip = (j < format.Length) ? (j - i + 1) : (format.Length - i);
+                return false;
+            }
+            skip = 1;
+            return c == ';';
+        }
+
         private static string[] SplitSections(string format)
         {
             int count = 1;
-            for (int i = 0; i < format.Length; i++) if (format[i] == ';') count = count + 1;
+            int skip = 1;
+            for (int i = 0; i < format.Length; i = i + skip)
+            {
+                if (SectionBreakAt(format, i, ref skip)) count = count + 1;
+            }
             string[] result = new string[count];
             int start = 0;
             int index = 0;
-            for (int i = 0; i < format.Length; i++)
+            skip = 1;
+            for (int i = 0; i < format.Length; i = i + skip)
             {
-                if (format[i] == ';')
+                if (SectionBreakAt(format, i, ref skip))
                 {
                     result[index] = format.Substring(start, i - start);
                     index = index + 1;
@@ -352,6 +394,7 @@ namespace System
                     while (i < s.Length && s[i] != quote) { sb.Append(s[i]); i = i + 1; }
                     if (i < s.Length) i = i + 1;
                 }
+                else if (c == ',') { i = i + 1; }
                 else { sb.Append(c); i = i + 1; }
             }
             return sb.ToString();

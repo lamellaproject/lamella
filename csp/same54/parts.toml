@@ -1,0 +1,14 @@
+# PARTS table for the SAM E54 family. The pin present-list is EMPTY (identity-first; no
+# binding references a pin yet) and grows from evidence as bindings land.
+
+[table]
+kind = "parts"
+family = "same54"
+
+[[parts]]
+part = "atsame54p20a"
+package = "TQFP (package suffix + pin count deferred to the datasheet)"
+flash = 0x100000
+ram = 0x40000
+pins = []
+source = "ATSAME54P20A part facts: 1 MB flash / 256 KB RAM"

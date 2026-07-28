@@ -11,7 +11,7 @@ sources = [
 ]
 notes = [
     "To hand a pin to its peripheral: write the line's bit in PDR (disable PIO control), then select peripheral A (ABSR bit 0, the reset default) or B (bit 1). PER takes a line back to GPIO.",
-    "The pin rows name the line and its function letter (A/B); the driver sets that line's bit. ABSR resets to 0 = all peripheral A, so a peripheral-A pin (like the UART) needs only PDR.",
+    "The pin-map rows name the line and its function letter (A/B); the driver sets that line's bit. ABSR resets to 0 = all peripheral A, so a peripheral-A pin (like the UART) needs only PDR.",
 ]
 
 [registers.PER]
@@ -38,7 +38,7 @@ width = 32
 fields = { ABSR = [0, 32] }
 notes = "Peripheral AB Select Register: per line, 0 = peripheral A, 1 = peripheral B. Reset 0 (all peripheral A)."
 
-# Function-letter values for a line's peripheral selection (the pin rows name letters).
+# Function-letter values for a line's peripheral selection (the pin-map rows name letters).
 [constants]
 FUNC_A = 0
 FUNC_B = 1

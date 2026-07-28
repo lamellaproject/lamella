@@ -1,0 +1,81 @@
+# BLOCK layout: the nRF51 GPIO port block. The nRF has no pinmux table -- a peripheral claims
+# pins through its own PSEL registers, and a pin's electrical configuration lives here in
+# PIN_CNF[n] = 0x700 + 4*n.
+#
+# Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
+# section 14.2, Tables 74/75/83, with the document open. PROVENANCE NOTE, because it is not the
+# ordinary case: Nordic's own download for this manual was returning errors, so the copy read was
+# a third-party mirror of the same manual. It was accepted
+# only after checking that the document SELF-IDENTIFIES on its title page as the Nordic "nRF51
+# Series Reference Manual, Version 3.0" -- the host is a mirror, the document is Nordic's. Nordic
+# currently publishes v3.0.1; if a register fact here is ever disputed, re-read that revision
+# before trusting this file.
+#
+# The offsets below happen to match the nRF52833's. That was NOT assumed -- it was read -- and the
+# two parts genuinely differ elsewhere: Table 74 lists ONE GPIO instance on this part, where the
+# nRF52833 has two ports at separate bases. Assuming the layouts carry over would have been right
+# about the offsets and wrong about the port count in the same breath.
+
+[table]
+kind = "block"
+family = "nrf51"
+block = "gpio"
+sources = [
+    "nRF51 Series Reference Manual v3.0 (Nordic Semiconductor), section 14.2 GPIO: Table 74 instances (GPIO @ 0x50000000), Table 75 register overview, Table 83 PIN_CNF[n] bit fields",
+]
+notes = [
+    "PIN_CNF[n] sits at 0x700 + PIN_CNF_STRIDE * n from the port base; one register per pin, no pairing.",
+    "OUT/DIR are whole-port registers: BIT n is PIN n, so they carry no named fields -- a driver builds its word from the board's per-pin masks. The SET/CLR aliases write one bit without a read-modify-write, which is what makes a scanned display safe to drive from a tight loop.",
+    "PIN_CNF[n] resets to 0x2 (Table 83): DIR input, INPUT disconnected. A pin driven as an output through DIRSET does not need PIN_CNF touched first.",
+]
+
+[registers.OUT]
+offset = 0x504
+width = 32
+fields = { }
+notes = "Whole-port output level; bit n is pin n. Read-modify-write -- prefer OUTSET/OUTCLR."
+
+[registers.OUTSET]
+offset = 0x508
+width = 32
+fields = { }
+notes = "Write 1 to a bit to drive that pin HIGH; 0 bits are untouched."
+
+[registers.OUTCLR]
+offset = 0x50C
+width = 32
+fields = { }
+notes = "Write 1 to a bit to drive that pin LOW; 0 bits are untouched."
+
+[registers.IN]
+offset = 0x510
+width = 32
+fields = { }
+notes = "Whole-port input level; bit n is pin n. Requires PIN_CNF[n].INPUT connected."
+
+[registers.DIR]
+offset = 0x514
+width = 32
+fields = { }
+notes = "Whole-port direction; bit n set = pin n is an output. Mirrors PIN_CNF[n].DIR."
+
+[registers.DIRSET]
+offset = 0x518
+width = 32
+fields = { }
+notes = "Write 1 to a bit to make that pin an OUTPUT; 0 bits are untouched."
+
+[registers.DIRCLR]
+offset = 0x51C
+width = 32
+fields = { }
+notes = "Write 1 to a bit to make that pin an INPUT; 0 bits are untouched."
+
+[registers.PIN_CNF0]
+offset = 0x700
+width = 32
+fields = { DIR = [0, 1], INPUT = [1, 1], PULL = [2, 2], DRIVE = [8, 3], SENSE = [16, 2] }
+notes = "PIN_CNF[0]; PIN_CNF[n] = this offset + PIN_CNF_STRIDE * n. Reset 0x2 (input, buffer disconnected)."
+
+[constants]
+PIN_CNF_STRIDE = 4

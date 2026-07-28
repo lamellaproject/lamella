@@ -6,6 +6,8 @@ use crate::module::{CastElem, CastPrim, MethodId, MethodKind, Module, TypeId, as
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
 use crate::value::{Location, Value};
+#[cfg(feature = "exceptions")]
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
@@ -172,10 +174,20 @@ pub struct Vm {
     /// authenticated protocol tier (NTS). `None` until the embedder installs one; the AEAD
     /// intrinsics then report failure rather than encrypt with nothing.
     aead_backend: Option<alloc::boxed::Box<dyn crate::aead::AeadBackend>>,
-    /// The file-system seam ([`crate::fs::FsBackend`]) -- blocking files + directories. `None`
-    /// until set (a device with no file system installs none): every managed file operation then
-    /// reports [`crate::fs::FsError::Io`] and the corlib throws a catchable `IOException`.
-    fs_backend: Option<alloc::boxed::Box<dyn crate::fs::FsBackend>>,
+    /// The file-system mount table ([`crate::mount::MountTable`]) -- the runtime VFS the `System.IO`
+    /// intrinsics route through. Empty until a backend is mounted (a device with no file system
+    /// mounts none): every managed file operation then reports [`crate::fs::FsError::Io`] and the
+    /// corlib throws a catchable `IOException`. A device with one file system is a one-entry `/`
+    /// table -- identical to holding a single backend.
+    mounts: crate::mount::MountTable,
+    /// The names of the file-system formats this build can create ([`Vm::set_filesystems`]) -- the
+    /// managed `DriveInfo.GetFileSystems`. The embedder that links a formatter declares them (e.g.
+    /// `["FAT"]`); empty by default (no format capability).
+    filesystems: alloc::vec::Vec<alloc::string::String>,
+    /// The embedder's on-demand mount-backend provider ([`crate::mount::StorageProvider`]) -- the FAT
+    /// / SD / RAM constructor the managed `Storage.Mount*` routes through. `None` until installed; the
+    /// mount calls then report NotSupported.
+    storage_provider: Option<alloc::boxed::Box<dyn crate::mount::StorageProvider>>,
     /// The serial-port seam ([`crate::serial::SerialBackend`]) -- a blocking UART/COM byte pipe.
     /// `None` until set (a device with no serial hardware installs none): every managed
     /// `System.IO.Ports.SerialPort` operation then reports [`crate::serial::SerialError::Io`] and
@@ -197,6 +209,14 @@ pub struct Vm {
     /// installs these (a device firmware with `write_volatile`/`read_volatile` at the real address;
     /// a host harness that wants real access). `None` falls back to the host simulated register
     /// file below, so a driver runs + is verifiable off-device with no seam installed.
+    /// The embedder's REMAINING-HEADROOM probe: bytes the allocator can still hand out. A long-
+    /// lived session (the device REPL) never reclaims, so one that runs long enough exhausts its
+    /// arena -- and because Rust's allocation path is infallible, exhaustion ABORTS rather than
+    /// erroring, which on a device is a panic, a reset, and a session that vanishes silently.
+    /// With this installed, the session asks BEFORE it starts allocating and refuses cleanly
+    /// instead. `None` (the host, where the heap is effectively unbounded) never refuses, so host
+    /// behaviour is unchanged.
+    heap_headroom_fn: Option<fn() -> usize>,
     mmio_write_fn: Option<fn(u32, u32)>,
     mmio_read_fn: Option<fn(u32) -> u32>,
     /// The SUB-WORD volatile MMIO seam (`Mmio` Read8/Write8/Read16/Write16). A driver needs these
@@ -515,26 +535,152 @@ impl Vm {
         self.aead_backend.as_deref_mut()
     }
 
-    /// Sets the file-system seam ([`crate::fs::FsBackend`]). The embedder provides it (the host
-    /// with `std::fs`; a device with a FAT-over-SD driver; tests with the in-memory tree);
-    /// without it, every managed file operation throws a catchable `IOException`.
+    /// Mounts the embedder's file-system backend ([`crate::fs::FsBackend`]) at the ROOT (`/`) -- the
+    /// single-file-system case (the host with `std::fs`; a device with a FAT-over-SD driver; tests
+    /// with the in-memory tree). Behavior is identical to holding one backend; [`Vm::mount`] adds
+    /// further file systems at other prefixes. Without any mount, every managed file operation
+    /// throws a catchable `IOException`.
     pub fn set_fs_backend(&mut self, backend: alloc::boxed::Box<dyn crate::fs::FsBackend>) {
-        self.fs_backend = Some(backend);
+        let _ = self.mounts.mount("/", backend);
     }
 
-    /// The file-system seam, if set -- the `System.IO` intrinsics drive it. Blocking by design
-    /// (bounded operations, no reactor involvement -- see the [`crate::fs`] module docs).
-    pub fn fs_backend(&mut self) -> Option<&mut (dyn crate::fs::FsBackend + 'static)> {
-        self.fs_backend.as_deref_mut()
-    }
-
-    /// The heap and the file-system seam together, split-borrowed -- a bulk read/write intrinsic
-    /// crosses the seam straight to/from a packed array's bytes, which needs a view into the
-    /// heap live while the backend runs.
-    pub fn heap_and_fs(
+    /// Mounts `backend` at `prefix` (`"/sd"`, `"D:"`, ...) -- a second file system beside the root.
+    ///
+    /// # Errors
+    /// [`crate::fs::FsError::InvalidPath`] if `prefix` escapes the root (a leading `..`).
+    pub fn mount(
         &mut self,
-    ) -> (&mut Heap, Option<&mut (dyn crate::fs::FsBackend + 'static)>) {
-        (&mut self.heap, self.fs_backend.as_deref_mut())
+        prefix: &str,
+        backend: alloc::boxed::Box<dyn crate::fs::FsBackend>,
+    ) -> crate::fs::FsResult<()> {
+        self.mounts.mount(prefix, backend)
+    }
+
+    /// Unmounts the file system at `prefix` exactly, returning whether one was removed. Handles
+    /// still open on it go stale (their next use reports [`crate::fs::FsError::Io`]).
+    ///
+    /// # Errors
+    /// [`crate::fs::FsError::InvalidPath`] if `prefix` escapes the root.
+    pub fn unmount(&mut self, prefix: &str) -> crate::fs::FsResult<bool> {
+        self.mounts.unmount(prefix)
+    }
+
+    /// The file-system mount table -- the `System.IO` intrinsics drive it. Blocking by design
+    /// (bounded operations, no reactor involvement -- see the [`crate::fs`] module docs).
+    pub fn mounts(&mut self) -> &mut crate::mount::MountTable {
+        &mut self.mounts
+    }
+
+    /// The heap and the mount table together, split-borrowed -- a bulk read/write intrinsic crosses
+    /// the seam straight to/from a packed array's bytes, which needs a view into the heap live while
+    /// the backend runs.
+    pub fn heap_and_mounts(&mut self) -> (&mut Heap, &mut crate::mount::MountTable) {
+        (&mut self.heap, &mut self.mounts)
+    }
+
+    /// Declares the file-system format names this build can create (for `DriveInfo.GetFileSystems`).
+    /// The embedder that links a formatter sets them, e.g. `vm.set_filesystems(&["FAT"])`.
+    pub fn set_filesystems(&mut self, names: &[&str]) {
+        self.filesystems = names
+            .iter()
+            .map(|name| alloc::string::String::from(*name))
+            .collect();
+    }
+
+    /// The declared file-system format names ([`Vm::set_filesystems`]).
+    #[must_use]
+    pub fn filesystems(&self) -> &[alloc::string::String] {
+        &self.filesystems
+    }
+
+    /// Installs the embedder's on-demand mount-backend provider (the FAT / SD / RAM constructor).
+    /// Without one, every managed `Storage.Mount*` reports [`crate::fs::FsError::Unsupported`].
+    pub fn set_storage_provider(
+        &mut self,
+        provider: alloc::boxed::Box<dyn crate::mount::StorageProvider>,
+    ) {
+        self.storage_provider = Some(provider);
+    }
+
+    /// Mounts a fresh RAM-backed volume of `size_bytes` at `prefix` (the managed `Storage.MountRam`):
+    /// the embedder's provider constructs the backend, which is mounted as
+    /// [`crate::mount::DriveType::Ram`].
+    ///
+    /// # Errors
+    /// [`crate::fs::FsError::Unsupported`] if no provider is installed or it does not support a RAM
+    /// disk; [`crate::fs::FsError::InvalidPath`] if `prefix` escapes the root; or any error the
+    /// provider raises constructing/formatting the volume.
+    pub fn mount_ram(&mut self, prefix: &str, size_bytes: u64) -> crate::fs::FsResult<()> {
+        let backend = self
+            .storage_provider
+            .as_mut()
+            .ok_or(crate::fs::FsError::Unsupported)?
+            .mount_ram(size_bytes)?;
+        self.mounts
+            .mount_as(prefix, backend, crate::mount::DriveType::Ram)
+    }
+
+    /// Mounts the FAT volume on an SD card wired to the SPI bus `bus_identity` names, with
+    /// `chip_select` as the software chip-select pin, at `prefix` (the managed
+    /// `Storage.MountSdOverSpi`). Mounted as [`crate::mount::DriveType::Removable`], which is what a
+    /// card slot IS -- the managed `DriveInfo` then reports it as removable without being told.
+    ///
+    /// `bus_identity` is carried, never dereferenced: see
+    /// [`crate::mount::StorageProvider::mount_sd_over_spi`] for what it names and why the two halves
+    /// can agree on it without a bus-naming scheme. **Zero names no bus** and is refused here rather
+    /// than passed on -- a provider should never be asked about the absence of a peripheral, and the
+    /// managed tier spells "this driver has no native instance" exactly that way.
+    ///
+    /// # Errors
+    /// [`crate::fs::FsError::Unsupported`] if `bus_identity` is 0, if no provider is installed, if
+    /// the provider does not support SD-over-SPI, or if it recognizes no bus by that identity;
+    /// [`crate::fs::FsError::InvalidPath`] if `prefix` escapes the root; or any error the provider
+    /// raises bringing the card up (no card present, an unreadable partition, a volume that is not
+    /// FAT).
+    pub fn mount_sd_over_spi(
+        &mut self,
+        prefix: &str,
+        bus_identity: u32,
+        chip_select: i32,
+    ) -> crate::fs::FsResult<()> {
+        if bus_identity == 0 {
+            return Err(crate::fs::FsError::Unsupported);
+        }
+        let backend = self
+            .storage_provider
+            .as_mut()
+            .ok_or(crate::fs::FsError::Unsupported)?
+            .mount_sd_over_spi(bus_identity, chip_select)?;
+        self.mounts
+            .mount_as(prefix, backend, crate::mount::DriveType::Removable)
+    }
+
+    /// Mounts the SD card on the SPI bus `bus_number` names, at `prefix` -- the nanoFramework-shaped
+    /// `SDCard.Mount()`, whose `spiBus` is a bus NUMBER rather than the register base
+    /// [`Vm::mount_sd_over_spi`] carries. Mounted as [`crate::mount::DriveType::Removable`].
+    ///
+    /// The two spellings stay apart all the way down to the provider; see
+    /// [`crate::mount::StorageProvider::mount_sd_over_spi_bus`] for why conflating them would mount
+    /// the wrong bus rather than fail.
+    ///
+    /// # Errors
+    /// [`crate::fs::FsError::Unsupported`] if no provider is installed, the provider does not
+    /// support naming a bus this way, or it knows no bus by that number;
+    /// [`crate::fs::FsError::InvalidPath`] if `prefix` escapes the root; or any error the provider
+    /// raises bringing the card up.
+    pub fn mount_sd_over_spi_bus(
+        &mut self,
+        prefix: &str,
+        bus_number: u32,
+        chip_select: i32,
+    ) -> crate::fs::FsResult<()> {
+        let backend = self
+            .storage_provider
+            .as_mut()
+            .ok_or(crate::fs::FsError::Unsupported)?
+            .mount_sd_over_spi_bus(bus_number, chip_select)?;
+        self.mounts
+            .mount_as(prefix, backend, crate::mount::DriveType::Removable)
     }
 
     /// Sets the serial-port seam ([`crate::serial::SerialBackend`]). The embedder provides it (the
@@ -557,7 +703,7 @@ impl Vm {
 
     /// The heap and the serial-port seam together, split-borrowed -- the bulk read/write
     /// intrinsics cross the seam straight to/from a packed array's bytes, which needs a view into
-    /// the heap live while the backend runs (the same discipline as [`Vm::heap_and_fs`]).
+    /// the heap live while the backend runs (the same discipline as [`Vm::heap_and_mounts`]).
     pub fn heap_and_serial(
         &mut self,
     ) -> (&mut Heap, Option<&mut (dyn crate::serial::SerialBackend + 'static)>) {
@@ -599,6 +745,19 @@ impl Vm {
     pub fn set_mmio(&mut self, write: fn(u32, u32), read: fn(u32) -> u32) {
         self.mmio_write_fn = Some(write);
         self.mmio_read_fn = Some(read);
+    }
+
+    /// Installs the embedder's remaining-headroom probe (see `heap_headroom_fn`): bytes the
+    /// allocator can still hand out. A device firmware installs its arena's; a host leaves it unset.
+    pub fn set_heap_headroom(&mut self, probe: fn() -> usize) {
+        self.heap_headroom_fn = Some(probe);
+    }
+
+    /// Bytes the embedder's allocator can still hand out, or `None` when no probe is installed
+    /// (a host, where the heap is effectively unbounded and nothing should be refused).
+    #[must_use]
+    pub fn heap_headroom(&self) -> Option<usize> {
+        self.heap_headroom_fn.map(|probe| probe())
     }
 
     /// Installs the SUB-WORD volatile MMIO seam (8- and 16-bit `write_volatile`/`read_volatile`),
@@ -1636,6 +1795,25 @@ pub fn run(
     entry: MethodId,
     args: Vec<Value>,
 ) -> Result<Option<Value>, Trap> {
+    run_serviced(module, vm, entry, args, &mut || {})
+}
+
+/// [`run`] plus a `service` callback fired at EVERY scheduler quantum boundary (every
+/// [`TIME_SLICE_QUANTUM`] instructions), single- OR multi-threaded. A device serve passes a
+/// USB-poll closure so a running program's tight loop cannot starve the POLLED Lamella Link: a
+/// single-threaded program that never yields otherwise runs to completion without the scheduler
+/// ever regaining control, so the serve never pumps the carrier and the host drops the Link. Plain
+/// [`run`] passes a no-op, so host runs and tests are unaffected.
+///
+/// # Errors
+/// Propagates a [`Trap`] from any thread's execution.
+pub fn run_serviced(
+    module: &Module,
+    vm: &mut Vm,
+    entry: MethodId,
+    args: Vec<Value>,
+    service: &mut dyn FnMut(),
+) -> Result<Option<Value>, Trap> {
     let mut threads = alloc::vec![ThreadSlot {
         id: 0,
         session: Session::new(module, entry, args)?,
@@ -1661,7 +1839,7 @@ pub fn run(
         cursor = index;
         vm.set_current_thread(threads[index].id);
         vm.set_live_thread_count(live);
-        match threads[index].session.run_until_yield(module, vm)? {
+        match threads[index].session.run_until_yield(module, vm, service)? {
             ThreadStatus::Done(value) => {
                 let finished = threads[index].id;
                 threads[index].result = Some(value);
@@ -2010,7 +2188,12 @@ impl Session {
     ///
     /// # Errors
     /// Returns a [`Trap`] if an instruction faults.
-    fn run_until_yield(&mut self, module: &Module, vm: &mut Vm) -> Result<ThreadStatus, Trap> {
+    fn run_until_yield(
+        &mut self,
+        module: &Module,
+        vm: &mut Vm,
+        service: &mut dyn FnMut(),
+    ) -> Result<ThreadStatus, Trap> {
         let mut quantum = TIME_SLICE_QUANTUM;
         loop {
             if let Some(result) = &self.result {
@@ -2022,6 +2205,7 @@ impl Session {
             }
             quantum -= 1;
             if quantum == 0 {
+                service();
                 if vm.live_thread_count() > 1 {
                     return Ok(ThreadStatus::Yielded);
                 }
@@ -2954,14 +3138,14 @@ fn build_string_from_pointer(
         Value::ByRef(location) => location,
         Value::Null | Value::Int32(0) | Value::NativeInt(0) => {
             return match length {
-                None | Some(0) => Ok(vm.heap_mut().alloc_string(&[])),
+                None | Some(0) => Ok(vm.heap_mut().alloc_text("")),
                 Some(_) => Err(Trap::NullReference),
             };
         }
         _ => return Err(Trap::TypeMismatch(Opcode::Newobj)),
     };
     let units = read_utf16_through_pointer(frames, vm, &location, start, length)?;
-    Ok(vm.heap_mut().alloc_string(&units))
+    Ok(vm.heap_mut().alloc_string(&units)?)
 }
 
 /// Reads UTF-16 code units through a raw `char*` -- a managed `location` naming a
@@ -3375,7 +3559,7 @@ fn method_code(module: &Module, id: MethodId) -> Result<&[Instruction], Trap> {
     module.method_body(id).map(|body| &body.code[..]).ok_or(Trap::NoSuchMethod(id))
 }
 #[cfg(feature = "code-in-place")]
-fn method_code(module: &Module, id: MethodId) -> Result<&'static [u8], Trap> {
+fn method_code(module: &Module, id: MethodId) -> Result<&[u8], Trap> {
     module.method_code_bytes(id).ok_or(Trap::NoSuchMethod(id))
 }
 
@@ -3406,8 +3590,12 @@ const EXTERNAL_TYPE_ID: u32 = u32::MAX;
 /// typeless `catch {}` (== Object) alike. `None` for traps that should still abort (a stack
 /// overflow, an unresolved token, malformed CIL, ...). The chains mirror .NET's hierarchy so
 /// the tags equal those a managed `throw` of the same type produces.
+///
+/// The message is a [`Cow`] because one fault names the value that caused it: an unencodable
+/// code unit reports WHICH unit and where, as .NET's own message for it does. Every other
+/// fault's text is a constant and stays borrowed.
 #[cfg(feature = "exceptions")]
-fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str])> {
+fn fault_exception(trap: &Trap) -> Option<(Cow<'static, str>, &'static [&'static str])> {
     const ARITHMETIC: &[&str] = &[
         "System.DivideByZeroException",
         "System.ArithmeticException",
@@ -3471,6 +3659,25 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
         "System.Exception",
         "System.Object",
     ];
+    const ENCODER_FALLBACK: &[&str] = &[
+        "System.Text.EncoderFallbackException",
+        "System.ArgumentException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    if let Trap::EncoderFallback {
+        char_unknown,
+        index,
+    } = trap
+    {
+        return Some((
+            Cow::Owned(alloc::format!(
+                "Unable to translate Unicode character \\\\u{char_unknown:04X} at index {index} to specified code page."
+            )),
+            ENCODER_FALLBACK,
+        ));
+    }
     let (text, chain): (&str, &[&str]) = match trap {
         Trap::DivideByZero => ("Attempted to divide by zero.", ARITHMETIC),
         Trap::NullReference => (
@@ -3496,7 +3703,7 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
         Trap::OutOfMemory => ("Insufficient memory to continue the execution of the program.", OUT_OF_MEMORY),
         _ => return None,
     };
-    Some((text, chain))
+    Some((Cow::Borrowed(text), chain))
 }
 
 /// Converts a catchable runtime fault into a thrown exception object (carrying a default
@@ -3512,8 +3719,7 @@ fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
         .map(crate::exception::exception_tag)
         .collect();
     let exception = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
-    let chars: Vec<u16> = text.bytes().map(u16::from).collect();
-    let message = vm.heap_mut().alloc_string(&chars);
+    let message = vm.heap_mut().alloc_text(&text);
     vm.set_exception_message(exception, message);
     vm.set_exception_chain(exception, chain);
     Some(exception)
@@ -4011,7 +4217,7 @@ fn step(
             let chars = module
                 .resolve_string_le(asm, token)
                 .ok_or(Trap::UnresolvedString(token))?;
-            let reference = vm.heap_mut().intern_string_le(chars);
+            let reference = vm.heap_mut().intern_string_le(chars)?;
             frame.stack.push(Value::Object(reference));
         }
 
@@ -4110,21 +4316,18 @@ fn step(
                     };
                     if let Some(value) = enum_value {
                         if let Some(name) = module.enum_name_or_flags(handle, value, false) {
-                            let chars: Vec<u16> = name.encode_utf16().collect();
-                            let string = vm.heap_mut().alloc_string(&chars);
+                            let string = vm.heap_mut().alloc_text(&name);
                             frame.stack.push(Value::Object(string));
                             return Ok(Flow::Next);
                         }
                         if module.is_enum_by_handle(handle) {
-                            let chars: Vec<u16> = value.to_string().encode_utf16().collect();
-                            let string = vm.heap_mut().alloc_string(&chars);
+                            let string = vm.heap_mut().alloc_text(&value.to_string());
                             frame.stack.push(Value::Object(string));
                             return Ok(Flow::Next);
                         }
                     }
                     if let Some(name) = module.type_name_by_handle(handle) {
-                        let chars: Vec<u16> = name.encode_utf16().collect();
-                        let string = vm.heap_mut().alloc_string(&chars);
+                        let string = vm.heap_mut().alloc_text(name);
                         frame.stack.push(Value::Object(string));
                         return Ok(Flow::Next);
                     }
@@ -5352,16 +5555,49 @@ fn pointer_offset(value: &Value) -> Option<i64> {
 /// commutative), `sub` as `pointer - offset` and as `pointer - pointer` (III.1.5). The latter
 /// yields the signed BYTE difference as a native int (C# then divides by `sizeof(T)` for the
 /// element count), defined only for two pointers into the same buffer/array.
+///
+/// Only the UNSIGNED overflow-checked forms take a pointer operand: Table III.7 gives `&` a
+/// result only under `add.ovf.un` and `sub.ovf.un`, so a pointer under the signed `add.ovf`/
+/// `sub.ovf` is invalid CIL and falls through here to the integer path, which rejects it.
+///
+/// # The overflow model for the checked forms
+///
+/// `add.ovf.un`/`sub.ovf.un` read both operands as unsigned native ints and throw when the
+/// result "cannot be represented in the result type" (III.3.2, III.3.65). On a flat address
+/// space that means the ADDRESS carried out of the pointer width. Our pointers have no address:
+/// they are a `Location` plus a byte offset within ONE allocation, which is the model III.1.5
+/// prescribes -- it defines pointer arithmetic only within a single array and leaves every other
+/// use unspecified, precisely because a moving memory manager makes absolute addresses and
+/// inter-object distances unstable. Our GC is moving-capable, so an address would be a fiction.
+///
+/// So a pointer's unsigned native value here IS its byte offset, and its representable range is
+/// its allocation's offset space -- `[0, 2^32)`, the target's pointer width (`TargetLayout::ilp32`,
+/// what `sizeof(IntPtr)` reports and what the `u32` offsets already encode). The check is that
+/// offset arithmetic carrying or borrowing out of the range. Equivalently: the allocation is
+/// modelled as based at 0. That is the only choice that is deterministic and independent of
+/// allocation order -- a synthetic base address would make a program's behaviour depend on heap
+/// layout.
+///
+/// Against a real flat-address device the model is exact for `pointer - pointer` (the base
+/// cancels), LOOSER by the base for `pointer + offset` (a device based at B carries where we do
+/// not), and STRICTER by the base for `pointer - offset` (we throw walking below the allocation
+/// base, where a device would not). All three residues lie outside a single allocation, which is
+/// exactly the region III.1.5 leaves unspecified; in-bounds arithmetic agrees exactly.
 fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Option<Value>, Trap> {
-    let add = matches!(opcode, Opcode::Add | Opcode::AddOvf | Opcode::AddOvfUn);
-    let sub = matches!(opcode, Opcode::Sub | Opcode::SubOvf | Opcode::SubOvfUn);
+    let add = matches!(opcode, Opcode::Add | Opcode::AddOvfUn);
+    let sub = matches!(opcode, Opcode::Sub | Opcode::SubOvfUn);
+    let checked = matches!(opcode, Opcode::AddOvfUn | Opcode::SubOvfUn);
     if !add && !sub {
         return Ok(None);
     }
     if sub {
         if let (Value::ByRef(la), Value::ByRef(lb)) = (a, b) {
             if is_raw_pointer(la) && is_raw_pointer(lb) {
-                return Ok(raw_pointer_byte_difference(la, lb).map(Value::NativeInt));
+                let difference = raw_pointer_byte_difference(la, lb);
+                if checked && difference.is_some_and(i64::is_negative) {
+                    return Err(Trap::Overflow);
+                }
+                return Ok(difference.map(Value::NativeInt));
             }
         }
     }
@@ -5380,8 +5616,19 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         }
         _ => return Ok(None),
     };
-    let signed = if sub { -offset } else { offset };
-    let walked = |base: u32| i64::from(base).wrapping_add(signed) as u32;
+    let signed = if sub { offset.wrapping_neg() } else { offset };
+    let walked = |base: u32| -> Result<u32, Trap> {
+        if !checked {
+            return Ok(i64::from(base).wrapping_add(signed) as u32);
+        }
+        let delta = offset as u32;
+        let result = if sub {
+            base.checked_sub(delta)
+        } else {
+            base.checked_add(delta)
+        };
+        result.ok_or(Trap::Overflow)
+    };
     let stepped = match location {
         Location::Stack {
             frame,
@@ -5390,7 +5637,7 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         } => Location::Stack {
             frame: *frame,
             buffer: *buffer,
-            offset: walked(*base),
+            offset: walked(*base)?,
         },
         Location::Element {
             array,
@@ -5399,24 +5646,24 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         } => Location::Element {
             array: *array,
             index: *index,
-            byte_offset: walked(*byte_offset),
+            byte_offset: walked(*byte_offset)?,
         },
         Location::StringChar {
             string,
             byte_offset,
         } => Location::StringChar {
             string: *string,
-            byte_offset: walked(*byte_offset),
+            byte_offset: walked(*byte_offset)?,
         },
         Location::Local { frame, slot } => Location::LocalBytes {
             frame: *frame,
             slot: *slot,
-            byte_offset: walked(0),
+            byte_offset: walked(0)?,
         },
         Location::Arg { frame, slot } => Location::ArgBytes {
             frame: *frame,
             slot: *slot,
-            byte_offset: walked(0),
+            byte_offset: walked(0)?,
         },
         Location::LocalBytes {
             frame,
@@ -5425,7 +5672,7 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         } => Location::LocalBytes {
             frame: *frame,
             slot: *slot,
-            byte_offset: walked(*byte_offset),
+            byte_offset: walked(*byte_offset)?,
         },
         Location::ArgBytes {
             frame,
@@ -5434,7 +5681,7 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         } => Location::ArgBytes {
             frame: *frame,
             slot: *slot,
-            byte_offset: walked(*byte_offset),
+            byte_offset: walked(*byte_offset)?,
         },
         _ => return Ok(None),
     };
@@ -6775,9 +7022,9 @@ mod tests {
         assert_eq!(check_alloc_budget(&vm), Ok(()));
         vm.set_object_budget(Some(2));
         assert_eq!(check_alloc_budget(&vm), Ok(()));
-        vm.heap_mut().alloc_string(&[b'a' as u16]);
+        vm.heap_mut().alloc_text("a");
         assert_eq!(check_alloc_budget(&vm), Ok(()));
-        vm.heap_mut().alloc_string(&[b'b' as u16]);
+        vm.heap_mut().alloc_text("b");
         assert_eq!(check_alloc_budget(&vm), Err(Trap::OutOfMemory));
     }
 
@@ -6793,6 +7040,46 @@ mod tests {
         assert_eq!(chain.last(), Some(&"System.Object"));
         assert!(chain.contains(&"System.SystemException"));
         assert!(chain.contains(&"System.Exception"));
+    }
+
+    /// The unencodable-unit fault names `EncoderFallbackException` AND `ArgumentException`, which
+    /// is the whole reason that type was the right pick: a `catch (ArgumentException)` written
+    /// against desktop .NET fires on it without naming a type that framework's author never wrote.
+    #[test]
+    fn the_encoder_fallback_fault_is_also_an_argument_exception() {
+        let (_, chain) = fault_exception(&Trap::EncoderFallback {
+            char_unknown: 0xD800,
+            index: 1,
+        })
+        .expect("an unencodable unit is a catchable fault");
+        assert_eq!(chain.first(), Some(&"System.Text.EncoderFallbackException"));
+        assert!(chain.contains(&"System.ArgumentException"));
+        assert_eq!(chain.last(), Some(&"System.Object"));
+    }
+
+    /// The message is .NET's OWN text for this fault, character for character -- read off a real
+    /// `EncoderFallbackException` from `Encoding.GetBytes` under `EncoderExceptionFallback`, not
+    /// reconstructed from the shape of the sentence.
+    ///
+    /// The DOUBLED BACKSLASH is deliberate and is the reason this test spells the string out
+    /// rather than describing it: .NET's resource really does emit `\\uD800`, and a reader who
+    /// "fixes" it to one backslash silently stops matching the desktop message.
+    ///
+    /// It is also the only place the diagnostic is asserted at all. Managed code cannot read it
+    /// back yet: `Exception.Message` on ANY runtime-raised exception traps, because such an
+    /// exception carries no field storage while corlib's getter reads a field. That is a separate,
+    /// older defect -- a plain divide-by-zero reproduces it -- so the text is pinned here.
+    #[test]
+    fn the_encoder_fallback_message_is_dotnets_own_text() {
+        let (message, _) = fault_exception(&Trap::EncoderFallback {
+            char_unknown: 0xD800,
+            index: 1,
+        })
+        .expect("an unencodable unit is a catchable fault");
+        assert_eq!(
+            message,
+            "Unable to translate Unicode character \\\\uD800 at index 1 to specified code page."
+        );
     }
 
     #[cfg(feature = "exceptions")]
@@ -6898,7 +7185,7 @@ mod tests {
     #[test]
     fn string_pinnable_pointer_reads_units_terminator_and_walks() {
         let mut vm = Vm::new();
-        let s = vm.heap_mut().alloc_string(&[42, 43]);
+        let s = vm.heap_mut().alloc_text("*+");
         let at = |offset: u32| {
             read_location_value(
                 &[],
@@ -6925,7 +7212,7 @@ mod tests {
                 byte_offset: 2,
             }))
         );
-        let empty = vm.heap_mut().alloc_string(&[]);
+        let empty = vm.heap_mut().alloc_text("");
         assert_eq!(
             read_location_value(
                 &[],
@@ -6937,6 +7224,71 @@ mod tests {
             ),
             Some(Value::Int32(0))
         );
+    }
+
+    /// A `localloc` buffer pointer at `offset`, for the pointer-arithmetic tests.
+    fn stack_pointer_at(offset: u32) -> Value {
+        Value::ByRef(Location::Stack {
+            frame: 0,
+            buffer: 0,
+            offset,
+        })
+    }
+
+    #[test]
+    fn checked_pointer_arithmetic_refuses_the_wrap_the_unchecked_form_allows() {
+        let ovf = |opcode, a: &Value, b: &Value| stack_pointer_arithmetic(opcode, a, b).unwrap_err();
+        let walk = |opcode, a: &Value, b: &Value| stack_pointer_arithmetic(opcode, a, b).unwrap();
+
+        let all_ones = Value::NativeInt(i64::from(u32::MAX));
+        assert_eq!(
+            walk(Opcode::Add, &stack_pointer_at(1), &all_ones),
+            Some(stack_pointer_at(0)),
+        );
+        assert!(matches!(
+            ovf(Opcode::AddOvfUn, &stack_pointer_at(1), &all_ones),
+            Trap::Overflow
+        ));
+        assert_eq!(
+            walk(Opcode::AddOvfUn, &stack_pointer_at(1), &Value::Int32(2)),
+            Some(stack_pointer_at(3)),
+        );
+
+        assert_eq!(
+            walk(Opcode::Sub, &stack_pointer_at(0), &Value::Int32(1)),
+            Some(stack_pointer_at(u32::MAX)),
+        );
+        assert!(matches!(
+            ovf(Opcode::SubOvfUn, &stack_pointer_at(0), &Value::Int32(1)),
+            Trap::Overflow
+        ));
+        assert_eq!(
+            walk(Opcode::SubOvfUn, &stack_pointer_at(5), &Value::Int32(3)),
+            Some(stack_pointer_at(2)),
+        );
+
+        assert_eq!(
+            walk(Opcode::SubOvfUn, &stack_pointer_at(6), &stack_pointer_at(2)),
+            Some(Value::NativeInt(4)),
+        );
+        assert_eq!(
+            walk(Opcode::Sub, &stack_pointer_at(2), &stack_pointer_at(6)),
+            Some(Value::NativeInt(-4)),
+        );
+        assert!(matches!(
+            ovf(Opcode::SubOvfUn, &stack_pointer_at(2), &stack_pointer_at(6)),
+            Trap::Overflow
+        ));
+
+        assert_eq!(walk(Opcode::AddOvf, &stack_pointer_at(1), &all_ones), None);
+        assert_eq!(
+            walk(Opcode::SubOvf, &stack_pointer_at(1), &Value::Int32(1)),
+            None,
+        );
+        assert!(matches!(
+            binary_numeric(Opcode::AddOvf, stack_pointer_at(1), all_ones).unwrap_err(),
+            Trap::TypeMismatch(Opcode::AddOvf)
+        ));
     }
 
     #[test]
@@ -6969,7 +7321,7 @@ mod tests {
             Err(Trap::ArgumentOutOfRange(1))
         );
 
-        let source = vm.heap_mut().alloc_string(&[42, 43]);
+        let source = vm.heap_mut().alloc_text("*+");
         let tail = build_string_from_pointer(
             &frames,
             &mut vm,

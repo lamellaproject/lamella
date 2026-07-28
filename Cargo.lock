@@ -294,6 +294,7 @@ dependencies = [
  "lamella-ir",
  "lamella-link",
  "lamella-metadata",
+ "lamella-probe-core",
  "lamella-token",
  "lamella-usbhid",
 ]
@@ -332,6 +333,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-bsp-gen"
+version = "0.0.0"
+dependencies = [
+ "lamella-wire",
+]
+
+[[package]]
 name = "lamella-cil"
 version = "0.0.0"
 dependencies = [
@@ -351,6 +359,7 @@ dependencies = [
 name = "lamella-cmsis-dap"
 version = "0.0.0"
 dependencies = [
+ "lamella-probe-core",
  "lamella-usbbulk",
  "lamella-usbhid",
 ]
@@ -366,6 +375,7 @@ dependencies = [
  "lamella-firmware",
  "lamella-ir",
  "lamella-link",
+ "lamella-probe-core",
  "lamella-py-frontend",
  "lamella-usbhid",
 ]
@@ -375,6 +385,7 @@ name = "lamella-cmsis-dap-rp2350"
 version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
+ "lamella-probe-core",
  "lamella-usbbulk",
 ]
 
@@ -384,6 +395,7 @@ version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
  "lamella-probe",
+ "lamella-probe-core",
  "lamella-usbhid",
 ]
 
@@ -392,6 +404,9 @@ name = "lamella-cmsis-dap-stm32"
 version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
+ "lamella-probe",
+ "lamella-probe-core",
+ "lamella-stlink",
  "lamella-usbhid",
 ]
 
@@ -426,6 +441,7 @@ dependencies = [
  "lamella-dap",
  "lamella-debug-backend",
  "lamella-metadata",
+ "lamella-probe-core",
  "lamella-usbhid",
 ]
 
@@ -440,6 +456,13 @@ dependencies = [
  "lamella-aot",
  "lamella-elf",
  "lamella-link",
+]
+
+[[package]]
+name = "lamella-fs-fat"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil-runtime",
 ]
 
 [[package]]
@@ -474,6 +497,7 @@ version = "0.0.0"
 dependencies = [
  "lamella-cil",
  "lamella-cil-runtime",
+ "lamella-fs-fat",
  "lamella-metadata",
  "lamella-token",
 ]
@@ -534,9 +558,14 @@ name = "lamella-probe"
 version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
+ "lamella-probe-core",
  "lamella-usbbulk",
  "lamella-usbhid",
 ]
+
+[[package]]
+name = "lamella-probe-core"
+version = "0.0.0"
 
 [[package]]
 name = "lamella-py-bytecode"
@@ -579,7 +608,9 @@ dependencies = [
 name = "lamella-runner"
 version = "0.0.0"
 dependencies = [
+ "lamella-assemble",
  "lamella-cil-runtime",
+ "lamella-fs-fat",
  "lamella-load",
  "lamella-metadata",
  "lamella-mmio",
@@ -597,10 +628,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-sd-spi"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil-runtime",
+]
+
+[[package]]
 name = "lamella-serial-mem"
 version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
+]
+
+[[package]]
+name = "lamella-stlink"
+version = "0.0.0"
+dependencies = [
+ "lamella-probe-core",
+ "lamella-usbbulk",
+]
+
+[[package]]
+name = "lamella-storage"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil-runtime",
+ "lamella-fs-fat",
+ "lamella-sd-spi",
 ]
 
 [[package]]
@@ -665,6 +720,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-wasm-bridge"
+version = "0.0.0"
+dependencies = [
+ "lamella-asm-wasm",
+ "lamella-cil-runtime",
+ "lamella-load",
+ "lamella-metadata",
+ "lamella-wasm-interp",
+]
+
+[[package]]
+name = "lamella-wasm-interp"
+version = "0.0.0"
+dependencies = [
+ "lamella-asm-wasm",
+ "libm",
+]
+
+[[package]]
 name = "lamella-wch-link"
 version = "0.0.0"
 dependencies = [
@@ -678,6 +752,7 @@ dependencies = [
  "lamella-cil-runtime",
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
+ "lamella-probe-core",
  "lamella-usbhid",
 ]
 

@@ -1,0 +1,68 @@
+# BLOCK layout: the nRF52833 GPIO port block, the registers a bus binding configures
+# through (PARTIAL). The nRF has no pinmux table: a
+# peripheral claims pins through its own PSEL registers, and the pin's electrical config
+# lives here in PIN_CNF[n] = 0x700 + 4*n.
+
+[table]
+kind = "block"
+family = "nrf52833"
+block = "gpio"
+sources = [
+    "Nordic nRF52833 Product Specification 4452_021 v1.7, ch. 6.8 GPIO (PIN_CNF encoding + the register overview table)",
+]
+notes = [
+    "PIN_CNF[n] sits at 0x700 + PIN_CNF_STRIDE * n from the port base; one register per pin, no pairing.",
+    "The TWI pins' Table-51 value (input, buffer connected, no pull, drive S0D1) is the twi block's PIN_CNF_TWI constant; this block carries the geometry and field encoding.",
+    "OUT/DIR are whole-port registers: BIT n is PIN n, so they carry no named fields -- a driver builds its word from the board's per-pin masks. The SET/CLR aliases write one bit without a read-modify-write, which is what makes a scanned display safe to drive from an interrupt or a tight loop.",
+]
+
+[registers.OUT]
+offset = 0x504
+width = 32
+fields = { }
+notes = "Whole-port output level; bit n is pin n. Read-modify-write -- prefer OUTSET/OUTCLR."
+
+[registers.OUTSET]
+offset = 0x508
+width = 32
+fields = { }
+notes = "Write 1 to a bit to drive that pin HIGH; 0 bits are untouched. Reads back OUT."
+
+[registers.OUTCLR]
+offset = 0x50C
+width = 32
+fields = { }
+notes = "Write 1 to a bit to drive that pin LOW; 0 bits are untouched. Reads back OUT."
+
+[registers.IN]
+offset = 0x510
+width = 32
+fields = { }
+notes = "Whole-port input level; bit n is pin n. Requires PIN_CNF[n].INPUT connected."
+
+[registers.DIR]
+offset = 0x514
+width = 32
+fields = { }
+notes = "Whole-port direction; bit n set = pin n is an output. Mirrors PIN_CNF[n].DIR."
+
+[registers.DIRSET]
+offset = 0x518
+width = 32
+fields = { }
+notes = "Write 1 to a bit to make that pin an OUTPUT; 0 bits are untouched."
+
+[registers.DIRCLR]
+offset = 0x51C
+width = 32
+fields = { }
+notes = "Write 1 to a bit to make that pin an INPUT; 0 bits are untouched."
+
+[registers.PIN_CNF0]
+offset = 0x700
+width = 32
+fields = { DIR = [0, 1], INPUT = [1, 1], PULL = [2, 2], DRIVE = [8, 3], SENSE = [16, 2] }
+notes = "PIN_CNF[0]; PIN_CNF[n] = this offset + PIN_CNF_STRIDE * n."
+
+[constants]
+PIN_CNF_STRIDE = 4

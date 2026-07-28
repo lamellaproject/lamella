@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 use lamella_binder::{
     Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, ConversionKind,
     Diagnostic as BinderDiagnostic, FieldReference, Model, SpecialType, TypeSymbol,
-    bind_compilation_unit_with_references, bind_type, collect_into, load_assembly,
-    parameter_symbol,
+    bind_compilation_unit_with_references_and_options, bind_type, collect_into, load_assembly,
+    parameter_symbol, resolve_constants,
 };
 use lamella_cil::{Instruction, MethodBodyImage, encode_with_offsets, write_method_body};
 use lamella_metadata::signature::element;
@@ -159,7 +159,7 @@ pub fn compile_unit_with_references(
     assembly_name: &str,
     references: &[Assembly],
 ) -> Compilation {
-    compile(unit, module_name, assembly_name, references, None, false, false)
+    compile(unit, module_name, assembly_name, references, None, false, false, false)
 }
 
 /// Like [`compile_unit_with_references`], but also emits a standalone Portable PDB
@@ -180,6 +180,7 @@ pub fn compile_unit_with_debug(
         assembly_name,
         references,
         Some((source, source_path)),
+        false,
         false,
         false,
     )
@@ -223,6 +224,7 @@ pub fn compile_source_with(
     options: LexOptions,
 ) -> Compilation {
     let native_interop = options.native_interop;
+    let unsafe_option_missing = !options.unsafe_code;
     let embed_pdb = options.embed_pdb;
     let parsed = parse_compilation_unit_with(source, options);
     let parse_diagnostics: Vec<Diagnostic> = parsed
@@ -246,6 +248,7 @@ pub fn compile_source_with(
         references,
         debug,
         native_interop,
+        unsafe_option_missing,
         embed_pdb,
     );
     if !parse_diagnostics.is_empty() {
@@ -263,24 +266,27 @@ fn compile(
     references: &[Assembly],
     debug: Option<(&str, &str)>,
     native_interop: bool,
+    unsafe_option_missing: bool,
     embed_pdb: bool,
 ) -> Compilation {
-    let diagnostics: Vec<Diagnostic> = bind_compilation_unit_with_references(unit, references)
+    let diagnostics: Vec<Diagnostic> =
+        bind_compilation_unit_with_references_and_options(unit, references, unsafe_option_missing)
         .iter()
         .map(Diagnostic::from_binder)
         .collect();
-    if diagnostics.iter().any(Diagnostic::is_error) {
+    let had_error = diagnostics.iter().any(Diagnostic::is_error);
+    let units = core::slice::from_ref(unit);
+    let Some(program) = ValidatedProgram::from_clean_bind(units, references, had_error) else {
         return Compilation {
             diagnostics,
             image: None,
             pdb: None,
             emit_error: None,
         };
-    }
-    let units = core::slice::from_ref(unit);
+    };
     let debug_sources = debug.map(|pair| [pair]);
     let debug = debug_sources.as_ref().map(|slice| &slice[..]);
-    match build_image(units, module_name, assembly_name, references, debug, native_interop, embed_pdb) {
+    match build_image(&program, module_name, assembly_name, debug, native_interop, embed_pdb) {
         Ok((image, pdb)) => Compilation {
             diagnostics,
             image: Some(image),
@@ -332,6 +338,7 @@ pub fn compile_sources_with(
     let mut syntax_error = false;
     let native_interop = options.native_interop;
     let embed_pdb = options.embed_pdb;
+    let unsafe_option_missing = !options.unsafe_code;
     for (source, _path) in sources {
         let parsed = parse_compilation_unit_with(source, options.clone());
         let parse_diagnostics: Vec<Diagnostic> = parsed
@@ -354,27 +361,30 @@ pub fn compile_sources_with(
     let mut any_error = false;
     for (per_unit, unit_diagnostics) in diagnostics
         .iter_mut()
-        .zip(lamella_binder::bind_compilation_units_with_references(&units, references))
+        .zip(lamella_binder::bind_compilation_units_with_references_and_options(
+            &units,
+            references,
+            unsafe_option_missing,
+        ))
     {
         let bound: Vec<Diagnostic> =
             unit_diagnostics.iter().map(Diagnostic::from_binder).collect();
         any_error |= bound.iter().any(Diagnostic::is_error);
         per_unit.extend(bound);
     }
-    if any_error {
+    let debug = emit_debug.then_some(sources);
+    let Some(program) = ValidatedProgram::from_clean_bind(&units, references, any_error) else {
         return MultiCompilation {
             diagnostics,
             image: None,
             pdb: None,
             emit_error: None,
         };
-    }
-    let debug = emit_debug.then_some(sources);
+    };
     match build_image(
-        &units,
+        &program,
         module_name,
         assembly_name,
-        references,
         debug,
         native_interop,
         embed_pdb,
@@ -411,18 +421,46 @@ fn reference_model(units: &[CompilationUnit], references: &[Assembly]) -> Model 
     }
     model.canonicalize_signatures();
     model.link_bases();
+    resolve_constants(&mut model, units);
     model
 }
 
+/// The emit-trust barrier (T1.2): a program whose declarations and bodies have bound without any
+/// error. [`build_image`] -- the PE/metadata emitter -- accepts ONLY this, and it can be minted
+/// ONLY by [`ValidatedProgram::from_clean_bind`] from an error-free bind, so no program still
+/// carrying errors (or recovery nodes) can reach emission. It carries just the units and references
+/// today; it is the seam Tier 3 grows into a fully-validated typed tree -- declaration validation,
+/// control flow, attributes, unsafe rules all discharged (the audit's C04 boundary) -- crossing
+/// here with its invariants proven.
+struct ValidatedProgram<'a, 'r> {
+    units: &'a [CompilationUnit],
+    references: &'a [Assembly<'r>],
+}
+
+impl<'a, 'r> ValidatedProgram<'a, 'r> {
+    /// Mints the barrier token iff the bind reported no error. `had_error` is the caller's verdict
+    /// over its own diagnostics (a flat list for one file, per-file for several), so the shape stays
+    /// in the caller while this stays the SOLE constructor. Holding a `ValidatedProgram` is therefore
+    /// proof the program bound cleanly -- and [`build_image`] cannot be reached without one.
+    fn from_clean_bind(
+        units: &'a [CompilationUnit],
+        references: &'a [Assembly<'r>],
+        had_error: bool,
+    ) -> Option<Self> {
+        (!had_error).then_some(ValidatedProgram { units, references })
+    }
+}
+
 fn build_image(
-    units: &[CompilationUnit],
+    program: &ValidatedProgram,
     module_name: &str,
     assembly_name: &str,
-    references: &[Assembly],
     debug: Option<&[(&str, &str)]>,
     native_interop: bool,
     embed_pdb: bool,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
+    let units = program.units;
+    let references = program.references;
     let model = reference_model(units, references);
     let mut tokens = assign_tokens(units, model.signature_canon());
     tokens.set_native_interop(native_interop);
@@ -1473,12 +1511,38 @@ fn emit_namespace(
 /// methods (II.22.37 semantics). Implementing classes get an `InterfaceImpl` row.
 fn emit_interface(
     image: &mut ImageBuilder,
+    binder: &Binder,
     tokens: &mut Tokens,
     namespace: &str,
     declaration: &TypeDecl,
 ) -> Result<(), crate::EmitError> {
     let nil = Token::new(TYPE_DEF, 0);
     let type_token = image.add_type(namespace, &declaration.name, nil, INTERFACE_FLAGS);
+    let own = named_symbol(namespace, &declaration.name);
+    let direct: Vec<TypeSymbol> = binder
+        .model()
+        .get_by_symbol(&own)
+        .map(|info| {
+            info.bases
+                .iter()
+                .filter_map(|base| binder.model().resolve_interface_base(base))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut interfaces: Vec<TypeSymbol> = Vec::new();
+    for interface in direct {
+        collect_interface_closure(binder.model(), interface, &mut interfaces);
+    }
+    let mut interface_tokens: Vec<Token> = Vec::new();
+    for interface in &interfaces {
+        mint_named_type_token(interface, image, tokens);
+        if let Some(token) = tokens.type_token(interface) {
+            interface_tokens.push(token);
+        }
+    }
+    for interface in interface_tokens {
+        image.add_interface_impl(type_token, interface);
+    }
     for member in &declaration.members {
         if let Member::Method {
             return_type,
@@ -1834,7 +1898,7 @@ fn emit_type(
     let enclosing = named_symbol(namespace, &declaration.name);
     if matches!(declaration.kind, TypeKind::Interface) {
         mint_member_signature_types(binder, &declaration.members, image, tokens);
-        return emit_interface(image, tokens, namespace, declaration);
+        return emit_interface(image, binder, tokens, namespace, declaration);
     }
     let (base_class, nested_in): (Option<TypeSymbol>, Option<Box<str>>) = {
         let info = binder.model().get_by_symbol(&enclosing);
@@ -4003,6 +4067,22 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 }
             }
         }
+        BoundExprKind::IndexerAccess {
+            receiver,
+            indices,
+            setter,
+        } => {
+            mint_in_expr(receiver, image, tokens);
+            for index in indices {
+                mint_in_expr(index, image, tokens);
+            }
+            if tokens
+                .method(&setter.declaring_type, &setter.name, &setter.parameters)
+                .is_none()
+            {
+                mint_member_ref(setter, image, tokens);
+            }
+        }
         BoundExprKind::Assignment {
             target,
             value,
@@ -4942,8 +5022,13 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
                     "a named type outside this module in a signature",
                 ));
         }
-        TypeSymbol::Array { element, .. } => {
-            return Ok(TypeSig::SzArray(Box::new(type_sig(tokens, element)?)));
+        TypeSymbol::Array { element, rank } => {
+            let element = Box::new(type_sig(tokens, element)?);
+            return Ok(if *rank == 1 {
+                TypeSig::SzArray(element)
+            } else {
+                TypeSig::Array { element, rank: *rank as u32 }
+            });
         }
         TypeSymbol::Pointer(element) => {
             return Ok(TypeSig::Pointer(Box::new(type_sig(tokens, element)?)));
@@ -5438,6 +5523,14 @@ mod tests {
     use lamella_syntax::parser::parse_compilation_unit;
 
     #[test]
+    fn validated_program_is_minted_only_by_a_clean_bind() {
+        let no_units: &[CompilationUnit] = &[];
+        let no_refs: &[Assembly] = &[];
+        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, false).is_some());
+        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, true).is_none());
+    }
+
+    #[test]
     fn compiles_a_method_to_a_round_trippable_dll() {
         let unit = parse_compilation_unit(
             "namespace App { public class Program { \
@@ -5586,6 +5679,232 @@ mod tests {
                 );
             }
             other => panic!("expected SigType::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rectangular_array_local_slot_keeps_its_rank() {
+        let unit = parse_compilation_unit(
+            "class Program { static int Main() { int[,] m = new int[2, 3]; \
+                m[0, 0] = 42; return m[0, 0]; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "arr2dlocal.dll", "arr2dlocal");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let main = assembly
+            .find_type("", "Program")
+            .expect("the Program type")
+            .methods()
+            .find(|method| method.name() == Some("Main"))
+            .expect("the Main method");
+        let locals = main.local_variables();
+        let slot = locals.first().expect("Main declares the m local");
+        match slot {
+            lamella_metadata::signature::SigType::Array { element, rank } => {
+                assert_eq!(*rank, 2, "the `int[,]` local slot must be rank 2");
+                assert!(
+                    matches!(**element, lamella_metadata::signature::SigType::I4),
+                    "element was {element:?}"
+                );
+            }
+            other => panic!("expected the local slot to be SigType::Array {{ rank: 2 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_volatile_field_access_carries_the_volatile_prefix() {
+        use lamella_cil::Opcode;
+        let unit = parse_compilation_unit(
+            "class C { volatile int v; int plain; \
+                 public void SetV(int x) { v = x; } \
+                 public int GetV() { return v; } \
+                 public void SetPlain(int x) { plain = x; } \
+                 public int GetPlain() { return plain; } \
+                 static volatile int sv; \
+                 public static void SetSV(int x) { sv = x; } \
+                 public static int GetSV() { return sv; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "vol.dll", "vol");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let ty = assembly.find_type("", "C").expect("the C type");
+        let code_of = |name: &str| {
+            ty.methods()
+                .find(|method| method.name() == Some(name))
+                .unwrap_or_else(|| panic!("method {name} is missing"))
+                .body()
+                .unwrap_or_else(|| panic!("method {name} has no body"))
+                .code
+        };
+        let prefixes = |code: &[Instruction], op: Opcode| {
+            code.windows(2)
+                .any(|w| w[0].opcode == Opcode::Volatile && w[1].opcode == op)
+        };
+        let carries_volatile =
+            |code: &[Instruction]| code.iter().any(|i| i.opcode == Opcode::Volatile);
+
+        assert!(
+            prefixes(&code_of("GetV"), Opcode::Ldfld),
+            "an instance volatile read must be `volatile. ldfld`"
+        );
+        assert!(
+            prefixes(&code_of("SetV"), Opcode::Stfld),
+            "an instance volatile write must be `volatile. stfld`"
+        );
+        assert!(
+            prefixes(&code_of("GetSV"), Opcode::Ldsfld),
+            "a static volatile read must be `volatile. ldsfld`"
+        );
+        assert!(
+            prefixes(&code_of("SetSV"), Opcode::Stsfld),
+            "a static volatile write must be `volatile. stsfld`"
+        );
+        assert!(
+            !carries_volatile(&code_of("GetPlain")),
+            "a non-volatile read must not carry `volatile.`"
+        );
+        assert!(
+            !carries_volatile(&code_of("SetPlain")),
+            "a non-volatile write must not carry `volatile.`"
+        );
+    }
+
+    #[test]
+    fn an_interface_records_its_base_interfaces_as_interface_impls() {
+        let unit = parse_compilation_unit(
+            "interface IBase { int Base(); } interface IDerived : IBase { int Derived(); }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "ifaces.dll", "ifaces");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let base = assembly.find_type("", "IBase").expect("the IBase type");
+        let derived = assembly.find_type("", "IDerived").expect("the IDerived type");
+        assert!(
+            derived.interfaces().any(|token| token == base.token()),
+            "IDerived must carry an InterfaceImpl row naming IBase"
+        );
+    }
+
+    #[test]
+    fn each_catch_handler_stores_into_a_slot_of_its_own_exception_type() {
+        let unit = parse_compilation_unit(
+            "namespace System { \
+                public class Exception { } \
+                public class InvalidOperationException : Exception { } \
+                public class DivideByZeroException : Exception { } \
+            } \
+            class Program { static int Main() { \
+                try { throw new System.InvalidOperationException(); } \
+                catch (System.DivideByZeroException e) { return 1; } \
+                catch (System.InvalidOperationException e) { return 42; } } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "ehmc.dll", "ehmc");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let main = assembly
+            .find_type("", "Program")
+            .expect("the Program type")
+            .methods()
+            .find(|method| method.name() == Some("Main"))
+            .expect("the Main method");
+        let locals = main.local_variables();
+        let clauses = main.exception_clauses();
+        let body = main.body().expect("Main has a method body");
+        assert_eq!(clauses.len(), 2, "two catch clauses: {clauses:?}");
+        assert_eq!(body.handlers.len(), 2, "two handler regions");
+
+        let mut slots = Vec::new();
+        let mut tags = Vec::new();
+        for (clause, handler) in clauses.iter().zip(body.handlers.iter()) {
+            let lamella_metadata::ExceptionHandlerKind::Catch(catch_token) = clause.kind else {
+                panic!("both clauses are typed catches, got {:?}", clause.kind);
+            };
+            let opener = &body.code[handler.handler_range.start as usize];
+            assert_eq!(
+                opener.opcode,
+                lamella_cil::Opcode::Stloc,
+                "a named handler opens by storing its exception, got {:?}",
+                opener.opcode
+            );
+            let &lamella_cil::Operand::Variable(slot) = &opener.operand else {
+                panic!("stloc carries a variable slot, got {:?}", opener.operand);
+            };
+            let slot_type = match &locals[slot as usize] {
+                lamella_metadata::signature::SigType::Class(token) => *token,
+                other => panic!("the exception slot is a class type, got {other:?}"),
+            };
+            let catch_tag = assembly.exception_tag(catch_token);
+            assert_ne!(catch_tag, 0, "a known exception type has a nonzero tag");
+            assert_eq!(
+                assembly.exception_tag(slot_type),
+                catch_tag,
+                "a handler must store its exception into a slot of that same type",
+            );
+            slots.push(slot);
+            tags.push(catch_tag);
+        }
+        assert_ne!(slots[0], slots[1], "the two `e` clauses occupy distinct slots");
+        assert_ne!(tags[0], tags[1], "the two clauses catch different types");
+    }
+
+    #[test]
+    fn only_the_literal_zero_converts_to_an_enum() {
+        let emits = |body: &str| {
+            let src = format!("enum E {{ A }} class P {{ static int M() {{ {body} }} }}");
+            compile_unit(&parse_compilation_unit(&src).unit, "z.dll", "z")
+                .image
+                .is_some()
+        };
+        assert!(emits("E e = 0; return (int)e;"), "the literal 0 converts");
+        assert!(!emits("E e = 0.0; return 0;"), "a floating zero does not convert");
+        assert!(!emits("E e = 0.0m; return 0;"), "a decimal zero does not convert");
+    }
+
+    #[test]
+    fn same_named_locals_in_sibling_scopes_keep_distinct_slots() {
+        let unit = parse_compilation_unit(
+            "struct A { public int X; } struct B { public int X; } \
+             class Program { static int M(bool c) { \
+                 if (c) { A v; v.X = 11; return v.X; } \
+                 else { B v; v.X = 22; return v.X; } } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "sib.dll", "sib");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let method = assembly
+            .find_type("", "Program")
+            .expect("the Program type")
+            .methods()
+            .find(|method| method.name() == Some("M"))
+            .expect("the M method");
+        let locals = method.local_variables();
+        let body = method.body().expect("M has a method body");
+        let value_slots: Vec<usize> = locals
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| matches!(ty, lamella_metadata::signature::SigType::ValueType(_)))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(value_slots.len(), 2, "two value-type locals (A v, B v): {locals:?}");
+        for slot in value_slots {
+            let referenced = body.code.iter().any(|instr| {
+                matches!(instr.operand, lamella_cil::Operand::Variable(v) if v as usize == slot)
+            });
+            assert!(
+                referenced,
+                "value-type local slot {slot} is declared but never referenced -- the name \
+                 collision collapsed both `v`s onto one slot"
+            );
         }
     }
 

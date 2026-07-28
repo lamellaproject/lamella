@@ -15,6 +15,7 @@ lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = fals
 # light with no firmware support. Host-only dev-deps; the library itself stays no_std.
 # winc-flash additionally reset-halts the host MCU (the SAM extension's DSU-aware halt) so
 # the resident serve firmware cannot contend for the module's SPI pins.
+lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam" }
 lamella-usbhid = { path = "../lamella-usbhid" }

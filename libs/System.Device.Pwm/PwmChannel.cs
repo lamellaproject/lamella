@@ -7,13 +7,16 @@ namespace System.Device.Pwm
         /// <summary>The frequency in hertz.</summary>
         public abstract int Frequency { get; set; }
 
+#if LAMELLA_SURFACE_FLOAT
         /// <summary>The duty cycle, from 0.0 to 1.0.</summary>
         public abstract double DutyCycle { get; set; }
+#endif
 
         public abstract void Start();
 
         public abstract void Stop();
 
+#if LAMELLA_SURFACE_FLOAT
         /// <summary>Creates a PwmChannel for the current platform -- not supported on a bare-metal
         /// Lamella target; construct the board's PwmChannel backend directly.</summary>
         public static PwmChannel Create(int chip, int channel, int frequency, double dutyCyclePercentage)
@@ -32,6 +35,7 @@ namespace System.Device.Pwm
         {
             return Create(chip, channel, 400, 0.5);
         }
+#endif
 
         public void Dispose()
         {

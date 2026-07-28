@@ -1,0 +1,19 @@
+[package]
+name = "lamella-wasm-interp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WebAssembly 1.0 (MVP) interpreter for the Lamella WASM tier (EXPERIMENTAL, preview): a never-panicking decoder and executor over host-granted import worlds."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The same MUSL/fdlibm port the CIL interpreter's Math intrinsics ride (already in-tree):
+# core lacks sqrt/ceil/floor/trunc/rint, and wasm requires them IEEE correctly-rounded.
+libm = "0.2.16"
+
+[dev-dependencies]
+lamella-asm-wasm = { path = "../lamella-asm-wasm" }

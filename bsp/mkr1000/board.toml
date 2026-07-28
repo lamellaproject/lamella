@@ -14,16 +14,18 @@ sources = [
     "size-gate feature notes: identical module-internal WINC wiring to the SAMW25 XPro; the board flips the advertised identity, otherwise the same build",
 ]
 
-[carrier]
+[[carriers]]
 kind = "native-usb"
+plan = "osc8m-8mhz"
+default = true
 
-
+[[plans]]
 name = "osc8m-8mhz"
 default = true
 source = "osc8m"
 gclk0_hz = 8000000
 
-
+[[plans]]
 name = "usb-48mhz"
 source = "dfll48m-usb-recovery"
 gclk1_hz = 48000000

@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Reflection.Assembly
+#if LAMELLA_SURFACE_REFLECTION
 namespace System.Reflection
 {
     public class Assembly
@@ -20,3 +21,4 @@ namespace System.Reflection
         public static bool operator !=(Assembly left, Assembly right) { return !HandleEquals(left, right); }
     }
 }
+#endif

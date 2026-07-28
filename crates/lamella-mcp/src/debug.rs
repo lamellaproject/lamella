@@ -347,7 +347,7 @@ impl Sessions {
             .unwrap_or_default();
         if vars.is_empty() {
             return text_result(
-                "no locals available on this target yet -- on-device locals over the wire (DBG_LOCALS) are being wired up.".to_owned(),
+                "no locals available on this target.".to_owned(),
                 false,
             );
         }

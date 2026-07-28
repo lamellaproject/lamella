@@ -30,6 +30,29 @@ pub enum LowerError {
     /// The function contains a call, which the single-function lowering cannot
     /// resolve; calls are lowered by the program (module) lowering.
     CallUnsupported,
+    /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
+    /// surrogate under `string-utf8`, whose encoding has no form for one. REFUSED rather than replaced
+    /// with U+FFFD, because string construction never loses data and the offending unit is known here,
+    /// at compile time (see `stringgen::encode_string_bytes`). The default tier and
+    /// `string-utf8-wtf8` never produce this.
+    UnencodableStringUnit {
+        /// The offending UTF-16 code unit.
+        unit: u16,
+        /// Its index in the literal, in UTF-16 code units.
+        index: u32,
+    },
+}
+
+/// Maps a string blob's encoding refusal into this backend's error, so the four blob-emission sites
+/// across the three backends carry the same two facts and the encoder stays the ONE place that decides
+/// whether a unit is representable.
+fn unencodable<T>(
+    result: Result<T, crate::stringgen::UnencodableUnit>,
+) -> Result<T, LowerError> {
+    result.map_err(|e| LowerError::UnencodableStringUnit {
+        unit: e.unit,
+        index: e.index,
+    })
 }
 
 /// The ARM condition code that tests a MIR comparison.
@@ -205,7 +228,8 @@ fn lower_inst(
         Inst::Call { .. }
         | Inst::CallVirtual { .. }
         | Inst::CallInterface { .. }
-        | Inst::CastClassScan { .. } => {
+        | Inst::CastClassScan { .. }
+        | Inst::InterfaceHasTag { .. } => {
             return Err(LowerError::CallUnsupported);
         }
         Inst::SemihostWrite { .. }
@@ -216,6 +240,7 @@ fn lower_inst(
         | Inst::IntToString { .. }
         | Inst::Alloc { .. }
         | Inst::AllocLike { .. }
+        | Inst::AllocDescribed { .. }
         | Inst::AllocArray { .. }
         | Inst::ArrayLoad { .. }
         | Inst::ArrayStore { .. }
@@ -311,8 +336,8 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
 /// reserved MIR-level EH-tag marker (`cil::G_EXCEPTION_TAG_OFFSET`) -- resolves to the ONE
 /// VES-global `__lamella_eh_tag` word every assembly shares (a per-assembly row 0 would break a
 /// cross-assembly throw/catch), any other OWN offset resolves to THIS assembly's own region
-/// symbol plus the slot's addend, so two linked assemblies' statics can never stomp each other
-/// (#15), and a REFERENCE-owned offset (a cross-assembly `ldsfld`/`stsfld`) resolves to the
+/// symbol plus the slot's addend, so two linked assemblies' statics can never stomp each other,
+/// and a REFERENCE-owned offset (a cross-assembly `ldsfld`/`stsfld`) resolves to the
 /// OWNING assembly's region symbol -- its slot 0 is reserved like every region's, so a reference
 /// offset is never 0 and needs no EH split. The linker-free flat path keeps the fixed
 /// `STATIC_FIELD_BASE` layout -- a self-contained single-assembly image, where another assembly's
@@ -494,16 +519,80 @@ fn load_const_word(
     Ok(())
 }
 
+/// The 8-byte-aligned outgoing STACK bytes a call's arguments need past the argument registers
+/// (`start_reg`..r3) -- the planning half of [`load_call_args`] with no emission. The spilled path
+/// reserves the widest such area at the frame BOTTOM (see [`out_args_bytes`]) so a call needs no
+/// around-call SP motion. Kept in lockstep with [`load_call_args`]'s own `stack_used` tally.
+fn outgoing_stack_bytes(value_types: &[MirType], args: &[ValueId], start_reg: u8) -> u16 {
+    let mut reg = start_reg;
+    let mut stack_used = 0u16;
+    for &a in args {
+        let ty = value_types.get(a.0 as usize).copied();
+        let words = ty.map_or(1, |t| (t.stack_slot_bytes() / 4).max(1));
+        if matches!(ty, Some(MirType::I64 | MirType::F64)) && reg % 2 == 1 {
+            reg += 1;
+        }
+        for _ in 0..words {
+            if reg < 4 {
+                reg += 1;
+            } else {
+                stack_used += 4;
+            }
+        }
+    }
+    (stack_used + 7) & !7
+}
+
+/// The outgoing-args area reserved at the BOTTOM of a spilled frame: the widest stack-argument area
+/// any call in `func` needs, so SP stays FIXED across every call. A per-call `sub sp`/`add sp` would
+/// move SP while the callee can park, and a GC walk of this (caller) frame would then read its roots
+/// against the wrong SP. `0` when no call spills arguments, keeping the frame byte-identical. Each
+/// call is measured at the SAME `start_reg` its lowering hands to [`load_call_args`], so the
+/// reservation always covers the actual overflow: the dispatch kinds (`CallVirtual`/`CallInterface`/
+/// `CallIndirect`) pass their receiver as `args[0]` from r0 (start_reg 0), while an `InvokeDelegate`
+/// to an instance target and a big-struct (sret) `Call` both reserve r0 for the `this`/return pointer
+/// and shift their args to r1.. (start_reg 1). For <=3 args both starts spill zero words, so only a
+/// 4+-arg delegate or sret call grows the area -- every existing frame stays byte-identical.
+fn out_args_bytes(func: &Function) -> u16 {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|(result, i)| match i {
+            Inst::Call { args, .. }
+                if matches!(
+                    func.value_type(*result),
+                    Some(MirType::ValueType { size, .. }) if size > 4
+                ) =>
+            {
+                Some(outgoing_stack_bytes(&func.value_types, args, 1))
+            }
+            Inst::Call { args, .. }
+            | Inst::CallIndirect { args, .. }
+            | Inst::CallNative { args, .. }
+            | Inst::CallVirtual { args, .. }
+            | Inst::CallInterface { args, .. } => {
+                Some(outgoing_stack_bytes(&func.value_types, args, 0))
+            }
+            Inst::InvokeDelegate { args, .. } => {
+                Some(outgoing_stack_bytes(&func.value_types, args, 1))
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Loads call arguments per the AAPCS: each word into a register (`start_reg`..r3, a
-/// doubleword even-aligned), then the remainder into an 8-byte-aligned outgoing stack area.
-/// Returns the stack bytes reserved, which the caller reclaims (`add sp`) after the `BL`.
+/// doubleword even-aligned), then the remainder into the reserved outgoing-args area at the frame
+/// bottom (`[sp + k]`, from [`out_args_bytes`]). SP does NOT move around the call, so a value slot
+/// stays at its fixed `slot(a)` offset and a GC walk of a parking call reads this frame correctly.
 fn load_call_args(
     enc: &mut Encoder,
     value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     args: &[ValueId],
     start_reg: u8,
-) -> Result<u16, LowerError> {
+) -> Result<(), LowerError> {
     let mut reg = start_reg;
     let mut reg_plan: Vec<(u8, ValueId, u16)> = Vec::new();
     let mut stack_plan: Vec<(u16, ValueId, u16)> = Vec::new();
@@ -525,24 +614,16 @@ fn load_call_args(
             }
         }
     }
-    let stack_bytes = (stack_used + 7) & !7;
-    if stack_bytes > 0 && start_reg != 0 {
-        return Err(LowerError::CallUnsupported);
-    }
-    if stack_bytes > 0 {
-        enc.sub_sp(stack_bytes)
-            .map_err(|_| LowerError::TooManyValues)?;
-    }
     for &(stack_off, a, woff) in &stack_plan {
-        slot_load(enc, Reg::R3, slot(a) + stack_bytes + woff)?;
+        slot_load(enc, Reg::R3, slot(a) + woff)?;
         enc.str_sp(Reg::R3, stack_off)
             .map_err(|_| LowerError::TooManyValues)?;
     }
     for &(r, a, woff) in &reg_plan {
         let dst = Reg::new(r).ok_or(LowerError::CallUnsupported)?;
-        slot_load(enc, dst, slot(a) + stack_bytes + woff)?;
+        slot_load(enc, dst, slot(a) + woff)?;
     }
-    Ok(stack_bytes)
+    Ok(())
 }
 
 /// Whether a field-access base is a pointer to dereference -- a managed pointer (`this`) or
@@ -571,6 +652,7 @@ fn lower_spilled_inst(
     func_labels: &[Label],
     relocate: bool,
     blob_table: Option<&[Box<[u16]>]>,
+    console_symbol: Option<u32>,
 ) -> Result<Option<u32>, LowerError> {
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
@@ -718,7 +800,7 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::Call { callee, args } => {
-            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            load_call_args(enc, value_types, slot, args, 0)?;
             if relocate {
                 enc.bl_symbol(*callee);
             } else {
@@ -728,10 +810,6 @@ fn lower_spilled_inst(
                 enc.bl(target);
             }
             let return_pc = enc.safepoint_label();
-            if stack_bytes > 0 {
-                enc.add_sp(stack_bytes)
-                    .map_err(|_| LowerError::TooManyValues)?;
-            }
             return Ok(Some(return_pc));
         }
         Inst::FuncAddr { func } => {
@@ -773,19 +851,12 @@ fn lower_spilled_inst(
         Inst::CallIndirect { target, args, .. } => {
             slot_load(enc, Reg::R0, slot(*target))?;
             enc.mov_reg(Reg::R12, Reg::R0);
-            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
             let return_pc = enc.safepoint_label();
-            if stack_bytes > 0 {
-                enc.add_sp(stack_bytes)
-                    .map_err(|_| LowerError::TooManyValues)?;
-            }
             return Ok(Some(return_pc));
         }
         Inst::InvokeDelegate { delegate, args, .. } => {
-            if args.len() > 3 {
-                return Err(LowerError::CallUnsupported);
-            }
             let mloop = enc.new_label();
             let multi = enc.new_label();
             let dispatch = enc.new_label();
@@ -836,13 +907,9 @@ fn lower_spilled_inst(
             if !relocate {
                 return Err(LowerError::CallUnsupported);
             }
-            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            load_call_args(enc, value_types, slot, args, 0)?;
             enc.bl_symbol(EXTERN_SYMBOL_FLAG | *symbol);
             let return_pc = enc.safepoint_label();
-            if stack_bytes > 0 {
-                enc.add_sp(stack_bytes)
-                    .map_err(|_| LowerError::TooManyValues)?;
-            }
             return Ok(Some(return_pc));
         }
         Inst::CallVirtual {
@@ -871,13 +938,9 @@ fn lower_spilled_inst(
             enc.adds_imm8(Reg::R0, 1)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.mov_reg(Reg::R12, Reg::R0);
-            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
             let return_pc = enc.safepoint_label();
-            if stack_bytes > 0 {
-                enc.add_sp(stack_bytes)
-                    .map_err(|_| LowerError::TooManyValues)?;
-            }
             return Ok(Some(return_pc));
         }
         Inst::CallInterface { tag, args, .. } => {
@@ -927,13 +990,9 @@ fn lower_spilled_inst(
             enc.adds_imm8(Reg::R0, 1)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.mov_reg(Reg::R12, Reg::R0);
-            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
             let return_pc = enc.safepoint_label();
-            if stack_bytes > 0 {
-                enc.add_sp(stack_bytes)
-                    .map_err(|_| LowerError::TooManyValues)?;
-            }
             return Ok(Some(return_pc));
         }
         Inst::CastClassScan { args } => {
@@ -945,6 +1004,9 @@ fn lower_spilled_inst(
             let found = enc.new_label();
             let miss = enc.new_label();
             let done = enc.new_label();
+            enc.cmp_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
             enc.bind_label(search);
             enc.cmp_reg(Reg::R0, Reg::R2)
                 .map_err(|_| LowerError::TooManyValues)?;
@@ -963,6 +1025,58 @@ fn lower_spilled_inst(
             enc.b(done);
             enc.bind_label(miss);
             enc.movs_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(done);
+        }
+        Inst::InterfaceHasTag { descriptor, tag } => {
+            let miss = enc.new_label();
+            let found = enc.new_label();
+            let search = enc.new_label();
+            let done = enc.new_label();
+            slot_load(enc, Reg::R0, slot(*descriptor))?;
+            enc.cmp_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
+            enc.ldr_imm(Reg::R1, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsrs_imm(Reg::R1, Reg::R1, 24)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
+            enc.ldr_imm(Reg::R1, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsls_imm(Reg::R1, Reg::R1, 2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R1, 16)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R2, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_imm(Reg::R2, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
+            enc.adds_imm8(Reg::R1, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            load_const_word(enc, pool, Reg::R3, *tag)?;
+            enc.bind_label(search);
+            enc.ldr_imm(Reg::R0, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_reg(Reg::R0, Reg::R3)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, found);
+            enc.adds_imm8(Reg::R1, 8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm8(Reg::R2, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Ne, search);
+            enc.bind_label(miss);
+            enc.movs_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(done);
+            enc.bind_label(found);
+            enc.movs_imm(Reg::R0, 1)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.bind_label(done);
         }
@@ -1151,15 +1265,29 @@ fn lower_spilled_inst(
         Inst::Truncate { value } => {
             slot_load(enc, Reg::R0, slot(*value))?;
         }
-        Inst::SemihostWrite { text } => {
-            let entry = enc.new_label();
-            strings.push((entry, text.clone()));
-            enc.adr(Reg::R1, entry)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.movs_imm(Reg::R0, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.bkpt(0xAB);
-        }
+        Inst::SemihostWrite { text } => match console_symbol {
+            Some(symbol) => {
+                let bytes: &[u8] = match text.split_last() {
+                    Some((0, head)) => head,
+                    _ => text,
+                };
+                let entry = enc.new_label();
+                strings.push((entry, bytes.into()));
+                enc.adr(Reg::R0, entry)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                load_const_word(enc, pool, Reg::R1, bytes.len() as u32)?;
+                enc.bl_symbol(EXTERN_SYMBOL_FLAG | symbol);
+            }
+            None => {
+                let entry = enc.new_label();
+                strings.push((entry, text.clone()));
+                enc.adr(Reg::R1, entry)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.movs_imm(Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.bkpt(0xAB);
+            }
+        },
         Inst::WriteInt { value } => {
             slot_load(enc, Reg::R0, slot(*value))?;
             emit_write_int(enc)?;
@@ -1283,6 +1411,7 @@ fn lower_spilled_inst(
         }
         Inst::Alloc { .. }
         | Inst::AllocLike { .. }
+        | Inst::AllocDescribed { .. }
         | Inst::AllocArray { .. }
         | Inst::AllocArray2D { .. }
         | Inst::AllocArrayMD { .. }
@@ -1416,7 +1545,7 @@ fn lower_spilled_inst(
 
 /// The absolute base of the FLAT path's static-field storage in RAM (`lower_module*` -- the
 /// linker-free self-contained image, where one shared region is exactly right). The OBJECT path
-/// retired this constant (#15): each assembly's accesses relocate against its own
+/// does not use this constant: each assembly's accesses relocate against its own
 /// `__lamella_statics_<hash>` symbol and `lamella-link` places the regions -- its per-machine
 /// default window starts at this same value, so flat and linked images share one RAM plan.
 pub const STATIC_FIELD_BASE: u32 = 0x2000_1000;
@@ -2021,51 +2150,6 @@ fn emit_string_equals(enc: &mut Encoder) -> Result<(), LowerError> {
     Ok(())
 }
 
-/// Encodes a string's UTF-16 units to the build's UTF-8 storage bytes: standard UTF-8 (lossy on
-/// lone surrogates) for `string-utf8`, surrogate-preserving WTF-8 for `string-utf8-wtf8`.
-#[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
-fn encode_string_bytes(units: &[u16]) -> Vec<u8> {
-    alloc::string::String::from_utf16_lossy(units).into_bytes()
-}
-
-/// WTF-8: a surrogate pair combines to its code point; a lone surrogate is encoded as its own
-/// (3-byte) code point, preserving the interpreter's surrogate parity.
-#[cfg(feature = "string-utf8-wtf8")]
-fn encode_string_bytes(units: &[u16]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < units.len() {
-        let u = units[i] as u32;
-        let code = if (0xD800..=0xDBFF).contains(&u)
-            && i + 1 < units.len()
-            && (0xDC00..=0xDFFF).contains(&(units[i + 1] as u32))
-        {
-            let lo = units[i + 1] as u32;
-            i += 2;
-            0x1_0000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
-        } else {
-            i += 1;
-            u
-        };
-        if code < 0x80 {
-            out.push(code as u8);
-        } else if code < 0x800 {
-            out.push(0xC0 | (code >> 6) as u8);
-            out.push(0x80 | (code & 0x3F) as u8);
-        } else if code < 0x1_0000 {
-            out.push(0xE0 | (code >> 12) as u8);
-            out.push(0x80 | ((code >> 6) & 0x3F) as u8);
-            out.push(0x80 | (code & 0x3F) as u8);
-        } else {
-            out.push(0xF0 | (code >> 18) as u8);
-            out.push(0x80 | ((code >> 12) & 0x3F) as u8);
-            out.push(0x80 | ((code >> 6) & 0x3F) as u8);
-            out.push(0x80 | (code & 0x3F) as u8);
-        }
-    }
-    out
-}
-
 /// Lowers a function whose values do not fit in registers into a shared encoder.
 /// Every value gets a stack slot; each instruction loads its operands into scratch
 /// registers, computes, and stores the result. Control flow is handled: because a
@@ -2078,7 +2162,10 @@ fn encode_string_bytes(units: &[u16]) -> Vec<u8> {
 /// drift from the offsets the emitted stores actually use.
 fn spilled_slot_offsets(func: &Function) -> (Vec<u16>, u16) {
     let mut offsets: Vec<u16> = Vec::with_capacity(func.value_types.len());
-    let mut used = 0u16;
+    let out = out_args_bytes(func);
+    let sret_bytes: u16 =
+        if matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4) { 4 } else { 0 };
+    let mut used = out.saturating_add(sret_bytes);
     for ty in &func.value_types {
         offsets.push(used);
         used = used.saturating_add(ty.stack_slot_bytes() as u16);
@@ -2098,10 +2185,13 @@ fn lower_spilled_into(
     vtables: &[TypeMeta],
     relocate: bool,
     blob_table: Option<&[Box<[u16]>]>,
+    console_symbol: Option<u32>,
+    string_header: Option<(u32, i32)>,
 ) -> Result<(), LowerError> {
     let has_calls = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(_, i)| {
-            matches!(
+            (console_symbol.is_some() && matches!(i, Inst::SemihostWrite { .. }))
+                || matches!(
                 i,
                 Inst::Call { .. }
                     | Inst::CallVirtual { .. }
@@ -2113,6 +2203,7 @@ fn lower_spilled_into(
                     | Inst::PyIntrinsic { .. }
                     | Inst::Alloc { .. }
                     | Inst::AllocLike { .. }
+                    | Inst::AllocDescribed { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::AllocArrayMD { .. }
@@ -2129,13 +2220,7 @@ fn lower_spilled_into(
     let lr_bytes = if has_calls { 4 } else { 0 };
     let returns_big_struct = matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4);
     let (offsets, mut used) = spilled_slot_offsets(func);
-    let result_ptr_off = 0u16;
-    let offsets: Vec<u16> = if returns_big_struct {
-        used = used.saturating_add(4);
-        offsets.iter().map(|o| o.saturating_add(4)).collect()
-    } else {
-        offsets
-    };
+    let result_ptr_off = out_args_bytes(func);
     let max_call_argc = func
         .blocks
         .iter()
@@ -2192,6 +2277,7 @@ fn lower_spilled_into(
     let mut string_blobs: Vec<(Label, Box<[u16]>)> = Vec::new();
     let mut type_descs: Vec<(Label, Box<[u32]>)> = Vec::new();
     let mut type_desc_labels: Vec<(lamella_ir::TypeHandle, Label)> = Vec::new();
+    let mut element_edges: Vec<(Label, lamella_ir::TypeHandle)> = Vec::new();
     if has_calls {
         enc.push_registers(saved_mask, true);
     }
@@ -2237,7 +2323,9 @@ fn lower_spilled_into(
             .iter()
             .enumerate()
             .filter(|(v, ty)| {
-                (ty.is_gc_reference() || ty.is_tagged_value())
+                (ty.is_gc_reference()
+                    || ty.is_tagged_value()
+                    || crate::stackmaps::is_ref_cell(**ty))
                     && !entry_params.contains(&ValueId(*v as u32))
             })
             .map(|(v, _)| offsets[v])
@@ -2473,6 +2561,26 @@ fn lower_spilled_into(
                 slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
+            if let Inst::AllocDescribed {
+                descriptor,
+                payload_size,
+            } = inst
+            {
+                let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
+                slot_load(enc, Reg::R0, slot(*payload_size))?;
+                slot_load(enc, Reg::R1, slot(*descriptor))?;
+                load_const_word(enc, &mut pool, Reg::R2, alloc)?;
+                enc.blx(Reg::R2);
+                record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
+                let ok = enc.new_label();
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Ne, ok);
+                enc.udf(0);
+                enc.bind_label(ok);
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
+                continue;
+            }
             if let Inst::TypeDescAddr { handle } = inst {
                 let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                     Some((_, label)) => *label,
@@ -2490,17 +2598,24 @@ fn lower_spilled_into(
             }
             if let Inst::LoadTypeDesc { object } = inst {
                 slot_load(enc, Reg::R0, slot(*object))?;
+                let not_null = enc.new_label();
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Eq, not_null);
                 enc.subs_imm8(Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.ldr_imm(Reg::R0, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
+                enc.bind_label(not_null);
                 slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             if let Inst::AllocArray {
                 handle,
+                element,
                 length,
                 element_size,
+                element_kind,
             } = inst
             {
                 let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
@@ -2508,8 +2623,15 @@ fn lower_spilled_into(
                     Some((_, label)) => *label,
                     None => {
                         let label = enc.new_label();
-                        type_descs.push((label, alloc::vec![0u32, 0u32, 0u32].into_boxed_slice()));
+                        type_descs.push((
+                            label,
+                            alloc::vec![ARRAY_DESC_MARK | 1, *element_kind, 0u32]
+                                .into_boxed_slice(),
+                        ));
                         type_desc_labels.push((*handle, label));
+                        if let Some(element) = element {
+                            element_edges.push((label, *element));
+                        }
                         label
                     }
                 };
@@ -2663,6 +2785,7 @@ fn lower_spilled_into(
                 func_labels,
                 relocate,
                 blob_table,
+                console_symbol,
             )?;
             if let Some(return_pc) = call_pc {
                 record_safepoint(stack_maps, index, inst_pos, return_pc);
@@ -2774,23 +2897,14 @@ fn lower_spilled_into(
     }
     for (entry, utf16) in string_blobs {
         enc.align_to_word();
+        let header = if string_header.is_some() { 4 } else { 0 };
+        if let Some((handle, vtable_bytes)) = string_header {
+            enc.data_word_symbol_addend(DESC_SYMBOL_FLAG | handle, vtable_bytes);
+        }
         enc.bind_label(entry);
         let blob_start = enc.position();
-        #[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
-        {
-            enc.emit_word(utf16.len() as u32);
-            for &unit in utf16.iter() {
-                enc.emit_u16(unit);
-            }
-        }
-        #[cfg(any(feature = "string-utf8", feature = "string-utf8-wtf8"))]
-        {
-            let bytes = encode_string_bytes(&utf16);
-            enc.emit_word(utf16.len() as u32);
-            enc.emit_word(bytes.len() as u32);
-            enc.emit_bytes(&bytes);
-        }
-        enc.mark_blob(entry, enc.position() - blob_start);
+        enc.emit_bytes(&unencodable(crate::stringgen::string_blob_bytes(&utf16))?);
+        enc.mark_blob_with_prefix(entry, header, enc.position() - blob_start);
     }
     let mut ancestor_i = 0;
     while ancestor_i < type_desc_labels.len() {
@@ -2812,6 +2926,10 @@ fn lower_spilled_into(
         }
         ancestor_i += 1;
     }
+    let laid_descriptors: Vec<(Label, u32)> = type_descs
+        .iter()
+        .map(|(label, words)| (*label, words.first().copied().unwrap_or(0)))
+        .collect();
     for (entry, words) in type_descs {
         enc.align_to_word();
         let meta = type_desc_labels
@@ -2841,6 +2959,29 @@ fn lower_spilled_into(
         }) {
             Some(base_label) => enc.data_word_diff(entry, base_label),
             None => enc.emit_word(0),
+        }
+        if words.first().is_some_and(|w| {
+            w & crate::resolver::ARRAY_DESC_MARK_MASK == crate::resolver::ARRAY_DESC_MARK
+        }) {
+            match element_edges
+                .iter()
+                .find(|(label, _)| *label == entry)
+                .and_then(|(_, element)| {
+                    type_desc_labels
+                        .iter()
+                        .find(|(h, _)| h == element)
+                        .map(|(_, l)| *l)
+                })
+                .filter(|element_label| {
+                    words.get(1) == Some(&crate::resolver::ELEMENT_KIND_REFERENCE)
+                        || laid_descriptors
+                            .iter()
+                            .find(|(l, _)| l == element_label)
+                            .is_some_and(|(_, payload)| *payload != 0)
+                }) {
+                Some(element_label) => enc.data_word_diff(entry, element_label),
+                None => enc.emit_word(0),
+            }
         }
         for &word in words.iter().skip(3) {
             enc.emit_word(word);
@@ -2935,6 +3076,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     }
                     | Inst::Alloc { .. }
                     | Inst::AllocLike { .. }
+                    | Inst::AllocDescribed { .. }
                     | Inst::AllocArray { .. }
                     | Inst::ArrayLoad { .. }
                     | Inst::ArrayStore { .. }
@@ -3586,6 +3728,16 @@ pub type MethodLineTables = Vec<(u32, LineTable)>;
 
 pub use crate::resolver::{TypeMeta, VtableEntry};
 
+/// One descriptor as the `TypeDescLiteral` scan finds it, borrowed from the lowered functions:
+/// `(handle, words, vtable, element)` -- the element being the ELEMENT type's handle for an array
+/// descriptor and `None` for a class's.
+type ChosenDesc<'a> = (u32, &'a [u32], &'a [u32], Option<u32>);
+
+/// One descriptor to LAY: the same four facts owned, with the itable joined in from the resolver's
+/// [`TypeMeta`]. The RISC-V twin carries these as the named fields of its `DescEmit`.
+type DescLayout = (u32, Vec<u32>, Vec<u32>, Vec<(u32, u32)>, Option<u32>);
+use crate::resolver::{ARRAY_DESC_MARK, ARRAY_DESC_MARK_MASK};
+
 impl LineTable {
     /// The CIL byte offset whose native code contains `offset` -- the last entry at or
     /// before it, or `None` if `offset` precedes all code.
@@ -3682,6 +3834,7 @@ fn method_record_roots(func: &Function, externs: &[alloc::string::String]) -> Ve
             MirType::ObjectRef => STACKMAP_KIND_OBJECT_REF,
             MirType::ManagedPtr => STACKMAP_KIND_MANAGED_PTR,
             MirType::PyValue => STACKMAP_KIND_TAGGED,
+            _ if crate::stackmaps::is_ref_cell(*ty) => STACKMAP_KIND_OBJECT_REF,
             _ => continue,
         };
         roots.push((offsets[v] / 4) | (kind << 14));
@@ -3733,6 +3886,8 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
             &mut Vec::new(),
             &[],
             false,
+            None,
+            None,
             None,
         )?,
     }
@@ -3789,6 +3944,8 @@ pub fn lower_debug(
             &mut Vec::new(),
             &[],
             false,
+            None,
+            None,
             None,
         )?,
     }
@@ -4119,6 +4276,7 @@ fn rewrite_md_alloc(
             handle: handle.0,
             words: alloc::vec![0, 0, type_tag, 0].into_boxed_slice(),
             vtable: alloc::vec![].into_boxed_slice(),
+            element: None,
         },
     ));
     insts.push((
@@ -4198,6 +4356,7 @@ fn lower_runtime_calls(
                         handle: handle.0,
                         words: words.into_boxed_slice(),
                         vtable,
+                        element: None,
                     },
                 ));
                 insts.push((
@@ -4236,16 +4395,32 @@ fn lower_runtime_calls(
                 ));
                 continue;
             }
-            if let Inst::AllocArray {
-                handle,
-                length,
-                element_size,
+            if let Inst::AllocDescribed {
+                descriptor,
+                payload_size,
             } = &inst
             {
                 let symbol = intern_extern(externs, "lamella_gc_alloc");
-                let type_tag = descriptors
-                    .iter()
-                    .find(|m| m.handle == *handle)
+                insts.push((
+                    result,
+                    Inst::CallNative {
+                        symbol,
+                        args: alloc::vec![*payload_size, *descriptor],
+                    },
+                ));
+                continue;
+            }
+            if let Inst::AllocArray {
+                handle,
+                element,
+                length,
+                element_size,
+                element_kind,
+            } = &inst
+            {
+                let symbol = intern_extern(externs, "lamella_gc_alloc");
+                let type_tag = element
+                    .and_then(|e| descriptors.iter().find(|m| m.handle == e))
                     .map_or(0, |m| m.type_tag);
                 let esize = ValueId(func.value_types.len() as u32);
                 func.value_types.push(MirType::I32);
@@ -4291,8 +4466,13 @@ fn lower_runtime_calls(
                     typedesc,
                     Inst::TypeDescLiteral {
                         handle: handle.0,
-                        words: alloc::vec![0, 0, type_tag, 0].into_boxed_slice(),
-                        vtable: alloc::vec![].into_boxed_slice(),
+                        words: alloc::vec![ARRAY_DESC_MARK | 1, *element_kind, type_tag, 0, 0]
+                            .into_boxed_slice(),
+                        vtable: descriptor_vtable(
+                            descriptors.iter().find(|m| m.handle == *handle),
+                            externs,
+                        ),
+                        element: element.map(|e| e.0),
                     },
                 ));
                 insts.push((
@@ -4359,8 +4539,11 @@ fn lower_runtime_calls(
                     result,
                     Inst::TypeDescLiteral {
                         handle: handle.0,
-                        words: alloc::vec![0, 0, type_tag, 0].into_boxed_slice(),
+                        words: meta
+                            .and_then(|m| m.words.clone())
+                            .unwrap_or_else(|| alloc::vec![0, 0, type_tag, 0].into_boxed_slice()),
                         vtable,
+                        element: None,
                     },
                 ));
                 continue;
@@ -4454,7 +4637,7 @@ pub fn lower_object(
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
         ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
-    lower_object_inner(funcs, names, extern_syms, &[], None, &mode).map(|(bytes, _)| bytes)
+    lower_object_inner(funcs, names, extern_syms, &[], None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
 /// As [`lower_object`], but also emitting per-type VTABLES/TypeDescs from `descriptors` (the resolver's
@@ -4470,7 +4653,7 @@ pub fn lower_object_vtables(
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
         ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
-    lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode).map(|(bytes, _)| bytes)
+    lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
 /// As [`lower_object_vtables`], but also emitting the assembly's GLOBAL-roots statics record
@@ -4486,8 +4669,44 @@ pub fn lower_object_vtables_statics(
     qualifiers: &DescQualifiers,
 ) -> Result<Vec<u8>, LowerError> {
     let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false };
-    lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode)
-        .map(|(bytes, _)| bytes)
+    lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode, None)
+        .map(|(bytes, ..)| bytes)
+}
+
+/// As [`lower_object_vtables_statics`], but threading `source_maps` (method `i`'s
+/// [`CilSourceMap`](crate::cil::CilSourceMap)) and returning, per method, `(its code offset within
+/// the object, its LineTable)`.
+///
+/// This is what a LINKED DEVICE image needs to carry DWARF: the flat path has produced line tables
+/// for a long time, but the object path discarded them, so debug info stopped at the linker-less
+/// build. The offsets are resolved AFTER `finish`, so Thumb-2 relaxation cannot leave them naming
+/// the wrong bytes.
+///
+/// `debug` also carries the resolved source positions the object's `.debug_*` sections are built
+/// from, so the returned object is directly linkable into a DEBUGGABLE device image. Passing a
+/// `debug` whose `source_maps` and `methods` are empty produces byte-identical output to
+/// [`lower_object_vtables_statics`] -- the rows are write-only with respect to the emitted code.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_object_vtables_statics_debug(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+    statics: &AssemblyStatics,
+    qualifiers: &DescQualifiers,
+    debug: &crate::debugmap::ObjectDebug,
+) -> Result<(Vec<u8>, MethodLineTables), LowerError> {
+    let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false };
+    lower_object_inner(
+        funcs,
+        names,
+        extern_syms,
+        descriptors,
+        Some(statics),
+        &mode,
+        Some(debug),
+    )
+    .map(|(bytes, _, lines)| (bytes, lines))
 }
 
 /// As [`lower_object_vtables_statics`], but DEFERRING instead of failing: a program method whose
@@ -4507,7 +4726,8 @@ pub fn lower_object_vtables_statics_report(
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
     let mode = ObjectBuildMode { emit_entry: true, defer_encode: true, qualifiers, wide };
-    lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode)
+    lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode, None)
+        .map(|(bytes, report, _)| (bytes, report))
 }
 
 /// As [`lower_object`], but for a LIBRARY object with no entry point: it omits the `lamella_main` entry
@@ -4520,7 +4740,7 @@ pub fn lower_object_library(
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
         ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
-    lower_object_inner(funcs, names, extern_syms, &[], None, &mode).map(|(bytes, _)| bytes)
+    lower_object_inner(funcs, names, extern_syms, &[], None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
 /// As [`lower_object_library_vtables`], but also returning the STUB REPORT: every function the
@@ -4541,7 +4761,8 @@ pub fn lower_object_library_vtables_report(
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
     let mode = ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers, wide };
-    lower_object_inner(funcs, names, extern_syms, descriptors, statics, &mode)
+    lower_object_inner(funcs, names, extern_syms, descriptors, statics, &mode, None)
+        .map(|(bytes, report, _)| (bytes, report))
 }
 
 /// As [`lower_object_library`], but emitting per-type vtables/TypeDescs from `descriptors` -- so a corlib
@@ -4555,17 +4776,28 @@ pub fn lower_object_library_vtables(
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
         ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
-    lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode).map(|(bytes, _)| bytes)
+    lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
 /// Verifies, prepares, and emits ONE function into `enc`. Extracted so a library object can DRY-RUN a
 /// method into a scratch encoder (tolerating one that does not lower) before emitting it for real.
+/// Lowers ONE function into an object-path encoder. `source_map` is the method's
+/// [`CilSourceMap`](crate::cil::CilSourceMap) rows (empty for a build with no debug info) and
+/// `lines` collects its native-offset -> CIL-offset pairs -- the same pair the flat path threads, so
+/// an object can carry the line table DWARF is generated from. Both are write-only with respect to
+/// the emitted code: passing an empty `source_map` leaves the bytes exactly as they were before this
+/// path could carry debug info.
+#[allow(clippy::too_many_arguments)]
 fn lower_one_func(
     func: &Function,
     enc: &mut Encoder,
     func_labels: &[Label],
     stack_maps: &mut Vec<StackMapEntry>,
     blob_table: Option<&[Box<[u16]>]>,
+    console_symbol: Option<u32>,
+    source_map: &[Vec<u32>],
+    lines: &mut Vec<(u32, u32)>,
+    string_header: Option<(u32, i32)>,
 ) -> Result<(), LowerError> {
     if lamella_ir::verify(func).is_err() {
         return Err(LowerError::NotWellFormed);
@@ -4577,8 +4809,8 @@ fn lower_one_func(
             &regs,
             saved,
             func_labels,
-            &[],
-            &mut Vec::new(),
+            source_map,
+            lines,
             stack_maps,
             true,
         ),
@@ -4593,8 +4825,8 @@ fn lower_one_func(
             saved,
             frame,
             func_labels,
-            &[],
-            &mut Vec::new(),
+            source_map,
+            lines,
             stack_maps,
             true,
         ),
@@ -4604,16 +4836,19 @@ fn lower_one_func(
             func_labels,
             None,
             PySupport::default(),
-            &[],
-            &mut Vec::new(),
+            source_map,
+            lines,
             stack_maps,
             &[],
             true,
             blob_table,
+            console_symbol,
+            string_header,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_object_inner(
     funcs: &[Function],
     names: &[&str],
@@ -4621,11 +4856,13 @@ fn lower_object_inner(
     descriptors: &[TypeMeta],
     statics_record: Option<&AssemblyStatics>,
     mode: &ObjectBuildMode,
-) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
+    debug: Option<&crate::debugmap::ObjectDebug>,
+) -> Result<(Vec<u8>, LibraryStubReport, MethodLineTables), LowerError> {
     let mut externs: Vec<alloc::string::String> = extern_syms.iter().map(|s| (*s).into()).collect();
     let mut program = funcs.to_vec();
-    crate::stringgen::lower_string_concat(&mut program);
-    crate::stringgen::lower_int_to_string(&mut program);
+    crate::stringgen::lower_string_concat(&mut program, mode.qualifiers.string);
+    crate::stringgen::lower_int_to_string(&mut program, mode.qualifiers.string);
+    crate::stringgen::lower_write_int(&mut program);
     let owned_names: Vec<alloc::string::String> = names
         .iter()
         .map(|s| alloc::string::String::from(*s))
@@ -4638,9 +4875,39 @@ fn lower_object_inner(
         .map(|f| lower_runtime_calls(f, &mut externs, descriptors))
         .collect();
     let funcs = funcs.as_slice();
+    if funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .any(|(_, i)| matches!(i, Inst::SemihostWrite { .. }))
+    {
+        intern_extern(&mut externs, crate::stringgen::CONSOLE_WRITE_BYTES);
+    }
     for meta in descriptors {
         for (_, impl_) in &meta.itable {
             if let crate::resolver::VtableEntry::Extern(symbol) = impl_ {
+                intern_extern(&mut externs, symbol);
+            }
+        }
+    }
+    let element_handles: Vec<u32> = funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter_map(|(_, inst)| match inst {
+            Inst::TypeDescLiteral {
+                element: Some(element),
+                ..
+            } => Some(*element),
+            _ => None,
+        })
+        .collect();
+    for meta in descriptors
+        .iter()
+        .filter(|meta| element_handles.contains(&meta.handle.0))
+    {
+        for entry in &meta.vtable {
+            if let crate::resolver::VtableEntry::Extern(symbol) = entry {
                 intern_extern(&mut externs, symbol);
             }
         }
@@ -4664,11 +4931,12 @@ fn lower_object_inner(
             statics_record,
             &stubbed,
             mode,
+            debug,
         )? {
-            PassOutcome::Object(bytes, mut stub_report) => {
+            PassOutcome::Object(bytes, mut stub_report, line_tables) => {
                 stub_report.extend(stubbed.iter().map(|&i| (i, LowerError::CodeTooLarge)));
                 stub_report.sort_by_key(|&(i, _)| i);
-                return Ok((bytes, stub_report));
+                return Ok((bytes, stub_report, line_tables));
             }
             PassOutcome::StubAndRetry(index) => {
                 stubbed.insert(index);
@@ -4676,13 +4944,153 @@ fn lower_object_inner(
         }
     }
 }
+/// The descriptors this object will LAY, in emission order -- decided BEFORE any function is
+/// lowered, because the question a string literal's object header has to answer ("is
+/// `System.String`'s descriptor a LOCAL copy in this object, or a cross-assembly reference?") is
+/// exactly membership in this set, and the per-function blob path emits its header WHILE lowering.
+/// Deciding it once here leaves ONE source for that answer; a second derivation of the same
+/// predicate is how the addend rule below comes to disagree with itself.
+///
+/// Pure computation -- it reads `funcs`, the resolver's `descriptors` and the already-interned
+/// `externs`, and touches no encoder -- so hoisting it above the lowering loop moves no bytes.
+fn descriptor_emit_set(
+    funcs: &[Function],
+    descriptors: &[TypeMeta],
+    externs: &[alloc::string::String],
+    emit_entry: bool,
+) -> Vec<DescLayout> {
+    let mut chosen: Vec<ChosenDesc> = Vec::new();
+    for func in funcs {
+        for block in &func.blocks {
+            for (_, inst) in &block.insts {
+                if let Inst::TypeDescLiteral {
+                    handle,
+                    words,
+                    vtable,
+                    element,
+                } = inst
+                {
+                    let is_class = |w: &[u32]| {
+                        w.first()
+                            .is_none_or(|f| f & ARRAY_DESC_MARK_MASK != ARRAY_DESC_MARK)
+                    };
+                    let rank = |w: &[u32], v: &[u32]| {
+                        (is_class(w), w.len(), w.first().copied().unwrap_or(0), v.len())
+                    };
+                    match chosen.iter_mut().find(|(h, ..)| h == handle) {
+                        Some(slot) => {
+                            if rank(words, vtable) > rank(slot.1, slot.2) {
+                                slot.1 = words;
+                                slot.2 = vtable;
+                                slot.3 = *element;
+                            }
+                        }
+                        None => chosen.push((*handle, words, vtable, *element)),
+                    }
+                }
+            }
+        }
+    }
+    let itable_of = |handle: u32| -> Vec<(u32, u32)> {
+        descriptors
+            .iter()
+            .find(|m| m.handle.0 == handle)
+            .map(|m| {
+                m.itable
+                    .iter()
+                    .map(|(tag, impl_)| (*tag, encoded_impl(impl_, externs)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut emit: Vec<DescLayout> = chosen
+        .iter()
+        .map(|(h, w, v, e)| (*h, w.to_vec(), v.to_vec(), itable_of(*h), *e))
+        .collect();
+    if !emit_entry {
+        for meta in descriptors {
+            let Some(words) = meta.words.as_deref().filter(|_| meta.exported) else {
+                continue;
+            };
+            if emit.iter().any(|(h, ..)| *h == meta.handle.0) {
+                continue;
+            }
+            let vtable: Vec<u32> = meta.vtable.iter().map(|e| encoded_impl(e, externs)).collect();
+            let itable: Vec<(u32, u32)> = meta
+                .itable
+                .iter()
+                .map(|(tag, impl_)| (*tag, encoded_impl(impl_, externs)))
+                .collect();
+            emit.push((meta.handle.0, words.to_vec(), vtable, itable, None));
+        }
+    }
+    let mut i = 0;
+    while i < emit.len() {
+        let handle = emit[i].0;
+        if let Some(element) = emit[i].4 {
+            let elements_are_references =
+                emit[i].1.get(1) == Some(&crate::resolver::ELEMENT_KIND_REFERENCE);
+            let cross_assembly =
+                crate::resolver::reference_handle_parts(lamella_ir::TypeHandle(element))
+                    .is_some();
+            let laid = |emit: &[DescLayout]| {
+                emit.iter().find(|(h, ..)| *h == element).map(|e| e.1.clone())
+            };
+            if laid(&emit).is_none() && !cross_assembly {
+                let meta = descriptors.iter().find(|m| m.handle.0 == element);
+                match meta.and_then(|m| m.words.as_deref()) {
+                    Some(words) => {
+                        let vtable = meta
+                            .map(|m| m.vtable.iter().map(|e| encoded_impl(e, externs)).collect())
+                            .unwrap_or_default();
+                        emit.push((element, words.to_vec(), vtable, itable_of(element), None));
+                    }
+                    None if elements_are_references => {
+                        let tag = meta.map_or(0, |m| m.type_tag);
+                        emit.push((
+                            element,
+                            alloc::vec![0, 0, tag, 0],
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        ));
+                    }
+                    None => emit[i].4 = None,
+                }
+            }
+            if !elements_are_references
+                && laid(&emit).is_some_and(|w| w.first().copied().unwrap_or(0) == 0)
+            {
+                emit[i].4 = None;
+            }
+        }
+        if let Some(base) = descriptors
+            .iter()
+            .find(|m| m.handle.0 == handle)
+            .and_then(|m| m.base)
+        {
+            if crate::resolver::reference_handle_parts(base).is_none()
+                && !emit.iter().any(|(h, ..)| *h == base.0)
+            {
+                let tag = descriptors
+                    .iter()
+                    .find(|m| m.handle == base)
+                    .map_or(0, |m| m.type_tag);
+                emit.push((base.0, alloc::vec![0, 0, tag, 0], Vec::new(), Vec::new(), None));
+            }
+        }
+        i += 1;
+    }
+    emit
+}
+
 
 /// One outcome of [`emit_object_pass`]: either the finished object bytes plus the pass's stub
 /// report -- each `(function index, why)` the pass emitted as a bare `bx lr` because its body
 /// failed the per-method dry run -- or, for a library, the index of a method that lowered but made
 /// the whole object exceed a Thumb-1 encoding reach, so the driver stubs it and rebuilds.
 enum PassOutcome {
-    Object(Vec<u8>, LibraryStubReport),
+    Object(Vec<u8>, LibraryStubReport, MethodLineTables),
     StubAndRetry(usize),
 }
 
@@ -4695,6 +5103,7 @@ pub type LibraryStubReport = Vec<(usize, LowerError)>;
 /// the object could not encode with them in). Returns [`PassOutcome::StubAndRetry`] if a LIBRARY object
 /// still fails to encode -- mapping the overflow site back to its method; a program's encode failure is
 /// fatal. Driven to a fixpoint by [`lower_object_inner`].
+#[allow(clippy::too_many_arguments)]
 fn emit_object_pass(
     funcs: &[Function],
     names: &[&str],
@@ -4703,10 +5112,15 @@ fn emit_object_pass(
     statics_record: Option<&AssemblyStatics>,
     stubbed: &alloc::collections::BTreeSet<usize>,
     mode: &ObjectBuildMode,
+    debug: Option<&crate::debugmap::ObjectDebug>,
 ) -> Result<PassOutcome, LowerError> {
     let (emit_entry, defer_encode, qualifiers) = (mode.emit_entry, mode.defer_encode, mode.qualifiers);
     let mut enc = Encoder::new();
     enc.set_wide_thumb2(mode.wide);
+    let console_symbol = externs
+        .iter()
+        .position(|s| s == crate::stringgen::CONSOLE_WRITE_BYTES)
+        .map(|i| i as u32);
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut stack_maps: Vec<StackMapEntry> = Vec::new();
     let string_table: Vec<Box<[u16]>> = if emit_entry {
@@ -4727,14 +5141,44 @@ fn emit_object_pass(
         Vec::new()
     };
     let blob_table: Option<&[Box<[u16]>]> = emit_entry.then_some(string_table.as_slice());
+    let emit = descriptor_emit_set(funcs, descriptors, externs, emit_entry);
+    let string_header: Option<(u32, i32)> = mode.qualifiers.string.map(|handle| {
+        let vtable_bytes = if emit.iter().any(|(h, ..)| *h == handle) {
+            0
+        } else {
+            descriptors
+                .iter()
+                .find(|m| m.handle.0 == handle)
+                .map_or(0, |m| m.vtable.len() as i32 * 4)
+        };
+        (handle, vtable_bytes)
+    });
     let mut map_ranges: Vec<(usize, usize)> = Vec::with_capacity(funcs.len());
     let mut stub_report: LibraryStubReport = Vec::new();
+    let mut method_lines: Vec<LineTable> = Vec::with_capacity(funcs.len());
+    let mut func_starts: Vec<u32> = Vec::with_capacity(funcs.len());
     for (index, func) in funcs.iter().enumerate() {
         enc.align_to_word();
         enc.bind_label(func_labels[index]);
         let map_start = stack_maps.len();
+        func_starts.push(enc.position());
+        let source_map = debug
+            .and_then(|d| d.source_maps.get(index))
+            .map(|m| m.0.as_slice())
+            .unwrap_or(&[]);
+        let mut lines: Vec<(u32, u32)> = Vec::new();
         if emit_entry && !defer_encode {
-            lower_one_func(func, &mut enc, &func_labels, &mut stack_maps, blob_table)?;
+            lower_one_func(
+                func,
+                &mut enc,
+                &func_labels,
+                &mut stack_maps,
+                blob_table,
+                console_symbol,
+                source_map,
+                &mut lines,
+                string_header,
+            )?;
         } else if stubbed.contains(&index) {
             if emit_entry {
                 enc.udf(0);
@@ -4746,11 +5190,30 @@ fn emit_object_pass(
             let scratch_labels: Vec<Label> =
                 (0..funcs.len()).map(|_| scratch.new_label()).collect();
             let mut scratch_maps = Vec::new();
-            match lower_one_func(func, &mut scratch, &scratch_labels, &mut scratch_maps, blob_table)
-            {
+            match lower_one_func(
+                func,
+                &mut scratch,
+                &scratch_labels,
+                &mut scratch_maps,
+                blob_table,
+                console_symbol,
+                source_map,
+                &mut Vec::new(),
+                string_header,
+            ) {
                 Ok(()) => {
-                    lower_one_func(func, &mut enc, &func_labels, &mut stack_maps, blob_table)
-                        .expect("a method that lowered in the dry run lowers for real");
+                    lower_one_func(
+                        func,
+                        &mut enc,
+                        &func_labels,
+                        &mut stack_maps,
+                        blob_table,
+                        console_symbol,
+                        source_map,
+                        &mut lines,
+                        string_header,
+                    )
+                    .expect("a method that lowered in the dry run lowers for real");
                 }
                 Err(error) => {
                     stub_report.push((index, error));
@@ -4763,91 +5226,13 @@ fn emit_object_pass(
             }
         }
         map_ranges.push((map_start, stack_maps.len()));
+        method_lines.push(LineTable(lines));
     }
     let code_end_label = enc.new_label();
     enc.bind_label(code_end_label);
     let mut desc_syms: Vec<(u32, Label, u32, u32, u32)> = Vec::new();
     {
-        let mut chosen: Vec<(u32, &[u32], &[u32])> = Vec::new();
-        for func in funcs {
-            for block in &func.blocks {
-                for (_, inst) in &block.insts {
-                    if let Inst::TypeDescLiteral {
-                        handle,
-                        words,
-                        vtable,
-                    } = inst
-                    {
-                        let rank = |w: &[u32], v: &[u32]| {
-                            (w.len(), w.first().copied().unwrap_or(0), v.len())
-                        };
-                        match chosen.iter_mut().find(|(h, _, _)| h == handle) {
-                            Some(slot) => {
-                                if rank(words, vtable) > rank(slot.1, slot.2) {
-                                    slot.1 = words;
-                                    slot.2 = vtable;
-                                }
-                            }
-                            None => chosen.push((*handle, words, vtable)),
-                        }
-                    }
-                }
-            }
-        }
-        let itable_of = |handle: u32| -> Vec<(u32, u32)> {
-            descriptors
-                .iter()
-                .find(|m| m.handle.0 == handle)
-                .map(|m| {
-                    m.itable
-                        .iter()
-                        .map(|(tag, impl_)| (*tag, encoded_impl(impl_, externs)))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let mut emit: Vec<(u32, Vec<u32>, Vec<u32>, Vec<(u32, u32)>)> = chosen
-            .iter()
-            .map(|(h, w, v)| (*h, w.to_vec(), v.to_vec(), itable_of(*h)))
-            .collect();
-        if !emit_entry {
-            for meta in descriptors {
-                let Some(words) = meta.words.as_deref() else {
-                    continue;
-                };
-                if emit.iter().any(|(h, ..)| *h == meta.handle.0) {
-                    continue;
-                }
-                let vtable: Vec<u32> = meta.vtable.iter().map(|e| encoded_impl(e, externs)).collect();
-                let itable: Vec<(u32, u32)> = meta
-                    .itable
-                    .iter()
-                    .map(|(tag, impl_)| (*tag, encoded_impl(impl_, externs)))
-                    .collect();
-                emit.push((meta.handle.0, words.to_vec(), vtable, itable));
-            }
-        }
-        let mut i = 0;
-        while i < emit.len() {
-            let handle = emit[i].0;
-            if let Some(base) = descriptors
-                .iter()
-                .find(|m| m.handle.0 == handle)
-                .and_then(|m| m.base)
-            {
-                if crate::resolver::reference_handle_parts(base).is_none()
-                    && !emit.iter().any(|(h, ..)| *h == base.0)
-                {
-                    let tag = descriptors
-                        .iter()
-                        .find(|m| m.handle == base)
-                        .map_or(0, |m| m.type_tag);
-                    emit.push((base.0, alloc::vec![0, 0, tag, 0], Vec::new(), Vec::new()));
-                }
-            }
-            i += 1;
-        }
-        for (handle, words, vtable, itable) in &emit {
+        for (handle, words, vtable, itable, element) in &emit {
             enc.align_to_word();
             let vtable_label = enc.new_label();
             enc.bind_label(vtable_label);
@@ -4858,7 +5243,26 @@ fn emit_object_pass(
                 .iter()
                 .find(|m| m.handle.0 == *handle)
                 .and_then(|m| m.base);
+            let laid_here = element.is_some_and(|e| emit.iter().any(|(h, ..)| *h == e));
+            let element_word = |enc: &mut Encoder, element: u32, laid_here: bool| {
+                let vtable_bytes = if laid_here {
+                    0
+                } else {
+                    descriptors
+                        .iter()
+                        .find(|m| m.handle.0 == element)
+                        .map_or(0, |m| m.vtable.len() as i32 * 4)
+                };
+                enc.data_word_symbol_reldesc(DESC_SYMBOL_FLAG | element, vtable_bytes + 16);
+            };
             for (idx, &word) in words.iter().enumerate() {
+                if idx == 4 {
+                    match element {
+                        Some(element) => element_word(&mut enc, *element, laid_here),
+                        None => enc.emit_word(word),
+                    }
+                    continue;
+                }
                 match base {
                     Some(base_handle)
                         if idx == 3 && emit.iter().any(|(h, ..)| *h == base_handle.0) =>
@@ -4881,18 +5285,12 @@ fn emit_object_pass(
                     _ => enc.emit_word(word),
                 }
             }
-            let itable_words = if itable.is_empty() {
-                0
-            } else {
-                1 + 2 * itable.len() as u32
-            };
-            if !itable.is_empty() {
-                enc.emit_word(itable.len() as u32);
-                let words_bytes = words.len() as i32 * 4;
-                for (i, &(tag, func_index)) in itable.iter().enumerate() {
-                    enc.emit_word(tag);
-                    enc.data_word_symbol_reldesc(func_index, words_bytes + 8 + 8 * i as i32);
-                }
+            let itable_words = 1 + 2 * itable.len() as u32;
+            enc.emit_word(itable.len() as u32);
+            let words_bytes = words.len() as i32 * 4;
+            for (i, &(tag, func_index)) in itable.iter().enumerate() {
+                enc.emit_word(tag);
+                enc.data_word_symbol_reldesc(func_index, words_bytes + 8 + 8 * i as i32);
             }
             desc_syms.push((
                 *handle,
@@ -4909,20 +5307,10 @@ fn emit_object_pass(
         let label = enc.new_label();
         enc.bind_label(label);
         let start = enc.position();
-        #[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
-        {
-            enc.emit_word(utf16.len() as u32);
-            for &unit in utf16.iter() {
-                enc.emit_u16(unit);
-            }
+        if let Some((handle, vtable_bytes)) = string_header {
+            enc.data_word_symbol_addend(DESC_SYMBOL_FLAG | handle, vtable_bytes);
         }
-        #[cfg(any(feature = "string-utf8", feature = "string-utf8-wtf8"))]
-        {
-            let bytes = encode_string_bytes(utf16);
-            enc.emit_word(utf16.len() as u32);
-            enc.emit_word(bytes.len() as u32);
-            enc.emit_bytes(&bytes);
-        }
+        enc.emit_bytes(&unencodable(crate::stringgen::string_blob_bytes(utf16))?);
         str_syms.push((label, enc.position() - start));
     }
     let assembled = if emit_entry && !defer_encode {
@@ -5198,7 +5586,11 @@ fn emit_object_pass(
                 None => (undef_desc_index[&handle], addend),
             }
         } else if r.symbol & STRING_SYMBOL_FLAG != 0 {
-            (str_index[(r.symbol & !STRING_SYMBOL_FLAG) as usize], addend)
+            let header = if mode.qualifiers.string.is_some() { 4 } else { 0 };
+            (
+                str_index[(r.symbol & !STRING_SYMBOL_FLAG) as usize],
+                addend + header,
+            )
         } else {
             (r.symbol, addend)
         };
@@ -5294,15 +5686,124 @@ fn emit_object_pass(
             addend: 0,
         });
     }
-    Ok(PassOutcome::Object(
-        lamella_elf::write_relocatable_object(
+    let line_tables: MethodLineTables = method_lines
+        .iter()
+        .enumerate()
+        .map(|(index, table)| (offsets.get(index).copied().unwrap_or(0), table.clone()))
+        .collect();
+
+    let object = match debug {
+        Some(dbg) => {
+            let described: Vec<(usize, Vec<crate::debugmap::SourceLine>)> = line_tables
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, table))| {
+                    let source = dbg.methods.get(index)?;
+                    let rows = crate::debugmap::function_rows(
+                        &table.0,
+                        source,
+                        func_starts.get(index).copied().unwrap_or(0),
+                    );
+                    (!rows.is_empty()).then_some((index, rows))
+                })
+                .collect();
+            let functions: Vec<crate::dwarf::FunctionLines> = described
+                .iter()
+                .map(|(index, rows)| crate::dwarf::FunctionLines {
+                    name: match dbg.methods[*index].name {
+                        "" => names[*index],
+                        display => display,
+                    },
+                    file: dbg.methods[*index].file,
+                    rows,
+                    code_size: symbols[*index].size,
+                })
+                .collect();
+            if functions.is_empty() {
+                lamella_elf::write_relocatable_object(
+                    lamella_elf::Machine::Arm,
+                    &text,
+                    &symbols,
+                    &relocations,
+                )
+            } else {
+                let first = described[0].0;
+                let last = described[described.len() - 1].0;
+                let span = Some(offsets[last] + symbols[last].size - offsets[first]);
+                let line = crate::dwarf::line_program(&functions);
+                let (info, abbrev) =
+                    crate::dwarf::compilation_unit(dbg.unit_name, dbg.producer, span, &functions);
+                let generated = [line, info, abbrev];
+                let first_section_symbol = symbols.len() as u32;
+                for i in 0..generated.len() {
+                    symbols.push(lamella_elf::Symbol {
+                        name: "",
+                        value: 0,
+                        size: 0,
+                        binding: lamella_elf::Binding::Local,
+                        kind: lamella_elf::SymbolType::Section,
+                        section: lamella_elf::SymbolSection::InSection(i as u32),
+                    });
+                }
+                let debug_relocs: Vec<Vec<lamella_elf::Relocation>> = generated
+                    .iter()
+                    .map(|section| {
+                        let code =
+                            section
+                                .code_relocs
+                                .iter()
+                                .map(|(at, function)| lamella_elf::Relocation {
+                                    offset: *at,
+                                    symbol: described[*function].0 as u32,
+                                    kind: lamella_elf::arm::R_ARM_ABS32,
+                                    addend: 0,
+                                });
+                        let cross =
+                            section
+                                .section_relocs
+                                .iter()
+                                .map(|(at, target)| lamella_elf::Relocation {
+                                    offset: *at,
+                                    symbol: first_section_symbol
+                                        + generated
+                                            .iter()
+                                            .position(|s| s.name == *target)
+                                            .unwrap_or(0)
+                                            as u32,
+                                    kind: lamella_elf::arm::R_ARM_ABS32,
+                                    addend: 0,
+                                });
+                        code.chain(cross).collect()
+                    })
+                    .collect();
+                let sections: Vec<lamella_elf::Section> = generated
+                    .iter()
+                    .enumerate()
+                    .map(|(i, section)| lamella_elf::Section {
+                        name: section.name,
+                        flags: 0,
+                        addralign: 1,
+                        data: &section.data,
+                        relocations: &debug_relocs[i],
+                    })
+                    .collect();
+                lamella_elf::write_relocatable_object_with_sections(
+                    lamella_elf::Machine::Arm,
+                    &text,
+                    &symbols,
+                    &relocations,
+                    &sections,
+                )
+            }
+        }
+        None => lamella_elf::write_relocatable_object(
             lamella_elf::Machine::Arm,
             &text,
             &symbols,
             &relocations,
         ),
-        stub_report,
-    ))
+    };
+    Ok(PassOutcome::Object(object, stub_report, line_tables))
 }
 
 /// Lowers a whole multi-method program WITH debug line tables -- the module variant of [`lower_debug`].
@@ -5329,8 +5830,8 @@ fn lower_module_inner(
 ) -> Result<(Vec<u8>, StackMaps, MethodLineTables), LowerError> {
     let original_count = funcs.len();
     let mut program = funcs.to_vec();
-    crate::stringgen::lower_string_concat(&mut program);
-    crate::stringgen::lower_int_to_string(&mut program);
+    crate::stringgen::lower_string_concat(&mut program, None);
+    crate::stringgen::lower_int_to_string(&mut program, None);
     let funcs = &program;
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
@@ -5389,6 +5890,8 @@ fn lower_module_inner(
                     vtables,
                     false,
                     None,
+                    None,
+                    None,
                 )?;
             }
         }
@@ -5428,17 +5931,6 @@ mod tests {
     use super::*;
     use lamella_ir::{BasicBlock, BlockId, MirType};
 
-    #[cfg(feature = "string-utf8-wtf8")]
-    #[test]
-    fn wtf8_encodes_surrogate_pairs_and_lone_surrogates() {
-        assert_eq!(
-            encode_string_bytes(&[0xD834, 0xDD1E]),
-            [0xF0, 0x9D, 0x84, 0x9E]
-        );
-        assert_eq!(encode_string_bytes(&[0xD800]), [0xED, 0xA0, 0x80]);
-        assert_eq!(encode_string_bytes(&[0x61, 0x62]), [0x61, 0x62]);
-    }
-
     #[test]
     fn lowers_constant_return() {
         let func = Function {
@@ -5469,6 +5961,7 @@ mod tests {
             "__lamella_typedesc_33554437"
         );
         let lib = DescQualifiers {
+            string: None,
             own: Some("0bd4d82a".into()),
             references: alloc::vec::Vec::new(),
         };
@@ -5478,6 +5971,7 @@ mod tests {
         );
         let handle = (crate::resolver::REFERENCE_HANDLE_TABLE << 24) | (1 << 20) | 5;
         let refs = DescQualifiers {
+            string: None,
             own: None,
             references: alloc::vec!["aaaaaaaa".into(), "0bd4d82a".into()],
         };
@@ -6079,6 +6573,129 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         let bytes = lower(&func).unwrap();
         assert!(bytes.windows(2).any(|w| w[1] == 0x68));
+    }
+
+    /// A one-instruction `Debug.WriteLine("Hi")` function, the fixture both console tests lower.
+    fn semihost_write_func() -> Function {
+        Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::SemihostWrite {
+                        text: b"Hi\0".to_vec().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        }
+    }
+
+    #[test]
+    fn object_semihost_write_calls_the_console_seam_not_semihosting() {
+        let bytes = lower_object(&[semihost_write_func()], &["main"], &[]).expect("lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let seam = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "lamella_console_write_bytes")
+            .expect("the console seam symbol is present");
+        assert!(!seam.defined, "the seam is an undefined extern the linker resolves");
+        assert!(
+            obj.relocations
+                .iter()
+                .any(|r| obj.symbols.get(r.symbol as usize).map(|s| s.name.as_str())
+                    == Some("lamella_console_write_bytes")),
+            "a relocation names the console seam"
+        );
+        let halfwords: Vec<u16> = obj
+            .text
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(
+            !halfwords.contains(&0xBEAB),
+            "no inline semihosting survives on the object path"
+        );
+    }
+
+    /// A one-instruction `Console.WriteLine(42)` function.
+    fn write_int_func() -> Function {
+        Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 42,
+                        },
+                    ),
+                    (ValueId(1), Inst::WriteInt { value: ValueId(0) }),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        }
+    }
+
+    #[test]
+    fn object_write_int_uses_the_shared_helper_not_the_inline_itoa() {
+        let bytes = lower_object(&[write_int_func()], &["main"], &[]).expect("lowers");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "lamella_console_write_bytes" && !s.defined),
+            "the console seam is an undefined extern"
+        );
+        let halfwords: Vec<u16> = obj
+            .text
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(
+            !halfwords.contains(&0xBEAB),
+            "no inline semihosting survives -- the hand-encoded itoa is off the object path"
+        );
+    }
+
+    #[test]
+    fn flat_write_int_keeps_the_inline_itoa() {
+        let bytes = lower(&write_int_func()).expect("lowers");
+        let halfwords: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(
+            halfwords.contains(&0xBEAB),
+            "the flat path still emits the inline itoa's `bkpt 0xAB`"
+        );
+    }
+
+    #[test]
+    fn flat_semihost_write_keeps_inline_semihosting() {
+        let bytes = lower(&semihost_write_func()).expect("lowers");
+        let halfwords: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(
+            halfwords.contains(&0xBEAB),
+            "the flat path still emits `bkpt 0xAB` (SYS_WRITE0)"
+        );
+        assert!(
+            bytes.windows(3).any(|w| w == b"Hi\0"),
+            "and keeps the NUL terminator SYS_WRITE0 needs"
+        );
     }
 
     #[test]
@@ -7501,6 +8118,7 @@ mod tests {
                 itable: vec![(iface_tag, VtableEntry::Func(1))],
                 base: None,
                 words: None,
+                exported: true,
             }],
         )
         .expect("metadata module lowers");
@@ -8390,8 +9008,10 @@ mod tests {
                         ValueId(1),
                         Inst::AllocArray {
                             handle: lamella_ir::TypeHandle(8),
+                            element: None,
                             length: ValueId(0),
                             element_size: 8,
+                            element_kind: 8,
                         },
                     ),
                     (
@@ -8562,10 +9182,100 @@ mod tests {
             itable: Vec::new(),
             base: None,
             words: None,
+            exported: true,
         }];
         let (words, vtable) = literal(&descriptors);
         assert_eq!(&*words, &[12, 2, 0xABCD, 0, 0, 4]);
         assert_eq!(&*vtable, &[3, 5]);
+    }
+
+    #[test]
+    fn an_array_descriptor_carries_a_vtable_and_the_object_header_still_points_at_word_0() {
+        let main = Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::AllocArray {
+                        handle: lamella_ir::TypeHandle(0x0500_0001),
+                        element: None,
+                        length: ValueId(0),
+                        element_size: 4,
+                        element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle: lamella_ir::TypeHandle(0x0500_0001),
+            type_tag: 0,
+            vtable: alloc::vec![
+                VtableEntry::Func(0),
+                VtableEntry::Func(0),
+                VtableEntry::Func(0)
+            ],
+            itable: Vec::new(),
+            base: None,
+            words: None,
+            exported: false,
+        }];
+        let (words, vtable) =
+            lower_runtime_calls(&main, &mut Vec::new(), &descriptors)
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.clone())
+                .find_map(|(_, i)| match i {
+                    Inst::TypeDescLiteral { words, vtable, .. } => Some((words, vtable)),
+                    _ => None,
+                })
+                .expect("the array allocation emits a TypeDescLiteral");
+        assert_eq!(
+            words[0],
+            ARRAY_DESC_MARK | 1,
+            "still the ratified array header"
+        );
+        assert_eq!(
+            &*vtable,
+            &[0, 0, 0],
+            "an array descriptor must carry System.Array's slots, not an empty vtable"
+        );
+
+        let object = lower_object_vtables(&[main], &["main"], &[], &descriptors)
+            .expect("the array object lowers");
+        let parsed = lamella_elf::read_object(&object).expect("our own object parses");
+        let desc = parsed
+            .symbols
+            .iter()
+            .find(|s| s.name.starts_with("__lamella_typedesc_"))
+            .expect("the array descriptor is a named symbol");
+        let vtable_bytes = 3 * 4;
+        let mark_at = desc.value as usize + vtable_bytes;
+        assert_eq!(
+            u32::from_le_bytes([
+                parsed.text[mark_at],
+                parsed.text[mark_at + 1],
+                parsed.text[mark_at + 2],
+                parsed.text[mark_at + 3],
+            ]),
+            ARRAY_DESC_MARK | 1,
+            "the descriptor SYMBOL spans the vtable, so word 0 sits vtable_bytes past it"
+        );
+        let to_desc = parsed
+            .relocations
+            .iter()
+            .find(|r| r.symbol as usize == parsed.symbols.iter().position(|s| s.name == desc.name).unwrap())
+            .expect("the allocation references the descriptor");
+        assert_eq!(
+            to_desc.addend as usize, vtable_bytes,
+            "the allocation must hand the allocator WORD 0 (symbol + vtable_bytes), never the \
+             symbol -- a header pointing into the vtable reads a code pointer as a payload size and \
+             desynchronizes the collector's walk over every object above it"
+        );
     }
 
     #[test]
@@ -8612,6 +9322,7 @@ mod tests {
             itable: Vec::new(),
             base: None,
             words: None,
+            exported: true,
         }];
         let bytes =
             lower_object_vtables(&[allocates, speak], &["f0", "f1"], &[], &descriptors).unwrap();
@@ -8699,6 +9410,7 @@ mod tests {
             itable: Vec::new(),
             base: None,
             words: None,
+            exported: true,
         }];
         let bytes = lower_object_vtables(
             &[allocates, stub_returning_int()],
@@ -8756,6 +9468,7 @@ mod tests {
             itable: Vec::new(),
             base: None,
             words: None,
+            exported: true,
         }];
         let bytes = lower_object_vtables(&[func], &["f0"], &[], &descriptors).unwrap();
         let obj = lamella_elf::read_object(&bytes).unwrap();
@@ -8766,7 +9479,7 @@ mod tests {
             .filter(|s| s.name == desc_name && s.defined)
             .collect();
         assert_eq!(descs.len(), 1, "the alloc and the type-test share ONE descriptor");
-        assert_eq!(descs[0].size, 20, "the alloc's richer header wins the dedup");
+        assert_eq!(descs[0].size, 24, "the alloc's richer header wins the dedup");
         let desc_index = obj.symbols.iter().position(|s| s.name == desc_name).unwrap() as u32;
         let refs = obj
             .relocations
@@ -8803,9 +9516,15 @@ mod tests {
             }],
         };
         let descriptors = alloc::vec![
-            TypeMeta { handle: derived, type_tag: 0xD1, vtable: Vec::new(), itable: Vec::new(), base: Some(mid), words: None },
-            TypeMeta { handle: mid, type_tag: 0xD2, vtable: Vec::new(), itable: Vec::new(), base: Some(base), words: None },
-            TypeMeta { handle: base, type_tag: 0xD3, vtable: Vec::new(), itable: Vec::new(), base: None, words: None },
+            TypeMeta { handle: derived, type_tag: 0xD1, vtable: Vec::new(), itable: Vec::new(), base: Some(mid), words: None,
+                exported: true,
+            },
+            TypeMeta { handle: mid, type_tag: 0xD2, vtable: Vec::new(), itable: Vec::new(), base: Some(base), words: None,
+                exported: true,
+            },
+            TypeMeta { handle: base, type_tag: 0xD3, vtable: Vec::new(), itable: Vec::new(), base: None, words: None,
+                exported: true,
+            },
         ];
         let bytes = lower_object_vtables(&[func], &["f0"], &[], &descriptors).unwrap();
         let obj = lamella_elf::read_object(&bytes).unwrap();
@@ -8856,6 +9575,7 @@ mod tests {
             itable: alloc::vec![(0xCAFE, VtableEntry::Func(1))],
             base: None,
             words: None,
+            exported: true,
         }];
         let bytes =
             lower_object_vtables(&[func, stub_returning_int()], &["f0", "f1"], &[], &descriptors)
@@ -9046,6 +9766,46 @@ mod tests {
             entry.ref_offsets.len(),
             2,
             "both the delegate and the ref arg are rooted (reloaded each iteration)"
+        );
+    }
+
+    #[test]
+    fn a_four_argument_delegate_invoke_reserves_an_outgoing_stack_word() {
+        let delegate_taking = |n: usize| Function {
+            params: core::iter::once(MirType::ObjectRef)
+                .chain(core::iter::repeat_n(MirType::I32, n))
+                .collect(),
+            ret: Some(MirType::I32),
+            value_types: core::iter::once(MirType::ObjectRef)
+                .chain(core::iter::repeat_n(MirType::I32, n + 1))
+                .collect(),
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: (0..=n as u32).map(ValueId).collect(),
+                insts: vec![(
+                    ValueId(n as u32 + 1),
+                    Inst::InvokeDelegate {
+                        delegate: ValueId(0),
+                        args: (1..=n as u32).map(ValueId).collect(),
+                        returns_value: true,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(n as u32 + 1)))),
+            }],
+        };
+        assert_eq!(
+            out_args_bytes(&delegate_taking(3)),
+            0,
+            "a 3-argument delegate spills nothing"
+        );
+        assert_eq!(
+            out_args_bytes(&delegate_taking(4)),
+            8,
+            "the 4th argument needs a reserved outgoing word"
+        );
+        assert!(
+            lower_module_gc_mapped(&[delegate_taking(4)], 0x1000).is_ok(),
+            "a 4-argument delegate invoke lowers"
         );
     }
 
@@ -9427,6 +10187,57 @@ mod tests {
         assert!(live_sites > 0, "the fixture must exercise live roots");
     }
 
+    /// A big-struct (sret) return reserves the result-pointer word in the SHARED
+    /// `spilled_slot_offsets`, below the first value slot -- so `method_record_roots` reports a ref
+    /// root at the SAME offset `lower_spilled_into` stores it at. Before the fix the sret word was
+    /// reserved only in the lowering (which remapped value offsets `+4`), while the record builder
+    /// read the unshifted offsets, skewing a big-struct-return spilled function's stack-map roots by
+    /// 4 bytes -- a latent moving-GC mis-walk. This pins the two back in lockstep.
+    #[test]
+    fn sret_return_shifts_value_slots_for_the_record_builder() {
+        let big = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(big),
+            value_types: vec![MirType::ObjectRef, big],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(0),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (ValueId(1), Inst::InitStruct),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(matches!(prepare(&func), Ok(Assignment::Spilled)));
+        let (offsets, _) = spilled_slot_offsets(&func);
+        assert_eq!(
+            offsets[0],
+            out_args_bytes(&func) + 4,
+            "value 0 must sit above the reserved sret word"
+        );
+        let record_slots: Vec<u16> = method_record_roots(&func, &[])
+            .iter()
+            .map(|r| (r & 0x3FFF) * 4)
+            .collect();
+        assert!(
+            record_slots.contains(&offsets[0]),
+            "v0's ref root must be recorded at its real slot {} (record {record_slots:?})",
+            offsets[0]
+        );
+    }
+
     #[test]
     fn lower_object_emits_method_records_with_function_relocations() {
         let main = Function {
@@ -9502,6 +10313,69 @@ mod tests {
                 && r.symbol == main_index
                 && r.kind == lamella_elf::arm::R_ARM_ABS32),
             "the func_addr word carries an ABS32 to the function symbol"
+        );
+    }
+
+    #[test]
+    fn a_reference_cell_is_recorded_as_an_object_ref_root() {
+        let main = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![
+                MirType::ValueType {
+                    handle: crate::stackmaps::REF_CELL_HANDLE,
+                    size: 4,
+                },
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::InitStruct),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let g = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let obj = lamella_elf::read_object(&lower_object(&[main, g], &["main", "g"], &[]).unwrap())
+            .unwrap();
+        let rec = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_smrec_main")
+            .expect("main gets a method record");
+        let bytes = &obj.text[rec.value as usize..(rec.value + rec.size) as usize];
+        let (_, _, mode, _, _, roots) = decode_stackmap_record(bytes);
+        assert_eq!(mode, STACKMAP_MODE_METHOD_SLOTS);
+        assert_eq!(roots.len(), 1, "the ref cell is the only reference-bearing slot");
+        assert_eq!(
+            roots[0] >> 14,
+            STACKMAP_KIND_OBJECT_REF,
+            "the REF_CELL_HANDLE cell must be enumerated as an ObjectRef root, not skipped"
         );
     }
 
@@ -9711,6 +10585,7 @@ mod tests {
             roots: Vec::new(),
         };
         let qualifiers = DescQualifiers {
+            string: None,
             own: None,
             references: alloc::vec![
                 alloc::string::String::from("aaaa0001"),
@@ -9945,5 +10820,280 @@ mod tests {
             u32::from(frame_words) * 4 > 1020,
             "the record spans the big frame ({frame_words} words)"
         );
+    }
+
+    #[test]
+    fn the_object_path_emits_dwarf_without_moving_a_byte_of_code() {
+        let body = |v: u32| Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: v as i64,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let funcs = [body(1), body(2)];
+        let names = ["first", "second"];
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("0badf00d"),
+            region_bytes: 0,
+            roots: Vec::new(),
+        };
+        let maps = [
+            crate::cil::CilSourceMap(vec![vec![7]]),
+            crate::cil::CilSourceMap(vec![vec![7]]),
+        ];
+        let points = [(7u32, 11u32, 5u32)];
+        let sources = [
+            crate::debugmap::MethodSource { name: "T.first", file: "t.cs", points: &points },
+            crate::debugmap::MethodSource { name: "T.second", file: "t.cs", points: &points },
+        ];
+        let debug = crate::debugmap::ObjectDebug {
+            source_maps: &maps,
+            methods: &sources,
+            unit_name: "t.cs",
+            producer: "test",
+        };
+        let (with_debug, lines) = lower_object_vtables_statics_debug(
+            &funcs,
+            &names,
+            &[],
+            &[],
+            &statics,
+            &DescQualifiers::default(),
+            &debug,
+        )
+        .unwrap();
+
+        let plain =
+            lower_object_vtables_statics(&funcs, &names, &[], &[], &statics, &DescQualifiers::default())
+                .unwrap();
+        let with_obj = lamella_elf::read_object(&with_debug).unwrap();
+        let plain_obj = lamella_elf::read_object(&plain).unwrap();
+        assert_eq!(with_obj.text, plain_obj.text, "debug info must not move a byte of code");
+        assert!(plain_obj.sections.is_empty(), "the plain build carries no debug sections");
+        let names_out: Vec<&str> = with_obj.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names_out, [".debug_line", ".debug_info", ".debug_abbrev"]);
+        assert!(
+            with_obj
+                .sections
+                .iter()
+                .any(|s| s.name == ".debug_line" && !s.relocations.is_empty()),
+            "the line program's addresses come from relocations"
+        );
+
+        assert_eq!(lines.len(), 2);
+        let obj = &with_obj;
+        for (index, name) in names.iter().enumerate() {
+            let (offset, table) = &lines[index];
+            assert!(!table.0.is_empty(), "{name} has no rows");
+            assert!(
+                table.0.iter().all(|&(_, cil)| cil == 7),
+                "{name}'s rows name the CIL offset they lowered from"
+            );
+            let sym = obj
+                .symbols
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("no {name} symbol"));
+            assert_eq!(
+                *offset,
+                sym.value & !1,
+                "{name}'s line-table offset is where the symbol says its code is"
+            );
+        }
+        assert_ne!(lines[0].0, lines[1].0, "the two functions sit at different offsets");
+    }
+
+    #[test]
+    fn a_flat_path_descriptor_lays_the_ratified_four_word_header() {
+        let func = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(0x0200_0001),
+                        payload_size: 12,
+                        ref_offsets: alloc::vec![4u32, 8].into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let bytes = lower_module_gc(&[func], 0x2000_0000).expect("the flat GC path lowers an Alloc");
+        let at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        let words: Vec<u32> = (0..bytes.len() / 4).map(|i| at(i * 4)).collect();
+        let ratified = words
+            .windows(6)
+            .any(|w| w[0] == 12 && w[1] == 2 && w[3] == 0 && w[4] == 4 && w[5] == 8);
+        assert!(
+            ratified,
+            "no descriptor with the ratified header              [payload@0][nrefs@4][tag@8][base_ptr@12][ref_offsets@16..]"
+        );
+        let three_word = words
+            .windows(5)
+            .any(|w| w[0] == 12 && w[1] == 2 && w[3] == 4 && w[4] == 8);
+        assert!(
+            !three_word,
+            "the pre-fix three-word header is still being emitted"
+        );
+    }
+
+    #[test]
+    fn a_flat_path_array_descriptor_lays_the_ratified_array_header() {
+        let func = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 3,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::AllocArray {
+                            handle: lamella_ir::synthetic_array_handle(8),
+                            element: None,
+                            length: ValueId(0),
+                            element_size: 8,
+                            element_kind: 8,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let bytes =
+            lower_module_gc(&[func], 0x2000_0000).expect("the flat GC path lowers an AllocArray");
+        let at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        let words: Vec<u32> = (0..bytes.len() / 4).map(|i| at(i * 4)).collect();
+        assert!(
+            words
+                .windows(4)
+                .any(|w| w[0] == ARRAY_DESC_MARK | 1 && w[1] == 8 && w[2] == 0 && w[3] == 0),
+            "no array descriptor with the ratified header [MARK|rank@0][element_kind@4][tag@8][base_ptr@12]"
+        );
+        assert!(
+            words.windows(4).all(|w| w != [0, 0, 0, 0]),
+            "an all-zero (unmarked) array descriptor is still being emitted"
+        );
+        let marks = words.iter().filter(|&&w| w == ARRAY_DESC_MARK | 1).count();
+        assert_eq!(marks, 1, "expected exactly one array descriptor");
+    }
+
+    #[test]
+    fn an_array_does_not_displace_the_class_descriptor_sharing_its_handle() {
+        let handle = lamella_ir::TypeHandle(0x0200_0004);
+        let boxed = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle,
+                        payload_size: 4,
+                        ref_offsets: alloc::vec![].into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let array = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 3,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::AllocArray {
+                            handle,
+                            element: None,
+                            length: ValueId(0),
+                            element_size: 4,
+                            element_kind: 5,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        for (funcs, names, order) in [
+            (alloc::vec![boxed.clone(), array.clone()], ["f0", "f1"], "class first"),
+            (alloc::vec![array.clone(), boxed.clone()], ["f0", "f1"], "array first"),
+        ] {
+            let obj = lower_object_vtables(&funcs, &names, &[], &[])
+                .expect("the object path lowers an Alloc beside an AllocArray");
+            let words: Vec<u32> = (0..obj.len() / 4)
+                .map(|i| {
+                    u32::from_le_bytes([obj[i * 4], obj[i * 4 + 1], obj[i * 4 + 2], obj[i * 4 + 3]])
+                })
+                .collect();
+            assert!(
+                words
+                    .windows(4)
+                    .any(|w| w[0] == 4 && w[1] == 0 && w[2] == 0 && w[3] == 0),
+                "{order}: the CLASS descriptor (payload 4, nrefs 0) must survive the shared handle"
+            );
+            assert!(
+                !words
+                    .iter()
+                    .any(|&w| w & ARRAY_DESC_MARK_MASK == ARRAY_DESC_MARK),
+                "{order}: the array must not take over the shared handle's canonical descriptor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_synthesized_array_handle_is_distinct_per_element_kind() {
+        let kinds = [0u32, 1, 2, 3, 4, 5, 6, 7, 8, 0xFF];
+        for (i, &a) in kinds.iter().enumerate() {
+            for &b in &kinds[i + 1..] {
+                assert_ne!(
+                    lamella_ir::synthetic_array_handle(a),
+                    lamella_ir::synthetic_array_handle(b),
+                    "kinds {a} and {b} collide on one handle"
+                );
+            }
+        }
+        for &k in &kinds {
+            let handle = lamella_ir::synthetic_array_handle(k).0;
+            assert_eq!(handle >> 24, lamella_ir::SYNTHETIC_ARRAY_HANDLE_TABLE);
+            assert!(handle < 1 << 27, "handle {handle:#x} reaches the flag bits");
+        }
     }
 }

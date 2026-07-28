@@ -1,18 +1,15 @@
-# BLOCK layout: the ESP32-C6 HP UART. Transcribed from the
-# retired v0 table (uart-esp32c6.toml), whose values were SILICON-VERIFIED via the old
-# samples/esp32c6/Esp32C6Uart.cs: a 10/10 byte round-trip through the peripheral's internal
-# loopback and the greeting on a host COM port through the DevKitC-1's on-board bridge.
+# BLOCK layout: the ESP32-C6 HP UART.
 # Offsets are instance-base-relative; instance bases live in ../instances.toml. Module
 # clock/reset + the function-clock source live in the PCR block (blocks/pcr.toml).
 #
-# Cross-block bring-up (PCR clock/reset, IO_MUX routing) is DRIVER code per language;
-# only block-local sequences ride here.
+# Cross-block bring-up (PCR clock/reset, IO_MUX routing) is DRIVER code per language
+#; only block-local sequences ride here.
 
 [table]
 kind = "block"
 family = "esp32c6"
 block = "uart"
-sources = ["espressif/svd esp32c6.svd", "esp-idf v5.3 hal/esp32c6 uart_ll.h", "ESP32-C6 TRM (UART) via the silicon-proven demo + serve paths"]
+sources = ["espressif/svd esp32c6.svd", "esp-idf v5.3 hal/esp32c6 uart_ll.h", "ESP32-C6 TRM (UART)"]
 notes = [
     "Every config change must be committed with the REG_UPDATE handshake (write 1, poll until self-clear) -- the register file is clock-domain synchronized.",
     "The FIFO register must be written as a FULL 32-bit word (the byte in bits 7..0): narrower access read-modify-writes the register and corrupts the FIFO.",

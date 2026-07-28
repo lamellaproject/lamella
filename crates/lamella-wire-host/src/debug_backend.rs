@@ -212,7 +212,7 @@ impl WireHostBackend {
     }
 
     /// Open a NATIVE-USB (driverless WinUSB) Lamella Link target by `vid`/`pid` + an optional serial
-    /// substring (the picker key: an RP2350 reports its 16-hex chip id, the F427 `F427-0001`).
+    /// substring (the picker key: an RP2350, for instance, reports its 16-hex chip id).
     ///
     /// # Errors
     /// As [`Self::open`], with a carrier error if no matching USB device is present.

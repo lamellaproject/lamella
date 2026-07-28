@@ -76,7 +76,9 @@ namespace System
 
         public static bool IsSurrogate(char c) { return c >= '\uD800' && c <= '\uDFFF'; }
 
+#if LAMELLA_SURFACE_FLOAT
         public static double GetNumericValue(char c) { return CharNumericData.Value(c); }
+#endif
 
         public static char ToUpper(char c) { return CaseMapping.ToUpper(c); }
         public static char ToLower(char c) { return CaseMapping.ToLower(c); }

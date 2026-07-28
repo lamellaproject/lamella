@@ -1,0 +1,19 @@
+# BOARD binding: the SAM E54 Xplained Pro -- identity-first. Board truth only: the
+# identity, the part, and the carrier. NO peripheral bindings yet (the SAM E54 family has
+# no generated driver); the vcp binding + its pin rows (SERCOM2, TX PB25/PAD0, RX
+# PB24/PAD1, function D) land here with the family's driver.
+
+[table]
+kind = "board"
+board = "same54-xpro"
+family = "same54"
+part = "atsame54p20a"
+board_model = 4             # lamella_wire::board_model::SAME54_XPLAINED_PRO
+sources = ["SAM E54 Xplained Pro board identity via the on-board EDBG bridge"]
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG bridge's VCP; a silent board is DTR-first
+                            # (the EDBG VCP sends nothing until the host asserts DTR).
+baud = 115200               # the bridge's wire rate
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.

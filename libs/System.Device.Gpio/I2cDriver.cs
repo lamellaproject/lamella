@@ -1,8 +1,9 @@
-// Lamella System.Device.I2c -- the dotnet/iot I2C API, in the System.Device.Gpio assembly.
-namespace System.Device.I2c
+// Lamella.Hardware -- the I2C chip-driver seam, in the System.Device.Gpio assembly.
+namespace Lamella.Hardware
 {
     /// <summary>Base class for I2C drivers: the chip-level bus primitives a board or chip
-    /// implementation provides, and the seam <see cref="I2cDevice"/> sits on.</summary>
+    /// implementation provides, and the seam <see cref="System.Device.I2c.I2cDevice"/> sits
+    /// on.</summary>
     public abstract class I2cDriver : System.IDisposable
     {
         /// <summary>The transfer completed; every byte was acknowledged.</summary>

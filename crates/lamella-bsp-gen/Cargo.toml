@@ -1,0 +1,17 @@
+[package]
+name = "lamella-bsp-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Harvests the neutral chip/board fact strata and emits the generated per-language bindings under csp/ and bsp/."
+
+[dev-dependencies]
+# The board-identity gate: every bsp/*/board.toml's board_model code must
+# be one lamella-wire's canonical map knows, and unique across boards -- the wire crate stays
+# the ONE map; the gate needs no mirrored table.
+lamella-wire = { path = "../lamella-wire" }
+
+[lints]
+workspace = true

@@ -20,6 +20,13 @@ use lamella_load::load_with_corlib;
 use lamella_metadata::Assembly;
 use lamella_wire::{Transport, TransportError};
 
+#[cfg(feature = "repl-session")]
+use lamella_cil_runtime::{MethodId, Module, ObjectRef, intrinsics::object_to_string};
+#[cfg(feature = "repl-session")]
+use lamella_load::{
+    DeltaContext, load_bootstrap, load_bootstrap_lazy_corlib, load_delta, load_delta_with_corlib,
+};
+
 /// Lamella Link message types for the REPL (debug types live elsewhere).
 pub mod repl {
     /// Host -> target: run a program. Payload = the program assembly (PE) bytes.
@@ -30,6 +37,73 @@ pub mod repl {
     /// (the host compiles + bakes per submission). The PE-less constrained-target path,
     /// advertised by `Capabilities::BAKED_IMAGE`; answered by the same [`RUN_RESULT`].
     pub const RUN_IMAGE: u8 = 0x22;
+
+    /// The incremental-REPL SESSION channel (the 0x50 block): a device holds a LIVE session --
+    /// a persistent interpreter Vm + heap + a growing `<repl>.__Repl` instance -- and accepts a
+    /// compiled submission DELTA that loads into that live session and runs ONLY the new code
+    /// (prior submissions run exactly once, never re-execute). This is a distinct channel from
+    /// the whole-program 0x20 RUN ops above (a session ACCUMULATES; a RUN is transient) and from
+    /// the 0x30 profile / 0x40 telemetry blocks, so a session-capable board can advertise it
+    /// (`Capabilities::REPL_RUN`) without disturbing the deploy/run path. Served by
+    /// [`crate::serve_one_repl`]; the reply ops flow target -> host on the same channel. (It sits
+    /// one block above the reserved 0x40 telemetry/scope range -- the PLC "observe" half that
+    /// pairs with this "adjust" half, [`crate::telemetry`].)
+    ///
+    /// Host -> target: open a live session. Payload = `heartbeat_ms(u32 LE) |
+    /// config_len(u16 LE) | config[config_len] | bootstrap[tail]`. `heartbeat_ms` is the comms
+    /// deadman interval, currently unarmed (0 = disabled); `config` is a RESERVED per-output
+    /// safe-state blob, currently empty -- both are carried from the first frame
+    /// so the fail-safe supervisor has its hook without a wire break. `bootstrap` is the empty
+    /// `<repl>.__Repl` library the host emits once. Answered by [`REPL_OPENED`].
+    pub const REPL_OPEN: u8 = 0x50;
+    /// Target -> host: the session opened (or did not). Payload = `status(u8)`; on `status == 0`
+    /// then `session_id(u32 LE) | max_fields(u16 LE) | max_methods(u16 LE) | heap_budget(u32 LE)`
+    /// (a 0 limit = unspecified); on a
+    /// nonzero status the tail is the failure reason (UTF-8).
+    pub const REPL_OPENED: u8 = 0x51;
+    /// Host -> target: a compiled submission DELTA to load into the live session and run. Payload
+    /// = the delta assembly (PE) bytes -- one `Submit$N(__Repl)` that binds prior session
+    /// variables/types by name and reads/writes the live `__Repl`. Answered by
+    /// [`REPL_DELTA_RESULT`].
+    pub const REPL_DELTA: u8 = 0x52;
+    /// Target -> host: the submission's result. Payload = `status(u8) | new_fields(u16 LE) |
+    /// display_len(u16 LE) | display[display_len] | output[tail]`. `status`: 0 ok, 1 no open
+    /// session, 2 the delta did not load, 3 the submission trapped. `new_fields` is how many
+    /// session variables this delta added (the live instance grew by that many). `display` is the
+    /// submission's rendered value (`""` for a void statement); `output` is the console output
+    /// THIS submission produced. On a nonzero status `display` is empty and `output` is the reason.
+    pub const REPL_DELTA_RESULT: u8 = 0x53;
+    /// Host -> target: close the live session cleanly (a graceful detach -- distinct from a lost
+    /// link, which the comms deadman handles). Empty payload; the tail is RESERVED for a
+    /// teardown reason. Answered by [`REPL_CLOSED`].
+    pub const REPL_CLOSE: u8 = 0x54;
+    /// Target -> host: the session was closed. Payload = `ok(u8)` (1). Idempotent: closing when no
+    /// session is open still answers `ok = 1`.
+    pub const REPL_CLOSED: u8 = 0x55;
+    /// Host -> target: a session heartbeat (keepalive). Empty payload. RESERVED for the comms
+    /// deadman armed from `REPL_OPEN`'s `heartbeat_ms`; it currently only refreshes the
+    /// last-contact marker and is not answered (any frame counts as contact).
+    pub const REPL_PING: u8 = 0x56;
+    /// Host -> target: RESET THE TARGET, the only thing that reclaims an exhausted arena.
+    ///
+    /// Empty payload. The target acknowledges with [`REPL_RESETTING`] and then performs a SYSTEM
+    /// reset back into serve mode -- so the session, its module, and every allocation any of it
+    /// made are gone, and the host must re-`HELLO` before opening a new session.
+    ///
+    /// **Why a whole-target reset rather than a session reset.** The constrained serve allocates
+    /// from a segregated-fit heap whose bump frontier never retreats and which never splits or
+    /// coalesces across size classes. Once a session has carved the arena,
+    /// dropping it returns its blocks to per-class free lists that a fresh session cannot spend, so
+    /// reopening yields a session refused its first submission. Nothing short of a reset reclaims,
+    /// which is why this op exists and why it is honest about being a reboot.
+    ///
+    /// Without it a host that exhausts a board has no in-band recovery at all -- it needs a debug
+    /// probe or a power cycle, neither of which a REPL user has to hand.
+    pub const REPL_RESET: u8 = 0x58;
+    /// Target -> host: the reset was accepted and is imminent. Payload = `ok(u8)` (1). Sent BEFORE
+    /// the reset and flushed, so a host can distinguish an accepted reset from a target that simply
+    /// stopped answering. Expect the link to drop immediately after; re-`HELLO` to resume.
+    pub const REPL_RESETTING: u8 = 0x59;
 }
 
 /// Lamella Link message types for the DEBUG channel (the reserved 0x10+ range). A code
@@ -172,10 +246,13 @@ pub mod profile {
 }
 
 /// Lamella Link message types for on-device TELEMETRY / live-signal SCOPE (the 0x40 range).
-/// RESERVED for a POST-v1 feature (the telemetry-scope "observe" half that
+/// RESERVED (the telemetry-scope "observe" half that
 /// pairs with the incremental REPL's "adjust"): the host subscribes to device signals -- command
 /// outputs, sensor traces, energy -- and the target streams samples asynchronously over the live
-/// session.
+/// session. **No firmware implements this range; the identifiers are claimed here so that nothing
+/// else takes them and breaks the wire when it lands.** The payload
+/// shapes are not settled; only the type bytes + the `TELEMETRY`
+/// capability ([`lamella_wire::Capabilities::TELEMETRY`]) are reserved here.
 pub mod telemetry {
     /// Host -> target: subscribe to a signal. RESERVED (payload shape set at build).
     pub const SCOPE_SUBSCRIBE: u8 = 0x40;
@@ -313,6 +390,12 @@ pub enum Served {
     Handled,
     /// The host sent [`deploy::DEPLOY_RUN`]: the firmware should reset into its boot-run path.
     RunRequested,
+    /// The host sent [`repl::REPL_RESET`]: the firmware should reset back into SERVE mode. The
+    /// acknowledgement has already been sent; the caller resets once its transport has drained.
+    ///
+    /// This is the only path that reclaims an exhausted interpreter arena -- see [`repl::REPL_RESET`]
+    /// for why dropping the session does not.
+    ResetRequested,
 }
 
 /// The result of running a program on the target: its process exit code and captured console output.
@@ -780,13 +863,21 @@ fn expand_reply(
     payload
 }
 
+/// How many interpreter steps a serve run driver takes between servicing the polled Lamella Link
+/// carrier (and, on the debug path, checking for a mid-run command). Op-count, not wall-clock -- the
+/// portable runner has no time source -- so it is a knob balancing keepalive against poll overhead:
+/// smaller keeps the carrier alive through slower I/O-bound loops (a tight `Mmio`-poll loop), and it
+/// matches the interpreter's own scheduler quantum, so the `run_serviced` (RUN_IMAGE) path services
+/// at the same cadence. A board-supplied wall-clock budget is the robust future refinement.
+#[cfg(feature = "baked-image")]
+const RUN_SERVICE_STEPS: u32 = 256;
+
 /// Run until a breakpoint, completion, a trap, or a [`debug::DBG_PAUSE`]: bounded bursts
 /// of steps with a wire poll between bursts, so a running target stays pause-able.
 /// A mid-run `HELLO` is answered with `caps` and ends the run ([`RunStop::Reclaimed`]);
 /// a mid-run detach is acked and ends it ([`RunStop::Detached`]) -- without these, a
-/// resume over a non-terminating program left the Lamella Link PERMANENTLY deaf on every
-/// carrier (the F427 post-debug wedge: the blink loops forever, no breakpoint fires,
-/// and the old loop dropped every reclaim HELLO here).
+/// resume over a non-terminating program would leave the Lamella Link permanently deaf
+/// on every carrier.
 #[cfg(feature = "baked-image")]
 fn run_until_stop(
     transport: &mut impl Transport,
@@ -797,7 +888,7 @@ fn run_until_stop(
 ) -> Result<RunStop, TransportError> {
     use lamella_cil_runtime::Status;
     loop {
-        for _ in 0..2048 {
+        for _ in 0..RUN_SERVICE_STEPS {
             match session.step(module, vm) {
                 Ok(Status::Done(value)) => return Ok(RunStop::Done(run_result_of(vm, &value))),
                 Err(trap) => {
@@ -1020,6 +1111,61 @@ pub fn run_debug_session_static(
     }
 }
 
+/// Boot a DEPLOYED ARTIFACT, which may be either a baked image or a bare program PE, deciding by
+/// the artifact's own first four bytes: `LMLI` is a baked image, `MZ` is a PE.
+///
+/// # Why a PE is worth booting at all
+///
+/// A baked image is self-contained -- it carries the corlib it needs -- which is what makes it
+/// deployable to a board with nothing resident. That is also its cost: the image is dominated by
+/// the corlib rather than by the program, so a small program bakes to a large image, and a device
+/// that already holds a resident corlib is storing a second copy of it per deploy.
+///
+/// A device that HAS one can take the program alone and resolve its corlib references against the
+/// resident bytes, so the deployed artifact is the PE and nothing else.
+///
+/// # The magic is the discriminator, so nothing on the wire changes
+///
+/// The deploy protocol writes bytes into the image region and the boot path reads them back; it has
+/// never inspected them. Both artifacts are self-identifying, so a host may deploy either and an
+/// older host keeps working unchanged. A PE arriving at a device with NO resident corlib is the one
+/// case that must fail loudly rather than silently: it names the situation instead of trapping later
+/// on the first unresolved corlib call.
+///
+/// # Errors
+/// A message naming what was wrong: an unrecognized artifact, a PE with no resident corlib to
+/// resolve against, a malformed assembly, or an image that records no entry point.
+#[cfg(feature = "baked-image")]
+pub fn load_deployed(
+    artifact: &'static [u8],
+    corlib: Option<&'static [u8]>,
+) -> Result<(lamella_cil_runtime::Module, lamella_cil_runtime::MethodId), String> {
+    match artifact.get(..2) {
+        Some(b"LM") => match lamella_cil_runtime::Module::from_baked(artifact) {
+            Ok((module, Some(entry))) => Ok((module, entry)),
+            Ok((_, None)) => Err(String::from("image records no entry point")),
+            Err(error) => Err(format!("image does not boot: {error:?}")),
+        },
+        Some(b"MZ") => {
+            let Some(corlib) = corlib else {
+                return Err(String::from(
+                    "deployed a bare PE but this firmware has no resident corlib to resolve it against",
+                ));
+            };
+            let corlib = Assembly::read(corlib)
+                .map_err(|error| format!("resident corlib does not parse: {error:?}"))?;
+            let program = Assembly::read(artifact)
+                .map_err(|error| format!("deployed PE does not parse: {error:?}"))?;
+            let loaded = load_with_corlib(&corlib, &program)
+                .map_err(|error| format!("deployed PE does not load: {error:?}"))?;
+            Ok((loaded.module, loaded.entry))
+        }
+        _ => Err(String::from(
+            "deployed artifact is neither a baked image (LMLI) nor a program PE (MZ)",
+        )),
+    }
+}
+
 /// Boot a baked image ([`lamella_cil_runtime::Module::from_baked`]) and run its entry point,
 /// capturing console output + exit code -- [`run_program`]'s twin for the PE-less path. The
 /// image bytes are leaked to `'static` (the image is borrowed in place, never copied): the
@@ -1039,6 +1185,21 @@ pub fn run_image(image: Vec<u8>) -> RunResult {
 #[cfg(feature = "baked-image")]
 #[must_use]
 pub fn run_image_with(image: Vec<u8>, configure: &mut dyn FnMut(&mut Vm)) -> RunResult {
+    run_image_serviced(image, configure, &mut || {})
+}
+
+/// [`run_image_with`] plus a `service` callback the interpreter fires at every scheduler quantum
+/// (~256 instructions), single- OR multi-threaded. A device serve passes a USB-poll closure so a
+/// running image's tight loop cannot starve the POLLED Lamella Link carrier -- without it a
+/// single-threaded program runs to completion without the serve ever pumping USB and the host drops
+/// the Link mid-run. The host [`run_image`] path passes a no-op.
+#[cfg(feature = "baked-image")]
+#[must_use]
+pub fn run_image_serviced(
+    image: Vec<u8>,
+    configure: &mut dyn FnMut(&mut Vm),
+    service: &mut dyn FnMut(),
+) -> RunResult {
     let image: &'static [u8] = Box::leak(image.into_boxed_slice());
     let (module, entry) = match lamella_cil_runtime::Module::from_baked(image) {
         Ok(booted) => booted,
@@ -1062,7 +1223,7 @@ pub fn run_image_with(image: Vec<u8>, configure: &mut dyn FnMut(&mut Vm)) -> Run
     if boot_static_ctors(&module, &mut vm).is_err() {
         return RunResult { exit: 70, stdout: String::from_utf16_lossy(vm.output()) };
     }
-    let outcome = run(&module, &mut vm, entry, Vec::new());
+    let outcome = lamella_cil_runtime::run_serviced(&module, &mut vm, entry, Vec::new(), service);
     let exit = match outcome {
         Ok(Some(Value::Int32(code))) => code,
         Ok(_) => 0,
@@ -1126,7 +1287,9 @@ fn serve_frame_baked(
     match frame.msg_type {
         msg::HELLO => hello_reply(transport, &frame)?,
         repl::RUN_IMAGE => {
-            let result = run_image_with(frame.payload, configure);
+            let result = run_image_serviced(frame.payload, configure, &mut || {
+                let _ = transport.poll();
+            });
             transport.send(repl::RUN_RESULT, frame.seq, &result.encode())?;
         }
         debug::DBG_IMAGE => {
@@ -1172,11 +1335,31 @@ pub fn serve_one_deploy_with(
     transport: &mut impl Transport,
     flash: &mut impl FlashSink,
     configure: &mut dyn FnMut(&mut Vm),
-    mut winc: Option<&mut dyn WincFlasher>,
+    winc: Option<&mut dyn WincFlasher>,
 ) -> Result<Served, TransportError> {
     let Some(frame) = transport.poll()? else {
         return Ok(Served::Nothing);
     };
+    serve_deploy_frame(transport, frame, flash, configure, winc)
+}
+
+/// Handle one ALREADY-POLLED frame on a DEPLOY-capable baked-image target: the deploy ops
+/// (`DEPLOY_IMAGE`/`CLEAR`/`CHUNK`, the `WINC_FW_*` module-update stream, `DEPLOY_STATUS`/`RUN`,
+/// `DBG_ATTACH`, and `HELLO` with the deploy caps), with every other frame delegated to
+/// [`serve_frame_baked`]. Split out (mirroring that split) so a combined deploy+session serve
+/// loop -- [`serve_one_deploy_repl_with`] -- can poll the wire ONCE and route the frame here or
+/// to the session handler, without double-reading the carrier.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+fn serve_deploy_frame(
+    transport: &mut impl Transport,
+    frame: lamella_wire::Frame,
+    flash: &mut impl FlashSink,
+    configure: &mut dyn FnMut(&mut Vm),
+    mut winc: Option<&mut dyn WincFlasher>,
+) -> Result<Served, TransportError> {
     match frame.msg_type {
         deploy::DEPLOY_IMAGE => {
             let ok = flash.program(&frame.payload);
@@ -1252,6 +1435,54 @@ pub fn serve_one_deploy_with(
     Ok(Served::Handled)
 }
 
+/// The capability set a serve that carries BOTH the deploy tier AND a live REPL session
+/// advertises: the deploy set (incl. `DEBUG_ATTACH`) plus `REPL_RUN`, in one `HELLO_ACK`.
+#[cfg(all(feature = "baked-image", feature = "repl-session"))]
+fn deploy_repl_caps() -> lamella_wire::Capabilities {
+    lamella_wire::Capabilities(deploy_caps().0 | lamella_wire::Capabilities::REPL_RUN)
+}
+
+/// Serve one pending frame on a target that is BOTH deploy-capable and session-capable, holding
+/// the live REPL `session` across calls. One poll, then route: a session-channel op (`REPL_OPEN`/
+/// `REPL_DELTA`/`REPL_CLOSE`/`REPL_PING`) is dispatched against `session` (a persistent interpreter
+/// that survives the request), a `HELLO` advertises the deploy tier and `REPL_RUN` in a single ack,
+/// and every other frame (`DEPLOY_*`, `WINC_FW_*`, `DBG_ATTACH`, `RUN_IMAGE`, ...) takes the transient
+/// deploy path. So one serve loop carries both tiers without double-reading the wire; a board that
+/// never receives a `REPL_OPEN` keeps `session` `None` and behaves exactly as [`serve_one_deploy_with`].
+/// `configure` installs the board's [`Vm`] seams -- on the session at `REPL_OPEN`, and on each
+/// transient evaluation -- the same hook [`run_image_with`] takes.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(all(feature = "baked-image", feature = "repl-session"))]
+pub fn serve_one_deploy_repl_with(
+    transport: &mut impl Transport,
+    flash: &mut impl FlashSink,
+    session: &mut Option<ReplSessionState>,
+    corlib: Option<&'static [u8]>,
+    configure: &mut dyn FnMut(&mut Vm),
+    winc: Option<&mut dyn WincFlasher>,
+) -> Result<Served, TransportError> {
+    let Some(frame) = transport.poll()? else {
+        return Ok(Served::Nothing);
+    };
+    match frame.msg_type {
+        repl::REPL_OPEN | repl::REPL_DELTA | repl::REPL_CLOSE | repl::REPL_PING => {
+            serve_repl_frame(transport, frame, session, corlib, configure)?;
+            Ok(Served::Handled)
+        }
+        repl::REPL_RESET => {
+            serve_repl_frame(transport, frame, session, corlib, configure)?;
+            Ok(Served::ResetRequested)
+        }
+        lamella_wire::msg::HELLO => {
+            hello_reply_caps(transport, &frame, deploy_repl_caps())?;
+            Ok(Served::Handled)
+        }
+        _ => serve_deploy_frame(transport, frame, flash, configure, winc),
+    }
+}
+
 /// Run a DEPLOYED baked image (booted from flash) at full speed, staying interruptible: it
 /// drives the interpreter session in bounded bursts and polls the wire between them, so a
 /// host that sends `HELLO` always takes the board back within a burst -- guaranteed,
@@ -1313,7 +1544,7 @@ pub fn run_deployed_with(
         }
     };
     loop {
-        for _ in 0..4096 {
+        for _ in 0..RUN_SERVICE_STEPS {
             match session.step(module, &mut vm) {
                 Ok(Status::Done(value)) => {
                     return Ok(Deployed::Completed(run_result_of(&vm, &value)));
@@ -1334,6 +1565,495 @@ pub fn run_deployed_with(
             }
         }
     }
+}
+
+
+/// The qualified name of the bootstrap's parameterless `<repl>.__Repl` constructor: it anchors the
+/// type to instantiate (its declaring type) and runs once to initialize the live instance. The same
+/// name the host emit (lamella_assemble's bootstrap) and driver (lamella_repl) use, so a device load
+/// binds it identically.
+#[cfg(feature = "repl-session")]
+const REPL_CTOR_NAME: &str = "<repl>.__Repl..ctor";
+
+/// A live incremental-REPL session held on the device across wire frames: ONE interpreter, ONE heap,
+/// and ONE `<repl>.__Repl` instance that GROWS as deltas load, so declared state -- including
+/// REFERENCE-typed state (a string / array / object, whose handle stays valid on the one unrebuilt
+/// heap) -- survives submission to submission. A device firmware holds an `Option<ReplSessionState>`
+/// and threads it into [`serve_one_repl`]; REPL_OPEN fills it, REPL_DELTA runs a submission against
+/// it, REPL_CLOSE drops it.
+#[cfg(feature = "repl-session")]
+pub struct ReplSessionState {
+    vm: Vm,
+    module: Module,
+    context: DeltaContext,
+    instance: ObjectRef,
+    root_slot: usize,
+    heartbeat_ms: u32,
+    corlib: Option<&'static [u8]>,
+}
+
+/// One submission's result, rendered for the wire: how many session variables the delta added (the
+/// live instance grew by that many), the submission's displayed value (`""` for a void statement),
+/// and the console output THIS submission produced.
+#[cfg(feature = "repl-session")]
+struct SubmitOutcome {
+    new_fields: u16,
+    display: String,
+    output: String,
+}
+
+/// Why a submission did not produce a result: the delta failed to load / grow (`NotLoaded`, wire
+/// status 2), the submission trapped while running (`Trapped`, wire status 3), or the session had
+/// no room left to attempt it at all (`OutOfMemory`, wire status 4). Distinct so the host can tell
+/// a bad delta from a runtime fault from an exhausted session without parsing the reason text.
+#[cfg(feature = "repl-session")]
+enum SubmitError {
+    NotLoaded(String),
+    Trapped(String),
+    OutOfMemory,
+}
+
+#[cfg(feature = "repl-session")]
+impl SubmitError {
+    fn status(&self) -> u8 {
+        match self {
+            SubmitError::NotLoaded(_) => 2,
+            SubmitError::Trapped(_) => 3,
+            SubmitError::OutOfMemory => 4,
+        }
+    }
+    fn reason(&self) -> &str {
+        match self {
+            SubmitError::NotLoaded(reason) | SubmitError::Trapped(reason) => reason,
+            SubmitError::OutOfMemory => OUT_OF_MEMORY_REASON,
+        }
+    }
+}
+
+/// What a host is told when a session runs out of room -- and what it can actually DO about it.
+///
+/// Reopening the session does NOT reclaim it, which is why this text names a reset instead:
+/// dropping a session returns its blocks to per-class free lists, but the bump frontier never
+/// retreats and blocks are never split or coalesced across classes, so a reopened session has no
+/// frontier and is refused its first submission. Only a target reset reclaims the arena.
+#[cfg(feature = "repl-session")]
+pub const OUT_OF_MEMORY_REASON: &str = "session out of memory -- the target must be reset to reclaim it";
+
+/// The room a submission is refused for want of, beyond its own delta PE. Sized from the MEASURED
+/// per-submission cost on a SAME54 -- ~2.8 KiB for a trivial submission, ~3.7 KiB for one that
+/// throws and catches -- with slack, so an ordinary submission clears it and the one that would
+/// have aborted mid-load is turned away first.
+#[cfg(feature = "repl-session")]
+const SUBMISSION_HEADROOM: usize = 8192;
+
+/// Whether the session can still afford a submission carrying a `delta_len`-byte PE.
+///
+/// A live session never reclaims, so one that runs long enough exhausts its arena. The failure that
+/// matters is HOW: Rust's allocation path is infallible, so exhaustion ABORTS inside the loader -- on a
+/// device a panic, a reset, and a session that vanishes with no diagnostic. Asking the embedder's
+/// probe BEFORE the first allocation converts that into a refusal the session survives.
+///
+/// Deliberately asks the allocator rather than probing it with a trial allocation: the device heap
+/// is a segregated free-list that never SPLITS blocks, so a trial allocation freed back to its size
+/// class would be popped again by the next probe and keep succeeding while the classes a real
+/// submission needs are exhausted -- a probe that stops predicting exactly when it matters.
+///
+/// A guard band, not a proof: a submission with an unusually large working set can still exhaust
+/// the arena after passing, and the probe under-reports (free-list bytes are already reusable but
+/// uncounted), so it errs toward refusing early. Both are the right direction.
+#[cfg(feature = "repl-session")]
+fn has_submission_headroom(vm: &Vm, delta_len: usize) -> bool {
+    vm.heap_headroom()
+        .is_none_or(|free| free >= delta_len.saturating_add(SUBMISSION_HEADROOM))
+}
+
+/// Whether a session can be OPENED over a `bootstrap_len`-byte PE. Same probe and same band as
+/// [`has_submission_headroom`]; named apart because the two guard different moments and the
+/// question of whether they should differ has now been settled by measurement.
+///
+/// They should NOT. Guarding the open on already-reclaimed bytes instead was tried, on the
+/// reasoning that an open follows a session DROP and so re-runs the very allocation pattern whose
+/// space it is asking about. On a SAME54 it did let the open succeed on a fully-carved arena -- and
+/// bought nothing: every subsequent submission was still refused, because the frontier is gone and
+/// the free lists are not fungible across size classes. An open that succeeds into a session which
+/// can never accept a submission is worse than a clean refusal, since the host has to discover the
+/// uselessness by trying.
+///
+/// **A device that has exhausted its arena cannot be recovered by reopening; it needs a reset.**
+/// That is a property of a non-coalescing allocator, not of this guard, and the honest thing is to
+/// refuse here and say so rather than to appear to recover. A heap tier that splits or coalesces
+/// would change the answer -- it is a documented future rung in `lamella-heap`.
+#[cfg(feature = "repl-session")]
+fn has_open_headroom(vm: &Vm, bootstrap_len: usize) -> bool {
+    has_submission_headroom(vm, bootstrap_len)
+}
+
+#[cfg(feature = "repl-session")]
+impl ReplSessionState {
+    /// Opens a live session over the empty `<repl>.__Repl` in `bootstrap` (the PE the host emits
+    /// once): loads it, allocates the single instance, roots it for the collector, runs its `.ctor`,
+    /// and installs the board's Vm seams via `configure` -- the SAME machine a RUN_IMAGE gets, so a
+    /// submission that drives a peripheral reaches real registers on device.
+    ///
+    /// # Errors
+    /// Returns `Err` if the bootstrap does not parse, declares no `<repl>.__Repl..ctor`, or the
+    /// constructor traps.
+    fn open(
+        bootstrap: &[u8],
+        heartbeat_ms: u32,
+        corlib: Option<&'static [u8]>,
+        configure: &mut dyn FnMut(&mut Vm),
+    ) -> Result<ReplSessionState, String> {
+        let assembly = Assembly::read(bootstrap)
+            .map_err(|error| format!("bootstrap does not parse: {error:?}"))?;
+
+        let mut vm = Vm::default();
+        #[cfg(target_os = "none")]
+        vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
+        #[cfg(target_os = "none")]
+        vm.set_mmio_subword(
+            lamella_mmio::write8,
+            lamella_mmio::read8,
+            lamella_mmio::write16,
+            lamella_mmio::read16,
+        );
+        vm.set_memory_backend(Box::new(SafeMemory::new()));
+        configure(&mut vm);
+
+        if !has_open_headroom(&vm, bootstrap.len()) {
+            return Err(String::from("not enough heap to open a session"));
+        }
+
+        let (module, name_index, type_index, first_delta_asm) = if corlib.is_some() {
+            let (module, name_index, type_index) = load_bootstrap_lazy_corlib(&assembly);
+            (module, name_index, type_index, 2)
+        } else {
+            let (module, name_index, type_index) = load_bootstrap(&assembly);
+            (module, name_index, type_index, 1)
+        };
+
+        let ctor = find_method(&module, REPL_CTOR_NAME)
+            .ok_or_else(|| format!("bootstrap defines no {REPL_CTOR_NAME}"))?;
+        let type_id = module
+            .method_type(ctor)
+            .ok_or_else(|| format!("{REPL_CTOR_NAME} has no declaring type"))?;
+        let fields = module
+            .type_field_defaults(type_id)
+            .ok_or_else(|| String::from("__Repl has no recorded field layout"))?;
+
+        let root_slot = module.static_field_defaults().len();
+        let mut storage = module.static_field_defaults().to_vec();
+        storage.push(Value::Null);
+
+        vm.init_statics(&storage);
+        let instance = vm.heap_mut().alloc_instance(type_id, fields);
+        vm.set_static_field(root_slot, Value::Object(instance));
+
+        run(&module, &mut vm, ctor, alloc::vec![Value::Object(instance)])
+            .map_err(|trap| format!("trap running {REPL_CTOR_NAME}: {trap:?}"))?;
+        let instance = current_instance(&vm, root_slot)?;
+
+        Ok(ReplSessionState {
+            vm,
+            module,
+            context: DeltaContext::new_at(type_id, name_index, type_index, first_delta_asm),
+            instance,
+            root_slot,
+            heartbeat_ms,
+            corlib,
+        })
+    }
+
+    /// Loads one submission `delta` into the live session, grows the single `__Repl` instance for
+    /// any new session variable, runs its `Submit$N` against that instance, and returns the render.
+    /// Reuses [`lamella_load::load_delta`] unchanged: the bytes arriving over the wire is the only
+    /// difference from the host driver.
+    fn submit(&mut self, delta: &[u8]) -> Result<SubmitOutcome, SubmitError> {
+        if !has_submission_headroom(&self.vm, delta.len()) {
+            return Err(SubmitError::OutOfMemory);
+        }
+        let assembly = Assembly::read(delta)
+            .map_err(|error| SubmitError::NotLoaded(format!("delta does not parse: {error:?}")))?;
+        let info = if let Some(corlib_bytes) = self.corlib {
+            let corlib = Assembly::read(corlib_bytes).map_err(|error| {
+                SubmitError::NotLoaded(format!("corlib does not parse: {error:?}"))
+            })?;
+            load_delta_with_corlib(&mut self.module, &mut self.context, &assembly, &corlib)
+        } else {
+            load_delta(&mut self.module, &mut self.context, &assembly)
+        }
+        .map_err(|error| SubmitError::NotLoaded(format!("delta did not load: {error}")))?;
+
+        let new_fields = info.new_field_defaults.len() as u16;
+        if !info.new_field_defaults.is_empty() {
+            self.vm
+                .heap_mut()
+                .grow_instance(self.instance, &info.new_field_defaults)
+                .ok_or_else(|| {
+                    SubmitError::NotLoaded(String::from("live __Repl instance could not be grown"))
+                })?;
+        }
+
+        let output_before = self.vm.output().len();
+        let result = run(
+            &self.module,
+            &mut self.vm,
+            info.submit,
+            alloc::vec![Value::Object(self.instance)],
+        )
+        .map_err(|trap| SubmitError::Trapped(format!("submission trapped: {trap:?}")))?;
+        self.instance = current_instance(&self.vm, self.root_slot)
+            .map_err(SubmitError::Trapped)?;
+        let output = String::from_utf16_lossy(&self.vm.output()[output_before..]);
+
+        Ok(SubmitOutcome {
+            new_fields,
+            display: self.display(result),
+            output,
+        })
+    }
+
+    /// Renders a submission's return value for display exactly as `Object.ToString` would -- void
+    /// (`None`) as `""`, a boxed value / string by its representation -- reusing the runtime's own
+    /// `object_to_string`, so a device display matches the host's byte for byte.
+    fn display(&mut self, result: Option<Value>) -> String {
+        let Some(value) = result else {
+            return String::new();
+        };
+        let rendered = object_to_string(&mut self.vm, &self.module, &[value]);
+        if let Ok(instance) = current_instance(&self.vm, self.root_slot) {
+            self.instance = instance;
+        }
+        match rendered {
+            Ok(Some(Value::Object(reference))) => self
+                .vm
+                .heap()
+                .as_string(reference)
+                .map(|chars| String::from_utf16_lossy(&chars))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// The comms-deadman interval this session was opened with (0 = disabled), for a fail-safe
+    /// supervisor to arm on. Read-only: nothing in this crate acts on it.
+    #[must_use]
+    pub fn heartbeat_ms(&self) -> u32 {
+        self.heartbeat_ms
+    }
+}
+
+/// Finds a method by its loader-qualified name (`namespace.type.method`) by scanning the module's
+/// bound methods. Used to anchor the bootstrap's `<repl>.__Repl..ctor`; a session runs later
+/// submissions by the `MethodId` [`lamella_load::load_delta`] returns, never by name.
+#[cfg(feature = "repl-session")]
+fn find_method(module: &Module, name: &str) -> Option<MethodId> {
+    let mut id: MethodId = 0;
+    while module.method_kind(id).is_some() {
+        if module.method_name(id) == Some(name) {
+            return Some(id);
+        }
+        id += 1;
+    }
+    None
+}
+
+/// The persistent instance's current handle, read back from its static root `slot` (a collection may
+/// have relocated it since it was stored). Errors if the slot no longer holds an object reference --
+/// which would mean the GC root was lost, a bug.
+#[cfg(feature = "repl-session")]
+fn current_instance(vm: &Vm, slot: usize) -> Result<ObjectRef, String> {
+    match vm.static_field(slot) {
+        Some(Value::Object(reference)) => Ok(reference),
+        other => Err(format!("__Repl instance root was lost (slot held {other:?})")),
+    }
+}
+
+/// The capability set a session-capable serve advertises: [`lamella_wire::Capabilities::REPL_RUN`]
+/// (it holds a live session and runs host-compiled deltas), plus the baked-image tier's set when
+/// this build also carries it (a REPL device is a resident-corlib device).
+#[cfg(feature = "repl-session")]
+fn repl_caps() -> lamella_wire::Capabilities {
+    #[cfg(feature = "baked-image")]
+    {
+        lamella_wire::Capabilities(serve_caps().0 | lamella_wire::Capabilities::REPL_RUN)
+    }
+    #[cfg(not(feature = "baked-image"))]
+    {
+        lamella_wire::Capabilities(lamella_wire::Capabilities::REPL_RUN)
+    }
+}
+
+/// Answers a `HELLO` on the session channel, advertising [`repl_caps`] (and the resident-profile
+/// identity when this build carries the baked tier). A malformed `HELLO` is dropped; the host
+/// retries.
+#[cfg(feature = "repl-session")]
+fn hello_reply_repl(
+    transport: &mut impl Transport,
+    frame: &lamella_wire::Frame,
+) -> Result<(), TransportError> {
+    use lamella_wire::{Hello, PROTOCOL_VERSION, ProtocolRange, msg, target_respond};
+    let range = ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION };
+    match Hello::decode(&frame.payload) {
+        Some(hello) => match target_respond(&hello, range, repl_caps()) {
+            Ok(ack) => {
+                #[cfg(feature = "baked-image")]
+                let ack = {
+                    let mut ack = ack;
+                    ack.profile = Some(profile_identity());
+                    ack
+                };
+                transport.send(msg::HELLO_ACK, frame.seq, &ack.encode())
+            }
+            Err(nak) => transport.send(msg::NAK, frame.seq, &nak.encode()),
+        },
+        None => Ok(()),
+    }
+}
+
+/// Decodes a [`repl::REPL_OPEN`] payload into `(heartbeat_ms, bootstrap_bytes)`, skipping the
+/// RESERVED per-output safe-state config blob. A short / garbled header yields
+/// heartbeat 0 and an empty bootstrap, so `open` then fails cleanly with a parse error rather than
+/// mis-reading the tail.
+#[cfg(feature = "repl-session")]
+fn decode_repl_open(payload: &[u8]) -> (u32, &[u8]) {
+    let Some(head) = payload.get(0..6) else {
+        return (0, &[]);
+    };
+    let heartbeat_ms = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+    let config_len = u16::from_le_bytes([head[4], head[5]]) as usize;
+    let bootstrap = payload.get(6 + config_len..).unwrap_or(&[]);
+    (heartbeat_ms, bootstrap)
+}
+
+/// The [`repl::REPL_OPENED`] payload for a session that opened: `status 0` then the session id and
+/// its resource caps, which are RESERVED and report 0 (= unspecified). The fields are carried from
+/// the first frame so the reply shape does not break when real numbers land.
+#[cfg(feature = "repl-session")]
+fn repl_opened_ok() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(13);
+    payload.push(0);
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload
+}
+
+/// The [`repl::REPL_OPENED`] payload for a session that did NOT open: `status 1` then the reason.
+#[cfg(feature = "repl-session")]
+fn repl_opened_err(reason: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + reason.len());
+    payload.push(1);
+    payload.extend_from_slice(reason.as_bytes());
+    payload
+}
+
+/// The [`repl::REPL_DELTA_RESULT`] payload for a submission that ran: `status 0`, the new-field
+/// count, the display string, then the console output tail.
+#[cfg(feature = "repl-session")]
+fn repl_delta_result_ok(outcome: &SubmitOutcome) -> Vec<u8> {
+    let display = outcome.display.as_bytes();
+    let display_len = display.len().min(u16::MAX as usize);
+    let mut payload = Vec::with_capacity(5 + display_len + outcome.output.len());
+    payload.push(0);
+    payload.extend_from_slice(&outcome.new_fields.to_le_bytes());
+    payload.extend_from_slice(&(display_len as u16).to_le_bytes());
+    payload.extend_from_slice(&display[..display_len]);
+    payload.extend_from_slice(outcome.output.as_bytes());
+    payload
+}
+
+/// The [`repl::REPL_DELTA_RESULT`] payload for a submission that could not run: the `status` (1 no
+/// session, 2 delta did not load, 3 trapped, 4 the session is out of memory -- still open, and
+/// reclaimable by reopening it), no new fields, no display, and the reason in the output tail.
+#[cfg(feature = "repl-session")]
+fn repl_delta_result_err(status: u8, reason: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(5 + reason.len());
+    payload.push(status);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(reason.as_bytes());
+    payload
+}
+
+/// Dispatches one already-polled session-channel frame against the held `session`. Split from
+/// [`serve_one_repl`] so a firmware that multiplexes channels itself can route a frame here after
+/// its own poll.
+#[cfg(feature = "repl-session")]
+fn serve_repl_frame(
+    transport: &mut impl Transport,
+    frame: lamella_wire::Frame,
+    session: &mut Option<ReplSessionState>,
+    corlib: Option<&'static [u8]>,
+    configure: &mut dyn FnMut(&mut Vm),
+) -> Result<(), TransportError> {
+    match frame.msg_type {
+        repl::REPL_OPEN => {
+            let (heartbeat_ms, bootstrap) = decode_repl_open(&frame.payload);
+            *session = None;
+            match ReplSessionState::open(bootstrap, heartbeat_ms, corlib, configure) {
+                Ok(state) => {
+                    *session = Some(state);
+                    transport.send(repl::REPL_OPENED, frame.seq, &repl_opened_ok())?;
+                }
+                Err(reason) => {
+                    *session = None;
+                    transport.send(repl::REPL_OPENED, frame.seq, &repl_opened_err(&reason))?;
+                }
+            }
+        }
+        repl::REPL_DELTA => {
+            let payload = match session {
+                Some(state) => match state.submit(&frame.payload) {
+                    Ok(outcome) => repl_delta_result_ok(&outcome),
+                    Err(error) => repl_delta_result_err(error.status(), error.reason()),
+                },
+                None => repl_delta_result_err(1, "no open REPL session"),
+            };
+            transport.send(repl::REPL_DELTA_RESULT, frame.seq, &payload)?;
+        }
+        repl::REPL_CLOSE => {
+            *session = None;
+            transport.send(repl::REPL_CLOSED, frame.seq, &[1])?;
+        }
+        repl::REPL_PING => {
+        }
+        repl::REPL_RESET => {
+            *session = None;
+            transport.send(repl::REPL_RESETTING, frame.seq, &[1])?;
+        }
+        lamella_wire::msg::HELLO => hello_reply_repl(transport, &frame)?,
+        #[cfg(feature = "baked-image")]
+        _ => serve_frame_baked(transport, frame, configure)?,
+        #[cfg(not(feature = "baked-image"))]
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Serve one pending frame on a SESSION-CAPABLE target, holding the live REPL `session` across
+/// calls: `REPL_OPEN` (re)opens it, `REPL_DELTA` runs a submission against it, `REPL_CLOSE` tears it
+/// down, a `HELLO` advertises `REPL_RUN`, a `REPL_PING` refreshes contact. Returns whether a frame
+/// was handled. A device firmware's session loop is this call in a loop over an
+/// `Option<ReplSessionState>` it owns; a board that never receives a `REPL_OPEN` keeps it `None` and
+/// behaves exactly as the stateless serve loop. `configure` installs the board's Vm seams on the
+/// session at open (the same hook [`run_image_with`] takes).
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "repl-session")]
+pub fn serve_one_repl(
+    transport: &mut impl Transport,
+    session: &mut Option<ReplSessionState>,
+    corlib: Option<&'static [u8]>,
+    configure: &mut dyn FnMut(&mut Vm),
+) -> Result<bool, TransportError> {
+    let Some(frame) = transport.poll()? else {
+        return Ok(false);
+    };
+    serve_repl_frame(transport, frame, session, corlib, configure)?;
+    Ok(true)
 }
 
 /// The runner's request handler: if a [`repl::RUN_PROGRAM`] is pending, run it (against `corlib_bytes`)
@@ -1367,6 +2087,23 @@ pub fn send_program(transport: &mut impl Transport, seq: u16, program: &[u8]) ->
     transport.send(repl::RUN_PROGRAM, seq, program)
 }
 
+/// Host driver: ask the target to RESET back into serve mode -- the only in-band way to reclaim an
+/// exhausted interpreter arena.
+///
+/// The target answers [`repl::REPL_RESETTING`] and then reboots, so expect the link to drop
+/// immediately: a caller should re-`HELLO` before opening a new session, and should treat a missing
+/// reply as "reset anyway, probably" rather than an error, since the reply races the reboot.
+///
+/// Reach for this when a session reports [`repl::REPL_DELTA_RESULT`] status 4 (out of memory).
+/// Reopening the session does NOT reclaim on the constrained serve's allocator -- see
+/// [`repl::REPL_RESET`] for the measurement behind that.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+pub fn send_repl_reset(transport: &mut impl Transport, seq: u16) -> Result<(), TransportError> {
+    transport.send(repl::REPL_RESET, seq, &[])
+}
+
 /// Host driver: send a baked `.lmli` `image` to the target for execution. Unconditional (no
 /// interpreter feature needed to DRIVE a device): the target answers with the same
 /// [`repl::RUN_RESULT`] that [`try_recv_result`] reads.
@@ -1388,6 +2125,51 @@ pub fn try_recv_result(transport: &mut impl Transport, seq: u16) -> Result<Optio
         }
     }
     Ok(None)
+}
+
+/// The session's out-of-room guard, which decides whether a submission is attempted at all. Its
+/// whole purpose is that exhaustion arrives as a REFUSAL rather than an abort, so the boundary is
+/// pinned in both directions -- including the un-probed host, which must never refuse.
+#[cfg(all(test, feature = "repl-session"))]
+mod headroom_tests {
+    use super::{SUBMISSION_HEADROOM, Vm, has_submission_headroom};
+
+    fn nearly_empty() -> usize {
+        512
+    }
+
+    fn exactly_enough() -> usize {
+        SUBMISSION_HEADROOM + 1024
+    }
+
+    #[test]
+    fn a_target_with_no_probe_never_refuses() {
+        let vm = Vm::default();
+        assert!(has_submission_headroom(&vm, 1024));
+        assert!(has_submission_headroom(&vm, 64 * 1024));
+    }
+
+    #[test]
+    fn a_session_out_of_room_refuses_before_allocating() {
+        let mut vm = Vm::default();
+        vm.set_heap_headroom(nearly_empty);
+        assert!(!has_submission_headroom(&vm, 1024));
+    }
+
+    #[test]
+    fn a_submission_that_fits_within_the_guard_band_is_attempted() {
+        let mut vm = Vm::default();
+        vm.set_heap_headroom(exactly_enough);
+        assert!(has_submission_headroom(&vm, 1024));
+        assert!(!has_submission_headroom(&vm, 1025));
+    }
+
+    #[test]
+    fn a_pathological_delta_length_cannot_wrap_the_check_into_admitting_it() {
+        let mut vm = Vm::default();
+        vm.set_heap_headroom(exactly_enough);
+        assert!(!has_submission_headroom(&vm, usize::MAX));
+    }
 }
 
 #[cfg(test)]

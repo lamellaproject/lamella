@@ -1,9 +1,8 @@
-# INSTANCE map: where each ESP32-C6 block copy sits. Every
-# base transcribed from the retired v0 uart-esp32c6.toml (silicon-verified through the demo
-# + serve paths). The C6 has no RESETS-style bit table: module reset rides each slot's PCR
+# INSTANCE map: where each ESP32-C6 block copy sits.
+# The C6 has no RESETS-style bit table: module reset rides each slot's PCR
 # register, so the record is bases only. The GPIO matrix (0x60091000) joins when a binding
-# first routes a non-native pin. uart1 ("register-identical at its own base" per the
-# retired header) joins with its first binding, verified against the TRM with it open.
+# first routes a non-native pin. uart1 (register-identical at its own base) joins with its
+# first binding, verified against the TRM with it open.
 
 [table]
 kind = "instances"
@@ -11,17 +10,17 @@ family = "esp32c6"
 record = ["base"]
 sources = ["espressif/svd esp32c6.svd (bases)", "ESP32-C6 TRM ch 5 (system address map)"]
 
-
+[[instances]]
 name = "uart0"
 block = "uart"
 base = 0x60000000
 
-
+[[instances]]
 name = "pcr"
 block = "pcr"
 base = 0x60096000
 
-
+[[instances]]
 name = "io_mux"
 block = "io-mux"
 base = 0x60090000

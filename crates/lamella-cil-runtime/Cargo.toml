@@ -61,8 +61,18 @@ code-in-place = ["flash-image"]
 flash-image = []
 # String storage encoding (a developer knob; .NET UTF-16 String semantics hold either way).
 # Default (feature off) = UTF-16 (O(1) indexing). On = UTF-8 (~half the ASCII-text memory,
-# O(n) UTF-16 indexing; the well-formed tier -- WTF-8 surrogate parity is a future feature).
+# O(n) UTF-16 indexing). The WELL-FORMED tier: a lone surrogate cannot be represented, so it is
+# the one place a String is not preserved byte-for-byte -- see string-utf8-wtf8 for the tier that
+# keeps it. Its guarantee in exchange: the backing bytes are ALWAYS valid UTF-8, so they can be
+# handed to a UTF-8-native consumer (a socket write, an LPUTF8Str marshal) with no validation pass.
 string-utf8 = []
+# WTF-8 storage: UTF-8's size with UTF-16's surrogate parity. A lone surrogate is stored as its own
+# 3-byte code point, so every String round-trips; a well-formed surrogate PAIR still combines to one
+# 4-byte supplementary code point (WTF-8, not CESU-8). Byte-identical to UTF-8 for any well-formed
+# string, so egress is a copy in the normal case -- but the bytes are NOT guaranteed valid UTF-8, so
+# a UTF-8-native consumer needs the check `string-utf8` makes unnecessary. Wins when both are set,
+# matching lamella-aot's convention so the interpreter previews the tier an AOT build would use.
+string-utf8-wtf8 = []
 # Typed references (System.TypedReference): the mkrefany / refanyval / refanytype opcodes
 # (__makeref / __refvalue / __reftype) and the Value::TypedRef they pass. Off (the default,
 # the tiny-target floor) => those three opcodes trap cleanly; they are vanishingly rare in

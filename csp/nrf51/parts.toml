@@ -1,0 +1,15 @@
+# PARTS table for the nRF51 family. The pin
+# present-list is EMPTY (identity-first; no binding references a pin yet) and grows from
+# evidence as bindings land.
+
+[table]
+kind = "parts"
+family = "nrf51"
+
+[[parts]]
+part = "nrf51822"
+package = "QFN"
+flash = 0x40000
+ram = 0x4000
+pins = ["P0.00", "P0.04-P0.15", "P0.30"]
+source = "nRF51822 PS v3.4 (256 KB flash / 16 KB RAM; GPIO is one port of up to 32 I/Os depending on package, section 3.7). Partial pin list, grown as bindings demand: P0.04-P0.15 are the display matrix, and P0.00 + P0.30 are the two-wire bus -- both confirmed as general-purpose I/O on the QFN pin assignment table (pins 4 and 3)."

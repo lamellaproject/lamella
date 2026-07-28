@@ -426,6 +426,29 @@ pub enum Inst {
         /// `[object_typedesc, target_typedesc]` -- the scan's start descriptor and the sought ancestor.
         args: Vec<ValueId>,
     },
+    /// An INTERFACE type test: scans `descriptor`'s itable for `tag`, one of the interface's method
+    /// tags. The result is 1 if the entry is present (the object's type implements the interface) or 0
+    /// if it is not, which is what a `castclass`/`isinst` to an interface needs.
+    ///
+    /// A SEPARATE instruction from [`Inst::CastClassScan`] because implementing an interface is not
+    /// being a subtype: the `base_ptr@12` chain that scan walks carries CLASSES only, so a cast to an
+    /// interface can never be answered by it -- and the alternative, comparing the descriptor against
+    /// every in-program implementer, makes the emitted code grow with the implementer count and
+    /// overflows a literal-pool reach on a broad interface. The itable is already emitted, already keyed
+    /// by a name-derived tag, and O(1) in code size.
+    ///
+    /// ONE TAG IS ENOUGH, and that is what makes this cheap: a type's itable carries an entry for every
+    /// interface method it implements, so any single method of the interface answers for the whole
+    /// interface. A MARKER interface (no methods) has no tag to test and the front end must decline
+    /// rather than emit this.
+    InterfaceHasTag {
+        /// The object's TypeDesc address (from [`Inst::LoadTypeDesc`]; 0 for a null reference, which
+        /// answers 0).
+        descriptor: ValueId,
+        /// The sought interface-method tag, derived from the interface's name and one of its methods --
+        /// the same derivation [`Inst::CallInterface`] uses, so the two agree by construction.
+        tag: u32,
+    },
     /// A dynamic-object operation from Python's abstract object protocol -- the `op`-selected
     /// operation over `args` (receiver-first). Lowers to a call into the Python runtime-support
     /// library at a backend-threaded entry point (the [`Inst::Alloc`]/`lamella_gc_alloc` pattern),
@@ -634,6 +657,28 @@ pub enum Inst {
         /// The payload size in bytes of the new object (a delegate is 12; matches `proto`'s size).
         payload_size: u32,
     },
+    /// Allocates a garbage-collected object of `payload_size` bytes carrying `descriptor` -- the
+    /// allocator's own ABI, `lamella_gc_alloc(size, desc)`, with BOTH operands run-time values. The
+    /// result is an `ObjectRef` to the payload (the header word sits at `obj - 4`).
+    ///
+    /// Every other allocation form fixes the type at BUILD time: [`Inst::Alloc`] and
+    /// [`Inst::AllocArray`] take a handle, and [`Inst::AllocLike`] takes a run-time descriptor but a
+    /// build-time size. This one fixes neither, which is what an untyped body needs: `Array.GetValue`
+    /// must BOX an element of a type it learns only by reading the array's descriptor
+    /// (`element_desc@16`) and the size only by reading THAT descriptor's payload word. A boxed value's
+    /// identity is its descriptor address, so an `unbox.any`/`castclass` on the result compares equal
+    /// to the element type exactly as a build-time `box` of it would.
+    ///
+    /// A SAFEPOINT, like every allocation. Its operands are deliberately NOT collector roots: a
+    /// descriptor address names a static, and a size is an integer, so neither can move across the
+    /// call -- unlike [`Inst::AllocLike`]'s prototype, which is a live object.
+    AllocDescribed {
+        /// The address of the TypeDesc the new object carries (a run-time value: read from another
+        /// descriptor, or from an object's header).
+        descriptor: ValueId,
+        /// The payload size in bytes (a run-time value: the descriptor's own payload word).
+        payload_size: ValueId,
+    },
     /// Loads the TypeDesc pointer of a heap object -- the word the allocator wrote in the header
     /// just before the payload (`object - 4` per the GC ABI). The runtime type identity of a boxed
     /// value / reference, compared against [`Inst::TypeDescAddr`] for an `unbox.any`/`castclass`
@@ -655,7 +700,10 @@ pub enum Inst {
     /// descriptor (box / type-identity compare by address), and a program can reference a descriptor that
     /// another assembly defines. The `words` are the GC ABI header + trace map: `[payload_size, nrefs,
     /// type_tag, base_ptr, ref_offsets...]` (`base_ptr` is a `0` placeholder until the base chain is
-    /// threaded in). The `vtable` is laid as TypeDesc-relative slots BEFORE the descriptor, so `callvirt`
+    /// threaded in). An ARRAY descriptor keeps that four-word header under the array spelling --
+    /// `[MARK | rank, element_kind, type_tag, base_ptr]` -- and takes `element_desc` at offset 16,
+    /// where a class takes its first ref offset: word 1 is the element KIND, not a reference count,
+    /// so an array carries no ref-offset table and the slot is free for arrays only. The `vtable` is laid as TypeDesc-relative slots BEFORE the descriptor, so `callvirt`
     /// dispatches through it on the linked device path. Result is the descriptor's address (an `i32`).
     TypeDescLiteral {
         /// The type handle -- the descriptor's identity, deduplicated to one symbol per type per object.
@@ -667,18 +715,49 @@ pub enum Inst {
         /// `method_entry - desc`), so dispatch reads `desc + slot + 1`. Empty when the type has no
         /// virtual methods.
         vtable: Box<[u32]>,
+        /// For an ARRAY descriptor, the ELEMENT type's handle -- the canonical descriptor the
+        /// backend binds `element_desc@16` to, as a `R_LAMELLA_REL_DESC` holding
+        /// `element_words - desc` (the same encoding, and the same "add it to this descriptor's
+        /// address" rule, as `base_ptr@12`). `None` for a class descriptor, and for an array whose
+        /// element names no descriptor -- the word is then laid `0`, meaning ABSENT.
+        element: Option<u32>,
     },
     /// Allocates a garbage-collected array of `length` elements of `element_size` bytes -- the
     /// CLI's `newarr`. The payload is `[u32 length][elements...]`; the result is an `ObjectRef`
     /// to it. Lowers to `lamella_gc_alloc(4 + length*element_size, &TypeDesc)` (a safepoint) and
     /// stores the length at offset 0. `ldlen` reads that length word (a `FieldLoad` at offset 0).
     AllocArray {
-        /// The array type's identity, for the emitted TypeDesc.
+        /// The array type's identity, for the emitted TypeDesc -- its OWN, distinct from the
+        /// element's (see [`array_handle`](crate::array_handle)), so that `T[]` and a boxed `T`
+        /// cannot share one descriptor.
         handle: TypeHandle,
+        /// The ELEMENT type's identity: which descriptor the array descriptor's `element_desc@16`
+        /// word names. `None` where the element HAS no descriptor to name -- a synthesized array's
+        /// primitive elements, or an element the metadata reader cannot resolve to a type -- and
+        /// the word is laid `0`, the absent value a consumer must refuse rather than stride by.
+        ///
+        /// It rides beside `element_kind` because the two answer different questions: the kind is
+        /// a STRIDE (how wide is one element), the descriptor is an IDENTITY (which type is it).
+        /// Four kinds name two types each, so identity cannot be recovered from the kind -- which
+        /// is why `Array::GetValue` cannot know what to box, and why a collector cannot size a
+        /// struct element, from the kind alone.
+        element: Option<TypeHandle>,
         /// The number of elements.
         length: ValueId,
         /// The size in bytes of one element.
         element_size: u32,
+        /// What one element IS, for the emitted array descriptor's element-kind word: a frozen
+        /// primitive code (`I1=1 U1=2 I2=3 U2=4 I4=5 I8=6 F4=7 F8=8`, whose byte width the code alone
+        /// derives), `0` for a REFERENCE element the collector traces, or `0xFF` for an element this
+        /// scheme deliberately cannot describe -- a struct, whose per-element reference offsets one
+        /// word cannot express, so the honest answer is "do not scan" rather than a wrong one.
+        ///
+        /// It rides here rather than being derived from `element_size` because size does not
+        /// determine kind: a 4-byte element is `int`, `float`, or a reference, and a collector must
+        /// tell them apart. An array's trace comes from this plus the `length` at the object's
+        /// offset 0 -- a ref-offset TABLE cannot describe an array, since it would have to be
+        /// length-dependent. The front end supplies it; the backend has no metadata access.
+        element_kind: u32,
     },
     /// Loads element `index` of `array` -- the CLI's `ldelem`. The result is the element at
     /// `array + 4 + index*element_size` (the 4-byte length prefix is skipped). A sub-word element

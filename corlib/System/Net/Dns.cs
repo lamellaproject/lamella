@@ -14,7 +14,7 @@ namespace System.Net
         {
             if ((object)hostNameOrAddress == null) throw new ArgumentNullException("hostNameOrAddress");
             IPAddress literal;
-            if (IPAddress.TryParse(hostNameOrAddress, out literal))
+            if (IPAddress.TryParseInternal(hostNameOrAddress, out literal))
             {
                 IPAddress[] single = new IPAddress[1];
                 single[0] = literal;

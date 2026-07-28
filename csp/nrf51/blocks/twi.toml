@@ -1,0 +1,423 @@
+# BLOCK layout: the nRF51 TWI, the polled two-wire master. This part instantiates ONE TWI
+# design -- there is no EasyDMA variant here to choose against, so the block is simply the
+# master this chip has: register-per-byte (TXD/RXD) plus TASKS/EVENTS, which is exactly the
+# polled shape a table-driven driver wants.
+#
+# Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
+# chapter 28, Tables 258/259/260/261/262/265/266/267/268/269/270/271/272, with the document
+# open. PROVENANCE NOTE, the same one the gpio block carries: Nordic's own download for this
+# manual was returning errors, so the copy read was a third-party mirror of the same manual,
+# accepted only after checking that the document SELF-IDENTIFIES on its title page as the
+# Nordic "nRF51 Series Reference Manual, Version 3.0". Nordic currently publishes v3.0.1; if a
+# register fact here is ever disputed, re-read that revision before trusting this file.
+#
+# EVERY OFFSET AND FIELD BELOW WAS READ FROM THIS PART'S OWN MANUAL. Other Nordic parts
+# document a TWI of the same name whose details differ, and four of the differences are noted
+# at their registers below. FREQUENCY K100 = 0x01980000 is the same word across them, which is
+# evidence the legacy design is shared -- but only evidence, and the differences below are what
+# assuming the rest would have cost.
+#
+# The interrupt registers INTEN, INTENSET and INTENCLR necessarily share one bit layout, so
+# each was read separately and the three required to agree before any of them was believed.
+# The error-source and enable widths were settled the same way, against their own tables.
+
+[table]
+kind = "block"
+family = "nrf51"
+block = "twi"
+sources = [
+    "nRF51 Series Reference Manual v3.0 (Nordic Semiconductor), ch. 28 TWI: Table 258 GPIO configuration, Table 259 instances (TWI0 0x40003000, TWI1 0x40004000), Table 260 register overview, Table 261 SHORTS, Tables 262-264 INTEN/INTENSET/INTENCLR, Table 265 ERRORSRC, Table 266 ENABLE, Tables 267/268 PSELSCL/PSELSDA, Tables 269/270 RXD/TXD, Table 271 FREQUENCY, Table 272 ADDRESS, plus 28.2 pin configuration, 28.3 shared resources, 28.4/28.5/28.6 the master write/read/repeated-start sequences",
+]
+notes = [
+    "Config envelope: FREQUENCY is enumerated -- 100 kbps (0x01980000), 250 kbps (0x04000000), 400 kbps (0x06680000) and nothing else. Section 28.1 describes the master as compatible with 100 kHz and 400 kHz operation, so 250 kbps is reachable in the register while sitting outside the two rates the functional description names.",
+    "FREQUENCY resets to K250 (Table 271 reset row = 0x04000000), NOT to the slowest rate. A driver that omits the FREQUENCY write inherits 250 kbps rather than a safe default, which is why the bring-up writes it unconditionally.",
+    "PSELSCL/PSELSDA carry a PLAIN 32-BIT PIN NUMBER (Tables 267/268 span bits 31:0), with 0xFFFFFFFF meaning disconnected. This part has ONE GPIO port, so there is no port field and no separate connect bit to compose -- the routing value IS the pin index.",
+    "PSELSCL/PSELSDA are used only while the master is enabled and retained only in ON mode, and must be configured ONLY while the TWI is disabled (28.2): route pins first, ENABLE last.",
+    "Table 258 GPIO configuration for both TWI pins: direction Input, drive strength S0D1 -- standard drive low, disconnect high, which is the open-drain shape the bus needs. S0D1 is DRIVE value 6 on this part (gpio block Table 83), so the PIN_CNF word is 0x600: DIR Input, INPUT buffer connected so the master can read SDA and sense clock stretching, PULL disabled because a TWI bus is pulled up externally.",
+    "Shared resources (28.3): the TWI shares registers with every peripheral holding the same ID, and ID is fixed by the base address (10.1.1 -- ID = (base - 0x40000000) >> 12). TWI0 at 0x40003000 is ID 3, shared with SPI0 alone; TWI1 at 0x40004000 is ID 4, shared with SPI1 and SPIS1. Disabling a sibling does NOT reset the shared registers, so a bring-up must write every relevant TWI register explicitly rather than trusting reset values. Because the siblings share one ENABLE register, writing ENABLE = Disabled at the TWI base IS the disable-the-siblings step.",
+    "The transmitter and receiver are single buffered, and the master stretches SCL while it waits for the CPU -- on a write until TXD is written, on a read until RXD is read (28.4/28.5). A polled driver can therefore be arbitrarily slow without losing bytes.",
+    "Master read (28.5): the master delays the ACK/NACK bit by stretching the clock until the CPU extracts the byte, so the STOP task MUST be triggered BEFORE the last byte is read out of RXD -- that is what makes the master NACK it before the stop condition. The SHORTS register is how a polled driver arms that in advance: BB fires before each byte, so BB_STOP arms the ending one byte ahead, and BB_SUSPEND parks the master at earlier boundaries so the CPU can extract RXD and RESUME.",
+    "Repeated start (28.6, the sensor sub-address pattern): trigger a second start task instead of STOP -- and after a READ phase the same before-the-last-extraction rule applies to that start task. Only one shortcut to STOP can be enabled at any given time.",
+    "A NACK raises EVENTS_ERROR with the cause latched in ERRORSRC: ANACK for the address phase, DNACK for a data byte, both write-1-to-clear. That is the driver-status AddressNack/DataNack mapping.",
+    "7-bit addressing (ADDRESS bits 6:0); the I2C specification reserves 0x00-0x07 and 0x78-0x7F.",
+    "INTEN 0x300 and INTENSET 0x304 exist alongside INTENCLR and carry the identical bit layout (Tables 262-264, all three read to the same positions). Only INTENCLR is stated here, because a polled driver's only interrupt business is turning them all off.",
+]
+
+[registers.TASKS_STARTRX]
+offset = 0x000
+width = 32
+fields = { TASKS_STARTRX = [0, 1] }
+notes = "Write 1: START (or repeated START) + address + R, then clock bytes in."
+
+[registers.TASKS_STARTTX]
+offset = 0x008
+width = 32
+fields = { TASKS_STARTTX = [0, 1] }
+notes = "Write 1: START (or repeated START) + address + W."
+
+[registers.TASKS_STOP]
+offset = 0x014
+width = 32
+fields = { TASKS_STOP = [0, 1] }
+notes = "Write 1: generate the STOP condition. On a read this must happen before the last RXD extraction (28.5)."
+
+[registers.TASKS_SUSPEND]
+offset = 0x01C
+width = 32
+fields = { TASKS_SUSPEND = [0, 1] }
+notes = "Park the master at a byte boundary. Reached through the BB_SUSPEND shortcut rather than written directly."
+
+[registers.TASKS_RESUME]
+offset = 0x020
+width = 32
+fields = { TASKS_RESUME = [0, 1] }
+notes = "Write 1: leave the suspended state -- the multi-byte read's per-byte go signal."
+
+[registers.EVENTS_STOPPED]
+offset = 0x104
+width = 32
+fields = { EVENTS_STOPPED = [0, 1] }
+notes = "1 = STOP reached the bus. Write 0 to clear before, poll after."
+
+[registers.EVENTS_RXDREADY]
+offset = 0x108
+width = 32
+fields = { EVENTS_RXDREADY = [0, 1] }
+notes = "1 = a received byte sits in RXD."
+
+[registers.EVENTS_TXDSENT]
+offset = 0x11C
+width = 32
+fields = { EVENTS_TXDSENT = [0, 1] }
+notes = "1 = the TXD byte went out and its ACK/NACK came back."
+
+[registers.EVENTS_ERROR]
+offset = 0x124
+width = 32
+fields = { EVENTS_ERROR = [0, 1] }
+notes = "1 = NACK or overrun -- the cause is in ERRORSRC."
+
+# DIFFERENCE 1 of 4 from the sibling family: there is NO SUSPENDED EVENT REGISTER on this part.
+# Figure 62 draws SUSPENDED as an output signal of the block and Figure 65 shows it on the
+# lifeline, but Table 260's register overview gives it no address and Tables 262-264 give it no
+# interrupt bit -- so it is not addressable here. Nothing is lost: SUSPEND is a task and the
+# BB_SUSPEND shortcut needs no event, so the read protocol below is unaffected. It is recorded
+# because an assumed layout would have placed a register where this part has none.
+[registers.EVENTS_BB]
+offset = 0x138
+width = 32
+fields = { EVENTS_BB = [0, 1] }
+notes = "Byte boundary, generated before each byte that is sent or received (Table 260) -- the SHORTS anchor. Never polled directly; its whole use is to fire a shortcut one byte ahead of the ending."
+
+[registers.SHORTS]
+offset = 0x200
+width = 32
+fields = { BB_SUSPEND = [0, 1], BB_STOP = [1, 1] }
+notes = "Hardware event->task wiring (Table 261): BB->SUSPEND parks before each byte (the multi-byte read), BB->STOP makes the next byte the last, so the master NACKs it and stops by hardware. Only one shortcut to STOP at a time (28.6)."
+
+[registers.INTENCLR]
+offset = 0x308
+width = 32
+fields = { STOPPED = [1, 1], RXDREADY = [2, 1], TXDSENT = [7, 1], ERROR = [9, 1], BB = [14, 1] }
+notes = "Write 1 to a bit to disable that interrupt. Polled driver: all interrupts stay off, cleared explicitly at bring-up because the shared-ID rule (28.3) means reset values cannot be assumed. Positions come from Table 264 and are cross-checked against Tables 262 and 263, which state the same layout. This part has no SUSPENDED bit -- see EVENTS_BB above."
+
+[registers.ERRORSRC]
+offset = 0x4C4
+width = 32
+fields = { OVERRUN = [0, 1], ANACK = [1, 1], DNACK = [2, 1] }
+notes = "Write 1 to clear each (Table 265). OVERRUN = a start condition arrived while previous data still lay in RXD, so that data is lost; ANACK = NACK received after sending the address, the scanner's absent-device answer; DNACK = NACK received after sending a data byte."
+
+# DIFFERENCE 2 of 4: ENABLE is a THREE-bit field here (Table 266 marks bits 2:0), where the
+# sibling family's is four. The enabled value 5 is identical and fits either width, so this
+# costs nothing today -- it is stated as read rather than as assumed.
+[registers.ENABLE]
+offset = 0x500
+width = 32
+fields = { ENABLE = [0, 3] }
+notes = "0 = disabled, 5 = TWI enabled (Table 266). One register shared with the same-ID siblings, so this value is what selects the TWI personality -- and writing 0 here is what disables them."
+
+# DIFFERENCE 3 of 4: PSELSCL/PSELSDA are a plain 32-bit pin number, not a composed
+# pin/port/connect word, and they are spelled without a separator in this manual. One GPIO port
+# means there is no port bit to place and no connect bit to clear.
+[registers.PSELSCL]
+offset = 0x508
+width = 32
+fields = { PSELSCL = [0, 32] }
+notes = "Pin number for the SCL signal (Table 267, bits 31:0). Reset 0xFFFFFFFF = disconnected. Configure only while the TWI is disabled (28.2)."
+
+[registers.PSELSDA]
+offset = 0x50C
+width = 32
+fields = { PSELSDA = [0, 32] }
+notes = "Pin number for the SDA signal (Table 268). Reset 0xFFFFFFFF = disconnected."
+
+[registers.RXD]
+offset = 0x518
+width = 32
+fields = { RXD = [0, 8] }
+notes = "The received byte. Extracting it releases the stretched clock and lets the ACK/NACK go out, which is why the ending must be armed before this read (28.5)."
+
+[registers.TXD]
+offset = 0x51C
+width = 32
+fields = { TXD = [0, 8] }
+notes = "The next byte to transmit. Single buffered: write the next only after TXDSENT."
+
+# DIFFERENCE 4 of 4: this register RESETS TO K250 (Table 271's reset row is 0x04000000), so an
+# unwritten FREQUENCY leaves the master at 250 kbps rather than at the slowest rate.
+[registers.FREQUENCY]
+offset = 0x524
+width = 32
+fields = { FREQUENCY = [0, 32] }
+notes = "Enumerated (Table 271): K100 = 0x01980000, K250 = 0x04000000, K400 = 0x06680000. Nothing in between; the master times itself from the high-frequency clock and no divisor derives from a plan rate."
+
+[registers.ADDRESS]
+offset = 0x588
+width = 32
+fields = { ADDRESS = [0, 7] }
+notes = "The 7-bit slave address used by every subsequent STARTRX/STARTTX (Table 272)."
+
+[constants]
+PIN_CNF_TWI = 0x600
+FREQUENCY_K100 = 0x01980000
+FREQUENCY_K250 = 0x04000000
+FREQUENCY_K400 = 0x06680000
+ENABLE_TWI = 5
+ENABLE_DISABLED = 0
+ERRORSRC_ALL_W1C = 0x7
+
+[parameters]
+addr = "The 7-bit slave address (0x08..0x77 usable)."
+txd_byte = "The next byte to transmit (sub-address or data)."
+
+# Master write of N bytes (28.4): STARTTX, then per byte TXD + TXDSENT, then STOP + STOPPED.
+# EVENTS_ERROR in place of any awaited event means a NACK -- the error_recover epilogue.
+
+[[sequences.write]]
+op = "write"
+reg = "ADDRESS"
+value = "$addr"
+
+[[sequences.write]]
+op = "write"
+reg = "EVENTS_TXDSENT"
+value = 0x0
+
+[[sequences.write]]
+op = "write"
+reg = "EVENTS_ERROR"
+value = 0x0
+
+[[sequences.write]]
+op = "write"
+reg = "EVENTS_STOPPED"
+value = 0x0
+
+[[sequences.write]]
+op = "write"
+reg = "SHORTS"
+value = 0x0
+note = "no shortcuts on a pure write"
+
+[[sequences.write]]
+op = "write"
+reg = "TASKS_STARTTX"
+value = 0x1
+note = "START + address + W go out; the master stretches SCL until TXD is written"
+
+[[sequences.write]]
+op = "write"
+reg = "TXD"
+value = "$txd_byte"
+note = "PER BYTE: write TXD, then poll EVENTS_TXDSENT and clear it before the next byte; EVENTS_ERROR instead = ANACK/DNACK"
+
+[[sequences.write]]
+op = "poll"
+reg = "EVENTS_TXDSENT"
+mask = 0x1
+note = "byte clocked out + ACK returned; write 0 to re-arm, repeat TXD for each remaining byte"
+
+[[sequences.write]]
+op = "write"
+reg = "TASKS_STOP"
+value = 0x1
+note = "after the last TXDSENT"
+
+[[sequences.write]]
+op = "poll"
+reg = "EVENTS_STOPPED"
+mask = 0x1
+
+[[sequences.write]]
+op = "write"
+reg = "EVENTS_STOPPED"
+value = 0x0
+
+# Master read of N bytes (28.5). The ending is pre-armed because extracting RXD is what
+# releases the ACK/NACK: BB_STOP while ONE byte remains, BB_SUSPEND at every earlier boundary.
+
+[[sequences.read]]
+op = "write"
+reg = "ADDRESS"
+value = "$addr"
+
+[[sequences.read]]
+op = "write"
+reg = "EVENTS_RXDREADY"
+value = 0x0
+
+[[sequences.read]]
+op = "write"
+reg = "EVENTS_ERROR"
+value = 0x0
+
+[[sequences.read]]
+op = "write"
+reg = "EVENTS_STOPPED"
+value = 0x0
+
+[[sequences.read]]
+op = "write"
+reg = "SHORTS"
+value = 0x2
+note = "N == 1: BB_STOP from the start, so the single byte is NACKed. N > 1: 0x1 BB_SUSPEND instead"
+
+[[sequences.read]]
+op = "write"
+reg = "TASKS_STARTRX"
+value = 0x1
+
+[[sequences.read]]
+op = "poll"
+reg = "EVENTS_RXDREADY"
+mask = 0x1
+note = "PER BYTE: EVENTS_ERROR instead = ANACK; clear RXDRDY, read RXD once; with bytes remaining, re-arm SHORTS to 0x2 once ONE remains, then TASKS_RESUME = 1"
+
+[[sequences.read]]
+op = "write"
+reg = "EVENTS_RXDREADY"
+value = 0x0
+
+[[sequences.read]]
+op = "read"
+reg = "RXD"
+mask = 0xFF
+note = "exactly one read per RXDRDY; this read releases the stretched clock, so the ending must already be armed"
+
+[[sequences.read]]
+op = "poll"
+reg = "EVENTS_STOPPED"
+mask = 0x1
+note = "after the last byte (BB_STOP already fired the STOP task)"
+
+[[sequences.read]]
+op = "write"
+reg = "EVENTS_STOPPED"
+value = 0x0
+
+# Repeated start, the sensor sub-address pattern (28.6): write the sub-address, then trigger
+# STARTRX with the read's shorts already armed -- no STOP between the phases.
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "ADDRESS"
+value = "$addr"
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "EVENTS_TXDSENT"
+value = 0x0
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "EVENTS_RXDREADY"
+value = 0x0
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "EVENTS_ERROR"
+value = 0x0
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "EVENTS_STOPPED"
+value = 0x0
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "SHORTS"
+value = 0x0
+note = "the write phase runs shortcut-free"
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "TASKS_STARTTX"
+value = 0x1
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "TXD"
+value = "$txd_byte"
+note = "the sub-address; any auto-increment convention is the SLAVE's, not this block's"
+
+[[sequences.write_then_read]]
+op = "poll"
+reg = "EVENTS_TXDSENT"
+mask = 0x1
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "EVENTS_TXDSENT"
+value = 0x0
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "SHORTS"
+value = 0x2
+note = "arm the read's last-byte rule BEFORE the repeated start: 0x2 for a single byte, 0x1 then the read loop's re-arm for more"
+
+[[sequences.write_then_read]]
+op = "write"
+reg = "TASKS_STARTRX"
+value = 0x1
+note = "the second start task in place of a STOP -- the write phase never sees one"
+
+[[sequences.write_then_read]]
+op = "poll"
+reg = "EVENTS_RXDREADY"
+mask = 0x1
+note = "then the read sequence's per-byte loop verbatim"
+
+# Error epilogue, shared by every sequence: on EVENTS_ERROR in place of the awaited event --
+
+[[sequences.error_recover]]
+op = "write"
+reg = "EVENTS_ERROR"
+value = 0x0
+
+[[sequences.error_recover]]
+op = "read"
+reg = "ERRORSRC"
+note = "OVERRUN bit 0 / ANACK bit 1 / DNACK bit 2"
+
+[[sequences.error_recover]]
+op = "write"
+reg = "ERRORSRC"
+value = 0x7
+note = "write-1-to-clear"
+
+[[sequences.error_recover]]
+op = "write"
+reg = "TASKS_STOP"
+value = 0x1
+note = "release the bus"
+
+[[sequences.error_recover]]
+op = "poll"
+reg = "EVENTS_STOPPED"
+mask = 0x1
+
+[[sequences.error_recover]]
+op = "write"
+reg = "EVENTS_STOPPED"
+value = 0x0

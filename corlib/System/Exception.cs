@@ -14,7 +14,18 @@ namespace System
             _innerException = innerException;
         }
 
-        public virtual string Message { get { return _message; } }
+        [Lamella.Runtime.RuntimeProvided] private string RuntimeMessage() { return null; }
+
+        public virtual string Message
+        {
+            get
+            {
+                string raised = RuntimeMessage();
+                if (raised != null) { return raised; }
+                return _message;
+            }
+        }
+
         public Exception InnerException { get { return _innerException; } }
     }
 }

@@ -5,6 +5,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use lamella_binder::{BoundStmt, BoundStmtKind, SpecialType, TypeSymbol};
+use lamella_syntax::span::Span;
 
 /// Where a named variable lives in a method frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,19 @@ pub struct Frame {
     /// temporary (e.g. spilling a value-type rvalue receiver) can be reserved during
     /// expression emission, which holds the frame only by shared reference.
     local_types: RefCell<Vec<TypeSymbol>>,
+    /// The source name of each local slot, parallel to `local_types` (empty for a compiler
+    /// temporary). The debug local-variable table reads this. Keeping it per-slot rather than
+    /// inverting the by-name `slots` map lets shadowed same-named locals -- two `catch (E e)`
+    /// clauses, or a name reused across sibling blocks -- each carry their own name in their
+    /// own slot instead of only the last-declared one being recorded.
+    local_names: RefCell<Vec<Box<str>>>,
+    /// The local slot reserved for each named declaration, keyed by its declaring span and name
+    /// (a `Local` declarator, a `catch` variable, a `foreach`/`fixed` variable). Same-named locals
+    /// in disjoint scopes each get a distinct slot here even though the by-name `slots` map keeps
+    /// only the last-declared one; emission rebinds the name to its own declaration's slot via
+    /// [`Frame::rebind_decl`] before that declaration's stores and its scope's reads, so a use
+    /// resolves to the right slot instead of a same-named sibling's.
+    decl_slots: BTreeMap<(u32, u32, Box<str>), u16>,
     /// The referent type of each byref (`ref`/`out`) parameter, by name. Such a
     /// parameter's argument slot holds an address: a read derefs it (`ldind`), a write
     /// stores through it (`stind`).
@@ -68,6 +82,19 @@ impl Frame {
         self.slots.get(name).copied()
     }
 
+    /// Points `name` at the local slot reserved for the declaration at `span` (a no-op if none is
+    /// recorded there). Emission calls this at each declaration so a name reused across disjoint
+    /// scopes -- two `catch (E e)`, a local redeclared in a sibling block, two `foreach` variables
+    /// -- resolves to THAT declaration's slot, not a same-named sibling's last-declared one. No
+    /// restore is needed: a use always follows its declaration and precedes any sibling
+    /// redeclaration (C# scoping forbids shadowing an enclosing local and makes sibling scopes
+    /// disjoint), so the binding is correct wherever the name is legally read.
+    pub fn rebind_decl(&mut self, span: Span, name: &str) {
+        if let Some(&slot) = self.decl_slots.get(&(span.start, span.end, Box::from(name))) {
+            self.slots.insert(name.into(), Slot::Local(slot));
+        }
+    }
+
     /// The argument slot and referent type of `name` when it is a byref (`ref`/`out`)
     /// parameter, so a read derefs (`ldind`) and a write stores through it (`stind`).
     #[must_use]
@@ -92,21 +119,28 @@ impl Frame {
     }
 
     /// The local-variable names in slot order, for debug info. (Parallel to
-    /// [`Frame::local_types`].)
+    /// [`Frame::local_types`]; a compiler temporary keeps the empty default.)
     #[must_use]
     pub fn local_names(&self) -> Vec<Box<str>> {
-        let mut names = alloc::vec![Box::<str>::from(""); self.local_types.borrow().len()];
-        for (name, slot) in &self.slots {
-            if let Slot::Local(index) = slot {
-                names[*index as usize] = name.clone();
-            }
-        }
-        names
+        self.local_names.borrow().clone()
     }
 
-    fn declare_local(&mut self, name: &str, ty: &TypeSymbol) {
+    /// Records the source name of a local slot for the debug local-variable table. Each slot is
+    /// named at most once (at its declaration), so shadowed same-named locals each keep their own
+    /// name. A no-op for an out-of-range slot; a temporary that is never named keeps its empty
+    /// default.
+    pub fn name_local(&self, slot: u16, name: &str) {
+        if let Some(entry) = self.local_names.borrow_mut().get_mut(slot as usize) {
+            *entry = name.into();
+        }
+    }
+
+    fn declare_local(&mut self, span: Span, name: &str, ty: &TypeSymbol) {
         let slot = self.reserve_local(ty);
+        self.name_local(slot, name);
         self.slots.insert(name.into(), Slot::Local(slot));
+        self.decl_slots
+            .insert((span.start, span.end, name.into()), slot);
     }
 
     /// Reserves an unnamed local of `ty` (a compiler temporary, such as the value a
@@ -114,9 +148,13 @@ impl Frame {
     /// receiver), returning its slot index. Takes `&self` so emission can reserve a
     /// temporary while holding the frame by shared reference.
     pub fn reserve_local(&self, ty: &TypeSymbol) -> u16 {
-        let mut locals = self.local_types.borrow_mut();
-        let slot = locals.len() as u16;
-        locals.push(ty.clone());
+        let slot = {
+            let mut locals = self.local_types.borrow_mut();
+            let slot = locals.len() as u16;
+            locals.push(ty.clone());
+            slot
+        };
+        self.local_names.borrow_mut().push(Box::from(""));
         slot
     }
 
@@ -138,7 +176,7 @@ impl Frame {
         match &stmt.kind {
             BoundStmtKind::Local { ty, declarators } => {
                 for declarator in declarators {
-                    self.declare_local(&declarator.name, ty);
+                    self.declare_local(stmt.span, &declarator.name, ty);
                 }
             }
             BoundStmtKind::Block(statements) => {
@@ -173,7 +211,7 @@ impl Frame {
                 body,
                 ..
             } => {
-                self.declare_local(name, element_type);
+                self.declare_local(stmt.span, name, element_type);
                 self.collect_locals(body);
             }
             BoundStmtKind::Checked(inner)
@@ -188,7 +226,7 @@ impl Frame {
                 body,
                 ..
             } => {
-                self.declare_local(name, &TypeSymbol::Pointer(Box::new(element.clone())));
+                self.declare_local(stmt.span, name, &TypeSymbol::Pointer(Box::new(element.clone())));
                 self.collect_locals(body);
             }
             BoundStmtKind::Try {
@@ -203,7 +241,7 @@ impl Frame {
                             .exception_type
                             .clone()
                             .unwrap_or(TypeSymbol::Special(SpecialType::Object));
-                        self.declare_local(name, &ty);
+                        self.declare_local(catch.span, name, &ty);
                     }
                     self.collect_locals(&catch.body);
                 }

@@ -59,7 +59,7 @@ namespace System
             return Concat(ObjectText(arg0), ObjectText(arg1), ObjectText(arg2));
         }
 
-        public static string Concat(string[] values)
+        public static string Concat(params string[] values)
         {
             if ((object)values == null) throw new ArgumentNullException("values");
             System.Text.StringBuilder result = new System.Text.StringBuilder();
@@ -71,7 +71,7 @@ namespace System
             return result.ToString();
         }
 
-        public static string Concat(object[] args)
+        public static string Concat(params object[] args)
         {
             if ((object)args == null) throw new ArgumentNullException("args");
             System.Text.StringBuilder result = new System.Text.StringBuilder();
@@ -98,7 +98,7 @@ namespace System
             return Format(format, new object[] { arg0, arg1, arg2 });
         }
 
-        public static string Format(string format, object[] args)
+        public static string Format(string format, params object[] args)
         {
             if ((object)format == null) throw new ArgumentNullException("format");
             if ((object)args == null) throw new ArgumentNullException("args");
@@ -227,11 +227,13 @@ namespace System
         }
         public static bool operator !=(string a, string b) { return !(a == b); }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static bool IsNullOrEmpty(string value)
         {
             if ((object)value == null) return true;
             return value.Length == 0;
         }
+#endif
 
         public int IndexOf(char value)
         {
@@ -320,7 +322,7 @@ namespace System
             return IndexOf(value) >= 0;
         }
 
-        public string[] Split(char[] separator)
+        public string[] Split(params char[] separator)
         {
             return Split(separator, Int32.MaxValue);
         }
@@ -459,7 +461,7 @@ namespace System
             return false;
         }
 
-        public string Trim(char[] trimChars)
+        public string Trim(params char[] trimChars)
         {
             int start = 0;
             int end = this.Length - 1;
@@ -469,7 +471,7 @@ namespace System
             return this.Substring(start, end - start + 1);
         }
 
-        public string TrimStart(char[] trimChars)
+        public string TrimStart(params char[] trimChars)
         {
             int start = 0;
             int n = this.Length;
@@ -477,7 +479,7 @@ namespace System
             return this.Substring(start);
         }
 
-        public string TrimEnd(char[] trimChars)
+        public string TrimEnd(params char[] trimChars)
         {
             int end = this.Length - 1;
             while (end >= 0 && IsTrimmable(this[end], trimChars)) end--;

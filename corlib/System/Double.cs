@@ -1,8 +1,36 @@
 // Lamella managed corlib (from scratch). -- System.Double
+#if LAMELLA_SURFACE_FLOAT
 namespace System
 {
     public struct Double : IComparable, IFormattable
     {
+        public static readonly double MaxValue = BitConverter.Int64BitsToDouble(0x7FEFFFFFFFFFFFFFL);
+        public static readonly double MinValue = BitConverter.Int64BitsToDouble(unchecked((long)0xFFEFFFFFFFFFFFFF));
+        public static readonly double Epsilon = BitConverter.Int64BitsToDouble(0x0000000000000001L);
+        public static readonly double NaN = BitConverter.Int64BitsToDouble(0x7FF8000000000000L);
+        public static readonly double PositiveInfinity = BitConverter.Int64BitsToDouble(0x7FF0000000000000L);
+        public static readonly double NegativeInfinity = BitConverter.Int64BitsToDouble(unchecked((long)0xFFF0000000000000));
+
+        public static bool IsNaN(double d)
+        {
+            return d != d;
+        }
+
+        public static bool IsInfinity(double d)
+        {
+            return d == PositiveInfinity || d == NegativeInfinity;
+        }
+
+        public static bool IsPositiveInfinity(double d)
+        {
+            return d == PositiveInfinity;
+        }
+
+        public static bool IsNegativeInfinity(double d)
+        {
+            return d == NegativeInfinity;
+        }
+
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
@@ -49,6 +77,78 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] internal static string ToFixed(double value, int decimals) { return null; }
 
         [Lamella.Runtime.RuntimeProvided] internal static string ToExponential(double value, int precision, bool upper) { return null; }
+
+        [Lamella.Runtime.RuntimeProvided] private static double ParseValid(string s) { return 0; }
+
+        public static double Parse(string s)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            if (!ParseValidate(s)) throw new FormatException("Input string was not in a correct format.");
+            return ParseValid(s);
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public static bool TryParse(string s, out double result)
+        {
+            result = 0.0;
+            if ((object)s == null || !ParseValidate(s)) return false;
+            result = ParseValid(s);
+            return true;
+        }
+#endif
+
+        private static bool ParseValidate(string s)
+        {
+            int end = s.Length;
+            while (end > 0 && Char.IsWhiteSpace(s[end - 1])) end = end - 1;
+            int i = 0;
+            while (i < end && Char.IsWhiteSpace(s[i])) i = i + 1;
+            if (i >= end) return false;
+
+            string core = s.Substring(i, end - i);
+            if (EqualsIgnoreCase(core, "NaN")) return true;
+            if (EqualsIgnoreCase(core, "Infinity") || EqualsIgnoreCase(core, "+Infinity")
+                || EqualsIgnoreCase(core, "-Infinity")) return true;
+
+            if (s[i] == '+' || s[i] == '-') i = i + 1;
+            bool sawDigit = false;
+            bool sawDot = false;
+            while (i < end)
+            {
+                char c = s[i];
+                if (c >= '0' && c <= '9') { sawDigit = true; i = i + 1; continue; }
+                if (c == '.') { if (sawDot) return false; sawDot = true; i = i + 1; continue; }
+                if (c == 'e' || c == 'E') break;
+                return false;
+            }
+            if (!sawDigit) return false;
+            if (i >= end) return true;
+
+            i = i + 1;
+            if (i < end && (s[i] == '+' || s[i] == '-')) i = i + 1;
+            bool sawExpDigit = false;
+            while (i < end)
+            {
+                char c = s[i];
+                if (c < '0' || c > '9') return false;
+                sawExpDigit = true;
+                i = i + 1;
+            }
+            return sawExpDigit;
+        }
+
+        private static bool EqualsIgnoreCase(string a, string b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int k = 0; k < a.Length; k++)
+            {
+                char ca = a[k]; char cb = b[k];
+                if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+                if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+                if (ca != cb) return false;
+            }
+            return true;
+        }
 
         public string ToString(string format)
         {
@@ -148,3 +248,4 @@ namespace System
         }
     }
 }
+#endif

@@ -1,0 +1,32 @@
+[package]
+name = "lamella-wasm-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Lamella WASM tier's driver bridge (EXPERIMENTAL, preview): a lamella_i2c import world served by the CIL interpreter running the real layer-1 C# driver."
+
+[lints]
+workspace = true
+
+[dependencies]
+lamella-wasm-interp = { path = "../lamella-wasm-interp" }
+lamella-cil-runtime = { path = "../lamella-cil-runtime" }
+lamella-load = { path = "../lamella-load" }
+lamella-metadata = { path = "../lamella-metadata" }
+
+[features]
+# Execute-in-place, forwarded from the loader so a device profile can pick the level here.
+# flash-image: method bodies are borrowed as `&'static [u8]` out of the flash-resident PE
+# instead of being copied into the arena. code-in-place adds: no decoded body is ever
+# resident either. Both make the session's PE bytes `&'static` (see PeBytes) -- on device
+# they are `include_bytes!` statics already, so nothing changes at the call site.
+# Why they exist: copying method bodies into the arena costs RAM the borrowed path does not, and
+# on a part whose SRAM is smaller than the assembly set that can be the difference between
+# booting and not. Size your own set against your own part; the ratio is not a constant.
+flash-image = ["lamella-load/flash-image"]
+code-in-place = ["lamella-load/code-in-place", "flash-image"]
+
+[dev-dependencies]
+lamella-asm-wasm = { path = "../lamella-asm-wasm" }

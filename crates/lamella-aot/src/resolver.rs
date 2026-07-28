@@ -60,7 +60,7 @@ fn reference_handle(ordinal: usize, type_def_token: u32) -> TypeHandle {
 /// `__lamella_statics_<hash>` region use; a program stays unqualified); a REFERENCE-owned handle
 /// (see [`REFERENCE_HANDLE_TABLE`]) takes `references[ordinal]`. Both sides of one type thus emit
 /// the SAME symbol (the program's strong synthesized copy dedupes against the library's weak own
-/// copy, identity-by-address preserved), while two DIFFERENT types can never share one.
+/// copy, identity-by-address preserved), while two DIFFERENT types never share a descriptor symbol.
 #[derive(Default)]
 pub struct DescQualifiers {
     /// The fnv1a32 hash (8 lowercase hex) qualifying THIS build's own descriptors; `None` = the
@@ -68,6 +68,13 @@ pub struct DescQualifiers {
     pub own: Option<String>,
     /// Ordinal-indexed reference hashes, exactly the resolver's reference order.
     pub references: Vec<String>,
+    /// `System.String`'s handle, when this build can name the type -- so a string LITERAL can be laid
+    /// with an object header (`[obj - 4]` = the descriptor) like any other object.
+    ///
+    /// It rides here rather than as another parameter because it is descriptor IDENTITY, which is
+    /// what this struct already carries to every object-emitting path. `None` (a build with no
+    /// resolvable `System.String`) lays literals exactly as before.
+    pub string: Option<u32>,
 }
 
 /// The canonical symbol for `handle`'s descriptor under `qualifiers` (see [`DescQualifiers`]).
@@ -385,14 +392,30 @@ impl<'a> MetadataResolver<'a> {
         let words: Vec<(TypeHandle, Box<[u32]>)> = self
             .assembly
             .type_defs()
-            .filter(|type_def| type_def.is_public() || type_def.is_nested())
             .filter_map(|type_def| {
                 let name = self.assembly.type_token_name(type_def.token())?;
                 let type_tag = exception_tag_for_name(name.namespace, name.name);
-                let layout = self.reference_layout_of(self.assembly, type_def)?;
-                let mut w =
-                    alloc::vec![layout.size, layout.reference_offsets.len() as u32, type_tag, 0];
-                w.extend(layout.reference_offsets.iter().copied());
+                let (size, reference_offsets) = match self.reference_layout_of(self.assembly, type_def) {
+                    Some(layout) => (layout.size, layout.reference_offsets),
+                    None => match primitive_value_size(name.namespace, name.name) {
+                        Some(size) => (size, Vec::new()),
+                        None => {
+                            let layout = self
+                                .assembly
+                                .value_type_layout(type_def.token(), &TargetLayout::ilp32())
+                                .ok()?;
+                            (layout.size, layout.reference_offsets)
+                        }
+                    },
+                };
+                if name.namespace == "System" && name.name == "String" {
+                    return Some((
+                        TypeHandle(type_def.token().0),
+                        string_descriptor_words(type_tag).to_vec().into_boxed_slice(),
+                    ));
+                }
+                let mut w = alloc::vec![size, reference_offsets.len() as u32, type_tag, 0];
+                w.extend(reference_offsets.iter().copied());
                 Some((TypeHandle(type_def.token().0), w.into_boxed_slice()))
             })
             .collect();
@@ -421,9 +444,69 @@ impl<'a> MetadataResolver<'a> {
                     itable,
                     base,
                     words,
+                    exported: self
+                        .assembly
+                        .type_def(handle.0 & 0x00ff_ffff)
+                        .is_some_and(|type_def| type_def.is_public() || type_def.is_nested()),
                 }
             })
             .collect()
+    }
+
+    /// `System.String`'s own [`TypeMeta`] -- the vtable every STRING dispatches through, and the
+    /// identity every type test on one compares against.
+    ///
+    /// Everything that reaches a string through its header -- `s.ToString()`, `o.GetHashCode()`,
+    /// `o.Equals(s)`, `o is string`, `"x" + n` -- resolves against this. The WORDS it is laid with
+    /// are the array form, which is [`string_descriptor_words`]' decision, not this one's.
+    ///
+    /// Answers in both directions the emitter meets, exactly as [`system_array_meta`](Self::system_array_meta)
+    /// does: this-assembly when building corlib, reference-owned in a program.
+    #[must_use]
+    pub fn string_type_meta(&self) -> Option<TypeMeta> {
+        let own = self.assembly.type_defs().find(|type_def| {
+            self.assembly
+                .type_token_name(type_def.token())
+                .is_some_and(|name| name.namespace == "System" && name.name == "String")
+        });
+        if let Some(type_def) = own {
+            let handle = TypeHandle(type_def.token().0);
+            return self
+                .type_descriptors()
+                .into_iter()
+                .find(|meta| meta.handle == handle);
+        }
+        let (ordinal, _, type_def) = self.find_reference_type("System", "String")?;
+        self.reference_type_meta(reference_handle(ordinal, type_def.token().0))
+    }
+
+    /// `System.Array`'s own [`TypeMeta`] -- the vtable EVERY array type dispatches through.
+    ///
+    /// An array type has no metadata row, so it has no meta of its own to find; but every array IS a
+    /// `System.Array`, and a `callvirt` on an array receiver resolves its slot in `System.Array`'s
+    /// numbering ([`virtual_slot`](Self::virtual_slot) asks the DECLARING type). So the slots an array
+    /// descriptor must carry are exactly these, and the two agree because they come from one place.
+    ///
+    /// Answers for both directions the emitter meets: this-assembly (building corlib itself, where
+    /// `System.Array` is a TypeDef) and reference-owned (a program, where the slots are corlib's
+    /// exported symbols reached across the link -- the same shape an inherited vtable slot already
+    /// takes). `None` without a resolvable `System.Array`, which leaves arrays exactly as they were.
+    #[must_use]
+    pub fn system_array_meta(&self) -> Option<TypeMeta> {
+        let own = self.assembly.type_defs().find(|type_def| {
+            self.assembly
+                .type_token_name(type_def.token())
+                .is_some_and(|name| name.namespace == "System" && name.name == "Array")
+        });
+        if let Some(type_def) = own {
+            let handle = TypeHandle(type_def.token().0);
+            return self
+                .type_descriptors()
+                .into_iter()
+                .find(|meta| meta.handle == handle);
+        }
+        let (ordinal, _, type_def) = self.find_reference_type("System", "Array")?;
+        self.reference_type_meta(reference_handle(ordinal, type_def.token().0))
     }
 
     /// The descriptor for a REFERENCED-assembly (corlib) type the program ALLOCATES but does not
@@ -466,7 +549,37 @@ impl<'a> MetadataResolver<'a> {
             vtable,
             itable: self.reference_itable(reference, type_def),
             base,
-            words: None,
+            words: self
+                .reference_layout_of(reference, type_def)
+                .map(|layout| (layout.size, layout.reference_offsets))
+                .or_else(|| {
+                    primitive_value_size(name.namespace, name.name).map(|size| (size, Vec::new()))
+                })
+                .or_else(|| {
+                    reference
+                        .value_type_layout(type_def.token(), &TargetLayout::ilp32())
+                        .ok()
+                        .map(|layout| (layout.size, layout.reference_offsets))
+                })
+                .map(|(size, reference_offsets)| {
+                    if name.namespace == "System" && name.name == "String" {
+                        return string_descriptor_words(exception_tag_for_name(
+                            name.namespace,
+                            name.name,
+                        ))
+                        .to_vec()
+                        .into_boxed_slice();
+                    }
+                    let mut w = alloc::vec![
+                        size,
+                        reference_offsets.len() as u32,
+                        exception_tag_for_name(name.namespace, name.name),
+                        0
+                    ];
+                    w.extend(reference_offsets.iter().copied());
+                    w.into_boxed_slice()
+                }),
+            exported: true,
         })
     }
 
@@ -485,9 +598,11 @@ impl<'a> MetadataResolver<'a> {
     /// implementations come from [`reference_vtable_slots`], which already resolves each interface
     /// method to its MOST-DERIVED override and names it by its stable extern symbol -- so every
     /// entry is an [`VtableEntry::Extern`] the linker resolves against the owning library object,
-    /// the same reloc family an inherited vtable slot rides. Implicit implementations only, exactly
-    /// as [`itables`](Self::itables) scopes them: explicit (MethodImpl) implementations are
-    /// unsupported on both sides.
+    /// the same reloc family an inherited vtable slot rides.
+    ///
+    /// IMPLICIT IMPLEMENTATIONS ONLY: this reads the interface map and not `MethodImpl`, so a
+    /// LIBRARY type implementing an interface member EXPLICITLY gets no entry here and dispatches
+    /// nowhere. A caller across an assembly boundary must not rely on an explicit implementation.
     fn reference_itable(
         &self,
         reference: &'a Assembly<'a>,
@@ -567,6 +682,80 @@ impl<'a> MetadataResolver<'a> {
             .collect()
     }
 
+    /// Every interface token `type_def` answers for, deduplicated: its own `InterfaceImpl` rows, its
+    /// BASES' rows (a derived class inherits them), and the rows of each interface reached (an interface
+    /// may extend others, and implementing IA implements what IA extends).
+    ///
+    /// Bounded against a malformed cyclic base or interface graph rather than trusting the metadata.
+    fn interface_closure(&self, type_def: TypeDef<'a>) -> Vec<Token> {
+        let mut queue: Vec<Token> = type_def.interfaces().collect();
+        let mut base = type_def.extends();
+        for _ in 0..64 {
+            if base.row() == 0 || base.table() != table::TYPE_DEF {
+                break;
+            }
+            let Some(base_def) = self.assembly.type_def(base.row()) else {
+                break;
+            };
+            queue.extend(base_def.interfaces());
+            base = base_def.extends();
+        }
+        let mut closed: Vec<Token> = Vec::new();
+        let mut i = 0;
+        let mut budget = 256;
+        while let Some(&token) = queue.get(i) {
+            i += 1;
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+            if closed.iter().any(|t| t.0 == token.0) {
+                continue;
+            }
+            closed.push(token);
+            if token.table() == table::TYPE_DEF {
+                if let Some(iface) = self.assembly.type_def(token.row()) {
+                    queue.extend(iface.interfaces());
+                }
+            }
+        }
+        closed
+    }
+
+    /// One `MethodImpl` row as an itable entry: `(interface_method_tag, implementation)`, or `None` if
+    /// the row is not interface dispatch or the implementation is not a function of this module.
+    ///
+    /// `MethodImpl` covers BOTH explicit interface implementations and explicit overrides of a base
+    /// CLASS's virtual, and only the first belongs here -- a class virtual is a vtable SLOT, and putting
+    /// it in the itable would key a slot by a tag no `callvirt` derives. So the declaring type must
+    /// actually be an interface, checked in this assembly first and then across the references, and
+    /// anything undecidable is DECLINED rather than guessed.
+    fn explicit_itable_entry(
+        &self,
+        body: Token,
+        declaration: Token,
+    ) -> Option<(u32, VtableEntry)> {
+        let declared = self.assembly.resolve_method(declaration)?;
+        let interface = declared.declaring_type?;
+        let is_interface = match self.assembly.find_type(interface.namespace, interface.name) {
+            Some(td) => td.is_interface(),
+            None => {
+                self.find_reference_type(interface.namespace, interface.name)?
+                    .2
+                    .is_interface()
+            }
+        };
+        if !is_interface {
+            return None;
+        }
+        let signature = declared.signature.as_ref()?;
+        let tag = interface_method_tag(&interface, declared.name?, &signature.parameters);
+        let MethodKind::Definition(rid) = self.assembly.resolve_method(body)?.kind else {
+            return None;
+        };
+        Some((tag, VtableEntry::Func(self.function_index(rid)?)))
+    }
+
     /// The per-type INTERFACE dispatch map: for each this-module type, the `(interface_method_tag,
     /// implementation function index)` pairs for every interface method it implements. The backend emits
     /// these as the type's itable; a `callvirt` on an interface method matches the tag in the receiver's
@@ -580,7 +769,7 @@ impl<'a> MetadataResolver<'a> {
         for type_def in self.assembly.type_defs() {
             let impls = self.vtable_methods(type_def);
             let mut entries: Vec<(u32, VtableEntry)> = Vec::new();
-            for iface_token in type_def.interfaces() {
+            for iface_token in self.interface_closure(type_def) {
                 if iface_token.table() != table::TYPE_DEF {
                     continue;
                 }
@@ -609,6 +798,15 @@ impl<'a> MetadataResolver<'a> {
                             entries.push((tag, VtableEntry::Func(func_index)));
                         }
                     }
+                }
+            }
+            for (body, declaration) in type_def.method_impls() {
+                let Some(entry) = self.explicit_itable_entry(body, declaration) else {
+                    continue;
+                };
+                match entries.iter_mut().find(|(tag, _)| *tag == entry.0) {
+                    Some(slot) => slot.1 = entry.1,
+                    None => entries.push(entry),
                 }
             }
             if !entries.is_empty() {
@@ -800,6 +998,120 @@ pub enum VtableEntry {
     Extern(String),
 }
 
+
+/// Marks a descriptor as describing an ARRAY rather than a class, in the high bits of word 0; the
+/// low bits carry the rank (1 = szarray). No real `payload_size` can collide: payloads are object
+/// byte sizes, far below this.
+pub const ARRAY_DESC_MARK: u32 = 0xA500_0000;
+
+/// Whether this build stores string BYTES (either UTF-8 tier) rather than UTF-16 units -- the one
+/// question the storage encoding asks, answered in ONE place and read by both the blob emission and
+/// the descriptor below.
+///
+/// `cfg!` rather than `#[cfg]` so every backend compiles BOTH arms and only the value changes: a tier
+/// switched on but never compiled is how a declared-and-unread storage feature came about, and how
+/// the UTF-8 tiers came to be honored by one backend out of three.
+pub const STORAGE_IS_BYTES: bool =
+    cfg!(any(feature = "string-utf8", feature = "string-utf8-wtf8"));
+
+/// `System.String`'s descriptor HEADER WORDS -- the ratified ARRAY form, conditioned on the storage
+/// tier.
+///
+/// In the DEFAULT (UTF-16) build a Lamella string's payload is byte-identically a `char[]`:
+/// `[unit_count][UTF-16LE units]`, which is the array layout a collector already knows how to size
+/// and stride. So the descriptor is the array form with the frozen UTF-16-unit element code, and it
+/// is not a new encoding -- it is the ratified one applied to a layout that already matches.
+///
+/// Under `string-utf8` / `string-utf8-wtf8` IT CANNOT BE, and no element width fixes it: the blob is
+/// `[unit_count][byte_len][bytes]`, so the first payload word is a UNIT count while the storage is
+/// BYTES, and there is a second header word besides. The array form would compute
+/// `4 + unit_count * width` and be wrong in both directions. So the kind is `ELEMENT_KIND_OPAQUE`,
+/// which is the format's existing "I cannot stride this" -- the same answer a struct element gives.
+/// A collector must REFUSE to size it rather than guess, because a wrong footprint does not corrupt
+/// one object, it desynchronizes the walk over every object above it.
+///
+/// The DISPATCH half is unaffected by the tier: word 2 and the vtable laid before the words are what
+/// `s.ToString()` and `o is string` read, and those are right in all three tiers.
+#[must_use]
+pub fn string_descriptor_words(type_tag: u32) -> [u32; 5] {
+    let element_kind = if STORAGE_IS_BYTES {
+        ELEMENT_KIND_OPAQUE
+    } else {
+        ELEMENT_KIND_UTF16_UNIT
+    };
+    [ARRAY_DESC_MARK | 1, element_kind, type_tag, 0, 0]
+}
+
+/// The mask selecting [`ARRAY_DESC_MARK`] out of word 0; the remainder is the rank.
+pub const ARRAY_DESC_MARK_MASK: u32 = 0xFF00_0000;
+
+/// Element kind 0 -- the elements are REFERENCES (4-byte pointers a collector traces). Collision-free
+/// by construction rather than by convention: the frozen primitive code space starts at 1.
+pub const ELEMENT_KIND_REFERENCE: u32 = 0;
+
+/// Element kind for a value type that is NOT one of the frozen primitives (a struct element). It
+/// carries no width, so a consumer cannot stride by it -- deliberately: the point is that such an
+/// array is NOT scannable by this scheme. A struct element holding a reference field would need
+/// per-element offsets, which word 1 cannot express, so this code says "do not scan" rather than
+/// inviting a wrong answer. Chosen outside the frozen code space so it can never be mistaken for one.
+pub const ELEMENT_KIND_OPAQUE: u32 = 0xFF;
+
+/// The frozen code for a UTF-16 code unit -- `U2`, the same code `System.Char` and `System.UInt16`
+/// take. Named for the synthesized STRING blob, which is not a `char[]`: it is
+/// `[u32 unit_count][UTF-16LE]`, and its descriptor's whole job is to say the elements are 2-byte
+/// NON-references, so a collector strides past them instead of tracing code units as pointers.
+/// Pinned against [`primitive_element_kind`] by test rather than restated as a literal.
+pub const ELEMENT_KIND_UTF16_UNIT: u32 = 4;
+
+/// The frozen primitive element code for a `System` primitive by name, or `None` if it is not one.
+///
+/// MIRRORS `lamella_cil_runtime::object::PrimKind` (`object.rs:195`), whose codes are FROZEN for the
+/// baked-image format: `I1=1 U1=2 I2=3 U2=4 I4=5 I8=6 F4=7 F8=8`, and whose `byte_width` derives the
+/// element size from the code alone -- which is what lets an untyped `System.Array` body compute a
+/// byte range at run time.
+///
+/// It is mirrored rather than imported because `lamella-aot` does not depend on the interpreter
+/// crate. That makes this a SECOND copy of a shared code space, which is the shape that bites later;
+/// both crates already depend on `lamella-cil`, so that is where the enum belongs. Raised with the
+/// runtime rather than moved unilaterally.
+#[must_use]
+pub fn primitive_element_kind(namespace: &str, name: &str) -> Option<u32> {
+    if namespace != "System" {
+        return None;
+    }
+    Some(match name {
+        "SByte" => 1,
+        "Byte" | "Boolean" => 2,
+        "Int16" => 3,
+        "UInt16" | "Char" => 4,
+        "Int32" | "UInt32" => 5,
+        "Int64" | "UInt64" => 6,
+        "Single" => 7,
+        "Double" => 8,
+        _ => return None,
+    })
+}
+
+/// The payload a value of a `System` primitive occupies -- boxed, or as one array element -- derived
+/// from its FROZEN element code so this is a view of [`primitive_element_kind`] rather than a second
+/// table beside it.
+///
+/// It has to exist because the metadata cannot answer: corlib declares `System.Int32` and its
+/// siblings with consts and methods and NO INSTANCE FIELD, so their `value_type_layout` is ZERO
+/// bytes. Everything that must agree about the width of a primitive -- what a `box` allocates, what
+/// an array strides by, and what the boxed type's DESCRIPTOR says its payload is -- reads it here.
+/// A descriptor answering 0 for `System.Int32` is not a cosmetic gap: `Array.GetValue` boxes an
+/// element against exactly that number.
+#[must_use]
+pub fn primitive_value_size(namespace: &str, name: &str) -> Option<u32> {
+    primitive_element_kind(namespace, name).map(|kind| match kind {
+        1 | 2 => 1,
+        3 | 4 => 2,
+        6 | 8 => 8,
+        _ => 4,
+    })
+}
+
 /// Per-type emission metadata the backend's GC module path consumes: the type's identity tag (appended
 /// to its TypeDesc for mixed mode), its vtable (function indices in slot order, laid BEFORE the TypeDesc),
 /// and its itable (interface-method tag -> function index, laid AFTER). Produced by
@@ -832,6 +1144,12 @@ pub struct TypeMeta {
     /// this only grows the reached set. Left `None` on the reference-owned metas that a consumer's
     /// [`reference_type_meta`](Self::reference_type_meta) stages (that path never lays the base itself).
     pub words: Option<Box<[u32]>>,
+    /// Whether another assembly can NAME this type -- public, or nested in something public. Only an
+    /// exported type can be a cross-assembly base or array element, so only an exported type's
+    /// descriptor is worth a library laying proactively; an internal one still carries its
+    /// [`words`](Self::words) here, for the emitter to lay locally when something in THIS build
+    /// reaches it.
+    pub exported: bool,
 }
 
 impl<'a> MetadataResolver<'a> {
@@ -1052,12 +1370,12 @@ impl CallResolver for MetadataResolver<'_> {
         })
     }
 
-    fn user_string(&self, operand: &Operand) -> Option<Box<[u8]>> {
+    fn user_string(&self, operand: &Operand) -> Option<Box<[u16]>> {
         let Operand::Token(token) = operand else {
             return None;
         };
         let raw = self.assembly.image().user_strings().get(token.row()).ok()?;
-        Some(decode_user_string(raw).into_bytes().into_boxed_slice())
+        Some(decode_user_string(raw).into_boxed_slice())
     }
 
     fn field_offset(&self, operand: &Operand) -> Option<u32> {
@@ -1283,25 +1601,52 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let by_layout = || {
-            self.assembly
-                .value_type_layout(*token, &TargetLayout::ilp32())
-                .map(|layout| layout.size)
-                .unwrap_or(4)
+        let definition = match token.table() {
+            table::TYPE_DEF => self
+                .assembly
+                .type_def(token.row())
+                .map(|type_def| (self.assembly, type_def)),
+            table::TYPE_REF => self
+                .assembly
+                .type_token_name(*token)
+                .and_then(|name| self.find_reference_type(name.namespace, name.name))
+                .map(|(_, owner, type_def)| (owner, type_def)),
+            _ => None,
         };
-        let element_size = match self.assembly.type_token_name(*token) {
-            Some(name) if name.namespace == "System" => match name.name {
-                "Boolean" | "SByte" | "Byte" => 1,
-                "Int16" | "UInt16" | "Char" => 2,
-                "Int32" | "UInt32" | "Single" => 4,
-                "Int64" | "UInt64" | "Double" => 8,
-                _ => by_layout(),
-            },
-            _ => by_layout(),
+        let value_type_size = || {
+            definition
+                .filter(|(_, type_def)| type_def.is_value_type())
+                .and_then(|(owner, type_def)| {
+                    owner
+                        .value_type_layout(type_def.token(), &TargetLayout::ilp32())
+                        .ok()
+                        .map(|layout| layout.size)
+                })
         };
+        let element_size = self
+            .assembly
+            .type_token_name(*token)
+            .and_then(|name| primitive_value_size(name.namespace, name.name))
+            .or_else(value_type_size)
+            .unwrap_or(4);
+        let element_kind = match self.assembly.type_token_name(*token) {
+            Some(name) => primitive_element_kind(name.namespace, name.name).unwrap_or({
+                match definition {
+                    Some((_, type_def)) if type_def.is_value_type() => ELEMENT_KIND_OPAQUE,
+                    _ => ELEMENT_KIND_REFERENCE,
+                }
+            }),
+            None => ELEMENT_KIND_OPAQUE,
+        };
+        let element = self
+            .assembly
+            .type_token_name(*token)
+            .map(|_| self.qualified_type_handle(*token));
         Some(ArrayElement {
-            handle: TypeHandle(token.0),
+            handle: lamella_ir::array_handle(element.unwrap_or(TypeHandle(token.0))),
+            element,
             element_size,
+            element_kind,
         })
     }
 
@@ -1537,6 +1882,30 @@ impl CallResolver for MetadataResolver<'_> {
         handles
     }
 
+    fn cast_interface_tag(&self, operand: &Operand) -> Option<u32> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let target = self.type_token_of(*token)?;
+        let name = self.assembly.type_token_name(target)?;
+        let (interface_assembly, interface): (&Assembly, TypeDef) =
+            match self.assembly.find_type(name.namespace, name.name) {
+                Some(td) => (self.assembly, td),
+                None => {
+                    let (_, owner, td) = self.find_reference_type(name.namespace, name.name)?;
+                    (owner, td)
+                }
+            };
+        if !interface.is_interface() {
+            return None;
+        }
+        let _ = interface_assembly;
+        interface.methods().find_map(|method| {
+            let signature = method.signature()?;
+            Some(interface_method_tag(&name, method.name()?, &signature.parameters))
+        })
+    }
+
     fn cast_target_chain(&self, operand: &Operand) -> Option<TypeHandle> {
         let Operand::Token(token) = operand else {
             return None;
@@ -1554,23 +1923,16 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         let handle = self.qualified_type_handle(*token);
-        if let Some(name) = self.assembly.type_token_name(*token) {
-            if name.namespace == "System" {
-                let size = match name.name {
-                    "Boolean" | "SByte" | "Byte" => Some(1),
-                    "Int16" | "UInt16" | "Char" => Some(2),
-                    "Int32" | "UInt32" | "Single" => Some(4),
-                    "Int64" | "UInt64" | "Double" => Some(8),
-                    _ => None,
-                };
-                if let Some(size) = size {
-                    return Some(ReferenceLayout {
-                        handle,
-                        size,
-                        reference_offsets: Vec::new(),
-                    });
-                }
-            }
+        if let Some(size) = self
+            .assembly
+            .type_token_name(*token)
+            .and_then(|name| primitive_value_size(name.namespace, name.name))
+        {
+            return Some(ReferenceLayout {
+                handle,
+                size,
+                reference_offsets: Vec::new(),
+            });
         }
         let layout = self
             .assembly
@@ -1998,25 +2360,71 @@ fn slot_types(
     (arg_types, local_types)
 }
 
+/// The ONE table of `call` targets this backend FOLDS into an [`Intrinsic`] instead of emitting a
+/// call to the method's own body. Keyed on exactly the data both a call site and the
+/// `[RuntimeProvided]` seam census hold -- the declaring type's name, the method's name, and its
+/// parameter signature -- so the two cannot answer differently about the same method. That matters
+/// because a folded target's body is UNREACHABLE by any call: a seam left as a silent placeholder is
+/// not a live wrong answer if every call to it was folded here, and a census that does not ask this
+/// question reports it as one. (`synthesized_seam_body` is the same discipline for the other half of
+/// a seam's fate: one place decides, and the report asks THAT place rather than restating it.)
+///
+/// The fold is only reachable for the call KINDS each arm of [`MetadataResolver::call_info`] admits;
+/// this answers what the table claims, not which call sites reach it.
+#[must_use]
+pub fn folded_intrinsic(
+    namespace: &str,
+    type_name: &str,
+    method_name: Option<&str>,
+    parameters: &[SigType],
+) -> Option<Intrinsic> {
+    Some(match (namespace, type_name, method_name?) {
+        ("System.Diagnostics", "Debug", "WriteLine") => Intrinsic::DebugWriteLine,
+        ("System", "Console", "WriteLine") if matches!(parameters, [SigType::I4]) => {
+            Intrinsic::ConsoleWriteLineInt
+        }
+        ("System", "String", "op_Equality")
+            if matches!(parameters, [SigType::String, SigType::String]) =>
+        {
+            Intrinsic::StringEquals
+        }
+        ("System", "Object" | "Attribute", ".ctor") => Intrinsic::ObjectCtor,
+        ("System", "Array", "GetLength") => Intrinsic::ArrayGetLength,
+        ("System", "String", "Concat")
+            if (2..=4).contains(&parameters.len())
+                && parameters.iter().all(|p| matches!(p, SigType::String)) =>
+        {
+            Intrinsic::StringConcat
+        }
+        ("System", "Int32", "ToString") if parameters.is_empty() => Intrinsic::IntToString,
+        _ => return None,
+    })
+}
+
+/// [`folded_intrinsic`] asked of a resolved call target -- the form the lowering's own arms use, so
+/// every predicate below is a view of the one table rather than a second copy of it.
+fn intrinsic_of(method: &ResolvedMethod) -> Option<Intrinsic> {
+    let declaring = method.declaring_type?;
+    folded_intrinsic(
+        declaring.namespace,
+        declaring.name,
+        method.name,
+        method
+            .signature
+            .as_ref()
+            .map_or(&[][..], |sig| sig.parameters.as_slice()),
+    )
+}
+
 /// Whether a resolved method is `System.Diagnostics.Debug.WriteLine`.
 fn is_debug_writeline(method: &ResolvedMethod) -> bool {
-    method.name == Some("WriteLine")
-        && method
-            .declaring_type
-            .is_some_and(|t| t.namespace == "System.Diagnostics" && t.name == "Debug")
+    matches!(intrinsic_of(method), Some(Intrinsic::DebugWriteLine))
 }
 
 /// Whether a resolved method is `System.Console.WriteLine(int)` -- the single-`int` overload,
 /// distinguished from the many other `WriteLine` overloads by its parameter type.
 fn is_console_writeline_int(method: &ResolvedMethod) -> bool {
-    method.name == Some("WriteLine")
-        && method
-            .declaring_type
-            .is_some_and(|t| t.namespace == "System" && t.name == "Console")
-        && method
-            .signature
-            .as_ref()
-            .is_some_and(|sig| matches!(sig.parameters.as_slice(), [SigType::I4]))
+    matches!(intrinsic_of(method), Some(Intrinsic::ConsoleWriteLineInt))
 }
 
 /// Whether a resolved method is a parameterless base-class constructor the lowering treats as a no-op:
@@ -2024,70 +2432,50 @@ fn is_console_writeline_int(method: &ResolvedMethod) -> bool {
 /// (so a user-defined attribute class -- e.g. a clean-room `[UnmanagedCallersOnly]` -- lowers; an
 /// attribute's ctor is never run on this target, attributes being pure metadata).
 fn is_noop_base_ctor(method: &ResolvedMethod) -> bool {
-    method.name == Some(".ctor")
-        && method.declaring_type.is_some_and(|t| {
-            t.namespace == "System" && (t.name == "Object" || t.name == "Attribute")
-        })
+    matches!(intrinsic_of(method), Some(Intrinsic::ObjectCtor))
 }
 
 /// Whether a resolved method is `System.Array::GetLength(int)` -- the per-dimension length accessor
 /// (used to loop over an array, including `int[,]`); the lowering reads it from the array header.
 fn is_array_getlength(method: &ResolvedMethod) -> bool {
-    method.name == Some("GetLength")
-        && method
-            .declaring_type
-            .is_some_and(|t| t.namespace == "System" && t.name == "Array")
+    matches!(intrinsic_of(method), Some(Intrinsic::ArrayGetLength))
 }
 
 /// Whether a resolved method is `System.String::op_Equality(string, string)` (the `==` operator).
 fn is_string_op_equality(method: &ResolvedMethod) -> bool {
-    method.name == Some("op_Equality")
-        && method
-            .declaring_type
-            .is_some_and(|t| t.namespace == "System" && t.name == "String")
-        && method.signature.as_ref().is_some_and(|sig| {
-            matches!(
-                sig.parameters.as_slice(),
-                [SigType::String, SigType::String]
-            )
-        })
+    matches!(intrinsic_of(method), Some(Intrinsic::StringEquals))
 }
 
 /// Whether a resolved method is a fixed-arity `System.String::Concat(string, ...)` -- the 2-, 3-, or
 /// 4-string overloads `a + b`, `a + b + c`, `a + b + c + d` emit. The front end chains it pairwise.
 /// (The `Concat(string[])` params-array and `Concat(object...)` overloads are not yet recognized.)
 fn is_string_concat(method: &ResolvedMethod) -> bool {
-    method.name == Some("Concat")
-        && method
-            .declaring_type
-            .is_some_and(|t| t.namespace == "System" && t.name == "String")
-        && method.signature.as_ref().is_some_and(|sig| {
-            (2..=4).contains(&sig.parameters.len())
-                && sig.parameters.iter().all(|p| matches!(p, SigType::String))
-        })
+    matches!(intrinsic_of(method), Some(Intrinsic::StringConcat))
 }
 
 /// Whether a resolved method is `System.Int32::ToString()` -- the no-argument decimal formatter
 /// (`i.ToString()`). The receiver is a managed pointer to the int. (The format-string and
 /// `IFormatProvider` overloads are not recognized.)
 fn is_int32_tostring(method: &ResolvedMethod) -> bool {
-    method.name == Some("ToString")
-        && method
-            .declaring_type
-            .is_some_and(|t| t.namespace == "System" && t.name == "Int32")
-        && method
-            .signature
-            .as_ref()
-            .is_some_and(|sig| sig.parameters.is_empty())
+    matches!(intrinsic_of(method), Some(Intrinsic::IntToString))
 }
 
-/// Decodes a `#US` entry (UTF-16 code units plus a trailing flag byte) to a [`String`].
-fn decode_user_string(raw: &[u8]) -> String {
+/// Decodes a `#US` entry (UTF-16 code units plus a trailing flag byte) to its CODE UNITS.
+///
+/// Units, not a [`String`], and that is the whole point of this function's shape. It used to end in
+/// `String::from_utf16_lossy` and hand back text, which the `ldstr` lowering then re-encoded to UTF-16
+/// -- a round trip through a type that CANNOT HOLD a lone surrogate. So `"a\u{D800}b"` reached every
+/// backend as `"a\u{FFFD}b"`, in EVERY tier including the default one whose storage is UTF-16 and can
+/// hold it perfectly well.
+///
+/// The `#US` heap is UTF-16 and a Lamella string is UTF-16 at the managed level, so text is not on the
+/// path at all; the one consumer that genuinely wants bytes (a semihosting console write) converts for
+/// itself, where the loss is in a diagnostic rather than in the program's data.
+fn decode_user_string(raw: &[u8]) -> Vec<u16> {
     let units = raw.len().saturating_sub(1) / 2;
-    let utf16: Vec<u16> = (0..units)
+    (0..units)
         .map(|i| u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]))
-        .collect();
-    String::from_utf16_lossy(&utf16)
+        .collect()
 }
 
 #[cfg(test)]
@@ -2096,7 +2484,11 @@ mod tests {
 
     #[test]
     fn decodes_a_user_string() {
-        assert_eq!(decode_user_string(&[0x48, 0x00, 0x69, 0x00, 0x00]), "Hi");
+        assert_eq!(decode_user_string(&[0x48, 0x00, 0x69, 0x00, 0x00]), [0x48, 0x69]);
+        assert_eq!(
+            decode_user_string(&[0x61, 0x00, 0x00, 0xD8, 0x62, 0x00, 0x00]),
+            [0x0061, 0xD800, 0x0062]
+        );
     }
 
     #[test]
@@ -2162,4 +2554,127 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn the_frozen_primitive_element_codes_match_the_runtime_enum() {
+        for (name, code) in [
+            ("SByte", 1),
+            ("Byte", 2),
+            ("Boolean", 2),
+            ("Int16", 3),
+            ("UInt16", 4),
+            ("Char", 4),
+            ("Int32", 5),
+            ("UInt32", 5),
+            ("Int64", 6),
+            ("UInt64", 6),
+            ("Single", 7),
+            ("Double", 8),
+        ] {
+            assert_eq!(
+                primitive_element_kind("System", name),
+                Some(code),
+                "System.{name} must carry the frozen code {code}"
+            );
+        }
+        assert_eq!(primitive_element_kind("System", "String"), None);
+        assert_eq!(primitive_element_kind("System", "Object"), None);
+        assert_eq!(primitive_element_kind("MyApp", "Int32"), None);
+    }
+
+    #[test]
+    fn the_fold_table_answers_the_seam_census_and_the_lowering_alike() {
+        use SigType::{I4, Object, String as Str};
+        assert_eq!(
+            folded_intrinsic("System", "String", Some("Concat"), &[Str, Str]),
+            Some(Intrinsic::StringConcat)
+        );
+        assert_eq!(
+            folded_intrinsic("System", "String", Some("Concat"), &[Str, Str, Str, Str]),
+            Some(Intrinsic::StringConcat)
+        );
+        assert_eq!(
+            folded_intrinsic("System", "String", Some("Concat"), &[Object, Object]),
+            None
+        );
+        assert_eq!(
+            folded_intrinsic("System", "String", Some("Concat"), &[Str]),
+            None
+        );
+        assert_eq!(
+            folded_intrinsic("System", "Array", Some("GetLength"), &[I4]),
+            Some(Intrinsic::ArrayGetLength)
+        );
+        assert_eq!(
+            folded_intrinsic("System", "Int32", Some("ToString"), &[]),
+            Some(Intrinsic::IntToString)
+        );
+        assert_eq!(
+            folded_intrinsic("System", "Int32", Some("ToString"), &[Str]),
+            None,
+            "the format-string overload is a real call"
+        );
+        assert_eq!(
+            folded_intrinsic("System", "String", Some("op_Equality"), &[Str, Str]),
+            Some(Intrinsic::StringEquals)
+        );
+        assert_eq!(
+            folded_intrinsic("System", "Object", Some(".ctor"), &[]),
+            Some(Intrinsic::ObjectCtor)
+        );
+        assert_eq!(
+            folded_intrinsic("System", "Console", Some("WriteLine"), &[I4]),
+            Some(Intrinsic::ConsoleWriteLineInt)
+        );
+        assert_eq!(
+            folded_intrinsic("System", "Console", Some("WriteLine"), &[Str]),
+            None,
+            "only the single-int overload is folded"
+        );
+        assert_eq!(
+            folded_intrinsic("System.Diagnostics", "Debug", Some("WriteLine"), &[Str]),
+            Some(Intrinsic::DebugWriteLine)
+        );
+        assert_eq!(
+            folded_intrinsic("MyApp", "String", Some("Concat"), &[Str, Str]),
+            None
+        );
+        assert_eq!(folded_intrinsic("System", "String", None, &[]), None);
+    }
+
+    #[test]
+    fn the_array_marker_cannot_collide_with_a_payload_or_an_element_kind() {
+        assert!(
+            ARRAY_DESC_MARK > 0x0010_0000,
+            "the marker must sit far above any real payload size"
+        );
+        assert_eq!(ARRAY_DESC_MARK & ARRAY_DESC_MARK_MASK, ARRAY_DESC_MARK);
+        for rank in 1u32..=8 {
+            let word = ARRAY_DESC_MARK | rank;
+            assert_eq!(word & ARRAY_DESC_MARK_MASK, ARRAY_DESC_MARK, "rank {rank}");
+            assert_eq!(word & !ARRAY_DESC_MARK_MASK, rank, "rank {rank} round-trips");
+        }
+        assert_eq!(ELEMENT_KIND_REFERENCE, 0);
+        for (name, _) in [("SByte", ()), ("Double", ())] {
+            assert_ne!(
+                primitive_element_kind("System", name),
+                Some(ELEMENT_KIND_REFERENCE)
+            );
+        }
+        assert!(
+            !(1..=8).contains(&ELEMENT_KIND_OPAQUE),
+            "OPAQUE must not alias a frozen primitive code"
+        );
+        assert_ne!(ELEMENT_KIND_OPAQUE, ELEMENT_KIND_REFERENCE);
+        assert_eq!(
+            ELEMENT_KIND_UTF16_UNIT,
+            primitive_element_kind("System", "Char").expect("Char is a frozen primitive"),
+            "the string blob's element kind must be the frozen UTF-16 code unit"
+        );
+        assert_eq!(
+            primitive_element_kind("System", "UInt16"),
+            Some(ELEMENT_KIND_UTF16_UNIT),
+            "Char and UInt16 share one frozen code"
+        );
+    }
 }
