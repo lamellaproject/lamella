@@ -450,6 +450,18 @@ name = "lamella-elf"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-esp-serial"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-esp-serial-host"
+version = "0.0.0"
+dependencies = [
+ "lamella-esp-serial",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "lamella-firmware"
 version = "0.1.0"
 dependencies = [

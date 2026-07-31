@@ -170,6 +170,8 @@ namespace System
             internal bool Percent;
             internal string Prefix;
             internal string Suffix;
+            internal string IntTemplate;
+            internal string FracTemplate;
             internal int MinInt;
             internal bool Grouping;
             internal int MaxFrac;
@@ -223,6 +225,8 @@ namespace System
                 }
                 if (lead > 0) shape.Suffix = shape.Suffix.Substring(lead);
             }
+            shape.IntTemplate = intRegion;
+            shape.FracTemplate = fracRegion;
             shape.MinInt = CountChar(intRegion, '0');
             shape.Grouping = intRegion.IndexOf(',') >= 0;
             shape.MaxFrac = CountPlaceholders(fracRegion);
@@ -247,13 +251,106 @@ namespace System
             if (!shape.HasPlaces) return EmitLiterals(shape.Section);
             double m = shape.Percent ? magnitude * 100.0 : magnitude;
             for (int s = 0; s < shape.Scale; s++) m = m / 1000.0;
-            string fixedText = System.Double.ToFixed(m, shape.MaxFrac);
+            string fixedText = RoundPlainDecimal(Significant15(m), shape.MaxFrac);
             int fdot = fixedText.IndexOf('.');
             string intDigits;
             string fracDigits;
             if (fdot < 0) { intDigits = fixedText; fracDigits = ""; }
             else { intDigits = fixedText.Substring(0, fdot); fracDigits = fixedText.Substring(fdot + 1); }
             return AssembleCustom(shape, intDigits, fracDigits);
+        }
+
+        private static string Significant15(double magnitude)
+        {
+            string text = System.Double.ToExponential(magnitude, 14, true);
+            int marker = text.IndexOf('E');
+            if (marker < 0) return text;
+            string mantissa = text.Substring(0, marker);
+            int exponent = ParseSignedInt(text.Substring(marker + 1));
+            int dot = mantissa.IndexOf('.');
+            string digits = (dot < 0)
+                ? mantissa
+                : mantissa.Substring(0, dot) + mantissa.Substring(dot + 1);
+
+            int point = exponent + 1;
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            if (point <= 0)
+            {
+                sb.Append("0.");
+                for (int i = 0; i < -point; i++) sb.Append('0');
+                sb.Append(digits);
+            }
+            else if (point >= digits.Length)
+            {
+                sb.Append(digits);
+                for (int i = digits.Length; i < point; i++) sb.Append('0');
+            }
+            else
+            {
+                sb.Append(digits.Substring(0, point));
+                sb.Append('.');
+                sb.Append(digits.Substring(point));
+            }
+            return sb.ToString();
+        }
+
+        private static string RoundPlainDecimal(string plain, int frac)
+        {
+            int dot = plain.IndexOf('.');
+            if (dot < 0 && !IsDigits(plain)) return plain;
+            string whole = (dot < 0) ? plain : plain.Substring(0, dot);
+            string fraction = (dot < 0) ? "" : plain.Substring(dot + 1);
+            if (fraction.Length <= frac)
+            {
+                System.Text.StringBuilder pad = new System.Text.StringBuilder(fraction);
+                while (pad.Length < frac) pad.Append('0');
+                fraction = pad.ToString();
+            }
+            else
+            {
+                bool up = fraction[frac] >= '5';
+                fraction = fraction.Substring(0, frac);
+                if (up)
+                {
+                    string carried = AddOneToLastDigit(whole + fraction);
+                    whole = carried.Substring(0, carried.Length - frac);
+                    fraction = carried.Substring(carried.Length - frac);
+                }
+            }
+            return (frac == 0) ? whole : (whole + "." + fraction);
+        }
+
+        private static string AddOneToLastDigit(string digits)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(digits);
+            int i = sb.Length - 1;
+            while (i >= 0)
+            {
+                if (sb[i] == '9') { sb[i] = '0'; i = i - 1; continue; }
+                sb[i] = (char)(sb[i] + 1);
+                return sb.ToString();
+            }
+            return "1" + sb.ToString();
+        }
+
+        private static int ParseSignedInt(string s)
+        {
+            bool negative = s.Length > 0 && s[0] == '-';
+            int value = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c < '0' || c > '9') continue;
+                value = value * 10 + (c - '0');
+            }
+            return negative ? -value : value;
+        }
+
+        private static bool IsDigits(string s)
+        {
+            if (s.Length == 0) return false;
+            for (int i = 0; i < s.Length; i++) if (s[i] < '0' || s[i] > '9') return false;
+            return true;
         }
 #endif
 
@@ -269,10 +366,79 @@ namespace System
             System.Text.StringBuilder result = new System.Text.StringBuilder();
             if (shape.EmitSign) result.Append('-');
             result.Append(EmitLiterals(shape.Prefix));
-            result.Append(intDigits);
-            if (fracDigits.Length > 0) { result.Append('.'); result.Append(fracDigits); }
+            result.Append(FillIntTemplate(shape.IntTemplate, intDigits));
+            string fraction = FillFracTemplate(shape.FracTemplate, fracDigits);
+            if (fraction.Length > 0) { result.Append('.'); result.Append(fraction); }
             result.Append(EmitLiterals(shape.Suffix));
             return result.ToString();
+        }
+
+        private static string FillIntTemplate(string template, string digits)
+        {
+            int places = CountPlaceholders(template);
+            int remaining = CountDigits(digits);
+            int skip = places - remaining;
+            if (skip < 0) skip = 0;
+
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            System.Text.StringBuilder literal = new System.Text.StringBuilder();
+            int cursor = 0;
+            int index = 0;
+            while (index < template.Length)
+            {
+                char c = template[index];
+                if (c != '0' && c != '#') { literal.Append(c); index = index + 1; continue; }
+                index = index + 1;
+                if (skip > 0) { skip = skip - 1; continue; }
+                sb.Append(EmitLiterals(literal.ToString()));
+                literal = new System.Text.StringBuilder();
+                places = places - 1;
+                int take = remaining - places;
+                if (take < 1) take = 1;
+                remaining = remaining - take;
+                while (take > 0 && cursor < digits.Length)
+                {
+                    char d = digits[cursor];
+                    sb.Append(d);
+                    cursor = cursor + 1;
+                    if (d != ',') take = take - 1;
+                }
+                while (cursor < digits.Length && digits[cursor] == ',')
+                {
+                    sb.Append(digits[cursor]);
+                    cursor = cursor + 1;
+                }
+            }
+            sb.Append(EmitLiterals(literal.ToString()));
+            while (cursor < digits.Length) { sb.Append(digits[cursor]); cursor = cursor + 1; }
+            return sb.ToString();
+        }
+
+        private static string FillFracTemplate(string template, string digits)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            System.Text.StringBuilder literal = new System.Text.StringBuilder();
+            int cursor = 0;
+            int index = 0;
+            while (index < template.Length)
+            {
+                char c = template[index];
+                if (c != '0' && c != '#') { literal.Append(c); index = index + 1; continue; }
+                index = index + 1;
+                sb.Append(EmitLiterals(literal.ToString()));
+                literal = new System.Text.StringBuilder();
+                if (cursor >= digits.Length) break;
+                sb.Append(digits[cursor]);
+                cursor = cursor + 1;
+            }
+            return sb.ToString();
+        }
+
+        private static int CountDigits(string s)
+        {
+            int count = 0;
+            for (int i = 0; i < s.Length; i++) if (s[i] != ',') count = count + 1;
+            return count;
         }
 
         private static string MagnitudeDecimal(long negMag)
@@ -349,9 +515,16 @@ namespace System
 
         private static int MinFracDigits(string fracRegion)
         {
-            int lastZero = -1;
-            for (int i = 0; i < fracRegion.Length; i++) if (fracRegion[i] == '0') lastZero = i;
-            return lastZero + 1;
+            int forced = 0;
+            int places = 0;
+            for (int i = 0; i < fracRegion.Length; i++)
+            {
+                char c = fracRegion[i];
+                if (c != '0' && c != '#') continue;
+                places = places + 1;
+                if (c == '0') forced = places;
+            }
+            return forced;
         }
 
         private static string Zeros(int n)

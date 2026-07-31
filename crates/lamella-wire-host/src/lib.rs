@@ -195,7 +195,7 @@ pub fn list_serial() -> Vec<SerialPortDesc> {
 
 /// Parse an example's `usb` target argument into (vid, pid, serial-substring):
 /// - `usb` -- the Lamella Link VID/PID, first attached board;
-/// - `usb:<vid>:<pid>` -- hex id pair (each exactly 4 hex digits), e.g. `usb:1209:0001`;
+/// - `usb:<vid>:<pid>` -- hex id pair (each exactly 4 hex digits), e.g. `usb:39e9:0001`;
 /// - `usb:<vid>:<pid>:<serial>` -- id pair plus a serial-substring pick;
 /// - `usb:<serial>` -- the Lamella Link VID/PID, board picked by a case-insensitive serial
 ///   substring (chip-id serials are hex, so a single token is ALWAYS a serial -- overriding
@@ -487,23 +487,23 @@ mod usb_target_tests {
 
     #[test]
     fn bare_usb_is_the_link_ids_first_board() {
-        assert_eq!(parse_usb_target("usb"), (0x1209, 0x0001, None));
+        assert_eq!(parse_usb_target("usb"), (0x39e9, 0x0001, None));
     }
 
     #[test]
     fn id_pair_and_optional_serial() {
-        assert_eq!(parse_usb_target("usb:1209:0001"), (0x1209, 0x0001, None));
+        assert_eq!(parse_usb_target("usb:39e9:0001"), (0x39e9, 0x0001, None));
         assert_eq!(
-            parse_usb_target("usb:1209:0001:E463"),
-            (0x1209, 0x0001, Some("E463".to_string()))
+            parse_usb_target("usb:39e9:0001:E463"),
+            (0x39e9, 0x0001, Some("E463".to_string()))
         );
     }
 
     #[test]
     fn lone_token_is_always_a_serial() {
-        assert_eq!(parse_usb_target("usb:BOARD-0001"), (0x1209, 0x0001, Some("BOARD-0001".into())));
-        assert_eq!(parse_usb_target("usb:E46341"), (0x1209, 0x0001, Some("E46341".into())));
-        assert_eq!(parse_usb_target("usb:7B53"), (0x1209, 0x0001, Some("7B53".into())));
+        assert_eq!(parse_usb_target("usb:BOARD-0001"), (0x39e9, 0x0001, Some("BOARD-0001".into())));
+        assert_eq!(parse_usb_target("usb:E46341"), (0x39e9, 0x0001, Some("E46341".into())));
+        assert_eq!(parse_usb_target("usb:7B53"), (0x39e9, 0x0001, Some("7B53".into())));
     }
 }
 

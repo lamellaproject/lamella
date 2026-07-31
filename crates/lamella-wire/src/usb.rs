@@ -1,10 +1,29 @@
 //! Identity + USB descriptors for the native driverless-WinUSB Lamella Link carrier -- the fast
 //! interpreter-flash path for a board with a native USB device peripheral.
 
-/// Vendor id: the pid.codes open-source VID for development (swap for an allocated Lamella PID before
-/// publish).
-pub const VID: u16 = 0x1209;
-/// Product id: the pid.codes prototype PID.
+/// Vendor id: Lamella LLC's own USB-IF vendor id.
+///
+/// A vendor id is the one part of a device's identity that cannot be self-asserted, which is why the
+/// numbers below are a contract rather than a configuration: a host, a `udev` rule and a browser's
+/// WebUSB filter all match on this pair BEFORE anything is opened, so it is the only identity the
+/// device has until the protocol gets a chance to speak.
+pub const VID: u16 = 0x39E9;
+/// Product id: the Lamella Link vendor-specific bulk interface.
+///
+/// **ONE product id for every board, deliberately.** A product id distinguishes a device SHAPE, not a
+/// product variant -- what a host needs to know before it opens anything is "is this a Lamella Link",
+/// and there is exactly one answer. Which board it is, and which silicon, is carried where there is
+/// room to say it properly: `iProduct` ("Lamella Link (RP2350)"), `iSerialNumber`, and then the
+/// `HELLO` handshake's profile identity. Spending a product id per board would be a 16-bit copy of
+/// facts the protocol already states better, and would make every host filter a list that grows with
+/// the board count.
+///
+/// **A NEW product id is warranted only when a host must tell two devices apart BEFORE opening one**
+/// -- i.e. when the interface layout differs, not when the hardware does. That means a composite
+/// device (Link beside a CDC console or a DFU function), a bootloader mode a flashing tool must find
+/// without the application running, or a separate class of Lamella-branded hardware. Windows caches a
+/// driver binding per vendor/product pair, so re-using this id for a different interface layout is
+/// how a stale binding gets made.
 pub const PID: u16 = 0x0001;
 /// The WinUSB device-interface GUID a host opens to reach the Lamella Link vendor interface. The device
 /// advertises it in its Microsoft OS 2.0 `DeviceInterfaceGUIDs` registry property; the host matches on
@@ -222,6 +241,12 @@ mod tests {
     }
     fn u16_at(d: &[u8], i: usize) -> u16 {
         u16::from_le_bytes([d[i], d[i + 1]])
+    }
+
+    #[test]
+    fn the_allocated_identity_is_pinned() {
+        assert_eq!(VID, 0x39E9, "Lamella LLC's allocated USB-IF vendor id");
+        assert_eq!(PID, 0x0001, "Lamella Link; see the doc comment before spending a second one");
     }
 
     #[test]

@@ -93,7 +93,7 @@ fn vid_pid_from_path(path: &[u16]) -> Option<(u16, u16)> {
 }
 
 /// The instance-id segment of a device-interface path -- for a device reporting an
-/// iSerialNumber, Windows uses the serial itself: `\\?\usb#vid_1209&pid_0001#SERIAL#{guid}`.
+/// iSerialNumber, Windows uses the serial itself: `\\?\usb#vid_39e9&pid_0001#SERIAL#{guid}`.
 /// (A serial-less device gets a synthesized `a&bcdef&0&1`-style id instead; matching against
 /// that is harmless -- it simply never equals a real serial.)
 fn instance_id_from_path(path: &[u16]) -> Option<String> {
