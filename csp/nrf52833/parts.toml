@@ -18,4 +18,4 @@ pins = [
     "P0.08", "P0.11", "P0.15", "P0.16", "P0.19", "P0.21",
     "P0.22", "P0.24", "P0.28", "P0.30", "P0.31", "P1.05",
 ]
-source = "nRF52833 PS 4452_021 v1.7 (512 kB flash / 128 kB RAM; INFO K512/K128). Partial pin list, grown as bindings demand."
+source = "nRF52833 PS 4452_021 v1.7 (512 kB flash / 128 kB RAM; INFO K512/K128). The pin list is PARTIAL rather than the package's full set."

@@ -32,20 +32,26 @@ public sealed class Stm32l476Uart
     /// resident firmware already configured.</summary>
     public void Init()
     {
-        Mmio.Write32(_binding.PortRccEnReg,
-            Mmio.Read32(_binding.PortRccEnReg) | _binding.PortRccEnMask);
+        Mmio.Write32(_binding.Tx.PortRccEnReg,
+            Mmio.Read32(_binding.Tx.PortRccEnReg) | _binding.Tx.PortRccEnMask);
+        Mmio.Write32(_binding.Rx.PortRccEnReg,
+            Mmio.Read32(_binding.Rx.PortRccEnReg) | _binding.Rx.PortRccEnMask);
         Mmio.Write32(_binding.RccEnReg, Mmio.Read32(_binding.RccEnReg) | _binding.RccEnMask);
 
         Mmio.Write32(_cr1, 0u);
 
-        Mmio.Write32(_binding.ModerReg,
-            (Mmio.Read32(_binding.ModerReg) & ~_binding.ModerMask) | _binding.ModerValue);
-        Mmio.Write32(_binding.AfrReg,
-            (Mmio.Read32(_binding.AfrReg) & ~_binding.AfrMask) | _binding.AfrValue);
+        MuxPin(_binding.Tx);
+        MuxPin(_binding.Rx);
 
         Mmio.Write32(_brr, _binding.BaudDivisor);
         Mmio.Write32(_cr1, Stm32l476UsartLayout.CR1_UE | Stm32l476UsartLayout.CR1_TE
             | Stm32l476UsartLayout.CR1_RE);
+    }
+
+    void MuxPin(Stm32l476UsartPinMux pin)
+    {
+        Mmio.Write32(pin.ModerReg, (Mmio.Read32(pin.ModerReg) & ~pin.ModerMask) | pin.ModerValue);
+        Mmio.Write32(pin.AfrReg, (Mmio.Read32(pin.AfrReg) & ~pin.AfrMask) | pin.AfrValue);
     }
 
     /// <summary>Sends one byte, waiting (bounded) for the transmit register to empty first.</summary>

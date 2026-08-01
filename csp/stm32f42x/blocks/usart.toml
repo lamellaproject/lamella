@@ -1,0 +1,115 @@
+# BLOCK layout: the STM32F42x USART, asynchronous use. Offsets are instance-base-relative; instance
+# bases + RCC enable routing live in ../instances.toml. Every register is 32-bit word-accessible.
+#
+# Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
+# sequences ride here.
+#
+# ST SHIPS TWO UNRELATED USART REGISTER LAYOUTS UNDER ONE PERIPHERAL NAME, and this part has the
+# older one. The F0, L4 and F7 lines carry a peripheral whose control register is at offset 0 and
+# whose status is ISR at 0x1C, with a separate receive register, a separate transmit register and a
+# write-1-to-clear flag register. This one has STATUS at offset 0 and ONE data register at 0x04 that
+# is the transmit register when written and the receive register when read, and it has no flag-clear
+# register at all -- a flag is cleared by the access that services it.
+#
+# TWO WAYS THAT DIFFERENCE BITES A DRIVER WRITTEN FOR THE OTHER LAYOUT, and neither fails loudly:
+#
+#   * THE ENABLE BIT MOVED. UE is bit 13 here and bit 0 there. Writing bit 0 sets the receiver
+#     enable instead, so the peripheral stays off while a plausible-looking value sits in CR1.
+#   * TXE IS BIT 7 IN BOTH -- IN DIFFERENT REGISTERS. Polling the right bit at the other design's
+#     offset reads CR1 here, whose bit 7 is the transmit-empty INTERRUPT enable: it reads back
+#     whatever was written, so a poll on it either spins forever or never waits at all.
+#
+# The register map and every field a polled 8N1 driver touches were read from this part's own manual.
+
+[table]
+kind = "block"
+family = "stm32f42x"
+block = "usart"
+sources = [
+    "RM0090 Rev 22 section 30.6 (USART registers): USART_SR 0x00, USART_DR 0x04, USART_BRR 0x08, USART_CR1 0x0C, USART_CR2 0x10, USART_CR3 0x14, USART_GTPR 0x18",
+    "RM0090 Rev 22 section 30.6.1 USART_SR per-bit descriptions: PE 0, FE 1, NF 2, ORE 3, IDLE 4, RXNE 5, TC 6, TXE 7, LBD 8, CTS 9",
+    "RM0090 Rev 22 section 30.6.3 USART_BRR: DIV_Fraction bits 3:0, DIV_Mantissa bits 15:4",
+    "RM0090 Rev 22 section 30.6.4 USART_CR1 per-bit descriptions: RE 2, TE 3, RXNEIE 5, TXEIE 7, PS 9, PCE 10, WAKE 11, M 12, UE 13, OVER8 15",
+    "RM0090 Rev 22 section 30.3.4 (fractional baud rate generation): Tx/Rx baud = fCK / (8 * (2 - OVER8) * USARTDIV), which with OVER8 = 0 is fCK / (16 * USARTDIV); USARTDIV is an unsigned fixed-point number coded in USART_BRR, its fractional part on 4 bits in DIV_Fraction when OVER8 = 0",
+]
+notes = [
+    "Every bit position here is the one the manual's per-bit descriptions give, which state each field's position in prose.",
+    "THE FIXED-POINT DIVISOR COMPUTES THE SAME 16-BIT WORD AS A PLAIN ONE, and a reader will expect otherwise. Splitting USARTDIV into a 12-bit mantissa at 15:4 and a 4-bit fraction at 3:0 IS a Q12.4 encoding, so the register's raw value is 16 * USARTDIV = fCK / baud, rounded. At 16 MHz and 115200 that is 8.68 -> mantissa 8, fraction 11 -> 0x8B, which is the same word the other design's plain divisor produces at the same clock and rate. No separate arithmetic is needed for this line as long as OVER8 is 0.",
+    "AT OVER8 = 1 THE ARITHMETIC DOES DIVERGE: the fraction narrows to 3 bits and bit 3 of BRR must be kept clear, so the raw value is no longer fCK / baud. Nothing here selects 8x oversampling, and this note is why that is a choice rather than an oversight.",
+    "The data register is one address for two directions. A write starts a transmission and a read takes a received byte, so a driver must not read it to inspect state -- reading consumes.",
+    "There is no flag-clear register. TXE clears when the data register is written and RXNE clears when it is read, which is why the sequences below end on the access that services the flag rather than on a clear.",
+]
+
+[registers.SR]
+offset = 0x00
+width = 32
+fields = { PE = [0, 1], FE = [1, 1], NF = [2, 1], ORE = [3, 1], IDLE = [4, 1], RXNE = [5, 1], TC = [6, 1], TXE = [7, 1], LBD = [8, 1], CTS = [9, 1] }
+notes = "Status, at offset 0 where the other ST design puts its control register. TXE = the data register is empty and may be written, TC = transmission complete, RXNE = the data register holds a received byte."
+
+[registers.DR]
+offset = 0x04
+width = 32
+fields = { DR = [0, 9] }
+notes = "One register, two directions: written it is the transmit register, read it is the receive register. Nine bits wide because a 9-data-bit frame is selectable; an 8-bit frame uses bits 7:0."
+
+[registers.BRR]
+offset = 0x08
+width = 32
+fields = { DIV_Fraction = [0, 4], DIV_Mantissa = [4, 12] }
+notes = "The baud divisor as fixed point. With OVER8 = 0 the whole 16-bit value is fCK / baud rounded, because the mantissa/fraction split is a Q12.4 encoding. fCK is the USART's own kernel clock and the APB it sits on differs by instance -- USART1 is on APB2 where USART2 and USART3 are on APB1 -- so the rate is a plan fact established per board; this block states the arithmetic only."
+
+[registers.CR1]
+offset = 0x0C
+width = 32
+fields = { RE = [2, 1], TE = [3, 1], RXNEIE = [5, 1], TXEIE = [7, 1], PS = [9, 1], PCE = [10, 1], WAKE = [11, 1], M = [12, 1], UE = [13, 1], OVER8 = [15, 1] }
+notes = "UE = USART enable, AT BIT 13 rather than bit 0. TE/RE = transmitter/receiver enable. M 0 = 8 data bits. PCE 0 = no parity. OVER8 0 = 16x oversampling, which is what makes BRR a plain divisor."
+
+[registers.CR2]
+offset = 0x10
+width = 32
+fields = { STOP = [12, 2] }
+notes = "STOP[1:0] at bits 13:12: 00 = 1 stop bit, 10 = 2 stop bits. Reset 00 is 8N1's one stop bit."
+
+[registers.CR3]
+offset = 0x14
+width = 32
+fields = { EIE = [0, 1], HDSEL = [3, 1], DMAR = [6, 1], DMAT = [7, 1], RTSE = [8, 1], CTSE = [9, 1] }
+notes = "Flow and DMA control. 0 for a basic polled 8N1 -- no RTS/CTS, no DMA, no half-duplex."
+
+[registers.GTPR]
+offset = 0x18
+width = 32
+fields = { PSC = [0, 8], GT = [8, 8] }
+notes = "Guard time and prescaler, for smartcard and IrDA use. Untouched by an asynchronous 8N1 driver, and stated so the register map is the manual's rather than a subset chosen by one driver's needs."
+
+[parameters]
+divisor = "the composed BRR word: the kernel clock divided by the wanted rate, rounded, which the fixed-point encoding makes a plain 16-bit divisor at 16x oversampling."
+
+# ---- THE ORDER A BYTE GOES OUT AND COMES IN -------------------------------------------------
+#
+# Both sequences END on the access that services the flag, because this design has no flag-clear
+# register: writing the data register is what clears TXE, and reading it is what clears RXNE. A
+# driver that polled, then cleared, then moved data would be writing to a register that does not
+# exist on this line.
+
+[[sequences.tx_byte]]
+op = "poll"
+reg = "SR"
+mask = 0x80
+note = "TXE: the data register is empty, so a write will not overwrite a byte still going out"
+
+[[sequences.tx_byte]]
+op = "write"
+reg = "DR"
+note = "the byte. This write is also what clears TXE"
+
+[[sequences.rx_poll]]
+op = "poll"
+reg = "SR"
+mask = 0x20
+note = "RXNE: a received byte is waiting"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "DR"
+note = "the byte. This read is also what clears RXNE, so it must happen exactly once per flag"

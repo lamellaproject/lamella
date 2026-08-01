@@ -1,0 +1,393 @@
+# PIN map: pin x function -> (instance, signal) for the STM32F7.
+# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers (AF0..AF15) that the
+# AFRL/AFRH nibbles select.
+#
+# THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
+# its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
+#
+# AND THE NUMBER IS NOT UNIFORM PER PERIPHERAL, WHICH IS WHY THAT MATTERS HERE. The quad-SPI
+# interface appears in TWO function columns on this part: AF9 carries its clock and its four data
+# lines, and AF10 carries its chip select. Muxing all six at AF9 leaves chip select on a CAN
+# transmit function instead -- a pin that drives, so nothing is obviously dead, and the flash is
+# simply never selected. The memory controller, by contrast, IS uniform at AF12 across all
+# thirty-eight of its signals below -- but a number belongs to a CELL, so a thirty-ninth signal has
+# to be taken from its own pin's row rather than from that uniformity.
+
+[table]
+kind = "pins"
+family = "stm32f7"
+sources = [
+    "STM32F745xx/STM32F746xx datasheet DS10916 Rev 5, Table 12 'alternate function mapping' (pages 78-87): the AF7 column is headed SPI2/3/USART1/2/3/UART5/SPDIFRX, AF4 is I2C1/2/3/4/CEC, AF9 is CAN1/2/TIM12/13/14/QUADSPI/LCD, AF10 is SAI2/QUADSPI/OTG2_HS/OTG1_FS, and AF12 is FMC/SDMMC1/OTG2_FS",
+    "Every quad-SPI, memory-controller and I2C row here was also exercised on silicon: the flash answered its JEDEC identity and executed code from its memory-mapped window, all eight accessible Mbytes of the SDRAM were swept and held across a refresh, and a device on the I2C bus reported its own part number",
+]
+notes = [
+    "A cell may name more than one signal. The memory controller's bank-address lines share their pins with two of its high address lines (PG4 is FMC_A14/FMC_BA0), and which one the pin carries is decided by the memory type the controller is configured for, not by the mux. The SDRAM rows below state the bank-address reading, which is what an SDRAM configuration makes it.",
+    "The rows are the pins a board here wires, not every cell the part offers. Several signals have alternatives -- SDCKE0 is on PC3 and PH2, and the quad-SPI data lines are on PC9/PC10 as well as PD11/PD12 -- and the board picks; a pin map that listed both would have to be read with a board file in the other hand.",
+]
+
+# --- USART1: the virtual COM port ------------------------------------------------------------
+
+[[pins]]
+pin = "PA9"
+function = "AF7"
+instance = "usart1"
+signal = "tx"
+source = "DS10916 Rev 5 Table 12: PA9's AF7 cell is USART1_TX. Corroborated by Table 10 (pin and ball definition), which lists USART1_TX among PA9's alternate functions"
+
+[[pins]]
+pin = "PB7"
+function = "AF7"
+instance = "usart1"
+signal = "rx"
+source = "DS10916 Rev 5 Table 12: PB7's AF7 cell is USART1_RX"
+
+# --- QUADSPI: five signals at AF9 and ONE AT AF10 ---------------------------------------------
+
+[[pins]]
+pin = "PB2"
+function = "AF9"
+instance = "quadspi"
+signal = "clk"
+source = "DS10916 Rev 5 Table 12 page 79: PB2's AF9 cell is QUADSPI_CLK"
+
+[[pins]]
+pin = "PB6"
+function = "AF10"
+instance = "quadspi"
+signal = "bk1_ncs"
+source = "DS10916 Rev 5 Table 12 page 79: PB6's AF10 cell is QUADSPI_BK1_NCS. THE ONLY AF10 OF THE SIX -- PB6's AF9 cell is CAN2_TX, so a uniform AF9 mux drives a CAN transmitter onto chip select and the flash is never addressed"
+
+[[pins]]
+pin = "PD11"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io0"
+source = "DS10916 Rev 5 Table 12 page 82: PD11's AF9 cell is QUADSPI_BK1_IO0"
+
+[[pins]]
+pin = "PD12"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io1"
+source = "DS10916 Rev 5 Table 12 page 82: PD12's AF9 cell is QUADSPI_BK1_IO1"
+
+[[pins]]
+pin = "PE2"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io2"
+source = "DS10916 Rev 5 Table 12 page 83: PE2's AF9 cell is QUADSPI_BK1_IO2"
+
+[[pins]]
+pin = "PD13"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io3"
+source = "DS10916 Rev 5 Table 12 page 82: PD13's AF9 cell is QUADSPI_BK1_IO3. The four data lines are NOT in pin order -- IO2 sits in another port entirely, between IO1 and IO3"
+
+# --- FMC data bus: sixteen lines, all AF12 ----------------------------------------------------
+
+[[pins]]
+pin = "PD14"
+function = "AF12"
+instance = "fmc"
+signal = "d0"
+source = "DS10916 Rev 5 Table 12 page 83: PD14's AF12 cell is FMC_D0"
+
+[[pins]]
+pin = "PD15"
+function = "AF12"
+instance = "fmc"
+signal = "d1"
+source = "DS10916 Rev 5 Table 12 page 83: PD15's AF12 cell is FMC_D1"
+
+[[pins]]
+pin = "PD0"
+function = "AF12"
+instance = "fmc"
+signal = "d2"
+source = "DS10916 Rev 5 Table 12 page 82: PD0's AF12 cell is FMC_D2"
+
+[[pins]]
+pin = "PD1"
+function = "AF12"
+instance = "fmc"
+signal = "d3"
+source = "DS10916 Rev 5 Table 12 page 82: PD1's AF12 cell is FMC_D3"
+
+[[pins]]
+pin = "PE7"
+function = "AF12"
+instance = "fmc"
+signal = "d4"
+source = "DS10916 Rev 5 Table 12 page 83: PE7's AF12 cell is FMC_D4"
+
+[[pins]]
+pin = "PE8"
+function = "AF12"
+instance = "fmc"
+signal = "d5"
+source = "DS10916 Rev 5 Table 12 page 83: PE8's AF12 cell is FMC_D5"
+
+[[pins]]
+pin = "PE9"
+function = "AF12"
+instance = "fmc"
+signal = "d6"
+source = "DS10916 Rev 5 Table 12 page 83: PE9's AF12 cell is FMC_D6"
+
+[[pins]]
+pin = "PE10"
+function = "AF12"
+instance = "fmc"
+signal = "d7"
+source = "DS10916 Rev 5 Table 12 page 83: PE10's AF12 cell is FMC_D7"
+
+[[pins]]
+pin = "PE11"
+function = "AF12"
+instance = "fmc"
+signal = "d8"
+source = "DS10916 Rev 5 Table 12 page 83: PE11's AF12 cell is FMC_D8"
+
+[[pins]]
+pin = "PE12"
+function = "AF12"
+instance = "fmc"
+signal = "d9"
+source = "DS10916 Rev 5 Table 12 page 83: PE12's AF12 cell is FMC_D9"
+
+[[pins]]
+pin = "PE13"
+function = "AF12"
+instance = "fmc"
+signal = "d10"
+source = "DS10916 Rev 5 Table 12 page 83: PE13's AF12 cell is FMC_D10"
+
+[[pins]]
+pin = "PE14"
+function = "AF12"
+instance = "fmc"
+signal = "d11"
+source = "DS10916 Rev 5 Table 12 page 84: PE14's AF12 cell is FMC_D11"
+
+[[pins]]
+pin = "PE15"
+function = "AF12"
+instance = "fmc"
+signal = "d12"
+source = "DS10916 Rev 5 Table 12 page 84: PE15's AF12 cell is FMC_D12"
+
+[[pins]]
+pin = "PD8"
+function = "AF12"
+instance = "fmc"
+signal = "d13"
+source = "DS10916 Rev 5 Table 12 page 82: PD8's AF12 cell is FMC_D13"
+
+[[pins]]
+pin = "PD9"
+function = "AF12"
+instance = "fmc"
+signal = "d14"
+source = "DS10916 Rev 5 Table 12 page 82: PD9's AF12 cell is FMC_D14"
+
+[[pins]]
+pin = "PD10"
+function = "AF12"
+instance = "fmc"
+signal = "d15"
+source = "DS10916 Rev 5 Table 12 page 82: PD10's AF12 cell is FMC_D15"
+
+# --- FMC address bus: twelve lines, all AF12 --------------------------------------------------
+#
+# A0 to A5 are the port F pins of the same index and A6 to A9 continue at PF12; the run is NOT
+# contiguous, and the break is why each line is a row of its own rather than a base plus a count.
+
+[[pins]]
+pin = "PF0"
+function = "AF12"
+instance = "fmc"
+signal = "a0"
+source = "DS10916 Rev 5 Table 12 page 84: PF0's AF12 cell is FMC_A0"
+
+[[pins]]
+pin = "PF1"
+function = "AF12"
+instance = "fmc"
+signal = "a1"
+source = "DS10916 Rev 5 Table 12 page 84: PF1's AF12 cell is FMC_A1"
+
+[[pins]]
+pin = "PF2"
+function = "AF12"
+instance = "fmc"
+signal = "a2"
+source = "DS10916 Rev 5 Table 12 page 84: PF2's AF12 cell is FMC_A2"
+
+[[pins]]
+pin = "PF3"
+function = "AF12"
+instance = "fmc"
+signal = "a3"
+source = "DS10916 Rev 5 Table 12 page 84: PF3's AF12 cell is FMC_A3"
+
+[[pins]]
+pin = "PF4"
+function = "AF12"
+instance = "fmc"
+signal = "a4"
+source = "DS10916 Rev 5 Table 12 page 84: PF4's AF12 cell is FMC_A4"
+
+[[pins]]
+pin = "PF5"
+function = "AF12"
+instance = "fmc"
+signal = "a5"
+source = "DS10916 Rev 5 Table 12 page 84: PF5's AF12 cell is FMC_A5"
+
+[[pins]]
+pin = "PF12"
+function = "AF12"
+instance = "fmc"
+signal = "a6"
+source = "DS10916 Rev 5 Table 12 page 84: PF12's AF12 cell is FMC_A6"
+
+[[pins]]
+pin = "PF13"
+function = "AF12"
+instance = "fmc"
+signal = "a7"
+source = "DS10916 Rev 5 Table 12 page 85: PF13's AF12 cell is FMC_A7"
+
+[[pins]]
+pin = "PF14"
+function = "AF12"
+instance = "fmc"
+signal = "a8"
+source = "DS10916 Rev 5 Table 12 page 85: PF14's AF12 cell is FMC_A8"
+
+[[pins]]
+pin = "PF15"
+function = "AF12"
+instance = "fmc"
+signal = "a9"
+source = "DS10916 Rev 5 Table 12 page 85: PF15's AF12 cell is FMC_A9"
+
+[[pins]]
+pin = "PG0"
+function = "AF12"
+instance = "fmc"
+signal = "a10"
+source = "DS10916 Rev 5 Table 12 page 85: PG0's AF12 cell is FMC_A10"
+
+[[pins]]
+pin = "PG1"
+function = "AF12"
+instance = "fmc"
+signal = "a11"
+source = "DS10916 Rev 5 Table 12 page 85: PG1's AF12 cell is FMC_A11"
+
+# --- FMC bank address: two lines that share their pins with two address lines ------------------
+
+[[pins]]
+pin = "PG4"
+function = "AF12"
+instance = "fmc"
+signal = "ba0"
+source = "DS10916 Rev 5 Table 12 page 85: PG4's AF12 cell reads FMC_A14/FMC_BA0 -- one cell naming two signals, and an SDRAM configuration makes it the bank-address line"
+
+[[pins]]
+pin = "PG5"
+function = "AF12"
+instance = "fmc"
+signal = "ba1"
+source = "DS10916 Rev 5 Table 12 page 85: PG5's AF12 cell reads FMC_A15/FMC_BA1 -- the bank-address reading, as for PG4"
+
+# --- FMC control: byte lanes, the three SDRAM strobes, clock, clock enable and chip select -----
+
+[[pins]]
+pin = "PE0"
+function = "AF12"
+instance = "fmc"
+signal = "nbl0"
+source = "DS10916 Rev 5 Table 12 page 83: PE0's AF12 cell is FMC_NBL0"
+
+[[pins]]
+pin = "PE1"
+function = "AF12"
+instance = "fmc"
+signal = "nbl1"
+source = "DS10916 Rev 5 Table 12 page 83: PE1's AF12 cell is FMC_NBL1"
+
+[[pins]]
+pin = "PF11"
+function = "AF12"
+instance = "fmc"
+signal = "sdnras"
+source = "DS10916 Rev 5 Table 12 page 84: PF11's AF12 cell is FMC_SDNRAS"
+
+[[pins]]
+pin = "PG15"
+function = "AF12"
+instance = "fmc"
+signal = "sdncas"
+source = "DS10916 Rev 5 Table 12 page 86: PG15's AF12 cell is FMC_SDNCAS"
+
+[[pins]]
+pin = "PH5"
+function = "AF12"
+instance = "fmc"
+signal = "sdnwe"
+source = "DS10916 Rev 5 Table 12 page 86: PH5's AF12 cell is FMC_SDNWE"
+
+[[pins]]
+pin = "PG8"
+function = "AF12"
+instance = "fmc"
+signal = "sdclk"
+source = "DS10916 Rev 5 Table 12 page 85: PG8's AF12 cell is FMC_SDCLK"
+
+[[pins]]
+pin = "PC3"
+function = "AF12"
+instance = "fmc"
+signal = "sdcke0"
+source = "DS10916 Rev 5 Table 12 page 80: PC3's AF12 cell is FMC_SDCKE0. The signal is also on PH2 (page 86); which one exists is a board fact"
+
+[[pins]]
+pin = "PH3"
+function = "AF12"
+instance = "fmc"
+signal = "sdne0"
+source = "DS10916 Rev 5 Table 12 page 86: PH3's AF12 cell is FMC_SDNE0. SDNE0 and SDCKE0 together are what make a fitted device the controller's SDRAM BANK 1 rather than its bank 2"
+
+# --- I2C: four pins, all AF4 ------------------------------------------------------------------
+
+[[pins]]
+pin = "PB8"
+function = "AF4"
+instance = "i2c1"
+signal = "scl"
+source = "DS10916 Rev 5 Table 12 page 79: PB8's AF4 cell is I2C1_SCL"
+
+[[pins]]
+pin = "PB9"
+function = "AF4"
+instance = "i2c1"
+signal = "sda"
+source = "DS10916 Rev 5 Table 12 page 80: PB9's AF4 cell is I2C1_SDA"
+
+[[pins]]
+pin = "PH7"
+function = "AF4"
+instance = "i2c3"
+signal = "scl"
+source = "DS10916 Rev 5 Table 12 page 86: PH7's AF4 cell is I2C3_SCL"
+
+[[pins]]
+pin = "PH8"
+function = "AF4"
+instance = "i2c3"
+signal = "sda"
+source = "DS10916 Rev 5 Table 12 page 87: PH8's AF4 cell is I2C3_SDA"

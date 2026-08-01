@@ -2,11 +2,11 @@
 # orderable package, with FIXED internal wiring -- identical on every board that carries the
 # module. Module wiring is neither samd21 truth nor per-board
 # truth; it lives exactly once, here. Boards name
-# `module = "atsamw25"` and inherit these bindings.
+# `module = "samw25"` and inherit these bindings.
 
 [table]
 kind = "module"
-module = "atsamw25"
+module = "samw25"
 family = "samd21"
 part = "atsamd21g18a"
 sources = [

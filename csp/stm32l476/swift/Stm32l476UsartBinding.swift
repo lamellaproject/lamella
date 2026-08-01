@@ -3,11 +3,42 @@
 // *Bindings enum; the driver never holds a base address, a pin register, or a divisor of its
 // own.
 //
-// The pin-mode and alternate-function words are per-PORT rather than per-pin: this family's
-// USART binding routes its TX and RX pins through ONE MODER read-modify-write and ONE AFRL
-// read-modify-write, because a bound pair sits in the same halves of both registers. That is
-// why a single reg/mask/value triple describes each, and it is the generator's resolution --
-// not an assumption this file is free to make.
+// THE TX AND RX MUX FACTS ARE SEPARATE, one descriptor each, because a USART's two pins need not
+// share anything: they may sit on different GPIO ports, and a pin above 7 takes its
+// alternate-function nibble from a different register than a pin below. Where they do coincide the
+// two descriptors carry the same register address and the driver's two read-modify-writes land on
+// it in turn, ending in the state one combined write would have produced.
+
+/// The resolved mux facts for ONE bound pin: the port clock gate to open, and the two
+/// read-modify-writes that put the pin into alternate-function mode on its function number.
+public struct Stm32l476UsartPinMux {
+    /// The RCC register gating this pin's port clock, and that port's enable bit as a mask.
+    public let portRccEnReg: UInt32
+    public let portRccEnMask: UInt32
+    /// The port's pin-mode register, this pin's field span, and the alternate-function mode value.
+    public let moderReg: UInt32
+    public let moderMask: UInt32
+    public let moderValue: UInt32
+    /// The alternate-function register covering this pin -- AFRL for pins 0..7, AFRH for pins
+    /// 8..15 -- this pin's nibble, and the function selection. Which register it is was decided
+    /// when the binding resolved, so there is no pin arithmetic left here.
+    public let afrReg: UInt32
+    public let afrMask: UInt32
+    public let afrValue: UInt32
+
+    public init(portRccEnReg: UInt32, portRccEnMask: UInt32,
+                moderReg: UInt32, moderMask: UInt32, moderValue: UInt32,
+                afrReg: UInt32, afrMask: UInt32, afrValue: UInt32) {
+        self.portRccEnReg = portRccEnReg
+        self.portRccEnMask = portRccEnMask
+        self.moderReg = moderReg
+        self.moderMask = moderMask
+        self.moderValue = moderValue
+        self.afrReg = afrReg
+        self.afrMask = afrMask
+        self.afrValue = afrValue
+    }
+}
 
 /// The descriptor a STM32L476 USART driver consumes: one binding's resolved values, exactly
 /// the constants a board's generated *Bindings enum carries. A board class constructs it from
@@ -18,40 +49,23 @@ public struct Stm32l476UsartBinding {
     /// The RCC register gating the USART instance's clock, and its enable bit as a mask.
     public let rccEnReg: UInt32
     public let rccEnMask: UInt32
-    /// The RCC register gating the GPIO PORT the pins live on, and its enable bit as a mask.
-    /// A separate bank from the USART's on this family -- that split is a generated fact.
-    public let portRccEnReg: UInt32
-    public let portRccEnMask: UInt32
-    /// The port's pin-mode register, the mask covering the bound pins, and the alternate-function
-    /// mode value for them.
-    public let moderReg: UInt32
-    public let moderMask: UInt32
-    public let moderValue: UInt32
-    /// The port's alternate-function-low register, the mask covering the bound pins, and the
-    /// alternate-function selection for them.
-    public let afrlReg: UInt32
-    public let afrlMask: UInt32
-    public let afrlValue: UInt32
+    /// The transmit and receive pins' mux facts, one descriptor each. A USART's two pins need
+    /// not share anything -- they may sit on different ports, and a pin above 7 takes its
+    /// alternate-function nibble from a different register than a pin below.
+    public let tx: Stm32l476UsartPinMux
+    public let rx: Stm32l476UsartPinMux
     /// The BRR divisor for the binding's wire rate under the board's default clock plan
     /// (plan-derived; never authored).
     public let brrDivisor: UInt32
 
     public init(base: UInt32, rccEnReg: UInt32, rccEnMask: UInt32,
-                portRccEnReg: UInt32, portRccEnMask: UInt32,
-                moderReg: UInt32, moderMask: UInt32, moderValue: UInt32,
-                afrlReg: UInt32, afrlMask: UInt32, afrlValue: UInt32,
+                tx: Stm32l476UsartPinMux, rx: Stm32l476UsartPinMux,
                 brrDivisor: UInt32) {
         self.base = base
         self.rccEnReg = rccEnReg
         self.rccEnMask = rccEnMask
-        self.portRccEnReg = portRccEnReg
-        self.portRccEnMask = portRccEnMask
-        self.moderReg = moderReg
-        self.moderMask = moderMask
-        self.moderValue = moderValue
-        self.afrlReg = afrlReg
-        self.afrlMask = afrlMask
-        self.afrlValue = afrlValue
+        self.tx = tx
+        self.rx = rx
         self.brrDivisor = brrDivisor
     }
 }

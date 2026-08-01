@@ -1,0 +1,137 @@
+# INSTANCE map: where each STM32F7 block copy sits, plus its RCC clock-enable routing.
+# The record carries the enable REGISTER OFFSET as data because ST spreads the gates across banked
+# enable registers that differ per line, so [base, rcc_en_off, rcc_en_bit] states each gate in full.
+# `-1` = the row gates nothing (the RCC itself).
+#
+# This part gates its GPIO ports from AHB1 and USART1 from APB2 -- two different banks, which is
+# exactly why the offset is data rather than a per-family constant.
+
+[table]
+kind = "instances"
+family = "stm32f7"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32F7 reference manual RM0385 Rev 9: memory map (RCC 0x40023800, GPIOA 0x40020000, GPIOB 0x40020400, USART1 0x40011000); RCC_AHB1ENR 5.3.10 (address offset 0x30, GPIOAEN bit 0, GPIOBEN bit 1); RCC_APB2ENR 5.3.14 (address offset 0x44, USART1EN bit 4)",
+    "STM32F7 reference manual RM0385 Rev 9: memory map (FMC control registers 0xA0000000, QUADSPI 0xA0001000); RCC_AHB3ENR 5.3.12 (address offset 0x38, FMCEN bit 0, QSPIEN bit 1). Both rows confirmed on silicon by a cold bring-up of each controller.",
+    "STM32F7 reference manual RM0385 Rev 9: memory map (GPIOC 0x40020800, GPIOD 0x40020C00, GPIOE 0x40021000, GPIOF 0x40021400, GPIOG 0x40021800, GPIOH 0x40021C00); RCC_AHB1ENR 5.3.10 (GPIOCEN bit 2 through GPIOHEN bit 7). Every one of the six ports carries a signal of an external memory proven on silicon.",
+    "STM32F7 reference manual RM0385 Rev 9: memory map (I2C1 0x40005400, I2C3 0x40005C00); RCC_APB1ENR 5.3.13 (address offset 0x40, I2C1EN bit 21, I2C3EN bit 23). Both rows confirmed on silicon by walking every address of each bus.",
+]
+notes = [
+    "Every bit position here is taken from the reference manual's per-bit descriptions rather than from its register bit-map diagram: the diagram is a wide table whose columns do not survive a text conversion, and the per-bit prose states the same fact unambiguously.",
+]
+
+[[instances]]
+name = "usart1"
+block = "usart"
+base = 0x40011000
+rcc_en_off = 0x44   # RCC_APB2ENR
+rcc_en_bit = 4      # USART1EN
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x40020000
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 0      # GPIOAEN
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x40020400
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 1      # GPIOBEN
+
+# THE PORTS AN EXTERNAL MEMORY REACHES ACROSS. A uart binding needs one or two ports; a 16-bit
+# SDRAM on the memory controller needs thirty-eight signals spread over six of them, and a
+# quad-SPI flash a seventh. The port bases are a plain 0x400 stride and the enable bits are the
+# port index, but both are stated per row rather than computed: a family that placed one port
+# elsewhere would break a formula silently, and there is nothing to gain by not writing them down.
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x40020800
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 2      # GPIOCEN
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x40020C00
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 3      # GPIODEN
+
+[[instances]]
+name = "gpioe"
+block = "gpio"
+base = 0x40021000
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 4      # GPIOEEN
+
+[[instances]]
+name = "gpiof"
+block = "gpio"
+base = 0x40021400
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 5      # GPIOFEN
+
+[[instances]]
+name = "gpiog"
+block = "gpio"
+base = 0x40021800
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 6      # GPIOGEN
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x40021C00
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 7      # GPIOHEN
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x40023800
+rcc_en_off = -1
+rcc_en_bit = -1
+
+# The two external-memory controllers. They are placed here without block tables of their own,
+# which the family model allows while a stratum grows: an instance row states WHERE a copy sits
+# and how it is clocked, and a block table states what its registers look like. A board that fits
+# external memory needs the first to name a controller; only a driver needs the second.
+#
+# Both gate from AHB3, which no other instance in this family uses -- the offset being data rather
+# than a per-family constant is what makes that free.
+
+# The two I2C copies a board here binds. THEY GATE FROM APB1, a third bank -- so this family now
+# routes clock enables through AHB1, AHB3, APB1 and APB2, and the enable-register offset being a
+# per-row value rather than a per-family constant is what lets one record schema state all four.
+
+[[instances]]
+name = "i2c1"
+block = "i2c"
+base = 0x40005400
+rcc_en_off = 0x40   # RCC_APB1ENR
+rcc_en_bit = 21     # I2C1EN
+
+[[instances]]
+name = "i2c3"
+block = "i2c"
+base = 0x40005C00
+rcc_en_off = 0x40   # RCC_APB1ENR
+rcc_en_bit = 23     # I2C3EN
+
+[[instances]]
+name = "fmc"
+block = "fmc"
+base = 0xA0000000
+rcc_en_off = 0x38   # RCC_AHB3ENR
+rcc_en_bit = 0      # FMCEN
+
+[[instances]]
+name = "quadspi"
+block = "quadspi"
+base = 0xA0001000
+rcc_en_off = 0x38   # RCC_AHB3ENR
+rcc_en_bit = 1      # QSPIEN

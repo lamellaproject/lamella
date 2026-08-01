@@ -28,6 +28,37 @@ pub struct SerialTransport {
     baud: u32,
 }
 
+/// Show everything that arrives on the carrier when `LAMELLA_WIRE_TRACE` is set.
+///
+/// # Why this is worth a function
+///
+/// **A target's firmware writes its diagnostics to the same line the protocol runs on**, and the frame
+/// reader necessarily DISCARDS anything outside a frame -- resynchronizing is normal operation on a line
+/// that also carries boot chatter. So a board that aborts, prints exactly why, and then fails to recover
+/// looks to every host tool like a board that said nothing at all: **the explanation was transmitted and
+/// thrown away one layer below the code that needed it.**
+///
+/// That is not a defect in the frame reader; it is the cost of sharing the line. The remedy is to make
+/// the discarded bytes visible on request, which is all this does.
+///
+/// Non-printable bytes become `.` rather than being escaped, because the thing being hunted is a
+/// sentence -- a hex dump of a frame with a sentence buried in it is harder to read than the sentence
+/// with the frame bytes flattened.
+#[cfg(feature = "serial")]
+fn trace_received(bytes: &[u8]) {
+    if std::env::var_os("LAMELLA_WIRE_TRACE").is_none() {
+        return;
+    }
+    let rendered: String = bytes
+        .iter()
+        .map(|&byte| match byte {
+            b'\r' | b'\n' | 0x20..=0x7E => char::from(byte),
+            _ => '.',
+        })
+        .collect();
+    eprint!("{rendered}");
+}
+
 #[cfg(feature = "serial")]
 impl SerialTransport {
     /// Open the serial port at `path` (e.g. `"COM5"` / `"/dev/ttyACM0"`) at `baud`. The baud is moot
@@ -83,7 +114,10 @@ impl Transport for SerialTransport {
         let mut buf = [0u8; 512];
         match self.port.read(&mut buf) {
             Ok(0) => {}
-            Ok(n) => self.reader.push(&buf[..n]),
+            Ok(n) => {
+                trace_received(&buf[..n]);
+                self.reader.push(&buf[..n]);
+            }
             Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return Err(TransportError::Carrier),
         }
@@ -345,13 +379,26 @@ pub fn deploy_blocking(
     Err(TransportError::Closed)
 }
 
+/// The largest image slice one `DEPLOY_CHUNK` frame can carry: the frame's `u16` LEN cap, less the
+/// 8-byte `(offset, total)` header this payload puts ahead of the bytes, rounded DOWN to the 512-byte
+/// flash page a chunk must start on.
+///
+/// **This is a bound on silent corruption, not on throughput.** [`lamella_wire::encode_frame`] answers
+/// an over-long payload by DROPPING THE TAIL and CRCing what is left, so the frame stays well formed
+/// and the target cannot tell it received a short chunk.
+///
+/// Not gated behind the carrier features the deploy driver needs, so the arithmetic stays testable
+/// without one.
+pub const CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 512) * 512;
+
 /// Deploy a baked image to flash in CHUNKS, so an image larger than one 64 KB wire frame can cross
 /// the wire (the frame LEN is a `u16`, so a single [`deploy_blocking`] silently truncates a
 /// corlib-baked image). Sends `DEPLOY_CHUNK(offset, total, bytes)` frames in ascending order,
 /// waiting for each `DEPLOY_RESULT` ack before the next; returns whether every chunk verified.
 /// `chunk_len` must be a multiple of the target's flash page (512 B) so each chunk starts on a page
-/// boundary, and leave frame-header room under 64 KB. A single-chunk deploy (image `<= chunk_len`)
-/// is equivalent to a `DEPLOY_IMAGE`, without the truncation risk.
+/// boundary; its UPPER bound is enforced here rather than required of the caller (see
+/// [`CHUNK_DATA_CAP`]). A single-chunk deploy (image `<= chunk_len`) is equivalent to a
+/// `DEPLOY_IMAGE`, without the truncation risk.
 ///
 /// # Errors
 /// Propagates a [`TransportError`], or reports the wire closed if a chunk goes unacked past `timeout`.
@@ -364,6 +411,7 @@ pub fn deploy_chunked_blocking(
     timeout: Duration,
 ) -> Result<bool, TransportError> {
     use lamella_wire::Frame;
+    let chunk_len = chunk_len.clamp(1, CHUNK_DATA_CAP);
     let total = image.len() as u32;
     let mut offset = 0usize;
     while offset < image.len() {
@@ -544,5 +592,67 @@ mod tests {
         let result = try_recv_result(&mut driver, 1).unwrap().expect("a result arrived");
         assert_eq!(result.exit, 7);
         assert_eq!(result.stdout, "hi\n");
+    }
+
+    /// THE DEFECT [`CHUNK_DATA_CAP`] EXISTS FOR, stated so it cannot come back quietly.
+    ///
+    /// `encode_frame` answers an over-long payload by dropping the tail and CRCing what is left, so
+    /// what reaches the target is INDISTINGUISHABLE FROM A GOOD FRAME -- there is no short read to
+    /// notice and no CRC failure to resynchronize on. A `DEPLOY_CHUNK` payload carries 8 bytes of
+    /// `(offset, total)` ahead of the image bytes, and those 8 bytes are what make 65536 -- round, and
+    /// a legal multiple of the 512-byte flash page the doc asks for -- the value that corrupts.
+    #[test]
+    fn an_oversized_chunk_loses_its_tail_and_still_verifies() {
+        let round_trip = |data_len: usize| {
+            let payload = vec![0xA5u8; 8 + data_len];
+            let mut reader = lamella_wire::FrameReader::new();
+            reader.push(&lamella_wire::encode_frame(0x20, 1, &payload));
+            let frame = reader.next_frame().expect("well formed either way -- that is the problem");
+            (payload.len(), frame.payload.len())
+        };
+
+        let (sent, received) = round_trip(65536);
+        assert!(received < sent, "encode_frame no longer truncates -- re-derive CHUNK_DATA_CAP");
+        assert_eq!(received, u16::MAX as usize, "it truncates to the LEN cap and says nothing");
+
+        let (sent, received) = round_trip(CHUNK_DATA_CAP);
+        assert_eq!(sent, received, "a capped chunk must cross whole");
+        assert_eq!(CHUNK_DATA_CAP % 512, 0, "a chunk must still start on a 512-byte flash page");
+    }
+
+    /// The same defect through the REAL deploy loop, which is what the clamp is actually protecting.
+    /// `wire-flash` takes `chunk-bytes` straight off the command line, so 65536 is a value a person
+    /// types. Un-clamped, the first chunk loses 9 bytes, the loop advances `offset` by the full 65536
+    /// regardless, and the image arrives WITH A HOLE while the call still returns `Ok(true)` -- so the
+    /// assertion that matters is coverage, not length.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb"))]
+    fn every_byte_crosses_even_when_the_caller_asks_for_an_oversized_chunk() {
+        let image: Vec<u8> = (0..(2 * 65536 + 777)).map(|i| (i % 251) as u8).collect();
+        let mut transport = MemTransport::new();
+        for _ in 0..8 {
+            transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 3, &[1]));
+        }
+
+        let ok = deploy_chunked_blocking(&mut transport, 3, &image, 65536, Duration::from_secs(5))
+            .expect("the in-memory carrier never errors");
+        assert!(ok, "every chunk acked");
+
+        let mut got = vec![0u8; image.len()];
+        let mut covered = vec![false; image.len()];
+        let mut reader = FrameReader::new();
+        reader.push(&transport.take_sent());
+        while let Some(frame) = reader.next_frame() {
+            if frame.msg_type != deploy::DEPLOY_CHUNK {
+                continue;
+            }
+            let offset = u32::from_le_bytes(frame.payload[0..4].try_into().unwrap()) as usize;
+            for (i, byte) in frame.payload[8..].iter().enumerate() {
+                got[offset + i] = *byte;
+                covered[offset + i] = true;
+            }
+        }
+        assert!(covered.iter().all(|c| *c), "a byte of the image never crossed, and the deploy said OK");
+        assert_eq!(got, image, "the image reassembled wrong");
     }
 }

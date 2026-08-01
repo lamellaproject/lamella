@@ -1,0 +1,23 @@
+# The RISC-V AOT linked image's soft-float support archive: the compiler_builtins soft-float helpers a
+# `double`/`float` op lowers to on the FPU-less RV32IM cores (the libgcc/compiler-rt names -- `__adddf3`,
+# `__fixdfsi`, ... -- NOT ARM's `__aeabi_*`). A STANDALONE crate (own [workspace]) so the host workspace's
+# `crates/*` glob does not adopt this riscv-only staticlib. Built for riscv32im (NO compressed extension):
+# it matches the backend's RV32IM output and keeps RVC relocations out of the archive. Build:
+#   cargo build --release --target riscv32im-unknown-none-elf
+# then link the resulting target/riscv32im-unknown-none-elf/release/liblamella_runtime_support_riscv.a via
+# lamella-link. RV32IM/QEMU-virt only: the members use
+# the M-extension, so an RV32E (CH32V003) image needs an RV32EC-compiled soft-float provider instead.
+[package]
+name = "lamella-runtime-support-riscv"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+[workspace]

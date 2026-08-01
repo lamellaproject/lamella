@@ -16,4 +16,4 @@ package = "64-pin (order-code package suffix deferred to the datasheet)"
 flash = 0
 ram = 0x8000
 pins = ["PA2-PA3"]
-source = "RM0091 (32 Kbytes SRAM; flash 'up to 256 Kbyte' -- exact F091RC size DEFERRED to the DS) -- PARTIAL pin list: complete from the DS as bindings demand"
+source = "RM0091 (32 Kbytes SRAM; flash 'up to 256 Kbyte' -- exact F091RC size DEFERRED to the DS) -- the pin list is PARTIAL rather than the package's full set"

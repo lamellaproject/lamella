@@ -1,0 +1,38 @@
+# PARTS table for the stm32f7 family. Pin lists are PARTIAL present-lists: they carry the pins the
+# boards bind, so validation covers every current binding; completing a list is a transcription task
+# from the datasheet's pin table, never a from-recall transcription.
+#
+# ram: SRAM1 only. This part's RAM is three banks that happen to ABUT -- DTCM (64 KB) at
+# 0x20000000, SRAM1 (240 KB) at 0x20010000, SRAM2 (16 KB) at 0x2004C000, 320 KB in one unbroken
+# span -- but they are different memories on different buses: DTCM is tightly coupled to the core
+# and is not on the bus matrix for every master. The row states the main internal SRAM the manual
+# names; the other two banks are stated when the schema describes banks and something consumes it.
+
+[table]
+kind = "parts"
+family = "stm32f7"
+sources = [
+    "STM32F7 reference manual RM0385 Rev 9: memory map -- DTCM (64 KB) 0x20000000-0x2000FFFF, SRAM1 (240 KB) 0x20010000-0x2004BFFF, SRAM2 (16 KB) 0x2004C000-0x2004FFFF; 2.1 names SRAM1 the 'main internal SRAM'",
+    "STM32F745xx/STM32F746xx datasheet DS10916 Rev 5: the ordering-information scheme -- pin count N = 216 pins, flash size G = 1024 Kbytes, package H = TFBGA -- which is what decodes the STM32F746NGH6 order code",
+]
+
+[[parts]]
+part = "stm32f746ng"
+package = "216-pin TFBGA"
+flash = 0x100000
+ram = 0x3C000
+source = "DS10916 Rev 5 ordering information (N = 216 pins, G = 1024 Kbytes flash, H = TFBGA) + RM0385 Rev 9 memory map (SRAM1 240 KB). The pin list is PARTIAL rather than the package's full set."
+# Every pin the family's map now names, stated as same-port ranges where the run is contiguous.
+# The high ports are the interesting claim -- F, G and H exist only on the larger packages -- and
+# the evidence is not a table reading: an external memory was brought up on this exact part with
+# signals in all of them, which cannot happen through pins the package does not bring out.
+pins = [
+    "PA9",
+    "PB2", "PB6-PB9",
+    "PC3",
+    "PD0-PD1", "PD8-PD15",
+    "PE0-PE2", "PE7-PE15",
+    "PF0-PF5", "PF11-PF15",
+    "PG0-PG1", "PG4-PG5", "PG8", "PG15",
+    "PH3", "PH5", "PH7-PH8",
+]

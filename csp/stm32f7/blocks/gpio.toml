@@ -1,0 +1,72 @@
+# BLOCK layout: the STM32F7 GPIO port block -- the registers a uart binding muxes through.
+# PARTIAL: MODER/AFRL/AFRH fields are stated for the pins bindings claim and grow as more do.
+# Offsets are instance-base-relative; port instance bases live in ../instances.toml.
+#
+# A pin's alternate function is selected in TWO registers, which is the thing to get right: MODER
+# puts the pin in alternate-function MODE (2 bits per pin), and an AFR register selects WHICH
+# function (4 bits per pin). Setting one without the other leaves the pin either driving nothing or
+# driving the wrong peripheral.
+#
+# THREE MORE REGISTERS SHAPE THE PIN ITSELF rather than route it, and a bus can need them as much
+# as it needs the mux. An I2C line must be OPEN DRAIN: a push-pull output cannot be pulled low by
+# the other device, so a target's acknowledge is fought rather than seen, and the controller reads
+# a bus that never answers. A memory signal wants the fastest EDGE the pad can drive. Neither is
+# the mux's business, and neither has a default that suits them.
+
+[table]
+kind = "block"
+family = "stm32f7"
+block = "gpio"
+sources = [
+    "STM32F7 reference manual RM0385 Rev 9: GPIOx_MODER 6.4.1 (address offset 0x00), GPIOx_AFRL 6.4.9 (0x20), GPIOx_AFRH 6.4.10 (0x24)",
+    "STM32F7 reference manual RM0385 Rev 9: GPIOx_OTYPER 6.4.2 (address offset 0x04, one bit per pin, 1 = open drain), GPIOx_OSPEEDR 6.4.3 (0x08, 2 bits per pin, 11 = very high speed), GPIOx_PUPDR 6.4.4 (0x0C, 2 bits per pin, 01 = pull-up)",
+]
+notes = [
+    "GPIO config is read-modify-write: MODER holds 2 bits per pin and an AFR nibble 4, so a pin's field span is cleared before the set value is OR-ed in.",
+    "WHICH AFR register a pin uses is decided by the pin number, not by the function: AFRL covers pins 0..7 and AFRH covers pins 8..15, each with 4 bits per pin counted from its own base. So pin 9's nibble is at bit 4 of AFRH, not at bit 36 of anything.",
+    "The alternate-function MODE value is 10 binary (2), the same on every port and pin.",
+    "OTYPER is the one register here with ONE bit per pin rather than two, so its shift is the pin index itself and not twice it. A rule applied uniformly across these registers is wrong for exactly this one.",
+    "The per-pin field rows below are PARTIAL and deliberately stay that way. A pin's span follows from its index by rule -- 2 bits at [2n], a nibble at [4n] within its own AFR half, one bit at [n] -- and that rule is what composes a binding's words at generation time, so a row per pin would be a second statement of the same arithmetic rather than a new fact.",
+]
+
+[registers.MODER]
+offset = 0x0
+width = 32
+fields = { MODER7 = [14, 2], MODER9 = [18, 2] }
+notes = "Port mode, 2 bits per pin at [2n, 2] (PARTIAL: pins 7 and 9 stated). 10 = alternate function."
+
+[registers.OTYPER]
+offset = 0x4
+width = 32
+fields = { }
+notes = "Output type, ONE bit per pin at [n]: 0 = push-pull (reset), 1 = open drain. An I2C line needs open drain; a mux alone leaves the pin driving both rails."
+
+[registers.OSPEEDR]
+offset = 0x8
+width = 32
+fields = { }
+notes = "Output speed, 2 bits per pin at [2n]: 00 low (reset), 01 medium, 10 high, 11 very high. A slew-rate setting, not a clock -- it does not make a bus faster, it stops a fast bus from being smeared."
+
+[registers.PUPDR]
+offset = 0xC
+width = 32
+fields = { }
+notes = "Pull-up/pull-down, 2 bits per pin at [2n]: 00 none (reset), 01 pull-up, 10 pull-down. An open-drain bus needs a pull somewhere; whether the internal one is enough is a board fact, never this table's."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { AFSEL7 = [28, 4] }
+notes = "Alternate function for pins 0..7, 4 bits per pin at [4n, 4] (PARTIAL: pin 7 stated)."
+
+[registers.AFRH]
+offset = 0x24
+width = 32
+fields = { AFSEL9 = [4, 4] }
+notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4] (PARTIAL: pin 9 stated)."
+
+[constants]
+MODER_MODE_AF = 2
+OTYPER_OPEN_DRAIN = 1
+OSPEEDR_VERY_HIGH = 3
+PUPDR_PULL_UP = 1

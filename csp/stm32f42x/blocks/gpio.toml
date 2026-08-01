@@ -1,0 +1,98 @@
+# BLOCK layout: the STM32F42x GPIO port. Offsets are instance-base-relative; the port bases + RCC
+# enable routing live in ../instances.toml. Every register is 32-bit word-accessible.
+#
+# Cross-block bring-up (RCC enables, pin muxing) is DRIVER code per language; only block-local
+# sequences ride here, and this block has none -- configuring a pin is a read-modify-write of a
+# shared register, which is a driver's job rather than an ordered sequence.
+#
+# THE FIELD LISTS ARE PARTIAL ON PURPOSE. Each of these registers packs all sixteen pins of a port
+# into one word, so a complete field list would be 16 rows per register saying the same thing at a
+# stride. Only the pins a binding actually mux are stated, and the notes give the stride so the rest
+# is derivable rather than absent.
+#
+# ST CARRIES THIS SAME GPIO DESIGN ON SEVERAL LINES, and its registers do agree across them -- which
+# is not a safe thing to assume from that alone: the USART on this very part is a case where two ST
+# lines share a peripheral's name and not its register layout. Every offset and encoding below is
+# this part's manual's.
+
+[table]
+kind = "block"
+family = "stm32f42x"
+block = "gpio"
+sources = [
+    "RM0090 Rev 22 section 8.4 (GPIO registers): GPIOx_MODER 0x00, GPIOx_OTYPER 0x04, GPIOx_OSPEEDR 0x08, GPIOx_PUPDR 0x0C, GPIOx_IDR 0x10, GPIOx_ODR 0x14, GPIOx_BSRR 0x18, GPIOx_LCKR 0x1C, GPIOx_AFRL 0x20, GPIOx_AFRH 0x24",
+    "RM0090 Rev 22 sections 8.4.1 to 8.4.4 per-bit descriptions: MODERy[1:0] at bits 2y with 00 = input (reset state), 01 = general purpose output mode and 10 = alternate function mode; OTy at bit y with 1 = output open-drain; OSPEEDRy[1:0] at bits 2y with 11 = very high speed; PUPDRy[1:0] at bits 2y with 01 = pull-up",
+    "RM0090 Rev 22 sections 8.4.9 and 8.4.10: AFRL selects the alternate function for pins 0 to 7 and AFRH for pins 8 to 15, four bits per pin",
+]
+notes = [
+    "Every bit position and encoding here is the one the manual's per-bit descriptions give, which state each field's position and each value's meaning in prose.",
+    "The manual writes the two-bit fields as 'Bits 2y:2y+1', which reads as though the low bit were the higher-numbered one. It is the ordinary little-endian field at bit 2y; the pin-9 field is bits 19:18 and the mode value 10 means bit 19 set.",
+]
+
+[registers.MODER]
+offset = 0x0
+width = 32
+fields = { MODER9 = [18, 2], MODER10 = [20, 2] }
+notes = "Port mode, 2 bits per pin at [2n, 2] (PARTIAL: pins 9 and 10 stated). 10 = alternate function; 01 = general purpose output; 00 = input, which is the reset state for most pins. The two written modes are both needed by a driver that disconnects one signal of a bus deliberately: alternate function hands the pin to a peripheral, and general purpose output is the only way to hold a level, because a pin left in alternate function mode with nothing driving it floats."
+
+[registers.OTYPER]
+offset = 0x4
+width = 32
+fields = { }
+notes = "Output type, ONE bit per pin at [n]: 0 = push-pull (reset), 1 = open drain. A shared bus needs open drain; a mux alone leaves the pin driving both rails."
+
+[registers.OSPEEDR]
+offset = 0x8
+width = 32
+fields = { }
+notes = "Output speed, 2 bits per pin at [2n]: 00 low (reset), 01 medium, 10 high, 11 very high. A slew-rate setting, not a clock -- it does not make a bus faster, it stops a fast bus from being smeared."
+
+[registers.PUPDR]
+offset = 0xC
+width = 32
+fields = { }
+notes = "Pull-up/pull-down, 2 bits per pin at [2n]: 00 none (reset), 01 pull-up, 10 pull-down. Whether an internal pull is enough for a given bus is a board fact, never this table's."
+
+[registers.IDR]
+offset = 0x10
+width = 32
+fields = { }
+notes = "Input data, ONE bit per pin at [n], read-only. What the pin IS, as opposed to what has been driven onto it -- the two differ exactly when something else is driving, which is what makes it the instrument for asking whether anything is out there."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { }
+notes = "Output data, ONE bit per pin at [n]. Read-modify-write, so two drivers sharing a port can lose each other's writes; BSRR exists to avoid that."
+
+[registers.BSRR]
+offset = 0x18
+width = 32
+fields = { }
+notes = "Bit set/reset: writing 1 to bit n sets pin n, writing 1 to bit n+16 clears it. Atomic per pin, so it needs no read and cannot lose a concurrent write to another pin of the same port."
+
+[registers.LCKR]
+offset = 0x1C
+width = 32
+fields = { }
+notes = "Configuration lock. A correct write sequence freezes a pin's configuration until the next reset, which is a safety feature and a foot-gun; nothing here writes it, and it is stated so the register map is the manual's rather than a subset chosen by one driver's needs."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { }
+notes = "Alternate function for pins 0..7, 4 bits per pin at [4n, 4]. No fields stated: both pins this family's bindings mux are above 7, so they are in AFRH."
+
+[registers.AFRH]
+offset = 0x24
+width = 32
+fields = { AFSEL9 = [4, 4], AFSEL10 = [8, 4] }
+notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4] (PARTIAL: pins 9 and 10 stated). The pin index is relative to 8, so pin 9 is the second nibble and not the tenth."
+
+[constants]
+MODER_MODE_AF = 2
+MODER_MODE_OUTPUT = 1
+MODER_MODE_INPUT = 0
+OTYPER_OPEN_DRAIN = 1
+OSPEEDR_VERY_HIGH = 3
+PUPDR_PULL_UP = 1

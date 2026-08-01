@@ -8,9 +8,9 @@
 # order, and writes them to --out-dir (default `managed/`). Nothing else in the tree is read or
 # written. `build-managed.ps1` is the same build for Windows and produces the same bytes.
 #
-# WHY THIS EXISTS: the sources alone are not enough to reproduce these assemblies. The corlib needs
-# an exact set of capability symbols, and the libraries have a reference order that is not derivable
-# from the files. Both are encoded here.
+# The sources alone are not enough to reproduce these assemblies: the corlib needs an exact set of
+# capability symbols, and the libraries have a reference order that is not derivable from the files.
+# Both are encoded here.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

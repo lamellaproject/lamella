@@ -1,5 +1,5 @@
 # BLOCK layout: the STM32L476 GPIO port block, the registers a uart binding muxes through
-# (PARTIAL -- MODER/AFRL fields grow as bindings demand
+# (PARTIAL -- only the muxed pins' MODER/AFRL fields are stated
 # them). Offsets are instance-base-relative; port instance bases live in
 # ../instances.toml.
 

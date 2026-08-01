@@ -16,4 +16,4 @@ package = "64-pin (order-code package suffix deferred to DS10198)"
 flash = 0x100000
 ram = 0x18000
 pins = ["PA2-PA3"]
-source = "RM0351 (SRAM1 96 KB / SRAM2 32 KB on L47x; flash up to 1 Mbyte) -- PARTIAL pin list: complete from DS10198 as bindings demand"
+source = "RM0351 (SRAM1 96 KB / SRAM2 32 KB on L47x; flash up to 1 Mbyte) -- the pin list is PARTIAL rather than the package's full set"

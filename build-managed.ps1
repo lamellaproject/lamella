@@ -7,11 +7,11 @@
 # in dependency order, and writes them to -OutDir (default `managed/`). Nothing else in the tree
 # is read or written.
 #
-# WHY THIS EXISTS: the sources alone are not enough to reproduce these assemblies. The corlib
-# needs an exact set of capability symbols, and the libraries have a reference order that is not
-# derivable from the files. Both are encoded here.
+# The sources alone are not enough to reproduce these assemblies: the corlib needs an exact set of
+# capability symbols, and the libraries have a reference order that is not derivable from the files.
+# Both are encoded here.
 #
-# THE OUTPUT IS ORDER-STABLE ON PURPOSE. A compiler lays metadata out in the order its sources
+# The output is order-stable by design. A compiler lays metadata out in the order its sources
 # arrive, and directory enumeration order differs between operating systems and even between
 # PowerShell hosts -- so the file list is SORTED before it is passed. Without that, the same
 # sources on two machines produce assemblies of identical length and entirely different bytes.

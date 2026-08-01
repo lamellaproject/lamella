@@ -1,0 +1,157 @@
+# INSTANCE map: where each STM32F42x block copy sits, plus its RCC clock-enable routing.
+# The record carries the enable REGISTER OFFSET as data because ST spreads the gates across banked
+# enable registers that differ per line, so [base, rcc_en_off, rcc_en_bit] states each gate in full.
+# `-1` = the row gates nothing (the RCC itself).
+#
+# THE REFERENCE MANUAL DOCUMENTS TWO RCC BLOCKS AND ONLY ONE OF THEM IS THIS PART'S. Its section 6
+# is "Reset and clock control for STM32F42xxx and STM32F43xxx"; its section 7 is the same thing for
+# STM32F405xx/07xx and STM32F415xx/17xx. Every offset and bit below is from SECTION 6. The two
+# sections state overlapping register names at overlapping offsets, so reading the wrong one
+# produces a table that looks entirely plausible and gates the wrong peripherals.
+
+[table]
+kind = "instances"
+family = "stm32f42x"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "RM0090 Rev 22 memory map (Table 1, register boundary addresses): RCC 0x40023800, GPIOA 0x40020000, GPIOB 0x40020400, GPIOC 0x40020800, GPIOD 0x40020C00, GPIOE 0x40021000, GPIOF 0x40021400, GPIOG 0x40021800, USART1 0x40011000",
+    "RM0090 Rev 22 section 6.3.10 RCC_AHB1ENR (address offset 0x30): GPIOAEN bit 0, GPIOBEN bit 1, GPIOCEN bit 2, GPIODEN bit 3, GPIOEEN bit 4, GPIOFEN bit 5, GPIOGEN bit 6, GPIOHEN bit 7, GPIOIEN bit 8, GPIOJEN bit 9, GPIOKEN bit 10",
+    "RM0090 Rev 22 section 6.3.14 RCC_APB2ENR (address offset 0x44): USART1EN bit 4",
+    "RM0090 Rev 22 memory map: USART2 0x40004400, the USB OTG full-speed core 0x50000000, the embedded-flash interface 0x40023C00. Section 6.3.13 RCC_APB1ENR (address offset 0x40) gives USART2EN bit 17 and section 6.3.11 RCC_AHB2ENR (address offset 0x34) gives OTGFSEN bit 7",
+    "RM0090 Rev 22 memory map: the FMC control registers at 0xA0000000. Section 6.3.12 RCC_AHB3ENR (address offset 0x38) gives FMCEN bit 0",
+]
+notes = [
+    "Every bit position here is the one the reference manual's per-bit descriptions give, which name each enable bit and its position in prose.",
+    "The port bases are a plain 0x400 stride and the enable bits are the port index, but both are stated per row rather than computed. A family that placed one port elsewhere would break a formula silently, and there is nothing to gain by not writing them down.",
+]
+
+# The virtual COM port's USART. It gates from APB2 while the GPIO ports gate from AHB1, which is
+# exactly why the enable-register offset is data rather than a per-family constant.
+
+[[instances]]
+name = "usart1"
+block = "usart"
+base = 0x40011000
+rcc_en_off = 0x44   # RCC_APB2ENR
+rcc_en_bit = 4      # USART1EN
+
+# A SECOND PERIPHERAL ON THE SAME ENABLE REGISTER, AND THE BIT IS NOWHERE NEAR THE FIRST. SPI5 sits
+# at bit 20 of the register whose bit 4 is USART1, which is why an enable is a (register, bit) pair
+# per instance rather than an index a driver could compute from a peripheral number.
+[[instances]]
+name = "spi5"
+block = "spi"
+base = 0x40015000
+rcc_en_off = 0x44   # RCC_APB2ENR
+rcc_en_bit = 20     # SPI5EN
+
+# PORT A CARRIES BOTH PINS OF A TWO-PIN SERIAL BINDING, so one port row is enough for a greeting.
+# Ports join this table when something reaches them, not because the package has them.
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x40020000
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 0      # GPIOAEN
+
+# THE SIX PORTS AN EXTERNAL MEMORY REACHES ACROSS. A serial binding needs one or two ports; a 16-bit
+# SDRAM on the memory controller needs thirty-eight signals spread over six of them. The bases are a
+# plain 0x400 stride and the enable bits are the port index, but both are stated per row rather than
+# computed: a family that placed one port elsewhere would break a formula silently, and there is
+# nothing to gain by not writing them down.
+#
+# ALL SIX GATE FROM ONE REGISTER, which is a fact about this family and not a rule. A driver that
+# enables a bus's ports reads six offsets and may find them equal; it may not assume they are.
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x40020400
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 1      # GPIOBEN
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x40020800
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 2      # GPIOCEN
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x40020C00
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 3      # GPIODEN
+
+[[instances]]
+name = "gpioe"
+block = "gpio"
+base = 0x40021000
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 4      # GPIOEEN
+
+[[instances]]
+name = "gpiof"
+block = "gpio"
+base = 0x40021400
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 5      # GPIOFEN
+
+[[instances]]
+name = "gpiog"
+block = "gpio"
+base = 0x40021800
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 6      # GPIOGEN
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x40023800
+rcc_en_off = -1
+rcc_en_bit = -1
+
+# THREE MORE PLACED INSTANCES, none of them reached by the binding above. A second USART, the USB
+# full-speed core and the embedded-flash interface are copies this part carries wherever they are
+# driven from, so they are stated here for the same reason every other row is.
+#
+# With them the family now gates through FOUR banks -- AHB1, AHB2, APB1 and APB2 -- which is the
+# whole reason the enable-register offset is a per-row value rather than a per-family constant.
+
+[[instances]]
+name = "usart2"
+block = "usart"
+base = 0x40004400
+rcc_en_off = 0x40   # RCC_APB1ENR
+rcc_en_bit = 17     # USART2EN
+
+[[instances]]
+name = "otg_fs"
+block = "otg-fs"
+base = 0x50000000
+rcc_en_off = 0x34   # RCC_AHB2ENR
+rcc_en_bit = 7      # OTGFSEN
+
+# The embedded-flash interface gates NOTHING, and that is a fact rather than an omission: this
+# family's RCC has no flash-interface enable bit at all, so the block is always clocked. A row that
+# invented one would describe a register field the part does not have.
+
+[[instances]]
+name = "flash"
+block = "flash"
+base = 0x40023C00
+rcc_en_off = -1
+rcc_en_bit = -1
+
+# The memory controller, for a board that fits external memory. It gates from AHB3, a fifth bank that
+# nothing else in this family uses -- which is free precisely because the enable register is a per-row
+# value.
+
+[[instances]]
+name = "fmc"
+block = "fmc"
+base = 0xA0000000
+rcc_en_off = 0x38   # RCC_AHB3ENR
+rcc_en_bit = 0      # FMCEN

@@ -1,0 +1,153 @@
+# BLOCK layout: the STM32F7 I2C, controller mode. Offsets are instance-base-relative; instance
+# bases + RCC enable routing live in ../instances.toml. Every register is 32-bit word-accessible.
+#
+# Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
+# sequences ride here.
+#
+# THIS IS NOT THE I2C AN OLDER ST PART CARRIES, and the difference is not a detail. The older
+# design sets its bit rate through a CCR divisor and a TRISE rise-time register; THIS ONE HAS
+# NEITHER. It has a single TIMINGR holding a prescaler and four separately programmed counts, and
+# it drives the whole transfer from CR2 -- the target address, the byte count, the direction and
+# the START are one word, and the controller issues the stop itself. A driver written against the
+# older register map does not fail to compile against this one; it writes to reserved addresses
+# and waits on flags that never set. The same family's USART set exactly this trap, with the same
+# answer: the newer ST lines share this design, and the register map was still read from THIS
+# part's own manual.
+#
+# The register set below is what a CONTROLLER-MODE driver touches. Own-address, timeout and PEC
+# registers exist on this block and are deliberately absent: a table states what a driver reads
+# and writes, and a row nothing has ever needed is a fact nobody has checked.
+
+[table]
+kind = "block"
+family = "stm32f7"
+block = "i2c"
+sources = [
+    "STM32F7 reference manual RM0385 Rev 9: I2C register map + per-register descriptions (section 30.9) -- CR1 0x00, CR2 0x04, TIMINGR 0x10, ISR 0x18, ICR 0x1C, RXDR 0x24, TXDR 0x28; bit positions from the per-bit descriptions (CR1 PE 0, ANFOFF 12, DNF 11:8; CR2 SADD 9:0, RD_WRN 10, START 13, STOP 14, NACK 15, NBYTES 23:16, RELOAD 24, AUTOEND 25; ISR TXE 0, TXIS 1, RXNE 2, NACKF 4, STOPF 5, TC 6, BUSY 15)",
+    "STM32F7 reference manual RM0385 Rev 9 section 30.4.10, Table 186 (timing settings for an 8 MHz kernel clock) and Table 187 (16 MHz): the PRESC/SCLDEL/SDADEL/SCLH/SCLL counts that produce a bus compliant with the bus specification at 100 kHz and at 400 kHz",
+]
+notes = [
+    "TIMINGR may only be written while PE = 0, so a rate change is disable-write-enable and not a live edit. The block's `init` sequence is written in that order for that reason.",
+    "THE TIMING COUNTS ARE STATED AS FIELDS, NEVER AS A COMPOSED WORD. Which point a board runs at depends on its kernel-clock rate, and the composition is generation's job -- a table carrying the assembled 32-bit value would be carrying a divisor, and a divisor is derived from a (rate, plan) pair rather than written down.",
+    "The counts come from the manual's own tables rather than from the timing formulas, which is a deliberate narrowing: the formulas need bus rise and fall times, which are a BOARD's electrical property (bus capacitance and pull-up strength) and not a chip fact. The tabulated points are the ones the manual states are compliant.",
+    "A transfer is described by ONE write to CR2 -- address, direction, byte count, and the automatic stop -- and then a byte at a time through TXDR/RXDR. There is no separate start-condition register and no address register: an address written anywhere else is written to the wrong place.",
+    "NBYTES is 8 bits, so a transfer longer than 255 bytes is a RELOAD sequence rather than one command. A driver that ignores RELOAD works up to 255 and then silently truncates.",
+]
+
+[registers.CR1]
+offset = 0x0
+width = 32
+fields = { PE = [0, 1], TXIE = [1, 1], RXIE = [2, 1], ADDRIE = [3, 1], NACKIE = [4, 1], STOPIE = [5, 1], TCIE = [6, 1], ERRIE = [7, 1], DNF = [8, 4], ANFOFF = [12, 1], TXDMAEN = [14, 1], RXDMAEN = [15, 1], SBC = [16, 1], NOSTRETCH = [17, 1], GCEN = [19, 1], SMBHEN = [20, 1], SMBDEN = [21, 1], ALERTEN = [22, 1], PECEN = [23, 1] }
+notes = "PE = peripheral enable. The filter fields (ANFOFF, DNF) and every mode bit above them are 0 at reset, which is what a plain controller wants, so PE alone is a complete enable."
+
+[registers.CR2]
+offset = 0x4
+width = 32
+fields = { SADD = [0, 10], RD_WRN = [10, 1], ADD10 = [11, 1], HEAD10R = [12, 1], START = [13, 1], STOP = [14, 1], NACK = [15, 1], NBYTES = [16, 8], RELOAD = [24, 1], AUTOEND = [25, 1], PECBYTE = [26, 1] }
+notes = "The whole transfer request. A 7-bit target address sits in SADD[7:1], NOT SADD[6:0] -- the field is laid out for 10-bit addressing and a 7-bit address is shifted up one, which is the single most common way to address the wrong device by a factor of two. RD_WRN 1 = read. AUTOEND 1 makes the controller issue the STOP after NBYTES."
+
+[registers.TIMINGR]
+offset = 0x10
+width = 32
+fields = { SCLL = [0, 8], SCLH = [8, 8], SDADEL = [16, 4], SCLDEL = [20, 4], PRESC = [28, 4] }
+notes = "Bus timing, all counts in prescaled kernel-clock periods: tPRESC = (PRESC + 1) x tI2CCLK, then SCL low and high for (SCLL + 1) and (SCLH + 1) of those. Writable only while PE = 0."
+
+[registers.ISR]
+offset = 0x18
+width = 32
+fields = { TXE = [0, 1], TXIS = [1, 1], RXNE = [2, 1], ADDR = [3, 1], NACKF = [4, 1], STOPF = [5, 1], TC = [6, 1], TCR = [7, 1], BERR = [8, 1], ARLO = [9, 1], OVR = [10, 1], PECERR = [11, 1], TIMEOUT = [12, 1], ALERT = [13, 1], BUSY = [15, 1], DIR = [16, 1], ADDCODE = [17, 7] }
+notes = "Status. TXIS = the transmit register wants the next byte; RXNE = a received byte is waiting; TC = the requested count is done (with AUTOEND clear); NACKF = the target did not acknowledge, which is also what an ABSENT device looks like and is therefore the answer a bus scan reads. TXE resets SET, so a driver waiting for it to become 1 before the first byte waits for something already true."
+
+[registers.ICR]
+offset = 0x1C
+width = 32
+fields = { ADDRCF = [3, 1], NACKCF = [4, 1], STOPCF = [5, 1], BERRCF = [8, 1], ARLOCF = [9, 1], OVRCF = [10, 1], PECCF = [11, 1], TIMOUTCF = [12, 1], ALERTCF = [13, 1] }
+notes = "Write-1-to-clear for the matching ISR flag. NACKF and STOPF are the two a scan must clear between addresses, or the next address inherits the previous one's answer."
+
+[registers.RXDR]
+offset = 0x24
+width = 32
+fields = { RXDATA = [0, 8] }
+notes = "Receive data (read). Reading it clears ISR.RXNE."
+
+[registers.TXDR]
+offset = 0x28
+width = 32
+fields = { TXDATA = [0, 8] }
+notes = "Transmit data (write when ISR.TXIS is set)."
+
+[parameters]
+timing = "the composed TIMINGR word for this instance's kernel-clock rate and the bus rate, which generation derives from the counts in [constants]."
+request = "the composed CR2 word: the shifted target address, the byte count, the direction, and the automatic stop."
+tx_byte = "the byte to transmit (write to TXDR once ISR.TXIS is set)."
+
+[constants]
+# The manual's own compliant operating points, one field per row so nothing here is a composed
+# word. The two kernel-clock rates are the two the manual tabulates; a board running at a third
+# rate needs its point ADDED with a source rather than interpolated. The counts do not scale with
+# the clock: the two 400 kHz points below describe the same bus rate and still differ in SDADEL.
+TIMING_100K_8MHZ_PRESC = 0x1
+TIMING_100K_8MHZ_SCLDEL = 0x4
+TIMING_100K_8MHZ_SDADEL = 0x2
+TIMING_100K_8MHZ_SCLH = 0xF
+TIMING_100K_8MHZ_SCLL = 0x13
+TIMING_400K_8MHZ_PRESC = 0x0
+TIMING_400K_8MHZ_SCLDEL = 0x3
+TIMING_400K_8MHZ_SDADEL = 0x1
+TIMING_400K_8MHZ_SCLH = 0x3
+TIMING_400K_8MHZ_SCLL = 0x9
+TIMING_100K_16MHZ_PRESC = 0x3
+TIMING_100K_16MHZ_SCLDEL = 0x4
+TIMING_100K_16MHZ_SDADEL = 0x2
+TIMING_100K_16MHZ_SCLH = 0xF
+TIMING_100K_16MHZ_SCLL = 0x13
+TIMING_400K_16MHZ_PRESC = 0x1
+TIMING_400K_16MHZ_SCLDEL = 0x3
+TIMING_400K_16MHZ_SDADEL = 0x2
+TIMING_400K_16MHZ_SCLH = 0x3
+TIMING_400K_16MHZ_SCLL = 0x9
+
+# The block-local bring-up. Three steps, and the ORDER is the whole content: TIMINGR is read-only
+# while the peripheral is enabled, so an enable before the timing write leaves the bus running at
+# the reset timing -- which is every count zero, a clock the specification does not describe.
+
+[[sequences.init]]
+op = "write"
+reg = "CR1"
+value = 0x0
+note = "PE = 0. TIMINGR may only be written while the peripheral is disabled"
+
+[[sequences.init]]
+op = "write"
+reg = "TIMINGR"
+value = "$timing"
+
+[[sequences.init]]
+op = "write"
+reg = "CR1"
+value = 0x1
+note = "PE = 1"
+
+# One transfer, controller mode. The request is a single CR2 write; the bytes follow it.
+
+[[sequences.write_byte]]
+op = "poll"
+reg = "ISR"
+mask = 0x2
+note = "TXIS: the transmit register is asking for the next byte"
+
+[[sequences.write_byte]]
+op = "write"
+reg = "TXDR"
+value = "$tx_byte"
+
+[[sequences.read_byte]]
+op = "poll"
+reg = "ISR"
+mask = 0x4
+note = "RXNE: a byte has been received"
+
+[[sequences.read_byte]]
+op = "read"
+reg = "RXDR"
+mask = 0xFF

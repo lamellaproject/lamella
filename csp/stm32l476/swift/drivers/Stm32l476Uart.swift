@@ -45,20 +45,21 @@ public struct Stm32l476Uart {
     /// Clock order matters: a peripheral's registers do not retain writes while its bus clock
     /// is gated, so both enables precede every other write here.
     public func initialize() {
-        // Clocks: the GPIO port and the USART sit on DIFFERENT RCC banks on this family; both
-        // registers and both bit masks are generated facts, so this reads the same for any
-        // board of the family.
-        Mmio.write32(binding.portRccEnReg,
-                     Mmio.read32(binding.portRccEnReg) | binding.portRccEnMask)
+        // Clocks: the GPIO ports and the USART sit on DIFFERENT RCC banks on this family; every
+        // register and bit mask is a generated fact, so this reads the same for any board of the
+        // family. Each pin gets its own port gate because the two need not share a port; when
+        // they do, the second write is a no-op over the first rather than a special case.
+        Mmio.write32(binding.tx.portRccEnReg,
+                     Mmio.read32(binding.tx.portRccEnReg) | binding.tx.portRccEnMask)
+        Mmio.write32(binding.rx.portRccEnReg,
+                     Mmio.read32(binding.rx.portRccEnReg) | binding.rx.portRccEnMask)
         Mmio.write32(binding.rccEnReg,
                      Mmio.read32(binding.rccEnReg) | binding.rccEnMask)
 
         // Pins: alternate-function mode, then which alternate function. Masked writes so the
         // port's other pins keep their configuration.
-        Mmio.write32(binding.moderReg,
-                     (Mmio.read32(binding.moderReg) & ~binding.moderMask) | binding.moderValue)
-        Mmio.write32(binding.afrlReg,
-                     (Mmio.read32(binding.afrlReg) & ~binding.afrlMask) | binding.afrlValue)
+        mux(binding.tx)
+        mux(binding.rx)
 
         // Configure while disabled, then enable. The divisor is only latched out of reset with
         // UE clear, so CR1 is cleared first even if this image did not set it.
@@ -67,6 +68,15 @@ public struct Stm32l476Uart {
         Mmio.write32(cr1, Stm32l476UsartLayout.CR1_UE
                         | Stm32l476UsartLayout.CR1_TE
                         | Stm32l476UsartLayout.CR1_RE)
+    }
+
+    /// One pin into alternate-function mode: clear each field span, then set. Which
+    /// alternate-function register this pin uses was decided when the binding resolved.
+    private func mux(_ pin: Stm32l476UsartPinMux) {
+        Mmio.write32(pin.moderReg,
+                     (Mmio.read32(pin.moderReg) & ~pin.moderMask) | pin.moderValue)
+        Mmio.write32(pin.afrReg,
+                     (Mmio.read32(pin.afrReg) & ~pin.afrMask) | pin.afrValue)
     }
 
     /// Sends one byte, waiting (bounded) for the transmit register to have room first.

@@ -1,0 +1,44 @@
+# PARTS table for the STM32F42x family.
+#
+# The pin present-list is PARTIAL: it names forty of the package's 144 pins, so a consumer must not
+# read it as the package. Each entry is either one pin or an inclusive same-port run, and every pin
+# inside a run is a pin this part is established to carry -- a range reaching over a pin that is not
+# would claim the package rather than state what the part is known to have.
+#
+# flash = 0x200000 (2 MB) is DUAL BANK -- 2 x 1 MB, with 128 KB sectors in each bank's upper part.
+# That is not decoration: a firmware and the image it loads have to tile ONE bank rather than the
+# whole part, so the linker gate holds that arithmetic. RM0090 gives the layout as a 2-Mbyte dual
+# bank organization for this line and states that dual bank exists only on its 1 MB and 2 MB devices.
+#
+# ram = 0x30000 (192 KB) is the CONTIGUOUS SRAM, which this part reaches as three blocks at one
+# base -- SRAM1 112 KB, SRAM2 16 KB, SRAM3 64 KB, running 0x2000 0000 to 0x2002 FFFF with no gap.
+# The 64 KB CCM data RAM is NOT in that figure: it sits at 0x1000 0000 on the Cortex-M4's own data
+# bus, so a linker script cannot treat the two as one region. The 4 KB backup SRAM is excluded for
+# the same reason -- it lives in the backup domain.
+#
+# THE FAMILY NAME COVERS TWO LINES THAT SHARE A DEVICE ID AND DIFFER IN PERIPHERALS. RM0090 gives
+# DEV_ID 0x419 for STM32F42xxx and STM32F43xxx alike, so the identity register cannot tell them
+# apart. What separates them is the peripheral set, and the manual draws that line per section: its
+# cryptographic-processor and hash-processor sections each state that they apply to "STM32F415/417xx
+# and STM32F43xxx devices", which is to say not to this part. A row here is one part a board proves.
+
+[table]
+kind = "parts"
+family = "stm32f42x"
+
+[[parts]]
+part = "stm32f429zi"
+package = "LQFP144"
+flash = 0x200000
+ram = 0x30000
+pins = [
+    "PA0",
+    "PA9-PA10",
+    "PB5-PB6",
+    "PC0",
+    "PD0-PD1", "PD8-PD10", "PD14-PD15",
+    "PE0-PE1", "PE7-PE15",
+    "PF0-PF5", "PF7-PF9", "PF11-PF15",
+    "PG0-PG1", "PG4-PG5", "PG8", "PG13-PG15",
+]
+source = "STM32F427xx/STM32F429xx datasheet (production data): STM32F429ZI is an order code of the STM32F429xx line, LQFP144 is one of its packages, and the line carries flash memory up to 2 Mbyte with up to 256 Kbytes of SRAM and up to 4 Kbytes of backup SRAM. RM0090 gives that SRAM as main SRAM1 112 KB plus auxiliary SRAM2 16 KB plus auxiliary SRAM3 64 KB, and its embedded-SRAM memory map places SRAM1 at 0x20000000 to 0x2001BFFF and SRAM2 at 0x2001C000 to 0x2001FFFF, leaving the three contiguous to 0x2002FFFF. The fitted part answers F_SIZE 0x0800 at 0x1FFF7A22, which is 2048 Kbytes, and DBGMCU_IDCODE 0x20036419 at 0xE0042000, which is DEV_ID 0x419 with REV_ID 0x2003; the image the board shipped with placed its initial stack pointer at 0x2002F080, inside the third block and 3968 bytes below the top of the contiguous region. The pin list is PARTIAL rather than the package's 144: it names the forty pins a binding or a pin-map row reaches. DS9405 Rev 13 Table 12 carries a row for every one of them, and UM1670 Rev 6 Table 7 gives each an LQFP144 pin number -- PA9 is 101 and PA10 is 102, while the memory controller's thirty-eight run from PF0 at pin 10 to PE1 at pin 142, which is why no arithmetic over pin numbers reproduces this list either."

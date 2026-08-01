@@ -18,4 +18,4 @@ package = "module-carried (order code lands with the module CSP)"
 flash = 0
 ram = 0x80000
 pins = ["GPIO16", "GPIO17"]
-source = "ESP32-C6 TRM ch 4 (internal memory: 512 KB HP SRAM) -- PARTIAL pin list: complete from the datasheet pinout as bindings demand"
+source = "ESP32-C6 TRM ch 4 (internal memory: 512 KB HP SRAM) -- the pin list is PARTIAL rather than the package's full set"

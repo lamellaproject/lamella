@@ -1,0 +1,52 @@
+# The AOT linked image's runtime-support object: lamella_gc_alloc + the compiler_builtins soft-float
+# helpers the backend's float ops emit. A STANDALONE crate (own [workspace]) so the host workspace's
+# `crates/*` glob does not adopt this thumbv6m-only staticlib. Build:
+#   cargo build --release --target thumbv6m-none-eabi
+# then link the resulting target/thumbv6m-none-eabi/release/liblamella_runtime_support.a via lamella-link
+# (the AOT crate's object-link verification example drives exactly this path).
+[package]
+name = "lamella-runtime-support"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+# The networking + TLS C-ABI layer (feature `net`): the same NetBackend/TlsBackend stacks
+# the interpreter binds, exported as lamella_net_* / lamella_tls_* archive members. Pulled
+# in HERE as a dependency (never as a second staticlib) so the image keeps exactly one
+# panic handler and one set of lang items.
+lamella-runtime-support-net = { path = "../../../crates/lamella-runtime-support-net", optional = true }
+
+[features]
+# The console_sink knob: where an AOT image's `Console.Write*` bytes GO. Every console entry point
+# in this archive bottoms out in one `console_put`, so a tier picks the destination here and the
+# program is untouched -- the interpreter=AOT-preview contract, where the sink is a deployment
+# property and never a property of the code.
+#
+# DEFAULT is semihosting, which is what QEMU and a debugger-attached board want, and what every
+# existing harness expects (a default build is byte-identical to before this knob existed). It is
+# also the WRONG default for a deployed board: semihosting is a `bkpt` serviced by a debugger, so on
+# BARE SILICON with nothing attached it HardFaults. That is the whole reason the knob exists.
+#
+# `console-board` routes to `lamella_board_console_putc`, which the IMAGE supplies -- a board's
+# console is a board fact (which UART, which pins, which baud) and this archive is built once per
+# ISA for every board, so it must not name one. Selecting it without providing the symbol fails the
+# LINK rather than silently picking a peripheral the board does not have.
+#
+# `console-none` drops the bytes: the headless exit-code-only tier.
+default = ["console-semihosting"]
+console-semihosting = []
+console-board = []
+console-none = []
+net = ["dep:lamella-runtime-support-net"]
+# TLS entry points too (the vendored mbedTLS C cross-build; wants an ARM GCC on the path).
+tls = ["net", "lamella-runtime-support-net/tls"]
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+[workspace]

@@ -1,0 +1,207 @@
+# BLOCK layout: the STM32F7 memory controller, SDRAM half. Offsets are instance-base-relative;
+# the instance base + RCC enable routing live in ../instances.toml. Every register is 32-bit
+# word-accessible.
+#
+# Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
+# sequences ride here.
+#
+# THE SDRAM HALF ONLY. This controller also drives NOR flash, PSRAM, SRAM and NAND, each through
+# its own register set at its own offsets, and none of those are here. A table states what a
+# driver reads and writes; a register nothing has needed is a fact nobody has checked.
+#
+# WHAT MAKES THIS BLOCK DIFFERENT FROM EVERY OTHER ONE IN THE FAMILY: a dynamic memory is not
+# configured, it is INITIALIZED. There is an order, it has a settling delay in the middle of it,
+# and one of its steps writes a register inside the memory device rather than inside the chip. A
+# controller that is merely configured correctly and never taken through that order drives a
+# memory that answers reads for a while and then decays, because nothing has started its refresh
+# -- which is a failure that passes every quick test.
+#
+# THE ORDER IS CHIP TRUTH AND THE DEVICE IS NOT, and the manual draws that line itself: three of
+# its own steps say "refer to the SDRAM datasheet" for the number, and those are exactly the three
+# numbers that ride a board's memory region rather than this table.
+
+[table]
+kind = "block"
+family = "stm32f7"
+block = "fmc"
+sources = [
+    "STM32F7 reference manual RM0385 Rev 9: SDRAM controller registers (section 13.8.5) -- SDCR1 0x140, SDCR2 0x144, SDTR1 0x148, SDTR2 0x14C, SDCMR 0x150, SDRTR 0x154, SDSR 0x158; bit positions from the per-bit descriptions (SDCR NC 1:0, NR 3:2, MWID 5:4, NB 6, CAS 8:7, WP 9, SDCLK 11:10, RBURST 12, RPIPE 14:13; SDTR TMRD 3:0 through TRCD 27:24; SDCMR MODE 2:0, CTB2 3, CTB1 4, NRFS 8:5, MRD 21:9; SDRTR CRE 0, COUNT 13:1, REIE 14; SDSR RE 0, MODES1 2:1, MODES2 4:3, BUSY 5)",
+    "STM32F7 reference manual RM0385 Rev 9 section 13.8.3 'SDRAM initialization': the nine-step order, its settling delay, and the three steps that defer to the memory device's own datasheet",
+    "STM32F7 reference manual RM0385 Rev 9 section 13.8.5, FMC_SDRTR: COUNT = (SDRAM refresh period / number of rows) - 20, a count of at least 41 SDRAM clock cycles, and the requirement that it not equal TWR + TRP + TRC + TRCD + 4",
+    "STM32F7 reference manual RM0385 Rev 9 Figure 34 (FMC memory banks): SDRAM bank 1 at 0xC0000000 and bank 2 at 0xD0000000, four times 64 Mbytes each. Confirmed by sweeping every accessible word of a fitted device in bank 1",
+]
+notes = [
+    "SDCR1 and SDTR1 are not simply 'bank 1's copy'. Several of their fields are the CONTROLLER's rather than the bank's and are read-only in the bank-2 copy: the clock configuration, the read burst, the read pipe, and the row-precharge and row-cycle timings. A board with one bank never notices; a board with two that programs them per bank finds half its settings ignored.",
+    "The geometry fields are all OFFSETS from the smallest legal value, never the value itself. Column bits are 8 plus the field, row bits are 11 plus the field, and the bus width is 8 shifted left by it. Writing 8 into a field that means 8 columns gives a device with sixteen times the columns it has, and every address above the first row aliases.",
+    "CAS latency is the exception: the field IS the cycle count (1, 2 or 3), and 0 is reserved. So a device's CAS number is written directly where its column count is not, in adjacent fields of one register.",
+    "SDCLK is stated in HCLK PERIODS, not in a frequency or a divisor: 2 means the SDRAM clock's period is twice the AHB clock's, so the memory runs at half the bus. It reads like a multiplier and behaves like a divisor.",
+    "THE REFRESH COUNT IS DERIVED, NEVER STATED. The formula is this block's (the manual gives it, with a 20-cycle margin it requires and a floor of 41), the retention specification is the fitted device's, and the clock is the board's plan. Any one of the three written down as a constant is wrong at the other two's next value.",
+    "The command register issues a command to whichever banks its target bits name, and a command naming NEITHER bank is silently ignored -- so a bring-up that forgets the target bit runs its whole sequence, reports no error, and initializes nothing.",
+    "The mode-register field carries a word that is written INSIDE the memory device, not into the controller. It is the one value in this block's registers that the chip's own manual cannot tell you.",
+    "SDTR's timings are cycle counts at the SDRAM clock, each one less than the number of cycles (0 means one cycle). Their VALUES are the fitted device's nanosecond figures converted at the plan's clock -- the same derivation as the refresh count, from the same two inputs.",
+]
+
+[registers.SDCR1]
+offset = 0x140
+width = 32
+fields = { NC = [0, 2], NR = [2, 2], MWID = [4, 2], NB = [6, 1], CAS = [7, 2], WP = [9, 1], SDCLK = [10, 2], RBURST = [12, 1], RPIPE = [13, 2] }
+notes = "Bank 1's geometry, plus the controller-wide clock, read-burst and read-pipe settings that live only in this copy. Reset 0x000002D0."
+
+[registers.SDCR2]
+offset = 0x144
+width = 32
+fields = { NC = [0, 2], NR = [2, 2], MWID = [4, 2], NB = [6, 1], CAS = [7, 2], WP = [9, 1], SDCLK = [10, 2], RBURST = [12, 1], RPIPE = [13, 2] }
+notes = "Bank 2's geometry. Its clock, burst and pipe fields are read-only -- the same bit positions, without the same meaning."
+
+[registers.SDTR1]
+offset = 0x148
+width = 32
+fields = { TMRD = [0, 4], TXSR = [4, 4], TRAS = [8, 4], TRC = [12, 4], TWR = [16, 4], TRP = [20, 4], TRCD = [24, 4] }
+notes = "Bank 1's timings in SDRAM clock cycles, each field one less than the count. TRP and TRC live only in this copy and describe the controller, so a two-device board programs them for the SLOWER device. Reset 0x0FFFFFFF, which is every timing at its maximum."
+
+[registers.SDTR2]
+offset = 0x14C
+width = 32
+fields = { TMRD = [0, 4], TXSR = [4, 4], TRAS = [8, 4], TRC = [12, 4], TWR = [16, 4], TRP = [20, 4], TRCD = [24, 4] }
+notes = "Bank 2's timings. Its TRP and TRC fields are ignored, and a board with one bank must leave its TWR at the reset value rather than clearing the register."
+
+[registers.SDCMR]
+offset = 0x150
+width = 32
+fields = { MODE = [0, 3], CTB2 = [3, 1], CTB1 = [4, 1], NRFS = [5, 4], MRD = [9, 13] }
+notes = "One command, issued the moment MODE is written. CTB1/CTB2 choose which banks receive it and a command naming neither is ignored. NRFS is the auto-refresh burst length minus one. MRD is the word loaded into the memory device's own mode register."
+
+[registers.SDRTR]
+offset = 0x154
+width = 32
+fields = { CRE = [0, 1], COUNT = [1, 13], REIE = [14, 1] }
+notes = "The refresh timer. COUNT is a 13-bit reload value counted down at the SDRAM clock; zero means no refresh is carried out at all, which is the value the register resets to. Programming it starts the timer, and it must not be reprogrammed afterwards."
+
+[registers.SDSR]
+offset = 0x158
+width = 32
+fields = { RE = [0, 1], MODES1 = [1, 2], MODES2 = [3, 2], BUSY = [5, 1] }
+notes = "Status. BUSY means the controller has not finished the last command, so it is what every step of the initialization waits on. RE is a refresh error, and it is the only place a memory that has quietly stopped refreshing says so."
+
+[constants]
+# Geometry, stated as the FIELD VALUES the manual defines rather than as the numbers they mean.
+# Every one of these is an offset from the smallest legal case, which is the trap in this register.
+SDCR_NC_8_COLUMN_BITS = 0
+SDCR_NC_9_COLUMN_BITS = 1
+SDCR_NC_10_COLUMN_BITS = 2
+SDCR_NC_11_COLUMN_BITS = 3
+SDCR_NR_11_ROW_BITS = 0
+SDCR_NR_12_ROW_BITS = 1
+SDCR_NR_13_ROW_BITS = 2
+SDCR_MWID_8 = 0
+SDCR_MWID_16 = 1
+SDCR_MWID_32 = 2
+SDCR_NB_TWO = 0
+SDCR_NB_FOUR = 1
+# CAS is the exception: the field is the cycle count itself, and 0 is reserved.
+SDCR_CAS_1 = 1
+SDCR_CAS_2 = 2
+SDCR_CAS_3 = 3
+# The clock, in HCLK PERIODS. There is no "same as HCLK" setting.
+SDCR_SDCLK_DISABLED = 0
+SDCR_SDCLK_HCLK_PERIODS_2 = 2
+SDCR_SDCLK_HCLK_PERIODS_3 = 3
+# The commands, in the order a bring-up issues them.
+SDCMR_MODE_NORMAL = 0
+SDCMR_MODE_CLOCK_ENABLE = 1
+SDCMR_MODE_PRECHARGE_ALL = 2
+SDCMR_MODE_AUTO_REFRESH = 3
+SDCMR_MODE_LOAD_MODE = 4
+SDCMR_MODE_SELF_REFRESH = 5
+SDCMR_MODE_POWER_DOWN = 6
+# The refresh-count formula's own two chip-side terms. The margin is not optional: the manual
+# requires it so an internal refresh request that collides with an accepted read still has room.
+SDRTR_COUNT_MARGIN = 20
+SDRTR_COUNT_MIN = 41
+# THE TWO SDRAM WINDOWS. These are the second statement of a number a board that fits a device
+# here also has to know, and the two are held equal at generation time rather than trusted to
+# agree. Which one a board has follows from which chip-select and clock-enable line is wired.
+SDRAM_BANK1_BASE = 0xC0000000
+SDRAM_BANK2_BASE = 0xD0000000
+
+[parameters]
+geometry = "the composed SDCR word: the fitted device's column and row bits, bus width, bank count and CAS latency, plus the clock and read-burst choices."
+timing = "the composed SDTR word: the fitted device's timings, converted from nanoseconds to cycles at this plan's SDRAM clock."
+mode_register = "the word to load into the memory device's own mode register, shifted into MRD."
+refresh_count = "the refresh reload value, derived from the device's retention specification and this plan's SDRAM clock."
+settle_us = "the delay the memory device requires after its clock starts, in microseconds. A device fact; the manual states only that one is needed and gives a typical figure."
+refresh_burst = "the number of consecutive auto-refresh commands the device requires, minus one."
+
+# ---- THE BRING-UP ORDER ----------------------------------------------------------------------
+#
+# The manual's own nine-step initialization, with its ninth step (the extended mode register of a
+# mobile device) absent because it applies to a class of device rather than to this controller.
+#
+# THREE OF THESE STEPS TAKE A NUMBER THE CHIP'S MANUAL CANNOT SUPPLY, and the manual says so at
+# each one: the settling delay, the auto-refresh burst length, and the mode-register word. That is
+# not a gap in this table -- it is the seam. Each of those is a `$parameter` here and a fact on
+# the board's memory region, because it is a property of the DEVICE that was fitted.
+#
+# `settle` is the one step that is not a register access. It cannot be folded into the step after
+# it: the delay is measured from the clock starting, and the clock starts on the step before.
+
+[[sequences.init]]
+op = "write"
+reg = "SDCR1"
+value = "$geometry"
+note = "the device's shape, plus the clock and read-burst settings that live only in this copy"
+
+[[sequences.init]]
+op = "write"
+reg = "SDTR1"
+value = "$timing"
+note = "the device's timings, in cycles of the clock configured above"
+
+[[sequences.init]]
+op = "poll"
+reg = "SDSR"
+mask = 0x20
+want = 0
+note = "BUSY clear before the first command"
+
+[[sequences.init]]
+op = "write"
+reg = "SDCMR"
+value = 0x11
+note = "MODE = clock enable, target bank 1. This starts the clock to the memory; the device is not yet ready to be commanded"
+
+[[sequences.init]]
+op = "delay"
+value = "$settle_us"
+note = "the device's required settling period, from its own datasheet. The one step here that touches no register, and the one a bring-up that works on a warm reset will appear not to need"
+
+[[sequences.init]]
+op = "write"
+reg = "SDCMR"
+value = 0x12
+note = "MODE = precharge all, target bank 1"
+
+[[sequences.init]]
+op = "write"
+reg = "SDCMR"
+value = "$refresh_burst"
+note = "MODE = auto-refresh, target bank 1, with the device's required burst length in NRFS"
+
+[[sequences.init]]
+op = "write"
+reg = "SDCMR"
+value = "$mode_register"
+note = "MODE = load mode register, target bank 1, with the device's mode word in MRD. This writes a register INSIDE the memory, and it must agree with the CAS latency configured above"
+
+[[sequences.init]]
+op = "poll"
+reg = "SDSR"
+mask = 0x20
+want = 0
+note = "BUSY clear: the mode-register load has reached the device"
+
+[[sequences.init]]
+op = "write"
+reg = "SDRTR"
+value = "$refresh_count"
+note = "the refresh timer, which starts counting on this write. THE MEMORY IS NOT USABLE UNTIL THIS STEP, and it does not say so -- reads succeed and then decay"

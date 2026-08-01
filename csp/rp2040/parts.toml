@@ -17,4 +17,4 @@ package = "QFN-56"
 flash = 0
 ram = 0x42000
 pins = ["GP0", "GP1"]
-source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- PARTIAL pin list: complete from the datasheet pinout as bindings demand"
+source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- the pin list is PARTIAL rather than the package's full set"
