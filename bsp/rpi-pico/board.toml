@@ -1,0 +1,61 @@
+# BOARD binding: the Raspberry Pi Pico / Pico H. Board truth
+# ONLY: role bindings, the carrier, and the clock plan. Chip truth lives in csp/rp2040/.
+
+[table]
+kind = "board"
+board = "pico"
+vendor = "raspberry-pi"
+family = "rp2040"
+part = "rp2040"
+board_model = 13            # lamella_wire::board_model::PICO
+sources = ["Raspberry Pi Pico datasheet (pinout: GP0/GP1 on header pins 1/2; 12 MHz crystal)"]
+
+[memory]                    # the RP2040 has NO internal flash (chip flash = 0,
+flash = 0x200000            # gate-pinned) -- the 2 MB QSPI chip it XIPs from is BOARD truth.
+source = "Raspberry Pi Pico datasheet (2 MB on-board QSPI flash, W25Q16)"
+
+[[carriers]]
+kind = "uart"               # a bare-UART Link carrier: the wire rides the uart0 binding
+role = "uart0"              # through an EXTERNAL bridge (RPi Debug Probe, any USB-UART
+baud = 115200               # dongle) -- no board-fixed USB identity to state.
+plan = "xosc-12mhz"
+default = true
+
+[[carriers]]
+kind = "native-usb"         # the SECOND wire: the chip's own USB device controller
+plan = "pll-125-48"         # driverless WinUSB, no bridge and no jumpers. It runs at a
+                            # DIFFERENT operating point from the uart wire above -- the
+                            # controller needs clk_usb = 48 MHz, which the crystal alone
+                            # cannot make -- so the two carriers here name two plans.
+
+[[bindings]]
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+[[plans]]
+name = "xosc-12mhz"
+default = true
+source = "xosc"
+xosc_hz = 12000000          # the Pico's soldered crystal
+clk_peri_hz = 12000000      # clk_peri rides AUXSRC xosc directly (no divider) -- the
+                            # generator verifies this equality (state-and-verify)
+
+[[plans]]                   # the native-USB operating point. STATE-AND-VERIFY: this row
+name = "pll-125-48"         # states both the chosen divisors and the rates they produce,
+source = "pll_sys + pll_usb"  # and generation refuses unless hz == xosc * fbdiv / (p1 * p2).
+xosc_hz = 12000000
+clk_sys_hz = 125000000      # 12 MHz * 125 / (6 * 2), VCO 1500 MHz -- the RP2040's rated
+pll_sys_fbdiv = 125         # speed, kept above clk_usb so the POLLED controller is
+pll_sys_postdiv1 = 6        # serviced fast enough for a Full Speed host.
+pll_sys_postdiv2 = 2
+clk_usb_hz = 48000000       # 12 MHz * 100 / (5 * 5), VCO 1200 MHz -- the rate the USB
+pll_usb_fbdiv = 100         # device controller requires.
+pll_usb_postdiv1 = 5
+pll_usb_postdiv2 = 5
+clk_peri_hz = 12000000      # DELIBERATELY UNTOUCHED: the usb bring-up leaves clk_peri on
+                            # the crystal, so the uart keeps its exact 12 MHz divisor and a
+                            # board running the usb wire still talks to a bridge at 115200.

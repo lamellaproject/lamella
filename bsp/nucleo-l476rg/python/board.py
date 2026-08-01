@@ -3,6 +3,7 @@
 
 BOARD = "nucleo-l476rg"
 BOARD_MODEL = 8
+BOARD_VENDOR = "St"
 
 # Role handles: the ONLY peripheral names an app sees. The value of a
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
@@ -24,21 +25,29 @@ FACTS = {
         "base": 0x40004400,
         "rcc_en_reg": 0x40021058,
         "rcc_en_mask": 0x20000,
-        "port_rcc_en_reg": 0x4002104C,
-        "port_rcc_en_mask": 0x1,
-        "moder_reg": 0x48000000,
-        "moder_mask": 0xF0,
-        "moder_value": 0xA0,
-        "afrl_reg": 0x48000020,
-        "afrl_mask": 0xFF00,
-        "afrl_value": 0x7700,
-        "pclk1_hz": 4000000,
+        "pclk_hz": 4000000,
+        "tx_port_rcc_en_reg": 0x4002104C,
+        "tx_port_rcc_en_mask": 0x1,
+        "tx_moder_reg": 0x48000000,
+        "tx_moder_mask": 0x30,
+        "tx_moder_value": 0x20,
+        "tx_afr_reg": 0x48000020,
+        "tx_afr_mask": 0xF00,
+        "tx_afr_value": 0x700,
+        "rx_port_rcc_en_reg": 0x4002104C,
+        "rx_port_rcc_en_mask": 0x1,
+        "rx_moder_reg": 0x48000000,
+        "rx_moder_mask": 0xC0,
+        "rx_moder_value": 0x80,
+        "rx_afr_reg": 0x48000020,
+        "rx_afr_mask": 0xF000,
+        "rx_afr_value": 0x7000,
         "brr_115200_msi_4mhz": 0x23,
     },
 }
 
 PLANS = {
-    "msi-4mhz": {"default": True, "source": "msi", "msi_hz": 4000000, "pclk1_hz": 4000000},
+    "msi-4mhz": {"default": True, "source": "msi", "msi_hz": 4000000, "pclk_hz": 4000000},
 }
 
 # On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/

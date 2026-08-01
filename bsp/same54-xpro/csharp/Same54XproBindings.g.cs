@@ -6,5 +6,6 @@ namespace Lamella.Generated
         private Same54XproBindings() { }
 
         public const int BOARD_MODEL = 4;
+        public const string BOARD_VENDOR = "Microchip";
     }
 }

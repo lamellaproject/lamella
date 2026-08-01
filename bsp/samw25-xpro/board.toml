@@ -1,4 +1,4 @@
-# The SAM W25 Xplained Pro: carries the ATSAMW25 module (csp/atsamw25/ -- a SAMD21G18A
+# The SAM W25 Xplained Pro: carries the ATSAMW25 module (csp/samw25/ -- a SAMD21G18A
 # host + WINC1500, module wiring inherited from module.toml). Its EDBG VCP is SERCOM4 on
 # PB10/PB11, pinmux function D: SERCOM3 transmits with nothing crossing the EDBG, and a host
 # feeding the VCP wiggles PB11, not PA23.
@@ -6,7 +6,8 @@
 [table]
 kind = "board"
 board = "samw25-xpro"
-module = "atsamw25"
+vendor = "microchip"
+module = "samw25"
 board_model = 6
 sources = [
     "SAM W25 Xplained Pro user guide 42463A (kit identity); the VCP routing is this board's own SERCOM4/PB10/PB11 wiring, which supersedes that guide's VCP table",

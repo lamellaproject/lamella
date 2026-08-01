@@ -8,6 +8,7 @@
 public enum Samd21XproBindings {
     // -- identity --
     public static let BOARD_MODEL: UInt16 = 5
+    public static let BOARD_VENDOR: String = "Microchip"
     public static let CARRIER_USB_VID: UInt16 = 0x03EB
     public static let CARRIER_USB_PID: UInt16 = 0x2169
 

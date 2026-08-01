@@ -6,6 +6,7 @@
 [table]
 kind = "board"
 board = "sam4s-xpro"
+vendor = "microchip"
 family = "sam4s"
 part = "atsam4sd32c"
 board_model = 3             # lamella_wire::board_model::SAM4S_XPLAINED_PRO

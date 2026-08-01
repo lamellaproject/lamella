@@ -9,6 +9,7 @@
 [table]
 kind = "board"
 board = "esp32c6-devkitc"
+vendor = "espressif"
 family = "esp32c6"
 part = "esp32c6"
 board_model = 14            # lamella_wire::board_model::ESP32_C6

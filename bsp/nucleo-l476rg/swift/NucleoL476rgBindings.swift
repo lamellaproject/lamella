@@ -8,19 +8,28 @@
 public enum NucleoL476rgBindings {
     // -- identity --
     public static let BOARD_MODEL: UInt16 = 8
+    public static let BOARD_VENDOR: String = "St"
 
     // -- VCP: an st-usart binding descriptor --
     public static let VCP_BASE: UInt32 = 0x40004400
     public static let VCP_RCC_EN_REG: UInt32 = 0x40021058
     public static let VCP_RCC_EN_MASK: UInt32 = 0x20000
-    public static let VCP_PORT_RCC_EN_REG: UInt32 = 0x4002104C
-    public static let VCP_PORT_RCC_EN_MASK: UInt32 = 0x1
-    public static let VCP_MODER_REG: UInt32 = 0x48000000
-    public static let VCP_MODER_MASK: UInt32 = 0xF0
-    public static let VCP_MODER_VALUE: UInt32 = 0xA0
-    public static let VCP_AFRL_REG: UInt32 = 0x48000020
-    public static let VCP_AFRL_MASK: UInt32 = 0xFF00
-    public static let VCP_AFRL_VALUE: UInt32 = 0x7700
-    public static let VCP_PCLK1_HZ: UInt32 = 4000000
+    public static let VCP_TX_PORT_RCC_EN_REG: UInt32 = 0x4002104C
+    public static let VCP_TX_PORT_RCC_EN_MASK: UInt32 = 0x1
+    public static let VCP_TX_MODER_REG: UInt32 = 0x48000000
+    public static let VCP_TX_MODER_MASK: UInt32 = 0x30
+    public static let VCP_TX_MODER_VALUE: UInt32 = 0x20
+    public static let VCP_TX_AFR_REG: UInt32 = 0x48000020
+    public static let VCP_TX_AFR_MASK: UInt32 = 0xF00
+    public static let VCP_TX_AFR_VALUE: UInt32 = 0x700
+    public static let VCP_RX_PORT_RCC_EN_REG: UInt32 = 0x4002104C
+    public static let VCP_RX_PORT_RCC_EN_MASK: UInt32 = 0x1
+    public static let VCP_RX_MODER_REG: UInt32 = 0x48000000
+    public static let VCP_RX_MODER_MASK: UInt32 = 0xC0
+    public static let VCP_RX_MODER_VALUE: UInt32 = 0x80
+    public static let VCP_RX_AFR_REG: UInt32 = 0x48000020
+    public static let VCP_RX_AFR_MASK: UInt32 = 0xF000
+    public static let VCP_RX_AFR_VALUE: UInt32 = 0x7000
+    public static let VCP_PCLK_HZ: UInt32 = 4000000
     public static let VCP_BRR_115200_MSI_4MHZ: UInt32 = 0x23
 }

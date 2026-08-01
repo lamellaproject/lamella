@@ -3,6 +3,7 @@
 
 BOARD = "esp32c6-devkitc"
 BOARD_MODEL = 14
+BOARD_VENDOR = "Espressif"
 
 # Role handles: the ONLY peripheral names an app sees. The value of a
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS

@@ -5,6 +5,7 @@
 [table]
 kind = "board"
 board = "samd21-xpro"
+vendor = "microchip"
 family = "samd21"
 part = "atsamd21j18a"
 board_model = 5

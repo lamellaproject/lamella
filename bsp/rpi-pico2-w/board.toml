@@ -1,0 +1,107 @@
+# BOARD binding: the Raspberry Pi Pico 2 W. The same RP2350A +
+# header wiring as the plain Pico 2, plus the board-soldered CYW43439 wireless chip -- named
+# here the way samw25-xpro names the WINC, as device records: the CYW is board-soldered,
+# not an orderable module, so its wiring stays in this board file. Its gSPI is a
+# BIT-BANGED shared-line wire through the SIO block (no hardware spi instance to bind), so
+# the record is the four control lines; the C# driver story joins with its first consumer.
+
+[table]
+kind = "board"
+board = "pico2-w"
+vendor = "raspberry-pi"
+family = "rp2350"
+part = "rp2350a"
+board_model = 10            # lamella_wire::board_model::PICO2_W
+sources = ["Raspberry Pi Pico 2 W datasheet (4 MB flash key-features list; p.9 wireless wiring) + the Pico 2 W schematic"]
+
+[memory]                    # chip flash = 0 (external XIP, gate-pinned); the
+flash = 0x400000            # soldered 4 MB QSPI chip is BOARD truth.
+source = "Pico 2 W datasheet key-features list ('RP2350 microcontroller with 4 MB of flash memory'). Conflict note: the same PDF's circuitry paragraph names 'Winbond W25Q16JV' -- a 2 Mbyte order code, a stale Pico W carry-over conflicting with the doc's own 4 MB statement -- so the chip NAME is deliberately not carried as fact."
+
+[[carriers]]
+kind = "native-usb"         # the chip's own USB device controller -- no bridge, and so no
+                            # board-fixed bridge identity to state.
+plan = "pll-150-48"
+default = true
+
+[[carriers]]
+kind = "uart"               # the SECOND wire: the debug-bridge UART, riding the uart0
+role = "uart0"              # binding through an EXTERNAL bridge (RPi Debug Probe, any
+baud = 115200               # USB-UART dongle) at the SAME operating point as the usb wire.
+plan = "pll-150-48"         # the same plan the usb carrier names: both wires run at this
+                            # one operating point.
+
+[[bindings]]
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+[[bindings]]
+role = "spi0"
+kind = "spi"
+instance = "spi0"
+function = "F1"
+mosi = { pin = "GP19" }
+sck = { pin = "GP18" }
+miso = { pin = "GP16" }
+cs = { pin = "GP17" }
+
+[[bindings]]
+role = "i2c0"
+kind = "i2c"
+instance = "i2c0"
+function = "F3"
+sda = { pin = "GP4" }
+scl = { pin = "GP5" }
+
+[[bindings]]
+role = "adc"
+kind = "adc"
+instance = "adc"
+reference_uv = 3300000
+source = "ADC_VREF/ADC_AVDD ride the board's filtered 3V3 rail (the Pico 2 family's shared analogue design). GP29/channel 3 additionally serves the wireless wiring on this board (below) -- the W's VSYS-monitor arrangement differs from the plain board's."
+
+# --- The CYW43439's fixed control lines (Pico 2 W datasheet p.9 + schematic). The DATA
+#     line is a SHARED half-duplex DI/DO/IRQ line and CLK is a clock: neither has an
+#     asserted level, so no `active` is stated (the WINC module_pins precedent). ---
+
+[[devices]]
+name = "cyw43439-wl-reg-on"
+pin = "GP23"
+active = "high"
+source = "Pico 2 W datasheet p.9 + schematic: WL_REG_ON = GPIO23 (the chip's power-on/regulator enable, driven high to power it)"
+
+[[devices]]
+name = "cyw43439-data"
+pin = "GP24"
+source = "Pico 2 W datasheet p.9 + schematic: the gSPI DATA line (DI + DO + IRQ share GPIO24)"
+
+[[devices]]
+name = "cyw43439-cs"
+pin = "GP25"
+active = "low"
+source = "Pico 2 W datasheet p.9 + schematic: gSPI CS = GPIO25 (active low)"
+
+[[devices]]
+name = "cyw43439-clk"
+pin = "GP29"
+source = "Pico 2 W datasheet p.9 + schematic: gSPI CLK = GPIO29"
+
+[[plans]]
+name = "pll-150-48"
+default = true
+source = "xosc"
+xosc_hz = 12000000
+clk_peri_hz = 12000000
+clk_sys_hz = 150000000
+clk_usb_hz = 48000000
+clk_adc_hz = 48000000
+pll_sys_fbdiv = 125
+pll_sys_postdiv1 = 5
+pll_sys_postdiv2 = 2
+pll_usb_fbdiv = 100
+pll_usb_postdiv1 = 5
+pll_usb_postdiv2 = 5

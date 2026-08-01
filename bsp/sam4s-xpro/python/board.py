@@ -3,6 +3,7 @@
 
 BOARD = "sam4s-xpro"
 BOARD_MODEL = 3
+BOARD_VENDOR = "Microchip"
 
 # Role handles: the ONLY peripheral names an app sees. The value of a
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS

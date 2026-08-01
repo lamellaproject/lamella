@@ -1,7 +1,7 @@
-// Lamella.Boards.Samw25Xpro -- the SAM W25 Xplained Pro (ATSAMW25 module: a SAMD21G18A host +
+// Lamella.Boards.Microchip.Samw25Xpro -- the SAM W25 Xplained Pro (ATSAMW25 module: a SAMD21G18A host +
 using Lamella.Generated;
 
-namespace Lamella.Boards
+namespace Lamella.Boards.Microchip
 {
     public sealed class Samw25Xpro
     {

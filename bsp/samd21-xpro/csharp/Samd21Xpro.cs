@@ -1,7 +1,7 @@
-// Lamella.Boards.Samd21Xpro -- the plain SAM D21 Xplained Pro (ATSAMD21J18A). Its EDBG VCP is
+// Lamella.Boards.Microchip.Samd21Xpro -- the plain SAM D21 Xplained Pro (ATSAMD21J18A). Its EDBG VCP is
 using Lamella.Generated;
 
-namespace Lamella.Boards
+namespace Lamella.Boards.Microchip
 {
     public sealed class Samd21Xpro
     {

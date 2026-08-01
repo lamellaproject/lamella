@@ -1,0 +1,182 @@
+# BOARD binding: the ST STM32F429I-DISC1. Board truth ONLY: role bindings, the carrier, and the
+# clock plan. Chip truth lives in csp/stm32f42x/.
+#
+# The VCP is the only BUS role stated, beside the memory region and the three plain-GPIO controls
+# below. The board carries a great deal more -- a 2.4" QVGA TFT LCD with a capacitive touch panel, a
+# MEMS gyroscope on its own SPI, USB OTG -- and none of it is here, because a board file states what
+# a binding resolves rather than what the hardware has.
+#
+# BOTH VCP PINS ARE ON ONE PORT, so this binding resolves from port A alone.
+#
+# AND THIS BOARD'S VCP IS GATED BY TWO SOLDER BRIDGES WHOSE DEFAULT DEPENDS ON THE REVISION. SB11
+# (PA9) and SB15 (PA10) connect USART1 to the on-board debugger. Their default is ON for the
+# STM32F429I-DISC1 and OFF for the earlier 32F429IDISCOVERY, so the same binding is live on one
+# revision and dead on the other with nothing in the silicon to say which. A host seeing the
+# debugger's virtual COM port enumerate learns nothing about it: that endpoint exists either way.
+
+[table]
+kind = "board"
+board = "stm32f429i-disco"
+vendor = "st"
+family = "stm32f42x"
+part = "stm32f429zi"
+board_model = 21            # lamella_wire::board_model::STM32F429I_DISCO
+sources = [
+    "Discovery kit user manual UM1670 Rev 6 section 7.3.3 (VCP configuration): the ST-LINK/V2-B supports a virtual COM port on U2 pins 12 and 13, connected to the target's USART1 (PA9, PA10) through the SB11 and SB15 solder bridges",
+    "UM1670 Rev 6 Table 7 (STM32 pin description versus board functions): the VCP column gives PA9 = USART1_TX at LQFP144 pin 101 and PA10 = USART1_RX at pin 102, and both pins are unused in every other board-function column",
+    "UM1670 Rev 6 introduction: the kit is the STM32F429 Discovery (32F429IDISCOVERY / STM32F429I-DISC1) and its microcontroller is the STM32F429ZIT6",
+]
+notes = [
+    "UM1670 states this bus twice -- in its VCP-configuration prose and in its pin table -- and the two agree, so neither had to be preferred over the other.",
+]
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-B bridge (a vendor carrier kind); its fixed
+role = "vcp"                # USB identity is stated once host tooling pins the ids with evidence.
+baud = 115200
+plan = "hsi-16mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart1"
+function = "AF7"
+tx = { pin = "PA9" }
+rx = { pin = "PA10" }
+
+# THE OPERATING POINT IS THE PART'S OWN RESET STATE, DELIBERATELY, because this board's external
+# oscillator arrangement is selected by solder bridges: the manual gives four configurations -- the
+# debugger's 8 MHz clock output, an on-board crystal, an external clock through a connector pin, or
+# no external oscillator at all -- and which one a given unit is built for is not readable from
+# silicon. The internal oscillator is present in every one of them, so a plan that uses it holds
+# whatever the bridges say. A faster plan is a later addition that has to state which arrangement it
+# assumes.
+
+# --- external memory -----------------------------------------------------------------------
+#
+# ONE REGION, AND IT IS ON THE CONTROLLER'S SECOND BANK. The board wires SDCKE1 and SDNE1, so the
+# memory appears at 0xD0000000 rather than 0xC0000000 -- and that is more than an address. Several
+# fields of the controller's first bank describe the CONTROLLER rather than that bank, and their
+# copies in the second bank's registers are read-only or ignored, so a board here programs its
+# geometry and most of its timings in bank 2's registers and the clock, read burst, TRP and TRC in
+# bank 1's. Generation composes both words; a board that assumed one would set its clock where writes
+# are discarded.
+#
+# The region is OPTIONAL: the board boots and greets with it never brought up, which is why it is a
+# region a program may enable rather than part of its memory budget. It does not exist at reset --
+# an access before its controller is configured is a bus fault rather than a wrong value.
+
+[[memory]]
+name = "sdram"
+kind = "ram"
+base = 0xD0000000           # FMC SDRAM BANK 2. Bank 1 is 0xC0000000 and is not wired here.
+window = "SDRAM_BANK2_BASE"
+size = 0x800000             # 8 MB, and ALL of it: every one of the device's data lines is wired.
+device_size = 0x800000
+controller = "fmc"
+optional = true
+source = "UM1670 Rev 6 section 7.10 (64-Mbit SDRAM, 1Mbit x 16-bit x 4-bank): the device is organized as 4,096 rows by 256 columns by 16 bits. The MB1075 schematic's SDRAM sheet wires SDCKE1 and SDNE1, which are the controller's bank 2, together with A[0..11], D[0..15], BA0, BA1, NBL0 and NBL1 -- so all sixteen of the device's data lines are connected and the whole part is reachable."
+
+# --- the fitted device -------------------------------------------------------------------------
+#
+# THE DEVICE IS THE SAME SHAPE AS ITS CONTROLLER NEEDS TO BE TOLD, and the two sizes above are this
+# record's arithmetic: rows x columns x banks x width IS the size, checked rather than trusted. A
+# column count off by one halves the memory, aliases every address above the first row, and passes a
+# write-then-read.
+#
+# `size` AND `device_size` ARE EQUAL HERE, which is worth stating because the schema exists to let
+# them differ: this device is 16 bits wide and all sixteen are wired, so what a program may reach and
+# what the part holds are the same number. A board that wires only some of a wider device's lines
+# reaches less than it fitted, and either number alone would be wrong for somebody.
+
+[memory.sdram.device]
+part = "IS42S16400J, 64-Mbit SDRAM, all 16 data lines wired"
+bank = 2                    # SDCKE1 and SDNE1 are the wired pair, so this is the controller's
+                            # bank 2. Bank 1 would answer at a different window and does not exist.
+column_bits = 8
+row_bits = 12
+banks = 4                   # the device's own internal banks, which are not the controller's.
+data_bits = 16              # what this board WIRED.
+device_data_bits = 16       # what the device HAS. Equal here, and generation checks both products.
+cas_latency = 2
+sdclk_hclk_periods = 2      # the memory clock's period is twice the bus clock's, so the memory runs
+                            # at half the bus. It reads like a multiplier and divides.
+read_burst = 1
+# The seven timings, in NANOSECONDS, converted at this plan's memory clock and rounded UP. Bounds
+# rather than this device's datasheet figures: at 8 MHz a cycle is 125 ns, an order of magnitude
+# longer than any device of this class requires, so these put timing off the list of explanations for
+# a failed bring-up at the cost of throughput nobody is measuring.
+tmrd_ns = 250               # load mode register to active
+txsr_ns = 875               # exit self-refresh to active
+tras_ns = 500               # row active time
+trc_ns = 875                # row cycle delay
+twr_ns = 375                # write recovery. NOT a bound like its neighbors: the controller requires
+                            # TWR to cover the row it closes -- at least TRAS - TRCD and at least
+                            # TRC - TRCD - TRP -- and the second is 3 cycles here. A shorter recovery
+                            # is not refused and a sequential test need not notice, so this is the one
+                            # timing a relation sets rather than the part.
+trp_ns = 250                # row precharge
+trcd_ns = 250               # row to column
+mode_register = 0x220       # the word loaded into the DEVICE's own mode register: burst length 1,
+                            # sequential, CAS 2, single-location writes. The one value here that the
+                            # chip's manual cannot tell you, because it is not the chip's.
+refresh_period_ns = 64000000 # the device holds a row for 64 ms...
+refresh_rows = 4096          # ...across 4096 of them. THE COUNT IS NOT HERE: it follows from these
+                             # two and the plan's memory clock, and stating it would fix this board at
+                             # one operating point.
+refresh_burst = 8
+settle_us = 100
+source = "UM1670 Rev 6 section 7.10 gives the organization (4,096 rows by 256 columns by 16 bits, four banks) and the part as a 64-Mbit SDRAM; the MB1075 schematic names it IS42S16400J and wires SDCKE1/SDNE1 for bank 2. CAS latency, the mode-register word, the settling delay and the auto-refresh burst are the reference manual's typical figures rather than this device's own datasheet, which has not been transcribed -- all four are values where longer and more are safe. The timings are bounds in nanoseconds at this plan's 8 MHz memory clock, except the write recovery, which the controller's own relation sets."
+
+# --- the board's own controls -------------------------------------------------------------------
+#
+# TWO LEDs AND ONE BUTTON, AND ALL THREE ARE PLAIN GPIO. No alternate function is involved, so these
+# rows state a pin and a level and nothing else -- which is why they need no pin-map row, while every
+# signal of the memory bus above needed one.
+#
+# EACH LED'S CATHODE IS AT GROUND through its own series resistor, so the pin drives it directly and
+# a HIGH level lights it. The button is the mirror of the arrangement a reader might assume: it is
+# pulled DOWN by a 220 kOhm resistor and the switch ties it UP to VDD, so a press reads HIGH, not low.
+#
+# TWO MORE LEDs EXIST AND ARE DELIBERATELY ABSENT. LD5 on PB13 and LD6 on PC5 indicate that VBUS is
+# present and that VBUS is drawing too much current; both pins carry a USB function as well, so
+# neither is a level a program chooses. A row here would offer a developer a light it does not own.
+
+[[devices]]
+name = "led-green"
+kind = "gpio-out"
+pin = "PG13"
+active = "high"
+source = "UM1670 Rev 6 section 7.5: user LD3 is a green LED connected to the I/O PG13. MB1075 schematic revision D-02 sheet 6 wires PG13 through R26 (510 ohm) to LD3's anode with its cathode at ground. UM1670 Rev 6 Table 7 gives PG13 as LQFP144 pin 128 and its LED column entry as the only board function on that pin."
+
+[[devices]]
+name = "led-red"
+kind = "gpio-out"
+pin = "PG14"
+active = "high"
+source = "UM1670 Rev 6 section 7.5: user LD4 is a red LED connected to the I/O PG14. MB1075 schematic revision D-02 sheet 6 wires PG14 through R27 (680 ohm) to LD4's anode with its cathode at ground. UM1670 Rev 6 Table 7 gives PG14 as LQFP144 pin 129 and its LED column entry as the only board function on that pin."
+
+# AND THE BUTTON REACHES ITS PIN THROUGH A SOLDER BRIDGE WHOSE DEFAULT THE MANUAL DOES NOT GIVE.
+# SB2 stands between the switch and PA0, and UM1670 Rev 6 states what its two positions mean without
+# saying which one a board leaves the factory with -- unlike the VCP's bridges, whose default it
+# gives per revision. So a program that reads this pin and never sees it change has two explanations,
+# and only looking at the board separates them.
+[[devices]]
+name = "button"
+kind = "gpio-in"
+pin = "PA0"
+active = "high"
+source = "UM1670 Rev 6 section 7.6: B1 USER is the user and wake-up button, connected to the I/O PA0. MB1075 schematic revision D-02 sheet 6 shows the switch tying that node to VDD through R25 (100 ohm) while R22 (220 kOhm) holds it at ground, with R23 (330 ohm) in series to the pin and C11 (100 nF) across it, so the pin reads low at rest and high while the button is held. UM1670 Rev 6 Table 7 gives PA0 as LQFP144 pin 34, its push-button column entry B1 the only board function on that pin."
+
+[[plans]]
+name = "hsi-16mhz"
+default = true
+source = "hsi"
+hsi_hz = 16000000           # the F4 reset clock: the internal 16 MHz RC oscillator, no PLL.
+hclk_hz = 16000000          # the AHB clock. RCC_CFGR resets to zero, so the AHB prescaler does not
+                            # divide and HCLK equals the system clock, which the generator verifies.
+pclk_hz = 16000000          # the APB clock feeding this board's bound USART. USART1 sits on APB2,
+                            # so this is PCLK2 -- which is exactly why the key is not named for a bus
+                            # number. Its prescaler also resets to no division, verified rather than
+                            # taken.

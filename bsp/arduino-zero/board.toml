@@ -5,7 +5,8 @@
 
 [table]
 kind = "board"
-board = "arduino-zero"
+board = "zero"
+vendor = "arduino"
 family = "samd21"
 part = "atsamd21g18a"
 board_model = 12

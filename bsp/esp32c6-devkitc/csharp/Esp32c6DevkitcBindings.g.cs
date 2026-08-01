@@ -6,6 +6,7 @@ namespace Lamella.Generated
         private Esp32c6DevkitcBindings() { }
 
         public const int BOARD_MODEL = 14;
+        public const string BOARD_VENDOR = "Espressif";
 
         public const uint UART0_BASE = 0x60000000;
         public const uint UART0_PCR_CONF = 0x60096000;

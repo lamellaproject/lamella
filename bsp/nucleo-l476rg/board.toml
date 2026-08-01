@@ -4,6 +4,7 @@
 [table]
 kind = "board"
 board = "nucleo-l476rg"
+vendor = "st"
 family = "stm32l476"
 part = "stm32l476rg"
 board_model = 8             # lamella_wire::board_model::STM32L476
@@ -29,6 +30,9 @@ name = "msi-4mhz"
 default = true
 source = "msi"
 msi_hz = 4000000            # the L4 reset clock (MSI at 4 MHz, all prescalers 1)
-pclk1_hz = 4000000          # PCLK1 == MSI under reset prescalers -- the generator verifies
-                            # this equality (state-and-verify). Firmware that raises MSI
-                            # for margin states that operating point as its own plan.
+pclk_hz = 4000000           # the APB clock feeding this board's bound USART. It is not named
+                            # for a bus number because WHICH APB a USART sits on is per
+                            # instance, so the number would be right for one binding and wrong
+                            # for the next. Under reset prescalers it equals MSI, which the
+                            # generator verifies rather than takes (state-and-verify). Firmware
+                            # that raises MSI for margin states that point as its own plan.

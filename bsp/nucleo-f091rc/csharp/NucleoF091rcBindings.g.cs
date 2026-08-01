@@ -6,19 +6,28 @@ namespace Lamella.Generated
         private NucleoF091rcBindings() { }
 
         public const int BOARD_MODEL = 7;
+        public const string BOARD_VENDOR = "St";
 
         public const uint VCP_BASE = 0x40004400;
         public const uint VCP_RCC_EN_REG = 0x4002101C;
         public const uint VCP_RCC_EN_MASK = 0x20000;
-        public const uint VCP_PORT_RCC_EN_REG = 0x40021014;
-        public const uint VCP_PORT_RCC_EN_MASK = 0x20000;
-        public const uint VCP_MODER_REG = 0x48000000;
-        public const uint VCP_MODER_MASK = 0xF0;
-        public const uint VCP_MODER_VALUE = 0xA0;
-        public const uint VCP_AFRL_REG = 0x48000020;
-        public const uint VCP_AFRL_MASK = 0xFF00;
-        public const uint VCP_AFRL_VALUE = 0x1100;
-        public const uint VCP_PCLK1_HZ = 8000000;
+        public const uint VCP_TX_PORT_RCC_EN_REG = 0x40021014;
+        public const uint VCP_TX_PORT_RCC_EN_MASK = 0x20000;
+        public const uint VCP_TX_MODER_REG = 0x48000000;
+        public const uint VCP_TX_MODER_MASK = 0x30;
+        public const uint VCP_TX_MODER_VALUE = 0x20;
+        public const uint VCP_TX_AFR_REG = 0x48000020;
+        public const uint VCP_TX_AFR_MASK = 0xF00;
+        public const uint VCP_TX_AFR_VALUE = 0x100;
+        public const uint VCP_RX_PORT_RCC_EN_REG = 0x40021014;
+        public const uint VCP_RX_PORT_RCC_EN_MASK = 0x20000;
+        public const uint VCP_RX_MODER_REG = 0x48000000;
+        public const uint VCP_RX_MODER_MASK = 0xC0;
+        public const uint VCP_RX_MODER_VALUE = 0x80;
+        public const uint VCP_RX_AFR_REG = 0x48000020;
+        public const uint VCP_RX_AFR_MASK = 0xF000;
+        public const uint VCP_RX_AFR_VALUE = 0x1000;
+        public const uint VCP_PCLK_HZ = 8000000;
         public const uint VCP_BRR_115200_HSI_8MHZ = 0x45;
     }
 }

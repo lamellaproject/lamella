@@ -6,6 +6,7 @@
 [table]
 kind = "board"
 board = "same54-xpro"
+vendor = "microchip"
 family = "same54"
 part = "atsame54p20a"
 board_model = 4             # lamella_wire::board_model::SAME54_XPLAINED_PRO

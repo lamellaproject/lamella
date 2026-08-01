@@ -8,7 +8,8 @@
 
 [table]
 kind = "board"
-board = "arduino-due"
+board = "due"
+vendor = "arduino"
 family = "sam3x"
 part = "atsam3x8e"
 board_model = 15            # lamella_wire::board_model::ARDUINO_DUE

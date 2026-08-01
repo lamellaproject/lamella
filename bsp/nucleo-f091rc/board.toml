@@ -7,6 +7,7 @@
 [table]
 kind = "board"
 board = "nucleo-f091rc"
+vendor = "st"
 family = "stm32f091"
 part = "stm32f091rc"
 board_model = 7             # lamella_wire::board_model::STM32F091
@@ -32,5 +33,6 @@ name = "hsi-8mhz"
 default = true
 source = "hsi"
 hsi_hz = 8000000            # the F0 reset clock (HSI at 8 MHz, all prescalers 1)
-pclk1_hz = 8000000          # PCLK1 == HSI under reset prescalers -- the generator verifies
-                            # this equality (state-and-verify)
+pclk_hz = 8000000           # the APB clock feeding this board's bound USART; under reset
+                            # prescalers it equals HSI, which the generator verifies rather
+                            # than takes (state-and-verify)

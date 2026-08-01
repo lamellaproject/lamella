@@ -1,8 +1,8 @@
-// Lamella.Boards.Esp32c6Devkitc -- the Espressif ESP32-C6-DevKitC-1 (RISC-V RV32IMAC) board
+// Lamella.Boards.Espressif.Esp32c6Devkitc -- the Espressif ESP32-C6-DevKitC-1 (RISC-V RV32IMAC) board
 using System.Device.Gpio;
 using Lamella.Generated;
 
-namespace Lamella.Boards
+namespace Lamella.Boards.Espressif
 {
     public sealed class Esp32c6Devkitc
     {
