@@ -144,6 +144,8 @@ impl DriverSession {
             entry.ok_or_else(|| BridgeError::Setup(String::from("image records no entry point")))?;
         let mut vm = Vm::new();
         configure_vm(&mut vm);
+        let entry = lamella_cil_runtime::boot_baked(&module, &mut vm, entry)
+            .map_err(|trap| BridgeError::Setup(alloc::format!("static constructor: {trap}")))?;
         DriverSession::bind(module, entry, vm)
     }
 

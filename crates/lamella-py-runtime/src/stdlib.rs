@@ -1,6 +1,7 @@
 //! The standard-library modules the interpreter provides natively.
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use lamella_py_bytecode::CodeObject;
@@ -62,6 +63,34 @@ enum StdlibFn {
     CollectionsDeque,
     /// `collections.namedtuple` -- the class FACTORY (a plain function, not a type object).
     CollectionsNamedtuple,
+    /// `math.frexp(x)` -- the (mantissa, exponent) pair with `x == m * 2**e` and `0.5 <= |m| < 1`.
+    MathFrexp,
+    /// `math.ldexp(x, i)` -- `x * 2**i`, the inverse of `frexp`.
+    MathLdexp,
+    /// `math.modf(x)` -- the (fractional, integer) parts, both floats, both carrying `x`'s sign.
+    MathModf,
+    /// `_time.time_ns()` -- nanoseconds since the Unix epoch, from the host's wall clock.
+    TimeTimeNs,
+    /// `_time.monotonic_ns()` -- nanoseconds from an arbitrary origin that never goes backwards.
+    TimeMonotonicNs,
+    /// `_time.sleep_ns(n)` -- block for `n` nanoseconds.
+    TimeSleepNs,
+    /// `_struct.pack_float(value, size, big_endian)` -- the exact IEEE-754 bytes of a float.
+    StructPackFloat,
+    /// `_struct.unpack_float(data, big_endian)` -- the float those bytes are.
+    StructUnpackFloat,
+    /// `_fs.listdir(path)` -- the names directly inside a directory.
+    FsListdir,
+    /// `_fs.remove(path)` -- delete a file.
+    FsRemove,
+    /// `_fs.mkdir(path)` -- create a directory.
+    FsMkdir,
+    /// `_fs.rmdir(path)` -- remove an empty directory.
+    FsRmdir,
+    /// `_fs.rename(src, dst)` -- rename a file or directory.
+    FsRename,
+    /// `_fs.kind(path)` -- `(is_directory, size)`; raises if the path does not exist.
+    FsKind,
 }
 
 impl StdlibFn {
@@ -109,6 +138,20 @@ impl StdlibFn {
             31 => CollectionsOrderedDict,
             32 => CollectionsDeque,
             33 => CollectionsNamedtuple,
+            34 => MathFrexp,
+            35 => MathLdexp,
+            36 => MathModf,
+            37 => TimeTimeNs,
+            38 => TimeMonotonicNs,
+            39 => TimeSleepNs,
+            40 => StructPackFloat,
+            41 => StructUnpackFloat,
+            42 => FsListdir,
+            43 => FsRemove,
+            44 => FsMkdir,
+            45 => FsRmdir,
+            46 => FsRename,
+            47 => FsKind,
             _ => return None,
         })
     }
@@ -151,6 +194,20 @@ impl StdlibFn {
             CollectionsOrderedDict => "OrderedDict",
             CollectionsDeque => "deque",
             CollectionsNamedtuple => "namedtuple",
+            MathFrexp => "frexp",
+            MathLdexp => "ldexp",
+            MathModf => "modf",
+            TimeTimeNs => "time_ns",
+            TimeMonotonicNs => "monotonic_ns",
+            TimeSleepNs => "sleep_ns",
+            StructPackFloat => "pack_float",
+            StructUnpackFloat => "unpack_float",
+            FsListdir => "listdir",
+            FsRemove => "remove",
+            FsMkdir => "mkdir",
+            FsRmdir => "rmdir",
+            FsRename => "rename",
+            FsKind => "kind",
         }
     }
 }
@@ -308,8 +365,121 @@ pub fn build_module(name: &str, model: &mut ObjectModel) -> Option<Result<Value,
     match name {
         "math" => Some(build_math_module(model)),
         "collections" => Some(build_collections_module(model)),
+        "_platform" => Some(build_platform_module(model)),
+        "_time" => Some(build_time_module(model)),
+        "_fs" => Some(build_fs_module(model)),
+        "_struct" => Some(build_struct_seam_module(model)),
         _ => None,
     }
+}
+
+/// Builds `_struct`: the float half of `struct`, which is the only part that cannot be written in
+/// Python. Reading a float's bits requires seeing the representation; everything else `struct` does
+/// is integer arithmetic the language already performs exactly.
+fn build_struct_seam_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    use StdlibFn::*;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in [StructPackFloat, StructUnpackFloat] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+/// Builds `_time`: the raw clock seam, in nanoseconds and nothing else. The `time` module builds
+/// CPython's surface (seconds as floats, the sleep argument, the aliases) on top of it in Python --
+/// so this side stays the smallest thing that must be native, which is reading the host's clock.
+fn build_time_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    use StdlibFn::*;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in [TimeTimeNs, TimeMonotonicNs, TimeSleepNs] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+/// Builds `_fs`: the directory half of the filesystem seam. `open()` is a built-in (a file is an
+/// object, not a module function), so what is left here is what `os` is made of -- and `os` itself is
+/// managed Python, because joining path strings needs no host underneath it.
+fn build_fs_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    use StdlibFn::*;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in [FsListdir, FsRemove, FsMkdir, FsRmdir, FsRename, FsKind] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+/// The C ABI of the target this runtime was compiled for, DERIVED from the compiler rather than
+/// written down: each entry is what `size_of`/`align_of` report for that C type, so the table
+/// cannot disagree with the code the same toolchain emitted.
+///
+/// This is why it is derived. `long` is 4 bytes under Windows' LLP64 and on a 32-bit device, and 8
+/// under LP64 -- so a hand-written table would be right on one machine and silently wrong on
+/// another, and the symptom would be a packed byte landing in the wrong place on silicon rather
+/// than a failing build.
+const C_TYPES: &[(&str, usize, usize)] = &[
+    ("char", size_of::<core::ffi::c_char>(), align_of::<core::ffi::c_char>()),
+    ("bool", size_of::<bool>(), align_of::<bool>()),
+    ("short", size_of::<core::ffi::c_short>(), align_of::<core::ffi::c_short>()),
+    ("int", size_of::<core::ffi::c_int>(), align_of::<core::ffi::c_int>()),
+    ("long", size_of::<core::ffi::c_long>(), align_of::<core::ffi::c_long>()),
+    (
+        "long long",
+        size_of::<core::ffi::c_longlong>(),
+        align_of::<core::ffi::c_longlong>(),
+    ),
+    ("float", size_of::<f32>(), align_of::<f32>()),
+    ("double", size_of::<f64>(), align_of::<f64>()),
+    ("size_t", size_of::<usize>(), align_of::<usize>()),
+    ("void*", size_of::<*const ()>(), align_of::<*const ()>()),
+];
+
+/// Builds `_platform`: the target's ABI facts, in one place because more than one caller needs
+/// them and none of them should guess. `struct`'s native mode reads the sizes and alignments to lay
+/// a record out the way the platform's C compiler would; `sys` reads `byteorder` and `maxsize`.
+///
+/// These are properly platform-DEPENDENT: the answer on a host and the answer on a device differ,
+/// and both are correct. That is why they are answered by the runtime a program is actually running
+/// on rather than baked in at any earlier stage.
+fn build_platform_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+
+    let key = model.new_str("byteorder")?;
+    let order = if cfg!(target_endian = "big") { "big" } else { "little" };
+    let value = model.new_str(order)?;
+    entries.push((key, value));
+
+    let key = model.new_str("maxsize")?;
+    let value = model.new_bigint(BigInt::from_i128(isize::MAX as i128))?;
+    entries.push((key, value));
+
+    let key = model.new_str("version")?;
+    let value = model.new_str(env!("CARGO_PKG_VERSION"))?;
+    entries.push((key, value));
+
+    let mut sizes: Vec<(Value, Value)> = Vec::new();
+    let mut aligns: Vec<(Value, Value)> = Vec::new();
+    for &(name, size, align) in C_TYPES {
+        let size_key = model.new_str(name)?;
+        let align_key = model.new_str(name)?;
+        sizes.push((size_key, Value::fixnum(size as i32).ok_or(Trap::Overflow)?));
+        aligns.push((align_key, Value::fixnum(align as i32).ok_or(Trap::Overflow)?));
+    }
+    let key = model.new_str("sizes")?;
+    let value = model.new_dict(sizes)?;
+    entries.push((key, value));
+    let key = model.new_str("aligns")?;
+    let value = model.new_dict(aligns)?;
+    entries.push((key, value));
+
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
 }
 
 /// Builds the `collections` module: the container types, each member both the constructor and the
@@ -352,7 +522,7 @@ fn build_math_module(model: &mut ObjectModel) -> Result<Value, Trap> {
         MathSqrt, MathFloor, MathCeil, MathTrunc, MathFabs, MathFactorial, MathGcd, MathLcm,
         MathIsqrt, MathPow, MathExp, MathLog, MathLog2, MathLog10, MathSin, MathCos, MathTan,
         MathAsin, MathAcos, MathAtan, MathAtan2, MathHypot, MathDegrees, MathRadians, MathCopysign,
-        MathFmod, MathIsnan, MathIsinf, MathIsfinite,
+        MathFmod, MathIsnan, MathIsinf, MathIsfinite, MathFrexp, MathLdexp, MathModf,
     ];
     for &f in FUNCTIONS {
         let key = model.new_str(f.python_name())?;
@@ -374,6 +544,127 @@ pub fn call_stdlib(
 ) -> Result<Value, Trap> {
     use StdlibFn::*;
     match StdlibFn::from_id(id).ok_or(Trap::Malformed)? {
+        TimeTimeNs | TimeMonotonicNs => {
+            if !args.is_empty() {
+                return Err(Trap::TypeError);
+            }
+            let nanos = if StdlibFn::from_id(id) == Some(TimeTimeNs) {
+                model.now_ns()?
+            } else {
+                model.monotonic_ns()?
+            };
+            model.new_bigint(BigInt::from_i128(i128::from(nanos)))
+        }
+        StructPackFloat => {
+            let [value, size, big_endian] = args else {
+                return Err(Trap::TypeError);
+            };
+            let Some(value) = model.as_f64(*value) else {
+                let message = "required argument is not a float";
+                return Err(model.raise_named_exception("TypeError", message));
+            };
+            let big = model.as_i128(*big_endian).unwrap_or(0) != 0;
+            let bytes: Vec<u8> = match model.as_i128(*size) {
+                Some(4) => {
+                    let narrowed = value as f32;
+                    if value.is_finite() && narrowed.is_infinite() {
+                        let message = "float too large to pack with f format";
+                        return Err(model.raise_named_exception("OverflowError", message));
+                    }
+                    if big {
+                        narrowed.to_be_bytes().to_vec()
+                    } else {
+                        narrowed.to_le_bytes().to_vec()
+                    }
+                }
+                Some(8) => {
+                    if big {
+                        value.to_be_bytes().to_vec()
+                    } else {
+                        value.to_le_bytes().to_vec()
+                    }
+                }
+                _ => return Err(Trap::TypeError),
+            };
+            model.new_bytes(bytes)
+        }
+        FsListdir | FsRemove | FsMkdir | FsRmdir | FsRename | FsKind => {
+            let path = match args.first().and_then(|value| model.str_value(*value)) {
+                Some(text) => String::from(text),
+                None => {
+                    let kind = args.first().map_or_else(
+                        || String::from("nothing"),
+                        |value| model.type_name_of(*value),
+                    );
+                    let message =
+                        alloc::format!("expected str, bytes or os.PathLike object, not {kind}");
+                    return Err(model.raise_named_exception("TypeError", &message));
+                }
+            };
+            let which = StdlibFn::from_id(id).ok_or(Trap::Malformed)?;
+            let expected = if which == FsRename { 2 } else { 1 };
+            if args.len() != expected {
+                return Err(Trap::TypeError);
+            }
+            match which {
+                FsListdir => model.fs_listdir(&path),
+                FsRemove => model.fs_remove(&path),
+                FsMkdir => model.fs_mkdir(&path),
+                FsRmdir => model.fs_rmdir(&path),
+                FsKind => model.fs_kind(&path),
+                _ => {
+                    let to = match model.str_value(args[1]) {
+                        Some(text) => String::from(text),
+                        None => return Err(Trap::TypeError),
+                    };
+                    model.fs_rename(&path, &to)
+                }
+            }
+        }
+        StructUnpackFloat => {
+            let [data, big_endian] = args else {
+                return Err(Trap::TypeError);
+            };
+            let Some(data) = model.bytes_value(*data).map(<[u8]>::to_vec) else {
+                return Err(Trap::TypeError);
+            };
+            let big = model.as_i128(*big_endian).unwrap_or(0) != 0;
+            let value = match data.len() {
+                4 => {
+                    let mut word = [0u8; 4];
+                    word.copy_from_slice(&data);
+                    let narrow = if big {
+                        f32::from_be_bytes(word)
+                    } else {
+                        f32::from_le_bytes(word)
+                    };
+                    f64::from(narrow)
+                }
+                8 => {
+                    let mut word = [0u8; 8];
+                    word.copy_from_slice(&data);
+                    if big {
+                        f64::from_be_bytes(word)
+                    } else {
+                        f64::from_le_bytes(word)
+                    }
+                }
+                _ => return Err(Trap::TypeError),
+            };
+            model.new_float(value)
+        }
+        TimeSleepNs => {
+            let [nanos] = args else {
+                return Err(Trap::TypeError);
+            };
+            let Some(nanos) = model.as_i128(*nanos) else {
+                let message = "sleep_ns() takes a whole number of nanoseconds";
+                return Err(model.raise_named_exception("TypeError", message));
+            };
+            let nanos = i64::try_from(nanos).unwrap_or(i64::MAX);
+            model.sleep_ns(nanos)?;
+            Ok(Value::NONE)
+        }
         CollectionsDefaultdict => {
             let (factory, init) = match args {
                 [] => (Value::NONE, None),
@@ -607,6 +898,41 @@ pub fn call_stdlib(
         MathIsnan => Ok(Value::from_bool(one_real(args, model)?.is_nan())),
         MathIsinf => Ok(Value::from_bool(one_real(args, model)?.is_infinite())),
         MathIsfinite => Ok(Value::from_bool(one_real(args, model)?.is_finite())),
+        MathFrexp => {
+            let (mantissa, exponent) = libm::frexp(one_real(args, model)?);
+            let mantissa = model.new_float(mantissa)?;
+            let exponent = float_to_int(f64::from(exponent), model)?;
+            model.new_tuple(vec![mantissa, exponent])
+        }
+        MathLdexp => {
+            let [x, i] = args else { return Err(Trap::TypeError) };
+            let x = real(*x, model)?;
+            if !model.is_int(*i) {
+                return Err(model.with_message(
+                    Trap::TypeError,
+                    "Expected an int as second argument to ldexp.",
+                ));
+            }
+            let exponent = model.as_f64(*i).ok_or(Trap::TypeError)?;
+            let exponent = if exponent > f64::from(i32::MAX) {
+                i32::MAX
+            } else if exponent < f64::from(i32::MIN) {
+                i32::MIN
+            } else {
+                exponent as i32
+            };
+            let scaled = libm::ldexp(x, exponent);
+            if scaled.is_infinite() && x.is_finite() {
+                return Err(model.with_message(Trap::Overflow, "math range error"));
+            }
+            model.new_float(scaled)
+        }
+        MathModf => {
+            let (fractional, integral) = libm::modf(one_real(args, model)?);
+            let fractional = model.new_float(fractional)?;
+            let integral = model.new_float(integral)?;
+            model.new_tuple(vec![fractional, integral])
+        }
     }
 }
 
@@ -898,6 +1224,68 @@ mod tests {
         let mut m = model();
         let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(25)], &[], &mut m, 0).unwrap();
         assert_eq!(m.repr(r), "15511210043330985984000000");
+    }
+
+    /// frexp splits a double into a mantissa in [0.5, 1) and an exponent that ldexp puts back --
+    /// exactly, including the subnormal that needs frexp's internal rescale.
+    #[test]
+    fn frexp_and_ldexp_round_trip() {
+        let mut m = model();
+        for value in [3.5_f64, -3.5, 1e300, 5e-324, 0.5] {
+            let x = m.new_float(value).unwrap();
+            let pair = call_stdlib(StdlibFn::MathFrexp.id(), &[x], &[], &mut m, 0).unwrap();
+            let parts = m.seq_value(pair).cloned().unwrap();
+            let mantissa = m.as_f64(parts[0]).unwrap();
+            assert!((0.5..1.0).contains(&libm::fabs(mantissa)), "mantissa {mantissa} of {value}");
+            let back =
+                call_stdlib(StdlibFn::MathLdexp.id(), &[parts[0], parts[1]], &[], &mut m, 0).unwrap();
+            assert_eq!(m.as_f64(back), Some(value));
+        }
+    }
+
+    /// ldexp's exponent reads through the int lane, so every integer tier works -- notably `bool`,
+    /// which is an int in Python but is not a fixnum here.
+    #[test]
+    fn ldexp_accepts_every_integer_tier_and_refuses_a_float() {
+        let mut m = model();
+        let one = m.new_float(1.0).unwrap();
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, Value::TRUE], &[], &mut m, 0).unwrap();
+        assert_eq!(m.as_f64(r), Some(2.0));
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, Value::FALSE], &[], &mut m, 0).unwrap();
+        assert_eq!(m.as_f64(r), Some(1.0));
+        let half = m.new_float(1.5).unwrap();
+        assert!(matches!(
+            call_stdlib(StdlibFn::MathLdexp.id(), &[one, half], &[], &mut m, 0),
+            Err(Trap::TypeError)
+        ));
+    }
+
+    /// An exponent past the double range raises, but only for a finite input: inf/nan pass through,
+    /// and scaling toward zero underflows silently.
+    #[test]
+    fn ldexp_overflows_only_a_finite_input() {
+        let mut m = model();
+        let one = m.new_float(1.0).unwrap();
+        assert!(matches!(
+            call_stdlib(StdlibFn::MathLdexp.id(), &[one, fixnum(2000)], &[], &mut m, 0),
+            Err(Trap::Overflow)
+        ));
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, fixnum(-2000)], &[], &mut m, 0).unwrap();
+        assert_eq!(m.as_f64(r), Some(0.0));
+        let inf = m.new_float(f64::INFINITY).unwrap();
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[inf, fixnum(2000)], &[], &mut m, 0).unwrap();
+        assert_eq!(m.as_f64(r), Some(f64::INFINITY));
+    }
+
+    /// modf yields (fractional, integer) -- Python's order, and both parts carry the sign.
+    #[test]
+    fn modf_splits_fraction_then_integer() {
+        let mut m = model();
+        let x = m.new_float(-3.5).unwrap();
+        let pair = call_stdlib(StdlibFn::MathModf.id(), &[x], &[], &mut m, 0).unwrap();
+        let parts = m.seq_value(pair).cloned().unwrap();
+        assert_eq!(m.as_f64(parts[0]), Some(-0.5));
+        assert_eq!(m.as_f64(parts[1]), Some(-3.0));
     }
 
     #[test]

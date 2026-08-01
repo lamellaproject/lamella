@@ -402,7 +402,7 @@ impl IncrementalSession {
     ) -> Result<IncrementalSession, String> {
         let assembly =
             Assembly::read(bytes).map_err(|error| format!("cannot read metadata: {error:?}"))?;
-        let (module, name_index, type_index, first_delta_asm) = if let Some(corlib) = eager_corlib {
+        let (mut module, name_index, type_index, first_delta_asm) = if let Some(corlib) = eager_corlib {
             let (module, name_index, type_index) = load_bootstrap_with_corlib(corlib, &assembly);
             (module, name_index, type_index, 2)
         } else if lazy_corlib_bytes.is_some() {
@@ -423,9 +423,8 @@ impl IncrementalSession {
             .ok_or_else(|| "__Repl has no recorded field layout".to_owned())?
             .to_vec();
 
-        let root_slot = module.static_field_defaults().len();
-        let mut storage = module.static_field_defaults().to_vec();
-        storage.push(Value::Null);
+        let root_slot = module.reserve_static_slot(Value::Null);
+        let storage = module.static_field_defaults().to_vec();
 
         let mut vm = Vm::new();
         vm.init_statics(&storage);
@@ -548,6 +547,8 @@ impl IncrementalSession {
             load_delta(&mut self.module, &mut self.context, &delta)
         }
         .map_err(|error| format!("cannot load delta {label}: {error}"))?;
+
+        self.vm.grow_statics(self.module.static_field_defaults());
 
         if !info.new_field_defaults.is_empty() {
             self.vm

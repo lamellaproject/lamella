@@ -218,6 +218,15 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     /// real silicon (the statics window's word 0 is the EH tag; garbage there HardFaults startup).
     const ZERO_START: u32 = 0x2000_0100;
     const ZERO_END: u32 = HEAP_BASE + 0x1_0000;
+    /// One past the last byte the bump allocator may hand out -- the archive returns NULL rather than
+    /// bumping past it, and a zero here means "no heap", so seeding it is not optional.
+    ///
+    /// The ceiling is [`ZERO_END`], i.e. the heap is exactly the band this stub PREPARED. That is the
+    /// honest bound rather than the larger one the 512 KB SRAM would allow: an object's reference
+    /// fields have to read as null before a constructor writes them, and only the zeroed band
+    /// guarantees that. Handing out memory this stub never cleared would seed live objects from
+    /// power-on garbage -- which on a mark-compact heap is a wrong ROOT, not merely a wrong value.
+    const HEAP_LIMIT: u32 = ZERO_END;
     /// The M33 vector-table offset register: the stub points it at the flash base so a fault vectors
     /// through THIS table (the bootrom leaves VTOR on its own).
     const SCB_VTOR: u32 = 0xE000_ED08;
@@ -249,6 +258,7 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     let zero_end_word = enc.new_label();
     let heap_ptr_word = enc.new_label();
     let heap_base_word = enc.new_label();
+    let heap_limit_word = enc.new_label();
     let boot_magic_word = enc.new_label();
     let done_magic_word = enc.new_label();
     let result_word = enc.new_label();
@@ -269,6 +279,8 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
     enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, heap_limit_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
     enc.ldr_literal(Reg::R0, boot_magic_word).unwrap();
     enc.ldr_literal(Reg::R1, result_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
@@ -295,6 +307,8 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     enc.emit_word(HEAP_PTR);
     enc.bind_label(heap_base_word);
     enc.emit_word(HEAP_BASE);
+    enc.bind_label(heap_limit_word);
+    enc.emit_word(HEAP_LIMIT);
     enc.bind_label(boot_magic_word);
     enc.emit_word(RP2350_BOOT_MAGIC);
     enc.bind_label(done_magic_word);
@@ -353,14 +367,21 @@ pub fn build_object_with_corlib_debug(
     let references = alloc::vec![&corlib_assembly];
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let (funcs, maps, fails) = lower_assembly_debug(&assembly, entry, &references);
+    let (mut funcs, maps, fails) = lower_assembly_debug(&assembly, entry, &references);
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(BuildError::LowerCil { rid, error });
     }
-    let names = object_symbol_names(&assembly, funcs.len());
-    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let resolver = MetadataResolver::new(&assembly).with_references(&references);
     let mut descriptors = resolver.type_descriptors();
+    let mut names = object_symbol_names(&assembly, funcs.len());
+    names.extend(append_enum_to_string(
+        &assembly,
+        &resolver,
+        &mut funcs,
+        &mut descriptors,
+    ));
+    replace_exception_message(&assembly, &mut funcs);
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, true);
     let qualifiers = crate::resolver::DescQualifiers::default();
@@ -530,8 +551,17 @@ fn build_object_core(
             entry_rid,
         );
     }
+    let resolver = MetadataResolver::new(&assembly).with_references(&references);
+    let mut descriptors = resolver.type_descriptors();
+    let mut names = object_symbol_names(&assembly, funcs.len());
+    names.extend(append_enum_to_string(
+        &assembly,
+        &resolver,
+        &mut funcs,
+        &mut descriptors,
+    ));
+    replace_exception_message(&assembly, &mut funcs);
     let funcs = funcs;
-    let names = object_symbol_names(&assembly, funcs.len());
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let display_names = method_display_names(&assembly, funcs.len());
     let mut silent_edges = silent_seam_call_edges(&assembly, &funcs, &seams, &display_names);
@@ -566,8 +596,6 @@ fn build_object_core(
             });
         }
     }
-    let resolver = MetadataResolver::new(&assembly).with_references(&references);
-    let mut descriptors = resolver.type_descriptors();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, true);
     if !defer {
@@ -608,7 +636,13 @@ fn build_object_core(
             .into_iter()
             .map(|(index, error)| (index as u32, name_of(index), alloc::format!("{error:?}")))
             .collect(),
-        unsynthesized_seams: unsynthesized_seam_rows(&assembly, &seams, &display_names, &names),
+        unsynthesized_seams: unsynthesized_seam_rows(
+            &assembly,
+            &seams,
+            &display_names,
+            &names,
+            &vtable_slot_rids(&resolver),
+        ),
         silent_seam_edges: silent_edges,
     };
     Ok((bytes, report))
@@ -663,6 +697,7 @@ fn append_reference_descriptors(
                             base: None,
                             words: None,
                             exported: false,
+                            full_name: None,
                         });
                     }
                 }
@@ -696,6 +731,485 @@ fn append_reference_descriptors(
             }
         }
         i += 1;
+    }
+}
+
+/// Synthesizes a `ToString()` for every enum this assembly declares and points that enum's ToString
+/// vtable slot at it, returning one symbol name per appended function (the caller extends its symbol
+/// table by them, in the same order).
+///
+/// WHY THERE IS ANYTHING TO SYNTHESIZE. `Console.WriteLine(e)` on an enum is `box` then
+/// `WriteLine(object)` then a virtual `ToString()`, so by the time the call happens the enum's static
+/// type is gone and only the receiver's descriptor can answer. Corlib's `System.Enum` deliberately
+/// declares no parameterless `ToString` -- its comment says the call "arrives as a `constrained.
+/// callvirt object::ToString()`, which the VES renders in place" -- which is true of the interpreter
+/// and has no counterpart here, because until this pass runs NO ENUM MEMBER NAME EXISTS ANYWHERE IN
+/// AN AOT IMAGE. The slot therefore held the synthesized `Object::ToString`, which answers the
+/// descriptor's NAME word, and every enum printed as its own TYPE name (`Color` for `Color.Green`).
+/// That is correct .NET behaviour for a type that overrides nothing -- the defect is the missing
+/// override, and this is it. A call-site rewrite cannot serve: the token is present only at the
+/// statically-typed `c.ToString()`, and every print goes through the object-typed path instead.
+///
+/// The member names and values are compile-time constants (`Field` rows with a `Constant`), so the
+/// body is a compare chain over the boxed payload returning a literal per member -- no runtime table,
+/// no metadata on device, and nothing for the collector to trace.
+///
+/// THE SLOT IS FOUND BY NAME, never by index ([`MetadataResolver::nullary_vtable_slot`]). An enum's
+/// vtable IS `System.Object`'s three slots today, because our `ValueType` and `Enum` declare no
+/// virtuals -- but a body placed at a guessed index would be a wrong method under a right name, and a
+/// test that only reads the printed string would pass on it.
+///
+/// SCOPE, stated because each limit shows up as a printed answer rather than an error:
+/// - ENUMS THIS ASSEMBLY DECLARES. A referenced assembly's enum (`DayOfWeek`) reaches its consumer as
+///   a descriptor whose slots are EXTERNS into the owner -- naming a per-enum export there is its own
+///   change, and this one does not pretend to it.
+/// - THE NUMERIC FALLBACK is emitted only where an unmatched value renders EXACTLY as a signed 32-bit
+///   decimal, which is every underlying type but `uint`, `long` and `ulong` ([`enum_numeric_fallback`]).
+///   Those three keep the type name for an unmatched value -- what a non-overriding type answers with
+///   -- rather than a plausible wrong number; the backend has no unsigned-32 or 64-bit integer
+///   formatter to call, and adding one is a separate change with its own proof.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn append_enum_to_string(
+    assembly: &Assembly,
+    resolver: &MetadataResolver,
+    funcs: &mut Vec<Function>,
+    descriptors: &mut [crate::resolver::TypeMeta],
+) -> Vec<alloc::string::String> {
+    let target = TargetLayout::ilp32();
+    let mut names = Vec::new();
+    for type_def in assembly.type_defs() {
+        let token = type_def.token();
+        let Some(underlying) = crate::resolver::enum_underlying(assembly, token, &[], &target) else {
+            continue;
+        };
+        let members = enum_members(&type_def);
+        if members.is_empty() {
+            continue;
+        }
+        let Some(meta) = descriptors
+            .iter_mut()
+            .find(|d| d.handle == TypeHandle(token.0))
+        else {
+            continue;
+        };
+        let Some(slot) = resolver.nullary_vtable_slot(type_def, "ToString") else {
+            continue;
+        };
+        let Some(entry) = meta.vtable.get_mut(slot) else {
+            continue;
+        };
+        let fallback = enum_numeric_fallback(&type_def, underlying);
+        let flags = underlying == MirType::I32
+            && assembly.has_attribute(token, "System", "FlagsAttribute");
+        let index = funcs.len() as u32;
+        funcs.push(if flags {
+            enum_flags_to_string_body(&members, fallback)
+        } else {
+            enum_to_string_body(&members, underlying, fallback)
+        });
+        *entry = crate::resolver::VtableEntry::Func(index);
+        names.push(alloc::format!("__lamella_enum_tostring_{:08x}", token.0));
+    }
+    names
+}
+
+/// Replaces `System.Exception::get_Message`'s BODY with the one `exception_strings = type-name`
+/// specifies: the receiver's own type name.
+///
+/// WHY THERE IS ANYTHING TO REPLACE. The in-flight exception is a TAG, so a caught exception is
+/// materialized with a ZEROED payload -- no constructor ran, and under this knob none can, because
+/// `throw` keeps costing one word. Corlib's own `Message` therefore reads a null `_message` and hands
+/// back null, and `"caught " + e.Message` then faults inside [`Inst::StringConcat`] on the null
+/// operand. That is the fault the object model would otherwise MOVE rather than fix: the binding stops
+/// hard-faulting on dispatch and starts hard-faulting one instruction later.
+///
+/// WHY IT REPLACES A BODY INSTEAD OF APPENDING ONE AND REPOINTING SLOTS. A consumer of a REFERENCED
+/// exception type builds its own copy of that type's descriptor, and the copy's vtable slots are
+/// EXTERNS read from the OWNER's metadata -- not from the owner's patched [`crate::resolver::TypeMeta`].
+/// So repointing corlib's slot leaves every program's `catch (ArgumentException e)` dispatching to
+/// corlib's ORIGINAL getter, which is exactly the named gap [`append_enum_to_string`] carries for a
+/// referenced enum. Replacing the body makes the extern symbol itself resolve to the new behavior, so
+/// one edit serves corlib and every assembly that links it, with no new symbol to collide.
+///
+/// ONE BODY SERVES EVERY EXCEPTION TYPE. It is `LoadTypeDesc(this)` then [`Inst::TypeName`] -- the same
+/// pair the synthesized `Object::ToString` uses -- so it answers the RECEIVER's descriptor name rather
+/// than a baked literal. Corlib declares 43 exception types and NONE of them overrides `Message`, so
+/// all 43 inherit this one slot and each still reports its own name.
+///
+/// - **`_message` is not consulted, because on this tier it can never be set.** No constructor runs at
+///   a throw, and a `newobj E` that is NOT thrown is still lowered to a tag rather than an object. When
+///   that second case becomes a real allocation, this body wants a `_message != null` arm ahead of the
+///   type name -- corlib's field is at payload offset 0, since `System.Exception` is the base-most block
+///   of every exception layout.
+/// - A program that OVERRIDES `Message` keeps its own body: this only rewrites the declaring type's.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn replace_exception_message(assembly: &Assembly, funcs: &mut [Function]) {
+    let Some(type_def) = assembly.find_type("System", "Exception") else {
+        return;
+    };
+    for method in type_def.methods() {
+        if method.name() != Some("get_Message") {
+            continue;
+        }
+        let rid = method.token().row() as usize;
+        if let Some(slot) = funcs.get_mut(rid) {
+            *slot = exception_message_body();
+        }
+    }
+}
+
+/// The MIR for the shared exception `Message` getter: the receiver's own type name.
+///
+/// Three instructions, and none of them touches a field -- which is what lets one function serve every
+/// exception type. [`Inst::TypeName`] answers null for a null descriptor rather than dereferencing, so
+/// the body is total even on a receiver whose header was never written.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn exception_message_body() -> Function {
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let object = params[0];
+    mb.at(0);
+    let descriptor = mb.emit(MirType::I32, Inst::LoadTypeDesc { object });
+    let text = mb.emit(objt, Inst::TypeName { descriptor });
+    mb.ret(text);
+    mb.finish(Some(objt))
+}
+
+/// An enum's members in DECLARATION order -- its static fields carrying a `Constant`, which is every
+/// field but the instance `value__` that holds the underlying storage.
+///
+/// Declaration order is what makes a DUPLICATE value answer the way .NET does: `Enum.GetName` reads a
+/// by-value sort of the same rows, and a stable sort leaves equal values in metadata order, so the
+/// FIRST-DECLARED name wins there and in the compare chain below.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn enum_members(type_def: &lamella_metadata::TypeDef) -> Vec<(alloc::string::String, i64)> {
+    let mut members = Vec::new();
+    for field in type_def.fields() {
+        if !field.is_static() {
+            continue;
+        }
+        let (Some(name), Some(constant)) = (field.name(), field.constant()) else {
+            continue;
+        };
+        let value = match constant {
+            lamella_metadata::ConstantValue::Bool(v) => i64::from(v),
+            lamella_metadata::ConstantValue::Char(v) => i64::from(v),
+            lamella_metadata::ConstantValue::I1(v) => i64::from(v),
+            lamella_metadata::ConstantValue::U1(v) => i64::from(v),
+            lamella_metadata::ConstantValue::I2(v) => i64::from(v),
+            lamella_metadata::ConstantValue::U2(v) => i64::from(v),
+            lamella_metadata::ConstantValue::I4(v) => i64::from(v),
+            lamella_metadata::ConstantValue::U4(v) => i64::from(v),
+            lamella_metadata::ConstantValue::I8(v) => v,
+            lamella_metadata::ConstantValue::U8(v) => v as i64,
+            _ => continue,
+        };
+        members.push((alloc::string::String::from(name), value));
+    }
+    members
+}
+
+/// Whether an UNMATCHED value of this enum renders exactly as a signed 32-bit decimal -- the only
+/// integer formatting the backend can emit inline ([`Inst::IntToString`]).
+///
+/// True for every underlying type whose whole range fits in `i32`: `bool`, `char`, `sbyte`, `byte`,
+/// `short`, `ushort`, `int`. False for `uint` (values at or above 2^31 would print negative) and for
+/// `long`/`ulong` (which do not fit at all). A false answer does not stop the member names being
+/// synthesized -- only the no-match arm changes, and it keeps the type name a non-overriding type
+/// already answers with, rather than a number that is right for most values and silently wrong for
+/// the rest.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn enum_numeric_fallback(type_def: &lamella_metadata::TypeDef, underlying: MirType) -> bool {
+    if underlying != MirType::I32 {
+        return false;
+    }
+    !matches!(
+        type_def
+            .fields()
+            .find(|field| !field.is_static())
+            .and_then(|field| field.signature()),
+        Some(SigType::U4)
+    )
+}
+
+/// The MIR for one enum's `ToString()`: read the boxed payload, compare it against each member's
+/// constant in declaration order, and return that member's name as a string literal.
+///
+/// The payload is at offset 0 of the object -- `box` lowers to an `Alloc` plus
+/// `FieldStore { offset: 0 }`, so this is the same read `unbox.any` makes, at the same width (the
+/// enum's underlying [`MirType`], so a `long`-backed enum compares both words).
+///
+/// With no member matching, `numeric` decides the arm: [`Inst::IntToString`] of the payload, which IS
+/// .NET's rule for a non-`[Flags]` enum; or, where that would not render exactly, the receiver's type
+/// name -- the same `LoadTypeDesc` + `TypeName` pair the synthesized `Object::ToString` uses, so the
+/// unrenderable case keeps precisely the answer it has today instead of gaining a new wrong one.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn enum_to_string_body(
+    members: &[(alloc::string::String, i64)],
+    underlying: MirType,
+    numeric: bool,
+) -> Function {
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let object = params[0];
+    let hits: Vec<usize> = members.iter().map(|_| mb.block()).collect();
+    let tests: Vec<usize> = members.iter().skip(1).map(|_| mb.block()).collect();
+    let none = mb.block();
+
+    mb.at(0);
+    let value = mb.emit(
+        underlying,
+        Inst::FieldLoad {
+            base: object,
+            offset: 0,
+        },
+    );
+    for (index, (_, constant)) in members.iter().enumerate() {
+        if index > 0 {
+            mb.at(tests[index - 1]);
+        }
+        let expected = mb.emit(
+            underlying,
+            Inst::ConstInt {
+                ty: underlying,
+                value: narrow(*constant, underlying),
+            },
+        );
+        let equal = mb.emit(
+            MirType::I32,
+            Inst::Compare {
+                op: CmpOp::Eq,
+                lhs: value,
+                rhs: expected,
+            },
+        );
+        let otherwise = tests.get(index).copied().unwrap_or(none);
+        mb.branch(equal, hits[index], otherwise);
+    }
+    for (index, (name, _)) in members.iter().enumerate() {
+        mb.at(hits[index]);
+        let literal = mb.emit(objt, string_literal(name));
+        mb.ret(literal);
+    }
+
+    mb.at(none);
+    if numeric {
+        let text = mb.emit(objt, Inst::IntToString { value });
+        mb.ret(text);
+    } else {
+        let descriptor = mb.emit(MirType::I32, Inst::LoadTypeDesc { object });
+        let text = mb.emit(objt, Inst::TypeName { descriptor });
+        mb.ret(text);
+    }
+    mb.finish(Some(objt))
+}
+
+/// The MIR for a `[Flags]` enum's `ToString()`: .NET's `InternalFlagsFormat`, unrolled over the
+/// members this build already knows.
+///
+/// The algorithm is theirs, walked step for step because the composite cases only agree if it is:
+/// sort the members by value ASCENDING (stably, so equal values keep declaration order), walk from
+/// the TOP down, and take a member whose bits are all still present -- subtracting them, so a
+/// composite member (`ab = 3` beside `a = 1`, `b = 2`) consumes its parts and they do not appear
+/// again. The smallest member is skipped when it is zero, which is .NET's `break` and the reason a
+/// `None = 0` never joins a non-zero rendering. Names are PREPENDED, so walking down yields
+/// ascending output: `A | C` is `"A, C"`.
+///
+/// Three exits, and each one is .NET's:
+/// - bits left over that no member claims -> the number (or, where that cannot render, the type
+///   name -- see [`append_enum_to_string`]);
+/// - the value was zero -> the zero member's name if the enum declares one, else the literal `"0"`;
+/// - otherwise the joined names.
+///
+/// The separator rides INSIDE each member's second literal (`"Name, "`), so a join is one
+/// concatenation rather than two, and the `acc == null` test is what distinguishes the first name
+/// taken from the rest.
+///
+/// I32 UNDERLYING ONLY; the caller keeps a 64-bit `[Flags]` enum on the plain exact-match chain. The
+/// decomposition needs `And`/`Sub` on the payload, and this build has no proof those lower on both
+/// backends at 64 bits -- an untested arm here would trade a wrong string for a refused BUILD.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn enum_flags_to_string_body(members: &[(alloc::string::String, i64)], numeric: bool) -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let mut ordered: Vec<&(alloc::string::String, i64)> = members.iter().collect();
+    ordered.sort_by_key(|(_, value)| *value as u64);
+    let zero_name = ordered
+        .first()
+        .filter(|(_, value)| *value == 0)
+        .map(|(name, _)| name.as_str());
+    let walk: Vec<&(alloc::string::String, i64)> = ordered
+        .iter()
+        .skip(usize::from(zero_name.is_some()))
+        .rev()
+        .copied()
+        .collect();
+
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let object = params[0];
+    let zero_case = mb.block();
+    let start = mb.block();
+    let steps: Vec<usize> = walk.iter().map(|_| mb.block()).collect();
+    let takes: Vec<usize> = walk.iter().map(|_| mb.block()).collect();
+    let firsts: Vec<usize> = walk.iter().map(|_| mb.block()).collect();
+    let mores: Vec<usize> = walk.iter().map(|_| mb.block()).collect();
+    let skips: Vec<usize> = walk.iter().map(|_| mb.block()).collect();
+    let done = mb.block();
+    let joined = mb.block();
+    let leftover = mb.block();
+    let first_step = steps.first().copied().unwrap_or(done);
+
+    mb.at(0);
+    let value = mb.emit(
+        i32t,
+        Inst::FieldLoad {
+            base: object,
+            offset: 0,
+        },
+    );
+    let zero = mb.emit(i32t, Inst::ConstInt { ty: i32t, value: 0 });
+    let empty = mb.emit(
+        objt,
+        Inst::Convert {
+            value: zero,
+            kind: ConvKind::IntToRef,
+        },
+    );
+    let is_zero = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: value,
+            rhs: zero,
+        },
+    );
+    mb.branch(is_zero, zero_case, start);
+
+    mb.at(zero_case);
+    let zero_text = mb.emit(objt, string_literal(zero_name.unwrap_or("0")));
+    mb.ret(zero_text);
+
+    mb.at(start);
+    mb.jump(first_step, alloc::vec![value, empty]);
+
+    for (index, (name, constant)) in walk.iter().enumerate() {
+        let next = steps.get(index + 1).copied().unwrap_or(done);
+        let state = mb.enter(steps[index], &[i32t, objt]);
+        let (rest, text) = (state[0], state[1]);
+        let bits = mb.emit(
+            i32t,
+            Inst::ConstInt {
+                ty: i32t,
+                value: narrow(*constant, i32t),
+            },
+        );
+        let masked = mb.emit(
+            i32t,
+            Inst::Binary {
+                op: BinOp::And,
+                lhs: rest,
+                rhs: bits,
+            },
+        );
+        let present = mb.emit(
+            i32t,
+            Inst::Compare {
+                op: CmpOp::Eq,
+                lhs: masked,
+                rhs: bits,
+            },
+        );
+        mb.branch(present, takes[index], skips[index]);
+
+        mb.at(takes[index]);
+        let remaining = mb.emit(
+            i32t,
+            Inst::Binary {
+                op: BinOp::Sub,
+                lhs: rest,
+                rhs: bits,
+            },
+        );
+        let as_int = mb.emit(
+            i32t,
+            Inst::Convert {
+                value: text,
+                kind: ConvKind::RefToInt,
+            },
+        );
+        let nothing_yet = mb.emit(
+            i32t,
+            Inst::Compare {
+                op: CmpOp::Eq,
+                lhs: as_int,
+                rhs: zero,
+            },
+        );
+        mb.branch(nothing_yet, firsts[index], mores[index]);
+
+        mb.at(firsts[index]);
+        let only = mb.emit(objt, string_literal(name));
+        mb.jump(next, alloc::vec![remaining, only]);
+
+        mb.at(mores[index]);
+        let prefix = mb.emit(objt, string_literal(&alloc::format!("{name}, ")));
+        let grown = mb.emit(
+            objt,
+            Inst::StringConcat {
+                lhs: prefix,
+                rhs: text,
+            },
+        );
+        mb.jump(next, alloc::vec![remaining, grown]);
+
+        mb.at(skips[index]);
+        mb.jump(next, alloc::vec![rest, text]);
+    }
+
+    let state = mb.enter(done, &[i32t, objt]);
+    let (rest, text) = (state[0], state[1]);
+    let all_claimed = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: rest,
+            rhs: zero,
+        },
+    );
+    mb.branch(all_claimed, joined, leftover);
+
+    mb.at(joined);
+    mb.ret(text);
+
+    mb.at(leftover);
+    if numeric {
+        let text = mb.emit(objt, Inst::IntToString { value });
+        mb.ret(text);
+    } else {
+        let descriptor = mb.emit(i32t, Inst::LoadTypeDesc { object });
+        let text = mb.emit(objt, Inst::TypeName { descriptor });
+        mb.ret(text);
+    }
+    mb.finish(Some(objt))
+}
+
+/// A UTF-16 string literal instruction for `text`.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn string_literal(text: &str) -> Inst {
+    Inst::StringLiteral {
+        utf16: text.encode_utf16().collect::<Vec<u16>>().into_boxed_slice(),
+    }
+}
+
+/// A member constant re-narrowed to the enum's underlying width, so the emitted `ConstInt` is the
+/// bit pattern the boxed payload holds: a `byte` enum's 255 must compare equal to the 255 the box
+/// stored, and a `short` enum's -1 to the sign-extended word.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn narrow(value: i64, underlying: MirType) -> i64 {
+    if underlying == MirType::I64 {
+        value
+    } else {
+        i64::from(value as i32)
     }
 }
 
@@ -739,14 +1253,14 @@ fn assembly_statics(
             }
         }
     }
-    for (row, slot) in &slots {
+    for (row, slot, _) in &slots {
         if *slot < 0x4000 && ref_rows.contains(row) {
             roots.push((*slot as u16) | (crate::stackmaps::STACKMAP_KIND_OBJECT_REF << 14));
         }
     }
     crate::stackmaps::AssemblyStatics {
         suffix: alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, cil)),
-        region_bytes: (slots.len() as u32 + 1) * 4,
+        region_bytes: crate::resolver::static_region_words(assembly) * 4,
         roots,
     }
 }
@@ -831,11 +1345,40 @@ fn build_object_riscv_inner(
         reference_cctors
             .extend(find_cctors(reference).into_iter().map(|rid| alloc::format!("{prefix}f{rid}")));
     }
-    let funcs = lower_reachable(&assembly, entry, &descriptors, &references, &reference_cctors)?;
-    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let names: Vec<alloc::string::String> =
+    let mut funcs =
+        lower_reachable(&assembly, entry, &descriptors, &references, &reference_cctors)?;
+    let mut names: Vec<alloc::string::String> =
         (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
+    names.extend(append_enum_to_string(
+        &assembly,
+        &resolver,
+        &mut funcs,
+        &mut descriptors,
+    ));
+    replace_exception_message(&assembly, &mut funcs);
+    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let imports = pinvoke_imports(&funcs);
+    let import_names: Vec<&str> = imports.iter().map(|(name, _)| name.as_str()).collect();
+    let mut silent_edges: Vec<(alloc::string::String, alloc::string::String)> = Vec::new();
+    for (ordinal, reference) in reference_assemblies.iter().enumerate() {
+        for (_, seam, symbol) in
+            imported_silent_seams(reference, &references[..ordinal], &import_names)
+        {
+            let caller_rid = imports
+                .iter()
+                .find(|(name, _)| *name == symbol)
+                .map_or(0, |(_, caller)| *caller);
+            silent_edges.push((alloc::format!("f{caller_rid}"), seam));
+        }
+    }
+    if let Some((caller, seam)) = silent_edges.first() {
+        return Err(BuildError::SilentSeamCallEdge {
+            caller: caller.clone(),
+            seam: seam.clone(),
+            total: silent_edges.len(),
+        });
+    }
     let statics = assembly_statics(cil, &assembly, true);
     let reference_regions: Vec<alloc::string::String> = reference_cils
         .iter()
@@ -1016,12 +1559,19 @@ fn build_library_object_riscv_inner(
         .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
-    let (funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &references);
+    let (mut funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &references);
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
-    let names = library_symbol_names(&assembly, &references, funcs.len(), &prefix);
-    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let resolver = MetadataResolver::new(&assembly).with_references(&references);
     let mut descriptors = resolver.type_descriptors();
+    let mut names = library_symbol_names(&assembly, &references, funcs.len(), &prefix);
+    names.extend(append_enum_to_string(
+        &assembly,
+        &resolver,
+        &mut funcs,
+        &mut descriptors,
+    ));
+    replace_exception_message(&assembly, &mut funcs);
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, false);
     let reference_regions: Vec<alloc::string::String> = reference_cils
@@ -1068,7 +1618,13 @@ fn build_library_object_riscv_inner(
             .into_iter()
             .map(|(index, error)| (index as u32, name_of(index), alloc::format!("{error:?}")))
             .collect(),
-        unsynthesized_seams: unsynthesized_seam_rows(&assembly, &seams, &display_names, &names),
+        unsynthesized_seams: unsynthesized_seam_rows(
+            &assembly,
+            &seams,
+            &display_names,
+            &names,
+            &vtable_slot_rids(&resolver),
+        ),
         silent_seam_edges: silent_seam_call_edges(&assembly, &funcs, &seams, &display_names),
     };
     Ok((bytes, report))
@@ -1198,6 +1754,10 @@ pub struct UnsynthesizedSeam {
     /// through a VIRTUAL slot or through a reference's internals is the linker's reachability
     /// question, which this flag does not speak to.
     pub folded_to_intrinsic: bool,
+    /// Whether this seam OCCUPIES A VTABLE SLOT of some type in this assembly -- so a `callvirt` on
+    /// that type reaches it with no `call` naming its rid, and the call-edge audit
+    /// ([`LibraryBuildReport::silent_seam_edges`]) structurally cannot see it.
+    pub in_vtable_slot: bool,
 }
 
 /// What [`build_library_object_report`] observed while building: the THREE distinct silent-demotion
@@ -1265,10 +1825,9 @@ fn build_library_object_inner(
         .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
         .collect::<Result<_, _>>()?;
     let reference_list: Vec<&Assembly> = reference_assemblies.iter().collect();
-    let (funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &reference_list);
+    let (mut funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &reference_list);
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
-    let names = library_symbol_names(&assembly, &reference_list, funcs.len(), &prefix);
-    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut names = library_symbol_names(&assembly, &reference_list, funcs.len(), &prefix);
     let qualifiers = arm32::DescQualifiers {
         string: MetadataResolver::new(&assembly)
             .with_references(&reference_list)
@@ -1282,6 +1841,14 @@ fn build_library_object_inner(
     };
     let resolver = MetadataResolver::new(&assembly).with_references(&reference_list);
     let mut descriptors = resolver.type_descriptors();
+    names.extend(append_enum_to_string(
+        &assembly,
+        &resolver,
+        &mut funcs,
+        &mut descriptors,
+    ));
+    replace_exception_message(&assembly, &mut funcs);
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, false);
     let (bytes, stubs) = arm32::lower_object_library_vtables_report(
@@ -1311,7 +1878,13 @@ fn build_library_object_inner(
             .into_iter()
             .map(|(index, error)| (index as u32, name_of(index), alloc::format!("{error:?}")))
             .collect(),
-        unsynthesized_seams: unsynthesized_seam_rows(&assembly, &seams, &display_names, &names),
+        unsynthesized_seams: unsynthesized_seam_rows(
+            &assembly,
+            &seams,
+            &display_names,
+            &names,
+            &vtable_slot_rids(&resolver),
+        ),
         silent_seam_edges: silent_seam_call_edges(&assembly, &funcs, &seams, &display_names),
     };
     Ok((bytes, report))
@@ -1328,11 +1901,13 @@ fn unsynthesized_seam_rows(
     seams: &[SeamRow],
     display_names: &[Option<alloc::string::String>],
     symbols: &[alloc::string::String],
+    vtable_slot_rids: &[u32],
 ) -> Vec<UnsynthesizedSeam> {
     seams
         .iter()
         .map(|(rid, disposition, folded)| UnsynthesizedSeam {
             folded_to_intrinsic: *folded,
+            in_vtable_slot: vtable_slot_rids.contains(rid),
             rid: *rid,
             name: display_names
                 .get(*rid as usize)
@@ -1345,6 +1920,25 @@ fn unsynthesized_seam_rows(
                 .unwrap_or_else(|| alloc::format!("f{rid}")),
             intended_default: assembly.is_intended_default(Token::new(table::METHOD_DEF, *rid)),
             disposition: *disposition,
+        })
+        .collect()
+}
+
+/// Every method rid this assembly places in a VTABLE SLOT -- the set a `callvirt` can reach without
+/// any `call` naming the rid, which is precisely what [`silent_seam_call_edges`] cannot see.
+///
+/// A slot filled from a REFERENCED assembly is an `Extern` symbol rather than a rid and is not
+/// collected: this answers "which of MY methods are virtually reachable", which is the question the
+/// census rows are about. Duplicates are kept -- the caller only membership-tests -- because a method
+/// legitimately occupies the same slot in every derived type that inherits it.
+fn vtable_slot_rids(resolver: &MetadataResolver<'_>) -> Vec<u32> {
+    resolver
+        .vtables()
+        .into_iter()
+        .flat_map(|(_, entries)| entries)
+        .filter_map(|entry| match entry {
+            crate::resolver::VtableEntry::Func(rid) => Some(rid),
+            crate::resolver::VtableEntry::Extern(_) => None,
         })
         .collect()
 }
@@ -1688,6 +2282,7 @@ fn mir_type<'x>(sig: &SigType, assembly: &'x Assembly<'x>, references: &[&'x Ass
         | SigType::Class(_)
         | SigType::SzArray(_)
         | SigType::Array { .. } => MirType::ObjectRef,
+        SigType::Pointer(_) => MirType::NativeInt,
         SigType::ValueType(token) => {
             if let Some(underlying) =
                 crate::resolver::enum_underlying(assembly, *token, references, &TargetLayout::ilp32())
@@ -2165,7 +2760,7 @@ fn synthesize_type_seam(
 /// form) -- into a runtime-support value-writer (`writer`), then optionally a trailing newline. So
 /// `Write(x)` = the writer, `WriteLine(x)` = the writer + newline, `WriteLine()` = just the newline.
 /// All are void `[RuntimeProvided]` statics; the object path rewrites each `PInvoke` to a `CallNative`
-/// the linker resolves against `tools/runtime-support`. The writer matches the interpreter / .NET
+/// the linker resolves against `tools/runtime/runtime-support`. The writer matches the interpreter / .NET
 /// formatting (signed/unsigned decimal, `True`/`False`, a `char`'s code unit).
 fn console_body(
     param: Option<MirType>,
@@ -2237,7 +2832,7 @@ fn console_body(
 /// a managed pointer to the `f64` value; load the 8-byte value from it and hand it to the runtime-support
 /// `lamella_double_to_string`, which formats it (byte-identical to the interpreter's `format_double`) and
 /// returns a GC-allocated `[len: u32][u16 units ...]` string. The object path rewrites the `PInvoke` to a
-/// `CallNative` the linker resolves against `tools/runtime-support`. `this` is dead by the allocating call,
+/// `CallNative` the linker resolves against `tools/runtime/runtime-support`. `this` is dead by the allocating call,
 /// so nothing improper is a GC root there; the returned ObjectRef is rooted as the live result.
 fn double_to_string_body() -> Function {
     Function {
@@ -2448,6 +3043,35 @@ fn synthesized_seam_body<'a>(
         synthesize_type_seam(type_name.namespace, type_name.name, method.name(), params)
     {
         return SeamEmission::Synthesized(func);
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Object")
+        && method.name() == Some("ToString")
+        && params == 0
+    {
+        return SeamEmission::Synthesized(Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::LoadTypeDesc {
+                            object: ValueId(0),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::TypeName {
+                            descriptor: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        });
     }
     if (type_name.namespace, type_name.name) == ("System", "Console") {
         let params = signature
@@ -2833,6 +3457,11 @@ impl MirBuilder {
             args,
         });
     }
+    /// A conditional branch. Its targets take NO arguments, which is not a shortcut of this builder
+    /// but the backends' rule: both ARM object paths refuse a `Branch` carrying arguments outright
+    /// (`ControlFlowUnsupported` -- "merges must go through Jump"). A synthesized body that needs to
+    /// hand different values to a join branches to a one-line block of its own that `jump`s with
+    /// them; the branching block dominates it, so it reads those values directly.
     fn branch(&mut self, cond: ValueId, if_true: usize, if_false: usize) {
         self.blocks[self.cur].terminator = Some(Terminator::Branch {
             cond,

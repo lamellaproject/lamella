@@ -35,7 +35,10 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 /// module namespace).
 ///
 /// Version 21 added `InplaceBinOp` (augmented assignment `x OP= y` -- the in-place binary operator).
-pub const FORMAT_VERSION: u16 = 21;
+///
+/// Version 22 added a code object's `doc` (a function's docstring, which `__doc__` reads) and
+/// `BuildClassKw` (keyword arguments in a class header).
+pub const FORMAT_VERSION: u16 = 22;
 
 /// The feature-flag bits a module's header carries, declaring which language
 /// surface its bytecode assumes. A reader lacking a required feature rejects the
@@ -90,6 +93,13 @@ pub const EXCEPTION_HIERARCHY: &[(&str, &str)] = &[
     ("OSError", "Exception"),
     ("TimeoutError", "OSError"),
     ("GeneratorExit", "BaseException"),
+    ("SystemExit", "BaseException"),
+    ("FileNotFoundError", "OSError"),
+    ("FileExistsError", "OSError"),
+    ("IsADirectoryError", "OSError"),
+    ("NotADirectoryError", "OSError"),
+    ("PermissionError", "OSError"),
+    ("MemoryError", "Exception"),
 ];
 
 /// The AOT exception TAG of a Python exception `name`: FNV-1a-32 over `"python." + name`, the high
@@ -269,6 +279,7 @@ impl UnaryOp {
 /// |     54 | YieldFrom | generators |
 /// |     55 | ImportStar | imports |
 /// |     56 | InplaceBinOp | augmented assignment |
+/// |     57 | BuildClassKw | class keyword arguments |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -358,6 +369,25 @@ pub enum Op {
     /// Pop the namespace dict, then the base, then the name, and push a new class object (a
     /// type). For a `class` definition.
     BuildClass,
+    /// [`Op::BuildClass`] for a class header carrying KEYWORD arguments -- `class C(Base, tag="x")`.
+    ///
+    /// At the op the stack is `[name, base, kwval0 .. kwval{k-1}]` and the NAMESPACE is in the
+    /// class-body register: [`Op::SetupClassNamespace`] runs after the keyword values are pushed. A
+    /// reader that takes the register when one is set and pops the namespace otherwise -- which is
+    /// what [`Op::BuildClass`]'s own dict-display form already needs -- reads this correctly either
+    /// way, since a stack-carried namespace would sit above the keyword values.
+    ///
+    /// `consts[kwnames]` (a [`Const::KwNames`]) gives the `k` keyword names in the same order, exactly
+    /// as [`Op::CallKw`] names a call's keywords -- source order, which is the order a base's
+    /// `__init_subclass__(cls, **kw)` needs to build its keyword arguments. `metaclass` is not among
+    /// them, being outside this subset.
+    ///
+    /// A class header WITHOUT keywords still emits the plain [`Op::BuildClass`], so nothing that
+    /// existed before this op changes shape.
+    BuildClassKw {
+        /// The index into `consts` of the [`Const::KwNames`] naming the keywords in order.
+        kwnames: u32,
+    },
     /// Pop the object, then the value, and do `object.<names[name]> = value` (`cache` is the
     /// inline-cache slot). For an attribute assignment `obj.attr = value`.
     SetAttr {
@@ -674,6 +704,12 @@ pub struct CodeObject {
     pub names: Vec<String>,
     /// The instructions, in order.
     pub ops: Vec<Op>,
+    /// The body's docstring: a leading bare-string statement, else `None`. It rides the code
+    /// object because a function object is built at its def site rather than by running a body, so
+    /// this is where `__doc__` can be read from -- the same place `__name__` and `__qualname__`
+    /// already come from. A MODULE and a CLASS bind their own `__doc__` as a name instead, since
+    /// both have a namespace to bind it into.
+    pub doc: Option<String>,
     /// How many inline-cache slots a running frame allocates for this code: the count
     /// of cacheable sites (each [`Op::LoadAttr`]), numbered in ascending static order.
     pub cache_count: usize,
@@ -901,6 +937,10 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(*flags);
         }
         Op::BuildClass => buf.push(31),
+        Op::BuildClassKw { kwnames } => {
+            buf.push(57);
+            put_u32(buf, *kwnames);
+        }
         Op::SetAttr { name, cache } => {
             buf.push(32);
             put_u32(buf, *name);
@@ -1022,6 +1062,13 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
     put_len(buf, co.names.len());
     for n in &co.names {
         put_str(buf, n);
+    }
+    match &co.doc {
+        Some(text) => {
+            buf.push(1);
+            put_str(buf, text);
+        }
+        None => buf.push(0),
     }
     put_len(buf, co.cache_count);
     put_len(buf, co.ops.len());
@@ -1313,6 +1360,7 @@ impl<'a> Reader<'a> {
             53 => Op::StoreGlobal(self.u32()?),
             54 => Op::YieldFrom,
             55 => Op::ImportStar,
+            57 => Op::BuildClassKw { kwnames: self.u32()? },
             56 => {
                 let b = self.u8()?;
                 Op::InplaceBinOp(BinOp::from_u8(b).ok_or(DecodeError::BadTag("BinOp", b))?)
@@ -1368,6 +1416,10 @@ impl<'a> Reader<'a> {
         for _ in 0..n_names {
             names.push(self.string()?);
         }
+        let doc = match self.u8()? {
+            0 => None,
+            _ => Some(self.string()?),
+        };
         let cache_count = self.u32()? as usize;
         let n_ops = self.u32()? as usize;
         let mut ops = Vec::with_capacity(n_ops);
@@ -1401,6 +1453,7 @@ impl<'a> Reader<'a> {
             consts,
             names,
             ops,
+            doc,
             cache_count,
             exc_table,
         })
@@ -1427,6 +1480,7 @@ mod tests {
     fn sample_module() -> Module {
         let func = CodeObject {
             name: String::from("inc"),
+            doc: None,
             params: vec![Param {
                 name: String::from("n"),
                 ty: StaticType::Int,
@@ -1465,6 +1519,7 @@ mod tests {
             functions: vec![func],
             body: CodeObject {
                 name: String::from("<module>"),
+                doc: None,
                 params: Vec::new(),
                 posonly_count: 0,
                 kwonly_count: 0,
@@ -1602,6 +1657,7 @@ mod tests {
     fn code_object_cellvars_freevars_round_trip() {
         let co = CodeObject {
             name: String::from("inner"),
+            doc: None,
             params: Vec::new(),
             posonly_count: 0,
             kwonly_count: 0,

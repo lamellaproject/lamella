@@ -5713,6 +5713,63 @@ mod tests {
         }
     }
 
+    /// The `fixed` statement's holder slot must be `pinned` in the emitted local-variable
+    /// signature AND that constraint must survive the metadata READ -- the producer and the
+    /// consumer, in one assertion, because a `pinned` byte the reader discards is worth exactly
+    /// as much as one never written.
+    ///
+    /// Why the pin is the whole statement: `fixed` hands the program a `T*`, and an unmanaged
+    /// pointer is NOT reported to the garbage collector (ECMA-335: `ELEMENT_TYPE_PTR` is not a
+    /// GC-tracked type). So on a MOVING collector the only thing keeping that pointer valid is
+    /// the array not moving, and the only thing that says so is this constraint.
+    ///
+    /// The pointer slot is asserted UNPINNED in the same breath: a fix that pins every slot in a
+    /// method containing `fixed` would satisfy the first half and quietly defeat compaction.
+    #[test]
+    fn a_fixed_statements_holder_slot_is_pinned_and_the_pointer_slot_is_not() {
+        use lamella_metadata::signature::SigType;
+        let unit = parse_compilation_unit(
+            "class Program { static unsafe int Main() { int[] arr = new int[4]; \
+                 fixed (int* p = arr) { p[0] = 42; } return arr[0]; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "pinned.dll", "pinned");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let main = assembly
+            .find_type("", "Program")
+            .expect("the Program type")
+            .methods()
+            .find(|method| method.name() == Some("Main"))
+            .expect("the Main method");
+        let slots = main.local_variable_slots();
+
+        let pinned: Vec<_> = slots.iter().filter(|slot| slot.pinned).collect();
+        assert!(
+            !pinned.is_empty(),
+            "the `fixed` holder slot must report `pinned`; slots were {slots:?}"
+        );
+        for slot in &pinned {
+            assert!(
+                matches!(slot.ty, SigType::SzArray(_) | SigType::ByRef(_)),
+                "a pinned slot must hold something the collector can pin, got {:?}",
+                slot.ty
+            );
+        }
+        let pointer_slots: Vec<_> = slots
+            .iter()
+            .filter(|slot| matches!(slot.ty, SigType::Pointer(_)))
+            .collect();
+        assert!(
+            !pointer_slots.is_empty(),
+            "Main declares the `int* p` local; slots were {slots:?}"
+        );
+        for slot in pointer_slots {
+            assert!(!slot.pinned, "the pointer slot must not be pinned: {slot:?}");
+        }
+    }
+
     #[test]
     fn a_volatile_field_access_carries_the_volatile_prefix() {
         use lamella_cil::Opcode;

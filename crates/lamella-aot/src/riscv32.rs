@@ -28,8 +28,17 @@ pub enum LowerError {
     TooManyValues,
     /// A control-flow shape this backend does not handle.
     ControlFlowUnsupported,
-    /// The final image could not be assembled (an out-of-range branch).
-    CodeTooLarge,
+    /// The final image could not be assembled: a branch could not reach its target. Carries the
+    /// SITE and the DISTANCE, because "too large" alone cannot say which branch tier was asked for
+    /// (conditional +/-4 KB, jump +/-1 MB) nor how far short it fell.
+    CodeTooLarge {
+        /// Byte offset of the instruction whose target was unreachable.
+        at: u32,
+        /// The distance it needed, in bytes, signed.
+        offset: i64,
+        /// The reach the encoding has, as `+/-limit` bytes.
+        limit: i64,
+    },
     /// A string literal holds a UTF-16 code unit this build's string storage cannot represent: a LONE
     /// surrogate under `string-utf8`. Refused rather than replaced with U+FFFD -- see
     /// `stringgen::encode_string_bytes` for why a compiler refuses where the interpreter throws.
@@ -811,7 +820,11 @@ fn lower_module_to_image(
         }
         method_lines.push(lines);
     }
-    if let Some(handle) = string_header.filter(|_| !abs_desc_relocs.is_empty()) {
+    let names_want_header = !cfg!(feature = "strip-type-names")
+        && descriptors.iter().any(|m| m.full_name.is_some());
+    if let Some(handle) =
+        string_header.filter(|_| !abs_desc_relocs.is_empty() || names_want_header)
+    {
         let handle = TypeHandle(handle);
         if !type_desc_labels.iter().any(|(h, _)| *h == handle) {
             if let Some(words) = descriptors
@@ -916,19 +929,58 @@ fn lower_module_to_image(
         }
         arrayi += 1;
     }
-    let desc_syms = emit_descriptors(
+    let type_names = !cfg!(feature = "strip-type-names");
+    let name_header: Option<u32> = relocate.then_some(string_handle).flatten();
+    let mut desc_syms = emit_descriptors(
         &mut enc,
         &type_descs,
         &type_desc_labels,
         &func_labels,
-        descriptors,
-        relocate,
-        &mut desc_relocs,
+        DescEmitCtx {
+            descriptors,
+            relocate,
+            desc_relocs: &mut desc_relocs,
+            abs_desc_relocs: &mut abs_desc_relocs,
+            type_names,
+            string_header: name_header,
+        },
     );
-    let bytes = enc
+    let assembled = enc
         .finish()
-        .map(|assembled| assembled.bytes)
-        .map_err(|_| LowerError::CodeTooLarge)?;
+        .map_err(|e| match e {
+            lamella_asm_riscv32::AssembleError::BranchOutOfRange { at, offset, limit } => {
+                LowerError::CodeTooLarge { at, offset, limit }
+            }
+            lamella_asm_riscv32::AssembleError::UnboundLabel(_) => LowerError::CodeTooLarge {
+                at: 0,
+                offset: 0,
+                limit: 0,
+            },
+        })?;
+    let shifts = &assembled.shifts;
+    let bytes = assembled.bytes;
+    if !shifts.is_empty() {
+        for off in &mut offsets {
+            *off = lamella_asm_riscv32::shift_position(shifts, *off);
+        }
+        for (at, _) in &mut call_relocs {
+            *at = lamella_asm_riscv32::shift_position(shifts, *at);
+        }
+        for (_, vtable_start, _, _) in &mut desc_syms {
+            *vtable_start = lamella_asm_riscv32::shift_position(shifts, *vtable_start);
+        }
+        for (at, _, _) in &mut desc_relocs {
+            *at = lamella_asm_riscv32::shift_position(shifts, *at);
+        }
+        for (at, _, _) in &mut abs_desc_relocs {
+            *at = lamella_asm_riscv32::shift_position(shifts, *at);
+        }
+        for lines in &mut method_lines {
+            for (at, _) in lines.iter_mut() {
+                *at = lamella_asm_riscv32::shift_position(shifts, *at);
+            }
+        }
+    }
     Ok((
         bytes,
         offsets,
@@ -2421,8 +2473,10 @@ fn lower_function_spilled(
                     return Err(LowerError::ControlFlowUnsupported);
                 }
                 for (p, a) in params.iter().zip(args) {
-                    slot_load(enc, Reg::T0, slot(*a));
-                    slot_store(enc, Reg::T0, slot(*p));
+                    for w in 0..slot_words(&func.value_types, *p) as i32 {
+                        slot_load(enc, Reg::T0, slot(*a) + w * 4);
+                        slot_store(enc, Reg::T0, slot(*p) + w * 4);
+                    }
                 }
                 enc.j(block_labels[target.index()]);
             }
@@ -2718,6 +2772,10 @@ fn lower_inst_spilled(
         }
         Inst::StaticLoad { owner, offset } => {
             emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
+            if matches!(value_types.get(result.index()), Some(MirType::I64 | MirType::F64)) {
+                enc.lw(t1, t0, 4);
+                slot_store(enc, t1, slot(result) + 4);
+            }
             enc.lw(t0, t0, 0);
             slot_store(enc, t0, slot(result));
         }
@@ -2729,6 +2787,13 @@ fn lower_inst_spilled(
             emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
             slot_load(enc, t1, slot(*value));
             enc.sw(t1, t0, 0);
+            if matches!(
+                value_types.get(value.index()),
+                Some(MirType::I64 | MirType::F64)
+            ) {
+                slot_load(enc, t1, slot(*value) + 4);
+                enc.sw(t1, t0, 4);
+            }
         }
         Inst::AllocArray2D {
             handle,
@@ -2944,6 +3009,10 @@ fn lower_inst_spilled(
                 _ => enc.lw(t1, t0, 0),
             }
             slot_store(enc, t1, slot(result));
+            if *width == 8 {
+                enc.lw(t1, t0, 4);
+                slot_store(enc, t1, slot(result) + 4);
+            }
         }
         Inst::Store {
             address,
@@ -2956,6 +3025,10 @@ fn lower_inst_spilled(
                 1 => enc.sb(t1, t0, 0),
                 2 => enc.sh(t1, t0, 0),
                 _ => enc.sw(t1, t0, 0),
+            }
+            if *width == 8 {
+                slot_load(enc, t1, slot(*value) + 4);
+                enc.sw(t1, t0, 4);
             }
         }
         Inst::FieldLoad { base, offset } => {
@@ -3257,6 +3330,10 @@ fn lower_inst_spilled(
                     l
                 }
             };
+            let has_descriptor = descriptors
+                .iter()
+                .find(|d| d.handle == *handle)
+                .is_some_and(|m| !m.vtable.is_empty() || !m.itable.is_empty());
             slot_load(enc, t0, slot(*length));
             if element_size.is_power_of_two() {
                 enc.slli(t0, t0, element_size.trailing_zeros());
@@ -3264,13 +3341,18 @@ fn lower_inst_spilled(
                 enc.li(t1, *element_size as i32);
                 enc.mul(t0, t0, t1);
             }
-            enc.addi(Reg::A0, t0, 4);
+            enc.addi(Reg::A0, t0, if has_descriptor { 8 } else { 4 });
             emit_desc_words_addr(enc, Reg::A1, t0, *handle, desc_label, desc_ptr_pool, relocate);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
             enc.bind_label(ok);
+            if has_descriptor {
+                emit_desc_words_addr(enc, t1, t0, *handle, desc_label, desc_ptr_pool, relocate);
+                enc.sw(t1, Reg::A0, 0);
+                enc.addi(Reg::A0, Reg::A0, 4);
+            }
             slot_load(enc, t0, slot(*length));
             enc.sw(t0, Reg::A0, 0);
             slot_store(enc, Reg::A0, slot(result));
@@ -3471,6 +3553,31 @@ fn lower_inst_spilled(
             enc.j(search);
             enc.bind_label(found);
             enc.li(t0, 1);
+            enc.j(done);
+            enc.bind_label(miss);
+            enc.li(t0, 0);
+            enc.bind_label(done);
+            slot_store(enc, t0, slot(result));
+        }
+        Inst::TypeName { descriptor } => {
+            let miss = enc.new_label();
+            let done = enc.new_label();
+            slot_load(enc, t0, slot(*descriptor));
+            enc.branch(BranchCond::Eq, t0, Reg::ZERO, miss);
+            enc.lw(t1, t0, 0);
+            enc.srli(t1, t1, 24);
+            enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
+            enc.branch(BranchCond::Eq, t1, t2, miss);
+            enc.lw(t1, t0, 4);
+            enc.slli(t1, t1, 2);
+            enc.addi(t1, t1, 16);
+            enc.add(t1, t0, t1);
+            enc.lw(t2, t1, 0);
+            enc.slli(t2, t2, 3);
+            enc.add(t1, t1, t2);
+            enc.lw(t2, t1, 4);
+            enc.branch(BranchCond::Eq, t2, Reg::ZERO, miss);
+            enc.add(t0, t0, t2);
             enc.j(done);
             enc.bind_label(miss);
             enc.li(t0, 0);
@@ -3833,7 +3940,7 @@ fn emit_convert(enc: &mut Encoder, dest: Reg, src: Reg, kind: ConvKind) -> Resul
             enc.slli(dest, src, 16);
             enc.srli(dest, dest, 16);
         }
-        ConvKind::RefToInt | ConvKind::IntToRef => {
+        ConvKind::RefToInt | ConvKind::IntToRef | ConvKind::ToNativeInt => {
             if dest != src {
                 enc.mv(dest, src);
             }
@@ -3897,15 +4004,41 @@ fn descriptor_vtable(
 /// or (base_ptr@12) a `DESC_SYMBOL_FLAG`-tagged base handle -- so a slot can point across the link and
 /// survive `--gc-sections`; each descriptor also becomes a `__lamella_typedesc_<handle>` symbol. The
 /// per-slot addend pins the slot to its descriptor so the linker's `S + A - P` reduces to `entry - desc`.
+///
+/// Everything that is not the descriptor list itself rides [`DescEmitCtx`]: the metadata the words
+/// are built from, the two relocation sinks (descriptor-RELATIVE and ABSOLUTE -- a name's object
+/// header is read from `[obj - 4]` by code holding only the pointer, so it cannot be relative), and
+/// the name-word inputs.
+struct DescEmitCtx<'a> {
+    /// The per-type metadata the words, vtable, itable and NAME are read from.
+    descriptors: &'a [TypeMeta],
+    /// Object path: slots become relocations rather than in-image label diffs.
+    relocate: bool,
+    /// Descriptor-RELATIVE relocations (`S + A - P` reducing to `entry - desc`).
+    desc_relocs: &'a mut Vec<DescReloc>,
+    /// ABSOLUTE relocations -- only a name string's object header, which has no second term to add.
+    abs_desc_relocs: &'a mut Vec<DescReloc>,
+    /// Whether names are laid at all (`strip-type-names` clears it). The WORD is laid either way.
+    type_names: bool,
+    /// `System.String`'s handle for a name's object header; `None` on the flat path.
+    string_header: Option<u32>,
+}
+
 fn emit_descriptors(
     enc: &mut Encoder,
     type_descs: &[DescEmit],
     type_desc_labels: &[(TypeHandle, Label)],
     func_labels: &[Label],
-    descriptors: &[TypeMeta],
-    relocate: bool,
-    desc_relocs: &mut Vec<DescReloc>,
+    ctx: DescEmitCtx<'_>,
 ) -> Vec<DescSym> {
+    let DescEmitCtx {
+        descriptors,
+        relocate,
+        desc_relocs,
+        abs_desc_relocs,
+        type_names,
+        string_header,
+    } = ctx;
     let mut desc_syms: Vec<DescSym> = Vec::new();
     for (desc, (handle, _)) in type_descs.iter().zip(type_desc_labels) {
         let vtable_start = enc.position();
@@ -4003,6 +4136,32 @@ fn emit_descriptors(
                 Some(target) => enc.emit_word_diff(desc.label, func_labels[*target as usize]),
                 None => enc.emit_word(0),
             }
+        }
+        let name: Option<Vec<u8>> = type_names
+            .then(|| {
+                descriptors
+                    .iter()
+                    .find(|m| m.handle == *handle)
+                    .and_then(|m| m.full_name.as_deref())
+                    .map(|n| n.encode_utf16().collect::<Vec<u16>>())
+            })
+            .flatten()
+            .and_then(|units| crate::stringgen::string_blob_bytes(&units).ok());
+        match &name {
+            Some(blob) => {
+                let name_label = enc.new_label();
+                enc.emit_word_diff(desc.label, name_label);
+                if let Some(string_handle) = string_header {
+                    abs_desc_relocs.push((enc.position(), DESC_SYMBOL_FLAG | string_handle, 0));
+                    enc.emit_word(0);
+                }
+                enc.bind_label(name_label);
+                enc.emit_bytes(blob);
+                for _ in 0..((4 - (blob.len() % 4)) % 4) {
+                    enc.emit_bytes(&[0]);
+                }
+            }
+            None => enc.emit_word(0),
         }
         desc_syms.push((
             handle.0,
@@ -4207,6 +4366,7 @@ fn is_i64(value_types: &[MirType], value: ValueId) -> bool {
 /// whatever packs after the struct.
 fn value_type_copy_extent(value_types: &[MirType], value: ValueId) -> Option<(u32, u32)> {
     match value_types.get(value.index()) {
+        Some(MirType::I64 | MirType::F64) => Some((2, 0)),
         Some(MirType::ValueType { size, .. }) => Some((size / 4, size % 4)),
         _ => None,
     }
@@ -5425,6 +5585,215 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_moves_every_word_of_a_multi_word_parameter() {
+        let i64t = MirType::I64;
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(i64t),
+            value_types: vec![i64t, i64t],
+            entry: BlockId(0),
+            blocks: vec![
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![(
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: i64t,
+                            value: 9_000_000_000,
+                        },
+                    )],
+                    terminator: Some(Terminator::Jump {
+                        target: BlockId(1),
+                        args: vec![ValueId(0)],
+                    }),
+                },
+                BasicBlock {
+                    params: vec![ValueId(1)],
+                    insts: Vec::new(),
+                    terminator: Some(Terminator::Return(Some(ValueId(1)))),
+                },
+            ],
+        };
+        let bytes = lower(&func).expect("an i64 through a merge lowers");
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let lw_t0_sp = |w: u32| w & 0x7F == 0x03 && (w >> 12) & 7 == 2 && (w >> 15) & 0x1F == 2 && (w >> 7) & 0x1F == 5;
+        let sw_t0_sp = |w: u32| w & 0x7F == 0x23 && (w >> 12) & 7 == 2 && (w >> 15) & 0x1F == 2 && (w >> 20) & 0x1F == 5;
+        let i_imm = |w: u32| (w as i32) >> 20;
+        let s_imm = |w: u32| {
+            let imm = (((w >> 25) & 0x7F) << 5) | ((w >> 7) & 0x1F);
+            ((imm as i32) << 20) >> 20
+        };
+        let moves: Vec<(i32, i32)> = words
+            .windows(2)
+            .filter(|p| lw_t0_sp(p[0]) && sw_t0_sp(p[1]))
+            .map(|p| (i_imm(p[0]), s_imm(p[1])))
+            .collect();
+        assert!(
+            !moves.is_empty(),
+            "the merge must move its argument into the parameter's slot"
+        );
+        assert!(
+            moves
+                .iter()
+                .any(|&(src, dst)| moves.contains(&(src + 4, dst + 4))),
+            "the SAME move must repeat one word up -- the high half of the i64. saw {moves:?}"
+        );
+    }
+
+    /// `lw t1, imm(t0)` -- the load a field/indirect read issues once the base address is in t0.
+    fn lw_t1_from_t0(w: u32) -> bool {
+        w & 0x7F == 0x03 && (w >> 12) & 7 == 2 && (w >> 15) & 0x1F == 5 && (w >> 7) & 0x1F == 6
+    }
+
+    /// `sw t1, imm(sp)` -- the store that lands one loaded word in a frame slot.
+    fn sw_t1_to_sp(w: u32) -> bool {
+        w & 0x7F == 0x23 && (w >> 12) & 7 == 2 && (w >> 15) & 0x1F == 2 && (w >> 20) & 0x1F == 6
+    }
+
+    /// Every (load offset from t0, store offset into the frame) COUPLE in the image. Following the
+    /// couples is what distinguishes moving two words from moving one word twice, or from the
+    /// adjacent pair a 64-bit literal writes by itself.
+    fn word_moves_through_t0(bytes: &[u8]) -> Vec<(i32, i32)> {
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let i_imm = |w: u32| (w as i32) >> 20;
+        let s_imm = |w: u32| {
+            let imm = (((w >> 25) & 0x7F) << 5) | ((w >> 7) & 0x1F);
+            ((imm as i32) << 20) >> 20
+        };
+        words
+            .windows(2)
+            .filter(|p| lw_t1_from_t0(p[0]) && sw_t1_to_sp(p[1]))
+            .map(|p| (i_imm(p[0]), s_imm(p[1])))
+            .collect()
+    }
+
+    #[test]
+    fn a_64_bit_indirect_load_reads_the_word_pair() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::NativeInt, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::NativeInt,
+                            value: 0x2000_1000,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Load {
+                            address: ValueId(0),
+                            width: 8,
+                            signed: false,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let moves = word_moves_through_t0(&lower(&func).expect("a 64-bit ldind lowers"));
+        let low = moves
+            .iter()
+            .find(|&&(src, _)| src == 0)
+            .copied()
+            .expect("the low word is read from the address");
+        assert!(
+            moves.contains(&(4, low.1 + 4)),
+            "the HIGH word must be read from address+4 into the next slot word. saw {moves:?}"
+        );
+    }
+
+    #[test]
+    fn a_64_bit_field_moves_both_words() {
+        let func = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::ObjectRef, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 8,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let moves = word_moves_through_t0(&lower(&func).expect("a 64-bit field load lowers"));
+        let low = moves
+            .iter()
+            .find(|&&(src, _)| src == 8)
+            .copied()
+            .expect("the low word is read from the field offset");
+        assert!(
+            moves.contains(&(12, low.1 + 4)),
+            "the HIGH word must be read from offset+4 into the next slot word. saw {moves:?}"
+        );
+    }
+
+    #[test]
+    fn a_type_name_walks_the_descriptor_instead_of_answering_null() {
+        let func = Function {
+            params: vec![MirType::NativeInt],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::NativeInt, MirType::ObjectRef, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(2),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 1,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::TypeName {
+                            descriptor: ValueId(0),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let bytes = lower(&func).expect("a type-name read lowers");
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let i_imm = |w: u32| (w as i32) >> 20;
+        let reads_from_t0_at = |off: i32| {
+            words
+                .iter()
+                .any(|&w| lw_t1_from_t0(w) && i_imm(w) == off)
+        };
+        assert!(
+            reads_from_t0_at(0),
+            "the walk must read the descriptor's mark word, to refuse an array"
+        );
+        assert!(
+            reads_from_t0_at(4),
+            "the walk must read the reference count at desc+4, which locates the itable"
+        );
+    }
+
+    #[test]
     fn a_sub_word_struct_field_copies_width_exact() {
         let flag = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
@@ -5768,6 +6137,7 @@ mod tests {
             ConvKind::ZeroExtend16,
             ConvKind::RefToInt,
             ConvKind::IntToRef,
+            ConvKind::ToNativeInt,
         ] {
             let func = convert_function(kind);
             assert!(lamella_ir::verify(&func).is_ok(), "{kind:?} must verify");
@@ -6390,6 +6760,7 @@ mod tests {
                 base: None,
                 words: None,
                 exported: true,
+                full_name: None,
             },
             TypeMeta {
                 handle: TypeHandle(2),
@@ -6399,6 +6770,7 @@ mod tests {
                 base: Some(TypeHandle(1)),
                 words: None,
                 exported: true,
+                full_name: None,
             },
         ];
         let funcs = [main, leaf(4), leaf(2)];
@@ -6436,6 +6808,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let name = alloc::format!("{}7", lamella_elf::TYPE_DESC_PREFIX);
         let binding_of = |object: &[u8]| {
@@ -6513,6 +6886,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         assert!(
             lower_module_gc_with_descriptors(&[main, area], 0x8000_0004, &descriptors).is_ok(),
@@ -6612,6 +6986,7 @@ mod tests {
                 base: None,
                 words: None,
                 exported: true,
+                full_name: None,
             },
             TypeMeta {
                 handle: TypeHandle(2),
@@ -6621,6 +6996,7 @@ mod tests {
                 base: Some(TypeHandle(1)),
                 words: None,
                 exported: true,
+                full_name: None,
             },
             TypeMeta {
                 handle: TypeHandle(3),
@@ -6630,6 +7006,7 @@ mod tests {
                 base: Some(TypeHandle(2)),
                 words: None,
                 exported: true,
+                full_name: None,
             },
         ];
         assert!(
@@ -7046,6 +7423,7 @@ mod tests {
             base: None,
             words: Some(alloc::vec![8, 0, 0x5151_5151, 0].into_boxed_slice()),
             exported: true,
+            full_name: None,
         }];
         let qualifiers = DescQualifiers {
             string: Some(handle),

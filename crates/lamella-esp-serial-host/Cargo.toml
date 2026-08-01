@@ -1,0 +1,26 @@
+[package]
+name = "lamella-esp-serial-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "HOST-side native driver for lamella-esp-serial: an OS serial port, and the loop that performs the protocol's emitted actions against it. The sibling a browser replaces with a Web Serial shim and an editor extension replaces with its own transport."
+
+[dependencies]
+# The protocol itself, transport-free. This crate supplies the transport and NOTHING else -- every
+# framing, checksum, packet and ordering decision stays on the other side of that line, so a defect
+# found here is a transport defect by construction.
+lamella-esp-serial = { path = "../lamella-esp-serial" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_Communication",
+    "Win32_System_IO",
+] }
+
+[lints]
+workspace = true

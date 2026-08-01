@@ -39,12 +39,28 @@ profile-full = [
 # compiles on every profile and emits the float/typedref tags only where the tier carries them.
 float = ["lamella-load/float"]
 typed-references = ["lamella-load/typed-references"]
+# profile-full's surface WITHOUT floating point: the full NETMF type/exception/collection surface,
+# no `float` and no transcendentals. It exists because a part can be roomy enough for the surface and
+# not for the float BCL on top of it it is spelled out, and the two lists are meant to stay in step
+# apart from `float` / `math-transcendental`.
+profile-no-float = [
+    "lamella-load/NETMFv4_4", "lamella-load/exceptions", "lamella-load/gc",
+    "lamella-load/finalizers", "typed-references", "lamella-load/varargs",
+]
 profile-minimal = ["lamella-load/bcl", "lamella-load/exceptions", "lamella-load/gc"]
 # RUN_IMAGE support: boot + run a baked flash image (Module::from_baked) as the runner's execution
 # path -- the PE-less constrained-target story. Forwards the loader's code-in-place (XIP) knob, which
 # pins the load API to Assembly<'static>; run_program then leaks its per-call inputs, matching the
 # one-image-per-process host pattern. The host DRIVER half (send_image / RUN_IMAGE) is unconditional.
 baked-image = ["lamella-load/code-in-place"]
+# corlib_resolution = lazy, forwarded to the loader: a deployed bare PE resolves its corlib
+# references out of the FLASH-RESIDENT corlib, materializing only the members it reaches, instead of
+# loading the whole corlib into RAM. This is what lets a 256 KB part take a program PE rather than a
+# baked image carrying its own copy of the corlib -- eager resolution costs about a megabyte, which
+# such a part does not have. Off by default: a host or a roomy part should keep the eager path, whose
+# lookups are faster and whose RAM is free. The two tiers run a program to the same output and the
+# same exit value; only timing and RAM differ.
+corlib-lazy = ["lamella-load/corlib-lazy"]
 # The incremental-REPL LIVE-SESSION serve path (serve_one_repl + ReplSessionState): a device holds a
 # persistent interpreter across wire frames and loads a compiled submission DELTA into it, running
 # ONLY the new code (prior submissions never re-execute -- the safety property this path exists for).

@@ -2155,7 +2155,7 @@ fn emit_convert(body: &mut Func, kind: ConvKind) -> Result<(), LowerError> {
         ConvKind::LongToFloat32 => body.f32_convert_i64_s(),
         ConvKind::UIntToFloat64 => body.f64_convert_i32_u(),
         ConvKind::ULongToFloat64 => body.f64_convert_i64_u(),
-        ConvKind::IntToRef | ConvKind::RefToInt => {}
+        ConvKind::IntToRef | ConvKind::RefToInt | ConvKind::ToNativeInt => {}
     }
     Ok(())
 }
@@ -2777,6 +2777,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the callvirt lowers to WASM");
@@ -2847,6 +2848,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the interface call lowers to WASM");
@@ -2904,6 +2906,7 @@ mod tests {
                 base: Some(lamella_ir::TypeHandle(1)),
                 words: None,
                 exported: true,
+                full_name: None,
             },
             TypeMeta {
                 handle: lamella_ir::TypeHandle(1),
@@ -2913,6 +2916,7 @@ mod tests {
                 base: None,
                 words: None,
                 exported: true,
+                full_name: None,
             },
         ];
         let bytes = lower_module_with_exports(&[main], &[("main", 0)], &descriptors)
@@ -2985,6 +2989,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the void callvirt lowers to WASM");

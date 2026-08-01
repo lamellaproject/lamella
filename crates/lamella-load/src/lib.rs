@@ -231,6 +231,16 @@ struct FieldNameIndex {
     statics: BTreeMap<String, usize>,
     /// Qualified name -> instance-field slot within its declaring type's layout.
     instances: BTreeMap<String, u32>,
+    /// Qualified ENUM type name -> the zero its storage takes, which is its UNDERLYING type's zero
+    /// and not a null reference (ECMA-335 II.14.3: an enum IS its underlying integral type).
+    ///
+    /// It rides here because it answers a question about fields -- what one of this type holds
+    /// before anything assigns it -- and because it has to cross assemblies for the same reason the
+    /// slot maps do: a program's field can be typed with the corlib's enum, and the reference
+    /// carries a name rather than anything the declaring assembly bound. Each assembly indexes its
+    /// own enums before its fields are laid out, so a type declared later in the same assembly is
+    /// still known when a field names it.
+    enum_zeros: BTreeMap<String, Value>,
 }
 
 impl FieldNameIndex {
@@ -627,52 +637,112 @@ pub fn load_bootstrap_with_corlib<'c, 'b>(
 /// high 32 bits), so up to 256 (`u8`) assemblies can be resolved at once.
 const FIRST_DELTA_ASM: u8 = 1;
 
+/// The name-keyed state a resident corlib is resolved INTO, plus the record of what has been
+/// materialized out of it so far.
+///
+/// It is a structure of its own because the lazy materialization walk has TWO drivers -- an
+/// incremental-REPL submission ([`load_delta_with_corlib`]) and a whole program
+/// ([`load_program_lazy_corlib`]) -- and only one of them has a `__Repl` type to hang session state
+/// on. Everything the walk reads or writes lives here; everything specific to a persistent REPL
+/// session stays in [`DeltaContext`], which owns one of these. The two drivers therefore share ONE
+/// walk instead of keeping two that would have to agree.
+struct CorlibResolution {
+    /// The method [`NameIndex`] every loaded assembly contributes to and resolves against, so a
+    /// cross-assembly call binds by name -- a declared type's base `System.Object::.ctor`, a
+    /// program's call into the corlib. A lazily materialized corlib member is inserted here as it
+    /// is pulled in, which is what lets the referencing assembly bind it exactly as it would bind a
+    /// member of an eagerly-loaded corlib.
+    index: NameIndex,
+    /// The type [`TypeNameIndex`], same role for types: a type a delta DECLARES (e.g. `Foo`) is
+    /// indexed here by qualified name so a LATER delta's `Foo` TypeRef -- its base reference, an
+    /// `isinst` -- resolves to the same [`TypeId`], and a materialized corlib type is interned here
+    /// so it is ONE session identity across every assembly that names it.
+    type_index: TypeNameIndex,
+    /// The cross-assembly field index, for BOTH storage kinds: a delta's or program's `ldsfld` /
+    /// `ldfld` into another assembly resolves to that assembly's slot by qualified name. A
+    /// materialized corlib type registers its own fields here for the same reason it registers its
+    /// methods -- the referencing assembly's token and the corlib's own token are unrelated, so
+    /// only the name can match them.
+    field_index: FieldNameIndex,
+    /// The corlib types materialized so far, by (namespace, name). When a driver introduces a
+    /// dispatch key never seen before, these are the maps that must be TOPPED UP with it -- a type
+    /// materialized earlier would otherwise keep the map it was built with and silently miss.
+    corlib_types: Vec<(String, String)>,
+    /// The type keys whose materialization is on the stack RIGHT NOW -- pushed on entry and popped
+    /// on the way out, so it is empty between walks. A type is not in `type_index` until it has
+    /// inherited its base's field layout, which is what makes the base recursion re-entrant, so this
+    /// is what ends an `extends` chain that comes back around on itself.
+    materializing: Vec<String>,
+    /// Every signature key dispatched VIRTUALLY so far -- from the loaded assemblies and from the
+    /// corlib bodies they pulled in. A lazily materialized type's dispatch map is populated for
+    /// these keys ONLY: building the full map instead means materializing every virtual body of the
+    /// type and its base chain, so merely boxing an int would drag in `ToString` and the whole
+    /// format machinery behind it, which costs seconds on a constrained target. It accumulates
+    /// across REPL submissions, because a type materialized by one submission may not be dispatched
+    /// on until a later one.
+    dispatch_keys: BTreeSet<String>,
+    /// Whether the resident corlib's ENUM zeroes have been indexed into `field_index` yet.
+    ///
+    /// This tier never runs the eager assembly walk over the corlib, so nothing else records them,
+    /// and a field typed with a corlib enum would zero to null here and to its underlying zero on
+    /// the eager tier. That is a TIER DIVERGENCE, which is the one thing the two resolutions must
+    /// never have -- they are meant to differ in RAM and in timing, never in an answer.
+    corlib_enums_indexed: bool,
+}
+
+impl CorlibResolution {
+    /// An empty resolution state -- no assembly loaded, nothing materialized.
+    fn new() -> CorlibResolution {
+        CorlibResolution {
+            index: NameIndex::new(),
+            type_index: TypeNameIndex::new(),
+            field_index: FieldNameIndex::new(),
+            corlib_types: Vec::new(),
+            materializing: Vec::new(),
+            dispatch_keys: BTreeSet::new(),
+            corlib_enums_indexed: false,
+        }
+    }
+
+    /// Whether `name`'s materialization is already on the stack -- the test that keeps a cyclic
+    /// `extends` chain from recursing until the stack runs out.
+    fn is_materializing(&self, name: TypeName<'_>) -> bool {
+        self.materializing.contains(&type_name_key(name))
+    }
+
+    /// A resolution state seeded with an already-loaded assembly's name indices -- the REPL's
+    /// bootstrap ([`load_bootstrap`]), whose types and methods a later delta must be able to name.
+    fn seeded(index: NameIndex, type_index: TypeNameIndex) -> CorlibResolution {
+        CorlibResolution { index, type_index, ..CorlibResolution::new() }
+    }
+}
+
 /// The persistent state a [`load_delta`] caller threads across submissions: the global
-/// [`crate::TypeId`] of the bootstrap's `__Repl`, and the stable `field name -> instance slot`
-/// map of the fields added to it so far. A submission delta references a prior field by name,
-/// which this maps back to its slot; a name absent here is a NEW field the delta introduces.
+/// [`crate::TypeId`] of the bootstrap's `__Repl`, the stable `field name -> instance slot` map of
+/// the fields added to it so far, and the [`CorlibResolution`] every submission resolves through. A
+/// submission delta references a prior field by name, which this maps back to its slot; a name
+/// absent here is a NEW field the delta introduces.
 pub struct DeltaContext {
     repl_type: TypeId,
     /// `__Repl` field name -> instance slot, in the stable order fields were added. The runtime
     /// contract is the field NAME (per the compiler's incremental-emit design): a delta names a
     /// persistent field by name, and the slot it occupies never moves (fields only append).
     field_slots: BTreeMap<String, u32>,
-    /// The persistent method [`NameIndex`], seeded from the bootstrap ([`load_bootstrap`]) and
-    /// grown by every delta. It lets a delta resolve a cross-assembly method call by name -- a
-    /// declared type's base `System.Object::.ctor`, say -- the same way [`load_with_corlib`]
-    /// resolves a program's call into the corlib.
-    index: NameIndex,
-    /// The persistent type [`TypeNameIndex`], seeded from the bootstrap and grown by every delta.
-    /// A type a delta DECLARES (e.g. `Foo`) is indexed here by qualified name, so a LATER delta's
-    /// `Foo` TypeRef -- its base reference, an `isinst`, etc. -- resolves to the same [`TypeId`].
-    type_index: TypeNameIndex,
-    /// The persistent static-field index, threaded so a delta's cross-assembly `ldsfld`/`stsfld`
-    /// resolves to a prior assembly's storage slot by name (the same role it plays in
-    /// [`load_with_corlib`]).
-    static_field_index: FieldNameIndex,
+    /// The name resolution this session binds through, seeded from the bootstrap and grown by every
+    /// delta -- and, on the lazy tier, by every corlib member a delta reaches.
+    resolution: CorlibResolution,
     /// Each declared type's INSTANCE fields by qualified name (`namespace.type.field`) -> instance
     /// slot, recorded as a delta's types load. A later delta's cross-assembly instance FieldRef to
-    /// one (e.g. `[decl]Foo::X`, an `ldfld`/`stfld`) resolves to the slot by name -- the instance
-    /// analog of `static_field_index`, which the shared loader does not build (it handles
-    /// cross-assembly method and static-field references, but not instance FieldRefs).
+    /// one (e.g. `[decl]Foo::X`, an `ldfld`/`stfld`) resolves to the slot by name. Distinct from
+    /// `resolution.field_index`, which the shared loader fills from the fields an assembly DEFINES:
+    /// this one is filled from the slots the module actually bound, which is the only place a
+    /// delta's own declared-type fields appear.
     instance_field_index: BTreeMap<String, u32>,
     /// The assembly id the NEXT submission delta loads under. Starts at [`FIRST_DELTA_ASM`] (one
     /// past the bootstrap's asm 0) and advances per [`load_delta`], so every delta gets a DISTINCT
     /// token space and all live deltas resolve simultaneously (the cap is 256 assemblies, the
     /// `u8` range -- [`crate::Module::asm_key`] folds the asm id into the high 32 bits of a u64).
     next_delta_asm: u8,
-    /// Every signature key this session has ever dispatched VIRTUALLY -- from the deltas and from
-    /// the corlib bodies they pulled in. A lazily materialized type's dispatch map is populated for
-    /// these keys ONLY: building the full map instead means materializing every virtual body of the
-    /// type and its base chain, so merely boxing an int would drag in `ToString` and the whole
-    /// format machinery behind it, which costs seconds on a constrained target. Accumulates across
-    /// submissions,
-    /// because a type materialized by one submission may not be dispatched on until a later one.
-    dispatch_keys: BTreeSet<String>,
-    /// The corlib types materialized so far, by (namespace, name). When a submission introduces a
-    /// dispatch key never seen before, these are the maps that must be TOPPED UP with it -- a type
-    /// materialized earlier would otherwise keep the map it was built with and silently miss.
-    corlib_types: Vec<(String, String)>,
 }
 
 /// The dispatch keys in play during one materialization pass, threaded alongside the worklist.
@@ -698,6 +768,58 @@ impl DispatchKeys {
     }
 }
 
+/// The tokens the materialized corlib bodies use, gathered so the SHARED per-assembly binder passes
+/// can be run over them.
+///
+/// The eager loader gathers exactly these sets while walking a whole assembly and then hands them to
+/// [`bind_array_defaults`], [`classify_type_test_tokens`] and the rest. The lazy tier materializes a
+/// SUBSET of the corlib's bodies, so it gathers the same sets over that subset and calls the very
+/// same functions. Reimplementing any of them here instead would be a second copy of a rule that has
+/// to agree with the first, and the classifications are exactly the kind that fail QUIETLY -- a
+/// `newarr` with no element kind recorded builds an array whose elements read back as the wrong sort
+/// of value, several operations away from the array that caused it.
+#[derive(Default)]
+struct BodyTokens {
+    /// `ldstr` user strings, whose literals are bound out of the corlib's own heap.
+    strings: BTreeSet<Token>,
+    /// `newarr` element types (the array's element kind, and the covariance identity of the element).
+    newarr: BTreeSet<Token>,
+    /// `box` types, for the primitive kind a boxed value carries.
+    boxes: BTreeSet<Token>,
+    /// `call` through a `MethodSpec` -- a generic instantiation.
+    generic_calls: BTreeSet<Token>,
+    /// `newobj` targets, for the value-type and collection-ctor markings.
+    newobj: BTreeSet<Token>,
+    /// `ldtoken` of a TYPE, so `Type.Name` can render it.
+    ldtoken_types: BTreeSet<Token>,
+    /// `ldtoken` of a FIELD, which is how an array initializer reaches its RVA data blob.
+    ldtoken_fields: BTreeSet<Token>,
+    /// `castclass` / `isinst` / `box` / `unbox` / `unbox.any` type identities.
+    type_tests: BTreeSet<Token>,
+    /// `sizeof` operands.
+    sizeofs: BTreeSet<Token>,
+    /// The `TypeDef` token of every materialized VALUE type, which is what gives `sizeof` a size.
+    value_types: Vec<Token>,
+    /// The global `MethodDef` rows a value type declares, so a `newobj` of one is marked as
+    /// constructing a value rather than allocating an object.
+    value_type_methods: BTreeSet<u32>,
+}
+
+/// Everything one materialization pass carries: what is left to do, and what the bodies it brings in
+/// will need bound once the pass settles. Bundled rather than passed as separate arguments because
+/// every step of the walk threads all of it.
+struct CorlibWalk {
+    /// Corlib `MethodDef` rows still to materialize.
+    worklist: Vec<u32>,
+    /// `MemberRef`s in materialized corlib bodies, bound against the materialized index at the end
+    /// of the pass -- by then the members they name are in it.
+    memberrefs: BTreeSet<Token>,
+    /// The dispatch keys in play during this pass.
+    dispatch: DispatchKeys,
+    /// The tokens the shared binder passes consume.
+    tokens: BodyTokens,
+}
+
 impl DeltaContext {
     /// The resident RAM (bytes) this context's own name indices hold, per structure -- the
     /// session-level bookkeeping that is NOT part of the module and therefore does NOT appear in
@@ -714,13 +836,13 @@ impl DeltaContext {
     pub fn heap_report(&self) -> Vec<(&'static str, usize)> {
         let entry = |key: &String| key.len() + 40;
         alloc::vec![
-            ("session method index", self.index.keys().map(entry).sum::<usize>()),
-            ("session type index", self.type_index.keys().map(entry).sum::<usize>()),
+            ("session method index", self.resolution.index.keys().map(entry).sum::<usize>()),
+            ("session type index", self.resolution.type_index.keys().map(entry).sum::<usize>()),
             (
                 "session field indexes",
                 self.field_slots.keys().map(entry).sum::<usize>()
-                    + self.static_field_index.statics.keys().map(entry).sum::<usize>()
-                    + self.static_field_index.instances.keys().map(entry).sum::<usize>()
+                    + self.resolution.field_index.statics.keys().map(entry).sum::<usize>()
+                    + self.resolution.field_index.instances.keys().map(entry).sum::<usize>()
                     + self.instance_field_index.keys().map(entry).sum::<usize>(),
             ),
         ]
@@ -755,13 +877,9 @@ impl DeltaContext {
         DeltaContext {
             repl_type,
             field_slots: BTreeMap::new(),
-            index,
-            type_index,
-            static_field_index: FieldNameIndex::new(),
+            resolution: CorlibResolution::seeded(index, type_index),
             instance_field_index: BTreeMap::new(),
             next_delta_asm: first_delta_asm,
-            dispatch_keys: BTreeSet::new(),
-            corlib_types: Vec::new(),
         }
     }
 
@@ -886,9 +1004,9 @@ pub fn load_delta<'pe>(
         delta,
         ram_cil,
         delta_asm,
-        &mut context.index,
-        &mut context.type_index,
-        &mut context.static_field_index,
+        &mut context.resolution.index,
+        &mut context.resolution.type_index,
+        &mut context.resolution.field_index,
         true,
     );
 
@@ -1011,7 +1129,8 @@ fn bind_delta_field(
         return Ok(None);
     }
     let signature = member.field_type().ok_or(DeltaError::UntypedFieldRef)?;
-    let default = default_field_value(Some(signature));
+    let default =
+        default_field_value_of(delta, Some(signature), &context.resolution.field_index.enum_zeros);
     let slot = module
         .add_type_field(context.repl_type, default.clone())
         .unwrap_or(0);
@@ -1026,9 +1145,84 @@ fn bind_delta_field(
 /// delta resolves to the same ids under lazy as under eager.
 const LAZY_CORLIB_ASM: u8 = 0;
 
-/// A corlib type's field inputs for materialization: its base token, its instance fields, and its
-/// static fields -- each field paired with its metadata token and zero default value.
-type CorlibTypeFields = (Token, Vec<(Token, Value)>, Vec<(Token, Value)>);
+/// What one instruction REACHES, for the purposes of lazy materialization.
+///
+/// There are two walks -- over the bodies of the assembly that REFERENCES the corlib, and over each
+/// corlib body materialized in turn -- and they resolve their operands differently (by name across
+/// the assembly seam, by row within the corlib). What must NOT differ is the rule for what counts as
+/// reaching something, so both consult this one classification rather than each carrying a list of
+/// opcodes that would have to be kept in step by hand.
+enum Reaches {
+    /// A `call` / `callvirt` / `newobj` target: the member itself has to resolve.
+    Member,
+    /// A type named directly. A reached TYPE is as much a reference as a reached member:
+    /// `box System.Int32` then a `callvirt` on the box resolves its receiver type THROUGH that
+    /// token, so an unmaterialized type leaves dispatch with no runtime type and the call silently
+    /// keeps the base method.
+    Type,
+    /// A field. Its DECLARING type is what has to be materialized -- the slot the reference binds to
+    /// does not exist until the type's layout does, and a static's cell is filled by the type's
+    /// `.cctor`.
+    Field,
+    /// A `ldstr` user string, which needs its literal bound and `System.String` present.
+    Text,
+    /// Nothing that has to be materialized.
+    Nothing,
+}
+
+/// The single classification both materialization walks consult ([`Reaches`]).
+fn reaches(opcode: Opcode) -> Reaches {
+    match opcode {
+        Opcode::Call | Opcode::Callvirt | Opcode::Newobj => Reaches::Member,
+        Opcode::Box
+        | Opcode::Unbox
+        | Opcode::UnboxAny
+        | Opcode::Castclass
+        | Opcode::Isinst
+        | Opcode::Newarr
+        | Opcode::Ldtoken
+        | Opcode::Constrained
+        | Opcode::Initobj
+        | Opcode::Sizeof
+        | Opcode::Ldelem
+        | Opcode::Stelem
+        | Opcode::Ldobj
+        | Opcode::Stobj
+        | Opcode::Cpobj
+        | Opcode::Mkrefany
+        | Opcode::Refanyval => Reaches::Type,
+        Opcode::Ldsfld
+        | Opcode::Stsfld
+        | Opcode::Ldsflda
+        | Opcode::Ldfld
+        | Opcode::Stfld
+        | Opcode::Ldflda => Reaches::Field,
+        Opcode::Ldstr => Reaches::Text,
+        _ => Reaches::Nothing,
+    }
+}
+
+/// One corlib field's materialization inputs: the corlib's own metadata token for it, its NAME, and
+/// its zero default value. The name is not decoration -- a referencing assembly's `MemberRef` to
+/// this field carries that assembly's own token, which the corlib never bound, so the two are
+/// matched by qualified NAME through [`FieldNameIndex`] exactly as methods are.
+struct CorlibField {
+    token: Token,
+    name: String,
+    default: Value,
+}
+
+/// What materializing one corlib type needs from its `TypeDef`.
+struct CorlibTypeDef {
+    /// The `extends` token -- row 0 when the type has no base.
+    extends: Token,
+    /// The interfaces it declares, as tokens to be resolved once each interface type exists.
+    interfaces: Vec<Token>,
+    /// Its own instance fields, in declaration order (they follow the base's layout).
+    instance_fields: Vec<CorlibField>,
+    /// Its own non-literal static fields.
+    static_fields: Vec<CorlibField>,
+}
 
 /// Loads the incremental-REPL bootstrap for a LAZY corlib session: the bootstrap takes asm 1,
 /// reserving asm 0 for corlib members materialized on demand ([`load_delta_with_corlib`]). NO corlib
@@ -1056,6 +1250,96 @@ pub fn load_bootstrap_lazy_corlib<'pe>(
     (module, index, type_index)
 }
 
+/// The assembly id a PROGRAM takes under lazy resolution -- 1, one past [`LAZY_CORLIB_ASM`], which
+/// is the same pair the eager [`load_with_corlib`] uses, so a program's tokens are keyed identically
+/// whichever tier loaded it.
+const LAZY_PROGRAM_ASM: u8 = 1;
+
+/// Why a program could not be loaded against a lazily-resolved resident corlib.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LazyLoadError {
+    /// The program itself is not runnable -- it names no entry point, or its entry point has no
+    /// body. Nothing to do with the corlib.
+    Load(LoadError),
+    /// A `call` / `callvirt` / `newobj` in the program names a member -- typically a corlib member
+    /// gated out of a constrained tier's resident corlib -- that neither the lazy resolver could
+    /// materialize nor an intrinsic provides. Left unbound it would trap at RUN as an opaque
+    /// `UnresolvedCall`, on a device with nobody watching; caught at load, it names the member while
+    /// the deploying host is still listening.
+    UnresolvedMember(String),
+}
+
+impl From<LoadError> for LazyLoadError {
+    fn from(error: LoadError) -> LazyLoadError {
+        LazyLoadError::Load(error)
+    }
+}
+
+impl fmt::Display for LazyLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LazyLoadError::Load(error) => error.fmt(formatter),
+            LazyLoadError::UnresolvedMember(name) => write!(
+                formatter,
+                "cannot resolve {name} -- no such member in the resident corlib, and no intrinsic provides it"
+            ),
+        }
+    }
+}
+
+/// Loads a whole PROGRAM against a flash-resident `corlib`, materializing only the corlib members
+/// the program reaches (and their transitive closure) -- [`load_with_corlib`]'s constrained-tier
+/// twin.
+///
+/// The eager [`load_with_corlib`] loads the corlib whole, which costs about a megabyte of RAM and is
+/// the right answer wherever RAM is ample. A 256 KB part cannot pay it, so this path keeps the corlib
+/// in flash and pulls in a working set instead: the members the program's own IL names, everything
+/// those bodies call in turn, the types they box or cast to, the fields they read, and each reached
+/// type's `.cctor`.
+///
+/// It is a STRATEGY and never a semantic. The corlib takes the same assembly slot
+/// ([`LAZY_CORLIB_ASM`]) and the program the same one ([`LAZY_PROGRAM_ASM`]) as under the eager
+/// tier, every member is resolved by the same name key, and a materialized type is registered with
+/// the same base link, value-type flag, field layout, static slot range and dispatch map the eager
+/// loader would give it -- so the program must produce the same output and the same exit value
+/// either way. That equivalence is what lets the roomy tier stand as a preview of the constrained
+/// one.
+///
+/// The same walk serves an incremental-REPL submission ([`load_delta_with_corlib`]); only the
+/// subject differs.
+///
+/// # Errors
+/// [`LazyLoadError::Load`] if the program names no entry point or its entry point has no body;
+/// [`LazyLoadError::UnresolvedMember`] naming the member if the program calls something the resident
+/// corlib does not carry and no intrinsic provides.
+pub fn load_program_lazy_corlib<'c, 'p>(
+    corlib: &SourceAssembly<'c>,
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LazyLoadError> {
+    if program.image().entry_point_token() == 0 {
+        return Err(LoadError::NoEntryPoint.into());
+    }
+    let mut module = Module::new();
+    let mut resolution = CorlibResolution::new();
+    materialize_corlib_refs(&mut module, &mut resolution, program, corlib);
+    let entry = load_assembly(
+        &mut module,
+        program,
+        flash_cil,
+        LAZY_PROGRAM_ASM,
+        &mut resolution.index,
+        &mut resolution.type_index,
+        &mut resolution.field_index,
+        true,
+    );
+    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
+    if let Some(name) = first_unresolved_call(&module, program, LAZY_PROGRAM_ASM, corlib) {
+        return Err(LazyLoadError::UnresolvedMember(name));
+    }
+    module.freeze();
+    Ok(Program { module, entry })
+}
+
 /// Like [`load_delta`], but resolves the submission's references to a MANAGED corlib member (one
 /// with a real IL body -- not a `[RuntimeProvided]` intrinsic the [`bind_bcl_calls`] fallback already
 /// recognizes) against a flash-resident `corlib`, materializing only the members the delta reaches
@@ -1070,24 +1354,31 @@ pub fn load_delta_with_corlib<'d, 'c>(
     delta: &Assembly<'d>,
     corlib: &SourceAssembly<'c>,
 ) -> Result<DeltaInfo, DeltaError> {
-    materialize_delta_corlib_refs(module, context, delta, corlib);
+    materialize_corlib_refs(module, &mut context.resolution, delta, corlib);
     let delta_asm = context.next_delta_asm;
     let info = load_delta(module, context, delta)?;
-    if let Some(name) = first_unresolved_call(module, delta, delta_asm) {
+    if let Some(name) = first_unresolved_call(module, delta, delta_asm, corlib) {
         return Err(DeltaError::UnresolvedMember(name));
     }
     Ok(info)
 }
 
-/// The first `call` / `callvirt` / `newobj` MemberRef in any of `delta`'s method bodies that resolves
-/// to NOTHING in `module` after loading -- a member the lazy resolver could not materialize and no
-/// intrinsic provides (a corlib member gated out of a constrained tier is the common case). Returns
-/// its qualified name so the caller can reject the delta LOUDLY at load, rather than let it trap at
-/// run as an opaque `UnresolvedCall`. Only `MemberRef` targets are checked -- a same-delta `MethodDef`
-/// is bound by [`load_assembly`] and never misses -- and a `[DllImport]` P/Invoke target is excluded,
-/// its absence on a device being a distinct expected trap, not a corlib miss.
-fn first_unresolved_call(module: &Module, delta: &Assembly, delta_asm: u8) -> Option<String> {
-    for type_def in delta.type_defs() {
+/// The first `call` / `callvirt` / `newobj` MemberRef in any of `assembly`'s method bodies that
+/// resolves to NOTHING in `module` after loading -- a member the lazy resolver could not materialize
+/// and no intrinsic provides (a corlib member gated out of a constrained tier is the common case).
+/// Returns its qualified name so the caller can reject the load LOUDLY, rather than let it trap at
+/// run as an opaque `UnresolvedCall`. Only `MemberRef` targets are checked -- a same-assembly
+/// `MethodDef` is bound by [`load_assembly`] and never misses -- and a `[DllImport]` P/Invoke target
+/// is excluded, its absence on a device being a distinct expected trap, not a corlib miss. Nor is a
+/// reference the corlib declares ABSTRACTLY ([`corlib_declares_abstract`]): that token is unbound
+/// under both tiers by design, so reporting it would refuse a program the eager tier runs.
+fn first_unresolved_call(
+    module: &Module,
+    assembly: &Assembly,
+    asm: u8,
+    corlib: &Assembly,
+) -> Option<String> {
+    for type_def in assembly.type_defs() {
         for method in type_def.methods() {
             let Some(body) = method.body() else {
                 continue;
@@ -1105,23 +1396,24 @@ fn first_unresolved_call(module: &Module, delta: &Assembly, delta_asm: u8) -> Op
                 if token.table() != MEMBER_REF {
                     continue;
                 }
-                if module.resolve(delta_asm, *token).is_some()
-                    || module.pinvoke_target(delta_asm, token.0).is_some()
+                if module.resolve(asm, *token).is_some()
+                    || module.pinvoke_target(asm, token.0).is_some()
+                    || corlib_declares_abstract(corlib, assembly, *token)
                 {
                     continue;
                 }
-                return Some(member_ref_display_name(delta, *token));
+                return Some(member_ref_display_name(assembly, *token));
             }
         }
     }
     None
 }
 
-/// A `MemberRef`'s qualified `Namespace.Type::method` name (best-effort) for a REPL diagnostic.
-fn member_ref_display_name(delta: &Assembly, token: Token) -> String {
-    let member = delta.member_ref(token.row());
+/// A `MemberRef`'s qualified `Namespace.Type::method` name (best-effort) for a load diagnostic.
+fn member_ref_display_name(assembly: &Assembly, token: Token) -> String {
+    let member = assembly.member_ref(token.row());
     let name = member.as_ref().and_then(|member| member.name()).unwrap_or("<unknown>");
-    match member.as_ref().and_then(|member| delta.type_token_name(member.parent())) {
+    match member.as_ref().and_then(|member| assembly.type_token_name(member.parent())) {
         Some(parent) if !parent.namespace.is_empty() => {
             alloc::format!("{}.{}::{}", parent.namespace, parent.name, name)
         }
@@ -1130,23 +1422,35 @@ fn member_ref_display_name(delta: &Assembly, token: Token) -> String {
     }
 }
 
-/// Seeds `context`'s name indices with every managed corlib member the `delta` references (and their
-/// transitive corlib closure), pulling each from `corlib` into the module under [`LAZY_CORLIB_ASM`].
-/// After this, the delta's own [`load_delta`] binds those references by name exactly as it would
-/// against an eagerly-loaded corlib. A reference already materialized (its key is in `context.index`)
-/// or naming a NON-corlib type is skipped -- left for [`load_delta`] / the intrinsic fallback.
-fn materialize_delta_corlib_refs<'c>(
+/// Seeds `resolution`'s name indices with every managed corlib member `assembly` references (and
+/// their transitive corlib closure), pulling each from `corlib` into the module under
+/// [`LAZY_CORLIB_ASM`].
+///
+/// This is the ONE materialization walk, and it is driven by both lazy entry points -- a REPL
+/// submission ([`load_delta_with_corlib`]) and a whole program ([`load_program_lazy_corlib`]) --
+/// which is why it names its subject `assembly` rather than either shape. After it runs, the
+/// subject's own [`load_assembly`] binds those references by name exactly as it would against an
+/// eagerly-loaded corlib. A reference already materialized (its key is in `resolution.index`) or
+/// naming a NON-corlib type is skipped, left to the ordinary load / the intrinsic fallback.
+fn materialize_corlib_refs<'c>(
     module: &mut Module,
-    context: &mut DeltaContext,
-    delta: &Assembly,
+    resolution: &mut CorlibResolution,
+    assembly: &Assembly,
     corlib: &SourceAssembly<'c>,
 ) {
-    let mut worklist: Vec<u32> = Vec::new();
     let mut seen: BTreeSet<Token> = BTreeSet::new();
     let mut type_tokens: Vec<Token> = Vec::new();
-    let mut dispatch =
-        DispatchKeys { wanted: core::mem::take(&mut context.dispatch_keys), fresh: Vec::new() };
-    for type_def in delta.type_defs() {
+    let mut needs_string_type = false;
+    let mut walk = CorlibWalk {
+        worklist: Vec::new(),
+        memberrefs: BTreeSet::new(),
+        dispatch: DispatchKeys {
+            wanted: core::mem::take(&mut resolution.dispatch_keys),
+            fresh: Vec::new(),
+        },
+        tokens: BodyTokens::default(),
+    };
+    for type_def in assembly.type_defs() {
         for method in type_def.methods() {
             let Some(body) = method.body() else {
                 continue;
@@ -1155,104 +1459,154 @@ fn materialize_delta_corlib_refs<'c>(
                 let Operand::Token(token) = &instruction.operand else {
                     continue;
                 };
-                match instruction.opcode {
-                    Opcode::Call | Opcode::Callvirt | Opcode::Newobj => {
+                match reaches(instruction.opcode) {
+                    Reaches::Member => {
                         if token.table() == MEMBER_REF && seen.insert(*token) {
-                            enqueue_corlib_ref(context, delta, corlib, *token, &mut worklist);
+                            enqueue_corlib_ref(resolution, assembly, corlib, *token, &mut walk.worklist);
                         }
                     }
-                    Opcode::Box
-                    | Opcode::Unbox
-                    | Opcode::UnboxAny
-                    | Opcode::Castclass
-                    | Opcode::Isinst
-                    | Opcode::Newarr
-                    | Opcode::Ldtoken
-                    | Opcode::Constrained
-                    | Opcode::Initobj
-                    | Opcode::Sizeof => {
+                    Reaches::Type => {
                         if seen.insert(*token) {
                             type_tokens.push(*token);
                         }
                     }
-                    _ => {}
+                    Reaches::Field => {
+                        if token.table() == MEMBER_REF && seen.insert(*token) {
+                            if let Some(parent) =
+                                assembly.member_ref(token.row()).map(|member| member.parent())
+                            {
+                                if seen.insert(parent) {
+                                    type_tokens.push(parent);
+                                }
+                            }
+                        }
+                    }
+                    Reaches::Text => needs_string_type = true,
+                    Reaches::Nothing => {}
                 }
                 if matches!(instruction.opcode, Opcode::Callvirt | Opcode::Ldvirtftn) {
-                    if let Some(key) = delta_callvirt_key(delta, *token) {
-                        dispatch.want(key);
+                    if let Some(key) = callvirt_key(assembly, *token) {
+                        walk.dispatch.want(key);
                     }
                 }
             }
         }
     }
-    let mut corlib_memberrefs: BTreeSet<Token> = BTreeSet::new();
+    if needs_string_type {
+        materialize_string_type(
+            module,
+            resolution,
+            corlib,
+            &mut walk,
+        );
+    }
     for token in type_tokens {
-        let Some(name) = delta.type_token_name(token) else {
+        let Some(name) = assembly.type_token_name(token) else {
             continue;
         };
         if corlib_defines_type(corlib, name) {
             materialize_corlib_type(
                 module,
-                context,
+                resolution,
                 corlib,
                 name,
-                &mut worklist,
-                &mut corlib_memberrefs,
-                &mut dispatch,
+                &mut walk,
             );
         }
     }
     let mut cursor = 0;
     loop {
-        while cursor < worklist.len() {
-            let row = worklist[cursor];
+        while cursor < walk.worklist.len() {
+            let row = walk.worklist[cursor];
             cursor += 1;
             materialize_corlib_method_row(
                 module,
-                context,
+                resolution,
                 corlib,
                 row,
-                &mut worklist,
-                &mut corlib_memberrefs,
-                &mut dispatch,
+                &mut walk,
             );
         }
-        let fresh = core::mem::take(&mut dispatch.fresh);
+        let fresh = core::mem::take(&mut walk.dispatch.fresh);
         if fresh.is_empty() {
             break;
         }
         top_up_corlib_dispatch_maps(
             module,
-            context,
+            resolution,
             corlib,
             &fresh,
-            &mut worklist,
-            &mut corlib_memberrefs,
-            &mut dispatch,
+            &mut walk,
         );
-        if cursor >= worklist.len() && dispatch.fresh.is_empty() {
+        if cursor >= walk.worklist.len() && walk.dispatch.fresh.is_empty() {
             break;
         }
     }
-    context.dispatch_keys = core::mem::take(&mut dispatch.wanted);
+    resolution.dispatch_keys = core::mem::take(&mut walk.dispatch.wanted);
     bind_bcl_calls(
         corlib,
         module,
         LAZY_CORLIB_ASM,
-        &context.index,
-        &context.type_index,
+        &resolution.index,
+        &resolution.type_index,
         true,
-        &corlib_memberrefs,
+        &walk.memberrefs,
     );
+    bind_materialized_body_tokens(module, resolution, corlib, &walk.tokens);
 }
 
-/// The dispatch signature key of a `callvirt` / `ldvirtftn` site in `delta` -- the same encoding
+/// Runs the SHARED per-assembly binder passes over the tokens the materialized corlib bodies use.
+///
+/// These are the same functions [`load_assembly`] calls after walking an assembly whole; the only
+/// difference is that the sets cover the bodies this pass brought in rather than every body in the
+/// corlib. Each pass answers a question the interpreter asks at RUN time about a token -- what
+/// element kind this `newarr` produces, what primitive that `box` carries, whether this `isinst`
+/// names a value type, where an array initializer's bytes live -- and an unanswered one does not
+/// trap. It yields a plausible wrong answer some distance from its cause, which is why these are run
+/// rather than reimplemented.
+fn bind_materialized_body_tokens<'c>(
+    module: &mut Module,
+    resolution: &CorlibResolution,
+    corlib: &SourceAssembly<'c>,
+    tokens: &BodyTokens,
+) {
+    bind_strings(corlib, module, LAZY_CORLIB_ASM, &tokens.strings);
+    bind_array_defaults(
+        corlib,
+        module,
+        LAZY_CORLIB_ASM,
+        &resolution.type_index,
+        &resolution.field_index.enum_zeros,
+        &tokens.newarr,
+    );
+    bind_box_primitives(corlib, module, LAZY_CORLIB_ASM, &tokens.boxes);
+    bind_generic_calls(corlib, module, LAZY_CORLIB_ASM, &tokens.generic_calls);
+    mark_value_type_ctors(module, LAZY_CORLIB_ASM, &tokens.newobj, &tokens.value_type_methods);
+    bind_field_rva_data(corlib, module, LAZY_CORLIB_ASM, &tokens.ldtoken_fields);
+    bind_type_names(
+        corlib,
+        module,
+        LAZY_CORLIB_ASM,
+        &resolution.type_index,
+        &tokens.ldtoken_types,
+    );
+    classify_type_test_tokens(
+        corlib,
+        module,
+        LAZY_CORLIB_ASM,
+        &resolution.type_index,
+        &tokens.type_tests,
+    );
+    bind_type_sizes(corlib, module, LAZY_CORLIB_ASM, &tokens.value_types, &tokens.sizeofs);
+}
+
+/// The dispatch signature key of a `callvirt` / `ldvirtftn` site in `assembly` -- the same encoding
 /// [`bind_call_targets`] binds to the site and [`resolve_callvirt`](lamella_cil_runtime) looks up in
 /// the runtime type's map, so the two agree by construction.
-fn delta_callvirt_key(delta: &Assembly, token: Token) -> Option<String> {
+fn callvirt_key(assembly: &Assembly, token: Token) -> Option<String> {
     let (name, params) = match token.table() {
         MEMBER_REF => {
-            let member = delta.member_ref(token.row())?;
+            let member = assembly.member_ref(token.row())?;
             let name: String = member.name()?.into();
             let params = member
                 .method_signature()
@@ -1262,7 +1616,7 @@ fn delta_callvirt_key(delta: &Assembly, token: Token) -> Option<String> {
         }
         _ => return None,
     };
-    Some(sig_encode(delta, &name, &params))
+    Some(sig_encode(assembly, &name, &params))
 }
 
 /// Adds `fresh` keys to the dispatch map of every corlib type materialized so far. A type is
@@ -1272,28 +1626,24 @@ fn delta_callvirt_key(delta: &Assembly, token: Token) -> Option<String> {
 /// materialized at all.
 fn top_up_corlib_dispatch_maps<'c>(
     module: &mut Module,
-    context: &mut DeltaContext,
+    resolution: &mut CorlibResolution,
     corlib: &SourceAssembly<'c>,
     fresh: &[String],
-    worklist: &mut Vec<u32>,
-    corlib_memberrefs: &mut BTreeSet<Token>,
-    dispatch: &mut DispatchKeys,
+    walk: &mut CorlibWalk,
 ) {
     let wanted: BTreeSet<String> = fresh.iter().cloned().collect();
-    let types = context.corlib_types.clone();
+    let types = resolution.corlib_types.clone();
     for (namespace, type_name) in types {
         let name = TypeName { namespace: &namespace, name: &type_name };
-        let Some(&type_id) = context.type_index.get(&type_name_key(name)) else {
+        let Some(&type_id) = resolution.type_index.get(&type_name_key(name)) else {
             continue;
         };
         let added = materialize_corlib_sig_methods(
             module,
-            context,
+            resolution,
             corlib,
             name,
-            worklist,
-            corlib_memberrefs,
-            dispatch,
+            walk,
             &wanted,
         );
         for (key, method) in added {
@@ -1313,45 +1663,85 @@ fn corlib_defines_type(corlib: &Assembly, name: TypeName<'_>) -> bool {
     })
 }
 
-/// If `token` (a `MemberRef` in `delta`) names a corlib method not yet materialized, finds its
+/// If `token` (a `MemberRef` in `assembly`) names a corlib method not yet materialized, finds its
 /// `MethodDef` row in `corlib` and pushes it onto `worklist`. A reference whose declaring type is not
 /// in corlib, or already materialized, is ignored.
 fn enqueue_corlib_ref(
-    context: &DeltaContext,
-    delta: &Assembly,
+    resolution: &CorlibResolution,
+    assembly: &Assembly,
     corlib: &Assembly,
     token: Token,
     worklist: &mut Vec<u32>,
 ) {
-    let Some(member) = delta.member_ref(token.row()) else {
+    let Some((parent, method_name, key)) = member_ref_identity(assembly, token) else {
         return;
     };
-    let Some(method_name) = member.name() else {
-        return;
-    };
-    let Some(parent) = delta.type_token_name(member.parent()) else {
-        return;
-    };
-    let signature = member.method_signature();
-    let params: Vec<SigType> = signature
-        .as_ref()
-        .map(|sig| sig.parameters.clone())
-        .unwrap_or_default();
-    let key = name_key(
-        delta,
-        parent.namespace,
-        parent.name,
-        method_name,
-        &params,
-        signature.as_ref().map(|sig| &sig.return_type),
-    );
-    if context.index.contains_key(&key) {
+    if resolution.index.contains_key(&key) {
         return;
     }
     if let Some(row) = find_corlib_method_row(corlib, parent.namespace, parent.name, method_name, &key)
     {
         worklist.push(row);
     }
+}
+
+/// The declaring type, method name, and cross-assembly [`name_key`] of a method `MemberRef` in
+/// `assembly` -- the identity by which the DEFINING assembly's `MethodDef` is matched, since the two
+/// assemblies' tokens are unrelated. Shared by the walk that materializes such a reference and the
+/// guardrail that reports one it could not, so the two ask about the same member.
+fn member_ref_identity<'a>(
+    assembly: &Assembly<'a>,
+    token: Token,
+) -> Option<(TypeName<'a>, &'a str, String)> {
+    let member = assembly.member_ref(token.row())?;
+    let method_name = member.name()?;
+    let parent = assembly.type_token_name(member.parent())?;
+    let signature = member.method_signature();
+    let params: Vec<SigType> = signature
+        .as_ref()
+        .map(|sig| sig.parameters.clone())
+        .unwrap_or_default();
+    let key = name_key(
+        assembly,
+        parent.namespace,
+        parent.name,
+        method_name,
+        &params,
+        signature.as_ref().map(|sig| &sig.return_type),
+    );
+    Some((parent, method_name, key))
+}
+
+/// Whether `corlib` declares the member this `MemberRef` names as an ABSTRACT or INTERFACE method:
+/// present, but with no IL body and no `[RuntimeProvided]` marking either.
+///
+/// Such a token is unbound after loading and that is CORRECT -- there is nothing to bind. The eager
+/// loader leaves it unbound too, and a `callvirt` on it reaches the implementation through the
+/// receiver's runtime type (`System.IDisposable::Dispose` at the end of a `foreach` is the everyday
+/// case). It has to be told apart from a member the resident corlib genuinely LACKS, and from a
+/// `[RuntimeProvided]` seam whose intrinsic this build gated out -- both of those are real misses
+/// that will trap at run, and both keep a body-less declaration or none at all.
+fn corlib_declares_abstract(corlib: &Assembly, assembly: &Assembly, token: Token) -> bool {
+    let Some((parent, method_name, key)) = member_ref_identity(assembly, token) else {
+        return false;
+    };
+    let Some(row) = find_corlib_method_row(corlib, parent.namespace, parent.name, method_name, &key)
+    else {
+        return false;
+    };
+    let mut method_row: u32 = 0;
+    for type_def in corlib.type_defs() {
+        for method in type_def.methods() {
+            method_row += 1;
+            if method_row != row {
+                continue;
+            }
+            let runtime_supplied = method.is_runtime_impl()
+                || has_runtime_provided_attribute(corlib, Token::new(METHOD_DEF, row));
+            return method.body().is_none() && !runtime_supplied;
+        }
+    }
+    false
 }
 
 /// Scans `corlib` for the `MethodDef` row of `namespace.type_name::method` whose stable [`name_key`]
@@ -1422,18 +1812,16 @@ fn corlib_memberref_target_row(corlib: &Assembly, token: Token) -> Option<u32> {
 
 /// Materializes the corlib `MethodDef` at `method_row` into the module under [`LAZY_CORLIB_ASM`]:
 /// its declaring type, then the method itself (an intrinsic if `[RuntimeProvided]`, else its managed
-/// IL body borrowed from `corlib`), binding its def token and recording it in `context.index` so both
-/// its own call sites and the referencing delta resolve to it. A managed body's own corlib callees
-/// (further `MethodDef` calls) are pushed onto `worklist` for transitive materialization. Idempotent:
-/// a row whose token is already bound returns immediately.
+/// IL body borrowed from `corlib`), binding its def token and recording it in `resolution.index` so
+/// both its own call sites and the referencing assembly resolve to it. A managed body's own corlib
+/// callees (further `MethodDef` calls) are pushed onto `worklist` for transitive materialization.
+/// Idempotent: a row whose token is already bound returns immediately.
 fn materialize_corlib_method_row<'c>(
     module: &mut Module,
-    context: &mut DeltaContext,
+    resolution: &mut CorlibResolution,
     corlib: &SourceAssembly<'c>,
     method_row: u32,
-    worklist: &mut Vec<u32>,
-    corlib_memberrefs: &mut BTreeSet<Token>,
-    dispatch: &mut DispatchKeys,
+    walk: &mut CorlibWalk,
 ) {
     let token = Token::new(METHOD_DEF, method_row);
     if module.resolve(LAZY_CORLIB_ASM, token).is_some() {
@@ -1450,6 +1838,9 @@ fn materialize_corlib_method_row<'c>(
             let Some(declaring) = declaring else {
                 return;
             };
+            if type_def.is_value_type() && !is_special_reference_base(Some(declaring)) {
+                walk.tokens.value_type_methods.insert(method_row);
+            }
             let name: String = method.name().unwrap_or("").into();
             let signature = method.signature();
             let return_type = signature.as_ref().map(|sig| sig.return_type.clone());
@@ -1467,12 +1858,10 @@ fn materialize_corlib_method_row<'c>(
             );
             let type_id = materialize_corlib_type(
                 module,
-                context,
+                resolution,
                 corlib,
                 declaring,
-                worklist,
-                corlib_memberrefs,
-                dispatch,
+                walk,
             );
 
             let string_ctor =
@@ -1490,7 +1879,7 @@ fn materialize_corlib_method_row<'c>(
                 let id = module.add_intrinsic(LAZY_CORLIB_ASM, func, intr_id, arg_count(&method));
                 module.bind_token(LAZY_CORLIB_ASM, token, id);
                 module.set_method_type(id, type_id);
-                context.index.insert(key, id);
+                resolution.index.insert(key, id);
                 return;
             }
 
@@ -1500,25 +1889,52 @@ fn materialize_corlib_method_row<'c>(
             let id = module.add_method(LAZY_CORLIB_ASM, flash_cil(raw_il), arg_count(&method));
             module.bind_token(LAZY_CORLIB_ASM, token, id);
             module.set_method_type(id, type_id);
-            context.index.insert(key, id);
+            resolution.index.insert(key, id);
 
             if let Some(body) = method.body() {
                 for instruction in body.code.iter() {
                     let Operand::Token(operand) = &instruction.operand else {
                         continue;
                     };
-                    if !matches!(
-                        instruction.opcode,
-                        Opcode::Call | Opcode::Callvirt | Opcode::Newobj
-                    ) {
-                        continue;
+                    collect_body_tokens(&mut walk.tokens, instruction.opcode, *operand);
+                    match reaches(instruction.opcode) {
+                        Reaches::Member => {}
+                        Reaches::Type => {
+                            materialize_corlib_type_token(
+                                module,
+                                resolution,
+                                corlib,
+                                *operand,
+                                walk,
+                            );
+                            continue;
+                        }
+                        Reaches::Field => {
+                            if let Some(declaring) = corlib_type_of_field_row(corlib, *operand) {
+                                let declaring =
+                                    TypeName { namespace: &declaring.0, name: &declaring.1 };
+                                materialize_corlib_type(
+                                    module,
+                                    resolution,
+                                    corlib,
+                                    declaring,
+                                    walk,
+                                );
+                            }
+                            continue;
+                        }
+                        Reaches::Text => {
+                            materialize_string_type(module, resolution, corlib, walk);
+                            continue;
+                        }
+                        Reaches::Nothing => continue,
                     }
                     match operand.table() {
-                        METHOD_DEF => worklist.push(operand.row()),
+                        METHOD_DEF => walk.worklist.push(operand.row()),
                         MEMBER_REF => {
-                            corlib_memberrefs.insert(*operand);
+                            walk.memberrefs.insert(*operand);
                             if let Some(row) = corlib_memberref_target_row(corlib, *operand) {
-                                worklist.push(row);
+                                walk.worklist.push(row);
                             }
                         }
                         _ => {}
@@ -1540,7 +1956,19 @@ fn materialize_corlib_method_row<'c>(
                             let key = sig_encode(corlib, &target_name, &params);
                             let argc = u16::try_from(params.len() + 1).unwrap_or(u16::MAX);
                             module.bind_call_target(LAZY_CORLIB_ASM, *operand, key.clone(), argc);
-                            dispatch.want(key);
+                            walk.dispatch.want(key);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "exceptions")]
+            if let Some(body) = method.body() {
+                for clause in body.handlers.iter() {
+                    if let EhKind::Catch(catch_token) = clause.kind {
+                        if let Some(catch_name) = corlib.type_token_name(catch_token) {
+                            let tag =
+                                exception_tag_for_name(catch_name.namespace, catch_name.name);
+                            module.bind_catch_type_tag(LAZY_CORLIB_ASM, catch_token, tag);
                         }
                     }
                 }
@@ -1550,27 +1978,136 @@ fn materialize_corlib_method_row<'c>(
     }
 }
 
+/// Records what one instruction of a materialized corlib body will need bound, into the sets the
+/// shared binder passes consume. This mirrors the collection the eager loader does over a whole
+/// assembly, opcode for opcode, and exists so the two cannot drift.
+fn collect_body_tokens(tokens: &mut BodyTokens, opcode: Opcode, operand: Token) {
+    match opcode {
+        Opcode::Ldstr => {
+            tokens.strings.insert(operand);
+        }
+        Opcode::Call if operand.table() == METHOD_SPEC => {
+            tokens.generic_calls.insert(operand);
+        }
+        Opcode::Newobj => {
+            tokens.newobj.insert(operand);
+        }
+        Opcode::Newarr => {
+            tokens.newarr.insert(operand);
+            tokens.type_tests.insert(operand);
+        }
+        Opcode::Ldtoken if operand.table() == FIELD => {
+            tokens.ldtoken_fields.insert(operand);
+        }
+        Opcode::Ldtoken | Opcode::Constrained | Opcode::Initobj | Opcode::Mkrefany
+        | Opcode::Refanyval
+            if matches!(operand.table(), TYPE_DEF | TYPE_REF | TYPE_SPEC) =>
+        {
+            tokens.ldtoken_types.insert(operand);
+        }
+        Opcode::Box => {
+            tokens.ldtoken_types.insert(operand);
+            tokens.type_tests.insert(operand);
+            tokens.boxes.insert(operand);
+        }
+        Opcode::Castclass | Opcode::Isinst | Opcode::Unbox | Opcode::UnboxAny => {
+            tokens.type_tests.insert(operand);
+        }
+        Opcode::Sizeof => {
+            tokens.sizeofs.insert(operand);
+        }
+        _ => {}
+    }
+}
+
+/// Materializes the corlib type a TYPE token in a corlib body names, if this corlib defines it. A
+/// `TypeSpec` (a constructed array type, say) names no single `TypeDef` and is skipped; so is a name
+/// this corlib does not carry, exactly as on the referencing side.
+fn materialize_corlib_type_token<'c>(
+    module: &mut Module,
+    resolution: &mut CorlibResolution,
+    corlib: &SourceAssembly<'c>,
+    token: Token,
+    walk: &mut CorlibWalk,
+) {
+    let Some(name) = corlib.type_token_name(token) else {
+        return;
+    };
+    if resolution.type_index.contains_key(&type_name_key(name)) {
+        return;
+    }
+    if corlib_defines_type(corlib, name) {
+        materialize_corlib_type(module, resolution, corlib, name, walk);
+    }
+}
+
+/// Materializes `System.String`, so the module has the canonical string type id `ldstr` and every
+/// string cast is decided against. The eager tier always has it because it loads the corlib whole;
+/// the lazy tier has to be told, because a string literal names no type token in the IL.
+fn materialize_string_type<'c>(
+    module: &mut Module,
+    resolution: &mut CorlibResolution,
+    corlib: &SourceAssembly<'c>,
+    walk: &mut CorlibWalk,
+) {
+    let name = TypeName { namespace: "System", name: "String" };
+    if resolution.type_index.contains_key(&type_name_key(name)) {
+        return;
+    }
+    if corlib_defines_type(corlib, name) {
+        materialize_corlib_type(module, resolution, corlib, name, walk);
+    }
+}
+
+/// The (namespace, name) of the corlib type declaring the field `token` names -- a `FieldDef` by
+/// global row, or a `MemberRef`'s parent. `None` when this corlib declares no such field.
+fn corlib_type_of_field_row(corlib: &Assembly, token: Token) -> Option<(String, String)> {
+    if token.table() == MEMBER_REF {
+        let parent = corlib.member_ref(token.row())?.parent();
+        let name = corlib.type_token_name(parent)?;
+        return Some((name.namespace.into(), name.name.into()));
+    }
+    if token.table() != FIELD {
+        return None;
+    }
+    let mut field_row: u32 = 0;
+    for type_def in corlib.type_defs() {
+        let declaring = type_def.name();
+        for _ in type_def.fields() {
+            field_row += 1;
+            if field_row == token.row() {
+                let declaring = declaring?;
+                return Some((declaring.namespace.into(), declaring.name.into()));
+            }
+        }
+    }
+    None
+}
+
 /// Registers a corlib type in the session module the first time it is reached, returning its
-/// [`crate::TypeId`]; a type already in `context.type_index` returns its existing id (interning by
-/// name, so a corlib type is ONE session identity across deltas -- a `string` from delta A and one
-/// from delta B share it). Records the canonical `System.String` id so `ldstr` works.
+/// [`crate::TypeId`]; a type already in `resolution.type_index` returns its existing id (interning
+/// by name, so a corlib type is ONE session identity across every assembly that names it -- a
+/// `string` from delta A and one from delta B share it). Records the canonical `System.String` id so
+/// `ldstr` works.
 fn materialize_corlib_type<'c>(
     module: &mut Module,
-    context: &mut DeltaContext,
+    resolution: &mut CorlibResolution,
     corlib: &SourceAssembly<'c>,
     name: TypeName<'_>,
-    worklist: &mut Vec<u32>,
-    corlib_memberrefs: &mut BTreeSet<Token>,
-    dispatch: &mut DispatchKeys,
+    walk: &mut CorlibWalk,
 ) -> TypeId {
     let key = type_name_key(name);
-    if let Some(&type_id) = context.type_index.get(&key) {
+    if let Some(&type_id) = resolution.type_index.get(&key) {
         return type_id;
+    }
+    if !resolution.corlib_enums_indexed {
+        resolution.corlib_enums_indexed = true;
+        index_enum_zeros(corlib, &mut resolution.field_index.enum_zeros);
     }
 
     let mut field_row: u32 = 0;
     let mut type_row: u32 = 0;
-    let mut found: Option<CorlibTypeFields> = None;
+    let mut found: Option<CorlibTypeDef> = None;
     for type_def in corlib.type_defs() {
         type_row += 1;
         let is_target = type_def
@@ -1578,47 +2115,97 @@ fn materialize_corlib_type<'c>(
             .is_some_and(|n| n.namespace == name.namespace && n.name == name.name);
         let mut own_instance = Vec::new();
         let mut own_static = Vec::new();
+        let is_enum = is_target && is_enum_type(corlib, type_def.extends());
+        if is_enum && has_flags_attribute(corlib, Token::new(TYPE_DEF, type_row)) {
+            module.set_enum_flags(LAZY_CORLIB_ASM, Token::new(TYPE_DEF, type_row).0);
+        }
         for field in type_def.fields() {
             field_row += 1;
             if !is_target {
                 continue;
             }
             let token = Token::new(FIELD, field_row);
-            if field.is_static() {
-                if !field.is_literal() {
-                    own_static.push((token, default_field_value(field.signature())));
+            if field.is_static() && field.is_literal() {
+                if let (true, Some(member), Some(constant)) = (is_enum, field.name(), field.constant())
+                {
+                    let type_token = Token::new(TYPE_DEF, type_row).0;
+                    if matches!(constant, ConstantValue::I8(_) | ConstantValue::U8(_)) {
+                        module.set_enum_wide(LAZY_CORLIB_ASM, type_token);
+                    }
+                    if matches!(
+                        constant,
+                        ConstantValue::U1(_)
+                            | ConstantValue::U2(_)
+                            | ConstantValue::U4(_)
+                            | ConstantValue::U8(_)
+                    ) {
+                        module.set_enum_unsigned(LAZY_CORLIB_ASM, type_token);
+                    }
+                    module.set_enum_width(
+                        LAZY_CORLIB_ASM,
+                        type_token,
+                        enum_constant_width(&constant),
+                    );
+                    if let Some(value) = constant_as_i64(constant) {
+                        module.set_enum_constant(LAZY_CORLIB_ASM, type_token, value, member.into());
+                    }
                 }
+                continue;
+            }
+            let entry = CorlibField {
+                token,
+                name: field.name().unwrap_or("").into(),
+                default: default_field_value_of(
+                    corlib,
+                    field.signature(),
+                    &resolution.field_index.enum_zeros,
+                ),
+            };
+            if field.is_static() {
+                own_static.push(entry);
             } else {
-                own_instance.push((token, default_field_value(field.signature())));
+                own_instance.push(entry);
             }
         }
         if is_target {
-            found = Some((type_def.extends(), own_instance, own_static));
+            found = Some(CorlibTypeDef {
+                extends: type_def.extends(),
+                interfaces: type_def.interfaces().collect(),
+                instance_fields: own_instance,
+                static_fields: own_static,
+            });
             break;
         }
     }
 
-    let (extends, own_instance, own_static) = match found {
+    let CorlibTypeDef {
+        extends,
+        interfaces,
+        instance_fields: own_instance,
+        static_fields: own_static,
+    } = match found {
         Some(found) => found,
         None => {
             let type_id = module.add_type(Vec::new());
             module.bind_type_full_name(type_id, full_type_name(name));
-            context.type_index.insert(key, type_id);
+            resolution.type_index.insert(key, type_id);
             return type_id;
         }
     };
 
+    resolution.materializing.push(key.clone());
+
     let mut base_type: Option<TypeId> = None;
     let base_defaults: Vec<Value> = if extends.row() != 0 {
-        if let Some(base) = corlib.type_token_name(extends) {
+        if let Some(base) =
+            corlib.type_token_name(extends).filter(|base| !resolution.is_materializing(*base))
+        {
             let base_id = materialize_corlib_type(
                 module,
-                context,
+                resolution,
                 corlib,
                 base,
-                worklist,
-                corlib_memberrefs,
-                dispatch,
+                walk,
             );
             base_type = Some(base_id);
             module.type_field_defaults(base_id).unwrap_or_default()
@@ -1630,7 +2217,7 @@ fn materialize_corlib_type<'c>(
     };
     let base_count = base_defaults.len();
     let mut full = base_defaults;
-    full.extend(own_instance.iter().map(|(_, default)| default.clone()));
+    full.extend(own_instance.iter().map(|field| field.default.clone()));
 
     let type_id = module.add_type(full);
     if module.string_type_id().is_none() && name.namespace == "System" && name.name == "String" {
@@ -1647,34 +2234,99 @@ fn materialize_corlib_type<'c>(
             _ => {}
         }
     }
+    if let Some(kind) = primitive_value_kind(name.namespace, name.name) {
+        module.set_primitive_type_token(LAZY_CORLIB_ASM, own_token, &kind);
+    }
     module.set_type_base(type_id, base_type);
     let is_value_type = corlib.type_token_name(extends).is_some_and(|base| {
         base.namespace == "System" && (base.name == "ValueType" || base.name == "Enum")
     });
     module.set_type_is_value_type(type_id, is_value_type);
-    context.type_index.insert(key, type_id);
-    for (index, (token, _)) in own_instance.iter().enumerate() {
-        module.bind_field(LAZY_CORLIB_ASM, *token, (base_count + index) as u32);
+    if is_value_type {
+        walk.tokens.value_types.push(own_token);
     }
-    for (token, default) in &own_static {
-        module.bind_static_field(LAZY_CORLIB_ASM, *token, default.clone());
+    resolution.type_index.insert(key, type_id);
+    for (index, field) in own_instance.iter().enumerate() {
+        let slot = (base_count + index) as u32;
+        module.bind_field(LAZY_CORLIB_ASM, field.token, slot);
+        module.bind_field_type(LAZY_CORLIB_ASM, field.token, type_id);
+        resolution
+            .field_index
+            .instances
+            .insert(field_name_key(name, &field.name), slot);
     }
-    context.corlib_types.push((name.namespace.into(), name.name.into()));
-    let wanted = dispatch.wanted.clone();
+    let statics_start = module.static_field_count() as u32;
+    for field in &own_static {
+        module.bind_static_field(LAZY_CORLIB_ASM, field.token, field.default.clone());
+        if let Some(slot) = module.static_field_slot(LAZY_CORLIB_ASM, field.token) {
+            resolution
+                .field_index
+                .statics
+                .insert(field_name_key(name, &field.name), slot);
+        }
+    }
+    module.bind_static_slot_range(statics_start, module.static_field_count() as u32, type_id);
+    resolution.corlib_types.push((name.namespace.into(), name.name.into()));
+    let implemented: Vec<TypeId> = interfaces
+        .iter()
+        .filter_map(|token| corlib.type_token_name(*token))
+        .filter(|interface| corlib_defines_type(corlib, *interface))
+        .map(|interface| {
+            materialize_corlib_type(module, resolution, corlib, interface, walk)
+        })
+        .collect();
+    if !implemented.is_empty() {
+        module.set_type_interfaces(type_id, implemented);
+    }
+    if let Some(row) = corlib_named_method_row(corlib, name, ".cctor") {
+        materialize_corlib_method_row(
+            module,
+            resolution,
+            corlib,
+            row,
+            walk,
+        );
+        if let Some(id) = module.resolve(LAZY_CORLIB_ASM, Token::new(METHOD_DEF, row)) {
+            module.add_static_ctor(id);
+        }
+    }
+    let wanted = walk.dispatch.wanted.clone();
     let sig_methods = materialize_corlib_sig_methods(
         module,
-        context,
+        resolution,
         corlib,
         name,
-        worklist,
-        corlib_memberrefs,
-        dispatch,
+        walk,
         &wanted,
     );
     if !sig_methods.is_empty() {
         module.set_sig_methods(type_id, sig_methods);
     }
+    resolution.materializing.pop();
     type_id
+}
+
+/// The global `MethodDef` row of `type_name`'s method called `method` (the same numbering
+/// [`materialize_corlib_method_row`] uses), or `None` if the type declares none. Used for the
+/// members no call site names -- a `.cctor`, which the runtime reaches through its type rather than
+/// through a token in anybody's IL.
+fn corlib_named_method_row(corlib: &Assembly, type_name: TypeName<'_>, method: &str) -> Option<u32> {
+    let mut method_row: u32 = 0;
+    for type_def in corlib.type_defs() {
+        let is_target = type_def
+            .name()
+            .is_some_and(|n| n.namespace == type_name.namespace && n.name == type_name.name);
+        for candidate in type_def.methods() {
+            method_row += 1;
+            if is_target && candidate.name() == Some(method) {
+                return Some(method_row);
+            }
+        }
+        if is_target {
+            return None;
+        }
+    }
+    None
 }
 
 /// The declared name + parameter types of the corlib method at global `row` (the same numbering
@@ -1714,12 +2366,10 @@ fn corlib_method_name_params(corlib: &Assembly, row: u32) -> Option<(String, Vec
 /// and it failed SILENTLY rather than trapping.
 fn materialize_corlib_sig_methods<'c>(
     module: &mut Module,
-    context: &mut DeltaContext,
+    resolution: &mut CorlibResolution,
     corlib: &SourceAssembly<'c>,
     name: TypeName<'_>,
-    worklist: &mut Vec<u32>,
-    corlib_memberrefs: &mut BTreeSet<Token>,
-    dispatch: &mut DispatchKeys,
+    walk: &mut CorlibWalk,
     wanted: &BTreeSet<String>,
 ) -> BTreeMap<String, MethodId> {
     const MAX_BASE_DEPTH: usize = 16;
@@ -1771,12 +2421,10 @@ fn materialize_corlib_sig_methods<'c>(
             }
             materialize_corlib_method_row(
                 module,
-                context,
+                resolution,
                 corlib,
                 row,
-                worklist,
-                corlib_memberrefs,
-                dispatch,
+                walk,
             );
             if let Some(id) = module.resolve(LAZY_CORLIB_ASM, Token::new(METHOD_DEF, row)) {
                 sig.insert(key, id);
@@ -1993,6 +2641,7 @@ fn load_assembly<'pe>(
     let mut method_row: u32 = 0;
     let mut field_row: u32 = 0;
     let mut type_row: u32 = 0;
+    index_enum_zeros(assembly, &mut field_index.enum_zeros);
     for type_def in assembly.type_defs() {
         type_row += 1;
         let is_enum = is_enum_type(assembly, type_def.extends());
@@ -2006,7 +2655,9 @@ fn load_assembly<'pe>(
             let token = Token::new(FIELD, field_row);
             if field.is_static() {
                 if !field.is_literal() {
-                    module.bind_static_field(asm, token, default_field_value(field.signature()));
+                    let default =
+                        default_field_value_of(assembly, field.signature(), &field_index.enum_zeros);
+                    module.bind_static_field(asm, token, default);
                     if let (Some(field_name), Some(slot)) =
                         (field.name(), module.static_field_slot(asm, token))
                     {
@@ -2040,7 +2691,10 @@ fn load_assembly<'pe>(
             if let (Some((ns, tn)), Some(field_name)) = (key_type_name(&type_def), field.name()) {
                 instance_field_keys.insert(token.0, field_key(&ns, &tn, field_name));
             }
-            own.push((token, default_field_value(field.signature())));
+            own.push((
+                token,
+                default_field_value_of(assembly, field.signature(), &field_index.enum_zeros),
+            ));
         }
         let type_id = module.add_type(Vec::new());
         module.bind_static_slot_range(
@@ -2323,7 +2977,7 @@ fn load_assembly<'pe>(
         resolve_external,
         &bcl_call_tokens,
     );
-    bind_array_defaults(assembly, module, asm, type_index, &newarr_tokens);
+    bind_array_defaults(assembly, module, asm, type_index, &field_index.enum_zeros, &newarr_tokens);
     bind_box_primitives(assembly, module, asm, &box_tokens);
     bind_generic_calls(assembly, module, asm, &generic_call_tokens);
     mark_value_type_ctors(module, asm, &newobj_tokens, &value_type_method_rows);
@@ -3278,6 +3932,55 @@ fn object_ctor_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u
     }
 }
 
+/// [`default_field_value`], plus the one value type whose zero is NOT a null reference: an ENUM.
+///
+/// An enum IS its underlying integral type (ECMA-335 II.14.3), so a field of enum type that nobody
+/// assigns holds that type's zero -- which is the whole reason C# needs no initializer for
+/// `private Sampling _mode;` and emits CS0649 as a warning rather than an error. Left as null it
+/// fails in both directions at once: `_mode == Sampling.Skipped` compares a null against an
+/// `Int32(0)` and answers FALSE with nothing reported, and `(int)_mode` traps on `conv.i4`. The
+/// silent half is the dangerous one -- a driver reads "this is not Skipped" for a field that is.
+///
+/// Non-enum value types still fall back to null: they are not laid out inline yet, and handing a
+/// struct field a numeric zero would be a different wrong answer rather than a fix.
+fn default_field_value_of(
+    assembly: &Assembly,
+    signature: Option<SigType>,
+    enum_zeros: &BTreeMap<String, Value>,
+) -> Value {
+    if let Some(SigType::ValueType(token)) = signature {
+        if let Some(name) = assembly.type_token_name(token) {
+            if let Some(zero) = enum_zeros.get(&type_name_key(name)) {
+                return zero.clone();
+            }
+        }
+    }
+    default_field_value(signature)
+}
+
+/// Record every enum this assembly DECLARES against the zero its storage takes, so a field typed
+/// with one gets that zero rather than a null reference. Runs before the field walk, because a
+/// field may name a type declared later in the same assembly.
+fn index_enum_zeros(assembly: &Assembly, enum_zeros: &mut BTreeMap<String, Value>) {
+    for type_def in assembly.type_defs() {
+        if !is_enum_type(assembly, type_def.extends()) {
+            continue;
+        }
+        let Some((namespace, name)) = key_type_name(&type_def) else {
+            continue;
+        };
+        let underlying = type_def
+            .fields()
+            .find(|field| !field.is_static())
+            .and_then(|field| field.signature());
+        let zero = match default_field_value(underlying) {
+            Value::Null => Value::Int32(0),
+            zero => zero,
+        };
+        enum_zeros.insert(alloc::format!("{namespace}.{name}"), zero);
+    }
+}
+
 /// The zero value a freshly allocated instance field of this signature holds
 /// (ECMA-335 III.4.21 zero-initializes instances): the numeric zero of its width,
 /// or null for a reference. Value types other than these primitives are not laid out
@@ -3312,10 +4015,12 @@ fn bind_array_defaults(
     module: &mut Module,
     asm: u8,
     type_index: &TypeNameIndex,
+    enum_zeros: &BTreeMap<String, Value>,
     tokens: &BTreeSet<Token>,
 ) {
     for token in tokens {
-        module.bind_array_default(asm, *token, array_element_default(assembly, *token));
+        let default = array_element_default(assembly, *token, enum_zeros);
+        module.bind_array_default(asm, *token, default);
         if let Some(kind) = assembly
             .type_token_name(*token)
             .and_then(|name| array_prim_kind_of(name.namespace, name.name))
@@ -4183,10 +4888,17 @@ fn primitive_type_size(namespace: &str, name: &str, pointer_size: u32) -> Option
 /// `TypeDef` (it defines `System.Int32` etc.) -- gets its numeric zero; a user `TypeDef`, a
 /// `TypeSpec` (array/generic), and unrecognized names are references (value-type array
 /// elements are not laid out inline yet).
-fn array_element_default(assembly: &Assembly, element_type: Token) -> Value {
+fn array_element_default(
+    assembly: &Assembly,
+    element_type: Token,
+    enum_zeros: &BTreeMap<String, Value>,
+) -> Value {
     let Some(name) = assembly.type_token_name(element_type) else {
         return Value::Null;
     };
+    if let Some(zero) = enum_zeros.get(&type_name_key(name)) {
+        return zero.clone();
+    }
     if name.namespace != "System" {
         return Value::Null;
     }

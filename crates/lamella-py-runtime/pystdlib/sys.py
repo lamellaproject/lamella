@@ -1,0 +1,65 @@
+# sys, bundled as a MANAGED module: the interpreter's own facts about itself and the machine it is on.
+#
+# The values that are properties of the MACHINE come from the `_platform` seam, which derives them from
+# the compiler that built the runtime -- so `byteorder` and `maxsize` are the same answers the C library
+# on that target would give, and on a host they agree with the CPython running beside them.
+#
+# The values that are properties of THIS interpreter say what it is rather than impersonating another.
+# `implementation.name` is "lamella"; `version_info` is the CPython language level this runtime tracks,
+# which is the established convention for an alternative implementation and is a statement about which
+# specification is being followed, not a claim of complete coverage.
+import _platform
+
+# --- the machine ---
+byteorder = _platform.byteorder
+maxsize = _platform.maxsize
+
+# --- this interpreter ---
+platform = "lamella"
+
+
+class _Implementation:
+    # Named like CPython's `sys.implementation` so `sys.implementation.name` reads the same, and so a
+    # program can tell which interpreter it is on without a version-string parse.
+    def __init__(self, name, version):
+        self.name = name
+        self.version = version
+
+    def __repr__(self):
+        return "namespace(name=" + repr(self.name) + ", version=" + repr(self.version) + ")"
+
+
+def _version_tuple(text):
+    parts = []
+    for piece in text.split("."):
+        digits = ""
+        for c in piece:
+            if c.isdecimal():
+                digits = digits + c
+            else:
+                break
+        if digits == "":
+            parts.append(0)
+        else:
+            parts.append(int(digits))
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+# The CPython language level this runtime is written against; every semantic here is grounded in that
+# specification. It is not a claim that every corner of it is implemented.
+version_info = (3, 14, 6, "final", 0)
+
+implementation = _Implementation("lamella", _version_tuple(_platform.version))
+version = "3.14.6; Lamella " + _platform.version
+
+argv = []
+
+
+def exit(status=None):
+    # CPython raises SystemExit rather than stopping the interpreter where it stands, so a `finally`
+    # still runs and a caller can catch it.
+    if status is None:
+        raise SystemExit()
+    raise SystemExit(status)

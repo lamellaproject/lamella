@@ -11,34 +11,43 @@ fn usage() -> ExitCode {
         "usage: lamella-bsp-gen gen          <table.toml> <bsp-root>   write a v0 table's bindings\n\
          \x20      lamella-bsp-gen check        <table.toml> <bsp-root>   fail if the v0 emission is stale\n\
          \x20      lamella-bsp-gen gen-family   <repo-root> <family>      write a v2 family's emissions\n\
-         \x20      lamella-bsp-gen check-family <repo-root> <family>      fail if any v2 emission is stale"
+         \x20      lamella-bsp-gen check-family <repo-root> <family>      fail if any v2 emission is stale\n\
+         \x20      lamella-bsp-gen gen-parts    <repo-root> <family>      write a part family's emissions\n\
+         \x20      lamella-bsp-gen check-parts  <repo-root> <family>      fail if any part emission is stale"
     );
     ExitCode::from(2)
 }
 
 fn run_family(mode: &str, repo_root: &str, family: &str) -> ExitCode {
     let root = Path::new(repo_root);
-    let generated = match lamella_bsp_gen::strata::generate_family(root, family) {
+    let parts = mode.ends_with("-parts");
+    let generated = if parts {
+        lamella_bsp_gen::strata::generate_parts(root, family)
+    } else {
+        lamella_bsp_gen::strata::generate_family(root, family)
+    };
+    let generated = match generated {
         Ok(generated) => generated,
         Err(error) => {
             eprintln!("{family}: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let writer = if parts { "gen-parts" } else { "gen-family" };
     let mut stale = false;
     for file in &generated {
         let out_path = root.join(&file.path);
-        if mode == "check-family" {
+        if mode.starts_with("check") {
             match std::fs::read_to_string(&out_path) {
                 Ok(existing) if existing.replace("\r\n", "\n") == file.contents => {
                     println!("{}: fresh", file.path);
                 }
                 Ok(_) => {
-                    eprintln!("{}: STALE -- regenerate with `gen-family`", file.path);
+                    eprintln!("{}: STALE -- regenerate with `{writer}`", file.path);
                     stale = true;
                 }
                 Err(error) => {
-                    eprintln!("{}: {error} -- generate with `gen-family`", file.path);
+                    eprintln!("{}: {error} -- generate with `{writer}`", file.path);
                     stale = true;
                 }
             }
@@ -64,7 +73,7 @@ fn main() -> ExitCode {
     let [mode, table_path, bsp_root] = args.as_slice() else {
         return usage();
     };
-    if mode == "gen-family" || mode == "check-family" {
+    if matches!(mode.as_str(), "gen-family" | "check-family" | "gen-parts" | "check-parts") {
         return run_family(mode, table_path, bsp_root);
     }
     if mode != "gen" && mode != "check" {

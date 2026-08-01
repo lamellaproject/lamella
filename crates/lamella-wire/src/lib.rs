@@ -42,6 +42,32 @@ pub mod msg {
     pub const PONG: u8 = 0x06;
 }
 
+/// What an [`msg::ERROR`] carries: why a frame was refused.
+///
+pub mod error {
+    /// The message type is not one this target implements. Byte 1 is that type.
+    pub const UNKNOWN_MESSAGE_TYPE: u8 = 0x01;
+
+    /// The payload refusing `msg_type` as unimplemented.
+    #[must_use]
+    pub fn unknown_message_type(msg_type: u8) -> [u8; 2] {
+        [UNKNOWN_MESSAGE_TYPE, msg_type]
+    }
+
+    /// The message type an [`unknown_message_type`] payload names, or `None` when the payload is some
+    /// other refusal.
+    ///
+    /// Both sides go through this pair rather than slicing the bytes at each site, so the layout has one
+    /// definition and a host cannot read a field a target never wrote.
+    #[must_use]
+    pub fn refused_message_type(payload: &[u8]) -> Option<u8> {
+        match payload {
+            [UNKNOWN_MESSAGE_TYPE, msg_type, ..] => Some(*msg_type),
+            _ => None,
+        }
+    }
+}
+
 /// A decoded protocol frame: its message type, sequence number, and payload bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -233,6 +259,45 @@ impl Capabilities {
     /// range). RESERVED: no firmware advertises this bit and no host may rely on it. First of
     /// the reserved 11-31 capability band.
     pub const TELEMETRY: u32 = 1 << 11;
+    /// The target holds a RESIDENT corlib in flash, so it accepts a bare program assembly and
+    /// resolves that program's corlib references out of the resident copy -- a program reaches the
+    /// board as its own kilobytes instead of as an image carrying a corlib with it.
+    ///
+    /// # Presence is only half the question, and the other half is why this bit is not enough alone
+    ///
+    /// A host must also know it is the corlib the program was compiled against. Getting that wrong is
+    /// SILENT: a corlib declaring a seam the firmware compiled out still loads, and the method keeps a
+    /// placeholder body that returns zero. **So [`ProfileIdentity::hash`] covers the resident corlib's
+    /// contents**, and a host that recorded that hash for a firmware it trusts can compare and be sure.
+    /// This bit says the path exists; the hash says it is the right one.
+    pub const RESIDENT_CORLIB: u32 = 1 << 13;
+    /// The target implements the BUNDLE message types (`lamella_runner::bundle`) -- an artifact it
+    /// loads through a different front end than a baked image. RESERVED: no firmware advertises this
+    /// bit yet.
+    ///
+    /// **This is what a host should gate on, in preference to sending the op and reading the answer.**
+    /// Both work -- an unimplemented type is refused with [`msg::ERROR`] naming it (see [`error`]) rather
+    /// than dropped -- but this bit arrives in the `HELLO_ACK` a session already exchanges, so gating on
+    /// it costs no round-trip and no wait, and it says what a target CAN do rather than one thing at a
+    /// time.
+    pub const BUNDLE: u32 = 1 << 12;
+    /// The target answers a memory READ and WRITE (`lamella_runner::live`) **while a deployed app
+    /// is still running** -- the on-target half of a host-side REPL evaluating against a live
+    /// program, rather than against a stopped one.
+    ///
+    /// # Why this is a separate bit from [`DEBUG_BASIC`] and [`MEM_WRITE`]
+    ///
+    /// Those two describe the same two verbs on the HALTED debug channel, where the program is
+    /// stopped at a known point and its state is at rest. This bit says the verbs are answered with
+    /// the program in motion, which is a different promise about a different situation: what a host
+    /// reads may be mid-update, and what it writes lands in a program that did not expect it.
+    ///
+    /// The distinction is not academic on a controller. Halting a live one is an EVENT -- a motor
+    /// keeps turning, a valve stays where it was -- so "inspect a running system" and "poke a
+    /// stopped one" are separate products, and a host must be able to tell which it is talking to.
+    /// A target that only sets [`DEBUG_BASIC`] can still be inspected; it just has to be stopped
+    /// first, and the host has to say so.
+    pub const LIVE_MEMORY: u32 = 1 << 14;
 
     /// Whether this set includes `flag`.
     #[must_use]
@@ -297,7 +362,14 @@ impl Hello {
 pub struct ProfileIdentity {
     /// The intrinsic-ABI level.
     pub abi: u16,
-    /// The content hash of the resident surface.
+    /// The content hash of the resident surface: the intrinsic registry, **and the resident corlib's
+    /// bytes when the target holds one** ([`Capabilities::RESIDENT_CORLIB`]).
+    ///
+    /// The corlib belongs in here because it IS part of the resident surface, and leaving it out made
+    /// this field unable to tell apart two firmwares that differ only in the corlib they carry -- which
+    /// is exactly the difference a host must not get wrong, since a mismatched corlib does not fail to
+    /// load, it returns zero from a seam the firmware compiled out. A target with no resident corlib
+    /// reports the registry's fingerprint alone, unchanged.
     pub hash: u64,
     /// The BOARD model code from [`board_model`] -- the product the firmware was built for,
     /// so a host names it without parsing a string. `0` = unknown (a custom board).
@@ -473,6 +545,12 @@ pub mod board_model {
     /// host MCU and bootloader-only deploy path as the Express and the WiFi, distinguished by what
     /// is soldered beside it: a card slot on SERCOM4 where the Express has 2 MB of SPI flash.
     pub const FEATHER_M0_ADALOGGER: u16 = 19;
+    /// ST 32F746GDISCOVERY (STM32F746NG, Cortex-M7) -- the first `stm32f7`-family board, and the
+    /// first whose UART crosses two GPIO ports (PA9 transmits, PB7 receives).
+    pub const STM32F746G_DISCO: u16 = 20;
+
+    /// ST STM32F429I-DISC1 (STM32F429ZI, Cortex-M4F).
+    pub const STM32F429I_DISCO: u16 = 21;
 
     /// The display name for a `board_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
@@ -501,6 +579,8 @@ pub mod board_model {
             FEATHER_M0_WIFI => "Adafruit Feather M0 WiFi",
             FEATHER_RP2040_ADALOGGER => "Adafruit Feather RP2040 Adalogger",
             FEATHER_M0_ADALOGGER => "Adafruit Feather M0 Adalogger",
+            STM32F746G_DISCO => "STM32F746G Discovery",
+            STM32F429I_DISCO => "STM32F429I Discovery",
             _ => return None,
         })
     }

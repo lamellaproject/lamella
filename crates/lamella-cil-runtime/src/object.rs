@@ -1992,6 +1992,33 @@ mod gc_tests {
         assert_eq!(heap.as_string(weak_target).as_deref(), Some(&[b'k' as u16][..]));
     }
 
+    /// `fixed (char* p = s)` yields a [`Location::StringChar`], the OTHER managed pointer a
+    /// `fixed` statement can produce, and it must be rooted and forwarded exactly as an element
+    /// pointer is. Rooted through the pointer ALONE, so the test proves both halves: the string
+    /// stays alive because the pointer names it, and the pointer reaches it afterwards.
+    ///
+    /// This is why the interpreter needs no `pinned` support: a managed pointer here carries its
+    /// base object, so the compactor moves the string and the pointer follows. A tier whose
+    /// `fixed` pointer is a RAW ADDRESS has no such option and must pin instead.
+    #[test]
+    fn pinned_string_pointer_roots_its_string_and_is_forwarded() {
+        let mut heap = Heap::new();
+        let _garbage = heap.alloc_text("x");
+        let text = heap.alloc_text("hi");
+        let mut roots = alloc::vec![Value::ByRef(Location::StringChar {
+            string: text,
+            byte_offset: 2,
+        })];
+        heap.collect(|visit| roots.iter_mut().for_each(visit));
+
+        assert_eq!(heap.object_count(), 1);
+        let Value::ByRef(Location::StringChar { string, byte_offset }) = roots[0] else {
+            panic!("root not a string-char pointer: {:?}", roots[0]);
+        };
+        assert_eq!(byte_offset, 2, "the displacement is relative, so it does not move");
+        assert_eq!(heap.as_string(string).as_deref(), Some(&[b'h' as u16, b'i' as u16][..]));
+    }
+
     #[test]
     fn packed_array_relocates_with_bytes_intact_and_element_pointers_forwarded() {
         let mut heap = Heap::new();

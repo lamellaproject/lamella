@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use lamella_asm_arm32::{AssembleError, Cond, Encoder, Label, Reg};
+use lamella_asm_arm32::{AssembleError, Cond, Encoder, Label, Reg, RelocKind};
 use lamella_ir::{
     BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, StaticOwner, Terminator, ValueId,
 };
@@ -24,9 +24,22 @@ pub enum LowerError {
     TooManyValues,
     /// A value's type is not an integer; floats and references are not lowered yet.
     NonIntegerValue,
-    /// The function plus its literal pool is too large for a literal load to
-    /// reach (a constant's pool entry sits more than ~1 KB past the load).
-    CodeTooLarge,
+    /// A reference could not reach its target once the code was laid out: a constant's pool entry
+    /// past the ~1 KB literal reach, an `adr`'s blob, or a branch, after every relaxation and
+    /// veneer the encoder can apply.
+    ///
+    /// CARRIES THE FAILING SITE, because "too large" on its own does not say WHICH reach ran out,
+    /// and the four have nothing in common but the symptom -- a pool word islands beside its load,
+    /// an `adr` veneers to an unbounded computed address, an unconditional branch veneers through
+    /// the pool, and an already-widened conditional branch has no further tier at all on ARMv6-M.
+    /// The encoder knows which one gave up and at what offset; discarding that left a deferred
+    /// method needing a disassembly to classify.
+    CodeTooLarge {
+        /// The failing reference's post-relaxation byte offset and kind, when the encoder named
+        /// one. `None` when the failure was not a reach -- an unbound label, an unencodable
+        /// operand, or a layout query that could not be answered.
+        site: Option<(u32, RelocKind)>,
+    },
     /// The function contains a call, which the single-function lowering cannot
     /// resolve; calls are lowered by the program (module) lowering.
     CallUnsupported,
@@ -53,6 +66,24 @@ fn unencodable<T>(
         unit: e.unit,
         index: e.index,
     })
+}
+
+/// Maps an assembly failure into [`LowerError::CodeTooLarge`], KEEPING the site the encoder named.
+///
+/// Every reach failure arrives here from a `finish` (or a layout query on the same image), and the
+/// encoder is the only thing that knows which reference gave up and where. Mapping with `|_|`
+/// throws that away and leaves "the function is too large" -- true, useless, and indistinguishable
+/// between a pool word that should have islanded and a conditional branch that has no further tier.
+/// The other two failures are not reaches and carry no site.
+fn reach_failure(err: AssembleError) -> LowerError {
+    match err {
+        AssembleError::BranchOutOfRange { at, kind } => LowerError::CodeTooLarge {
+            site: Some((at, kind)),
+        },
+        AssembleError::UnboundLabel(_) | AssembleError::UnencodableOperand => {
+            LowerError::CodeTooLarge { site: None }
+        }
+    }
 }
 
 /// The ARM condition code that tests a MIR comparison.
@@ -229,7 +260,8 @@ fn lower_inst(
         | Inst::CallVirtual { .. }
         | Inst::CallInterface { .. }
         | Inst::CastClassScan { .. }
-        | Inst::InterfaceHasTag { .. } => {
+        | Inst::InterfaceHasTag { .. }
+        | Inst::TypeName { .. } => {
             return Err(LowerError::CallUnsupported);
         }
         Inst::SemihostWrite { .. }
@@ -320,7 +352,7 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
         | ConvKind::LongToFloat32
         | ConvKind::UIntToFloat64
         | ConvKind::ULongToFloat64 => Ok(()),
-        ConvKind::IntToRef | ConvKind::RefToInt => {
+        ConvKind::IntToRef | ConvKind::RefToInt | ConvKind::ToNativeInt => {
             if rd != rm {
                 enc.mov_reg(rd, rm);
             }
@@ -1028,6 +1060,47 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.bind_label(done);
         }
+        Inst::TypeName { descriptor } => {
+            let miss = enc.new_label();
+            let done = enc.new_label();
+            slot_load(enc, Reg::R0, slot(*descriptor))?;
+            enc.cmp_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
+            enc.ldr_imm(Reg::R1, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsrs_imm(Reg::R1, Reg::R1, 24)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
+            enc.ldr_imm(Reg::R1, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsls_imm(Reg::R1, Reg::R1, 2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R1, 16)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R2, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsls_imm(Reg::R2, Reg::R2, 3)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R1, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R2, Reg::R1, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_imm(Reg::R2, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
+            enc.adds(Reg::R0, Reg::R0, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(done);
+            enc.bind_label(miss);
+            enc.movs_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(done);
+        }
         Inst::InterfaceHasTag { descriptor, tag } => {
             let miss = enc.new_label();
             let found = enc.new_label();
@@ -1396,6 +1469,10 @@ fn lower_spilled_inst(
         }
         Inst::StaticLoad { owner, offset } => {
             static_slot_addr(enc, pool, sym_pool, relocate, *owner, *offset)?;
+            if matches!(result_ty, Some(MirType::I64 | MirType::F64)) {
+                enc.ldr_imm(Reg::R1, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
@@ -1408,6 +1485,14 @@ fn lower_spilled_inst(
             slot_load(enc, Reg::R1, slot(*value))?;
             enc.str_imm(Reg::R1, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
+            if matches!(
+                value_types.get(value.0 as usize),
+                Some(MirType::I64 | MirType::F64)
+            ) {
+                slot_load(enc, Reg::R1, slot(*value) + 4)?;
+                enc.str_imm(Reg::R1, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
         }
         Inst::Alloc { .. }
         | Inst::AllocLike { .. }
@@ -1702,6 +1787,11 @@ fn emit_f2i(enc: &mut Encoder) -> Result<(), LowerError> {
 /// and the exponent (`158 - shifts`) and the 23-bit mantissa (the next bits) are assembled with the
 /// sign. Exact for magnitudes below 2^24; larger values truncate the low bits (round-to-nearest is
 /// unsupported). r1-r3 are scratch.
+///
+/// THE FLAT (linker-free) PATH ONLY, since that truncation is a wrong answer wherever it can be
+/// avoided: the linked path routes this conversion to the archive's `__aeabi_i2f`, which rounds to
+/// nearest ([`aeabi_convert_helper`]). A self-contained single-assembly image has no helper to call,
+/// so it keeps this and its 2^24 limit.
 fn emit_i2f(enc: &mut Encoder) -> Result<(), LowerError> {
     let oops = |_| LowerError::TooManyValues;
     let done = enc.new_label();
@@ -3893,7 +3983,7 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
     }
     enc.finish()
         .map(|assembled| assembled.bytes)
-        .map_err(|_| LowerError::CodeTooLarge)
+        .map_err(reach_failure)
 }
 
 /// Lowers a function and also returns a [`LineTable`] mapping native code offsets to the
@@ -3952,7 +4042,7 @@ pub fn lower_debug(
     let bytes = enc
         .finish()
         .map(|assembled| assembled.bytes)
-        .map_err(|_| LowerError::CodeTooLarge)?;
+        .map_err(reach_failure)?;
     Ok((bytes, LineTable(lines)))
 }
 
@@ -4097,12 +4187,18 @@ fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static
     }
 }
 
-/// The `__aeabi_*` soft-float helper for a float CONVERSION the no-FPU target does not do inline; `None`
-/// for a conversion lowered inline (the f32 ones via `emit_f2i`/`emit_i2f`) or an integer widen. Only
-/// `Float64ToInt` needs one -- `__aeabi_d2iz` truncates a double toward zero to a signed int; its single
-/// f64 argument arrives in `r0:r1`, which the C-ABI arg lowering already forms for a `CallNative`.
+/// The `__aeabi_*` soft-float helper for a float CONVERSION the no-FPU target does not do inline;
+/// `None` for one lowered inline (`emit_f2i`) or an integer widen. A helper's single f64 argument
+/// arrives in `r0:r1`, which the C-ABI arg lowering already forms for a `CallNative`.
+///
+/// `IntToFloat32` IS in this table even though [`emit_i2f`] can lower it inline, and that is the
+/// point: the inline loop is exact only below 2^24 and TRUNCATES above it, so `(float)int.MaxValue`
+/// came out 2147483520 where .NET rounds to nearest and answers 2147483648. The archive's
+/// `__aeabi_i2f` rounds correctly. The flat path tests this kind BEFORE consulting this table, so it
+/// keeps the inline form -- it has no linker and cannot call a helper at all.
 fn aeabi_convert_helper(kind: ConvKind) -> Option<&'static str> {
     match kind {
+        ConvKind::IntToFloat32 => Some("__aeabi_i2f"),
         ConvKind::Float64ToInt => Some("__aeabi_d2iz"),
         ConvKind::IntToFloat64 => Some("__aeabi_i2d"),
         ConvKind::LongToFloat64 => Some("__aeabi_l2d"),
@@ -4934,7 +5030,7 @@ fn lower_object_inner(
             debug,
         )? {
             PassOutcome::Object(bytes, mut stub_report, line_tables) => {
-                stub_report.extend(stubbed.iter().map(|&i| (i, LowerError::CodeTooLarge)));
+                stub_report.extend(stubbed.iter().map(|&i| (i, LowerError::CodeTooLarge { site: None })));
                 stub_report.sort_by_key(|&(i, _)| i);
                 return Ok((bytes, stub_report, line_tables));
             }
@@ -5153,6 +5249,7 @@ fn emit_object_pass(
         };
         (handle, vtable_bytes)
     });
+    let type_names = !cfg!(feature = "strip-type-names");
     let mut map_ranges: Vec<(usize, usize)> = Vec::with_capacity(funcs.len());
     let mut stub_report: LibraryStubReport = Vec::new();
     let mut method_lines: Vec<LineTable> = Vec::with_capacity(funcs.len());
@@ -5239,6 +5336,8 @@ fn emit_object_pass(
             for (k, &func_index) in vtable.iter().enumerate().rev() {
                 enc.data_word_symbol_reldesc(func_index, -(4 + 4 * k as i32));
             }
+            let words_label = enc.new_label();
+            enc.bind_label(words_label);
             let base = descriptors
                 .iter()
                 .find(|m| m.handle.0 == *handle)
@@ -5285,12 +5384,40 @@ fn emit_object_pass(
                     _ => enc.emit_word(word),
                 }
             }
-            let itable_words = 1 + 2 * itable.len() as u32;
+            let mut itable_words = 1 + 2 * itable.len() as u32;
             enc.emit_word(itable.len() as u32);
             let words_bytes = words.len() as i32 * 4;
             for (i, &(tag, func_index)) in itable.iter().enumerate() {
                 enc.emit_word(tag);
                 enc.data_word_symbol_reldesc(func_index, words_bytes + 8 + 8 * i as i32);
+            }
+            let name: Option<Vec<u16>> = type_names
+                .then(|| {
+                    descriptors
+                        .iter()
+                        .find(|m| m.handle.0 == *handle)
+                        .and_then(|m| m.full_name.as_deref())
+                        .map(|n| n.encode_utf16().collect())
+                })
+                .flatten();
+            match &name {
+                Some(units) => {
+                    let name_label = enc.new_label();
+                    enc.data_word_diff(words_label, name_label);
+                    if let Some((string_handle, vtable_bytes)) = string_header {
+                        enc.data_word_symbol_addend(DESC_SYMBOL_FLAG | string_handle, vtable_bytes);
+                    }
+                    enc.bind_label(name_label);
+                    let blob = unencodable(crate::stringgen::string_blob_bytes(units))?;
+                    enc.emit_bytes(&blob);
+                    let header_words = u32::from(string_header.is_some());
+                    itable_words += 1 + header_words + (blob.len() as u32).div_ceil(4);
+                    enc.align_to_word();
+                }
+                None => {
+                    enc.emit_word(0);
+                    itable_words += 1;
+                }
             }
             desc_syms.push((
                 *handle,
@@ -5314,30 +5441,30 @@ fn emit_object_pass(
         str_syms.push((label, enc.position() - start));
     }
     let assembled = if emit_entry && !defer_encode {
-        enc.finish().map_err(|_| LowerError::CodeTooLarge)?
+        enc.finish().map_err(reach_failure)?
     } else {
         let probe = enc.clone();
         match enc.finish() {
             Ok(assembled) => assembled,
-            Err(AssembleError::BranchOutOfRange { at }) => {
+            Err(AssembleError::BranchOutOfRange { at, kind }) => {
                 let mut query = func_labels.clone();
                 query.push(code_end_label);
                 let positions = probe
                     .relaxed_positions(&query)
-                    .map_err(|_| LowerError::CodeTooLarge)?;
+                    .map_err(reach_failure)?;
                 let code_end_pos = positions[funcs.len()].unwrap_or(u32::MAX);
                 if at >= code_end_pos {
-                    return Err(LowerError::CodeTooLarge);
+                    return Err(LowerError::CodeTooLarge { site: Some((at, kind)) });
                 }
                 let failed = (0..funcs.len())
                     .rev()
                     .find(|&i| positions[i].is_some_and(|start| start <= at));
                 return match failed {
                     Some(i) if !stubbed.contains(&i) => Ok(PassOutcome::StubAndRetry(i)),
-                    _ => Err(LowerError::CodeTooLarge),
+                    _ => Err(LowerError::CodeTooLarge { site: Some((at, kind)) }),
                 };
             }
-            Err(_) => return Err(LowerError::CodeTooLarge),
+            Err(e) => return Err(reach_failure(e)),
         }
     };
     let offsets: Vec<u32> = func_labels
@@ -5907,7 +6034,7 @@ fn lower_module_inner(
             stack_maps.sort_by_key(|entry| entry.return_pc);
             (assembled.bytes, StackMaps(stack_maps), method_lines)
         })
-        .map_err(|_| LowerError::CodeTooLarge)
+        .map_err(reach_failure)
 }
 
 /// The ARMv6-M (Cortex-M) target code generator.
@@ -8119,6 +8246,7 @@ mod tests {
                 base: None,
                 words: None,
                 exported: true,
+                full_name: None,
             }],
         )
         .expect("metadata module lowers");
@@ -9183,6 +9311,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let (words, vtable) = literal(&descriptors);
         assert_eq!(&*words, &[12, 2, 0xABCD, 0, 0, 4]);
@@ -9223,6 +9352,7 @@ mod tests {
             base: None,
             words: None,
             exported: false,
+            full_name: None,
         }];
         let (words, vtable) =
             lower_runtime_calls(&main, &mut Vec::new(), &descriptors)
@@ -9323,6 +9453,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let bytes =
             lower_object_vtables(&[allocates, speak], &["f0", "f1"], &[], &descriptors).unwrap();
@@ -9411,6 +9542,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let bytes = lower_object_vtables(
             &[allocates, stub_returning_int()],
@@ -9469,6 +9601,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let bytes = lower_object_vtables(&[func], &["f0"], &[], &descriptors).unwrap();
         let obj = lamella_elf::read_object(&bytes).unwrap();
@@ -9479,7 +9612,7 @@ mod tests {
             .filter(|s| s.name == desc_name && s.defined)
             .collect();
         assert_eq!(descs.len(), 1, "the alloc and the type-test share ONE descriptor");
-        assert_eq!(descs[0].size, 24, "the alloc's richer header wins the dedup");
+        assert_eq!(descs[0].size, 28, "the alloc's richer header wins the dedup");
         let desc_index = obj.symbols.iter().position(|s| s.name == desc_name).unwrap() as u32;
         let refs = obj
             .relocations
@@ -9518,12 +9651,15 @@ mod tests {
         let descriptors = alloc::vec![
             TypeMeta { handle: derived, type_tag: 0xD1, vtable: Vec::new(), itable: Vec::new(), base: Some(mid), words: None,
                 exported: true,
+                full_name: None,
             },
             TypeMeta { handle: mid, type_tag: 0xD2, vtable: Vec::new(), itable: Vec::new(), base: Some(base), words: None,
                 exported: true,
+                full_name: None,
             },
             TypeMeta { handle: base, type_tag: 0xD3, vtable: Vec::new(), itable: Vec::new(), base: None, words: None,
                 exported: true,
+                full_name: None,
             },
         ];
         let bytes = lower_object_vtables(&[func], &["f0"], &[], &descriptors).unwrap();
@@ -9545,6 +9681,84 @@ mod tests {
         assert_eq!(chain.len(), 2, "Derived->Mid and Mid->Base, and Base->Object terminates at 0");
         assert!(chain.contains(&name(mid).as_str()), "Derived's base_ptr targets Mid");
         assert!(chain.contains(&name(base).as_str()), "Mid's base_ptr targets Base");
+    }
+
+    /// A descriptor carries its type's NAME after the itable, and `Object.ToString()` reads it there.
+    ///
+    /// Three things are pinned, because each fails silently on its own. The word is UNCONDITIONAL
+    /// (a nameless type gets a zero), so a reader never has to know which way the knob was thrown.
+    /// It is a DIFF from the descriptor's own address, so `--gc-sections` moving the descriptor
+    /// leaves it correct -- an absolute address would be right until the first trim. And the name is
+    /// laid INSIDE the descriptor's symbol, which is what makes that diff safe: the collector copies
+    /// a symbol whole, so the two ends cannot be separated.
+    #[test]
+    fn a_descriptor_carries_its_type_name_after_the_itable() {
+        let handle = lamella_ir::TypeHandle(0x0200_0007);
+        let descriptors = alloc::vec![TypeMeta {
+            handle,
+            type_tag: 0xAB,
+            vtable: Vec::new(),
+            itable: Vec::new(),
+            base: None,
+            words: None,
+            exported: true,
+            full_name: Some(alloc::boxed::Box::from("Ns.Square")),
+        }];
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle,
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let bytes = lower_object_vtables(&[func], &["f0"], &[], &descriptors).unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let desc = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle.0))
+            .expect("the descriptor is laid");
+        let name_word_at = desc.value as usize + 4 * 4 + 4;
+        let word = u32::from_le_bytes(
+            obj.text[name_word_at..name_word_at + 4]
+                .try_into()
+                .expect("four bytes"),
+        );
+        if cfg!(feature = "strip-type-names") {
+            assert_eq!(word, 0, "a stripped build lays the name word as absent, not as nothing");
+            assert_eq!(desc.size, 4 * 4 + 4 + 4, "vtable 0 + words 4 + itable 1 + name 1");
+            return;
+        }
+        let blob = crate::stringgen::string_blob_bytes(
+            &"Ns.Square".encode_utf16().collect::<Vec<u16>>(),
+        )
+        .expect("an ASCII name encodes in every tier");
+        let at = obj
+            .text
+            .windows(blob.len())
+            .position(|w| w == blob.as_slice())
+            .expect("the name blob is laid in the object");
+        assert!(
+            (desc.value as usize) < at && at < (desc.value + desc.size) as usize,
+            "the name blob must lie inside the descriptor's own symbol span"
+        );
+        assert_ne!(word, 0, "a named type's name word must not read as absent");
+        assert_eq!(
+            desc.value as usize + word as usize,
+            at,
+            "the name word is the blob's offset FROM the descriptor words, not its address"
+        );
     }
 
     #[test]
@@ -9576,6 +9790,7 @@ mod tests {
             base: None,
             words: None,
             exported: true,
+            full_name: None,
         }];
         let bytes =
             lower_object_vtables(&[func, stub_returning_int()], &["f0", "f1"], &[], &descriptors)
@@ -9586,7 +9801,7 @@ mod tests {
             .iter()
             .find(|s| s.name == alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle.0))
             .expect("the descriptor is laid");
-        assert_eq!(desc.size, 28, "the descriptor symbol spans vtable + words + itable");
+        assert_eq!(desc.size, 32, "the descriptor symbol spans vtable + words + itable + name");
         let f1 = obj.symbols.iter().position(|s| s.name == "f1").unwrap() as u32;
         let slot = obj
             .relocations
@@ -10470,6 +10685,106 @@ mod tests {
     }
 
     #[test]
+    fn a_64_bit_static_moves_both_words() {
+        let f = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::I64, MirType::I32, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 9_000_000_000,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::StaticStore {
+                            owner: StaticOwner::Own,
+                            offset: 4,
+                            value: ValueId(0),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::StaticLoad {
+                            owner: StaticOwner::Own,
+                            offset: 4,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let bytes = lower(&f).expect("a 64-bit static lowers");
+        let halfwords: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(
+            halfwords.contains(&0x6041),
+            "the store must write the high word at region+4"
+        );
+        assert!(
+            halfwords.contains(&0x6841),
+            "the load must read the high word from region+4"
+        );
+    }
+
+    #[test]
+    fn a_typespec_handle_never_aliases_a_bit_tested_symbol_flag() {
+        const TYPE_SPEC_TABLE: u32 = 0x1B;
+        let handles: [u32; 9] = [
+            0x0000_0001,
+            0x0100_0001,
+            0x0200_0001,
+            0x0300_0001,
+            0x0400_0001,
+            0x0500_0001,
+            0x0600_0001,
+            0x0700_0001,
+            (TYPE_SPEC_TABLE << 24) | 1,
+        ];
+        for handle in handles {
+            let sym = DESC_SYMBOL_FLAG | handle;
+            assert_ne!(
+                sym, EH_TAG_SYMBOL_FLAG,
+                "a descriptor reference must never EQUAL the EH word's symbol (handle {handle:#x})"
+            );
+            assert_ne!(
+                sym >> 24,
+                STATICS_BASE_SYMBOL_FLAG >> 24,
+                "a descriptor reference must differ from a statics base in its TOP BYTE, which is \
+                 the only test that separates them (handle {handle:#x})"
+            );
+            assert_eq!(
+                sym & EXTERN_SYMBOL_FLAG,
+                0,
+                "a type handle must not reach bit 31 (handle {handle:#x})"
+            );
+            assert_eq!(
+                sym & STRING_SYMBOL_FLAG,
+                0,
+                "a type handle must not reach bit 29, or a descriptor reference would bit-test as a \
+                 string blob (handle {handle:#x})"
+            );
+        }
+        for payload in [0u32, 1, 16, 0x00ff_ffff] {
+            let sym = STATICS_BASE_SYMBOL_FLAG | payload;
+            assert_eq!(
+                sym & DESC_SYMBOL_FLAG,
+                0,
+                "a statics base must not bit-test as a descriptor (payload {payload:#x})"
+            );
+            assert_ne!(sym, EH_TAG_SYMBOL_FLAG);
+        }
+    }
+
+    #[test]
     fn object_statics_split_eh_word_from_the_assembly_region() {
         let f = Function {
             params: Vec::new(),
@@ -10794,6 +11109,23 @@ mod tests {
         assert!(
             halfwords.iter().any(|&h| h & 0xFFC0 == 0xB240),
             "the signed byte load sign-extends (SXTB)"
+        );
+    }
+
+    #[test]
+    fn a_reach_failure_keeps_the_site_the_encoder_named() {
+        assert_eq!(
+            reach_failure(AssembleError::BranchOutOfRange {
+                at: 1106,
+                kind: RelocKind::ThumbLdrLit8,
+            }),
+            LowerError::CodeTooLarge {
+                site: Some((1106, RelocKind::ThumbLdrLit8)),
+            }
+        );
+        assert_eq!(
+            reach_failure(AssembleError::UnencodableOperand),
+            LowerError::CodeTooLarge { site: None }
         );
     }
 

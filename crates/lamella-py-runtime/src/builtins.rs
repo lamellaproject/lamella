@@ -180,6 +180,38 @@ pub enum Builtin {
     /// `vars(obj)` -- `obj.__dict__` (an instance/class/module namespace). The no-argument form
     /// (CPython's `locals()`) is unsupported here (no frame-locals access from a builtin).
     Vars = 68,
+    /// `object` -- the universal base type. `object()` builds a bare, attribute-less instance whose
+    /// only distinguishing trait is IDENTITY (the `_MISSING = object()` sentinel idiom); every value
+    /// is an `isinstance` of it and every type an `issubclass`.
+    Object = 69,
+    /// `globals()` -- the current module's global namespace as a dict (a fresh snapshot each call, so
+    /// it reflects state up to the call; not the live mapping object CPython returns).
+    Globals = 70,
+    /// `locals()` -- the current frame's local bindings as a dict. At module level it is the globals
+    /// (as CPython). The no-argument call is intercepted at the call site (it needs the frame); a stray
+    /// argument, or an indirect call with no visible frame, is handled here.
+    Locals = 71,
+    /// The type of a `def` or a `lambda` -- what `type(f)` answers. A TYPE OBJECT ONLY: no name binds
+    /// to it (in CPython it is reached as `types.FunctionType`) and it constructs nothing.
+    FunctionType = 72,
+    /// The type of a built-in function and of a built-in method bound to a value (`len`, `[].append`,
+    /// `"a".upper`) -- one type for both, as in CPython. A type object only.
+    BuiltinFunctionType = 73,
+    /// The type of a method bound to a user instance (`instance.method`). A type object only.
+    MethodType = 74,
+    /// The type of a generator object -- what calling a generator function returns. A type object only.
+    GeneratorType = 75,
+    /// The type of a module object. A type object only.
+    ModuleType = 76,
+    /// `open(path, mode='r')` -- the file object that reads or writes a host file. Refuses when the
+    /// embedder installed no filesystem, rather than answering an empty read or dropping a write.
+    Open = 77,
+    /// `dir([obj])` -- the attribute names `obj` actually has, sorted. With no argument, the names
+    /// bound in the calling frame (intercepted at the call site, which is where the frame is).
+    Dir = 78,
+    /// `(5).is_integer()` -- always True. An int IS an integer; the method exists so a caller holding
+    /// a number can ask without knowing whether it is an int or a float.
+    IntIsInteger = 79,
 }
 
 impl Builtin {
@@ -257,6 +289,17 @@ impl Builtin {
             66 => Some(Builtin::DictItemsType),
             67 => Some(Builtin::NotImplementedType),
             68 => Some(Builtin::Vars),
+            69 => Some(Builtin::Object),
+            70 => Some(Builtin::Globals),
+            71 => Some(Builtin::Locals),
+            72 => Some(Builtin::FunctionType),
+            73 => Some(Builtin::BuiltinFunctionType),
+            74 => Some(Builtin::MethodType),
+            75 => Some(Builtin::GeneratorType),
+            76 => Some(Builtin::ModuleType),
+            77 => Some(Builtin::Open),
+            78 => Some(Builtin::Dir),
+            79 => Some(Builtin::IntIsInteger),
             _ => None,
         }
     }
@@ -341,6 +384,17 @@ impl Builtin {
             Builtin::DictItemsType => "dict_items",
             Builtin::NotImplementedType => "NotImplementedType",
             Builtin::Vars => "vars",
+            Builtin::Object => "object",
+            Builtin::Globals => "globals",
+            Builtin::Locals => "locals",
+            Builtin::FunctionType => "function",
+            Builtin::BuiltinFunctionType => "builtin_function_or_method",
+            Builtin::MethodType => "method",
+            Builtin::GeneratorType => "generator",
+            Builtin::ModuleType => "module",
+            Builtin::Open => "open",
+            Builtin::Dir => "dir",
+            Builtin::IntIsInteger => "is_integer",
         }
     }
 
@@ -375,6 +429,7 @@ impl Builtin {
                 | Builtin::DictValuesType
                 | Builtin::DictItemsType
                 | Builtin::NotImplementedType
+                | Builtin::Object
         )
     }
 }
@@ -417,6 +472,9 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
     #[cfg(feature = "complex")]
     if model.is_complex(value) {
         return Some(Value::builtin_ref(Builtin::Complex.id()));
+    }
+    if model.is_object_base(value) {
+        return Some(Value::builtin_ref(Builtin::Object.id()));
     }
     let builtin = if value.is_fixnum() || model.is_long(value) || model.is_bigint(value) {
         Builtin::Int
@@ -466,6 +524,28 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         } else {
             Builtin::Staticmethod
         }
+    } else if model.is_slice(value) {
+        Builtin::Slice
+    } else if model.is_class(value) || model.is_ntclass(value) {
+        Builtin::Type
+    } else if let Some(id) = value.as_builtin_id() {
+        let is_type_object = Builtin::from_id(id).is_some_and(Builtin::is_type)
+            || crate::stdlib::stdlib_is_type(id);
+        if is_type_object {
+            Builtin::Type
+        } else {
+            Builtin::BuiltinFunctionType
+        }
+    } else if value.as_function_index().is_some() || model.is_py_function(value) {
+        Builtin::FunctionType
+    } else if model.is_py_bound(value) {
+        Builtin::MethodType
+    } else if model.is_bound_method(value) || model.is_unbound_method(value) {
+        Builtin::BuiltinFunctionType
+    } else if model.is_generator(value) {
+        Builtin::GeneratorType
+    } else if model.is_module_object(value) {
+        Builtin::ModuleType
     } else {
         return None;
     };
@@ -534,6 +614,11 @@ pub fn builtin_id(name: &str) -> Option<u32> {
         "setattr" => Builtin::Setattr,
         "delattr" => Builtin::Delattr,
         "vars" => Builtin::Vars,
+        "object" => Builtin::Object,
+        "open" => Builtin::Open,
+        "dir" => Builtin::Dir,
+        "globals" => Builtin::Globals,
+        "locals" => Builtin::Locals,
         "hash" => Builtin::Hash,
         "__match_class__" => Builtin::MatchClassPositional,
         _ => return None,
@@ -1256,23 +1341,17 @@ pub fn call_builtin(
         }
         Builtin::IntFromBytes => {
             let (bytes, byteorder) = match args {
+                [b] => (
+                    model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?,
+                    String::from("big"),
+                ),
                 [b, order] => (
                     model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?,
                     model.str_value(*order).map(String::from).ok_or(Trap::TypeError)?,
                 ),
                 _ => return Err(Trap::TypeError),
             };
-            let ordered: alloc::vec::Vec<u8> = match byteorder.as_str() {
-                "big" => bytes,
-                "little" => bytes.into_iter().rev().collect(),
-                _ => return Err(Trap::ValueError),
-            };
-            let base = crate::bigint::BigInt::from_i128(256);
-            let mut result = crate::bigint::BigInt::from_i128(0);
-            for byte in &ordered {
-                result = result.mul(&base).add(&crate::bigint::BigInt::from_i128(i128::from(*byte)));
-            }
-            model.new_bigint(result)
+            model.int_from_bytes(&bytes, &byteorder, false)
         }
         Builtin::BytesFromhex => {
             let [s] = args else { return Err(Trap::TypeError); };
@@ -1303,7 +1382,13 @@ pub fn call_builtin(
             let [value] = args else {
                 return Err(Trap::TypeError);
             };
-            type_of(*value, model).ok_or(Trap::Unsupported)
+            match type_of(*value, model) {
+                Some(class) => Ok(class),
+                None => {
+                    let message = "type() is not supported for this object";
+                    Err(model.raise_named_exception("TypeError", message))
+                }
+            }
         }
         Builtin::NoneType => match args {
             [] => Ok(Value::NONE),
@@ -1319,6 +1404,14 @@ pub fn call_builtin(
         },
         view_type @ (Builtin::DictKeysType | Builtin::DictValuesType | Builtin::DictItemsType) => {
             let message = alloc::format!("cannot create '{}' instances", view_type.python_name());
+            Err(model.raise_named_exception("TypeError", &message))
+        }
+        only_a_type @ (Builtin::FunctionType
+        | Builtin::BuiltinFunctionType
+        | Builtin::MethodType
+        | Builtin::GeneratorType
+        | Builtin::ModuleType) => {
+            let message = alloc::format!("cannot create '{}' instances", only_a_type.python_name());
             Err(model.raise_named_exception("TypeError", &message))
         }
         Builtin::Getattr => {
@@ -1342,6 +1435,59 @@ pub fn call_builtin(
                 Err(other) => Err(other),
             }
         }
+        Builtin::IntIsInteger => {
+            if !args.is_empty() {
+                return Err(Trap::TypeError);
+            }
+            Ok(Value::TRUE)
+        }
+        Builtin::Dir => {
+            let [value] = args else {
+                let message = "dir() with no arguments is only supported at a call site";
+                return Err(model.raise_named_exception("TypeError", message));
+            };
+            #[cfg(not(feature = "introspection"))]
+            {
+                let _ = value;
+                let message = "dir() is not available in this build (introspection is off)";
+                return Err(model.raise_named_exception("NotImplementedError", message));
+            }
+            #[cfg(feature = "introspection")]
+            {
+                let names = model.dir_names(*value);
+                let mut entries = Vec::with_capacity(names.len());
+                for name in names {
+                    entries.push(model.new_str(&name)?);
+                }
+                model.new_list(entries)
+            }
+        }
+        Builtin::Open => {
+            let (path, mode) = match args {
+                [path] => (*path, "r"),
+                [path, mode] => {
+                    let text = model.str_value(*mode).ok_or(Trap::TypeError)?;
+                    (*path, text)
+                }
+                _ => return Err(Trap::TypeError),
+            };
+            let mode = String::from(mode);
+            let parsed = match crate::fileio::FileMode::parse(&mode) {
+                Ok(parsed) => parsed,
+                Err(message) => return Err(model.raise_named_exception("ValueError", &message)),
+            };
+            let path = match model.str_value(path) {
+                Some(path) => String::from(path),
+                None => {
+                    let kind = model.type_name_of(path);
+                    let message = alloc::format!(
+                        "expected str, bytes or os.PathLike object, not {kind}"
+                    );
+                    return Err(model.raise_named_exception("TypeError", &message));
+                }
+            };
+            model.open_file(&path, parsed)
+        }
         Builtin::Vars => {
             let [obj] = args else {
                 let message = "vars() with no arguments is not supported";
@@ -1356,6 +1502,26 @@ pub fn call_builtin(
                 }
                 Err(other) => Err(other),
             }
+        }
+        Builtin::Object => {
+            if !args.is_empty() {
+                return Err(model.raise_named_exception("TypeError", "object() takes no arguments"));
+            }
+            model.new_object_base()
+        }
+        Builtin::Globals => {
+            if !args.is_empty() {
+                return Err(model.raise_named_exception("TypeError", "globals() takes no arguments"));
+            }
+            let pairs = model.current_module_globals();
+            model.namespace_from_globals(pairs)
+        }
+        Builtin::Locals => {
+            if !args.is_empty() {
+                return Err(model.raise_named_exception("TypeError", "locals() takes no arguments"));
+            }
+            let pairs = model.current_module_globals();
+            model.namespace_from_globals(pairs)
         }
         Builtin::Hasattr => {
             let [obj, name] = args else {
@@ -1447,6 +1613,7 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
             return Ok(matches);
         }
         let matches = match Builtin::from_id(id) {
+            Some(Builtin::Object) => true,
             Some(Builtin::Bool) => value == Value::TRUE || value == Value::FALSE,
             Some(Builtin::Int) => model.is_int(value),
             Some(Builtin::Float) => model.is_float(value),
@@ -1476,6 +1643,17 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
                 model.dict_view_kind(value) == Some(DictViewKind::Values)
             }
             Some(Builtin::DictItemsType) => model.dict_view_kind(value) == Some(DictViewKind::Items),
+            Some(Builtin::FunctionType) => {
+                value.as_function_index().is_some() || model.is_py_function(value)
+            }
+            Some(Builtin::MethodType) => model.is_py_bound(value),
+            Some(Builtin::BuiltinFunctionType) => {
+                value.as_builtin_id().is_some()
+                    || model.is_bound_method(value)
+                    || model.is_unbound_method(value)
+            }
+            Some(Builtin::GeneratorType) => model.is_generator(value),
+            Some(Builtin::ModuleType) => model.is_module_object(value),
             _ => return Err(Trap::TypeError),
         };
         return Ok(matches);
@@ -1513,6 +1691,9 @@ fn issubclass_of(cls: Value, classinfo: Value, model: &ObjectModel) -> Result<bo
     }
     if !is_type(classinfo) {
         return Err(Trap::TypeError);
+    }
+    if classinfo.as_builtin_id() == Some(Builtin::Object.id()) {
+        return Ok(true);
     }
     if model.is_class(cls) && model.is_class(classinfo) {
         return Ok(model.is_subclass_of(cls, classinfo));
@@ -1580,6 +1761,34 @@ pub fn call_builtin_kw(
         Builtin::Print => print_kw(posargs, kwargs, functions, model, depth),
         Builtin::Enumerate => enumerate_kw(posargs, kwargs, functions, model, depth),
         Builtin::Zip => zip_kw(posargs, kwargs, functions, model, depth),
+        Builtin::IntFromBytes => {
+            let mut byteorder = String::from("big");
+            let bytes = match posargs {
+                [b] => model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?,
+                [b, order] => {
+                    byteorder = model.str_value(*order).map(String::from).ok_or(Trap::TypeError)?;
+                    model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?
+                }
+                _ => return Err(Trap::TypeError),
+            };
+            let mut signed = false;
+            for &(name, value) in kwargs {
+                match name {
+                    "signed" => signed = model.py_truthy(value)?.unwrap_or(false),
+                    "byteorder" if posargs.len() == 1 => {
+                        byteorder =
+                            model.str_value(value).map(String::from).ok_or(Trap::TypeError)?;
+                    }
+                    other => {
+                        let message = alloc::format!(
+                            "from_bytes() got an unexpected keyword argument '{other}'"
+                        );
+                        return Err(model.raise_named_exception("TypeError", &message));
+                    }
+                }
+            }
+            model.int_from_bytes(&bytes, &byteorder, signed)
+        }
         _ if kwargs.is_empty() => call_builtin(id, posargs, functions, model, depth),
         _ => Err(Trap::TypeError),
     }
@@ -1770,18 +1979,17 @@ fn format_radix(
         return Err(Trap::TypeError);
     };
     let arg = coerce_index(*arg, functions, model, depth)?;
-    let n = arg.as_int().ok_or(Trap::TypeError)?;
-    let (sign, mag) = if n < 0 {
-        ("-", n.unsigned_abs())
-    } else {
-        ("", n as u64)
+    let value = model.as_bigint(arg).ok_or(Trap::TypeError)?;
+    let bits_per_digit = match radix {
+        16 => 4,
+        8 => 3,
+        _ => 1,
     };
-    let body = match radix {
-        16 => alloc::format!("{mag:x}"),
-        8 => alloc::format!("{mag:o}"),
-        _ => alloc::format!("{mag:b}"),
+    let body = value.to_power_of_two_radix_string(bits_per_digit);
+    let rendered = match body.strip_prefix('-') {
+        Some(magnitude) => alloc::format!("-{prefix}{magnitude}"),
+        None => alloc::format!("{prefix}{body}"),
     };
-    let rendered = alloc::format!("{sign}{prefix}{body}");
     model.new_str(&rendered)
 }
 
@@ -2435,7 +2643,16 @@ fn min_max_impl(
     let mut iter = elements.into_iter();
     let mut best = match iter.next() {
         Some(first) => first,
-        None => return default.ok_or(Trap::ValueError),
+        None => {
+            return match default {
+                Some(value) => Ok(value),
+                None => {
+                    let name = if keep == Ordering::Less { "min" } else { "max" };
+                    let message = alloc::format!("{name}() iterable argument is empty");
+                    Err(model.raise_named_exception("ValueError", &message))
+                }
+            };
+        }
     };
     let mut best_key = mapped(best, model)?;
     for element in iter {

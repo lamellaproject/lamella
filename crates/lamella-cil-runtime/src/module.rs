@@ -1709,6 +1709,33 @@ pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(image.get(at..at + 8)?.try_into().ok()?))
 }
 
+/// The content checksum of a baked image, VERIFIED against the bytes rather than taken on trust
+/// from the header: `None` unless the image parses AND hashes to what its header records.
+///
+/// [`baked_image_checksum`] answers from the header alone, which is right for a HOST checksumming a
+/// file it holds -- that file is intact by construction, and hashing it would only cost time. A
+/// DEVICE answering "do I already hold this image?" is reading FLASH, where a surviving header can
+/// describe content that a partial write, an interrupted deploy or an overrunning firmware erase has
+/// since changed. Answering from the header there makes a CONTENT-addressed skip trust the one thing
+/// it exists to check: the host skips a deploy the board needs, and the next attach reports a corrupt
+/// image with nothing connecting it to the deploy that never happened.
+///
+/// This is the same comparison [`Module::from_baked`] makes before booting an image, without
+/// building the module -- so a board answers the deploy-status query with an image it could actually
+/// boot, rather than with one that merely claims to be there.
+#[cfg(feature = "code-in-place")]
+pub fn verified_image_checksum(image: &[u8]) -> Option<u64> {
+    let stored = baked_image_checksum(image)?;
+    let words = image.get(8..)?;
+    let directory_len = image_word(words, 16)? as usize;
+    let arena_len = image_word(words, 17)? as usize;
+    let directory_start: usize = 8 + 19 * 8;
+    let arena_start = directory_start.checked_add(directory_len)?;
+    let directory = image.get(directory_start..arena_start)?;
+    let arena = image.get(arena_start..arena_start.checked_add(arena_len)?)?;
+    (image_checksum(directory, arena) == stored).then_some(stored)
+}
+
 /// The baked-image format version. v3 repurposed the `newarr` element table's payload from a
 /// byte width to a [`PrimKind`] code (packed primitive arrays) -- a v2 image's widths would
 /// misdecode as kinds, so `from_baked` rejects it (rebake). v2 added the content checksum
@@ -4163,6 +4190,18 @@ impl Module {
         self.types.len()
     }
 
+    /// The number of methods the module holds -- managed bodies and intrinsics together. The
+    /// method-side twin of [`Module::type_count`], and the measure of what a lazily-resolved corlib
+    /// actually materialized as against what an eager load brings in whole.
+    #[must_use]
+    pub fn method_count(&self) -> usize {
+        #[cfg(feature = "code-in-place")]
+        if let Some(baked) = &self.baked {
+            return baked.count;
+        }
+        self.methods.len()
+    }
+
     /// Records debug names for method `id`: its qualified name (e.g. `Program.Fact`) and
     /// its argument names in CIL slot order (`this` first for an instance method). The
     /// debugger surfaces these on stack frames and in the arguments view.
@@ -4474,6 +4513,20 @@ impl Module {
         let slot = self.static_defaults.len();
         self.static_defaults.push(default);
         self.static_fields.insert(asm_key(asm, token.0), slot);
+    }
+
+    /// Reserves a static storage slot that belongs to NO metadata token, returning its index.
+    ///
+    /// A host needs this to park a value where managed code cannot reach it -- an incremental
+    /// session roots its persistent instance in one, so the collector marks and relocates it. Taking
+    /// the slot one past the end instead only holds while the module's static count is FIXED: a
+    /// module that keeps materializing members hands out that very slot to the next static field it
+    /// binds, and the host's value is then overwritten by a `.cctor` writing what it believes is its
+    /// own storage.
+    pub fn reserve_static_slot(&mut self, default: Value) -> usize {
+        let slot = self.static_defaults.len();
+        self.static_defaults.push(default);
+        slot
     }
 
     /// Binds a static-field reference token in assembly `asm` to an EXISTING storage slot,
@@ -4941,6 +4994,25 @@ impl Module {
         &self.static_ctors
     }
 
+    /// Whether this module BOOTED from a baked image ([`Module::from_baked`]) rather than
+    /// being built by the loader.
+    ///
+    /// The distinction is not cosmetic: a baked module restores the ordered `static_ctors`
+    /// list but NOT the `cctor_types` trigger map, so the lazy initialization of II.10.5.3
+    /// cannot fire on it and its static constructors must be run eagerly before its entry
+    /// point ([`crate::boot_baked`]).
+    #[must_use]
+    pub fn is_baked(&self) -> bool {
+        #[cfg(feature = "code-in-place")]
+        {
+            self.baked.is_some()
+        }
+        #[cfg(not(feature = "code-in-place"))]
+        {
+            false
+        }
+    }
+
     /// Records `type_id`'s base type, for subtype checks.
     pub fn set_type_base(&mut self, type_id: TypeId, base: Option<TypeId>) {
         if let Some(info) = self.types.get_mut(type_id as usize) {
@@ -5034,13 +5106,19 @@ impl Module {
 
     /// Whether `sub` is `ancestor` or a type derived from it, walking the base chain.
     /// Bounded by the type count so malformed cyclic metadata cannot loop forever.
+    ///
+    /// Both the step and the bound go through the accessors rather than the builder's `types`
+    /// vector, because a BAKED module does not have one: its type records live in the arena, and
+    /// reading the vector directly finds an empty table. That failed in a way designed to be
+    /// missed -- the first comparison is against `sub` itself, so an exact-type cast still
+    /// answered true while every cast to a base answered false.
     #[must_use]
     pub fn is_subtype(&self, sub: TypeId, ancestor: TypeId) -> bool {
         let mut current = Some(sub);
-        for _ in 0..=self.types.len() {
+        for _ in 0..=self.type_count() {
             match current {
                 Some(type_id) if type_id == ancestor => return true,
-                Some(type_id) => current = self.types.get(type_id as usize).and_then(|i| i.base),
+                Some(type_id) => current = self.type_base(type_id),
                 None => break,
             }
         }
@@ -5060,7 +5138,7 @@ impl Module {
         let mut pending = Vec::new();
 
         let mut current = Some(type_id);
-        for _ in 0..=self.types.len() {
+        for _ in 0..=self.type_count() {
             match current {
                 Some(id) => {
                     for index in 0.. {
@@ -5821,7 +5899,7 @@ impl Module {
     pub fn exception_base_chain(&self, type_id: TypeId) -> Vec<u32> {
         let mut chain = Vec::new();
         let mut current = Some(type_id);
-        for _ in 0..=self.types.len() {
+        for _ in 0..=self.type_count() {
             match current {
                 Some(id) => {
                     if let Some(tag) = self.exception_tag_of(id) {
@@ -6036,6 +6114,27 @@ mod tests {
         let image = module.write_baked(Some(id)).expect("bake");
 
         assert!(baked_image_checksum(&image).is_some(), "a v2 image records a checksum");
+        assert_eq!(
+            verified_image_checksum(&image),
+            baked_image_checksum(&image),
+            "on an INTACT image the verified and header-only readers agree"
+        );
+
+        {
+            let mut damaged = image.clone();
+            let last = damaged.len() - 1;
+            damaged[last] ^= 0xFF;
+            assert_eq!(
+                baked_image_checksum(&damaged),
+                baked_image_checksum(&image),
+                "the header survives content damage -- which is exactly why it cannot be the answer"
+            );
+            assert_eq!(
+                verified_image_checksum(&damaged),
+                None,
+                "the verified reader refuses it, so the host re-deploys instead of skipping"
+            );
+        }
 
         let clean: &'static [u8] = Box::leak(image.clone().into_boxed_slice());
         assert!(Module::from_baked(clean).is_ok(), "the clean image boots");

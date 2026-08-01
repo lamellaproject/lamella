@@ -28,13 +28,16 @@ pub mod value;
 #[cfg(feature = "exceptions")]
 pub use exception::{exception_tag, tag_is_exact, tag_is_subtype};
 pub use interp::{
-    CodeLocation, FrameView, NamedValue, PInvokeArg, PInvokeHostFn, Session, Status, Stop,
-    StopReason, Vm, run, run_method, run_serviced,
+    CodeLocation, FrameView, NamedValue, PInvokeArg, PInvokeHostFn, PendingOp, Ran, Session, Status,
+    Stop, StopReason, Vm, boot_baked, run, run_interruptible, run_method, run_serviced,
+    take_pending_op,
 };
 pub use module::{
     CastElem, CastPrim, IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn,
     PInvokeTarget, TypeId, asm_key, baked_image_checksum,
 };
+#[cfg(feature = "code-in-place")]
+pub use module::verified_image_checksum;
 pub use mount::{DriveType, MountTable, StorageProvider};
 pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind, UnencodableChar};
 pub use trap::Trap;

@@ -45,6 +45,14 @@ wasm = ["dep:lamella-asm-wasm"]
 # which is a louder failure than a knob that does nothing.
 string-utf8 = []
 string-utf8-wtf8 = []
+# Drop the per-type NAME strings the descriptors carry. Names are ON by default because that is what
+# `Object.ToString()` returns on .NET and a default that silently answers null is the kind of quiet
+# divergence this backend keeps paying for. They are strippable because they are pure text with no
+# behavioural role beyond rendering -- the same trade the exception-message knob makes -- and a
+# constrained tier that never prints a type name should not carry one per live type. With this set,
+# the descriptor still carries the name WORD (a zero), so the format stays total across tiers and a
+# reader never has to know which way the knob was thrown.
+strip-type-names = []
 
 [lints]
 workspace = true

@@ -755,10 +755,132 @@ fn patch_int_to_string_for_string(f: &mut Function, handle: u32) {
         .extend(core::iter::repeat_n(i32t, (next as usize) - f.value_types.len()));
 }
 
+/// The value-id base the null-substitution prologue occupies in `__string_concat`: just past the
+/// hand-numbered `0..=20` the body uses. **BOTH block-0 builders must pass this same base** --
+/// [`string_concat_mir`] lays the prologue and the copy loops name its results, and
+/// [`patch_string_concat_for_string`] REPLACES block 0 wholesale, so it has to re-emit the identical
+/// values at the identical ids or the loops read definitions that no longer exist.
+const CONCAT_GUARD_BASE: u32 = 21;
+/// How many value ids [`null_safe_concat_operands`] consumes from its base.
+const CONCAT_GUARD_VALUES: u32 = 18;
+
+/// Re-expresses `__string_concat`'s two operands as references that are NEVER null: each is itself when
+/// non-null, and the EMPTY STRING when null. Returns the prologue instructions plus the two safe values.
+///
+/// WHY THIS EXISTS. `"x" + (string)null` is `""`-for-the-null-operand in .NET, and this helper read
+/// `a.length` as its very first instruction -- a `FieldLoad` through a null pointer, which hard-faults.
+/// The row that found it is `string-concat-object`: it prints 13 correct lines and then dies on
+/// `"param=" + ex.ParamName`, and the same row already proves the MANAGED `Concat(object, object)`
+/// overloads handle null correctly. So the defect was the INTRINSIC replacing a managed body that was
+/// right, and it is independent of why the null showed up.
+///
+/// THE SUBSTITUTION IS BRANCH-FREE, and deliberately so. This function is ONE hand-numbered MIR body
+/// with explicit block indices and explicit value ids that every string concatenation in the tree goes
+/// through; guarding each length read with a real branch means six new blocks, moving block 0's tail,
+/// and re-pointing terminators that are written as literal `BlockId`s. A select expressed in arithmetic
+/// touches block 0 and nothing else:
+///
+/// ```text
+///   nz   = (x != null)          0 or 1
+///   mask = 0 - nz               0 or all-ones
+///   safe = empty + ((x - empty) & mask)
+/// ```
+///
+/// x non-null gives `empty + (x - empty)` = x; x null gives `empty + 0` = empty.
+///
+/// **THE EMPTY STRING IS A REAL LITERAL, not a zeroed scratch cell**, and that matters for three
+/// separate reasons: its count word is 0 and so is its byte-count word, so the length reads answer 0 in
+/// BOTH storage tiers with no special case; the copy loop for that operand runs zero times, so its
+/// element reads never happen; and the value stays a genuine heap `ObjectRef`, so nothing here hands the
+/// collector a frame address to range-check. `System.String`'s meta is already staged for any program
+/// carrying an [`Inst::StringConcat`], which is precisely the set of programs that reach this body.
+///
+/// The pointer DIFFERENCE is typed `i32`, so it is not reported as a root -- correct, because a
+/// difference is not a pointer -- and it is consumed before the allocation, the body's only safepoint.
+fn null_safe_concat_operands(base: u32) -> (Vec<(ValueId, Inst)>, ValueId, ValueId) {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let id = |n: u32| ValueId(base + n);
+    let (null_obj, one, empty, empty_int) = (id(0), id(1), id(2), id(3));
+    let mut insts = vec![
+        (null_obj, Inst::ConstInt { ty: objt, value: 0 }),
+        (one, Inst::ConstInt { ty: i32t, value: 1 }),
+        (
+            empty,
+            Inst::StringLiteral {
+                utf16: Vec::new().into_boxed_slice(),
+            },
+        ),
+        (
+            empty_int,
+            Inst::Convert {
+                value: empty,
+                kind: lamella_ir::ConvKind::RefToInt,
+            },
+        ),
+    ];
+    let mut select = |operand: ValueId, first: u32| {
+        let (nz, mask, operand_int, diff, masked, sum, safe) = (
+            id(first),
+            id(first + 1),
+            id(first + 2),
+            id(first + 3),
+            id(first + 4),
+            id(first + 5),
+            id(first + 6),
+        );
+        insts.push((
+            nz,
+            Inst::Compare {
+                op: CmpOp::Ne,
+                lhs: operand,
+                rhs: null_obj,
+            },
+        ));
+        insts.push((
+            operand_int,
+            Inst::Convert {
+                value: operand,
+                kind: lamella_ir::ConvKind::RefToInt,
+            },
+        ));
+        for (result, op, lhs, rhs) in [
+            (mask, BinOp::Sub, nz, one),
+            (diff, BinOp::Sub, empty_int, operand_int),
+            (masked, BinOp::And, diff, mask),
+            (sum, BinOp::Add, operand_int, masked),
+        ] {
+            insts.push((result, Inst::Binary { op, lhs, rhs }));
+        }
+        insts.push((
+            safe,
+            Inst::Convert {
+                value: sum,
+                kind: lamella_ir::ConvKind::IntToRef,
+            },
+        ));
+        safe
+    };
+    let a_safe = select(ValueId(0), 4);
+    let b_safe = select(ValueId(1), 11);
+    (insts, a_safe, b_safe)
+}
+
+/// The [`MirType`] of each value [`null_safe_concat_operands`] defines, in id order from its base -- the
+/// two selected operands are references, everything between them is integer arithmetic.
+fn concat_guard_types() -> Vec<MirType> {
+    let (i32t, objt) = (MirType::I32, MirType::ObjectRef);
+    let operand = [i32t, i32t, i32t, i32t, i32t, i32t, objt];
+    let mut types = alloc::vec![objt, i32t, objt, i32t];
+    types.extend(operand);
+    types.extend(operand);
+    types
+}
+
 /// The `__string_concat(a, b) -> ObjectRef` helper: allocates a `[u32 unit_count][u16 units]` blob of
 /// `a.length + b.length` units (an `AllocArray` of element size 2, which stores the count word) and
-/// copies a's then b's units in with two length-2 array-copy loops. (Non-null operands; null handling
-/// is a follow-up.)
+/// copies a's then b's units in with two length-2 array-copy loops. A NULL operand contributes the
+/// empty string, as in .NET -- see [`null_safe_concat_operands`].
 ///
 /// `string` is `System.String`'s handle where the build can name the type. With it the result is a real
 /// `System.String` object rather than a synthetic UTF-16-unit array (see [`emit_string_alloc`]), and
@@ -795,20 +917,28 @@ fn string_concat_mir(string: Option<u32>) -> Function {
         rhs,
     };
     let v = ValueId;
+    let (guard, a_safe, b_safe) = null_safe_concat_operands(CONCAT_GUARD_BASE);
+    let mut value_types = vec![
+        objt, objt, i32t, i32t, i32t, objt, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t,
+        i32t, i32t, i32t, i32t, i32t, i32t,
+    ];
+    debug_assert_eq!(value_types.len() as u32, CONCAT_GUARD_BASE);
+    value_types.extend(concat_guard_types());
+    debug_assert_eq!(
+        value_types.len() as u32,
+        CONCAT_GUARD_BASE + CONCAT_GUARD_VALUES
+    );
+    let mut block0 = guard;
+    block0.extend([(v(2), len(a_safe)), (v(3), len(b_safe))]);
     let mut f = Function {
         params: vec![objt, objt],
         ret: Some(objt),
-        value_types: vec![
-            objt, objt, i32t, i32t, i32t, objt, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t,
-            i32t, i32t, i32t, i32t, i32t, i32t, i32t,
-        ],
+        value_types,
         entry: BlockId(0),
         blocks: vec![
             BasicBlock {
                 params: vec![v(0), v(1)],
                 insts: vec![
-                    (v(2), len(v(0))),
-                    (v(3), len(v(1))),
                     (v(4), add(v(2), v(3))),
                     (
                         v(5),
@@ -841,7 +971,7 @@ fn string_concat_mir(string: Option<u32>) -> Function {
             BasicBlock {
                 params: Vec::new(),
                 insts: vec![
-                    (v(9), unit(v(0), v(7))),
+                    (v(9), unit(a_safe, v(7))),
                     (v(10), put(v(5), v(7), v(9))),
                     (v(11), ci(1)),
                     (v(12), add(v(7), v(11))),
@@ -873,7 +1003,7 @@ fn string_concat_mir(string: Option<u32>) -> Function {
             BasicBlock {
                 params: Vec::new(),
                 insts: vec![
-                    (v(16), unit(v(1), v(14))),
+                    (v(16), unit(b_safe, v(14))),
                     (v(17), add(v(2), v(14))),
                     (v(18), put(v(5), v(17), v(16))),
                     (v(19), ci(1)),
@@ -891,6 +1021,7 @@ fn string_concat_mir(string: Option<u32>) -> Function {
             },
         ],
     };
+    f.blocks[0].insts.splice(0..0, block0);
     if let Some(handle) = string {
         patch_string_concat_for_string(&mut f, handle);
     }
@@ -922,14 +1053,7 @@ fn string_concat_mir(string: Option<u32>) -> Function {
 fn patch_string_concat_for_string(f: &mut Function, handle: u32) {
     let i32t = MirType::I32;
     let mut next = f.value_types.len() as u32;
-    let (a, b, la, lb, units, result) = (
-        ValueId(0),
-        ValueId(1),
-        ValueId(2),
-        ValueId(3),
-        ValueId(4),
-        ValueId(5),
-    );
+    let (la, lb, units, result) = (ValueId(2), ValueId(3), ValueId(4), ValueId(5));
     let add = |lhs, rhs| Inst::Binary {
         op: BinOp::Add,
         lhs,
@@ -937,17 +1061,14 @@ fn patch_string_concat_for_string(f: &mut Function, handle: u32) {
     };
     let count = |s| Inst::FieldLoad { base: s, offset: 0 };
 
-    let mut insts = vec![
-        (la, count(a)),
-        (lb, count(b)),
-        (units, add(la, lb)),
-    ];
+    let (mut insts, a_safe, b_safe) = null_safe_concat_operands(CONCAT_GUARD_BASE);
+    insts.extend([(la, count(a_safe)), (lb, count(b_safe)), (units, add(la, lb))]);
     let (bytes_a, bytes_b) = (ValueId(next), ValueId(next + 1));
     let total_bytes = ValueId(next + 2);
     let byte_len = if STORAGE_IS_BYTES {
         next += 3;
-        insts.push((bytes_a, Inst::FieldLoad { base: a, offset: 4 }));
-        insts.push((bytes_b, Inst::FieldLoad { base: b, offset: 4 }));
+        insts.push((bytes_a, Inst::FieldLoad { base: a_safe, offset: 4 }));
+        insts.push((bytes_b, Inst::FieldLoad { base: b_safe, offset: 4 }));
         insts.push((total_bytes, add(bytes_a, bytes_b)));
         Some(total_bytes)
     } else {
@@ -956,8 +1077,8 @@ fn patch_string_concat_for_string(f: &mut Function, handle: u32) {
     emit_string_alloc(&mut insts, &mut next, result, handle, units, byte_len);
     let (mut from_a, mut from_b, mut into) = (ValueId(next), ValueId(next), ValueId(next));
     if STORAGE_IS_BYTES {
-        from_a = storage_address(&mut insts, &mut next, a);
-        from_b = storage_address(&mut insts, &mut next, b);
+        from_a = storage_address(&mut insts, &mut next, a_safe);
+        from_b = storage_address(&mut insts, &mut next, b_safe);
         into = storage_address(&mut insts, &mut next, result);
     }
     insts.push((ValueId(6), Inst::ConstInt { ty: i32t, value: 0 }));
@@ -1320,8 +1441,9 @@ mod tests {
                 lamella_ir::verify(&int_to_string_mir(string)).is_ok(),
                 "__int_to_string, string handle {string:?}"
             );
-            assert!(
-                lamella_ir::verify(&string_concat_mir(string)).is_ok(),
+            assert_eq!(
+                lamella_ir::verify(&string_concat_mir(string)),
+                Ok(()),
                 "__string_concat, string handle {string:?}"
             );
         }
@@ -1367,6 +1489,60 @@ mod tests {
             assert!(
                 matches!(defines, Inst::TypeDescAddr { handle } if handle.0 == STRING),
                 "{name} must allocate against System.String's own descriptor, got {defines:?}"
+            );
+        }
+    }
+
+
+    /// `"x" + (string)null` is `"x"` in .NET, and this helper's very first instruction used to be
+    /// `a.length` -- a `FieldLoad` through a null pointer. `string-concat-object` printed 13 correct
+    /// lines and then died on `"param=" + ex.ParamName`.
+    ///
+    /// PINS THE INVARIANT, NOT THE INSTRUCTION LIST: no read of either operand may name the raw
+    /// parameter. Every length read, every element read, and (under a byte tier) every storage-address
+    /// conversion has to go through the null-substituted value, and the substitution itself is the ONLY
+    /// thing allowed to touch `ValueId(0)`/`ValueId(1)`. Checked for BOTH `string` shapes, because
+    /// `patch_string_concat_for_string` REPLACES block 0 and so has to re-emit the guard -- forgetting
+    /// that is the exact way this regresses, and it would leave the copy loops naming a definition that
+    /// no longer exists.
+    #[test]
+    fn every_concat_operand_read_goes_through_the_null_substitution() {
+        for string in [None, Some(STRING)] {
+            let f = string_concat_mir(string);
+            let raw = [ValueId(0), ValueId(1)];
+            let allowed = |inst: &Inst| {
+                matches!(inst, Inst::Compare { .. })
+                    || matches!(
+                        inst,
+                        Inst::Convert {
+                            kind: lamella_ir::ConvKind::RefToInt,
+                            ..
+                        }
+                    )
+            };
+            for (result, inst) in f.blocks.iter().flat_map(|b| &b.insts) {
+                if allowed(inst) {
+                    continue;
+                }
+                let reads_raw = match inst {
+                    Inst::FieldLoad { base, .. } => raw.contains(base),
+                    Inst::ArrayLoad { array, .. } => raw.contains(array),
+                    Inst::Convert { value, .. } => raw.contains(value),
+                    Inst::Binary { lhs, rhs, .. } => raw.contains(lhs) || raw.contains(rhs),
+                    _ => false,
+                };
+                assert!(
+                    !reads_raw,
+                    "string handle {string:?}: {result:?} <- {inst:?} reads a raw operand, which \
+                     hard-faults when that operand is null"
+                );
+            }
+            assert!(
+                f.blocks.iter().flat_map(|b| &b.insts).any(|(_, i)| matches!(
+                    i,
+                    Inst::StringLiteral { utf16 } if utf16.is_empty()
+                )),
+                "string handle {string:?}: the empty string a null operand becomes is missing"
             );
         }
     }

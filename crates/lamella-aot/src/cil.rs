@@ -49,12 +49,60 @@ pub enum CilError {
     Unsupported(Opcode),
     /// A `call` target token could not be resolved (no [`CallResolver`] mapping).
     UnresolvedCall,
-    /// A control-flow shape this lowering does not handle yet: a conditional branch
-    /// into a merge block (which would need its edge split), an entry block reached
-    /// by a back-edge, or a block that runs off the end of the method.
-    UnsupportedControlFlow,
+    /// A control-flow shape this lowering does not handle yet, named by [`ControlFlowGap`].
+    ///
+    /// The reason is part of the error because these shapes have nothing in common but the
+    /// refusal: an irreducible back-edge and a `switch` into the middle of a block are
+    /// different defects with different fixes, and a payload-less variant reports a count
+    /// where what a fix needs is a census.
+    UnsupportedControlFlow(ControlFlowGap),
     /// A method selected for module lowering has no CIL body (abstract or extern).
     MissingBody,
+    /// A `catch (T e)` handler lets its exception binding ESCAPE -- stored to a field or another
+    /// local, returned, thrown, or passed as a call argument -- so the object materialized in the
+    /// handler's frame could be read after that frame is gone.
+    ///
+    /// This is a REFUSAL, not a limitation of the lowering: the alternative is a dangling pointer
+    /// that reads whatever the next call left on the stack, which no test would catch and no user
+    /// could diagnose. The safe uses are the ones [`classify_catch_binding`] whitelists; a program
+    /// that needs more wants a heap-allocated exception object, which is a scope decision above this
+    /// crate.
+    ExceptionBindingEscapes,
+}
+
+/// Which control-flow shape a [`CilError::UnsupportedControlFlow`] refused.
+///
+/// One variant per refusing site, so a corpus census reads as a list of named defects rather
+/// than a single total. Several are reachable only from CIL a C# compiler does not emit; the
+/// ones that fire on ordinary source are the ones worth fixing, and telling them apart is what
+/// this enum is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFlowGap {
+    /// A back-edge targets block 0 (the entry doubling as a loop header) while the entry also
+    /// has more than one predecessor, or an argument is memory-backed (`ldarga`) or a promoted
+    /// written reference. Block 0's parameters are the arguments, and its instruction stream --
+    /// which lays those cells -- re-runs on every back-edge entry, so a loop-carried write
+    /// through one would not persist across iterations.
+    EntryLoopArgs,
+    /// A block no edge reaches, so its locals have no predecessor to inherit from. (A trailing
+    /// block after a `throw` or `ret` is handled as an `Unreachable` trap instead; this fires
+    /// only where such a block is genuinely threaded.)
+    NoPredecessor,
+    /// A block whose first predecessor comes LATER in the listing and is not a merge, so the
+    /// values it would inherit are not defined yet -- an irreducible back-edge.
+    BackEdgeNotHeader,
+    /// An `endfinally` terminating a block that is not inside a `finally` handler.
+    EndfinallyOutsideFinally,
+    /// A branch, `leave` or `switch` target instruction that does not begin a basic block --
+    /// a jump into the middle of one, which would need that block split.
+    TargetNotBlockStart,
+    /// A block with no terminator and no following block: control runs off the end of the method.
+    RanOffEnd,
+    /// A branch opcode [`control_flow::branch_kind`] does not classify.
+    UnknownBranchOpcode,
+    /// A synthesized trap leader needs the tag of a builtin exception the [`CallResolver`] does
+    /// not supply, so the failure edge has nothing to dispatch on.
+    NoBuiltinExceptionTag,
 }
 
 /// What a `call`'s target is, recovered from its metadata token by a [`CallResolver`].
@@ -278,6 +326,17 @@ pub trait CallResolver {
         self.exception_tag(operand).into_iter().collect()
     }
 
+    /// The object layout a `catch (T e)` clause materializes when its binding is READ -- `T`'s full
+    /// payload size and reference-field offsets across the whole `extends` chain, plus the handle
+    /// naming the TypeDesc the materialized header carries. `None` for a non-exception token, and
+    /// `None` by default so a resolver with no layout knowledge keeps the tag-only behavior.
+    ///
+    /// The in-flight exception is a TAG, so `T` here is the CAUGHT type, not the thrown one -- see
+    /// [`materialize_catch_binding`] for why that distinction is a named limit rather than a bug.
+    fn catch_binding_layout(&self, _operand: &Operand) -> Option<ReferenceLayout> {
+        None
+    }
+
     /// The type HANDLES a `castclass T` accepts: `T`'s own handle plus the handles of every
     /// in-program type that derives from `T` (a subtype the cast must also accept). Each handle
     /// names a TypeDesc to compare the cast object's runtime type against. Empty by default; the
@@ -349,6 +408,22 @@ pub trait CallResolver {
     /// receiver type's itable is searched for it). `None` for a non-interface target -- which then
     /// falls to [`virtual_slot`](Self::virtual_slot) or a direct call. Defaults to None.
     fn interface_call_tag(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
+    /// Where a `constrained. T` prefix names a value type that ITSELF provides the method the
+    /// following `callvirt` names, the implementation to call -- directly, on the byref receiver,
+    /// with no box (ECMA-335 III.2.1's first case).
+    ///
+    /// `constrained` is the prefix's type token and `method` the `callvirt`'s method token, which
+    /// names the BASE declaration (`object::ToString()`); the answer is T's override of it, so the
+    /// returned target differs from what [`resolve`](Self::resolve) gives for the same operand.
+    ///
+    /// `None` means T inherits the method, and the lowering then takes III.2.1's second case:
+    /// dereference the byref, BOX the value, and dispatch on the boxed object. That is also the
+    /// default, so a resolver that does not answer this is never wrong -- only unoptimized, since
+    /// boxing reaches the same implementation through the object's TypeDesc.
+    fn constrained_call(&self, _constrained: &Operand, _method: &Operand) -> Option<CallInfo> {
         None
     }
 }
@@ -675,7 +750,77 @@ fn lower_with_source(
             (!in_range(*target as usize, finally_clauses[clause].try_range)).then_some(clause)
         })
         .collect();
+    let clause_span = |range: lamella_cil::InstructionRange| range.end - range.start;
+    let resume_catches: Vec<Vec<usize>> = finally_clauses
+        .iter()
+        .map(|clause| {
+            let mut covering: Vec<usize> = catch_clauses
+                .iter()
+                .enumerate()
+                .filter(|(_, catch)| {
+                    catch.try_range.start <= clause.try_range.start
+                        && clause.try_range.end <= catch.try_range.end
+                })
+                .map(|(index, _)| index)
+                .collect();
+            covering.sort_by_key(|&i| clause_span(catch_clauses[i].try_range));
+            covering
+        })
+        .collect();
+    let resume_finally: Vec<Option<usize>> = finally_clauses
+        .iter()
+        .enumerate()
+        .map(|(self_index, clause)| {
+            finally_clauses
+                .iter()
+                .enumerate()
+                .filter(|&(index, outer)| {
+                    index != self_index
+                        && outer.try_range.start <= clause.try_range.start
+                        && clause.try_range.end <= outer.try_range.end
+                })
+                .min_by_key(|(_, outer)| clause_span(outer.try_range))
+                .map(|(index, _)| index)
+        })
+        .collect();
+    let runs_with_tag_in_flight: Vec<bool> = blocks
+        .iter()
+        .map(|&(start, end)| {
+            body.handlers.iter().any(|clause| {
+                let from = match clause.kind {
+                    EhKind::Catch(_) => return false,
+                    EhKind::Filter { filter_start } => filter_start as usize,
+                    EhKind::Finally | EhKind::Fault => clause.handler_range.start as usize,
+                };
+                from <= start && end <= clause.handler_range.end as usize
+            })
+        })
+        .collect();
+    let finally_is_innermost: Vec<bool> = (0..blocks.len())
+        .map(|b| {
+            let Some(clause) = finally_protect[b] else {
+                return false;
+            };
+            let span = |range: lamella_cil::InstructionRange| range.end - range.start;
+            let finally_span = span(finally_clauses[clause].try_range);
+            match throw_clauses[b].first() {
+                Some(&catch) => finally_span < span(catch_clauses[catch].try_range),
+                None => true,
+            }
+        })
+        .collect();
     let unwind_finally = |b: usize| finally_protect[b].map(|clause| finally_handler_block[clause]);
+    let finally_body: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(start, _)| {
+            finally_clauses
+                .iter()
+                .enumerate()
+                .filter(|(_, clause)| in_range(start, clause.handler_range))
+                .min_by_key(|(_, clause)| clause_span(clause.handler_range))
+                .map(|(index, _)| index)
+        })
+        .collect();
     let takes_local_params =
         |b: usize| is_merge(b) || finally_handler[b].is_some() || finally_continuation[b];
     let trap_access: Vec<Option<TrapKind>> = blocks
@@ -702,7 +847,9 @@ fn lower_with_source(
             || mem_arg.iter().any(|arg| arg.is_some())
             || promoted_arg.iter().any(|arg| arg.is_some()))
     {
-        return Err(CilError::UnsupportedControlFlow);
+        return Err(CilError::UnsupportedControlFlow(
+            ControlFlowGap::EntryLoopArgs,
+        ));
     }
 
     let mut value_types: Vec<MirType> = Vec::new();
@@ -760,6 +907,7 @@ fn lower_with_source(
     let mut exit_stack: Vec<Vec<ValueId>> = vec![Vec::new(); blocks.len()];
     let original_block_count = blocks.len();
     let mut split_blocks: Vec<BasicBlock> = Vec::new();
+    let mut split_source: Vec<Vec<u32>> = Vec::new();
     let mut propagate_fixups: Vec<usize> = Vec::new();
 
     for (b, &(start, end)) in blocks.iter().enumerate() {
@@ -795,13 +943,19 @@ fn lower_with_source(
         } else if takes_local_params(b) {
             block_params[b].iter().map(|&p| Some(p)).collect()
         } else {
-            let pred = *preds[b].first().ok_or(CilError::UnsupportedControlFlow)?;
+            let pred = *preds[b]
+                .first()
+                .ok_or(CilError::UnsupportedControlFlow(
+                    ControlFlowGap::NoPredecessor,
+                ))?;
             if pred < b {
                 exit_locals[pred].clone()
             } else if is_merge(pred) {
                 block_params[pred].iter().map(|&p| Some(p)).collect()
             } else {
-                return Err(CilError::UnsupportedControlFlow);
+                return Err(CilError::UnsupportedControlFlow(
+                    ControlFlowGap::BackEdgeNotHeader,
+                ));
             }
         };
         locals.resize(local_count, None);
@@ -818,6 +972,21 @@ fn lower_with_source(
         if let Some(exception) = current_exception {
             stack.push(exception);
         }
+        let catch_binding_layout = match handler_clause[b].and_then(|c| catch_clauses.get(c)) {
+            Some(clause) => {
+                match classify_catch_binding(code, clause.handler_range, resolver) {
+                    CatchBinding::Escapes => return Err(CilError::ExceptionBindingEscapes),
+                    CatchBinding::ReadInPlace => match &clause.kind {
+                        EhKind::Catch(token) => {
+                            resolver.catch_binding_layout(&Operand::Token(*token))
+                        }
+                        _ => None,
+                    },
+                    CatchBinding::Unread => None,
+                }
+            }
+            None => None,
+        };
         if trap_access[b].is_some() {
             if !is_merge(b) {
                 if let Some(&pred) = preds[b].first() {
@@ -864,9 +1033,18 @@ fn lower_with_source(
             }
         }
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+        if let Some(layout) = &catch_binding_layout {
+            let object = materialize_catch_binding(layout, &mut value_types, &mut insts);
+            if let Some(slot) = stack.first_mut() {
+                *slot = object;
+            }
+        }
         let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
+        let mut segment: Option<usize> = None;
         let mut last_local_addr: Option<(AddrOf, u32)> = None;
+
+        let mut pending_constrained: Option<Operand> = None;
 
         if b == 0 {
             for n in 0..arg_count {
@@ -912,6 +1090,7 @@ fn lower_with_source(
                     &catch_clauses,
                     &handler_block_of_clause,
                     finally_protect[b],
+                    finally_is_innermost[b],
                     &finally_handler_block,
                     resolver,
                     &mut stack,
@@ -925,9 +1104,27 @@ fn lower_with_source(
                     &mut propagate_fixups,
                 )?);
             } else if is_last && inst.opcode == Opcode::Endfinally {
-                let clause = finally_handler[b].ok_or(CilError::UnsupportedControlFlow)?;
+                let clause = finally_body[b].ok_or(CilError::UnsupportedControlFlow(
+                    ControlFlowGap::EndfinallyOutsideFinally,
+                ))?;
+                let resume_innermost = match (resume_finally[clause], resume_catches[clause].first())
+                {
+                    (Some(outer), Some(&catch)) => {
+                        clause_span(finally_clauses[outer].try_range)
+                            < clause_span(catch_clauses[catch].try_range)
+                    }
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
                 terminator = Some(build_eh_endfinally(
                     finally_continuation_block[clause],
+                    &resume_catches[clause],
+                    resume_finally[clause],
+                    resume_innermost,
+                    &catch_clauses,
+                    &handler_block_of_clause,
+                    &finally_handler_block,
+                    resolver,
                     &locals,
                     local_count,
                     local_types,
@@ -936,7 +1133,7 @@ fn lower_with_source(
                     &mut split_blocks,
                     original_block_count,
                     &mut propagate_fixups,
-                ));
+                )?);
             } else if is_last
                 && matches!(inst.opcode, Opcode::Leave | Opcode::LeaveS)
                 && leave_exits[b].is_some()
@@ -957,8 +1154,9 @@ fn lower_with_source(
                 let Operand::Target(target_instr) = &inst.operand else {
                     return Err(CilError::BadOperand);
                 };
-                let leave_target =
-                    block_of(*target_instr as usize).ok_or(CilError::UnsupportedControlFlow)?;
+                let leave_target = block_of(*target_instr as usize).ok_or(
+                    CilError::UnsupportedControlFlow(ControlFlowGap::TargetNotBlockStart),
+                )?;
                 terminator = Some(build_eh_leave(
                     leave_target,
                     &throw_clauses[b],
@@ -1021,6 +1219,7 @@ fn lower_with_source(
                     &mut strings,
                     resolver,
                     &mut last_local_addr,
+                    &mut pending_constrained,
                     &mem_elem,
                     &arg_cells,
                     &promoted_arg,
@@ -1029,6 +1228,81 @@ fn lower_with_source(
             for _ in before..insts.len() {
                 il_index.push(byte_offsets[i]);
             }
+
+            let guarded = (!throw_clauses[b].is_empty() || finally_protect[b].is_some())
+                && !runs_with_tag_in_flight[b];
+            let leave_covers_it = i + 2 == end
+                && matches!(code[end - 1].opcode, Opcode::Leave | Opcode::LeaveS)
+                && leave_exits[b].is_none()
+                && !throw_clauses[b].is_empty();
+            if guarded
+                && !leave_covers_it
+                && terminator.is_none()
+                && insts[before..].iter().any(|(_, i)| may_leave_exception(i))
+            {
+                let continuation = split_blocks.len();
+                split_blocks.push(BasicBlock {
+                    params: Vec::new(),
+                    insts: Vec::new(),
+                    terminator: None,
+                });
+                let landing = eh_landing(
+                    &throw_clauses[b],
+                    &catch_clauses,
+                    &handler_block_of_clause,
+                    finally_protect[b],
+                    finally_is_innermost[b],
+                    &finally_handler_block,
+                    resolver,
+                    &locals,
+                    local_count,
+                    local_types,
+                    &mut value_types,
+                    &mut split_blocks,
+                    original_block_count,
+                    &mut propagate_fixups,
+                )?;
+                let in_flight = new_value(&mut value_types, MirType::I32);
+                insts.push((
+                    in_flight,
+                    Inst::StaticLoad {
+                        owner: StaticOwner::Own,
+                        offset: G_EXCEPTION_TAG_OFFSET,
+                    },
+                ));
+                il_index.push(byte_offsets[i]);
+                let check = Terminator::Branch {
+                    cond: in_flight,
+                    if_true: BlockId(landing as u32),
+                    true_args: Vec::new(),
+                    if_false: BlockId((original_block_count + continuation) as u32),
+                    false_args: Vec::new(),
+                };
+                let done = core::mem::take(&mut insts);
+                let done_map = core::mem::take(&mut il_index);
+                match segment {
+                    None => {
+                        mir_blocks.push(BasicBlock {
+                            params: block_params[b].clone(),
+                            insts: done,
+                            terminator: Some(check),
+                        });
+                        source_map.push(done_map);
+                    }
+                    Some(slot) => {
+                        split_blocks[slot] = BasicBlock {
+                            params: Vec::new(),
+                            insts: done,
+                            terminator: Some(check),
+                        };
+                        if split_source.len() <= slot {
+                            split_source.resize(slot + 1, Vec::new());
+                        }
+                        split_source[slot] = done_map;
+                    }
+                }
+                segment = Some(continuation);
+            }
         }
 
         let terminator = match terminator {
@@ -1036,17 +1310,28 @@ fn lower_with_source(
             None => {
                 let next = b + 1;
                 if next >= blocks.len() {
-                    return Err(CilError::UnsupportedControlFlow);
+                    return Err(CilError::UnsupportedControlFlow(ControlFlowGap::RanOffEnd));
                 }
                 if let Some(kind) = trap_access[next].clone() {
-                    let operand_count =
-                        trap_operand_types(&code[blocks[next].0], widths[blocks[next].0], resolver)
-                            .len();
+                    let operand_types =
+                        trap_operand_types(&code[blocks[next].0], widths[blocks[next].0], resolver);
+                    let operand_count = operand_types.len();
                     let mut operands = Vec::with_capacity(operand_count);
                     for _ in 0..operand_count {
                         operands.push(stack.pop().ok_or(CilError::StackUnderflow)?);
                     }
                     operands.reverse();
+                    for (operand, declared) in operands.iter_mut().zip(&operand_types) {
+                        let actual = value_types
+                            .get(operand.index())
+                            .copied()
+                            .unwrap_or(MirType::I32);
+                        if *declared == MirType::I32
+                            && matches!(actual, MirType::NativeInt | MirType::ManagedPtr)
+                        {
+                            *operand = reinterpret_word(*operand, actual, &mut value_types, &mut insts);
+                        }
+                    }
                     build_trap_access_check(
                         next,
                         kind,
@@ -1055,6 +1340,7 @@ fn lower_with_source(
                         &catch_clauses,
                         &handler_block_of_clause,
                         finally_protect[b],
+                        finally_is_innermost[b],
                         &finally_handler_block,
                         resolver,
                         &locals,
@@ -1097,17 +1383,32 @@ fn lower_with_source(
 
         exit_locals[b] = locals.clone();
         exit_stack[b] = stack.clone();
-        mir_blocks.push(BasicBlock {
-            params: block_params[b].clone(),
-            insts,
-            terminator: Some(terminator),
-        });
-        source_map.push(il_index);
+        match segment {
+            None => {
+                mir_blocks.push(BasicBlock {
+                    params: block_params[b].clone(),
+                    insts,
+                    terminator: Some(terminator),
+                });
+                source_map.push(il_index);
+            }
+            Some(slot) => {
+                split_blocks[slot] = BasicBlock {
+                    params: Vec::new(),
+                    insts,
+                    terminator: Some(terminator),
+                };
+                if split_source.len() <= slot {
+                    split_source.resize(slot + 1, Vec::new());
+                }
+                split_source[slot] = il_index;
+            }
+        }
     }
 
-    for split in split_blocks {
+    for (slot, split) in split_blocks.into_iter().enumerate() {
         mir_blocks.push(split);
-        source_map.push(Vec::new());
+        source_map.push(split_source.get(slot).cloned().unwrap_or_default());
     }
 
     let ret = mir_blocks.iter().find_map(|blk| match &blk.terminator {
@@ -1239,6 +1540,45 @@ fn binary(
         .get(rhs.0 as usize)
         .copied()
         .unwrap_or(MirType::I32);
+    let rhs = if matches!(op, BinOp::Shl | BinOp::ShrSigned | BinOp::ShrUnsigned) {
+        let mask = if matches!(lty, MirType::I64) { 63 } else { 31 };
+        match const_value(insts, rhs) {
+            Some(count) if count & !mask != 0 => {
+                let masked = new_value(value_types, rty);
+                insts.push((
+                    masked,
+                    Inst::ConstInt {
+                        ty: rty,
+                        value: count & mask,
+                    },
+                ));
+                masked
+            }
+            Some(_) => rhs,
+            None => {
+                let width = new_value(value_types, rty);
+                insts.push((
+                    width,
+                    Inst::ConstInt {
+                        ty: rty,
+                        value: mask,
+                    },
+                ));
+                let masked = new_value(value_types, rty);
+                insts.push((
+                    masked,
+                    Inst::Binary {
+                        op: BinOp::And,
+                        lhs: rhs,
+                        rhs: width,
+                    },
+                ));
+                masked
+            }
+        }
+    } else {
+        rhs
+    };
     let is_ptr = |t: MirType| matches!(t, MirType::ManagedPtr | MirType::NativeInt);
     if is_ptr(lty) || is_ptr(rty) {
         let li = reinterpret_word(lhs, lty, value_types, insts);
@@ -1360,6 +1700,28 @@ fn compare(
 ) -> Result<(), CilError> {
     let rhs = stack.pop().ok_or(CilError::StackUnderflow)?;
     let lhs = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let lty = value_types
+        .get(lhs.index())
+        .copied()
+        .unwrap_or(MirType::I32);
+    let rty = value_types
+        .get(rhs.index())
+        .copied()
+        .unwrap_or(MirType::I32);
+    let one_word = |t: MirType| {
+        matches!(
+            t,
+            MirType::I32 | MirType::NativeInt | MirType::ObjectRef | MirType::ManagedPtr
+        )
+    };
+    let (lhs, rhs) = if lty != rty && one_word(lty) && one_word(rty) {
+        (
+            reinterpret_word(lhs, lty, value_types, insts),
+            reinterpret_word(rhs, rty, value_types, insts),
+        )
+    } else {
+        (lhs, rhs)
+    };
     let result = new_value(value_types, MirType::I32);
     insts.push((result, Inst::Compare { op, lhs, rhs }));
     stack.push(result);
@@ -1481,6 +1843,80 @@ fn addr_base(
     Ok(slot)
 }
 
+/// ECMA-335 III.2.1's second case for `constrained. T` + `callvirt`: T does NOT provide the method,
+/// so the byref receiver is dereferenced, the value BOXED, and the boxed object passed as `this`.
+///
+/// The box is not an optimization the prefix lets us skip -- it is what the standard requires, and
+/// for the same reason on this tier as on a JIT: the callee is a base-class body reached through the
+/// object's TypeDesc (`object::ToString` answers the descriptor's name word), and a bare `&T` carries
+/// no header to read one from. 
+///
+/// The emitted pair is exactly [`Opcode::Box`]'s -- an `Alloc` plus a `FieldStore` of the value at
+/// offset 0 -- so a call the front end used to spell `ldloc; box; callvirt` lowers identically when
+/// it spells it `ldloca; constrained.; callvirt`.
+#[allow(clippy::too_many_arguments)]
+fn box_constrained_receiver(
+    constrained: &Operand,
+    resolver: &dyn CallResolver,
+    pending: Option<(AddrOf, u32)>,
+    stack: &mut Vec<ValueId>,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<ValueId, CilError> {
+    let layout = resolver
+        .boxed_layout(constrained)
+        .ok_or(CilError::BadOperand)?;
+    let value = match pending {
+        Some((source, 0)) => addr_base(source, locals, local_types, args, value_types, insts)?,
+        Some((source, offset)) => {
+            let base = addr_base(source, locals, local_types, args, value_types, insts)?;
+            let ty = resolver
+                .boxed_value_type(constrained)
+                .unwrap_or(MirType::I32);
+            let loaded = new_value(value_types, ty);
+            insts.push((loaded, Inst::FieldLoad { base, offset }));
+            loaded
+        }
+        None => {
+            let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let ty = resolver
+                .boxed_value_type(constrained)
+                .unwrap_or(MirType::I32);
+            let loaded = new_value(value_types, ty);
+            insts.push((
+                loaded,
+                Inst::FieldLoad {
+                    base: address,
+                    offset: 0,
+                },
+            ));
+            loaded
+        }
+    };
+    let obj = new_value(value_types, MirType::ObjectRef);
+    insts.push((
+        obj,
+        Inst::Alloc {
+            handle: layout.handle,
+            payload_size: layout.size,
+            ref_offsets: layout.reference_offsets.into_boxed_slice(),
+        },
+    ));
+    let placeholder = new_value(value_types, MirType::I32);
+    insts.push((
+        placeholder,
+        Inst::FieldStore {
+            base: obj,
+            offset: 0,
+            value,
+        },
+    ));
+    Ok(obj)
+}
+
 /// Applies one value-producing CIL instruction to the abstract state. Control-flow
 /// terminators (`ret` and the branches) are handled by the caller, not here.
 #[allow(clippy::too_many_arguments)]
@@ -1495,12 +1931,19 @@ fn apply_value_op(
     strings: &mut Vec<(ValueId, Box<[u16]>)>,
     resolver: &dyn CallResolver,
     last_local_addr: &mut Option<(AddrOf, u32)>,
+    pending_constrained: &mut Option<Operand>,
     mem_elem: &[Option<MirType>],
     arg_cells: &[Option<ValueId>],
     promoted_arg: &[Option<usize>],
 ) -> Result<(), CilError> {
     match inst.opcode {
         Opcode::Nop => {}
+        Opcode::Constrained => {
+            if !matches!(inst.operand, Operand::Token(_)) {
+                return Err(CilError::BadOperand);
+            }
+            *pending_constrained = Some(inst.operand.clone());
+        }
         Opcode::Ldarg0 => read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, 0)?,
         Opcode::Ldarg1 => read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, 1)?,
         Opcode::Ldarg2 => read_arg(arg_cells, promoted_arg, value_types, args, locals, stack, insts, 2)?,
@@ -1515,7 +1958,16 @@ fn apply_value_op(
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            write_arg(arg_cells, promoted_arg, value_types, locals, stack, insts, *n as usize)?;
+            write_arg(
+                arg_cells,
+                promoted_arg,
+                value_types,
+                locals,
+                stack,
+                local_types,
+                insts,
+                *n as usize,
+            )?;
         }
         Opcode::Ldloc0 => read_local(
             mem_elem,
@@ -1927,7 +2379,14 @@ fn apply_value_op(
             let top = *stack.last().ok_or(CilError::StackUnderflow)?;
             stack.push(top);
         }
-        Opcode::ConvI | Opcode::ConvU => {}
+        Opcode::ConvI | Opcode::ConvU => {
+            let value = *stack.last().ok_or(CilError::StackUnderflow)?;
+            if value_types.get(value.index()) != Some(&MirType::NativeInt) {
+                stack.pop();
+                let native = to_native_int(value, value_types, insts);
+                stack.push(native);
+            }
+        }
         Opcode::StindI1 => stind(value_types, stack, insts, 1)?,
         Opcode::StindI2 => stind(value_types, stack, insts, 2)?,
         Opcode::StindI4 => stind(value_types, stack, insts, 4)?,
@@ -1971,6 +2430,7 @@ fn apply_value_op(
             stack.push(value);
         }
         Opcode::Call | Opcode::Callvirt => {
+            let constrained = pending_constrained.take();
             if let Some((arg_count, has_result)) = resolver.delegate_invoke_args(&inst.operand) {
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
@@ -2170,9 +2630,16 @@ fn apply_value_op(
                 }
                 _ => {}
             }
-            let info = resolver
-                .resolve(&inst.operand)
-                .ok_or(CilError::UnresolvedCall)?;
+            let constrained_direct = constrained
+                .as_ref()
+                .and_then(|token| resolver.constrained_call(token, &inst.operand));
+            let direct = constrained_direct.is_some();
+            let info = match constrained_direct {
+                Some(info) => info,
+                None => resolver
+                    .resolve(&inst.operand)
+                    .ok_or(CilError::UnresolvedCall)?,
+            };
             if matches!(info.target, CallTarget::Intrinsic(Intrinsic::IntToString)) {
                 let value = match last_local_addr.take() {
                     Some((source, _)) => {
@@ -2197,28 +2664,47 @@ fn apply_value_op(
                 stack.push(result);
                 return Ok(());
             }
-            let this = last_local_addr
-                .take()
-                .map(|(source, off)| -> Result<ValueId, CilError> {
-                    let base = addr_base(source, locals, local_types, args, value_types, insts)?;
-                    let ptr = new_value(value_types, MirType::ManagedPtr);
-                    insts.push((ptr, Inst::FieldAddr { base, offset: off }));
-                    Ok(ptr)
-                })
-                .transpose()?;
-            let explicit = info.args.saturating_sub(this.is_some() as usize);
+            let pending = last_local_addr.take();
+            let off_stack = pending.is_some() || constrained.is_some();
+            let explicit = info.args.saturating_sub(off_stack as usize);
             let mut call_args = Vec::with_capacity(info.args);
             for _ in 0..explicit {
                 call_args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
             }
             call_args.reverse();
+            let this = match (&constrained, direct) {
+                (Some(token), false) => Some(box_constrained_receiver(
+                    token,
+                    resolver,
+                    pending,
+                    stack,
+                    locals,
+                    local_types,
+                    args,
+                    value_types,
+                    insts,
+                )?),
+                _ => match pending {
+                    Some((source, off)) => {
+                        let base =
+                            addr_base(source, locals, local_types, args, value_types, insts)?;
+                        let ptr = new_value(value_types, MirType::ManagedPtr);
+                        insts.push((ptr, Inst::FieldAddr { base, offset: off }));
+                        Some(ptr)
+                    }
+                    None if constrained.is_some() => {
+                        Some(stack.pop().ok_or(CilError::StackUnderflow)?)
+                    }
+                    None => None,
+                },
+            };
             if let Some(this) = this {
                 call_args.insert(0, this);
             }
             match info.target {
                 CallTarget::Internal(callee) => {
                     let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
-                    let is_callvirt = inst.opcode == Opcode::Callvirt;
+                    let is_callvirt = inst.opcode == Opcode::Callvirt && !direct;
                     let interface_tag = is_callvirt
                         .then(|| resolver.interface_call_tag(&inst.operand))
                         .flatten();
@@ -2248,7 +2734,7 @@ fn apply_value_op(
                 }
                 CallTarget::External(symbol) => {
                     let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
-                    let is_callvirt = inst.opcode == Opcode::Callvirt;
+                    let is_callvirt = inst.opcode == Opcode::Callvirt && !direct;
                     let interface_tag = is_callvirt
                         .then(|| resolver.interface_call_tag(&inst.operand))
                         .flatten();
@@ -3488,18 +3974,207 @@ fn synthesize_dispatch(
     base
 }
 
-/// Builds the terminator for a block ending in `throw` (the no-GC tag model). The exception's
-/// tag -- the value `newobj E` produced -- is stored into `g_exception_tag`, then control goes to a
-/// synthesized dispatch ([`synthesize_dispatch`]) for the enclosing catch (`throw_clause`); else, if
-/// the throw is inside a `finally`-protected try (`finally_protect`), to that finally (which runs and
-/// then propagates); else it propagates directly (returns with the tag set, filled once the return
-/// type is known via `propagate_fixups`).
+/// The local slot a load-ish opcode reads (`ldloc`/`ldloca` in all their spellings), or `None` for
+/// any other opcode. `ldloca` counts: taking a binding's ADDRESS is a read that can outlive it.
+fn local_load_slot(inst: &Instruction) -> Option<usize> {
+    match (inst.opcode, &inst.operand) {
+        (Opcode::Ldloc0, _) => Some(0),
+        (Opcode::Ldloc1, _) => Some(1),
+        (Opcode::Ldloc2, _) => Some(2),
+        (Opcode::Ldloc3, _) => Some(3),
+        (
+            Opcode::LdlocS | Opcode::Ldloc | Opcode::LdlocaS | Opcode::Ldloca,
+            Operand::Variable(n),
+        ) => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// The local slot a store-ish opcode writes (`stloc` in all its spellings), or `None` otherwise.
+fn local_store_slot(inst: &Instruction) -> Option<usize> {
+    match (inst.opcode, &inst.operand) {
+        (Opcode::Stloc0, _) => Some(0),
+        (Opcode::Stloc1, _) => Some(1),
+        (Opcode::Stloc2, _) => Some(2),
+        (Opcode::Stloc3, _) => Some(3),
+        (Opcode::StlocS | Opcode::Stloc, Operand::Variable(n)) => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// How a `catch (T e)` handler treats its exception binding -- the three cases the object model
+/// splits on, decided from the handler's own instruction range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatchBinding {
+    /// No binding, or a binding never read: `catch (T)` (whose handler entry `pop`s the exception),
+    /// `catch (T e)` with `e` unused, and a handler whose only use is `rethrow`. The exception stays
+    /// a TAG -- exactly today's lowering, and the reason a handler that ignores `e` costs nothing.
+    Unread,
+    /// A binding that is read, and every read is a use that CANNOT retain the reference past the
+    /// handler -- so a frame-materialized object is safe.
+    ReadInPlace,
+    /// A binding that is read somewhere a frame object could OUTLIVE its frame: stored to a field or
+    /// another local, returned, thrown, or passed as a call ARGUMENT (a callee may keep it). Refused
+    /// at compile time rather than compiled into a dangling pointer.
+    Escapes,
+}
+
+/// Classifies a catch handler's exception binding by walking the handler's instruction range.
+///
+/// THE ENTRY STORE IS THE BINDING. A handler is entered with the exception on the evaluation stack,
+/// so csc's first instruction is `stloc n` for `catch (T e)` and `pop` for `catch (T)`. Anything else
+/// leading a handler is a shape this analysis does not model, and is treated as unread (the tag path,
+/// which is what shipped before this existed).
+///
+/// WHY THE SAFE SET IS AN ALLOWLIST AND NOT A BLOCKLIST. A frame object dangles the moment the
+/// reference outlives the frame, and the ways a reference can escape are open-ended (a field, an
+/// array element, a call argument whose callee stores it, a return). Enumerating the ESCAPES would
+/// make every unlisted opcode silently safe; enumerating the SAFE uses makes every unlisted opcode a
+/// refusal. The whitelist is deliberately small -- a nullary instance call on the binding, a field
+/// read, a null test, a discard -- which is every use the corpus and `libs/` actually make of a
+/// caught exception, and it grows by measurement rather than by guess.
+///
+/// **A CALL IS RECEIVER-POSITION ONLY WHEN THE CALLEE IS NULLARY.** `ldloc e; callvirt get_Message()`
+/// reads `e` as the receiver; `ldloc e; call Console.WriteLine(object)` passes it as an ARGUMENT, and
+/// the two are indistinguishable by adjacency alone. So the arity comes from the resolved callee
+/// ([`CallInfo::args`] counts the receiver), never from the instruction's position. This is the same
+/// trap that made a `box` before a `callvirt` look like a receiver when it was the last argument.
+fn classify_catch_binding(
+    code: &[Instruction],
+    handler: lamella_cil::InstructionRange,
+    resolver: &dyn CallResolver,
+) -> CatchBinding {
+    let (start, end) = (handler.start as usize, handler.end as usize);
+    if start >= end || end > code.len() {
+        return CatchBinding::Unread;
+    }
+    let Some(slot) = local_store_slot(&code[start]) else {
+        return CatchBinding::Unread;
+    };
+    let mut read = false;
+    for i in (start + 1)..end {
+        if local_store_slot(&code[i]) == Some(slot) {
+            break;
+        }
+        if local_load_slot(&code[i]) != Some(slot) {
+            continue;
+        }
+        read = true;
+        if matches!(code[i].opcode, Opcode::Ldloca | Opcode::LdlocaS) {
+            return CatchBinding::Escapes;
+        }
+        let Some(next) = code.get(i + 1) else {
+            return CatchBinding::Escapes;
+        };
+        let safe = match next.opcode {
+            Opcode::Ldfld
+            | Opcode::Pop
+            | Opcode::Brtrue
+            | Opcode::BrtrueS
+            | Opcode::Brfalse
+            | Opcode::BrfalseS => true,
+            Opcode::Call | Opcode::Callvirt => {
+                resolver.resolve(&next.operand).is_some_and(|info| info.args == 1)
+            }
+            _ => false,
+        };
+        if !safe {
+            return CatchBinding::Escapes;
+        }
+    }
+    if read {
+        CatchBinding::ReadInPlace
+    } else {
+        CatchBinding::Unread
+    }
+}
+
+/// Materializes the caught exception as a real object in THIS frame, returning the `ObjectRef` a
+/// handler's `stloc` then binds -- the object half of the no-GC exception model.
+///
+/// The in-flight exception is a TAG, and a tag is not an object: every member read on one today
+/// dereferences an FNV hash as if it were a heap pointer, which hard-faults, while `e == null`
+/// answers False because the hash is nonzero. This builds the object the binding needs at the ONE
+/// place it is observable -- a binding `catch` -- so `throw` keeps costing a single word and a
+/// handler that ignores `e` keeps costing nothing.
+///
+/// THE OBJECT IS A ZEROED FRAME CELL PLUS A HEADER WORD. `InitStruct` zero-initializes a
+/// `size + 4`-byte value-type slot, word 0 takes the TypeDesc address, and the payload starts at
+/// word 1 -- exactly the `[obj - 4]` header the allocator writes, so every consumer that dispatches
+/// on, type-tests, or reads a field off this object behaves as it does on a heap object. Zeroed is
+/// what makes the reads correct rather than merely non-fatal: corlib's non-virtual
+/// `get_InnerException` reads a null `_innerException`, and a derived type's own fields read 0.
+///
+/// THE CELL'S HANDLE IS A SENTINEL, and layout is never looked up for it -- the same contract
+/// [`crate::stackmaps::REF_CELL_HANDLE`] documents for an address-taken reference local:
+/// `InitStruct`/`FieldAddr` are size- and offset-based. It is deliberately NOT `REF_CELL_HANDLE`,
+/// whose word IS enumerated as a root; this cell's words must not be, because they are a descriptor
+/// address and null fields, and a mark-compact collector REWRITES what it accepts as a root.
+///
+/// TWO LIMITS, both named rather than discovered later:
+///
+/// 1. **The header carries the CAUGHT type's descriptor, not the THROWN type's.** `catch (Exception
+///    e)` on a thrown subtype therefore reports `System.Exception`. Recovering the thrown type means
+///    mapping a tag back to a descriptor, and no whole-image tag-to-descriptor table exists; putting
+///    a descriptor address in the in-flight word instead of a tag would fix it and is a CROSS-TIER
+///    ABI change (`exception_tag_for_name` is shared with the interpreter and with cross-assembly
+///    catch), so it is not made here.
+/// 2. **The reference is a frame address flowing in an `ObjectRef`.** The collector range-checks a
+///    maybe-heap root and skips a non-heap value, which is what makes this safe -- and it is the
+///    SAME reliance the tag already has, since an FNV hash has flowed through this slot as an
+///    `ObjectRef` since the tag model shipped. [`CatchBinding::Escapes`] is what keeps the address
+///    from outliving the frame that owns it.
+fn materialize_catch_binding(
+    layout: &ReferenceLayout,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let cell = new_value(
+        value_types,
+        MirType::ValueType {
+            handle: crate::stackmaps::EXCEPTION_CELL_HANDLE,
+            size: layout.size + 4,
+        },
+    );
+    insts.push((cell, Inst::InitStruct));
+    let header = new_value(value_types, MirType::ManagedPtr);
+    insts.push((header, Inst::FieldAddr { base: cell, offset: 0 }));
+    let descriptor = new_value(value_types, MirType::I32);
+    insts.push((
+        descriptor,
+        Inst::TypeDescAddr {
+            handle: layout.handle,
+        },
+    ));
+    let stored = new_value(value_types, MirType::I32);
+    insts.push((
+        stored,
+        Inst::Store {
+            address: header,
+            value: descriptor,
+            width: 4,
+        },
+    ));
+    let object = new_value(value_types, MirType::ObjectRef);
+    insts.push((object, Inst::FieldAddr { base: cell, offset: 4 }));
+    object
+}
+
+/// Builds the terminator for a block ending in `throw` (the no-GC tag model). The exception's tag --
+/// the value `newobj E` produced -- is stored into `g_exception_tag`, and control then goes wherever
+/// [`eh_landing`] says an in-flight exception belongs.
+///
+/// The routing is DELEGATED rather than repeated. A throw, a may-trap access and a returning call
+/// all raise the same exception into the same clauses, and when this function carried its own copy
+/// of the decision the copies disagreed about whether an intervening `finally` runs -- so there is
+/// one answer now, and all three ask it.
 #[allow(clippy::too_many_arguments)]
 fn build_eh_throw(
     throw_clauses: &[usize],
     catch_clauses: &[&EhClause],
     handler_block_of_clause: &[usize],
     finally_protect: Option<usize>,
+    finally_is_innermost: bool,
     finally_handler_block: &[usize],
     resolver: &dyn CallResolver,
     stack: &mut Vec<ValueId>,
@@ -3522,43 +4197,24 @@ fn build_eh_throw(
             value: tag,
         },
     ));
-
-    if !throw_clauses.is_empty() {
-        let catches = catch_dispatch_list(
-            throw_clauses,
-            resolver,
-            catch_clauses,
-            handler_block_of_clause,
-        )?;
-        let unwind = finally_protect.map(|clause| finally_handler_block[clause]);
-        let dispatch = synthesize_dispatch(
-            &catches,
-            unwind,
-            locals,
-            local_count,
-            local_types,
-            value_types,
-            split_blocks,
-            block_count,
-            propagate_fixups,
-        );
-        return Ok(Terminator::Jump {
-            target: BlockId(dispatch as u32),
-            args: Vec::new(),
-        });
-    }
-
-    if let Some(finally_clause) = finally_protect {
-        let args = merge_args(true, local_count, locals, local_types, value_types, insts);
-        return Ok(Terminator::Jump {
-            target: BlockId(finally_handler_block[finally_clause] as u32),
-            args,
-        });
-    }
-
-    let propagate = push_propagate(split_blocks, block_count, propagate_fixups);
+    let landing = eh_landing(
+        throw_clauses,
+        catch_clauses,
+        handler_block_of_clause,
+        finally_protect,
+        finally_is_innermost,
+        finally_handler_block,
+        resolver,
+        locals,
+        local_count,
+        local_types,
+        value_types,
+        split_blocks,
+        block_count,
+        propagate_fixups,
+    )?;
     Ok(Terminator::Jump {
-        target: BlockId(propagate as u32),
+        target: BlockId(landing as u32),
         args: Vec::new(),
     })
 }
@@ -3633,6 +4289,109 @@ fn build_eh_leave(
         if_false: BlockId(landing as u32),
         false_args: Vec::new(),
     })
+}
+
+/// Whether an instruction can leave an exception in flight -- a call into MANAGED code.
+///
+/// In the no-GC tag model a throwing callee writes `g_exception_tag` and then RETURNS: there is no
+/// stack unwinder to abandon its caller's frame. So every one of these is a point where control may
+/// have to transfer instead of falling through, and the lowering has to ask right after it. A
+/// cross-assembly managed call lowers to [`Inst::PInvoke`] (the own linker resolves it against the
+/// defining library object), so that variant is in the list; a genuine native import cannot set the
+/// tag, which makes the check there redundant rather than wrong. The runtime helpers a target
+/// lowering synthesizes ([`Inst::Alloc`], the string ops, `CallNative`) never touch the word.
+fn may_leave_exception(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::Call { .. }
+            | Inst::CallVirtual { .. }
+            | Inst::CallInterface { .. }
+            | Inst::CallIndirect { .. }
+            | Inst::InvokeDelegate { .. }
+            | Inst::PInvoke { .. }
+    )
+}
+
+/// The block an exception a CALL left in flight must reach, given the clauses that enclose the call:
+/// the enclosing catches' dispatch cascade, else a landing that runs the enclosing `finally` first
+/// (whose `endfinally` then propagates), else a direct propagation exit. Exactly the routing
+/// [`build_eh_throw`] performs, minus the tag store -- a throwing callee has already written it.
+///
+/// Every target is PARAMETER-LESS, because the post-call test is a `Branch` and a `Branch` edge
+/// carries no arguments: the dispatch cascade and the propagation exit take none by construction,
+/// and the finally arm gets a landing block that supplies the locals through a `Jump`.
+///
+/// THE INNERMOST REGION WINS. When a `finally` guards the call more tightly than any catch does,
+/// the exception goes to the finally EVEN THOUGH a catch also covers it: every finally between the
+/// fault site and a handler has to complete first, so dispatching straight into the catch would
+/// skip it -- and that finally is a C# `using`'s `Dispose` or a `lock`'s release. (The finally then
+/// propagates rather than resuming into that catch, which is the separate `endfinally` gap: it has
+/// no continuation to resume a handler at. Skipping the catch is the pre-existing behaviour;
+/// skipping the finally would be a new resource leak.)
+///
+/// TOTAL over the three routings on purpose. WHICH call sites are worth testing is a code-size
+/// question the caller answers (it tests inside a protected region, so the propagation arm is the
+/// one no post-call test reaches); WHICH handler an in-flight exception belongs to is not, and is
+/// answered here.
+#[allow(clippy::too_many_arguments)]
+fn eh_landing(
+    throw_clauses: &[usize],
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+    finally_protect: Option<usize>,
+    finally_is_innermost: bool,
+    finally_handler_block: &[usize],
+    resolver: &dyn CallResolver,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> Result<usize, CilError> {
+    if !throw_clauses.is_empty() && !finally_is_innermost {
+        let catches = catch_dispatch_list(
+            throw_clauses,
+            resolver,
+            catch_clauses,
+            handler_block_of_clause,
+        )?;
+        let unwind = finally_protect.map(|clause| finally_handler_block[clause]);
+        return Ok(synthesize_dispatch(
+            &catches,
+            unwind,
+            locals,
+            local_count,
+            local_types,
+            value_types,
+            split_blocks,
+            block_count,
+            propagate_fixups,
+        ));
+    }
+    if let Some(clause) = finally_protect {
+        let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
+        let args = merge_args(
+            true,
+            local_count,
+            locals,
+            local_types,
+            value_types,
+            &mut landing_insts,
+        );
+        let index = block_count + split_blocks.len();
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: landing_insts,
+            terminator: Some(Terminator::Jump {
+                target: BlockId(finally_handler_block[clause] as u32),
+                args,
+            }),
+        });
+        return Ok(index);
+    }
+    Ok(push_propagate(split_blocks, block_count, propagate_fixups))
 }
 
 /// The kind of runtime check a may-trap access needs, and the builtin exception it raises.
@@ -4243,6 +5002,7 @@ fn build_trap_access_check(
     catch_clauses: &[&EhClause],
     handler_block_of_clause: &[usize],
     finally_protect: Option<usize>,
+    finally_is_innermost: bool,
     finally_handler_block: &[usize],
     resolver: &dyn CallResolver,
     locals: &[Option<ValueId>],
@@ -4531,7 +5291,9 @@ fn build_trap_access_check(
 
     let tag = resolver
         .builtin_exception_tag("System", exception_name)
-        .ok_or(CilError::UnsupportedControlFlow)?;
+        .ok_or(CilError::UnsupportedControlFlow(
+            ControlFlowGap::NoBuiltinExceptionTag,
+        ))?;
     let mut trap_insts: Vec<(ValueId, Inst)> = Vec::new();
     let tag_value = new_value(value_types, MirType::I32);
     trap_insts.push((
@@ -4547,6 +5309,7 @@ fn build_trap_access_check(
         catch_clauses,
         handler_block_of_clause,
         finally_protect,
+        finally_is_innermost,
         finally_handler_block,
         resolver,
         &mut trap_stack,
@@ -4613,15 +5376,28 @@ fn build_eh_finally_leave(
     }
 }
 
-/// Builds the terminator for a finally handler's `endfinally`: load the in-flight tag and, when it
-/// is nonzero, propagate (the exception passed through the finally); otherwise resume at the
-/// finally's normal continuation (the pending leave target), carrying the finally's locals through a
-/// landing block (a `Branch` edge carries no arguments). When the try always throws there is no
-/// normal continuation, so the finally simply propagates. The propagation return value is filled in
-/// once the function's return type is known.
+/// Builds the terminator for a finally handler's `endfinally`: load the in-flight tag and branch on
+/// it. Zero means the finally ran on the NORMAL path, so it resumes at the pending leave target,
+/// carrying the finally's locals through a landing block (a `Branch` edge carries no arguments).
+/// Nonzero means an exception passed THROUGH the finally, so the search for its handler resumes at
+/// the clauses enclosing this finally's own try -- [`eh_landing`] again, with `resume_*` naming that
+/// outer region. When the try always throws there is no normal continuation and only that edge
+/// exists.
+///
+/// The tag is what distinguishes the two entries, which is why no per-entry continuation selector is
+/// needed: the same word that says "an exception is in flight" says "you were entered by one".
+/// Propagating on a set tag -- the previous answer -- made every intervening `finally` CONSUME the
+/// exception, so a handler in the same frame never saw it.
 #[allow(clippy::too_many_arguments)]
 fn build_eh_endfinally(
     continuation: Option<usize>,
+    resume_catches: &[usize],
+    resume_finally: Option<usize>,
+    resume_finally_is_innermost: bool,
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+    finally_handler_block: &[usize],
+    resolver: &dyn CallResolver,
     locals: &[Option<ValueId>],
     local_count: usize,
     local_types: &[MirType],
@@ -4630,13 +5406,33 @@ fn build_eh_endfinally(
     split_blocks: &mut Vec<BasicBlock>,
     block_count: usize,
     propagate_fixups: &mut Vec<usize>,
-) -> Terminator {
+) -> Result<Terminator, CilError> {
+    let in_flight_target = |value_types: &mut Vec<MirType>,
+                            split_blocks: &mut Vec<BasicBlock>,
+                            propagate_fixups: &mut Vec<usize>| {
+        eh_landing(
+            resume_catches,
+            catch_clauses,
+            handler_block_of_clause,
+            resume_finally,
+            resume_finally_is_innermost,
+            finally_handler_block,
+            resolver,
+            locals,
+            local_count,
+            local_types,
+            value_types,
+            split_blocks,
+            block_count,
+            propagate_fixups,
+        )
+    };
     let Some(continuation) = continuation else {
-        let propagate = push_propagate(split_blocks, block_count, propagate_fixups);
-        return Terminator::Jump {
-            target: BlockId(propagate as u32),
+        let landing = in_flight_target(value_types, split_blocks, propagate_fixups)?;
+        return Ok(Terminator::Jump {
+            target: BlockId(landing as u32),
             args: Vec::new(),
-        };
+        });
     };
     let in_flight = new_value(value_types, MirType::I32);
     insts.push((
@@ -4647,7 +5443,6 @@ fn build_eh_endfinally(
         },
     ));
     let landing = block_count + split_blocks.len();
-    let propagate = landing + 1;
     let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
     let cont_args = merge_args(
         true,
@@ -4665,15 +5460,14 @@ fn build_eh_endfinally(
             args: cont_args,
         }),
     });
-    let propagate_actual = push_propagate(split_blocks, block_count, propagate_fixups);
-    debug_assert_eq!(propagate_actual, propagate);
-    Terminator::Branch {
+    let unwind = in_flight_target(value_types, split_blocks, propagate_fixups)?;
+    Ok(Terminator::Branch {
         cond: in_flight,
-        if_true: BlockId(propagate as u32),
+        if_true: BlockId(unwind as u32),
         true_args: Vec::new(),
         if_false: BlockId(landing as u32),
         false_args: Vec::new(),
-    }
+    })
 }
 
 /// Pushes a propagation block -- an exit that returns, leaving `g_exception_tag` set -- and
@@ -4715,7 +5509,9 @@ fn build_branch(
     let Operand::Target(target_instr) = &inst.operand else {
         return Err(CilError::BadOperand);
     };
-    let target = block_of(*target_instr as usize).ok_or(CilError::UnsupportedControlFlow)?;
+    let target = block_of(*target_instr as usize).ok_or(CilError::UnsupportedControlFlow(
+        ControlFlowGap::TargetNotBlockStart,
+    ))?;
 
     match control_flow::branch_kind(inst.opcode) {
         Some(control_flow::BranchKind::Unconditional) => {
@@ -4741,7 +5537,9 @@ fn build_branch(
             })
         }
         Some(control_flow::BranchKind::Conditional) => {
-            let other = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow)?;
+            let other = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow(
+                ControlFlowGap::TargetNotBlockStart,
+            ))?;
             let (cond, if_true, if_false) =
                 build_condition(inst.opcode, target, other, stack, value_types, insts)?;
             let stack_args: Vec<ValueId> = stack.clone();
@@ -4769,7 +5567,9 @@ fn build_branch(
                 false_args: Vec::new(),
             })
         }
-        None => Err(CilError::UnsupportedControlFlow),
+        None => Err(CilError::UnsupportedControlFlow(
+            ControlFlowGap::UnknownBranchOpcode,
+        )),
     }
 }
 
@@ -4805,7 +5605,9 @@ fn build_switch(
     let index = stack.pop().ok_or(CilError::StackUnderflow)?;
     let stack_args: Vec<ValueId> = stack.clone();
 
-    let default = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow)?;
+    let default = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow(
+        ControlFlowGap::TargetNotBlockStart,
+    ))?;
     let mut not_matched = split_edge_to_merge(
         default,
         is_merge,
@@ -4820,7 +5622,9 @@ fn build_switch(
     );
 
     for case in (1..targets.len()).rev() {
-        let target = block_of(targets[case] as usize).ok_or(CilError::UnsupportedControlFlow)?;
+        let target = block_of(targets[case] as usize).ok_or(CilError::UnsupportedControlFlow(
+            ControlFlowGap::TargetNotBlockStart,
+        ))?;
         let matched = split_edge_to_merge(
             target,
             is_merge,
@@ -4856,7 +5660,9 @@ fn build_switch(
             args: Vec::new(),
         });
     };
-    let target0 = block_of(first as usize).ok_or(CilError::UnsupportedControlFlow)?;
+    let target0 = block_of(first as usize).ok_or(CilError::UnsupportedControlFlow(
+        ControlFlowGap::TargetNotBlockStart,
+    ))?;
     let matched = split_edge_to_merge(
         target0,
         is_merge,
@@ -5116,17 +5922,19 @@ fn read_arg(
 /// writes through its cell (a `FieldStore` at offset 0, so the write is visible through any `&arg`-derived
 /// pointer). A plain argument is an SSA value threaded from entry, not a mutable slot, so storing to one is
 /// unsupported.
+#[allow(clippy::too_many_arguments)]
 fn write_arg(
     arg_cells: &[Option<ValueId>],
     promoted: &[Option<usize>],
     value_types: &mut Vec<MirType>,
     locals: &mut [Option<ValueId>],
     stack: &mut Vec<ValueId>,
+    local_types: &[MirType],
     insts: &mut Vec<(ValueId, Inst)>,
     index: usize,
 ) -> Result<(), CilError> {
     if let Some(pidx) = promoted.get(index).copied().flatten() {
-        return store_local(value_types, locals, stack, insts, pidx);
+        return store_local(value_types, locals, stack, local_types, insts, pidx);
     }
     let Some(cell) = arg_cells.get(index).copied().flatten() else {
         return Err(CilError::Unsupported(Opcode::Starg));
@@ -5174,10 +5982,53 @@ fn push_local(
 }
 
 /// Stores the stack top into local slot `index`.
+/// Retypes a one-word value to `NativeInt`: a CONSTANT is simply re-emitted at the native type
+/// (nothing to reinterpret, and a real reference is never a constant, so this cannot quietly
+/// untrack one), and anything else takes a [`ConvKind::ToNativeInt`].
+///
+/// Re-emitting rather than converting is not only cheaper -- it keeps a constant VISIBLE as one to
+/// the passes that look back for it. `localloc` accepts only a constant frame size, and `ldc 16;
+/// conv.u; localloc` is exactly how a `stackalloc int[4]` arrives, so a `Convert` interposed here
+/// would turn a supported shape into a refusal.
+///
+/// **This is the point at which the collector stops tracking the word**, so it is deliberately not
+/// applied by inference anywhere: only where the CIL says a pointer is being formed -- an explicit
+/// `conv.i`/`conv.u`, or an assignment into a local the metadata DECLARES as `T*`.
+fn to_native_int(
+    value: ValueId,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    if let Some((_, Inst::ConstInt { value: konst, .. })) =
+        insts.iter().find(|(id, _)| *id == value)
+    {
+        let konst = *konst;
+        let retyped = new_value(value_types, MirType::NativeInt);
+        insts.push((
+            retyped,
+            Inst::ConstInt {
+                ty: MirType::NativeInt,
+                value: konst,
+            },
+        ));
+        return retyped;
+    }
+    let native = new_value(value_types, MirType::NativeInt);
+    insts.push((
+        native,
+        Inst::Convert {
+            value,
+            kind: ConvKind::ToNativeInt,
+        },
+    ));
+    native
+}
+
 fn store_local(
     value_types: &mut Vec<MirType>,
     locals: &mut [Option<ValueId>],
     stack: &mut Vec<ValueId>,
+    local_types: &[MirType],
     insts: &mut Vec<(ValueId, Inst)>,
     index: usize,
 ) -> Result<(), CilError> {
@@ -5190,6 +6041,13 @@ fn store_local(
         let copy = new_value(value_types, ty);
         insts.push((copy, Inst::CopyStruct { src: value }));
         copy
+    } else if local_types.get(index) == Some(&MirType::NativeInt)
+        && matches!(
+            value_types.get(value.index()),
+            Some(MirType::ObjectRef | MirType::ManagedPtr | MirType::I32)
+        )
+    {
+        to_native_int(value, value_types, insts)
     } else {
         value
     };
@@ -5250,7 +6108,7 @@ fn write_local(
     index: usize,
 ) -> Result<(), CilError> {
     if mem_elem.get(index).copied().flatten().is_none() {
-        return store_local(value_types, locals, stack, insts, index);
+        return store_local(value_types, locals, stack, local_types, insts, index);
     }
     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
     let cell = addr_base(
@@ -6480,6 +7338,398 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
     }
 
+    /// A resolver whose every `call` is a real managed call to function 0, and whose every catch
+    /// clause is a catch-all -- the two facts the post-call exception check turns on.
+    struct CatchAllCalls;
+
+    impl CallResolver for CatchAllCalls {
+        fn resolve(&self, operand: &Operand) -> Option<CallInfo> {
+            let callee = match operand {
+                Operand::Token(token) => token.0 & 0x00FF_FFFF,
+                _ => 0,
+            };
+            Some(CallInfo {
+                args: 0,
+                has_result: false,
+                result_type: None,
+                target: CallTarget::Internal(callee),
+            })
+        }
+        fn is_catch_all_type(&self, _operand: &Operand) -> bool {
+            true
+        }
+    }
+
+    /// `call ; ldc 4242 ; stloc.0 ; leave` inside a try, with a catch handler: the try body's CIL
+    /// laid out so a marker instruction sits BETWEEN the call and the leave.
+    fn call_then_marker_in_a_catch_try(handler: EhKind) -> MethodBodyImage {
+        MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token(0x0600_0001))),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(4242)),
+                Instruction::new(Opcode::Stloc, Operand::Variable(0)),
+                Instruction::new(Opcode::Leave, Operand::Target(6)),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Leave, Operand::Target(6)),
+                Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 4 },
+                handler_range: lamella_cil::InstructionRange { start: 4, end: 6 },
+                kind: handler,
+            }]
+            .into_boxed_slice(),
+        }
+    }
+
+    /// The block holding `Inst::Call`, and the value its terminator branches on when it is a branch.
+    fn call_block(func: &Function) -> (usize, &BasicBlock) {
+        func.blocks
+            .iter()
+            .enumerate()
+            .find(|(_, blk)| {
+                blk.insts
+                    .iter()
+                    .any(|(_, inst)| matches!(inst, Inst::Call { .. }))
+            })
+            .expect("the call is lowered somewhere")
+    }
+
+    #[test]
+    fn a_call_in_a_try_is_followed_by_the_in_flight_tag_check() {
+        let func = lower_method_typed(
+            &call_then_marker_in_a_catch_try(EhKind::Catch(lamella_token::Token(0x0100_0001))),
+            &CatchAllCalls,
+            &[],
+            &[MirType::I32],
+        )
+        .expect("a call inside a try lowers")
+        .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+
+        let (_, block) = call_block(&func);
+        let cond = match &block.terminator {
+            Some(Terminator::Branch { cond, .. }) => *cond,
+            other => panic!("the call's block must end in the tag check, got {other:?}"),
+        };
+        assert!(
+            block.insts.iter().any(|(id, inst)| *id == cond
+                && matches!(
+                    inst,
+                    Inst::StaticLoad {
+                        owner: StaticOwner::Own,
+                        offset: G_EXCEPTION_TAG_OFFSET
+                    }
+                )),
+            "the branch must test the in-flight tag the callee would have written"
+        );
+        assert!(
+            !block
+                .insts
+                .iter()
+                .any(|(_, inst)| matches!(inst, Inst::ConstInt { value: 4242, .. })),
+            "the marker after the call must not stay in the call's block -- that is the defect"
+        );
+        assert!(
+            func.blocks.iter().any(|blk| blk
+                .insts
+                .iter()
+                .any(|(_, inst)| matches!(inst, Inst::ConstInt { value: 4242, .. }))),
+            "the marker still runs when no exception is in flight"
+        );
+    }
+
+    #[test]
+    fn a_call_in_a_finally_protected_try_routes_to_the_finally() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token(0x0600_0001))),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(4242)),
+                Instruction::new(Opcode::Stloc, Operand::Variable(0)),
+                Instruction::new(Opcode::Leave, Operand::Target(5)),
+                Instruction::simple(Opcode::Endfinally),
+                Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 4 },
+                handler_range: lamella_cil::InstructionRange { start: 4, end: 5 },
+                kind: EhKind::Finally,
+            }]
+            .into_boxed_slice(),
+        };
+        let func = lower_method_typed(&body, &CatchAllCalls, &[], &[MirType::I32])
+            .expect("a call inside a try/finally lowers")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+
+        let (_, block) = call_block(&func);
+        let taken = match &block.terminator {
+            Some(Terminator::Branch { if_true, .. }) => if_true.0 as usize,
+            other => panic!("the call's block must end in the tag check, got {other:?}"),
+        };
+        let onward = match &func.blocks[taken].terminator {
+            Some(Terminator::Jump { target, args }) => {
+                assert_eq!(args.len(), 1, "the finally handler takes one parameter per local");
+                target.0 as usize
+            }
+            other => panic!("the landing must jump to the finally, got {other:?}"),
+        };
+        assert_eq!(
+            func.blocks[onward].params.len(),
+            1,
+            "the finally handler's entry takes the locals as parameters"
+        );
+    }
+
+    #[test]
+    fn a_finally_handler_with_internal_control_flow_lowers() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Leave, Operand::Target(5)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(0)),
+                Instruction::new(Opcode::Brfalse, Operand::Target(4)),
+                Instruction::simple(Opcode::Nop),
+                Instruction::simple(Opcode::Endfinally),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 1 },
+                handler_range: lamella_cil::InstructionRange { start: 1, end: 5 },
+                kind: EhKind::Finally,
+            }]
+            .into_boxed_slice(),
+        };
+        let func = lower_method_typed(&body, &NoCalls, &[], &[])
+            .expect("a finally handler with a branch in it lowers")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks
+                .iter()
+                .any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))),
+            "the endfinally epilogue branches on the in-flight tag"
+        );
+    }
+
+    #[test]
+    fn a_call_a_leave_already_covers_is_not_checked_twice() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token(0x0600_0001))),
+                Instruction::new(Opcode::Leave, Operand::Target(3)),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 2 },
+                handler_range: lamella_cil::InstructionRange { start: 2, end: 3 },
+                kind: EhKind::Catch(lamella_token::Token(0x0100_0001)),
+            }]
+            .into_boxed_slice(),
+        };
+        let func = lower_method_typed(&body, &CatchAllCalls, &[], &[MirType::I32])
+            .expect("a call immediately before a leave lowers")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+
+        let (_, block) = call_block(&func);
+        assert!(
+            matches!(block.terminator, Some(Terminator::Branch { .. })),
+            "the call's block still ends in a check -- the leave's"
+        );
+        let cascades = func
+            .blocks
+            .iter()
+            .flat_map(|blk| blk.insts.iter())
+            .filter(|(_, inst)| {
+                matches!(
+                    inst,
+                    Inst::StaticStore {
+                        owner: StaticOwner::Own,
+                        offset: G_EXCEPTION_TAG_OFFSET,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(cascades, 1, "one dispatch cascade for one question, not two");
+    }
+
+    /// `try { try { T(); } finally { A(); B(); } } catch { }` -- the geometry a C# `using` inside a
+    /// `try`/`catch` compiles to, with the OUTER catch's try covering the inner finally's HANDLER.
+    fn a_finally_inside_a_catch_try() -> MethodBodyImage {
+        MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token(0x0600_0001))),
+                Instruction::new(Opcode::Leave, Operand::Target(7)),
+                Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token(0x0600_0002))),
+                Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token(0x0600_0003))),
+                Instruction::simple(Opcode::Endfinally),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Leave, Operand::Target(7)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(0)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![
+                EhClause {
+                    try_range: lamella_cil::InstructionRange { start: 0, end: 2 },
+                    handler_range: lamella_cil::InstructionRange { start: 2, end: 5 },
+                    kind: EhKind::Finally,
+                },
+                EhClause {
+                    try_range: lamella_cil::InstructionRange { start: 0, end: 5 },
+                    handler_range: lamella_cil::InstructionRange { start: 5, end: 7 },
+                    kind: EhKind::Catch(lamella_token::Token(0x0100_0001)),
+                },
+            ]
+            .into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn a_call_inside_a_finally_is_not_tested_against_the_in_flight_tag() {
+        let func = lower_method_typed(&a_finally_inside_a_catch_try(), &CatchAllCalls, &[], &[])
+            .expect("a try/finally inside a try/catch lowers")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+
+        let block_of_call = |callee: u32| {
+            func.blocks
+                .iter()
+                .position(|blk| {
+                    blk.insts
+                        .iter()
+                        .any(|(_, inst)| matches!(inst, Inst::Call { callee: c, .. } if *c == callee))
+                })
+                .unwrap_or_else(|| panic!("call to {callee} is lowered somewhere"))
+        };
+        assert_eq!(
+            block_of_call(2),
+            block_of_call(3),
+            "the finally handler's body must not be split by a post-call check"
+        );
+    }
+
+    #[test]
+    fn an_intervening_finally_is_not_skipped_when_a_catch_also_covers_the_call() {
+        let func = lower_method_typed(&a_finally_inside_a_catch_try(), &CatchAllCalls, &[], &[])
+            .expect("a try/finally inside a try/catch lowers")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+
+        let finally_entry = func
+            .blocks
+            .iter()
+            .position(|blk| {
+                blk.insts
+                    .iter()
+                    .any(|(_, inst)| matches!(inst, Inst::Call { callee: 2, .. }))
+            })
+            .expect("the finally body is lowered");
+        let throwing = func
+            .blocks
+            .iter()
+            .find(|blk| {
+                blk.insts
+                    .iter()
+                    .any(|(_, inst)| matches!(inst, Inst::Call { callee: 1, .. }))
+            })
+            .expect("the throwing call is lowered");
+        let taken = match &throwing.terminator {
+            Some(Terminator::Branch { if_true, .. }) => if_true.0 as usize,
+            other => panic!("the call's block must end in the tag check, got {other:?}"),
+        };
+        let reached = match &func.blocks[taken].terminator {
+            Some(Terminator::Jump { target, .. }) => target.0 as usize,
+            other => panic!("the landing must jump onward, got {other:?}"),
+        };
+        assert_eq!(
+            reached, finally_entry,
+            "the in-flight exception must run the intervening finally, not jump past it into the catch"
+        );
+    }
+
+    #[test]
+    fn a_finally_that_ran_on_the_exceptional_path_resumes_the_search_at_the_enclosing_catch() {
+        let func = lower_method_typed(&a_finally_inside_a_catch_try(), &CatchAllCalls, &[], &[])
+            .expect("a try/finally inside a try/catch lowers")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+
+        let endfinally = func
+            .blocks
+            .iter()
+            .find(|blk| {
+                blk.insts
+                    .iter()
+                    .any(|(_, inst)| matches!(inst, Inst::Call { callee: 3, .. }))
+            })
+            .expect("the finally body's last call is lowered");
+        let in_flight = match &endfinally.terminator {
+            Some(Terminator::Branch { if_true, .. }) => if_true.0 as usize,
+            other => panic!("the endfinally must branch on the tag, got {other:?}"),
+        };
+        assert!(
+            !matches!(func.blocks[in_flight].terminator, Some(Terminator::Return(_))),
+            "a set tag must not simply return; the enclosing catch has not been searched yet"
+        );
+        let dispatch = &func.blocks[in_flight];
+        let cond = match &dispatch.terminator {
+            Some(Terminator::Branch { cond, .. }) => *cond,
+            other => panic!("the resume target must be a dispatch, got {other:?}"),
+        };
+        assert!(
+            dispatch.insts.iter().any(|(id, inst)| *id == cond
+                && matches!(
+                    inst,
+                    Inst::StaticLoad {
+                        owner: StaticOwner::Own,
+                        offset: G_EXCEPTION_TAG_OFFSET
+                    }
+                )),
+            "the dispatch tests the tag it was entered with"
+        );
+        let matched = match &dispatch.terminator {
+            Some(Terminator::Branch { if_true, .. }) => if_true.0 as usize,
+            _ => unreachable!("checked above"),
+        };
+        assert!(
+            func.blocks[matched].insts.iter().any(|(_, inst)| matches!(
+                inst,
+                Inst::StaticStore {
+                    owner: StaticOwner::Own,
+                    offset: G_EXCEPTION_TAG_OFFSET,
+                    ..
+                }
+            )),
+            "entering the handler clears the in-flight tag"
+        );
+    }
+
     #[test]
     fn a_finally_handler_entry_is_not_mistaken_for_unreachable() {
         let body = MethodBodyImage {
@@ -6852,10 +8102,12 @@ mod tests {
             .into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        assert!(matches!(
-            lower_method_typed(&body, &NoCalls, &[MirType::I32], &[]),
-            Err(CilError::UnsupportedControlFlow)
-        ));
+        assert_eq!(
+            lower_method_typed(&body, &NoCalls, &[MirType::I32], &[]).err(),
+            Some(CilError::UnsupportedControlFlow(
+                ControlFlowGap::EntryLoopArgs
+            ))
+        );
     }
 
     #[test]
@@ -6963,7 +8215,7 @@ mod tests {
             local_var_sig: None,
             code: vec![
                 Instruction::simple(Opcode::LdcI41),
-                Instruction::new(Opcode::Newarr, Operand::Token(Token::new(0x01, 2))),
+                Instruction::new(Opcode::Newarr, Operand::Token(lamella_token::Token::new(0x01, 2))),
                 Instruction::simple(Opcode::Dup),
                 Instruction::simple(Opcode::LdcI40),
                 Instruction::simple(Opcode::Ldnull),
@@ -7019,7 +8271,7 @@ mod tests {
             local_var_sig: None,
             code: vec![
                 Instruction::simple(Opcode::LdcI41),
-                Instruction::new(Opcode::Newarr, Operand::Token(Token::new(0x01, 1))),
+                Instruction::new(Opcode::Newarr, Operand::Token(lamella_token::Token::new(0x01, 1))),
                 Instruction::simple(Opcode::Dup),
                 Instruction::simple(Opcode::LdcI40),
                 Instruction::new(Opcode::LdcI8, Operand::Int64(42)),
@@ -7073,7 +8325,7 @@ mod tests {
                 Some(0x8000_0001)
             }
         }
-        let int = Operand::Token(Token::new(0x01, 7));
+        let int = Operand::Token(lamella_token::Token::new(0x01, 7));
         let body = MethodBodyImage {
             max_stack: 1,
             init_locals: false,
@@ -7146,7 +8398,7 @@ mod tests {
                 Some(MirType::I32)
             }
         }
-        let int = Operand::Token(Token::new(0x01, 7));
+        let int = Operand::Token(lamella_token::Token::new(0x01, 7));
         let body = MethodBodyImage {
             max_stack: 1,
             init_locals: false,
@@ -7708,5 +8960,427 @@ mod tests {
         let func = lower_method(&forty_plus_two()).unwrap();
         let bytes = crate::arm32::lower(&func).unwrap();
         assert_eq!(&bytes[bytes.len() - 2..], &[0x70, 0x47]);
+    }
+
+    /// A managed pointer assigned into a local the metadata DECLARES `T*` becomes a `NativeInt`,
+    /// which is the moment the collector stops tracking that word. `NativeInt` and not `ManagedPtr`
+    /// because the device heap is MARK-COMPACT: a word it accepts as a root is REWRITTEN to the
+    /// object's new address, so an unmanaged pointer that happened to fall in the heap range would
+    /// be silently corrupted rather than merely retained.
+    #[cfg(any(feature = "arm32", feature = "riscv32"))]
+    #[test]
+    fn a_byref_assigned_to_a_pointer_local_stops_being_gc_tracked() {
+        use lamella_token::Token;
+        struct FieldAt0;
+        impl CallResolver for FieldAt0 {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(0)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Ldflda, Operand::Token(Token::new(0x04, 1))),
+                Instruction::new(Opcode::StlocS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdlocS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdindI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &FieldAt0,
+            &[MirType::ObjectRef],
+            &[MirType::NativeInt],
+        )
+        .unwrap();
+        assert!(lamella_ir::verify(&func).is_ok(), "the pointer local must type-check");
+        assert!(
+            func.blocks.iter().flat_map(|b| &b.insts).any(|(id, i)| matches!(
+                i,
+                Inst::Convert { kind: ConvKind::ToNativeInt, .. }
+            ) && func.value_types[id.index()] == MirType::NativeInt),
+            "a byref stored into a `T*` local must be retyped to NativeInt"
+        );
+        let loaded_through = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(_, i)| match i {
+                Inst::Load { address, .. } => Some(*address),
+                _ => None,
+            })
+            .expect("ldind.i4 lowers to a Load");
+        assert_eq!(
+            func.value_types[loaded_through.index()],
+            MirType::NativeInt,
+            "the load must read through the untracked pointer, not the managed one"
+        );
+    }
+
+    /// `p == null` on a pointer: `ldnull` pushes a REFERENCE and the pointer is a native int, and a
+    /// `Compare` needs its operands to agree. Both are one word, so the comparison is on the bits.
+    #[cfg(any(feature = "arm32", feature = "riscv32"))]
+    #[test]
+    fn a_pointer_compares_against_ldnull() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldnull),
+                Instruction::new(Opcode::StlocS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdlocS, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ldnull),
+                Instruction::simple(Opcode::Ceq),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) =
+            lower_method_typed(&body, &NoCalls, &[], &[MirType::NativeInt]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks.iter().flat_map(|b| &b.insts).any(|(_, i)| matches!(
+                i,
+                Inst::ConstInt { ty: MirType::NativeInt, value: 0 }
+            )),
+            "the null pointer is a native zero"
+        );
+    }
+
+    /// A `constrained. T` + `callvirt` on a value type that does NOT provide the method: the
+    /// receiver is a byref, and ECMA-335 III.2.1 dereferences it, BOXES the value, and dispatches
+    /// on the boxed object -- the same object the front end builds when it spells the call
+    /// `ldloc; box; callvirt` instead.
+    #[cfg(any(feature = "arm32", feature = "riscv32"))]
+    #[test]
+    fn constrained_callvirt_on_an_inherited_method_boxes_the_receiver() {
+        use lamella_token::Token;
+        struct Inherited;
+        impl CallResolver for Inherited {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::ObjectRef),
+                    target: CallTarget::Internal(3),
+                })
+            }
+            fn boxed_layout(&self, _: &Operand) -> Option<ReferenceLayout> {
+                Some(ReferenceLayout {
+                    handle: lamella_ir::TypeHandle(9),
+                    size: 4,
+                    reference_offsets: Vec::new(),
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                Some(2)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Constrained, Operand::Token(Token::new(0x02, 4))),
+                Instruction::new(Opcode::Callvirt, Operand::Token(lamella_token::Token::new(0x0A, 2))),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &Inherited, &[], &[MirType::I32]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::Alloc { payload_size: 4, .. })),
+            "an inherited target must box the byref's value"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldStore { offset: 0, .. }))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::CallVirtual { slot: 2, .. })),
+            "the boxed object dispatches through the vtable, not a direct call"
+        );
+    }
+
+    /// The other half of III.2.1: where the value type ITSELF provides the method, the byref IS
+    /// the receiver -- a direct call, and no allocation at all.
+    #[cfg(any(feature = "arm32", feature = "riscv32"))]
+    #[test]
+    fn constrained_callvirt_on_a_declared_method_calls_direct_without_boxing() {
+        use lamella_token::Token;
+        struct Declared;
+        impl CallResolver for Declared {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::ObjectRef),
+                    target: CallTarget::Internal(3),
+                })
+            }
+            fn constrained_call(&self, _: &Operand, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::ObjectRef),
+                    target: CallTarget::Internal(11),
+                })
+            }
+            fn boxed_layout(&self, _: &Operand) -> Option<ReferenceLayout> {
+                Some(ReferenceLayout {
+                    handle: lamella_ir::TypeHandle(9),
+                    size: 4,
+                    reference_offsets: Vec::new(),
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                Some(2)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Constrained, Operand::Token(Token::new(0x02, 4))),
+                Instruction::new(Opcode::Callvirt, Operand::Token(lamella_token::Token::new(0x0A, 2))),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &Declared, &[], &[MirType::I32]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            !insts.iter().any(|(_, i)| matches!(i, Inst::Alloc { .. })),
+            "a method the type declares needs no box"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::Call { callee: 11, .. })),
+            "the constrained type's own implementation is what gets called"
+        );
+        assert!(
+            !insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::CallVirtual { .. })),
+            "a devirtualized constrained call must not also dispatch virtually"
+        );
+    }
+
+    /// A catch handler whose body is `stloc.0` then the given instruction stream, wrapped in a try
+    /// that throws -- the shape every binding-classification test below varies.
+    fn binding_handler(after_store: Vec<Instruction>) -> MethodBodyImage {
+        let mut code = vec![
+            Instruction::new(Opcode::Newobj, Operand::Token(lamella_token::Token::new(0x0A, 1))),
+            Instruction::simple(Opcode::Throw),
+            Instruction::new(Opcode::Stloc, Operand::Variable(0)),
+        ];
+        let handler_len = 1 + after_store.len() as u32;
+        code.extend(after_store);
+        code.push(Instruction::new(Opcode::LdcI4, Operand::Int32(7)));
+        code.push(Instruction::simple(Opcode::Ret));
+        MethodBodyImage {
+            max_stack: 4,
+            init_locals: false,
+            local_var_sig: None,
+            code: code.into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 2 },
+                handler_range: lamella_cil::InstructionRange {
+                    start: 2,
+                    end: 2 + handler_len,
+                },
+                kind: EhKind::Catch(lamella_token::Token::new(0x01, 1)),
+            }]
+            .into_boxed_slice(),
+        }
+    }
+
+    /// A resolver that names an exception type, reports a callee of the given arity, and supplies a
+    /// binding layout -- enough to drive the materialization end to end.
+    struct CatchBindingResolver {
+        /// The arity the `call`/`callvirt` resolver reports, RECEIVER INCLUDED.
+        args: usize,
+        /// Whether a binding layout is available, so the tag-keeping default can be tested too.
+        layout: bool,
+    }
+
+    impl CallResolver for CatchBindingResolver {
+        fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+            Some(CallInfo {
+                args: self.args,
+                has_result: true,
+                result_type: Some(MirType::ObjectRef),
+                target: CallTarget::Internal(9),
+            })
+        }
+        fn exception_tag(&self, _operand: &Operand) -> Option<u32> {
+            Some(0xABCD_1234)
+        }
+        fn is_catch_all_type(&self, _operand: &Operand) -> bool {
+            true
+        }
+        fn catch_binding_layout(&self, _operand: &Operand) -> Option<ReferenceLayout> {
+            self.layout.then(|| ReferenceLayout {
+                handle: TypeHandle(0x0200_0009),
+                size: 8,
+                reference_offsets: alloc::vec![0, 4],
+            })
+        }
+        fn virtual_slot(&self, _operand: &Operand) -> Option<usize> {
+            Some(3)
+        }
+    }
+
+    /// Whether a lowered body carries the two instructions a materialization is made of.
+    fn is_materialized(func: &Function) -> bool {
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        insts.iter().any(|(_, i)| matches!(i, Inst::InitStruct))
+            && insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::TypeDescAddr { .. }))
+    }
+
+    #[test]
+    fn a_catch_binding_that_is_never_read_stays_a_tag() {
+        let body = binding_handler(vec![Instruction::new(Opcode::Leave, Operand::Target(4))]);
+        let resolver = CatchBindingResolver {
+            args: 1,
+            layout: true,
+        };
+        let (func, _) =
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            !is_materialized(&func),
+            "an unread binding must lower exactly as it did before the object model"
+        );
+    }
+
+    #[test]
+    fn a_catch_binding_read_by_a_nullary_call_is_materialized() {
+        let body = binding_handler(vec![
+            Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+            Instruction::new(Opcode::Callvirt, Operand::Token(lamella_token::Token::new(0x0A, 2))),
+            Instruction::simple(Opcode::Pop),
+            Instruction::new(Opcode::Leave, Operand::Target(6)),
+        ]);
+        let resolver = CatchBindingResolver {
+            args: 1,
+            layout: true,
+        };
+        let (func, _) =
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            is_materialized(&func),
+            "a read binding needs an object: a tag cannot answer a member access"
+        );
+        let cell = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(v, i)| matches!(i, Inst::InitStruct).then_some(*v))
+            .expect("the frame cell is defined");
+        let payload = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(v, i)| match i {
+                Inst::FieldAddr { base, offset: 4 } if *base == cell => Some(*v),
+                _ => None,
+            })
+            .expect("the payload address is taken at offset 4, past the header word");
+        assert!(
+            func.blocks.iter().flat_map(|b| &b.insts).any(
+                |(_, i)| matches!(i, Inst::CallVirtual { args, .. } if args.first() == Some(&payload))
+            ),
+            "the receiver must be the materialized payload pointer"
+        );
+    }
+
+    #[test]
+    fn a_catch_binding_passed_as_a_call_argument_is_refused() {
+        let body = binding_handler(vec![
+            Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+            Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token::new(0x0A, 3))),
+            Instruction::new(Opcode::Leave, Operand::Target(6)),
+        ]);
+        let escaping = CatchBindingResolver {
+            args: 2,
+            layout: true,
+        };
+        assert_eq!(
+            lower_method_typed(&body, &escaping, &[], &[MirType::ObjectRef]).err(),
+            Some(CilError::ExceptionBindingEscapes),
+            "an escaping binding is refused at compile time, not compiled to a dangling pointer"
+        );
+        let receiver_only = CatchBindingResolver {
+            args: 1,
+            layout: true,
+        };
+        assert!(
+            lower_method_typed(&body, &receiver_only, &[], &[MirType::ObjectRef]).is_ok(),
+            "the refusal must come from the arity, not from the instruction pair"
+        );
+    }
+
+    #[test]
+    fn taking_the_address_of_a_catch_binding_is_refused() {
+        let body = binding_handler(vec![
+            Instruction::new(Opcode::Ldloca, Operand::Variable(0)),
+            Instruction::simple(Opcode::Pop),
+            Instruction::new(Opcode::Leave, Operand::Target(6)),
+        ]);
+        let resolver = CatchBindingResolver {
+            args: 1,
+            layout: true,
+        };
+        assert_eq!(
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef]).err(),
+            Some(CilError::ExceptionBindingEscapes),
+        );
+    }
+
+    #[test]
+    fn a_resolver_with_no_binding_layout_keeps_the_tag() {
+        let body = binding_handler(vec![
+            Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+            Instruction::new(Opcode::Callvirt, Operand::Token(lamella_token::Token::new(0x0A, 2))),
+            Instruction::simple(Opcode::Pop),
+            Instruction::new(Opcode::Leave, Operand::Target(6)),
+        ]);
+        let resolver = CatchBindingResolver {
+            args: 1,
+            layout: false,
+        };
+        let (func, _) =
+            lower_method_typed(&body, &resolver, &[], &[MirType::ObjectRef]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(!is_materialized(&func));
     }
 }

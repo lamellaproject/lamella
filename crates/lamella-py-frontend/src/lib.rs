@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod boardfacts;
 pub mod compile;
 pub mod exc;
 pub mod lexer;
@@ -28,6 +29,8 @@ pub enum FrontendError {
     Parse(parser::ParseError),
     /// A lowering error (a construct outside the typed subset).
     Compile(compile::CompileError),
+    /// A board fact the program names and the board does not state.
+    BoardFact(boardfacts::BoardFactError),
 }
 
 impl core::fmt::Display for FrontendError {
@@ -36,7 +39,14 @@ impl core::fmt::Display for FrontendError {
             FrontendError::Lex(e) => write!(f, "lex error: {e}"),
             FrontendError::Parse(e) => write!(f, "syntax error: {e}"),
             FrontendError::Compile(e) => write!(f, "compile error: {e}"),
+            FrontendError::BoardFact(e) => write!(f, "board fact error: {e}"),
         }
+    }
+}
+
+impl From<boardfacts::BoardFactError> for FrontendError {
+    fn from(e: boardfacts::BoardFactError) -> Self {
+        FrontendError::BoardFact(e)
     }
 }
 
@@ -68,6 +78,32 @@ pub fn compile_str(
     let ast = parser::parse(tokens)?;
     let module = compile::compile_module(module_name, &ast)?;
     Ok(module)
+}
+
+/// Compile Python `source` against ONE BOARD's generated facts: `import board` plus every
+/// `board.` the program reads are resolved to constants before compilation, and the import is
+/// dropped. `board_source` is a generated `bsp/<board>/python/board.py`.
+///
+/// This is how a tier with no filesystem and no import machinery reads the same facts the
+/// interpreter loads at run time -- the program is spelled identically either way; only the moment
+/// the fact is bound differs. A program that never imports the board module compiles exactly as
+/// [`compile_str`] would compile it.
+pub fn compile_str_for_board(
+    module_name: &str,
+    source: &str,
+    board_source: &str,
+) -> Result<(bytecode::Module, usize), FrontendError> {
+    let facts = boardfacts::BoardFacts::parse(board_source)?;
+    if facts.is_empty() {
+        return Err(FrontendError::from(boardfacts::BoardFactError::Unparsable(
+            alloc::string::String::from("it states no facts at all"),
+        )));
+    }
+    let tokens = lexer::tokenize(source)?;
+    let mut ast = parser::parse(tokens)?;
+    let bound = boardfacts::fold_module(&mut ast, &facts)?;
+    let module = compile::compile_module(module_name, &ast)?;
+    Ok((module, bound))
 }
 
 /// Compile a multi-file Python program into a [`bytecode::Bundle`]: the `entry` module plus,

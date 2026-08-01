@@ -27,6 +27,11 @@ pub trait Transport {
 /// The standard CMSIS-DAP v1 HID report size.
 const PACKET: usize = 64;
 
+/// How many stale replies [`Dap::command`] will discard while looking for its own echo. Small on
+/// purpose: it only has to cover the replies an abandoned session can leave queued, and each read
+/// past the backlog costs a full transport timeout.
+const STALE_REPLY_LIMIT: usize = 4;
+
 /// The 128-bit dormant-to-SWD SELECTION ALERT (Arm ADIv5.1 / ADIv6): the fixed value every SWD-DP
 /// recognizes to leave the dormant state, least-significant bit first. Followed by the 8-bit SWD
 /// activation code `0x1A`. Used by [`Dap::connect_swd_from_dormant`].
@@ -188,17 +193,32 @@ impl<T: Transport> Dap<T> {
     }
 
     /// Sends a command and returns the reply slice, checking the command-id echo.
+    ///
+    /// A MISMATCHED ECHO IS RESYNCHRONIZED, NOT REPORTED, and that is what makes a probe
+    /// recoverable. Replies are strictly ordered one per command, so an echo that names a
+    /// different command means the pipe still holds a reply nobody read -- which is what an
+    /// earlier session leaves behind when it is killed between writing and reading. Failing on
+    /// that error leaves the stale reply queued, so the NEXT session reads it, fails the same way,
+    /// and leaves its own: the probe stays poisoned until it is physically unplugged, and the
+    /// symptom is a pair of errors that alternate as each run shifts the queue by one. Discarding
+    /// replies until the echo matches consumes the backlog and ends it.
     fn command(&mut self, request: &[u8]) -> Result<&[u8], DapError> {
         self.transport.write_packet(request)?;
-        let n = self.transport.read_packet(&mut self.reply)?;
-        let reply = &self.reply[..n];
-        if reply.first() != request.first() {
-            return Err(DapError::Unexpected {
-                expected: request.first().copied().unwrap_or(0),
-                got: reply.first().copied().unwrap_or(0),
-            });
+        let want = request.first().copied().unwrap_or(0);
+        let mut got = 0;
+        let mut matched = None;
+        for _ in 0..=STALE_REPLY_LIMIT {
+            let n = self.transport.read_packet(&mut self.reply)?;
+            got = self.reply.first().copied().unwrap_or(0);
+            if got == want {
+                matched = Some(n);
+                break;
+            }
         }
-        Ok(reply)
+        match matched {
+            Some(n) => Ok(&self.reply[..n]),
+            None => Err(DapError::Unexpected { expected: want, got }),
+        }
     }
 
     /// Reads a `DAP_Info` string from the probe itself (no target involved): `id` 0x01 vendor,
@@ -853,12 +873,20 @@ mod tests {
     }
 
     #[test]
-    fn wrong_echo_is_error() {
-        let mut dap = Dap::new(Mock::new(vec![vec![0xff, 0, 0]]));
-        assert!(matches!(
-            dap.read_idcode(),
-            Err(DapError::Unexpected { .. })
-        ));
+    fn a_stale_reply_is_discarded_and_the_command_still_answers() {
+        let replies = vec![
+            vec![0xff, 0, 0],
+            vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x77, 0x14, 0xb1, 0x0b],
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        assert_eq!(dap.read_idcode().unwrap(), 0x0bb1_1477);
+    }
+
+    #[test]
+    fn a_probe_that_never_echoes_the_command_is_still_an_error() {
+        let replies = vec![vec![0xff, 0, 0]; STALE_REPLY_LIMIT + 1];
+        let mut dap = Dap::new(Mock::new(replies));
+        assert!(matches!(dap.read_idcode(), Err(DapError::Unexpected { .. })));
     }
 
     #[test]

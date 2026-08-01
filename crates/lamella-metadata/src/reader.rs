@@ -13,7 +13,7 @@ use crate::layout::{LayoutError, TargetLayout, TypeLayout, layout_value_type};
 use crate::pe::PeImage;
 use crate::rows::Tables;
 use crate::signature::{
-    MethodSig, SigType, calling, element, parse_field, parse_local_var_sig, parse_method,
+    LocalVar, MethodSig, SigType, calling, element, parse_field, parse_local_vars, parse_method,
     parse_type,
 };
 use crate::tables::{TableError, TablesHeader, table};
@@ -1686,8 +1686,28 @@ impl<'a> Method<'a> {
     /// the local's slot number. Empty when the method declares no locals (or has no
     /// body). This is what an interpreter or AOT lowering needs to type its locals,
     /// and what `lamella-dap` needs to show them.
+    ///
+    /// TYPES ONLY: the `pinned` constraint a `fixed` statement's holder slot carries is not in
+    /// this answer. A consumer that derives a raw address from a slot and reports roots to a
+    /// MOVING collector needs [`Self::local_variable_slots`] instead -- see [`LocalVar::pinned`].
     #[must_use]
     pub fn local_variables(&self) -> Vec<SigType> {
+        self.local_variable_slots()
+            .into_iter()
+            .map(|local| local.ty)
+            .collect()
+    }
+
+    /// The method's local-variable slots COMPLETE -- each slot's type AND its `pinned`
+    /// constraint (II.23.2.6), indexed by slot number. Empty when the method declares no
+    /// locals (or has no body).
+    ///
+    /// [`Self::local_variables`] is the types-only view over the same decode. This is the one a
+    /// collector-facing consumer wants: a pinned slot is a C# `fixed` statement's holder, and its
+    /// promise (do not relocate this object while the slot is live) is what keeps the untracked
+    /// `T*` the statement hands the program valid across a collection.
+    #[must_use]
+    pub fn local_variable_slots(&self) -> Vec<LocalVar> {
         let Some(token) = self.body().and_then(|body| body.local_var_sig) else {
             return Vec::new();
         };
@@ -1695,7 +1715,7 @@ impl<'a> Method<'a> {
             .tables
             .row(table::STAND_ALONE_SIG, token.row())
             .and_then(|row| self.assembly.image.blob().get(row.raw(0)).ok())
-            .and_then(|blob| parse_local_var_sig(blob).ok())
+            .and_then(|blob| parse_local_vars(blob).ok())
             .unwrap_or_default()
     }
 

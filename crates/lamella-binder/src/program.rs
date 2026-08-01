@@ -4,9 +4,9 @@ use crate::bind::{bind_type, parameter_symbol};
 use crate::bound::{Binder, literal_int_value};
 use crate::declaration::{
     accessibility_of, collect_into, is_constant_form, model_const_values, qualified_type_name,
-    resolve_const_expr,
+    resolve_const_expr, resolve_constants,
 };
-use crate::diagnostic::{Diagnostic, DiagnosticKind, SignaturePosition};
+use crate::diagnostic::{Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition};
 use crate::reference::load_assembly;
 use crate::special::SpecialType;
 use crate::symbols::{Accessibility, Model, TypeInfo};
@@ -18,7 +18,7 @@ use lamella_metadata::Assembly;
 use lamella_syntax::ast::{
     AttributeSection, CompilationUnit, ConversionDirection, DelegateDecl, EnumDecl, Member, Modifier,
     NamespaceMember, OverloadableOperator, Parameter, ParameterModifier, QualifiedName, TypeDecl,
-    TypeKind, TypeRefKind, UsingDirective, UsingKind,
+    TypeKind, TypeRef, TypeRefKind, UsingDirective, UsingKind,
 };
 use lamella_syntax::span::Span;
 
@@ -56,6 +56,7 @@ pub fn bind_compilation_unit_with_references_and_options(
     collect_into(&mut model, unit);
     model.canonicalize_signatures();
     model.link_bases();
+    resolve_constants(&mut model, core::slice::from_ref(unit));
     let mut binder = Binder::with_model(model);
     binder.set_unsafe_option_missing(unsafe_option_missing);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
@@ -63,7 +64,10 @@ pub fn bind_compilation_unit_with_references_and_options(
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
     report_multiple_entry_points(&mut binder);
     binder.report_unused_fields();
-    binder.into_diagnostics()
+    let mut units = [binder.into_diagnostics()];
+    withhold_body_diagnostics_after_declaration_error(&mut units);
+    let [diagnostics] = units;
+    diagnostics
 }
 
 /// Binds `unit` against an already-built reference `model`, into which the unit's
@@ -76,13 +80,17 @@ pub fn bind_compilation_unit_with_model(
     collect_into(&mut model, unit);
     model.canonicalize_signatures();
     model.link_bases();
+    resolve_constants(&mut model, core::slice::from_ref(unit));
     let mut binder = Binder::with_model(model);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
     report_multiple_entry_points(&mut binder);
     binder.report_unused_fields();
-    binder.into_diagnostics()
+    let mut units = [binder.into_diagnostics()];
+    withhold_body_diagnostics_after_declaration_error(&mut units);
+    let [diagnostics] = units;
+    diagnostics
 }
 
 /// The set of type names already declared in each namespace, so a second declaration of
@@ -141,6 +149,72 @@ fn report_duplicate_types(
 
 /// CS0017: a program declares more than one entry point when two or more of its types have a
 /// valid `static Main` (10.1). lcsc has no `/main` selector, so any second entry point is an error.
+/// The CLI's RESTRICTED TYPES, by the simple name csc quotes in the message.
+///
+/// A value of one of these carries a managed pointer into the frame that created it, so it must
+/// never outlive that frame. The language enforces that by PLACEMENT rather than by analysis:
+/// a local and a by-value parameter are legal (both die with the frame), and returning one,
+/// storing it in a field or an array element, or passing it by reference are each refused --
+/// those are the four ways out. `System.RuntimeArgumentHandle` is restricted for the same reason
+/// even though it is not itself a pointer: it names a frame's argument list.
+///
+/// Matched on the LAST segment so `TypedReference`, `System.TypedReference` and a `using`-aliased
+/// spelling all resolve alike. That over-matches a user type of the same simple name in another
+/// namespace; the tighter form wants the resolved symbol, and this position runs before the
+/// member's type is bound.
+pub(crate) fn restricted_type_name(ty: &TypeRef) -> Option<&'static str> {
+    let TypeRefKind::Name(parts) = &ty.kind else {
+        return None;
+    };
+    match parts.last().map(alloc_str)? {
+        "TypedReference" => Some("TypedReference"),
+        "ArgIterator" => Some("ArgIterator"),
+        "RuntimeArgumentHandle" => Some("RuntimeArgumentHandle"),
+        _ => None,
+    }
+}
+
+/// `&Box<str>` -> `&str`, so the match above reads as string literals.
+fn alloc_str(part: &Box<str>) -> &str {
+    part
+}
+
+/// The restricted type an ARRAY's element type names, at any nesting depth --
+/// `TypedReference[][]` is refused the same as `TypedReference[]`.
+pub(crate) fn restricted_array_element(ty: &TypeRef) -> Option<&'static str> {
+    match &ty.kind {
+        TypeRefKind::Array { element, .. } => {
+            restricted_type_name(element).or_else(|| restricted_array_element(element))
+        }
+        _ => None,
+    }
+}
+
+/// The restricted-type rules a PARAMETER is subject to, shared by every parameter list (a
+/// method's, a delegate's, an indexer's, an operator's) so the rule has one definition.
+///
+/// A BY-VALUE parameter of a restricted type is LEGAL and must not be flagged -- it dies with the
+/// frame exactly as a local does. Only `ref`/`out` is a way out.
+fn report_restricted_parameter(binder: &mut Binder, parameter: &Parameter) {
+    if matches!(
+        parameter.modifier,
+        Some(ParameterModifier::Ref | ParameterModifier::Out)
+    ) {
+        if let Some(name) = restricted_type_name(&parameter.ty) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::RestrictedTypeByReference { ty: name.into() },
+                parameter.ty.span,
+            ));
+        }
+    }
+    if let Some(name) = restricted_array_element(&parameter.ty) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::RestrictedTypeArrayElement { ty: name.into() },
+            parameter.ty.span,
+        ));
+    }
+}
+
 fn report_multiple_entry_points(binder: &mut Binder) {
     if binder.model().entry_point_count() > 1 {
         binder.report(Diagnostic::new(
@@ -184,6 +258,7 @@ pub fn bind_compilation_units_with_references_and_options(
     }
     model.canonicalize_signatures();
     model.link_bases();
+    resolve_constants(&mut model, units);
     let mut binder = Binder::with_model(model);
     binder.set_unsafe_option_missing(unsafe_option_missing);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
@@ -204,6 +279,7 @@ pub fn bind_compilation_units_with_references_and_options(
             ));
         }
     }
+    withhold_body_diagnostics_after_declaration_error(&mut per_unit);
     per_unit
 }
 
@@ -409,6 +485,20 @@ fn invalid_delegate_modifier(modifier: &Modifier) -> Option<&'static str> {
 
 fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaration: &DelegateDecl) {
     validate_parameter_names(binder, &declaration.parameters);
+    if let Some(name) = restricted_array_element(&declaration.return_type) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::RestrictedTypeArrayElement { ty: name.into() },
+            declaration.return_type.span,
+        ));
+    } else if let Some(name) = restricted_type_name(&declaration.return_type) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::RestrictedTypeReturn { ty: name.into() },
+            declaration.return_type.span,
+        ));
+    }
+    for parameter in &declaration.parameters {
+        report_restricted_parameter(binder, parameter);
+    }
     for modifier in &declaration.modifiers {
         if let Some(name) = invalid_delegate_modifier(modifier) {
             binder.report(Diagnostic::new(
@@ -720,6 +810,40 @@ fn member_attributes(member: &Member) -> Option<&[AttributeSection]> {
     Some(attributes)
 }
 
+/// Withholds every BODY-phase diagnostic when the DECLARATION phase reported an error anywhere in
+/// the compilation -- csc's behavior, and the reason a program with one bad signature reports that
+/// signature and nothing else.
+///
+/// WHY A COMPILER DOES THIS. Bodies are checked AGAINST declarations. If a declaration is wrong,
+/// every conclusion drawn from it is suspect: an `out` parameter of an illegal type is not really
+/// an out parameter, so "you did not assign it" is a statement about a method that does not exist
+/// as written. csc reports the declaration and stops, and the repair is to fix the declaration and
+/// compile again.
+///
+/// IT IS COMPILATION-WIDE, NOT PER-MEMBER, and that was the surprise worth measuring: a bad
+/// signature in one class withholds an unrelated definite-assignment error in a DIFFERENT class,
+/// in a different file. The two passes are over the whole compilation, so the gate is too -- which
+/// is why this takes every unit's diagnostics at once rather than filtering each as it finishes.
+///
+/// ERRORS ONLY. A declaration WARNING does not gate: csc reports an unused-field warning and a
+/// body's definite-assignment error together. Measured, both directions.
+///
+/// THIS CANNOT CHANGE ANY PROGRAM'S VERDICT, which is what makes it safe to apply so broadly. It
+/// fires only when a declaration ERROR is already present, so the compilation was failing before
+/// and fails after; all that changes is how many diagnostics accompany the one that matters.
+pub fn withhold_body_diagnostics_after_declaration_error(units: &mut [Vec<Diagnostic>]) {
+    let declaration_error = units.iter().flatten().any(|diagnostic| {
+        diagnostic.phase == DiagnosticPhase::Declaration
+            && diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+    });
+    if !declaration_error {
+        return;
+    }
+    for unit in units {
+        unit.retain(|diagnostic| diagnostic.phase == DiagnosticPhase::Declaration);
+    }
+}
+
 /// CS0579 / CS0182: the attribute rules that need no knowledge of the attribute CLASS. A section
 /// may not name the same attribute twice (24.2), and every argument must be a compile-time
 /// constant, a `typeof`, or an array creation -- an attribute is baked into metadata, so nothing
@@ -754,10 +878,21 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
                     attribute.span,
                 ));
             }
+            let positional = attribute
+                .arguments
+                .iter()
+                .filter(|argument| {
+                    matches!(argument, lamella_syntax::ast::AttributeArgument::Positional(_))
+                })
+                .count();
+            validate_attribute_parameter_types(binder, &resolved, positional, attribute.span);
             for argument in &attribute.arguments {
                 let value = match argument {
                     lamella_syntax::ast::AttributeArgument::Positional(value) => value,
-                    lamella_syntax::ast::AttributeArgument::Named { value, .. } => value,
+                    lamella_syntax::ast::AttributeArgument::Named { name, value } => {
+                        validate_named_attribute_argument(binder, &resolved, name, attribute.span);
+                        value
+                    }
                 };
                 if !is_attribute_argument_form(value) {
                     binder.report(Diagnostic::new(
@@ -768,6 +903,151 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
             }
         }
     }
+}
+
+/// CS0246: a named attribute argument `Name = value` whose `Name` matches NO member of the
+/// attribute class. csc reports this as an unfound TYPE rather than an unfound member -- the
+/// message is the ordinary "The type or namespace name 'Name' could not be found", measured
+/// against csc rather than predicted, since CS0117 is what the shape suggests.
+///
+/// CS0181: the attribute constructor this application binds to takes a parameter whose type cannot
+/// be encoded as an attribute argument (24.1.3). An attribute's arguments are baked into metadata,
+/// so the legal set is exactly what the blob can carry.
+///
+/// FOUR PROPERTIES, ALL MEASURED AGAINST csc RATHER THAN ASSUMED, because each one changed the
+/// implementation:
+/// - It fires at the APPLICATION, not the declaration. An attribute class with a bad constructor
+///   that is never applied is clean, and so is one whose OTHER constructor is the one used.
+/// - ONE DIAGNOSTIC PER BAD PARAMETER, in declaration order -- not one per attribute.
+/// - Per application SITE: applying the same attribute to two types reports twice.
+///
+/// THE ARITY GUARD IS A DELIBERATE UNDER-REPORT, and the measurement says so plainly. csc does
+/// real overload resolution over the attribute's arguments, so it separates two same-arity
+/// constructors when the ARGUMENTS can: `A(Item)` versus `A(int)` applied as `[A(null)]` resolves
+/// to `A(Item)` and reports CS0181, while `A(Item)` versus `A(string)` is genuinely ambiguous and
+/// draws CS0121 instead. This matches only on arity, so it reports for the first case just as csc
+/// does when there is ONE candidate, and stays silent whenever two share the count -- covering
+/// csc's CS0121 case correctly and MISSING its resolvable one. A gap, never a wrong code. Closing
+/// it means binding the attribute arguments to types here, which is the increment, not a tweak.
+///
+/// SILENT WHEN THE PARAMETER HAS NO KNOWN NAME. The message quotes the name, and a method whose
+/// source could not supply one has no honest way to fill that slot -- a blank or invented name in
+/// an otherwise authoritative sentence is worse than no diagnostic. This is the case
+/// [`MethodSymbol::parameter_name`] returns `None` for.
+fn validate_attribute_parameter_types(
+    binder: &mut Binder,
+    attribute_type: &TypeSymbol,
+    positional: usize,
+    span: Span,
+) {
+    if attribute_type.is_error() {
+        return;
+    }
+    let Some(info) = binder.model().get_by_symbol(attribute_type) else {
+        return;
+    };
+    let mut candidates = info
+        .constructors
+        .iter()
+        .filter(|constructor| constructor.parameters.len() == positional);
+    let Some(constructor) = candidates.next() else {
+        return;
+    };
+    if candidates.next().is_some() {
+        return;
+    }
+    let offenders: Vec<(Box<str>, Box<str>)> = constructor
+        .parameters
+        .iter()
+        .enumerate()
+        .filter(|(_, ty)| !is_valid_attribute_parameter_type(binder.model(), ty))
+        .filter_map(|(index, ty)| {
+            constructor
+                .parameter_name(index)
+                .map(|name| (Box::from(name), Box::from(ty.to_string().as_str())))
+        })
+        .collect();
+    for (parameter, type_name) in offenders {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::InvalidAttributeParameterType {
+                parameter,
+                type_name,
+            },
+            span,
+        ));
+    }
+}
+
+/// Whether `ty` may be an attribute argument (24.1.3): a primitive the metadata blob encodes,
+/// `string`, `object`, `System.Type`, an enum, or a SINGLE-dimensional array of one of those.
+///
+/// `decimal` is the trap worth naming: it is a C# primitive and a compile-time constant type, and
+/// it is NOT encodable here -- measured, because the predicate reads as "the built-in value types"
+/// and that answer would be wrong. Jagged arrays are excluded by the same clause that admits
+/// arrays: the ELEMENT must itself be a legal non-array type, so `int[]` is legal and `int[][]` is
+/// not, and neither is any rank above one.
+fn is_valid_attribute_parameter_type(model: &Model, ty: &TypeSymbol) -> bool {
+    match ty {
+        TypeSymbol::Special(special) => !matches!(
+            special,
+            SpecialType::Decimal | SpecialType::Void | SpecialType::Null
+        ),
+        TypeSymbol::Named(_) => {
+            if qualified_type_name_of(ty) == "System.Type" {
+                return true;
+            }
+            model
+                .get_by_symbol(ty)
+                .is_some_and(|info| info.kind == crate::symbols::TypeKind::Enum)
+        }
+        TypeSymbol::Array { element, rank } => {
+            *rank == 1
+                && !matches!(**element, TypeSymbol::Array { .. })
+                && is_valid_attribute_parameter_type(model, element)
+        }
+        TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => false,
+    }
+}
+
+/// The dotted spelling of a named type symbol, for comparing against a known BCL name.
+fn qualified_type_name_of(ty: &TypeSymbol) -> String {
+    ty.to_string()
+}
+
+/// THREE FAILURES SHARE THIS SYNTAX AND csc GIVES EACH ITS OWN CODE, because the repairs differ:
+/// CS0246 when nothing of that name exists (rename it), CS0122 when it exists but is not reachable
+/// from here (widen it), CS0617 when it is reachable but can never be assigned in an attribute
+/// (pick a different member). Classified by [`Binder::named_attribute_argument_target`], which
+/// keeps the member knowledge next to the rest of the member lookup.
+fn validate_named_attribute_argument(
+    binder: &mut Binder,
+    attribute_type: &TypeSymbol,
+    name: &str,
+    span: Span,
+) {
+    if attribute_type.is_error() {
+        return;
+    }
+    let target = binder.named_attribute_argument_target(attribute_type, name);
+    if let crate::bound::NamedArgumentTarget::Valid(declaring)
+    | crate::bound::NamedArgumentTarget::Inaccessible(declaring)
+    | crate::bound::NamedArgumentTarget::NotAValidTarget(declaring) = &target
+    {
+        binder.record_attribute_named_argument(&declaring.clone(), name);
+    }
+    let kind = match target {
+        crate::bound::NamedArgumentTarget::Valid(_) => return,
+        crate::bound::NamedArgumentTarget::Missing => {
+            DiagnosticKind::TypeNotFound { name: name.into() }
+        }
+        crate::bound::NamedArgumentTarget::Inaccessible(declaring) => DiagnosticKind::Inaccessible {
+            member: qualified_type_name(&declaring.to_string(), name).into(),
+        },
+        crate::bound::NamedArgumentTarget::NotAValidTarget(_) => {
+            DiagnosticKind::NotAValidNamedAttributeArgument { name: name.into() }
+        }
+    };
+    binder.report(Diagnostic::new(kind, span));
 }
 
 /// Whether an expression has a form an attribute argument may take (24.2): a constant expression,
@@ -784,6 +1064,50 @@ fn is_attribute_argument_form(value: &lamella_syntax::ast::Expr) -> bool {
 /// CS0768: a constructor that reaches ITSELF through a chain of `: this(...)` initializers
 /// (17.10.1). Such a chain would never terminate, so no constructor in the cycle can run. The
 /// graph is keyed by parameter-type list, which is what a `this(...)` call resolves on.
+/// The `ref`/`out`/by-value mode of each declared parameter, in order.
+fn parameter_modes(parameters: &[Parameter]) -> alloc::vec::Vec<crate::symbols::ParameterMode> {
+    crate::bind::parameter_infos(parameters)
+        .iter()
+        .map(|info| info.mode)
+        .collect()
+}
+
+/// Which duplicate-member code two same-signature members earn: `CS0663` when they differ only in
+/// a by-reference parameter's MODE, `CS0111` otherwise.
+///
+/// The two are indistinguishable by parameter TYPE -- `ref int` and `out int` are both `ByRef(int)`
+/// -- so the collision is detected the same way and only the recorded modes separate the codes.
+/// csc names the LATER declaration's modifier first, then the earlier one; measured both orders.
+fn duplicate_or_modifier_clash(
+    type_name: &str,
+    member: &str,
+    member_kind: &'static str,
+    current: &[crate::symbols::ParameterMode],
+    previous: &[crate::symbols::ParameterMode],
+) -> DiagnosticKind {
+    let keyword = |mode: crate::symbols::ParameterMode| match mode {
+        crate::symbols::ParameterMode::Ref => "ref",
+        crate::symbols::ParameterMode::Out => "out",
+        crate::symbols::ParameterMode::Value => "",
+    };
+    match current
+        .iter()
+        .zip(previous)
+        .find(|(mine, theirs)| mine != theirs)
+    {
+        Some((mine, theirs)) => DiagnosticKind::OverloadDiffersOnlyByRefOut {
+            type_name: type_name.into(),
+            member_kind,
+            current: keyword(*mine).into(),
+            previous: keyword(*theirs).into(),
+        },
+        None => DiagnosticKind::DuplicateMethod {
+            type_name: type_name.into(),
+            member: member.into(),
+        },
+    }
+}
+
 fn validate_constructor_initializer_cycles(binder: &mut Binder, declaration: &TypeDecl) {
     let constructors: Vec<(Vec<TypeSymbol>, Option<usize>, Span, &[Parameter])> = declaration
         .members
@@ -1439,8 +1763,11 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             _ => {}
         }
     }
-    let mut seen_methods: alloc::vec::Vec<(Box<str>, alloc::vec::Vec<TypeSymbol>)> =
-        alloc::vec::Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut seen_methods: alloc::vec::Vec<(
+        (Box<str>, alloc::vec::Vec<TypeSymbol>),
+        alloc::vec::Vec<crate::symbols::ParameterMode>,
+    )> = alloc::vec::Vec::new();
     for member in &declaration.members {
         let named = match member {
             Member::Method {
@@ -1463,20 +1790,28 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                     .map(parameter_symbol)
                     .collect::<alloc::vec::Vec<_>>(),
             );
-            if seen_methods.contains(&key) {
+            let modes = parameter_modes(parameters);
+            if let Some((_, previous)) = seen_methods.iter().find(|(seen, _)| *seen == key) {
                 binder.report(Diagnostic::new(
-                    DiagnosticKind::DuplicateMethod {
-                        type_name: declaration.name.clone(),
-                        member: name,
-                    },
+                    duplicate_or_modifier_clash(
+                        &declaration.name,
+                        &name,
+                        "method",
+                        &modes,
+                        previous,
+                    ),
                     *span,
                 ));
             } else {
-                seen_methods.push(key);
+                seen_methods.push((key, modes));
             }
         }
     }
-    let mut seen_constructors: alloc::vec::Vec<alloc::vec::Vec<TypeSymbol>> = alloc::vec::Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut seen_constructors: alloc::vec::Vec<(
+        alloc::vec::Vec<TypeSymbol>,
+        alloc::vec::Vec<crate::symbols::ParameterMode>,
+    )> = alloc::vec::Vec::new();
     for member in &declaration.members {
         if let Member::Constructor {
             modifiers,
@@ -1490,16 +1825,20 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             }
             let key: alloc::vec::Vec<TypeSymbol> =
                 parameters.iter().map(parameter_symbol).collect();
-            if seen_constructors.contains(&key) {
+            let modes = parameter_modes(parameters);
+            if let Some((_, previous)) = seen_constructors.iter().find(|(seen, _)| *seen == key) {
                 binder.report(Diagnostic::new(
-                    DiagnosticKind::DuplicateMethod {
-                        type_name: declaration.name.clone(),
-                        member: declaration.name.clone(),
-                    },
+                    duplicate_or_modifier_clash(
+                        &declaration.name,
+                        &declaration.name,
+                        "constructor",
+                        &modes,
+                        previous,
+                    ),
                     *span,
                 ));
             } else {
-                seen_constructors.push(key);
+                seen_constructors.push((key, modes));
             }
         }
     }
@@ -2215,6 +2554,28 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             }
             _ => {}
         }
+        let restricted_position = match member {
+            Member::Field { ty, .. } | Member::Property { ty, .. } => Some((ty, true)),
+            Member::Method { return_type: ty, .. }
+            | Member::Operator { return_type: ty, .. }
+            | Member::Indexer { ty, .. } => Some((ty, false)),
+            _ => None,
+        };
+        if let Some((ty, stores)) = restricted_position {
+            if let Some(name) = restricted_array_element(ty) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::RestrictedTypeArrayElement { ty: name.into() },
+                    ty.span,
+                ));
+            } else if let Some(name) = restricted_type_name(ty) {
+                let kind = if stores {
+                    DiagnosticKind::RestrictedTypeField { ty: name.into() }
+                } else {
+                    DiagnosticKind::RestrictedTypeReturn { ty: name.into() }
+                };
+                binder.report(Diagnostic::new(kind, ty.span));
+            }
+        }
         match member {
             Member::Method { parameters, .. }
             | Member::Constructor { parameters, .. }
@@ -2223,6 +2584,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             | Member::Indexer { parameters, .. } => {
                 for parameter in parameters {
                     binder.resolve_named_type(&bind_type(&parameter.ty), parameter.ty.span);
+                    report_restricted_parameter(binder, parameter);
                 }
             }
             _ => {}
@@ -2415,14 +2777,13 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 let field_ty = binder.canonicalize(&bind_type(ty));
                 let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
                 for declarator in declarators {
-                    let is_candidate = !is_const
-                        && !field_ty.is_void()
-                        && declarator.name != declaration.name
-                        && binder
-                            .model()
-                            .get_by_symbol(&enclosing)
-                            .and_then(|info| info.find_field(&declarator.name))
-                            .is_some_and(|field| field.accessibility == Accessibility::Private);
+                    let is_private = binder
+                        .model()
+                        .get_by_symbol(&enclosing)
+                        .and_then(|info| info.find_field(&declarator.name))
+                        .is_some_and(|field| field.accessibility == Accessibility::Private);
+                    let is_candidate =
+                        !is_const && !field_ty.is_void() && declarator.name != declaration.name;
                     if is_candidate {
                         let eligible_never_used = !is_const
                             && type_is_resolvable(binder.model(), &field_ty)
@@ -2441,6 +2802,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                             declarator.span,
                             shared_prefix,
                             eligible_never_used,
+                            is_private,
                             default_value,
                         );
                     }
@@ -2450,6 +2812,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                             &declarator.name,
                             &field_ty,
                             initializer,
+                            is_const,
                         );
                     }
                 }
@@ -2485,6 +2848,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         _ => {}
     }
     check_constant_cycles(binder, declaration);
+    binder.check_base_constructor_call(&enclosing, declaration);
     binder.check_interface_implementations(&enclosing, declaration);
     binder.check_overrides_have_base(&enclosing, declaration);
     binder.check_property_overrides_have_base(&enclosing, declaration);
@@ -2952,6 +3316,151 @@ mod tests {
     }
 
     #[test]
+    fn a_base_constructor_call_with_no_matching_constructor_is_reported() {
+        assert_eq!(
+            sorted_codes("class B { public B(int value) { } } class D : B { public D() { } }"),
+            [7036]
+        );
+        assert_eq!(
+            sorted_codes("class B { public B(int value) { } } class D : B { }"),
+            [7036]
+        );
+        assert_eq!(
+            sorted_codes("class B { public B(int value) { } } class D : B { public D() : base() { } }"),
+            [7036]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { public B(int a) { } public B(string s) { } } \
+                 class D : B { public D() { } }"
+            ),
+            [1729]
+        );
+        assert!(sorted_codes("class B { public B() { } } class D : B { public D() { } }").is_empty());
+        assert!(sorted_codes(
+            "class B { public B(int value) { } } class D : B { public D() : base(1) { } }"
+        )
+        .is_empty());
+        assert!(sorted_codes(
+            "class B { public B(int value) { } } \
+             class D : B { public D() : this(1) { } public D(int v) : base(v) { } }"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn too_few_arguments_with_one_candidate_names_the_parameter_cs7036() {
+        assert_eq!(
+            sorted_codes("class C { static void M(int a, string b) { } static void Go() { M(1); } }"),
+            [7036]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static void M(int a) { } static void M(int a, string b) { } \
+                 static void Go() { M(); } }"
+            ),
+            [1501]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void M(int a) { } static void Go() { M(1, 2); } }"),
+            [1501]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { public B(int value) { } } class C { static void Go() { B b = new B(); } }"
+            ),
+            [7036]
+        );
+    }
+
+    #[test]
+    fn a_modifier_the_parameter_does_not_take_is_cs1615() {
+        assert_eq!(
+            sorted_codes("class C { static void T(int x) { } static void M() { int v = 1; T(ref v); } }"),
+            [1615]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void T(int x) { } static void M() { int v = 1; T(out v); } }"),
+            [1615]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void T(ref int x) { } static void M() { int v = 1; T(v); } }"),
+            [1620]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void T(int x) { } static void M() { string s = null; T(ref s); } }"),
+            [1615]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static void T(int a, int b) { } \
+                 static void M() { string s = null; int v = 1; T(v, ref s); } }"
+            ),
+            [1615]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static void T(ref int x) { } static void T(int y) { } \
+                 static void M() { string s = null; T(ref s); } }"
+            ),
+            [1503]
+        );
+    }
+
+    #[test]
+    fn members_differing_only_by_ref_and_out_are_cs0663() {
+        assert_eq!(
+            sorted_codes("class C { static void T(ref int x) { } static void T(out int x) { x = 0; } }"),
+            [663]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void T(out int x) { x = 0; } static void T(ref int x) { } }"),
+            [663]
+        );
+        assert_eq!(
+            sorted_codes("class C { public C(ref int x) { } public C(out int x) { x = 0; } }"),
+            [663]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void T(ref int x) { } static void T(ref int y) { } }"),
+            [111]
+        );
+        assert!(sorted_codes(
+            "class C { static void T(ref int x) { } static void T(out string y) { y = null; } }"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_byref_argument_under_the_wrong_modifier_is_cs1620() {
+        assert_eq!(
+            sorted_codes("class C { static void T(ref int x) { } static void M() { int v = 1; T(out v); } }"),
+            [1620]
+        );
+        assert_eq!(
+            sorted_codes("class C { static void T(out int x) { x = 1; } static void M() { int v = 1; T(ref v); } }"),
+            [1620]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class C { static void T(ref int x) { } static void T(int x) { } \
+                 static void M() { int v = 1; T(out v); } }"
+            ),
+            [1620]
+        );
+        assert!(sorted_codes(
+            "class C { static void T(ref int x) { } static void T(int x) { } \
+             static void M() { int v = 1; T(v); } }"
+        )
+        .is_empty());
+        assert!(sorted_codes(
+            "class C { static void T(ref int x) { } static void T(int x) { } \
+             static void M() { int v = 1; T(ref v); } }"
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn a_name_declared_twice_in_one_declaration_space_is_cs0102_or_cs0111() {
         assert_eq!(
             sorted_codes("class C { int P { get { return 0; } } int P() { return 0; } }"),
@@ -2988,7 +3497,7 @@ mod tests {
             "class C { int this[int i] { get { return i; } } \
              int this[string s] { get { return 0; } } }",
             "class C { int P { get { return 0; } } int this[int i] { get { return i; } } }",
-            "class C { public int F; public int G; static void M(int a, int b) { } }",
+            "class C { public int F = 1; public int G = 2; static void M(int a, int b) { } }",
             "enum E { A, B }",
         ] {
             assert_eq!(sorted_codes(clean), [], "expected no diagnostic for: {clean}");
@@ -3327,11 +3836,11 @@ mod tests {
             sorted_codes("struct S { public int x; } class C { public volatile S a; }"),
             [677]
         );
-        assert!(sorted_codes("class C { public volatile int a; }").is_empty());
-        assert!(sorted_codes("class C { public volatile bool a; }").is_empty());
-        assert!(sorted_codes("class C { public volatile char a; }").is_empty());
-        assert!(sorted_codes("class C { public volatile float a; }").is_empty());
-        assert!(sorted_codes("class C { public volatile string a; }").is_empty());
+        assert!(sorted_codes("class C { public volatile int a = 1; }").is_empty());
+        assert!(sorted_codes("class C { public volatile bool a = false; }").is_empty());
+        assert!(sorted_codes("class C { public volatile char a = (char)0; }").is_empty());
+        assert!(sorted_codes("class C { public volatile float a = 0f; }").is_empty());
+        assert!(sorted_codes("class C { public volatile string a = null; }").is_empty());
     }
 
     #[test]
@@ -3474,7 +3983,7 @@ mod tests {
         assert_eq!(sorted_codes("class C { int f; }"), [169]);
         assert_eq!(sorted_codes("class C { int f; int Get() { return f; } }"), [649]);
         assert_eq!(sorted_codes("class C { int f; void Set() { f = 1; } }"), [414]);
-        assert_eq!(sorted_codes("class C { public int f; }"), []);
+        assert_eq!(sorted_codes("class C { public int f; }"), [649]);
         assert_eq!(sorted_codes("class C { const int F = 1; }"), []);
         assert_eq!(sorted_codes("class C { const int F; }"), [145]);
         assert_eq!(sorted_codes("class C { int f = 5; }"), [414]);
@@ -3524,8 +4033,330 @@ mod tests {
         );
         assert_eq!(sorted_codes("struct S { protected const int X = 1; }"), [666]);
         assert_eq!(
-            sorted_codes("class C { protected int x; int Get() { return x; } }"),
+            sorted_codes("class C { protected int x = 0; int Get() { return x; } }"),
             []
+        );
+    }
+
+    #[test]
+    fn an_attribute_constructor_parameter_of_an_illegal_type_is_cs0181() {
+        use crate::symbols::{Model, TypeInfo, TypeKind};
+        let codes = |source: &str| {
+            let mut model = Model::new();
+            model.insert(TypeInfo::new("System", "Object", TypeKind::Class));
+            model.insert(TypeInfo::new("System", "Attribute", TypeKind::Class));
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit_with_model(&unit, model)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+        assert_eq!(
+            codes(
+                "class Item { } class A : System.Attribute { public A(Item item) { } } \
+                 [A(null)] class C { }"
+            ),
+            [181]
+        );
+        assert_eq!(
+            codes("class A : System.Attribute { public A(decimal d) { } } [A(1)] class C { }"),
+            [181]
+        );
+        assert_eq!(
+            codes("class A : System.Attribute { public A(int[] a) { } } [A(null)] class C { }"),
+            []
+        );
+        for bad in [
+            "class A : System.Attribute { public A(int[,] a) { } } [A(null)] class C { }",
+            "class A : System.Attribute { public A(int[][] a) { } } [A(null)] class C { }",
+            "interface I { } class A : System.Attribute { public A(I i) { } } [A(null)] class C { }",
+        ] {
+            assert_eq!(codes(bad), [181], "for: {bad}");
+        }
+        assert_eq!(
+            codes("class Item { } class A : System.Attribute { public A(Item item) { } } class C { }"),
+            []
+        );
+        assert_eq!(
+            codes(
+                "class Item { } class A : System.Attribute { public A(Item i) { } public A() { } } \
+                 [A()] class C { }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "class Item { } \
+                 class A : System.Attribute { public A(Item a) { } public A(string s) { } } \
+                 [A(null)] class C { }"
+            ),
+            []
+        );
+    }
+
+    /// Needs a real `System.Attribute` to derive from, so it runs against a model carrying one --
+    /// the same reason the CS0616/CS1674 test does. Without it every attribute class here would
+    /// draw CS0246 for its own base plus CS0616, and the rule under test would be invisible
+    /// underneath them.
+    #[test]
+    fn a_declaration_error_withholds_every_body_diagnostic() {
+        assert_eq!(
+            sorted_codes("class C { static void M(out Missing t) { t = t; } }"),
+            [246]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class Bad { void M(out Missing t) { } } \
+                 class Good { void N() { int u; int v = u; } }"
+            ),
+            [246]
+        );
+        for (source, code) in [
+            ("class Bad { void M() { } void M() { } } class Good { void N() { int u; int v = u; } }", 111),
+            ("class C { static void M(int a, int a) { int u; int v = u; } }", 100),
+            ("class C { static void M(void a) { int u; int v = u; } }", 1536),
+            ("class Bad { const int f = \"s\"; } class Good { void N() { int u; int v = u; } }", 29),
+        ] {
+            assert_eq!(sorted_codes(source), [code], "for: {source}");
+        }
+        assert_eq!(
+            sorted_codes(
+                "class Bad { void M(void a) { } } class Good { void N() { return; int u = 1; } }"
+            ),
+            [1536]
+        );
+    }
+
+    #[test]
+    fn the_declaration_gate_stays_shut_when_it_should() {
+
+        assert_eq!(
+            sorted_codes("class A { void M() { int u; int v = u; } } class B { void N() { Nope(); } }"),
+            [103, 165]
+        );
+        assert_eq!(
+            sorted_codes("class Bad { int f; } class Good { void N() { int u; int v = u; } }"),
+            [165, 169]
+        );
+        assert_eq!(
+            sorted_codes("class Bad { int f = \"s\"; } class Good { void N() { int u; int v = u; } }"),
+            [29, 165]
+        );
+    }
+
+    #[test]
+    fn a_named_attribute_argument_naming_no_member_is_cs0246() {
+        use crate::symbols::{Model, TypeInfo, TypeKind};
+        let codes = |source: &str| {
+            let mut model = Model::new();
+            model.insert(TypeInfo::new("System", "Object", TypeKind::Class));
+            model.insert(TypeInfo::new("System", "Attribute", TypeKind::Class));
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit_with_model(&unit, model)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+        assert_eq!(
+            codes("class A : System.Attribute { public A() { } } [A(Missing = 1)] class C { }"),
+            [246]
+        );
+        assert_eq!(
+            codes("class A : System.Attribute { public A() { } } [A(Zqxjkw = 1)] class C { }"),
+            [246]
+        );
+        assert_eq!(
+            codes(
+                "class A : System.Attribute { public A() { } public int F; } \
+                 [A(F = 1)] class C { }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "class A : System.Attribute { public A() { } \
+                 public int P { get { return 1; } set { } } } [A(P = 1)] class C { }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "class Base : System.Attribute { public int Inherited; } \
+                 class A : Base { public A() { } } [A(Inherited = 1)] class C { }"
+            ),
+            []
+        );
+        assert_eq!(codes("[Nope(Missing = 1)] class C { }"), []);
+
+
+        for source in [
+            "class A : System.Attribute { public A() { } protected int F; } [A(F = 1)] class C { }",
+            "class A : System.Attribute { public A() { } int P { get { return 1; } set { } } } \
+             [A(P = 1)] class C { }",
+        ] {
+            assert_eq!(codes(source), [122], "for: {source}");
+        }
+        assert_eq!(
+            codes("class A : System.Attribute { public A() { } int F; } [A(F = 1)] class C { }"),
+            [122]
+        );
+
+        for source in [
+            "class A : System.Attribute { public A() { } internal int F; } [A(F = 1)] class C { }",
+            "class A : System.Attribute { public A() { } public static int F; } [A(F = 1)] class C { }",
+            "class A : System.Attribute { public A() { } public readonly int F; } [A(F = 1)] class C { }",
+            "class A : System.Attribute { public A() { } public const int F = 0; } [A(F = 1)] class C { }",
+            "class A : System.Attribute { public A() { } public int P { get { return 1; } } } \
+             [A(P = 1)] class C { }",
+            "class A : System.Attribute { public A() { } public int P { set { } } } [A(P = 1)] class C { }",
+            "class A : System.Attribute { public A() { } internal int P { get { return 1; } set { } } } \
+             [A(P = 1)] class C { }",
+            "class A : System.Attribute { public A() { } public int M() { return 1; } } [A(M = 1)] class C { }",
+            "class A : System.Attribute { public A() { } public class N { } } [A(N = 1)] class C { }",
+        ] {
+            assert_eq!(codes(source), [617], "for: {source}");
+        }
+    }
+
+    #[test]
+    fn protected_member_through_a_base_typed_qualifier_is_cs1540() {
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { static int M(B other) { return other.value; } }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { int M(B other) { return other.value; } }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { static void M(B other) { other.value = 1; } }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { static int M(S other) { return other.value; } } \
+                 class S : B { }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class M : B { } \
+                 class D : M { static int F(M other) { return other.value; } }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { int F() { return ((B)this).value; } }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int P { get { return 1; } } } \
+                 class D : B { static int M(B other) { return other.P; } }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int F() { return 1; } } \
+                 class D : B { static int M(B other) { return other.F(); } }"
+            ),
+            [1540]
+        );
+    }
+
+    #[test]
+    fn protected_access_that_csc_accepts_draws_no_cs1540() {
+        let cases = [
+            "class B { protected int value = 0; } class D : B { int M() { return this.value; } }",
+            "class B { protected int value = 0; } class D : B { int M() { return base.value; } }",
+            "class B { protected int value = 0; } class D : B { int M() { return value; } }",
+            "class B { protected int value = 0; } \
+             class D : B { static int M(D other) { return other.value; } }",
+            "class B { protected int value = 0; } \
+             class D : B { static int M(E other) { return other.value; } } class E : D { }",
+            "class B { protected int value = 0; static int M(B other) { return other.value; } }",
+            "class B { protected int value = 0; static int F(D other) { return other.value; } } \
+             class D : B { }",
+            "class B { protected static int value = 0; } \
+             class D : B { static int M() { return B.value; } }",
+            "class B { protected internal int value = 0; } \
+             class D : B { static int M(B other) { return other.value; } }",
+            "class B { protected int F() { return 1; } } class D : B { int M() { return this.F(); } }",
+            "class B { protected int F() { return 1; } } \
+             class D : B { static int M(D other) { return other.F(); } }",
+        ];
+        for case in cases {
+            assert_eq!(sorted_codes(case), [], "expected no diagnostic for: {case}");
+        }
+    }
+
+    #[test]
+    fn a_nested_type_reaches_its_enclosing_class_protected_members() {
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { class N { static int M(D other) { return other.value; } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { class N { class Q { static int F(D other) { return other.value; } } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class D : B { class N { static int M(B other) { return other.value; } } }"
+            ),
+            [1540]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; class N { static int F(B other) { return other.value; } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { private int value = 1; class N { static int F(B other) { return other.value; } } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn an_unrelated_class_still_gets_cs0122_not_cs1540() {
+        assert_eq!(
+            sorted_codes(
+                "class B { protected int value = 0; } \
+                 class U { static int M(B other) { return other.value; } }"
+            ),
+            [122]
         );
     }
 
@@ -3787,7 +4618,7 @@ mod tests {
             [52]
         );
         assert_eq!(
-            sorted_codes("public delegate void H(); public class C { public H f; }"),
+            sorted_codes("public delegate void H(); public class C { public H f = null; }"),
             []
         );
     }
@@ -3806,10 +4637,10 @@ mod tests {
             []
         );
         assert_eq!(
-            sorted_codes("struct Inner {} struct Outer { public Inner x; }"),
+            sorted_codes("struct Inner {} struct Outer { public Inner x = new Inner(); }"),
             []
         );
-        assert_eq!(sorted_codes("struct S { public static S s; }"), []);
+        assert_eq!(sorted_codes("struct S { public static S s = new S(); }"), []);
     }
 
     #[test]
@@ -4222,6 +5053,7 @@ mod tests {
                 name: "ToString".into(),
                 return_type: TypeSymbol::Special(SpecialType::String),
                 parameters: Vec::new(),
+                parameter_info: Vec::new(),
                 is_static: false,
                 is_params: false,
                 is_vararg: false,
@@ -4444,6 +5276,7 @@ mod tests {
                 name: "ToString".into(),
                 return_type: TypeSymbol::Special(SpecialType::String),
                 parameters: Vec::new(),
+                parameter_info: Vec::new(),
                 is_static: false,
                 is_params: false,
                 is_vararg: false,
@@ -4461,6 +5294,7 @@ mod tests {
                 name: "Read".into(),
                 return_type: TypeSymbol::Special(SpecialType::Int32),
                 parameters: vec![TypeSymbol::Special(SpecialType::Int32)],
+                parameter_info: Vec::new(),
                 is_static: false,
                 is_params: false,
                 is_vararg: false,
@@ -4542,6 +5376,7 @@ mod tests {
             name: "WriteLine".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::String)],
+            parameter_info: Vec::new(),
             is_static: true,
             is_params: false,
             is_vararg: false,

@@ -33,12 +33,32 @@ fn error(message: &str) -> CompileError {
 /// Compile a module AST to a [`bc::Module`]: each top-level `def` becomes a function
 /// code object, and the remaining top-level statements become the `<module>` body.
 pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, CompileError> {
+    let sum_helper = synthesize_sum_helper(&ast.body);
+    let min_helper = synthesize_extremum_helper(&ast.body, "min");
+    let max_helper = synthesize_extremum_helper(&ast.body, "max");
+    let stmts = || {
+        sum_helper
+            .iter()
+            .chain(min_helper.iter())
+            .chain(max_helper.iter())
+            .chain(ast.body.iter())
+    };
+
     let mut functions = Vec::new();
     let mut top_level: Vec<&Stmt> = Vec::new();
-    let def_counts = direct_def_counts(&ast.body);
+    let def_counts = direct_def_counts(stmts());
     let mut defs_seen: BTreeMap<String, usize> = BTreeMap::new();
-    let func_rets = module_func_return_types(&ast.body);
-    for stmt in &ast.body {
+    let mut func_rets = module_func_return_types(&ast.body);
+    if sum_helper.is_some() {
+        func_rets.insert(String::from(SUM_LIST_INT_HELPER), bc::StaticType::Int);
+    }
+    if min_helper.is_some() {
+        func_rets.insert(String::from(MIN_LIST_INT_HELPER), bc::StaticType::Int);
+    }
+    if max_helper.is_some() {
+        func_rets.insert(String::from(MAX_LIST_INT_HELPER), bc::StaticType::Int);
+    }
+    for stmt in stmts() {
         match stmt {
             Stmt::FuncDef(func) => {
                 let seen = defs_seen.entry(func.name.clone()).or_insert(0);
@@ -76,6 +96,279 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
         name: String::from(name),
         functions,
         body,
+    })
+}
+
+/// The synthesized `sum(list[int])` reducer's name. A plain identifier (no `$`) so it symbolizes
+/// cleanly on the AOT lane, dunder-prefixed and specific enough that a real program is not expected to
+/// bind it -- and if one does, the injection is skipped (see [`synthesize_sum_helper`]).
+const SUM_LIST_INT_HELPER: &str = "__sum_list_int";
+
+/// The synthesized `min(list[int])` / `max(list[int])` reducers, named like the `sum` one.
+const MIN_LIST_INT_HELPER: &str = "__min_list_int";
+const MAX_LIST_INT_HELPER: &str = "__max_list_int";
+
+/// CPython's own message for `min(())` / `max(())`, carried so the INTERPRETER lane -- which runs
+/// the synthesized reducer instead of the builtin -- keeps saying exactly what CPython says. The
+/// typed lane raises the same ValueError as a tag and drops the message, which is that tier's
+/// documented shape and unobservable there.
+const MIN_EMPTY_MESSAGE: &str = "min() iterable argument is empty";
+const MAX_EMPTY_MESSAGE: &str = "max() iterable argument is empty";
+
+/// The largest exponent `x ** k` is unrolled to repeated multiplication for (see
+/// [`Compiler::emit_int_pow`]). A literal beyond this stays the dynamic `**` -- the result overflows
+/// `i32` for any base >= 2 well before here anyway, so the cap only bounds emitted code size.
+const POW_UNROLL_MAX: i64 = 64;
+
+/// If a module calls the BUILTIN `sum` (unshadowed at module scope), synthesize a reducer
+///
+/// ```text
+/// def __sum_list_int(xs: list[int]) -> int:
+///     s = 0
+///     for v in xs:
+///         s = s + v
+///     return s
+/// ```
+///
+/// so that a `sum(<fixed int list>)` runs the typed counted-reduce on the AOT lane (the call is
+/// rewritten to this reducer in [`Compiler::compile_expr`], with the matching inference in
+/// [`expr_static_type`]). Returns `None` -- leaving every `sum(...)` the dynamic builtin -- when `sum`
+/// is bound at module scope (a user `sum` shadows the builtin), when the reducer name is itself already
+/// bound, or when `sum` is never referenced (so no unused reducer is emitted).
+///
+/// Injecting the reducer is never wrong on its own: a call is rewritten to it ONLY when the argument is
+/// a fixed int list, so if every `sum(...)` in the module has some other argument the reducer is simply
+/// unreferenced -- trimmed on the AOT lane, harmless on the interpreter.
+fn synthesize_sum_helper(body: &[Stmt]) -> Option<Stmt> {
+    let refs: Vec<&Stmt> = body.iter().collect();
+    let module_bound = bound_names(&[], &refs);
+    if module_bound.contains("sum") || module_bound.contains(SUM_LIST_INT_HELPER) {
+        return None;
+    }
+    let mut uses = Uses::default();
+    for stmt in body {
+        walk_stmt_uses(stmt, &mut uses);
+    }
+    if !uses.direct.contains("sum") && !uses.child_free.contains("sum") {
+        return None;
+    }
+    Some(build_sum_reducer_def())
+}
+
+/// If a module calls the BUILTIN `min` or `max` with one argument anywhere, synthesize the matching
+/// reducer over a fixed int list:
+///
+/// ```text
+/// def __min_list_int(xs: list[int]) -> int:
+///     n = len(xs)
+///     if n == 0:
+///         raise ValueError("min() iterable argument is empty")
+///     m = xs[0]
+///     i = 1
+///     while i < n:
+///         v = xs[i]
+///         if v < m:
+///             m = v
+///         i = i + 1
+///     return m
+/// ```
+///
+/// Same discipline as [`synthesize_sum_helper`]: skipped when the name is bound at module scope (a
+/// user `min` shadows the builtin), when the reducer name is taken, or when the builtin is never
+/// referenced. The empty case RAISES rather than returning a sentinel, because the reducer replaces
+/// the builtin on the interpreter too and CPython raises there -- carrying the message is what keeps
+/// that lane's behavior identical rather than merely close.
+fn synthesize_extremum_helper(body: &[Stmt], builtin: &str) -> Option<Stmt> {
+    let helper = if builtin == "min" { MIN_LIST_INT_HELPER } else { MAX_LIST_INT_HELPER };
+    let refs: Vec<&Stmt> = body.iter().collect();
+    let module_bound = bound_names(&[], &refs);
+    if module_bound.contains(builtin) || module_bound.contains(helper) {
+        return None;
+    }
+    let mut uses = Uses::default();
+    for stmt in body {
+        walk_stmt_uses(stmt, &mut uses);
+    }
+    if !uses.direct.contains(builtin) && !uses.child_free.contains(builtin) {
+        return None;
+    }
+    Some(build_extremum_reducer_def(builtin))
+}
+
+/// Build the reducer AST for [`synthesize_extremum_helper`]. Constructed directly, like the `sum`
+/// one, so it reuses the shipped `list[int]` parameter typing, `len`, indexing and int inference
+/// with no new lowering -- the one thing it needs that `sum` did not is `raise E("...")`, which the
+/// typed lane lowers to the type's tag.
+fn build_extremum_reducer_def(builtin: &str) -> Stmt {
+    let is_min = builtin == "min";
+    let helper = if is_min { MIN_LIST_INT_HELPER } else { MAX_LIST_INT_HELPER };
+    let message = if is_min { MIN_EMPTY_MESSAGE } else { MAX_EMPTY_MESSAGE };
+    let name = |n: &str| Expr::Name(String::from(n));
+    let call1 = |f: &str, arg: Expr| Expr::Call {
+        func: Box::new(Expr::Name(String::from(f))),
+        args: vec![arg],
+        keywords: Vec::new(),
+    };
+    let index = |seq: &str, at: Expr| Expr::Subscript {
+        value: Box::new(Expr::Name(String::from(seq))),
+        index: Box::new(at),
+    };
+    let assign = |target: &str, value: Expr| {
+        Stmt::Assign(Assign {
+            target: String::from(target),
+            annotation: None,
+            value: Some(value),
+        })
+    };
+    Stmt::FuncDef(FuncDef {
+        name: String::from(helper),
+        params: vec![ast::ParamDef {
+            name: String::from("xs"),
+            annotation: Some(Expr::Subscript {
+                value: Box::new(name("list")),
+                index: Box::new(name("int")),
+            }),
+            default: None,
+            keyword_only: false,
+            positional_only: false,
+            is_vararg: false,
+            is_varkwarg: false,
+        }],
+        ret: Some(name("int")),
+        body: vec![
+            assign("n", call1("len", name("xs"))),
+            Stmt::If {
+                test: Expr::Compare {
+                    op: ast::CmpOp::Eq,
+                    lhs: Box::new(name("n")),
+                    rhs: Box::new(Expr::Int(0)),
+                },
+                body: vec![Stmt::Raise {
+                    exc: Some(Expr::Call {
+                        func: Box::new(name("ValueError")),
+                        args: vec![Expr::Str(String::from(message))],
+                        keywords: Vec::new(),
+                    }),
+                    cause: None,
+                }],
+                orelse: Vec::new(),
+            },
+            assign("m", index("xs", Expr::Int(0))),
+            assign("i", Expr::Int(1)),
+            Stmt::While {
+                test: Expr::Compare {
+                    op: ast::CmpOp::Lt,
+                    lhs: Box::new(name("i")),
+                    rhs: Box::new(name("n")),
+                },
+                body: vec![
+                    assign("v", index("xs", name("i"))),
+                    Stmt::If {
+                        test: Expr::Compare {
+                            op: if is_min { ast::CmpOp::Lt } else { ast::CmpOp::Gt },
+                            lhs: Box::new(name("v")),
+                            rhs: Box::new(name("m")),
+                        },
+                        body: vec![assign("m", name("v"))],
+                        orelse: Vec::new(),
+                    },
+                    assign(
+                        "i",
+                        Expr::Binary {
+                            op: ast::BinOp::Add,
+                            lhs: Box::new(name("i")),
+                            rhs: Box::new(Expr::Int(1)),
+                        },
+                    ),
+                ],
+                orelse: Vec::new(),
+            },
+            Stmt::Return(Some(name("m"))),
+        ],
+    })
+}
+
+/// Whether `func(args)` is a ONE-argument `min` / `max` over a fixed int list -- and if so, which
+/// reducer it is rewritten to. ONE function, called by both [`expr_static_type`] and the emission in
+/// [`Compiler::compile_expr`], so the inference and the rewrite cannot drift apart about which calls
+/// become a typed reduce.
+///
+/// The gate mirrors the `sum` one: the reducer present in the VISIBLE `func_rets` (true only when
+/// the feature is active AND this scope resolves the name to the builtin rather than to a captured
+/// free variable), the name not a local of this scope, and the argument a fixed int list. A tuple,
+/// growable, float or dynamic argument stays the dynamic builtin -- the reducer's `list[int]`
+/// parameter would refuse it at the AOT call, so typing the result int would be unsound.
+fn extremum_helper_for(
+    func: &Expr,
+    args: &[Expr],
+    keywords: &[ast::Keyword],
+    names: &[String],
+    types: &[bc::StaticType],
+    func_rets: &BTreeMap<String, bc::StaticType>,
+) -> Option<&'static str> {
+    if !keywords.is_empty() || args.len() != 1 {
+        return None;
+    }
+    let Expr::Name(called) = func else {
+        return None;
+    };
+    let helper = match called.as_str() {
+        "min" => MIN_LIST_INT_HELPER,
+        "max" => MAX_LIST_INT_HELPER,
+        _ => return None,
+    };
+    if !func_rets.contains_key(helper) || names.iter().any(|n| n == called) {
+        return None;
+    }
+    if expr_static_type(&args[0], names, types, func_rets) != bc::StaticType::ListInt {
+        return None;
+    }
+    Some(helper)
+}
+
+/// Build the reducer AST for [`synthesize_sum_helper`]. Constructed directly (not parsed) so it reuses
+/// the shipped `list[int]` parameter typing, the typed-list `for` desugar, and int inference, with no
+/// new lowering: `s` seeds int, `v` is a `list[int]` element (int), so `s = s + v` and the returned `s`
+/// stay int, and the whole reducer lowers to the AOT counted-reduce.
+fn build_sum_reducer_def() -> Stmt {
+    let name = |n: &str| Expr::Name(String::from(n));
+    Stmt::FuncDef(FuncDef {
+        name: String::from(SUM_LIST_INT_HELPER),
+        params: vec![ast::ParamDef {
+            name: String::from("xs"),
+            annotation: Some(Expr::Subscript {
+                value: Box::new(name("list")),
+                index: Box::new(name("int")),
+            }),
+            default: None,
+            keyword_only: false,
+            positional_only: false,
+            is_vararg: false,
+            is_varkwarg: false,
+        }],
+        ret: Some(name("int")),
+        body: vec![
+            Stmt::Assign(Assign {
+                target: String::from("s"),
+                annotation: None,
+                value: Some(Expr::Int(0)),
+            }),
+            Stmt::ForIter {
+                target: String::from("v"),
+                iterable: name("xs"),
+                body: vec![Stmt::Assign(Assign {
+                    target: String::from("s"),
+                    annotation: None,
+                    value: Some(Expr::Binary {
+                        op: ast::BinOp::Add,
+                        lhs: Box::new(name("s")),
+                        rhs: Box::new(name("v")),
+                    }),
+                })],
+                orelse: Vec::new(),
+            },
+            Stmt::Return(Some(name("s"))),
+        ],
     })
 }
 
@@ -257,6 +550,18 @@ fn class_body_bound_names(body: &[Stmt]) -> BTreeSet<String> {
     bound
 }
 
+/// A body's docstring: the string of a leading bare-string statement, else `None`.
+///
+/// Python's rule is positional -- the FIRST statement, and only if it is a plain string literal.
+/// A string anywhere else is an expression whose value is discarded, and a body that opens with
+/// anything else has no docstring however many strings follow.
+fn docstring_of(first: Option<&Stmt>) -> Option<&str> {
+    match first {
+        Some(Stmt::Expr(Expr::Str(text))) => Some(text),
+        _ => None,
+    }
+}
+
 /// Resolve an annotation expression to a static type: a bare `int` is the typed
 /// integer path; everything else (including no annotation) is dynamic.
 fn resolve_type(annotation: &Option<Expr>) -> bc::StaticType {
@@ -287,6 +592,10 @@ fn compile_code_object(
     let mut local_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
     let mut local_types: Vec<bc::StaticType> =
         params.iter().map(|p| resolve_type(&p.annotation)).collect();
+    if scope == Scope::Module {
+        local_names.push(String::from("__doc__"));
+        local_types.push(bc::StaticType::Dynamic);
+    }
     collect_locals(body, &mut local_names, &mut local_types);
     for stmt in body {
         collect_comp_targets_stmt(stmt, &mut local_names, &mut local_types);
@@ -397,6 +706,15 @@ fn compile_code_object(
         module_defs_seen: BTreeMap::new(),
         func_rets: visible_rets.clone(),
     };
+    if scope == Scope::Module {
+        let doc = docstring_of(body.first().copied());
+        let doc_const = match doc {
+            Some(text) => compiler.const_index(bc::Const::Str(String::from(text))),
+            None => compiler.const_index(bc::Const::None),
+        };
+        compiler.asm.emit(bc::Op::LoadConst(doc_const));
+        compiler.emit_store_name("__doc__");
+    }
     for stmt in body {
         compiler.direct_body_stmt = true;
         compiler.compile_stmt(stmt)?;
@@ -419,6 +737,10 @@ fn compile_code_object(
         posonly_count: params.iter().filter(|p| p.positional_only).count() as u32,
         kwonly_count: params.iter().filter(|p| p.keyword_only).count() as u32,
         is_generator: compiler.has_yield,
+        doc: match scope {
+            Scope::Function => docstring_of(body.first().copied()).map(String::from),
+            Scope::Module => None,
+        },
         has_varargs: params.iter().any(|p| p.is_vararg),
         has_varkwargs: params.iter().any(|p| p.is_varkwarg),
         ret_ty: resolve_type(ret),
@@ -1873,6 +2195,12 @@ fn expr_static_type(
             .position(|x| x == n)
             .map(|i| types[i])
             .unwrap_or(Dynamic),
+        Expr::Binary { op: ast::BinOp::Pow, lhs, rhs }
+            if expr_static_type(lhs, names, types, func_rets) == Int
+                && matches!(rhs.as_ref(), Expr::Int(k) if (1..=POW_UNROLL_MAX).contains(k)) =>
+        {
+            Int
+        }
         Expr::Binary { op, lhs, rhs } | Expr::InplaceBinary { op, lhs, rhs } => {
             let a = expr_static_type(lhs, names, types, func_rets);
             let b = expr_static_type(rhs, names, types, func_rets);
@@ -1979,6 +2307,21 @@ fn expr_static_type(
             if keywords.is_empty()
                 && args.len() == 1
                 && matches!(&**func, Expr::Name(n) if n == "len") =>
+        {
+            Int
+        }
+        Expr::Call { func, args, keywords }
+            if keywords.is_empty()
+                && args.len() == 1
+                && matches!(&**func, Expr::Name(n) if n == "sum")
+                && func_rets.contains_key(SUM_LIST_INT_HELPER)
+                && !names.iter().any(|n| n == "sum")
+                && expr_static_type(&args[0], names, types, func_rets) == ListInt =>
+        {
+            Int
+        }
+        Expr::Call { func, args, keywords }
+            if extremum_helper_for(func, args, keywords, names, types, func_rets).is_some() =>
         {
             Int
         }
@@ -2309,7 +2652,9 @@ impl Compiler {
                 value,
                 op,
             } => self.compile_setattr(obj, attr, value, *op),
-            Stmt::ClassDef { name, bases, body } => self.compile_classdef(name, bases, body, direct),
+            Stmt::ClassDef { name, bases, keywords, body } => {
+                self.compile_classdef(name, bases, keywords, body, direct)
+            }
             Stmt::Expr(expr) => {
                 self.compile_expr(expr)?;
                 self.asm.emit(bc::Op::PopTop);
@@ -2697,9 +3042,11 @@ impl Compiler {
         }
         self.asm.emit_jump(after);
         self.asm.place(fcopy);
+        self.handler_depth += 1;
         for stmt in finalbody {
             self.compile_stmt(stmt)?;
         }
+        self.handler_depth -= 1;
         self.asm.emit(bc::Op::Reraise);
         self.asm.add_exc_entry(protected_start, protected_end, fcopy, 0);
         self.asm.place(after);
@@ -2814,6 +3161,7 @@ impl Compiler {
         &mut self,
         name: &str,
         bases: &[Expr],
+        keywords: &[(String, Expr)],
         body: &[Stmt],
         direct: bool,
     ) -> Result<(), CompileError> {
@@ -2848,8 +3196,18 @@ impl Compiler {
                 self.asm.emit(bc::Op::BuildTuple(many.len() as u32));
             }
         }
+        for (_, value) in keywords {
+            self.compile_expr(value)?;
+        }
         self.asm.emit(bc::Op::SetupClassNamespace);
         self.in_class_body = true;
+        let doc = docstring_of(body.first());
+        let doc_const = match doc {
+            Some(text) => self.const_index(bc::Const::Str(String::from(text))),
+            None => self.const_index(bc::Const::None),
+        };
+        self.asm.emit(bc::Op::LoadConst(doc_const));
+        self.emit_store_member("__doc__");
         self.class_body_bound = class_body_bound_names(body);
         let names = method_qualified_names(&class_qual, body);
         for (i, member) in body.iter().enumerate() {
@@ -2893,7 +3251,13 @@ impl Compiler {
         }
         self.in_class_body = false;
         self.class_body_bound = BTreeSet::new();
-        self.asm.emit(bc::Op::BuildClass);
+        if keywords.is_empty() {
+            self.asm.emit(bc::Op::BuildClass);
+        } else {
+            let names: Vec<String> = keywords.iter().map(|(k, _)| k.clone()).collect();
+            let kwnames = self.const_index(bc::Const::KwNames(names));
+            self.asm.emit(bc::Op::BuildClassKw { kwnames });
+        }
         self.emit_store_name(name);
         Ok(())
     }
@@ -3023,6 +3387,81 @@ impl Compiler {
         Ok(())
     }
 
+    /// Whether `func(args)` is a `sum(<fixed int list>)` call to rewrite to the synthesized reducer.
+    /// The gate mirrors the `sum` arm of [`expr_static_type`] exactly: the reducer present in this
+    /// scope's visible `func_rets` (feature active + a scope that resolves `sum` to the builtin), `sum`
+    /// not a local here, one positional argument, and that argument a fixed int list.
+    fn is_typed_sum_call(&self, func: &Expr, args: &[Expr], keywords: &[ast::Keyword]) -> bool {
+        keywords.is_empty()
+            && args.len() == 1
+            && matches!(func, Expr::Name(n) if n == "sum")
+            && self.func_rets.contains_key(SUM_LIST_INT_HELPER)
+            && !self.local_names.iter().any(|n| n == "sum")
+            && expr_static_type(&args[0], &self.local_names, &self.local_types, &self.func_rets)
+                == bc::StaticType::ListInt
+    }
+
+    /// The reducer a one-argument `min(...)` / `max(...)` over a fixed int list is rewritten to, or
+    /// `None` when this call is not that. Spelled IDENTICALLY to the matching arm of
+    /// [`expr_static_type`], so the inference and this emission cannot disagree about which calls
+    /// become a typed reduce. The TWO-argument `min(a, b)` is untouched -- it has its own inline
+    /// lowering and never reaches here.
+    fn typed_extremum_helper(
+        &self,
+        func: &Expr,
+        args: &[Expr],
+        keywords: &[ast::Keyword],
+    ) -> Option<&'static str> {
+        extremum_helper_for(
+            func,
+            args,
+            keywords,
+            &self.local_names,
+            &self.local_types,
+            &self.func_rets,
+        )
+    }
+
+    /// If `lhs <op> rhs` is a `**` over an int base with a non-negative integer LITERAL exponent in the
+    /// unroll range, that exponent -- else `None`. Mirrors the `Pow` arm of [`expr_static_type`] exactly,
+    /// so the inference and this emission agree on which powers are typed int.
+    fn int_pow_unroll_exponent(&self, op: &ast::BinOp, lhs: &Expr, rhs: &Expr) -> Option<i64> {
+        if !matches!(op, ast::BinOp::Pow) {
+            return None;
+        }
+        let Expr::Int(k) = rhs else {
+            return None;
+        };
+        if !(1..=POW_UNROLL_MAX).contains(k) {
+            return None;
+        }
+        if expr_static_type(lhs, &self.local_names, &self.local_types, &self.func_rets)
+            != bc::StaticType::Int
+        {
+            return None;
+        }
+        Some(*k)
+    }
+
+    /// Emit `base ** k` for a non-negative integer literal `k` (1..=`POW_UNROLL_MAX`) as repeated
+    /// multiplication, so the AOT lane runs native int muls with no `**` op or runtime call. The base is
+    /// evaluated EXACTLY once: `k == 1` is just the base; `k >= 2` stores it in a temp (so a
+    /// side-effecting base runs once) and multiplies that temp `k` times.
+    fn emit_int_pow(&mut self, base: &Expr, k: i64) -> Result<(), CompileError> {
+        if k == 1 {
+            return self.compile_expr(base);
+        }
+        let t = self.alloc_temp();
+        self.compile_expr(base)?;
+        self.asm.emit(bc::Op::StoreFast(t));
+        self.asm.emit(bc::Op::LoadFast(t));
+        for _ in 1..k {
+            self.asm.emit(bc::Op::LoadFast(t));
+            self.asm.emit(bc::Op::Binary(bc::BinOp::Mul));
+        }
+        Ok(())
+    }
+
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             Expr::Int(value) => {
@@ -3139,9 +3578,13 @@ impl Compiler {
                 self.compile_hoisted_comprehension("genexpr", body, &clauses[0].iterable)?;
             }
             Expr::Binary { op, lhs, rhs } => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
-                self.asm.emit(bc::Op::Binary(binop_sel(*op)));
+                if let Some(k) = self.int_pow_unroll_exponent(op, lhs, rhs) {
+                    self.emit_int_pow(lhs, k)?;
+                } else {
+                    self.compile_expr(lhs)?;
+                    self.compile_expr(rhs)?;
+                    self.asm.emit(bc::Op::Binary(binop_sel(*op)));
+                }
             }
             Expr::InplaceBinary { op, lhs, rhs } => {
                 self.compile_expr(lhs)?;
@@ -3167,7 +3610,17 @@ impl Compiler {
                 }
             }
             Expr::Call { func, args, keywords } => {
-                if !keywords.is_empty() {
+                if self.is_typed_sum_call(func, args, keywords) {
+                    let idx = self.name_index(SUM_LIST_INT_HELPER);
+                    self.asm.emit(bc::Op::LoadGlobal(idx));
+                    self.compile_expr(&args[0])?;
+                    self.asm.emit(bc::Op::Call(1));
+                } else if let Some(helper) = self.typed_extremum_helper(func, args, keywords) {
+                    let idx = self.name_index(helper);
+                    self.asm.emit(bc::Op::LoadGlobal(idx));
+                    self.compile_expr(&args[0])?;
+                    self.asm.emit(bc::Op::Call(1));
+                } else if !keywords.is_empty() {
                     self.compile_expr(func)?;
                     for arg in args {
                         self.compile_expr(arg)?;
@@ -4116,6 +4569,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn float_literal_emits_a_float_const() {
         let module = compile_src("x = 3.14\nprint(x)\n").unwrap();
         assert!(module
@@ -4841,6 +5295,264 @@ mod tests {
         let f = func(&module, "f");
         let i_slot = f.local_names.iter().position(|n| n == "i").unwrap();
         assert_eq!(f.local_types[i_slot], StaticType::Int);
+    }
+
+    /// Whether a code object loads the given global by name at least once.
+    fn loads_global(co: &bc::CodeObject, name: &str) -> bool {
+        co.ops.iter().any(|op| {
+            matches!(op, Op::LoadGlobal(i)
+                if co.names.get(*i as usize).map(String::as_str) == Some(name))
+        })
+    }
+
+    #[test]
+    fn sum_over_a_fixed_int_list_calls_the_injected_reducer() {
+        let m = compile_src(
+            "def main() -> int:\n    xs = [1, 2, 3]\n    return sum(xs)\n\nprint(main())\n",
+        )
+        .unwrap();
+        let reducer = m.functions.iter().find(|f| f.name == "__sum_list_int");
+        assert!(reducer.is_some(), "the reducer is injected");
+        assert_eq!(reducer.unwrap().local_types[0], StaticType::ListInt);
+        let mainf = func(&m, "main");
+        assert!(loads_global(mainf, "__sum_list_int"), "main loads the reducer global");
+        assert!(!loads_global(mainf, "sum"), "the builtin sum is not loaded for the rewritten call");
+    }
+
+    #[test]
+    fn sum_over_a_fixed_int_list_infers_int() {
+        let m = compile_src("def f(xs: list[int]) -> int:\n    total = sum(xs)\n    return total\n")
+            .unwrap();
+        let f = func(&m, "f");
+        let slot = f.local_names.iter().position(|n| n == "total").unwrap();
+        assert_eq!(f.local_types[slot], StaticType::Int);
+    }
+
+    #[test]
+    fn sum_of_a_non_int_list_stays_the_dynamic_builtin() {
+        let m = compile_src(
+            "def main() -> int:\n    xs = [1.0, 2.0]\n    print(sum(xs))\n    return 0\n\nprint(main())\n",
+        )
+        .unwrap();
+        assert!(loads_global(func(&m, "main"), "sum"), "a float-list sum stays the dynamic builtin");
+    }
+
+    #[test]
+    fn a_user_sum_def_suppresses_the_reducer() {
+        let m = compile_src("def sum(xs):\n    return 999\n\nprint(sum([1, 2, 3]))\n").unwrap();
+        assert!(
+            !m.functions.iter().any(|f| f.name == "__sum_list_int"),
+            "no reducer when the user shadows sum"
+        );
+    }
+
+    #[test]
+    fn no_reducer_is_injected_when_sum_is_unused() {
+        let m = compile_src("def main() -> int:\n    return 1\n\nprint(main())\n").unwrap();
+        assert!(!m.functions.iter().any(|f| f.name == "__sum_list_int"));
+    }
+
+    #[test]
+    fn a_module_binds_its_docstring_and_none_without_one() {
+        let documented = compile_src("\"the doc.\"\nx = 1\n").unwrap();
+        assert!(documented
+            .body
+            .consts
+            .contains(&bc::Const::Str(String::from("the doc."))));
+        for m in [documented, compile_src("x = 1\n").unwrap()] {
+            assert!(
+                m.body.local_names.iter().any(|n| n == "__doc__"),
+                "a module always binds __doc__"
+            );
+        }
+    }
+
+    #[test]
+    fn a_class_binds_its_docstring_into_its_own_namespace() {
+        let m = compile_src("class C:\n    \"class doc.\"\n    def me(self):\n        return 1\n")
+            .unwrap();
+        assert!(m
+            .body
+            .consts
+            .contains(&bc::Const::Str(String::from("class doc."))));
+        assert!(
+            m.body.names.iter().any(|n| n == "__doc__"),
+            "the class body stores __doc__ as a member"
+        );
+    }
+
+    /// `__doc__` sits in each class's OWN dict, so an undocumented class must bind None rather than
+    /// leave the name unbound -- otherwise a subclass of a documented base would inherit the base's
+    /// text, which CPython does not do.
+    #[test]
+    fn an_undocumented_class_still_binds_none() {
+        let m = compile_src("class D:\n    def me(self):\n        return 1\n").unwrap();
+        assert!(m.body.consts.contains(&bc::Const::None));
+        assert!(m.body.names.iter().any(|n| n == "__doc__"));
+    }
+
+    /// A FUNCTION's docstring rides its code object -- the place a function object can read one
+    /// from at its def site, and where `__name__` already comes from.
+    #[test]
+    fn a_function_carries_its_docstring_on_its_code_object() {
+        let m = compile_src("def f():\n    \"f doc.\"\n    return 1\n").unwrap();
+        assert_eq!(func(&m, "f").doc.as_deref(), Some("f doc."));
+        let bare = compile_src("def g():\n    return 1\n").unwrap();
+        assert_eq!(func(&bare, "g").doc, None);
+        let later = compile_src("def h():\n    x = 1\n    \"not a doc\"\n    return x\n").unwrap();
+        assert_eq!(func(&later, "h").doc, None);
+    }
+
+    /// `class C(Base, tag="x")`: the keyword VALUES are pushed between the base and the namespace,
+    /// and the op names them through a `Const::KwNames` in source order. The interpreter reads the
+    /// stack in exactly that shape, so this pins it.
+    #[test]
+    fn a_class_header_keyword_emits_build_class_kw() {
+        let m = compile_src(
+            "class Base:\n    pass\n\n\nclass C(Base, tag=\"x\", level=2):\n    pass\n",
+        )
+        .unwrap();
+        let top = &m.body;
+        let kwnames = top.ops.iter().find_map(|op| match op {
+            Op::BuildClassKw { kwnames } => Some(*kwnames),
+            _ => None,
+        });
+        let kwnames = kwnames.expect("a keyworded class header emits BuildClassKw");
+        assert_eq!(
+            top.consts.get(kwnames as usize),
+            Some(&bc::Const::KwNames(vec![
+                String::from("tag"),
+                String::from("level")
+            ])),
+            "the keywords are named in source order"
+        );
+        assert!(top.ops.iter().any(|op| matches!(op, Op::BuildClass)));
+    }
+
+    #[test]
+    fn a_class_header_without_keywords_is_unchanged() {
+        let m = compile_src("class Base:\n    pass\n\n\nclass C(Base):\n    pass\n").unwrap();
+        assert!(!m.body.ops.iter().any(|op| matches!(op, Op::BuildClassKw { .. })));
+        assert_eq!(
+            m.body.ops.iter().filter(|op| matches!(op, Op::BuildClass)).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_metaclass_keyword_is_still_refused() {
+        assert!(
+            crate::compile_str("test", "class C(metaclass=M):\n    pass\n").is_err(),
+            "metaclasses stay out of the subset"
+        );
+    }
+
+    #[test]
+    fn a_base_after_a_keyword_is_refused() {
+        assert!(crate::compile_str("test", "class C(tag=\"x\", Base):\n    pass\n").is_err());
+    }
+
+    #[test]
+    fn min_and_max_over_a_fixed_int_list_call_their_reducers() {
+        let m = compile_src(
+            "def main() -> int:\n    xs = [3, 1, 4]\n    print(min(xs))\n    return max(xs)\n\nprint(main())\n",
+        )
+        .unwrap();
+        for helper in ["__min_list_int", "__max_list_int"] {
+            let reducer = m.functions.iter().find(|f| f.name == helper);
+            assert!(reducer.is_some(), "{helper} is injected");
+            assert_eq!(reducer.unwrap().local_types[0], StaticType::ListInt);
+            assert!(loads_global(func(&m, "main"), helper), "main loads {helper}");
+        }
+        assert!(!loads_global(func(&m, "main"), "min"), "the builtin min is not loaded");
+        assert!(!loads_global(func(&m, "main"), "max"), "the builtin max is not loaded");
+    }
+
+    #[test]
+    fn min_over_a_fixed_int_list_infers_int() {
+        let m = compile_src("def f(xs: list[int]) -> int:\n    lo = min(xs)\n    return lo\n").unwrap();
+        let f = func(&m, "f");
+        let slot = f.local_names.iter().position(|n| n == "lo").unwrap();
+        assert_eq!(f.local_types[slot], StaticType::Int);
+    }
+
+    /// The two-argument form is a DIFFERENT builtin with its own inline lowering, and the reducer
+    /// must not swallow it -- `min(a, b)` compares two scalars and never touches a list.
+    #[test]
+    fn the_two_argument_form_is_left_alone() {
+        let m = compile_src("def f(a: int, b: int) -> int:\n    return min(a, b)\n").unwrap();
+        assert!(
+            !loads_global(func(&m, "f"), "__min_list_int"),
+            "min(a, b) is not a reduce over a list"
+        );
+    }
+
+    #[test]
+    fn a_user_min_def_suppresses_its_reducer() {
+        let m = compile_src("def min(xs):\n    return 999\n\nprint(min([1, 2, 3]))\n").unwrap();
+        assert!(
+            !m.functions.iter().any(|f| f.name == "__min_list_int"),
+            "no reducer when the user shadows min"
+        );
+    }
+
+    #[test]
+    fn an_unused_extremum_injects_no_reducer() {
+        let m = compile_src("def main() -> int:\n    return max([1, 2])\n\nprint(main())\n").unwrap();
+        assert!(
+            m.functions.iter().any(|f| f.name == "__max_list_int"),
+            "max is used, so its reducer is injected"
+        );
+        assert!(
+            !m.functions.iter().any(|f| f.name == "__min_list_int"),
+            "min is never referenced, so no min reducer is injected"
+        );
+    }
+
+    #[test]
+    fn pow_over_int_base_with_literal_exponent_unrolls_to_muls() {
+        let m = compile_src("def f(x: int) -> int:\n    return x ** 3\n").unwrap();
+        let f = func(&m, "f");
+        assert!(f.ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Mul))), "unrolled to muls");
+        assert!(!f.ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Pow))), "no ** op remains");
+    }
+
+    #[test]
+    fn pow_result_infers_int() {
+        let m = compile_src("def f(x: int) -> int:\n    y = x ** 2\n    return y\n").unwrap();
+        let f = func(&m, "f");
+        let slot = f.local_names.iter().position(|n| n == "y").unwrap();
+        assert_eq!(f.local_types[slot], StaticType::Int);
+    }
+
+    #[test]
+    fn pow_with_a_variable_exponent_stays_dynamic() {
+        let m = compile_src("def f(x: int, k: int) -> int:\n    return x ** k\n").unwrap();
+        assert!(
+            func(&m, "f").ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Pow))),
+            "a variable exponent keeps the dynamic **"
+        );
+    }
+
+    #[test]
+    fn pow_with_zero_or_negative_exponent_stays_dynamic() {
+        for src in [
+            "def f(x: int) -> int:\n    return x ** 0\n",
+            "def f(x: int) -> int:\n    return x ** -1\n",
+        ] {
+            let m = compile_src(src).unwrap();
+            let f = func(&m, "f");
+            assert!(f.ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Pow))), "{src}");
+            assert!(!f.ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Mul))), "{src}");
+        }
+    }
+
+    #[test]
+    fn pow_over_a_float_base_stays_dynamic() {
+        let m = compile_src("def f(x: float) -> float:\n    return x ** 2\n").unwrap();
+        let f = func(&m, "f");
+        assert!(f.ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Pow))), "a float base keeps **");
+        assert!(!f.ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Mul))), "not unrolled");
     }
 
     #[test]

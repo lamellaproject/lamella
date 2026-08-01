@@ -9,7 +9,7 @@ pub mod strata;
 
 /// An integer fact plus how the table spelled it (hex spelling is preserved in the emission,
 /// so a generated file reads like the table that produced it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Int {
     /// The value (wide enough for u32 facts and signed calibration records alike).
     pub value: i64,
@@ -51,7 +51,13 @@ pub struct Register {
 /// One step of a named sequence: the table's op/reg/value/mask/note records, kept as data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
-    /// The operation: `write`, `poll`, `read` (the vocabulary is the table's, not ours).
+    /// The operation: `write`, `poll`, `read`, `delay` (the vocabulary is the table's, not ours).
+    ///
+    /// `delay` is the one that touches no register, and it earns its place rather than bending
+    /// the rule: a dynamic memory's initialization has a settling period between starting its
+    /// clock and commanding it, measured from the step BEFORE it, so it can neither be folded
+    /// into a neighbor nor left to a comment. Its duration is a `$parameter`, because how long
+    /// is a property of the fitted device and not of the block.
     pub op: String,
     /// The register the step touches.
     pub reg: String,

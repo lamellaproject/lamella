@@ -512,6 +512,10 @@ pub enum Stmt {
         /// The base-class expressions, in order (empty inherits `object`); more than one is
         /// multiple inheritance, resolved by the runtime's C3 MRO.
         bases: Vec<Expr>,
+        /// Keyword arguments in the class header (`class C(Base, tag="x")`), in source order --
+        /// what a base's `__init_subclass__(cls, **kw)` receives. `metaclass` is not among them:
+        /// it is outside this subset, and the parser refuses that name specifically.
+        keywords: Vec<(String, Expr)>,
         /// The class body.
         body: Vec<Stmt>,
     },

@@ -37,5 +37,7 @@ pub use reader::{
     encode_exception_base_chain, exception_tag_for_name, fnv1a32,
 };
 pub use rows::{Col, Row, Tables, columns};
-pub use signature::{MethodSig, SigError, SigType, parse_field, parse_method, parse_type};
+pub use signature::{
+    LocalVar, MethodSig, SigError, SigType, parse_field, parse_local_vars, parse_method, parse_type,
+};
 pub use tables::{TableError, TablesHeader};

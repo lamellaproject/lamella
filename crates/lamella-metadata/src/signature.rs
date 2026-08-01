@@ -18,6 +18,14 @@ pub mod calling {
     pub const VARARG: u8 = 0x05;
     /// The mask for the calling-convention nibble (the low 4 bits of the leading byte).
     pub const CONVENTION_MASK: u8 = 0x0F;
+    /// The GENERIC flag: the method declares type parameters, so its signature carries a
+    /// `GenParamCount` BEFORE `ParamCount` (II.23.2.1).
+    ///
+    /// IT IS ABOVE [`CONVENTION_MASK`], WHICH IS EXACTLY WHY IT HAS TO BE TESTED SEPARATELY. A
+    /// generic method's leading byte masks to `0x00` -- indistinguishable from DEFAULT -- so a
+    /// reader that only looks at the nibble reads `GenParamCount` as the parameter count and every
+    /// later read shifts by one. That produces a WRONG signature and no error.
+    pub const GENERIC: u8 = 0x10;
     /// The vararg-sentinel element type, separating fixed from vararg parameters.
     pub const SENTINEL: u8 = 0x41;
     /// The leading byte of a local-variable signature (II.23.2.6).
@@ -93,6 +101,13 @@ pub enum SigError {
     BadElementType(u8),
     /// A field signature did not begin with the FIELD calling convention.
     BadCallingConvention(u8),
+    /// A method signature declares type parameters (the GENERIC convention, II.23.2.1). This
+    /// reader does not decode generics, and REFUSING is the whole point: the layout differs by an
+    /// extra leading `GenParamCount`, so decoding it as an ordinary signature silently yields the
+    /// wrong arity and the wrong types rather than failing. A caller that maps this to `None`
+    /// omits the member, which a consumer sees as "no such method" instead of as a mysterious
+    /// mismatch.
+    GenericSignature,
 }
 
 /// A decoded method signature (II.23.2.1): the `this` flags, the return type, and
@@ -272,6 +287,9 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
     let has_this = convention & calling::HAS_THIS != 0;
     let explicit_this = convention & calling::EXPLICIT_THIS != 0;
     let is_vararg = convention & calling::CONVENTION_MASK == calling::VARARG;
+    if convention & calling::GENERIC != 0 {
+        return Err(SigError::GenericSignature);
+    }
     let param_count = reader.read_compressed_u32()?;
     let return_type = read_type(&mut reader)?;
     let mut parameters = Vec::new();
@@ -293,10 +311,33 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
     })
 }
 
-/// Decodes a local-variable signature blob (II.23.2.6): the LOCAL_SIG byte, the
-/// count, then each local's type. A `pinned` constraint before a local is skipped;
-/// a by-ref local decodes through [`read_type`]'s `BYREF` handling.
-pub fn parse_local_var_sig(blob: &[u8]) -> Result<Vec<SigType>, SigError> {
+/// One local-variable slot as its signature declares it (II.23.2.6): the slot's type, and
+/// whether the slot carries the `pinned` constraint.
+///
+/// `pinned` is not a property of the TYPE -- it is a promise the slot makes to the garbage
+/// collector: *while this slot is live, do not move the object it references*. C#
+/// `fixed (int* p = arr)` compiles to exactly this, because an unmanaged pointer
+/// (`ELEMENT_TYPE_PTR`) is NOT reported to the collector -- so the only thing that can keep
+/// `p` valid across a collection is the array not moving. A consumer that hands raw addresses
+/// to a MOVING collector and drops this flag produces a dangling interior pointer with no
+/// error anywhere; a non-moving collector is unaffected, which is what makes the omission easy
+/// to miss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalVar {
+    /// The slot's type.
+    pub ty: SigType,
+    /// Whether the slot is `pinned` (`ELEMENT_TYPE_PINNED`, 0x45): the collector must not
+    /// relocate the object this slot references for as long as the slot is live.
+    pub pinned: bool,
+}
+
+/// Decodes a local-variable signature blob (II.23.2.6) COMPLETE: the LOCAL_SIG byte, the
+/// count, then each local's `pinned` constraint (when present) and its type. A by-ref local
+/// decodes through [`read_type`]'s `BYREF` handling.
+///
+/// This is the full form; [`parse_local_var_sig`] is the types-only view over it. Use this one
+/// wherever the answer reaches a collector.
+pub fn parse_local_vars(blob: &[u8]) -> Result<Vec<LocalVar>, SigError> {
     let mut reader = Reader::new(blob);
     let convention = reader.read_u8()?;
     if convention != calling::LOCAL_SIG {
@@ -305,12 +346,32 @@ pub fn parse_local_var_sig(blob: &[u8]) -> Result<Vec<SigType>, SigError> {
     let count = reader.read_compressed_u32()?;
     let mut locals = Vec::with_capacity(count as usize);
     while (locals.len() as u32) < count {
+        let mut pinned = false;
         while reader.peek_u8()? == element::PINNED {
             reader.read_u8()?;
+            pinned = true;
         }
-        locals.push(read_type(&mut reader)?);
+        locals.push(LocalVar {
+            ty: read_type(&mut reader)?,
+            pinned,
+        });
     }
     Ok(locals)
+}
+
+/// The local-variable TYPES only, by slot index -- [`parse_local_vars`] with the `pinned`
+/// constraint dropped.
+///
+/// Dropping it is right for a consumer that only types its slots (a `pinned int32[]` slot holds
+/// an `int32[]`), and it is enough for an interpreter whose managed pointers carry their base
+/// object -- such a pointer relocates with the object, so nothing has to be held still. It is
+/// NOT enough for anything that derives a raw address and reports roots to a moving collector:
+/// see [`LocalVar::pinned`] and read the signature through [`parse_local_vars`] there.
+pub fn parse_local_var_sig(blob: &[u8]) -> Result<Vec<SigType>, SigError> {
+    Ok(parse_local_vars(blob)?
+        .into_iter()
+        .map(|local| local.ty)
+        .collect())
 }
 
 #[cfg(test)]
@@ -341,22 +402,70 @@ mod tests {
         );
     }
 
+    /// The blob a C# `fixed (int* p = arr)` produces for its holder slot: `pinned int32[]`,
+    /// beside an ordinary local.
+    const PINNED_ARRAY_LOCALS: &[u8] = &[
+        calling::LOCAL_SIG,
+        0x03,
+        element::PINNED,
+        element::SZARRAY,
+        element::I4,
+        element::I4,
+        element::BYREF,
+        element::R8,
+    ];
+
+    /// The types-only view drops the constraint, so a `pinned int32[]` slot reads as an
+    /// `int32[]` -- correct for typing a slot, and the reason this omission was invisible.
     #[test]
-    fn local_var_sig_skips_pinned_and_reads_byref() {
-        let blob = [
-            calling::LOCAL_SIG,
-            0x02,
-            element::PINNED,
-            element::I4,
-            element::BYREF,
-            element::R8,
-        ];
+    fn local_var_sig_reads_the_types_and_drops_the_pin() {
         assert_eq!(
-            parse_local_var_sig(&blob),
+            parse_local_var_sig(PINNED_ARRAY_LOCALS),
             Ok(alloc::vec![
+                SigType::SzArray(alloc::boxed::Box::new(SigType::I4)),
                 SigType::I4,
                 SigType::ByRef(alloc::boxed::Box::new(SigType::R8))
             ])
+        );
+    }
+
+    /// **The defect is stated here, not described elsewhere.** Slot 0 is the `fixed` holder and
+    /// its `pinned` constraint must REACH the caller; the other two must not acquire one. The
+    /// first assertion is what the old reader could not satisfy -- it consumed the 0x45 byte and
+    /// reported nothing -- and the last two are what stops a fix from pinning everything.
+    #[test]
+    fn a_pinned_local_reports_its_constraint_and_its_neighbours_do_not() {
+        let locals = parse_local_vars(PINNED_ARRAY_LOCALS).expect("the blob decodes");
+        assert_eq!(locals.len(), 3);
+        assert!(locals[0].pinned, "the `fixed` holder slot is pinned");
+        assert_eq!(
+            locals[0].ty,
+            SigType::SzArray(alloc::boxed::Box::new(SigType::I4))
+        );
+        assert!(!locals[1].pinned, "a plain local is not pinned");
+        assert!(!locals[2].pinned, "a by-ref local is not pinned");
+        assert_eq!(
+            parse_local_var_sig(PINNED_ARRAY_LOCALS).unwrap(),
+            locals.iter().map(|l| l.ty.clone()).collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
+    /// A slot may be pinned AND by-ref (`pinned int32&`, what pinning a struct field's address
+    /// looks like), and the constraint must survive the by-ref decode rather than be eaten by it.
+    #[test]
+    fn a_pinned_byref_local_keeps_both_facts() {
+        let blob = [
+            calling::LOCAL_SIG,
+            0x01,
+            element::PINNED,
+            element::BYREF,
+            element::I4,
+        ];
+        let locals = parse_local_vars(&blob).expect("the blob decodes");
+        assert!(locals[0].pinned);
+        assert_eq!(
+            locals[0].ty,
+            SigType::ByRef(alloc::boxed::Box::new(SigType::I4))
         );
     }
 
@@ -409,6 +518,31 @@ mod tests {
     fn an_unknown_element_type_errors() {
         assert_eq!(parse_type(&[0x77]), Err(SigError::BadElementType(0x77)));
         assert_eq!(parse_type(&[]), Err(SigError::Truncated));
+    }
+
+    #[test]
+    fn a_generic_method_signature_is_refused_not_misread() {
+        let generic = [
+            calling::GENERIC | calling::HAS_THIS,
+            0x01,
+            0x02,
+            element::I4,
+            element::I4,
+            element::I4,
+        ];
+        assert_eq!(parse_method(&generic), Err(SigError::GenericSignature));
+
+        let mut as_default = generic;
+        as_default[0] &= !calling::GENERIC;
+        let misread = parse_method(&as_default).expect("the shifted read succeeds -- that is why");
+        assert_eq!(misread.parameters.len(), 1, "truth is 2");
+        assert_ne!(misread.return_type, SigType::I4, "truth is I4");
+
+        assert_eq!(
+            parse_method(&[calling::GENERIC, 0x01, 0x00, element::I4]),
+            Err(SigError::GenericSignature)
+        );
+        assert!(parse_method(&[calling::HAS_THIS, 0x00, element::VOID]).is_ok());
     }
 
     #[test]

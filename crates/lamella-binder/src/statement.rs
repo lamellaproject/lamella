@@ -260,6 +260,12 @@ impl Binder {
                 declarators,
                 is_const,
             } => {
+                if let Some(name) = crate::program::restricted_array_element(ty) {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::RestrictedTypeArrayElement { ty: name.into() },
+                        ty.span,
+                    ));
+                }
                 if *is_const {
                     self.bind_const_local(ty, declarators)
                 } else {

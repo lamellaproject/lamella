@@ -50,6 +50,14 @@ impl BigInt {
         self.negative
     }
 
+    /// The bytes this value's magnitude holds, beyond the struct itself -- its contribution to
+    /// [`crate::object::Footprint`]. Capacity, not limb count: the reserved buffer is what was taken
+    /// from the allocator.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        self.mag.capacity() * size_of::<u32>()
+    }
+
     /// Builds a `BigInt` from an `i128` -- the promotion path from the fixnum / i128-`long` tiers.
     #[must_use]
     pub fn from_i128(n: i128) -> BigInt {
@@ -329,6 +337,45 @@ impl BigInt {
             out.push_str(&alloc::format!("{chunk:09}"));
         }
         out
+    }
+
+    /// The magnitude's string in a POWER-OF-TWO radix, lowercase, with a `-` prefix when negative
+    /// -- what `bin`/`oct`/`hex` render after their prefix. `bits_per_digit` is 1, 3 or 4.
+    ///
+    /// A power-of-two radix needs no division: each digit is a fixed run of bits, read straight
+    /// out of the magnitude. Octal's 3 bits do not divide the 32-bit limb, so digits are read by
+    /// bit position rather than per limb, which keeps all three radices on one path.
+    #[must_use]
+    pub fn to_power_of_two_radix_string(&self, bits_per_digit: u32) -> String {
+        if self.is_zero() {
+            return String::from("0");
+        }
+        let mut out = String::new();
+        if self.negative {
+            out.push('-');
+        }
+        let digits = self.bit_length().div_ceil(u64::from(bits_per_digit));
+        let radix = 1u32 << bits_per_digit;
+        for index in (0..digits).rev() {
+            let digit = self.bits_at(index * u64::from(bits_per_digit), bits_per_digit);
+            out.push(char::from_digit(digit, radix).unwrap_or('0'));
+        }
+        out
+    }
+
+    /// The `count` magnitude bits starting at bit position `shift` (little-endian), as the low bits
+    /// of the result; bits past the top of the magnitude read zero.
+    fn bits_at(&self, shift: u64, count: u32) -> u32 {
+        let mut value = 0u32;
+        for bit in 0..count {
+            let position = shift + u64::from(bit);
+            let limb = (position / 32) as usize;
+            let offset = (position % 32) as u32;
+            if self.mag.get(limb).is_some_and(|word| (word >> offset) & 1 == 1) {
+                value |= 1 << bit;
+            }
+        }
+        value
     }
 
     /// Parses a decimal string: an optional leading `+`/`-` then ASCII digits. The caller strips

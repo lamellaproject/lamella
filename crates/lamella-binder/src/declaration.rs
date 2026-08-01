@@ -98,6 +98,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     .iter()
                     .map(parameter_symbol)
                     .collect(),
+                parameter_info: crate::bind::parameter_infos(&declaration.parameters),
                 is_static: false,
                 is_params: has_params_array(&declaration.parameters),
                 is_vararg: false,
@@ -396,6 +397,7 @@ pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
             break;
         }
     }
+    resolve_enum_members(model, units, &values);
     for decl in &pending {
         let Some(literal) = values.get(&(decl.type_full.clone(), decl.name.to_string())) else {
             continue;
@@ -408,6 +410,94 @@ pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
                 }
             }
         }
+    }
+}
+
+/// Re-numbers every enum against the WHOLE model, which the first pass could not do.
+///
+/// THE FAILURE THIS FIXES IS SILENT BY CONSTRUCTION. The first pass evaluates a member's
+/// initializer against `prior` -- the enum's own earlier members -- and falls back to auto-numbering
+/// when that fails. So `Normal = (int)Facts.MODE_NORMAL` does not resolve, takes the auto value, and
+/// the enum compiles and runs with the WRONG constant: an unresolvable initializer is
+/// indistinguishable from an absent one, because both end at the same `unwrap_or`.
+///
+/// AND IT HAS NO WORKAROUND, which is why it is worth a second pass of its own. A const FIELD that
+/// mis-folds can be spelled `static readonly` and computed at run time; an enum member must be a
+/// compile-time constant, so a driver naming a generated device code had to transcribe it by hand --
+/// the exact duplication the generated facts tables exist to remove.
+///
+/// The whole enum is re-numbered rather than patched member-by-member, because a late-resolving
+/// member moves every auto-numbered member after it (`enum E { A = Facts.X, B }` -- B is X+1). Same
+/// order of precedence as the first pass: the enum's own earlier members win over the model, so a
+/// same-enum reference cannot be captured by a same-named constant elsewhere.
+fn resolve_enum_members(
+    model: &mut Model,
+    units: &[CompilationUnit],
+    values: &BTreeMap<(String, String), Literal>,
+) {
+    let mut enums: Vec<(String, &str, &[lamella_syntax::ast::EnumMember])> = Vec::new();
+    for unit in units {
+        for member in &unit.members {
+            collect_enum_decls(member, "", &mut enums);
+        }
+    }
+    for (namespace, name, members) in enums {
+        let full = qualified_type_name(&namespace, name);
+        let mut next_value: i64 = 0;
+        let mut prior: BTreeMap<Box<str>, i64> = BTreeMap::new();
+        let mut renumbered: Vec<(Box<str>, i64)> = Vec::new();
+        for member in members {
+            let value = member
+                .value
+                .as_ref()
+                .and_then(|expr| {
+                    eval_enum_member(expr, &prior).or_else(|| {
+                        resolve_const_expr(expr, &full, values).as_ref().and_then(literal_int_value)
+                    })
+                })
+                .unwrap_or(next_value);
+            next_value = value.wrapping_add(1);
+            prior.insert(member.name.clone(), value);
+            renumbered.push((member.name.clone(), value));
+        }
+        let (namespace, name) = split_type_full(&full);
+        let Some(info) = model.get_mut(&namespace, name) else {
+            continue;
+        };
+        for (member_name, value) in renumbered {
+            if let Some(field) = info.fields.iter_mut().find(|f| f.name == member_name) {
+                field.constant = Some(integer_literal(value));
+            }
+        }
+    }
+}
+
+/// Collects every enum declaration, descending namespaces and nested types, with its containing
+/// namespace (or enclosing type's full name, for a nested enum).
+fn collect_enum_decls<'a>(
+    member: &'a NamespaceMember,
+    namespace: &str,
+    out: &mut Vec<(String, &'a str, &'a [lamella_syntax::ast::EnumMember])>,
+) {
+    match member {
+        NamespaceMember::Namespace(declaration) => {
+            let inner = join_namespace(namespace, &declaration.name);
+            for nested in &declaration.members {
+                collect_enum_decls(nested, &inner, out);
+            }
+        }
+        NamespaceMember::Enum(declaration) => {
+            out.push((namespace.to_string(), &declaration.name, &declaration.members));
+        }
+        NamespaceMember::Type(declaration) => {
+            let full = qualified_type_name(namespace, &declaration.name);
+            for member in &declaration.members {
+                if let Member::NestedType(nested) = member {
+                    collect_enum_decls(nested, &full, out);
+                }
+            }
+        }
+        NamespaceMember::Delegate(_) => {}
     }
 }
 
@@ -545,7 +635,71 @@ pub(crate) fn model_const_values(model: &Model) -> BTreeMap<(String, String), Li
             }
         }
     }
+    register_unambiguous_short_spellings(&keys, &mut values);
     values
+}
+
+/// Also registers each constant under the SHORTER type spellings a source file may legitimately
+/// write -- `Facts.X` for `G.Facts.X` under a `using G;`, `Outer.Inner.X` for `Ns.Outer.Inner.X`.
+///
+/// WHY THIS IS NEEDED AT ALL: a constant initializer is folded against this map by NAME, using the
+/// receiver exactly as the source wrote it. A `using`-shortened receiver therefore matched nothing,
+/// and the fold quietly produced no value -- which downstream is indistinguishable from zero. That
+/// is the const-of-const mis-fold: `const byte X = (byte)Facts.IDENTITY_REG;` read back as 0 while
+/// the identical expression written INLINE folded correctly, because the inline path resolves names
+/// through scope and this one did not.
+///
+/// ONLY UNAMBIGUOUS SUFFIXES ARE REGISTERED, and that is the whole safety argument. This is not
+/// scope resolution -- it does not know which namespaces a file imported -- so it earns the right
+/// to answer only where every candidate agrees. A suffix owned by two types resolves to NOTHING,
+/// which leaves the fold unresolved exactly as it is today: a gap, never a wrong value. A file that
+/// writes `Facts.X` while two `Facts` types exist gets no fold rather than the wrong one.
+///
+/// A full name already inserted above is never displaced -- aliases fill empty slots only.
+fn register_unambiguous_short_spellings(
+    keys: &[(String, String)],
+    values: &mut BTreeMap<(String, String), Literal>,
+) {
+    let full_names: Vec<String> = keys
+        .iter()
+        .map(|(namespace, name)| qualified_type_name(namespace, name))
+        .collect();
+    let mut owners: BTreeMap<String, usize> = BTreeMap::new();
+    for full in &full_names {
+        for suffix in dotted_suffixes(full) {
+            *owners.entry(suffix).or_insert(0) += 1;
+        }
+    }
+    let constants: Vec<((String, String), Literal)> = values
+        .iter()
+        .map(|(key, literal)| (key.clone(), literal.clone()))
+        .collect();
+    for full in &full_names {
+        for suffix in dotted_suffixes(full) {
+            if owners.get(&suffix).copied() != Some(1) {
+                continue;
+            }
+            for ((owner, field), literal) in &constants {
+                if owner == full {
+                    values
+                        .entry((suffix.clone(), field.clone()))
+                        .or_insert_with(|| literal.clone());
+                }
+            }
+        }
+    }
+}
+
+/// The proper dotted suffixes of a type's full name -- `A.B.C` yields `B.C` and `C`. The full name
+/// itself is excluded: it is already a key.
+fn dotted_suffixes(full: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = full;
+    while let Some((_, tail)) = rest.split_once('.') {
+        out.push(tail.to_string());
+        rest = tail;
+    }
+    out
 }
 
 /// Whether `expr` is a constant-expression FORM (14.15): built only from literals, names, member
@@ -704,6 +858,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 },
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(parameter_symbol).collect(),
+                parameter_info: crate::bind::parameter_infos(parameters),
                 is_static: explicit_interface.is_none() && is_static(modifiers),
                 is_params: has_params_array(parameters),
                 is_vararg: *is_vararg,
@@ -726,6 +881,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 name: operator.method_name(parameters.len()).into(),
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(parameter_symbol).collect(),
+                parameter_info: crate::bind::parameter_infos(parameters),
                 is_static: true,
                 is_params: false,
                 is_vararg: false,
@@ -745,6 +901,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 name: direction.method_name().into(),
                 return_type: bind_type(target),
                 parameters: parameters.iter().map(parameter_symbol).collect(),
+                parameter_info: crate::bind::parameter_infos(parameters),
                 is_static: true,
                 is_params: false,
                 is_vararg: false,
@@ -794,6 +951,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         name: "get_Item".into(),
                         return_type: element.clone(),
                         parameters: indices.clone(),
+                        parameter_info: crate::bind::parameter_infos(parameters),
                         is_static: false,
                         is_params: has_params_array(parameters),
                         is_vararg: false,
@@ -806,12 +964,18 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     });
                 }
                 if setter.is_some() {
+                    let mut info_with_value = crate::bind::parameter_infos(parameters);
+                    info_with_value.push(crate::symbols::ParameterInfo {
+                        name: "value".into(),
+                        mode: crate::symbols::ParameterMode::Value,
+                    });
                     let mut parameters = indices;
                     parameters.push(element);
                     info.methods.push(MethodSymbol {
                         name: "set_Item".into(),
                         return_type: TypeSymbol::Special(SpecialType::Void),
                         parameters,
+                        parameter_info: info_with_value,
                         is_static: false,
                         is_params: false,
                         is_vararg: false,
@@ -863,6 +1027,7 @@ fn constructor(
         name: ".ctor".into(),
         return_type: TypeSymbol::Special(SpecialType::Void),
         parameters: parameters.iter().map(parameter_symbol).collect(),
+        parameter_info: crate::bind::parameter_infos(parameters),
         is_static: false,
         is_params: has_params_array(parameters),
         is_vararg: false,
@@ -990,6 +1155,74 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
     use lamella_syntax::parser::parse_compilation_unit;
+
+    /// DIAGNOSTIC probe for the const-of-const mis-fold (@layering, 2026-07-28): does the second
+    /// pass actually fold these four shapes into the model, or is the loss downstream of it?
+    #[test]
+    fn resolve_constants_folds_a_const_that_names_another_const() {
+        let unit = parse_compilation_unit(
+            "namespace G { public sealed class Facts { \
+                 public const uint IDENTITY_REG = 0xD0; \
+                 public const uint DIG_P9_WIDTH = 16; \
+                 public const uint OSRS_T_LSB = 5; } } \
+             namespace P { using G; public sealed class C { \
+                 private const byte CROSS = (byte)Facts.IDENTITY_REG; \
+                 private const int ARITH = (int)(Facts.DIG_P9_WIDTH + Facts.OSRS_T_LSB + 3); \
+                 private const int LOCAL_SRC = 208; \
+                 private const int LOCAL = LOCAL_SRC; } }",
+        )
+        .unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        model.canonicalize_signatures();
+        model.link_bases();
+        resolve_constants(&mut model, core::slice::from_ref(&unit));
+
+        let constant = |ty: &str, field: &str| {
+            model
+                .get("P", ty)
+                .and_then(|info| {
+                    info.fields
+                        .iter()
+                        .find(|f| &*f.name == field)
+                        .map(|f| f.constant.clone())
+                })
+                .expect("the type and field exist")
+        };
+        assert!(constant("C", "CROSS").is_some(), "cast of a cross-class const");
+        assert!(constant("C", "ARITH").is_some(), "arithmetic over cross-class consts");
+        assert!(constant("C", "LOCAL").is_some(), "a const naming a same-class const");
+    }
+
+    #[test]
+    fn an_enum_member_takes_its_value_from_a_cross_class_const() {
+        let unit = parse_compilation_unit(
+            "namespace G { public sealed class Facts { \
+                 public const uint MODE_NORMAL = 3; \
+                 public const uint MODE_FORCED = 1; } } \
+             namespace P { using G; \
+                 public enum Mode { Normal = (int)Facts.MODE_NORMAL, Next, \
+                                    Forced = (int)Facts.MODE_FORCED } }",
+        )
+        .unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        model.canonicalize_signatures();
+        model.link_bases();
+        resolve_constants(&mut model, core::slice::from_ref(&unit));
+
+        let value = |member: &str| {
+            model
+                .get("P", "Mode")
+                .and_then(|info| info.fields.iter().find(|f| &*f.name == member).cloned())
+                .and_then(|f| f.constant)
+                .and_then(|literal| literal_int_value(&literal))
+                .expect("the member exists and has a constant")
+        };
+        assert_eq!(value("Normal"), 3, "folded from the cross-class const");
+        assert_eq!(value("Next"), 4, "auto-numbered from the resolved member");
+        assert_eq!(value("Forced"), 1, "a later explicit member re-anchors");
+    }
 
     #[test]
     fn collects_top_level_namespaced_and_nested_namespace_types() {

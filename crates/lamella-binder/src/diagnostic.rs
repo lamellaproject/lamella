@@ -5,20 +5,48 @@ use core::fmt;
 use lamella_syntax::diagnostic::Severity;
 use lamella_syntax::span::Span;
 
-/// A semantic diagnostic: its kind and the source range it concerns.
+/// Which of a C# compiler's two passes reported a diagnostic. A compilation is checked in the
+/// order the language is defined: DECLARATIONS first -- signatures, base clauses, interface
+/// implementation, const values, enum members, attributes -- and then METHOD BODIES, which are
+/// checked AGAINST those declarations.
+///
+/// The order is not an implementation detail, because it decides what gets reported: a body is
+/// only worth analyzing if the declarations it is checked against are sound, so when the
+/// declaration pass reports an error the body pass is withheld entirely. See
+/// [`crate::withhold_body_diagnostics_after_declaration_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiagnosticPhase {
+    /// Reported while checking declarations. Never withheld.
+    #[default]
+    Declaration,
+    /// Reported while checking a method body, a field initializer, or a constructor initializer.
+    Body,
+}
+
+/// A semantic diagnostic: its kind, the source range it concerns, and which pass reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     /// What went wrong, with the detail needed to render the message.
     pub kind: DiagnosticKind,
     /// The source range the diagnostic concerns.
     pub span: Span,
+    /// Which pass reported this. Set by the binder as it leaves a body; everything else is a
+    /// declaration, which is why the default is the conservative one -- a diagnostic nobody
+    /// classified is never withheld.
+    pub phase: DiagnosticPhase,
 }
 
 impl Diagnostic {
-    /// Creates a diagnostic of `kind` over `span`.
+    /// Creates a diagnostic of `kind` over `span`, in the DECLARATION phase. The binder re-tags
+    /// the range it reported while inside a body, so every construction site can stay unaware of
+    /// the distinction.
     #[must_use]
     pub fn new(kind: DiagnosticKind, span: Span) -> Diagnostic {
-        Diagnostic { kind, span }
+        Diagnostic {
+            kind,
+            span,
+            phase: DiagnosticPhase::Declaration,
+        }
     }
 
     /// The `CSxxxx` numeric code.
@@ -178,6 +206,38 @@ pub enum DiagnosticKind {
         /// The field's disallowed type, as rendered.
         ty: Box<str>,
     },
+    /// `CS1599`: a method or delegate may not RETURN a restricted type.
+    ///
+    /// `System.TypedReference`, `System.ArgIterator` and `System.RuntimeArgumentHandle` are the
+    /// CLI's restricted types: a value of one carries a managed pointer into the frame that made
+    /// it, so it must never outlive that frame. This rule and its three siblings
+    /// ([`DiagnosticKind::RestrictedTypeField`], [`DiagnosticKind::RestrictedTypeArrayElement`],
+    /// [`DiagnosticKind::RestrictedTypeByReference`]) are what enforce that structurally --
+    /// returning one lets it escape upward. A local and a BY-VALUE parameter stay legal, which is
+    /// where such a value is meant to live.
+    RestrictedTypeReturn {
+        /// The restricted type's simple name, as the message quotes it (`TypedReference`).
+        ty: Box<str>,
+    },
+    /// `CS0610`: a field or property may not be OF a restricted type -- that would put a
+    /// frame-bound pointer on the heap. See [`DiagnosticKind::RestrictedTypeReturn`].
+    RestrictedTypeField {
+        /// The restricted type's simple name, as the message quotes it.
+        ty: Box<str>,
+    },
+    /// `CS0611`: an array element may not be OF a restricted type, for the same reason a field may
+    /// not be. See [`DiagnosticKind::RestrictedTypeReturn`].
+    RestrictedTypeArrayElement {
+        /// The restricted type's simple name, as the message quotes it.
+        ty: Box<str>,
+    },
+    /// `CS1601`: a `ref` or `out` parameter may not be OF a restricted type -- an out-slot is a way
+    /// out of the frame. A BY-VALUE parameter of the same type is legal. See
+    /// [`DiagnosticKind::RestrictedTypeReturn`].
+    RestrictedTypeByReference {
+        /// The restricted type's simple name, as the message quotes it.
+        ty: Box<str>,
+    },
     /// `CS0558`: a user-defined operator must be declared `static` and `public` (17.9.1); one
     /// missing either modifier is rejected.
     OperatorMustBeStaticAndPublic {
@@ -322,6 +382,57 @@ pub enum DiagnosticKind {
         /// The member's display signature, e.g. `P.M(int, __arglist)`.
         method: Box<str>,
     },
+    /// `CS7036`: a call supplied too FEW arguments and exactly ONE candidate exists, so csc
+    /// names the first parameter left without an argument instead of reporting a bare count
+    /// mismatch. With two or more candidates it falls back to the count (`CS1501` for a method,
+    /// `CS1729` for a constructor) -- measured, both ways.
+    MissingArgumentForParameter {
+        /// The first parameter with no corresponding argument.
+        parameter: Box<str>,
+        /// The candidate's display signature, e.g. `B.B(int)` or `C.M(int, out int)`.
+        method: Box<str>,
+    },
+    /// `CS1620`: an argument reached a by-reference parameter under the WRONG modifier --
+    /// `out` where the parameter is `ref`, or the reverse. Both spellings give the argument
+    /// the same `ByRef` type, so overload resolution cannot tell them apart and the call
+    /// resolves; only the parameter's recorded mode distinguishes them. csc names the mode
+    /// the PARAMETER wants, not the one the argument wrote.
+    ///
+    /// A missing modifier where the parameter is byref is also this code in csc, but it
+    /// cannot arise here: an unmodified argument does not share the parameter's `ByRef`
+    /// type, so no candidate is applicable and the call is `CS1503` instead.
+    ArgumentModeRequired {
+        /// The 1-based argument position.
+        index: u32,
+        /// The keyword the parameter requires -- `ref` or `out`.
+        keyword: Box<str>,
+    },
+    /// `CS0663`: two members differ ONLY in whether a by-reference parameter is `ref` or `out`.
+    /// Both spellings give the parameter the same by-reference type, so they do not overload --
+    /// and csc gives that its own code rather than the generic duplicate-member one, because the
+    /// repair is different: one of the two modifiers has to change, not one of the signatures.
+    ///
+    /// It is also the rule that makes `CS1620` single-valued: a resolved call's by-reference
+    /// parameter has exactly one mode, so "which keyword did the parameter want" has one answer.
+    OverloadDiffersOnlyByRefOut {
+        /// The declaring type.
+        type_name: Box<str>,
+        /// `method` or `constructor` -- csc changes the noun.
+        member_kind: &'static str,
+        /// The modifier on the LATER declaration. csc names this one first.
+        current: Box<str>,
+        /// The modifier on the earlier one.
+        previous: Box<str>,
+    },
+    /// `CS1615`: an argument carried a `ref`/`out` modifier its parameter does not take. The
+    /// mirror of [`Self::ArgumentModeRequired`], and it names the keyword the ARGUMENT wrote
+    /// rather than one the parameter wants -- the parameter wants none.
+    ArgumentModeForbidden {
+        /// The 1-based argument position.
+        index: u32,
+        /// The keyword the argument carried -- `ref` or `out`.
+        keyword: Box<str>,
+    },
     /// `CS1503`: an argument has no implicit conversion to its parameter type.
     ArgumentConversion {
         /// The 1-based argument position.
@@ -340,6 +451,34 @@ pub enum DiagnosticKind {
     Inaccessible {
         /// The qualified member name.
         member: Box<str>,
+    },
+    /// `CS0181`: an attribute constructor parameter whose type cannot appear in metadata as an
+    /// attribute argument (24.1.3). An attribute's arguments are baked into the assembly, so the
+    /// legal set is what the metadata blob can encode.
+    InvalidAttributeParameterType {
+        /// The parameter's declared name, as csc quotes it.
+        parameter: Box<str>,
+        /// The parameter's type.
+        type_name: Box<str>,
+    },
+    /// `CS0617`: a named attribute argument naming a member that exists and is reachable but can
+    /// never be assigned in an attribute -- a non-public, static, readonly or const field; a
+    /// property that is not public, is static, or lacks an accessor; a method; a nested type.
+    NotAValidNamedAttributeArgument {
+        /// The member name as written, unqualified -- csc names it bare here.
+        name: Box<str>,
+    },
+    /// `CS1540`: a `protected` instance member reached from a derived class through a qualifier
+    /// whose type is not that class or one derived from it (10.5.3). Deriving from a class grants
+    /// access to its protected members *through instances of the deriving class* -- not through an
+    /// arbitrary instance of the base, which need not be one of ours.
+    ProtectedQualifier {
+        /// The qualified member name.
+        member: Box<str>,
+        /// The static type of the qualifier the access was written through.
+        qualifier: Box<str>,
+        /// The type the access is written in, as csc names it.
+        accessing: Box<str>,
     },
     /// `CS0070`: a field-like event used from outside its declaring type anywhere other
     /// than the left of `+=`/`-=`.
@@ -927,6 +1066,10 @@ impl DiagnosticKind {
             DiagnosticKind::ConstantOverflowInCheckedContext => 220,
             DiagnosticKind::CheckedConstantConversionOverflow { .. } => 221,
             DiagnosticKind::VolatileFieldType { .. } => 677,
+            DiagnosticKind::RestrictedTypeReturn { .. } => 1599,
+            DiagnosticKind::RestrictedTypeField { .. } => 610,
+            DiagnosticKind::RestrictedTypeArrayElement { .. } => 611,
+            DiagnosticKind::RestrictedTypeByReference { .. } => 1601,
             DiagnosticKind::OperatorMustBeStaticAndPublic { .. } => 558,
             DiagnosticKind::AbstractTypeSealedOrStatic { .. } => 418,
             DiagnosticKind::StaticMemberCannotBeVirtual { .. } => 112,
@@ -952,9 +1095,16 @@ impl DiagnosticKind {
             DiagnosticKind::ArglistOutsideVarargMethod => 190,
             DiagnosticKind::ArglistOutsideCall => 226,
             DiagnosticKind::NoArgumentForArglist { .. } => 7036,
+            DiagnosticKind::MissingArgumentForParameter { .. } => 7036,
+            DiagnosticKind::ArgumentModeRequired { .. } => 1620,
+            DiagnosticKind::ArgumentModeForbidden { .. } => 1615,
+            DiagnosticKind::OverloadDiffersOnlyByRefOut { .. } => 663,
             DiagnosticKind::ArgumentConversion { .. } => 1503,
             DiagnosticKind::AmbiguousCall { .. } => 121,
             DiagnosticKind::Inaccessible { .. } => 122,
+            DiagnosticKind::InvalidAttributeParameterType { .. } => 181,
+            DiagnosticKind::NotAValidNamedAttributeArgument { .. } => 617,
+            DiagnosticKind::ProtectedQualifier { .. } => 1540,
             DiagnosticKind::EventOutsideAddRemove { .. } => 70,
             DiagnosticKind::NoEnclosingLoop => 139,
             DiagnosticKind::MultipleEntryPoints => 17,
@@ -1082,9 +1232,11 @@ impl DiagnosticKind {
 impl fmt::Display for DiagnosticKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DiagnosticKind::TypeNotFound { name } => {
-                write!(f, "The type or namespace name '{name}' could not be found")
-            }
+            DiagnosticKind::TypeNotFound { name } => write!(
+                f,
+                "The type or namespace name '{name}' could not be found \
+                 (are you missing a using directive or an assembly reference?)"
+            ),
             DiagnosticKind::NameNotFound { name } => {
                 write!(f, "The name '{name}' does not exist in the current context")
             }
@@ -1103,6 +1255,19 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::VolatileFieldType { field, ty } => {
                 write!(f, "'{field}': a volatile field cannot be of the type '{ty}'")
+            }
+            DiagnosticKind::RestrictedTypeReturn { ty } => write!(
+                f,
+                "The return type of a method, delegate, or function pointer cannot be '{ty}'"
+            ),
+            DiagnosticKind::RestrictedTypeField { ty } => {
+                write!(f, "Field or property cannot be of type '{ty}'")
+            }
+            DiagnosticKind::RestrictedTypeArrayElement { ty } => {
+                write!(f, "Array elements cannot be of type '{ty}'")
+            }
+            DiagnosticKind::RestrictedTypeByReference { ty } => {
+                write!(f, "Cannot make reference to variable of type '{ty}'")
             }
             DiagnosticKind::OperatorMustBeStaticAndPublic { signature } => write!(
                 f,
@@ -1208,6 +1373,28 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "There is no argument given that corresponds to the required parameter '__arglist' of '{method}'"
             ),
+            DiagnosticKind::MissingArgumentForParameter { parameter, method } => write!(
+                f,
+                "There is no argument given that corresponds to the required parameter '{parameter}' of '{method}'"
+            ),
+            DiagnosticKind::ArgumentModeRequired { index, keyword } => write!(
+                f,
+                "Argument {index} must be passed with the '{keyword}' keyword"
+            ),
+            DiagnosticKind::ArgumentModeForbidden { index, keyword } => write!(
+                f,
+                "Argument {index} may not be passed with the '{keyword}' keyword"
+            ),
+            DiagnosticKind::OverloadDiffersOnlyByRefOut {
+                type_name,
+                member_kind,
+                current,
+                previous,
+            } => write!(
+                f,
+                "'{type_name}' cannot define an overloaded {member_kind} that differs only on \
+                 parameter modifiers '{current}' and '{previous}'"
+            ),
             DiagnosticKind::ArgumentConversion { index, from, to } => write!(
                 f,
                 "Argument {index}: cannot convert from '{from}' to '{to}'"
@@ -1218,6 +1405,29 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::Inaccessible { member } => {
                 write!(f, "'{member}' is inaccessible due to its protection level")
             }
+            DiagnosticKind::InvalidAttributeParameterType {
+                parameter,
+                type_name,
+            } => write!(
+                f,
+                "Attribute constructor parameter '{parameter}' has type '{type_name}', \
+                 which is not a valid attribute parameter type"
+            ),
+            DiagnosticKind::NotAValidNamedAttributeArgument { name } => write!(
+                f,
+                "'{name}' is not a valid named attribute argument. Named attribute arguments \
+                 must be fields which are not readonly, static, or const, or read-write \
+                 properties which are public and not static."
+            ),
+            DiagnosticKind::ProtectedQualifier {
+                member,
+                qualifier,
+                accessing,
+            } => write!(
+                f,
+                "Cannot access protected member '{member}' via a qualifier of type '{qualifier}'; \
+                 the qualifier must be of type '{accessing}' (or derived from it)"
+            ),
             DiagnosticKind::EventOutsideAddRemove { event } => write!(
                 f,
                 "The event '{event}' can only appear on the left hand side of += or -= \
@@ -1758,7 +1968,8 @@ mod tests {
                 name: "Widget".into()
             }
             .to_string(),
-            "The type or namespace name 'Widget' could not be found"
+            "The type or namespace name 'Widget' could not be found \
+             (are you missing a using directive or an assembly reference?)"
         );
         assert_eq!(
             DiagnosticKind::NoImplicitConversion {

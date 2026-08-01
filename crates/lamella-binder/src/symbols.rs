@@ -123,6 +123,31 @@ pub struct EventSymbol {
     pub is_abstract: bool,
 }
 
+/// How a parameter is passed (17.5.1). The signature TYPE records by-reference-ness
+/// (`TypeSymbol::ByRef`) but cannot tell `ref` from `out`: both are `T&` in metadata, separated
+/// only by the `Out` flag on the parameter row. Diagnostics need the distinction -- CS1620 is
+/// literally "this argument needs `ref`, not `out`" -- so it is recorded here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParameterMode {
+    /// Passed by value.
+    #[default]
+    Value,
+    /// `ref`: passed by reference, assigned by the caller before the call.
+    Ref,
+    /// `out`: passed by reference, assigned by the callee before it returns.
+    Out,
+}
+
+/// What a parameter DECLARES beyond its type: the name a diagnostic quotes, and whether it is
+/// `ref` or `out`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterInfo {
+    /// The declared name. Empty when the source of this method could not supply one.
+    pub name: Box<str>,
+    /// `ref` / `out` / by value.
+    pub mode: ParameterMode,
+}
+
 /// A method of a type (17.5), reduced to what overload resolution needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodSymbol {
@@ -130,8 +155,17 @@ pub struct MethodSymbol {
     pub name: Box<str>,
     /// The return type (`void` is `SpecialType::Void`).
     pub return_type: TypeSymbol,
-    /// The parameter types, in order.
+    /// The parameter types, in order. This is what overload resolution and signature identity are
+    /// computed from, and it is deliberately unchanged: widening it to a struct would rewrite ~230
+    /// call sites for facts almost none of them want.
     pub parameters: Vec<TypeSymbol>,
+    /// The declaration facts for those parameters -- names and `ref`/`out` modes.
+    ///
+    /// INVARIANT: EMPTY, or exactly as long as `parameters`. Empty means "not known", which is the
+    /// honest state for a synthesized method or one whose source could not supply names -- and it
+    /// is why this is a separate vector rather than fields on the type list. A consumer must treat
+    /// empty as absence of information, never as "no parameters": see [`MethodSymbol::parameter_name`].
+    pub parameter_info: Vec<ParameterInfo>,
     /// Whether the method is `static`.
     pub is_static: bool,
     /// Whether the last parameter is a `params` array (a variable-length trailing
@@ -159,6 +193,32 @@ pub struct MethodSymbol {
     /// The `[Conditional("SYMBOL")]` symbols (24.4.2): a call to this method is omitted unless
     /// one of these is defined at the call site. Empty for an unconditional method.
     pub conditional: Vec<Box<str>>,
+}
+
+impl MethodSymbol {
+    /// The declared name of parameter `index`, or `None` when this method carries no parameter
+    /// facts.
+    ///
+    /// EVERY CALLER MUST HANDLE `None`, and that is the point of returning an option rather than
+    /// an empty string: a diagnostic whose message quotes a parameter name cannot be emitted at
+    /// all for a method whose names we never learned. Emitting it with a blank or invented name
+    /// would be worse than not emitting it -- the message would look authoritative and name the
+    /// wrong thing.
+    #[must_use]
+    pub fn parameter_name(&self, index: usize) -> Option<&str> {
+        self.parameter_info
+            .get(index)
+            .map(|info| &*info.name)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// How parameter `index` is passed, or `None` when this method carries no parameter facts.
+    /// `None` is NOT `Value`: an unknown mode must not be reported as by-value, or CS1620 would
+    /// fire on a method we simply could not read.
+    #[must_use]
+    pub fn parameter_mode(&self, index: usize) -> Option<ParameterMode> {
+        self.parameter_info.get(index).map(|info| info.mode)
+    }
 }
 
 /// A named type with its members.
@@ -656,6 +716,7 @@ mod tests {
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
+            parameter_info: Vec::new(),
             is_static: false,
             is_params: false,
             is_vararg: false,
@@ -670,6 +731,7 @@ mod tests {
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
+            parameter_info: Vec::new(),
             is_static: false,
             is_params: false,
             is_vararg: false,
@@ -684,6 +746,7 @@ mod tests {
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Double)],
+            parameter_info: Vec::new(),
             is_static: false,
             is_params: false,
             is_vararg: false,

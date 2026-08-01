@@ -30,6 +30,14 @@ pub struct Frame {
     /// Whether this is the module body (its `StoreFast`s mirror into the module globals). Only
     /// the entry frame of [`run_module`] sets it; a called function never does.
     is_module: bool,
+    /// Which module this frame's code, globals and sibling-function refs resolve against -- the
+    /// callee's HOME module, not the caller's.
+    ///
+    /// It rides the FRAME rather than the driver loop, which is what lets one frame stack hold
+    /// frames from several modules: the driver installs the top frame's module before each op, so a
+    /// call into an imported module is a frame push instead of a nested driver loop the collector's
+    /// safe point cannot see past.
+    module: u16,
     /// The instruction pointer: the index into the code's `ops` of the next op to run.
     ip: usize,
     locals: Vec<Value>,
@@ -39,10 +47,17 @@ pub struct Frame {
     /// immutable (flash-resident under XIP); the caches are the per-activation RAM side array
     /// (`lamella_py_bytecode` module note), so they belong to the frame, not the code.
     caches: Vec<InlineCache>,
-    /// The exception currently being handled in this frame -- set on entry to an `except` block,
-    /// cleared by `PopExcept` -- or `None`. A GC root while set (traced by [`Frame::trace`]), so an
-    /// allocation inside a handler body cannot free the in-flight exception out from under it.
-    active_exception: Option<Value>,
+    /// The exceptions being handled in this frame, innermost LAST -- pushed on entry to a handler,
+    /// popped by `PopExcept`. A STACK rather than one slot because a handler can raise and catch
+    /// another exception, and when that inner handling finishes the OUTER exception is being handled
+    /// again: it is what a bare `raise` re-raises and what the next raise records as its
+    /// `__context__`. Every entry is a GC root (traced by [`Frame::trace`]), so an allocation inside
+    /// a handler body cannot free an in-flight exception out from under it.
+    ///
+    /// Each entry remembers the PROTECTED RANGE of the try block whose handler pushed it, because a
+    /// handler body an exception escapes never reaches its own `PopExcept` -- see
+    /// [`Frame::enter_handler`], the only thing that pushes.
+    handled: Vec<Handled>,
     /// The deref array for closures: `[0 .. cellvars.len())` are this frame's OWN cells (locals a
     /// nested function captures), then the captured cells the closure carried in. `LoadDeref` /
     /// `StoreDeref` / `LoadClosure` index it; empty for a function with no cell/free variables. Each
@@ -52,6 +67,11 @@ pub struct Frame {
     /// sets it, `StoreName`/`LoadName` target it, `BuildClass` consumes it), else `None`. A GC root
     /// while set (traced by [`Frame::trace`]) so building the namespace cannot free it.
     class_namespace: Option<Value>,
+    /// Set only on an imported module's BODY frame: the rest of the `import` that pushed it, held
+    /// until the body finishes -- the module object to hand the importer, and the name to un-cache if
+    /// the body raises instead. A GC root while set (traced by [`Frame::trace`]): the module object
+    /// is reachable from nowhere else until the body completes and the importer binds it.
+    finishes_import: Option<ImportCompletion>,
     /// Whether this frame is mid `yield from` delegation (an `Op::YieldFrom` episode). While set, a
     /// resume of this generator re-runs YieldFrom (its ip was rewound to the op) with the sent value
     /// on TOS above the sub-iterator; false marks the first entry (send `None`) and each completed
@@ -72,13 +92,15 @@ impl Frame {
         Frame {
             code: CodeId::Entry,
             is_module: false,
+            module: 0,
             ip: 0,
             locals,
             stack: Vec::new(),
             caches,
-            active_exception: None,
+            handled: Vec::new(),
             derefs: Vec::new(),
             class_namespace: None,
+            finishes_import: None,
             yield_from_active: false,
         }
     }
@@ -91,9 +113,10 @@ impl Frame {
         self.locals.clear();
         self.stack.clear();
         self.caches.clear();
-        self.active_exception = None;
+        self.handled.clear();
         self.derefs.clear();
         self.class_namespace = None;
+        self.finishes_import = None;
         self.yield_from_active = false;
     }
 
@@ -129,6 +152,31 @@ impl Frame {
         Ok(())
     }
 
+    /// Enters `handler` for `exception`: truncates the operand stack, records the exception as the
+    /// one this frame is handling, and jumps to the handler.
+    ///
+    /// The recording is where the block structure matters. A handler body is left in one of two ways.
+    /// Normally it runs to its `PopExcept`. But when an exception ESCAPES the body, that `PopExcept`
+    /// is never reached, and the entry it would have popped has to go somewhere. It goes here: an
+    /// entry whose try block is INSIDE the one now handling belongs to a handler body being left, so
+    /// it stops being handled. Nesting of protected ranges IS the lexical nesting of try blocks, so
+    /// the exception table already carries what is needed.
+    ///
+    /// The distinction this draws is the one a single slot could not: an exception escaping a handler
+    /// body outward (drop the inner entry) versus a NEW try block written inside a handler body (keep
+    /// the outer entry -- its exception is still being handled, and is what a bare raise re-raises).
+    fn enter_handler(&mut self, exception: Value, handler: ExcEntry) {
+        self.stack.truncate(handler.depth as usize);
+        self.handled.retain(|h| !(h.start >= handler.start && h.end <= handler.end));
+        self.handled.push(Handled { exception, start: handler.start, end: handler.end });
+        self.ip = handler.target as usize;
+    }
+
+    /// The exception this frame is handling -- the innermost still-open handler's -- or `None`.
+    fn handling(&self) -> Option<Value> {
+        self.handled.last().map(|h| h.exception)
+    }
+
     /// Reports every slot the frame holds (locals and the evaluation stack) to the
     /// collector, tracing each *by tag*: pointer slots relocate in place, immediates
     /// are skipped. Drive it from [`lamella_gc::Heap::collect`]'s root closure.
@@ -142,12 +190,30 @@ impl Frame {
         for slot in self.derefs.iter_mut() {
             Value::trace_slot(slot, visit);
         }
-        if let Some(exc) = self.active_exception.as_mut() {
-            Value::trace_slot(exc, visit);
+        for entry in self.handled.iter_mut() {
+            Value::trace_slot(&mut entry.exception, visit);
         }
         if let Some(namespace) = self.class_namespace.as_mut() {
             Value::trace_slot(namespace, visit);
         }
+        if let Some(pending) = self.finishes_import.as_mut() {
+            Value::trace_slot(&mut pending.module_obj, visit);
+        }
+    }
+
+    /// The bytes this frame's buffers hold -- its locals, evaluation stack, inline caches, open
+    /// handlers and closure cells. CAPACITY rather than length, because a buffer that has grown and
+    /// shrunk still owns what it reserved, and the arena it came from does not know the difference.
+    ///
+    /// Part of [`crate::object::ObjectModel::footprint`]; a suspended generator's frame and a pooled
+    /// one both cost this much whether or not anything is stored in them.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        self.locals.capacity() * size_of::<Value>()
+            + self.stack.capacity() * size_of::<Value>()
+            + self.caches.capacity() * size_of::<InlineCache>()
+            + self.handled.capacity() * size_of::<Handled>()
+            + self.derefs.capacity() * size_of::<Value>()
     }
 }
 
@@ -758,6 +824,8 @@ fn dispatch_compare(
         Ok(value)
     } else if let Some(value) = try_deque_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
         Ok(value)
+    } else if let Some(value) = try_seq_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
     } else if let Some(value) = try_dict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
         Ok(value)
     } else {
@@ -1294,6 +1362,63 @@ fn try_deque_compare_dyn(
     Ok(Some(Value::from_bool(value)))
 }
 
+/// `list == list` / `tuple == tuple` (and ordering) comparing ELEMENT BY ELEMENT through the full
+/// dispatch, so an element's own `__eq__` decides. Without this the comparison falls back to a
+/// native value check that cannot call a user dunder, and `[obj] == [obj2]` is False for objects
+/// their own `__eq__` calls equal.
+///
+/// A list never equals a tuple, so both operands must be the same kind -- but a namedtuple IS a
+/// tuple, which is why the tuple side tests "not a list, and sequence-shaped" rather than a
+/// concrete type.
+fn try_seq_compare_dyn(
+    op: CmpOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if matches!(op, CmpOp::Is | CmpOp::IsNot) {
+        return Ok(None);
+    }
+    let both_lists = model.is_list(a) && model.is_list(b);
+    let both_tuples = !model.is_list(a)
+        && !model.is_list(b)
+        && model.seq_value(a).is_some()
+        && model.seq_value(b).is_some();
+    if !both_lists && !both_tuples {
+        return Ok(None);
+    }
+    let a_elems = model.seq_value(a).cloned().unwrap_or_default();
+    let b_elems = model.seq_value(b).cloned().unwrap_or_default();
+    let mut split = None;
+    for (i, (&x, &y)) in a_elems.iter().zip(&b_elems).enumerate() {
+        if !elem_eq(x, y, functions, model, depth)? {
+            split = Some(i);
+            break;
+        }
+    }
+    let value = match op {
+        CmpOp::Eq => split.is_none() && a_elems.len() == b_elems.len(),
+        CmpOp::Ne => split.is_some() || a_elems.len() != b_elems.len(),
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match split {
+            Some(i) => {
+                let decided = dispatch_compare(op, a_elems[i], b_elems[i], functions, model, depth)?;
+                return Ok(Some(decided));
+            }
+            None => match op {
+                CmpOp::Lt => a_elems.len() < b_elems.len(),
+                CmpOp::Le => a_elems.len() <= b_elems.len(),
+                CmpOp::Gt => a_elems.len() > b_elems.len(),
+                CmpOp::Ge => a_elems.len() >= b_elems.len(),
+                _ => unreachable!("guarded by the outer match arm"),
+            },
+        },
+        CmpOp::Is | CmpOp::IsNot => unreachable!("returned None above"),
+    };
+    Ok(Some(Value::from_bool(value)))
+}
+
 /// The ORDER-SENSITIVE OrderedDict equality: `od1 == od2` compares entries pairwise IN ORDER --
 /// only when BOTH operands are OrderedDicts (CPython); an OrderedDict against a plain dict (or
 /// another subtype) falls through to the order-insensitive dict equality. Orderings stay
@@ -1599,50 +1724,68 @@ pub fn run_bundle(bundle: Bundle, model: &mut ObjectModel) -> Result<Value, Trap
 
 /// Resolves an `import name` the interpreter-aware way, backing [`Op::ImportName`]: a cached / host /
 /// native module FIRST (native wins, the sealed-bundle precedence -- a bundled `math.py` does not
-/// shadow the stdlib `math`), else a MANAGED Python-authored module (run its body once in its own
-/// namespace), else `ModuleNotFoundError`. Interpreter-level, not a plain model method, because a
-/// managed module runs bytecode -- which needs the driver.
-fn resolve_import(name: &str, model: &mut ObjectModel) -> Result<Value, Trap> {
+/// shadow the stdlib `math`), else a MANAGED Python-authored module whose body has to RUN, else
+/// `ModuleNotFoundError`.
+///
+/// It does not run the body itself. A managed module's body runs on the IMPORTER's frame stack --
+/// pushed by the driver like a call, finished by [`finish_import`] when it returns -- because a body
+/// run on a nested driver loop reaches no safe point, so nothing it allocates can be reclaimed until
+/// the import completes. Everything the import machinery still has to do after the body runs rides an
+/// [`ImportCompletion`] on the body's frame.
+///
+/// The module object is cached BEFORE its body runs, so a circular import (`a` imports `b`, `b`
+/// imports `a`) sees the in-progress module and terminates rather than re-running the body forever.
+/// During the body that cached module's namespace is empty; it is filled once the body completes (a
+/// re-entrant import mid-cycle thus sees an empty module, which is enough to break the cycle --
+/// exposing the partial-as-of-that-point state is a later refinement).
+fn begin_import(name: &str, model: &mut ObjectModel) -> Result<ImportOutcome, Trap> {
     if let Some(result) = model.import_builtin_module(name) {
-        return result;
+        return result.map(ImportOutcome::Ready);
     }
-    if model.managed_module_id(name).is_some() {
-        return run_managed_module(name, model);
-    }
-    Err(model.module_not_found(name))
-}
-
-/// Runs a MANAGED (Python-authored) module's body ONCE in its own namespace and returns the module
-/// object. Mirrors CPython's import machinery for the subset:
-///
-/// - The module object is cached in `sys.modules` BEFORE its body runs, so a circular import
-///   (`a` imports `b`, `b` imports `a`) sees the in-progress module and terminates rather than
-///   re-running the body forever. During the body the cached module's namespace is empty; it is
-///   filled once the body completes (a re-entrant import mid-cycle thus sees an empty module, which
-///   is enough to break the cycle -- exposing the partial-as-of-that-point state is a later refinement).
-/// - The body runs against the module's OWN function table + global namespace (module id `k`): each
-///   top-level binding populates module `k`'s globals (`managed_globals[k-1]`), not the importer's, so
-///   `import helpers` does not leak `helpers`' names into the importer. That namespace, UNIONed with the
-///   module's top-level `def`s (which live in the function table, not globals), becomes the module's dict
-///   (`from m import x` / `m.x` read it -- constants, classes, and functions alike).
-/// - On a body error the module is un-cached, so a later import retries (CPython drops a failed
-///   import from `sys.modules`).
-///
-/// A module FUNCTION called after import resolves its globals + sibling functions against THIS module
-/// (its home id rides the function value, stamped at `MakeFunction`), so `helpers.compute()` reads
-/// helpers' globals -- the Phase 2 binding.
-fn run_managed_module(name: &str, model: &mut ObjectModel) -> Result<Value, Trap> {
-    let module_id = model.managed_module_id(name).ok_or(Trap::Malformed)?;
-    let body = model.managed_module_body(module_id).ok_or(Trap::Malformed)?;
-    let functions = model.managed_functions_rc(module_id).ok_or(Trap::Malformed)?;
+    let Some(module_id) = model.managed_module_id(name) else {
+        return Err(model.module_not_found(name));
+    };
     let empty = model.new_dict(Vec::new())?;
     let module_obj = model.new_module(empty)?;
     model.cache_module(name, module_obj);
-    let result = run_frames(&body, &functions, &[], &[], model, true, 0, module_id);
-    if let Err(trap) = result {
-        model.uncache_module(name);
-        return Err(trap);
+    let completion = ImportCompletion { name: String::from(name), module_obj };
+    Ok(ImportOutcome::RunBody { module_id, completion })
+}
+
+/// The other half of an `import`, run when the module BODY's frame returns: builds the module's dict
+/// from what the body bound and hands back the MODULE object, which is what the importer receives.
+///
+/// The dict = the names the body BOUND (assignments, classes, and defaulted defs -- all mirrored into
+/// module `module_id`'s globals by `StoreFast`) UNIONed with its top-level `def`s. A plain top-level
+/// def is NOT stored as a global -- it lives in the function table, resolved by name via
+/// [`resolve_global`] -- so without this union it is absent from the namespace and `from m import fn`
+/// / `m.fn` fail. A top-level def has a SIMPLE name; nested defs (`outer.inner`), lambdas
+/// (`<module>.<lambda.0>`) and class methods (`C.m`) carry a dotted qualified name and are not
+/// module-level bindings, so a dot excludes them. Each exported def is stamped with THIS module as its
+/// home (`function_ref_in_module`), so a call through it resolves the callee's own globals. A def the
+/// body already bound (a defaulted def, stored as a PyFunction carrying its defaults) is skipped so
+/// its defaults are not lost.
+fn finish_import(
+    module_id: u16,
+    completion: ImportCompletion,
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    match build_module_namespace(module_id, completion.module_obj, model) {
+        Ok(()) => Ok(completion.module_obj),
+        Err(trap) => {
+            model.uncache_module(&completion.name);
+            Err(trap)
+        }
     }
+}
+
+/// Fills `module_obj`'s namespace from module `module_id`'s bound globals and top-level defs.
+fn build_module_namespace(
+    module_id: u16,
+    module_obj: Value,
+    model: &mut ObjectModel,
+) -> Result<(), Trap> {
+    let functions = model.managed_functions_rc(module_id).ok_or(Trap::Malformed)?;
     let mut pairs = model.managed_module_globals(module_id);
     for (index, func) in functions.iter().enumerate() {
         if !func.name.contains('.') && !pairs.iter().any(|(n, _)| *n == func.name) {
@@ -1651,7 +1794,7 @@ fn run_managed_module(name: &str, model: &mut ObjectModel) -> Result<Value, Trap
     }
     let namespace = model.namespace_from_globals(pairs)?;
     model.set_module_namespace(module_obj, namespace);
-    Ok(module_obj)
+    Ok(())
 }
 
 /// One op's control-flow outcome, returned from the per-op block to the [`run_frames`]
@@ -1661,13 +1804,16 @@ fn run_managed_module(name: &str, model: &mut ObjectModel) -> Result<Value, Trap
 enum Flow {
     Next,
     Return(Value),
-    /// Call module function `index` with `args` already bound to its parameters. The driver
-    /// pushes a new [`Frame`] onto the explicit frame stack, so a deep Python call chain never
-    /// grows the native stack. Only a DIRECT call of a plain or defaulted Python function
-    /// reaches here; builtins, bound methods, class init, and dunders stay on [`call_value`]
-    /// (bounded native recursion). `cells` are the captured cells if the callee is a closure
-    /// (empty otherwise); the driver seeds the freevar half of the new frame's deref array with them.
-    Call { index: u32, args: Vec<Value>, cells: Vec<Value> },
+    /// Call the planned Python function. The driver pushes a new [`Frame`] onto the explicit frame
+    /// stack, so a deep Python call chain never grows the native stack -- and, since the frame
+    /// carries its own module, so does a call into an IMPORTED module or a method of a class defined
+    /// in one. Builtins, class init, dunders and generator resumes still stay on [`call_value`]
+    /// (bounded native recursion).
+    Call(PendingPyCall),
+    /// Run an imported module's BODY on this frame stack, then hand the caller the MODULE object
+    /// (not the body's return value) -- see [`ImportCompletion`]. The same reason as [`Flow::Call`]:
+    /// a body run on a nested driver loop reaches no safe point.
+    ImportBody { module_id: u16, completion: ImportCompletion },
     /// The current (generator) frame yielded `value`: [`drive`] stops and returns it, leaving the
     /// yielding frame on top of the stack for the resumer to re-suspend. Reached only during a
     /// generator resume -- a generator function's body runs nowhere else.
@@ -1691,6 +1837,45 @@ enum CodeId {
     Entry,
     /// Module function `functions[index]` -- every pushed frame, and every generator.
     Func(u32),
+    /// An imported module's top-level BODY, resolved from the registry by the frame's own module id.
+    /// Distinct from [`CodeId::Entry`] because a body frame is pushed onto the IMPORTER's stack,
+    /// where `Entry` means the importer's own code rather than this frame's.
+    ModuleBody,
+}
+
+/// The half of an `import` that cannot run until the module BODY has: carried on the body's frame
+/// from the moment it is pushed onto the caller's stack until it returns or raises.
+#[derive(Debug)]
+struct ImportCompletion {
+    /// The module's registry name, so a body that RAISES can be un-cached and a later import retries
+    /// (CPython drops a failed import from `sys.modules`).
+    name: String,
+    /// The module object, cached before the body ran so a circular import terminates against it. Its
+    /// namespace is empty until the body completes; the importer receives THIS, not what the body
+    /// returned.
+    module_obj: Value,
+}
+
+/// What resolving an `import` produced: the module itself, or a body the driver has to run first.
+enum ImportOutcome {
+    /// A cached, host or native module -- nothing to run.
+    Ready(Value),
+    /// A Python-authored module being imported for the first time: its body has to run, and it runs
+    /// on the importer's own frame stack so the collector's safe point reaches it.
+    RunBody { module_id: u16, completion: ImportCompletion },
+}
+
+/// One exception this frame is handling, with the protected range of the try block whose handler
+/// recorded it -- the range is how [`Frame::enter_handler`] tells a handler body being LEFT from a try
+/// block written INSIDE one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Handled {
+    /// The exception being handled.
+    exception: Value,
+    /// First op index of the try body its handler protects.
+    start: u32,
+    /// One past the last op index of that try body.
+    end: u32,
 }
 
 /// The innermost `exc_table` entry whose protected range covers op `ip`, or `None`. Entries
@@ -1727,74 +1912,153 @@ fn resolve_global(name: &str, functions: &[CodeObject], model: &mut ObjectModel)
     }
 }
 
-/// Invokes function `index` of module `home` with already-bound `args` -- the cross-module-aware
-/// funnel. A function runs against its HOME module's function table (fetched as a shared `Rc`) with
-/// `home` installed as the module context, so its globals + sibling-function refs resolve against its
-/// home module even when called from another module. This holds for the entry too (`home == 0` -> the
-/// entry `Rc` `run_bundle` installed), so a managed module calling an entry-defined function reaches
-/// the entry's code; the threaded `functions` is only the fallback when no entry `Rc` is set (a
-/// single-file program, where no managed caller exists).
-fn invoke_function_value(
-    home: u16,
+/// A call of Python-authored code, resolved to everything needed to RUN it -- which function of
+/// which module, its arguments already bound to the parameters, and its captured cells -- but not
+/// yet run.
+///
+/// Separating the resolution from the running is what lets ONE frame stack serve a call into an
+/// imported module: the driver pushes the frame itself ([`Flow::Call`]) instead of re-entering a
+/// nested driver loop, and a nested driver loop is precisely what the collector's safe point cannot
+/// see past. Both callers of [`plan_py_call`] use this, so a call binds its arguments the same way
+/// whichever of the two runs it.
+struct PendingPyCall {
+    /// Index into `module`'s function table.
     index: u32,
-    args: &[Value],
-    cells: &[Value],
-    functions: &[CodeObject],
-    model: &mut ObjectModel,
-    depth: usize,
-) -> Result<Value, Trap> {
-    match model.managed_functions_rc(home) {
-        Some(home_funcs) => invoke_function(index, args, cells, &home_funcs, model, depth, home),
-        None => invoke_function(index, args, cells, functions, model, depth, home),
-    }
+    /// The arguments, already placed in the callee's parameter slots.
+    args: Vec<Value>,
+    /// The captured cells if the callee is a closure, else empty; they seed the freevar half of the
+    /// new frame's deref array.
+    cells: Vec<Value>,
+    /// The callee's HOME module: which function table its code comes from and which globals it
+    /// resolves against, regardless of who called it.
+    module: u16,
+    /// Whether the callee is a generator function -- calling one RETURNS a generator object and
+    /// runs no code, so the frame built here is suspended rather than pushed.
+    is_generator: bool,
 }
 
-/// Binds `posargs`/`kwargs` (with any defaults) to a Python function VALUE (`function_ref` or
-/// `PyFunction`) resolved against its HOME module, then invokes it -- the shared cross-module-aware
-/// tail of the binding call arms (a defaulted function, a keyword call, a bound method). The callee's
-/// CODE lives in its home module, so binding + invocation both use the home function table.
-fn call_py_function_value(
-    func: Value,
-    posargs: &[Value],
+/// What [`plan_py_call`] made of a callee.
+enum PyCallPlan {
+    /// It runs Python code in a frame.
+    Frame(PendingPyCall),
+    /// It does not (a builtin, a class, a native shim, a callable instance), and here are the
+    /// positional arguments back, so the caller dispatches them without copying them twice.
+    NotAFrame(Vec<Value>),
+}
+
+/// Resolves `callee` to the frame it would run, or hands the arguments back if it is not a Python
+/// function at all.
+///
+/// The three shapes that run Python code in a frame are a bare `function_ref`, a `PyFunction`
+/// (defaults / kwdefaults / closure cells) and a bound method of a user class (`self` prepended).
+/// Each resolves against the callee's OWN home module -- its code, its globals and its sibling
+/// functions -- so an imported function behaves the same called from anywhere.
+///
+/// **Whether the arguments are BOUND here is not a tuning choice, it is which error a bad call
+/// reports.** A bare function called positionally takes its arguments as they stand and lets frame
+/// creation check the arity; everything that has to PLACE a value -- a default, a keyword, `*args`,
+/// `**kwargs`, a keyword-only parameter, or the `self` of a method -- goes through
+/// [`bind_arguments`] first, which is where the per-shape CPython wording lives.
+fn plan_py_call(
+    callee: Value,
+    posargs: Vec<Value>,
     kwargs: &[(&str, Value)],
     functions: &[CodeObject],
     model: &mut ObjectModel,
-    depth: usize,
-) -> Result<Value, Trap> {
-    let home = model.function_home(func);
-    let (index, defaults, kwdefaults, cells) = if let Some(index) = func.as_function_index() {
-        (index, Vec::new(), Value::NONE, Vec::new())
+) -> Result<PyCallPlan, Trap> {
+    let (func, receiver) = if model.is_py_bound(callee) {
+        let func = model.bound_func(callee);
+        if func.as_function_index().is_none() && !model.is_py_function(func) {
+            return Err(Trap::TypeError);
+        }
+        (func, Some(model.bound_self(callee)))
+    } else if callee.as_function_index().is_some() || model.is_py_function(callee) {
+        (callee, None)
     } else {
-        (
+        return Ok(PyCallPlan::NotAFrame(posargs));
+    };
+    let module = model.function_home(func);
+    let (index, defaults, kwdefaults, cells) = match func.as_function_index() {
+        Some(index) => (index, Vec::new(), Value::NONE, Vec::new()),
+        None => (
             model.py_function_index(func),
             model.py_function_defaults(func),
             model.py_function_kwdefaults(func),
             model.py_function_cells(func),
-        )
+        ),
     };
-    let home_funcs = model.managed_functions_rc(home);
+    let home_funcs = model.managed_functions_rc(module);
     let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
     let code = code_funcs.get(index as usize).ok_or(Trap::Malformed)?;
-    let bound = bind_arguments(code, posargs, kwargs, &defaults, kwdefaults, model)?;
-    invoke_function(index, &bound, &cells, code_funcs, model, depth, home)
+    let is_generator = code.is_generator;
+    let must_bind = receiver.is_some()
+        || func.as_function_index().is_none()
+        || !kwargs.is_empty()
+        || code.has_varargs
+        || code.has_varkwargs
+        || code.kwonly_count > 0;
+    let args = if must_bind {
+        let mut positional = Vec::with_capacity(posargs.len() + usize::from(receiver.is_some()));
+        if let Some(self_value) = receiver {
+            positional.push(self_value);
+        }
+        positional.extend_from_slice(&posargs);
+        bind_arguments(code, &positional, kwargs, &defaults, kwdefaults, model)?
+    } else {
+        posargs
+    };
+    Ok(PyCallPlan::Frame(PendingPyCall { index, args, cells, module, is_generator }))
 }
 
-fn invoke_function(
-    index: u32,
-    args: &[Value],
-    cells: &[Value],
+/// Builds the frame a planned call runs in, resolving the callee's code against its HOME module's
+/// table. Shared by the driver's same-stack push and the generator-object case, so a generator's
+/// suspended frame and a called frame are built identically.
+fn new_planned_frame(
+    pending: &PendingPyCall,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+) -> Result<Frame, Trap> {
+    let home_funcs = model.managed_functions_rc(pending.module);
+    let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+    let code = code_funcs.get(pending.index as usize).ok_or(Trap::Malformed)?;
+    new_frame(
+        code,
+        CodeId::Func(pending.index),
+        &pending.args,
+        false,
+        &pending.cells,
+        pending.module,
+        model,
+    )
+}
+
+/// Runs a planned call on a NESTED driver loop and returns its value -- the callback path, for a
+/// callee reached from somewhere that has no frame stack to push onto (a dunder, a builtin's `key=`,
+/// a class initializer). The same plan pushed by [`Flow::Call`] instead runs on the caller's own
+/// stack, which is the one the safe point can see.
+fn run_planned_call(
+    pending: PendingPyCall,
     functions: &[CodeObject],
     model: &mut ObjectModel,
     depth: usize,
-    module_id: u16,
 ) -> Result<Value, Trap> {
-    let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-    if code.is_generator {
-        let generator = new_frame(code, CodeId::Func(index), args, false, cells, model)?;
-        model.new_generator(generator, module_id)
-    } else {
-        run_frames(code, functions, args, cells, model, false, depth, module_id)
+    if pending.is_generator {
+        let generator = new_planned_frame(&pending, functions, model)?;
+        return model.new_generator(generator, pending.module);
     }
+    let home_funcs = model.managed_functions_rc(pending.module);
+    let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+    let code = code_funcs.get(pending.index as usize).ok_or(Trap::Malformed)?;
+    run_frames(
+        code,
+        code_funcs,
+        &pending.args,
+        &pending.cells,
+        model,
+        false,
+        depth,
+        pending.module,
+    )
 }
 
 /// `object.attr = value` -- the one attribute-store dispatch shared by the `SetAttr` op and the
@@ -1845,23 +2109,16 @@ pub(crate) fn call_value(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if let Some(index) = callee.as_function_index() {
-        let home = callee.function_home_module().unwrap_or(0);
-        let needs_bind = {
-            let home_funcs = model.managed_functions_rc(home);
-            let code_funcs = home_funcs.as_deref().unwrap_or(functions);
-            code_funcs
-                .get(index as usize)
-                .is_some_and(|c| c.has_varargs || c.has_varkwargs || c.kwonly_count > 0)
+    if callee.as_function_index().is_some()
+        || model.is_py_function(callee)
+        || model.is_py_bound(callee)
+    {
+        return match plan_py_call(callee, args.to_vec(), &[], functions, model)? {
+            PyCallPlan::Frame(pending) => run_planned_call(pending, functions, model, depth),
+            PyCallPlan::NotAFrame(_) => Err(Trap::Malformed),
         };
-        if needs_bind {
-            call_py_function_value(callee, args, &[], functions, model, depth)
-        } else {
-            invoke_function_value(home, index, args, &[], functions, model, depth)
-        }
-    } else if model.is_py_function(callee) {
-        call_py_function_value(callee, args, &[], functions, model, depth)
-    } else if let Some(id) = callee.as_builtin_id() {
+    }
+    if let Some(id) = callee.as_builtin_id() {
         crate::builtins::call_builtin(id, args, functions, model, depth)
     } else if model.is_str_join(callee) {
         let [iterable] = args else {
@@ -1878,7 +2135,45 @@ pub(crate) fn call_value(
     } else if model.is_bound_method(callee) {
         let receiver = model.bound_receiver(callee);
         let method_id = model.bound_method_id(callee);
-        if model.is_builtin_dunder_method(method_id) {
+        if method_id == crate::object::CALL_DUNDER {
+            call_value(receiver, args, functions, model, depth)
+        } else if method_id == crate::object::NEXT_DUNDER {
+            match py_next_value(receiver, functions, model, depth)? {
+                Some(value) => Ok(value),
+                None => {
+                    let value = if model.is_generator(receiver) {
+                        model.take_generator_return().unwrap_or(Value::NONE)
+                    } else {
+                        Value::NONE
+                    };
+                    Err(model.raise_named_exception_with_value("StopIteration", value))
+                }
+            }
+        } else if model.is_builtin_dunder_method(method_id)
+            && model.builtin_dunder_comparison(method_id).is_some()
+            && !model.is_instance(match args {
+                [subject, _] => *subject,
+                _ => receiver,
+            })
+        {
+            let op = model.builtin_dunder_comparison(method_id).unwrap_or(CmpOp::Eq);
+            let (receiver, other) = match args {
+                [other] => (receiver, *other),
+                [subject, other] => (*subject, *other),
+                _ => return Err(Trap::TypeError),
+            };
+            if !model.comparison_dunder_accepts(receiver, other) {
+                return Ok(Value::NOT_IMPLEMENTED);
+            }
+            if model.is_dict(receiver) && !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                return Ok(Value::NOT_IMPLEMENTED);
+            }
+            match dispatch_compare(op, receiver, other, functions, model, depth) {
+                Ok(value) => Ok(value),
+                Err(Trap::TypeError) => Ok(Value::NOT_IMPLEMENTED),
+                Err(error) => Err(error),
+            }
+        } else if model.is_builtin_dunder_method(method_id) {
             model.call_bound_method(callee, args)
         } else if model.is_generator(receiver) {
             call_generator_method(receiver, method_id, args, functions, model, depth)
@@ -1893,15 +2188,6 @@ pub(crate) fn call_value(
         } else {
             model.call_bound_method(callee, args)
         }
-    } else if model.is_py_bound(callee) {
-        let func = model.bound_func(callee);
-        if func.as_function_index().is_none() && !model.is_py_function(func) {
-            return Err(Trap::TypeError);
-        }
-        let mut method_args = Vec::with_capacity(args.len() + 1);
-        method_args.push(model.bound_self(callee));
-        method_args.extend_from_slice(args);
-        call_py_function_value(func, &method_args, &[], functions, model, depth)
     } else if model.is_unbound_method(callee) {
         let (receiver, rest) = args.split_first().ok_or(Trap::TypeError)?;
         let name_value = model.unbound_method_name(callee);
@@ -1911,16 +2197,7 @@ pub(crate) fn call_value(
     } else if model.is_ntclass(callee) {
         construct_namedtuple(callee, args, &[], model)
     } else if model.is_class(callee) {
-        let instance = model.new_object(callee)?;
-        if let Some(init) = model.find_init(callee) {
-            let mut init_args = Vec::with_capacity(args.len() + 1);
-            init_args.push(instance);
-            init_args.extend_from_slice(args);
-            call_value(init, &init_args, functions, model, depth)?;
-        } else if !args.is_empty() {
-            model.init_default_args(instance, args)?;
-        }
-        Ok(instance)
+        instantiate(callee, args, &[], functions, model, depth)
     } else if model.is_pin_factory(callee) {
         model.call_pin_factory(args)
     } else if model.is_uart_shim_factory(callee) {
@@ -1992,6 +2269,66 @@ fn construct_namedtuple(
     model.new_ntinstance(class, elements)
 }
 
+/// `C(*posargs, **kwargs)`: constructs an instance of a user class. Allocation goes through the
+/// class's `__new__` and initialization through the result's `__init__` -- CPython's two-step, in
+/// that order, and the ONE path both the positional and the keyword call arms use, so a class
+/// cannot be constructed two different ways depending on how its arguments were spelled.
+///
+/// Two consequences of the two-step worth naming, because they are what `__new__` is FOR:
+/// a `__new__` returning something that is not an instance of the class skips initialization
+/// entirely (a caching or interning factory hands back an object that is already initialized), and
+/// `__init__` is resolved on the RESULT's class rather than on the class that was called (a `__new__`
+/// returning a subclass instance initializes as that subclass).
+fn instantiate(
+    class: Value,
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let instance = match model.find_new(class)? {
+        Some(new) => {
+            let mut new_args = Vec::with_capacity(posargs.len() + 1);
+            new_args.push(class);
+            new_args.extend_from_slice(posargs);
+            let made = call_maybe_kw(new, &new_args, kwargs, functions, model, depth + 1)?;
+            if !model.is_instance_of(made, class) {
+                return Ok(made);
+            }
+            made
+        }
+        None => model.object_new(class, posargs, kwargs)?,
+    };
+    let actual = crate::builtins::type_of(instance, model).unwrap_or(class);
+    if let Some(init) = model.find_init(actual) {
+        let mut init_args = Vec::with_capacity(posargs.len() + 1);
+        init_args.push(instance);
+        init_args.extend_from_slice(posargs);
+        call_maybe_kw(init, &init_args, kwargs, functions, model, depth)?;
+    } else {
+        model.init_default_args(instance, posargs)?;
+    }
+    Ok(instance)
+}
+
+/// Calls `callee` with positional arguments and, when there are any, keywords -- the keyword path
+/// only when it is needed, so a purely positional call behaves exactly as [`call_value`] does.
+fn call_maybe_kw(
+    callee: Value,
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if kwargs.is_empty() {
+        call_value(callee, posargs, functions, model, depth)
+    } else {
+        call_value_kw(callee, posargs, kwargs, functions, model, depth)
+    }
+}
+
 /// Dispatches a call carrying KEYWORD arguments (`Op::CallKw`). Like [`call_value`] but binds
 /// `posargs` + `kwargs` (+ any defaults) to the callee's parameters via [`bind_arguments`]. Handles
 /// Python functions (plain + defaulted), bound methods, and class instantiation. A keyword call to a
@@ -2004,27 +2341,48 @@ fn call_value_kw(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if callee.as_function_index().is_some() || model.is_py_function(callee) {
-        call_py_function_value(callee, posargs, kwargs, functions, model, depth)
-    } else if model.is_py_bound(callee) {
-        let func = model.bound_func(callee);
-        let mut all_pos = Vec::with_capacity(posargs.len() + 1);
-        all_pos.push(model.bound_self(callee));
-        all_pos.extend_from_slice(posargs);
-        call_value_kw(func, &all_pos, kwargs, functions, model, depth)
-    } else if model.is_ntclass(callee) {
+    if callee.as_function_index().is_some()
+        || model.is_py_function(callee)
+        || model.is_py_bound(callee)
+    {
+        return match plan_py_call(callee, posargs.to_vec(), kwargs, functions, model)? {
+            PyCallPlan::Frame(pending) => run_planned_call(pending, functions, model, depth),
+            PyCallPlan::NotAFrame(_) => Err(Trap::Malformed),
+        };
+    }
+    if model.is_ntclass(callee) {
         construct_namedtuple(callee, posargs, kwargs, model)
     } else if model.is_class(callee) {
-        let instance = model.new_object(callee)?;
-        if let Some(init) = model.find_init(callee) {
-            let mut all_pos = Vec::with_capacity(posargs.len() + 1);
-            all_pos.push(instance);
-            all_pos.extend_from_slice(posargs);
-            call_value_kw(init, &all_pos, kwargs, functions, model, depth)?;
-        } else if !posargs.is_empty() || !kwargs.is_empty() {
+        instantiate(callee, posargs, kwargs, functions, model, depth)
+    } else if model.is_int_to_bytes_bound(callee) {
+        let receiver = model.bound_receiver(callee);
+        let mut length = match posargs.first() {
+            Some(value) => value.as_int().ok_or(Trap::TypeError)?,
+            None => 1,
+        };
+        let mut byteorder = match posargs.get(1) {
+            Some(value) => model.str_value(*value).map(String::from).ok_or(Trap::TypeError)?,
+            None => String::from("big"),
+        };
+        if posargs.len() > 2 {
             return Err(Trap::TypeError);
         }
-        Ok(instance)
+        let mut signed = false;
+        for &(name, value) in kwargs {
+            match name {
+                "signed" => signed = model.py_truthy(value)?.unwrap_or(false),
+                "length" if posargs.is_empty() => length = value.as_int().ok_or(Trap::TypeError)?,
+                "byteorder" if posargs.len() < 2 => {
+                    byteorder = model.str_value(value).map(String::from).ok_or(Trap::TypeError)?;
+                }
+                other => {
+                    let message =
+                        alloc::format!("to_bytes() got an unexpected keyword argument '{other}'");
+                    return Err(model.raise_named_exception("TypeError", &message));
+                }
+            }
+        }
+        model.int_to_bytes(receiver, length, &byteorder, signed)
     } else if model.is_list_sort_bound(callee) {
         let receiver = model.bound_receiver(callee);
         list_sort_kw(posargs, kwargs, receiver, functions, model, depth)
@@ -2111,6 +2469,12 @@ fn call_value_kw(
                 return Err(model.raise_named_exception("TypeError", &message));
             }
             return model.new_ntinstance(class, elements);
+        }
+        if model.bound_method_id(callee) == crate::object::OBJECT_NEW {
+            let (class, rest) = posargs.split_first().ok_or_else(|| {
+                model.raise_named_exception("TypeError", "object.__new__(): not enough arguments")
+            })?;
+            return model.object_new(*class, rest, kwargs);
         }
         if kwargs.is_empty() {
             model.call_bound_method(callee, posargs)
@@ -2211,12 +2575,22 @@ fn bind_arguments(
         match target {
             Some(idx) => {
                 if slots[idx].is_some() {
-                    return Err(Trap::TypeError);
+                    let message = alloc::format!(
+                        "{}() got multiple values for argument '{name}'",
+                        code.name
+                    );
+                    return Err(model.raise_named_exception("TypeError", &message));
                 }
                 slots[idx] = Some(value);
             }
             None if code.has_varkwargs => extra.push((model.new_str(name)?, value)),
-            None => return Err(Trap::TypeError),
+            None => {
+                let message = alloc::format!(
+                    "{}() got an unexpected keyword argument '{name}'",
+                    code.name
+                );
+                return Err(model.raise_named_exception("TypeError", &message));
+            }
         }
     }
     if let Some(vk) = varkwargs_idx {
@@ -2388,7 +2762,7 @@ fn resume_generator(
     let gen_functions: &[CodeObject] = gen_functions_rc.as_deref().unwrap_or(functions);
     let entry = match frame.code {
         CodeId::Func(index) => gen_functions.get(index as usize).ok_or(Trap::Malformed)?,
-        CodeId::Entry => return Err(Trap::Malformed),
+        CodeId::Entry | CodeId::ModuleBody => return Err(Trap::Malformed),
     };
     match resume {
         Resume::Send(value) => {
@@ -2405,11 +2779,7 @@ fn resume_generator(
                 model.set_yield_from_throw(exc);
             } else {
                 match find_handler(&entry.exc_table, frame.ip as u32) {
-                    Some(handler) => {
-                        frame.stack.truncate(handler.depth as usize);
-                        frame.active_exception = Some(exc);
-                        frame.ip = handler.target as usize;
-                    }
+                    Some(handler) => frame.enter_handler(exc, handler),
                     None => {
                         model.set_pending_exception(exc);
                         return Err(Trap::Raised);
@@ -2423,11 +2793,7 @@ fn resume_generator(
                 model.set_yield_from_throw(exc);
             } else {
                 match find_handler(&entry.exc_table, frame.ip as u32) {
-                    Some(handler) => {
-                        frame.stack.truncate(handler.depth as usize);
-                        frame.active_exception = Some(exc);
-                        frame.ip = handler.target as usize;
-                    }
+                    Some(handler) => frame.enter_handler(exc, handler),
                     None => return Ok(Value::NONE),
                 }
             }
@@ -2696,6 +3062,9 @@ pub(crate) fn iterator_for(
     if model.is_generator(value) || model.is_lazy_iter(value) {
         return Ok(value);
     }
+    if model.is_file(value) {
+        return Ok(value);
+    }
     if let Some(iter_method) = model.find_dunder(value, "__iter__") {
         let result = call_value(iter_method, &[], functions, model, depth)?;
         if model.is_iter(result)
@@ -2736,6 +3105,15 @@ pub(crate) fn py_next_value(
         Ok(if value.is_stop() { None } else { Some(value) })
     } else if model.is_lazy_iter(iterator) {
         lazy_iter_next(iterator, functions, model, depth)
+    } else if model.is_file(iterator) {
+        match model.call_file_method(iterator, crate::fileio::FILE_NEXT, &[]) {
+            Ok(line) => Ok(Some(line)),
+            Err(Trap::Raised) if model.pending_exception_is("StopIteration") => {
+                model.take_pending_exception();
+                Ok(None)
+            }
+            Err(other) => Err(other),
+        }
     } else if let Some(next_method) = model.find_dunder(iterator, "__next__") {
         match call_value(next_method, &[], functions, model, depth) {
             Ok(value) => Ok(Some(value)),
@@ -2748,6 +3126,30 @@ pub(crate) fn py_next_value(
     } else {
         model.py_next(iterator)
     }
+}
+
+/// `locals()`: the running frame's local bindings as a dict. At MODULE level this is the module
+/// globals (CPython's rule -- module-level `locals()` IS `globals()`); in a FUNCTION it is each BOUND
+/// local name mapped to its value (an unassigned slot, [`Value::UNBOUND`], is omitted, as CPython omits
+/// a not-yet-bound local). Needs the running frame, so it is driven from the `Op::Call` site.
+fn build_frame_locals(
+    frame: &Frame,
+    code: &CodeObject,
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    if frame.is_module {
+        let pairs = model.current_module_globals();
+        return model.namespace_from_globals(pairs);
+    }
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
+    for (i, name) in code.local_names.iter().enumerate() {
+        let value = frame.locals.get(i).copied().unwrap_or(Value::UNBOUND);
+        if value != Value::UNBOUND {
+            let key = model.new_str(name)?;
+            pairs.push((key, value));
+        }
+    }
+    model.new_dict(pairs)
 }
 
 /// CPython's `zip(strict=True)` length-mismatch message: `index` is the 0-based position of the
@@ -2868,28 +3270,35 @@ fn lazy_iter_next(
     }
 }
 
-/// Resolves a [`CodeId`] to its [`CodeObject`] against the driver's entry + function table.
-/// Every stored `CodeId` is validated when its frame is created, so the index is in range.
+/// Resolves a [`CodeId`] to its [`CodeObject`] against the driver's entry, the frame's own module's
+/// function table, and that module's body. Every stored `CodeId` is validated when its frame is
+/// created, so the index is in range; a missing `body` is a frame claiming to be a module body in a
+/// module that has none, which is malformed rather than possible.
 fn resolve_code<'a>(
     id: CodeId,
     entry: &'a CodeObject,
     functions: &'a [CodeObject],
-) -> &'a CodeObject {
+    body: Option<&'a CodeObject>,
+) -> Result<&'a CodeObject, Trap> {
     match id {
-        CodeId::Entry => entry,
-        CodeId::Func(index) => &functions[index as usize],
+        CodeId::Entry => Ok(entry),
+        CodeId::Func(index) => Ok(&functions[index as usize]),
+        CodeId::ModuleBody => body.ok_or(Trap::Malformed),
     }
 }
 
 /// Builds a fresh frame for `code`, binding `args` to its leading local slots. A wrong argument
 /// count is a `TypeError` (CPython call binding), not malformed bytecode. `id` records which
-/// code the frame runs, and `is_module` whether it is the module body.
+/// code the frame runs, `is_module` whether it is the module body, and `module` which module the
+/// code belongs to (the callee's home, which the driver installs while the frame is on top).
+#[allow(clippy::too_many_arguments)]
 fn new_frame(
     code: &CodeObject,
     id: CodeId,
     args: &[Value],
     is_module: bool,
     captured_cells: &[Value],
+    module: u16,
     model: &mut ObjectModel,
 ) -> Result<Frame, Trap> {
     if args.len() != code.params.len() {
@@ -2908,7 +3317,7 @@ fn new_frame(
             pooled.caches.clear();
             pooled.caches.resize(code.cache_count, InlineCache::empty());
             pooled.stack.clear();
-            pooled.active_exception = None;
+            pooled.handled.clear();
             pooled.ip = 0;
             pooled
         }
@@ -2916,6 +3325,7 @@ fn new_frame(
     };
     frame.code = id;
     frame.is_module = is_module;
+    frame.module = module;
     for (i, arg) in args.iter().enumerate() {
         frame.locals[i] = *arg;
     }
@@ -2936,15 +3346,20 @@ fn new_frame(
 
 /// The interpreter driver: runs `entry` (with `args`) over an EXPLICIT stack of [`Frame`]s, so
 /// a deep chain of direct Python calls grows a heap `Vec`, never the native stack. A direct
-/// `Op::Call` / `Op::CallKw` of a plain or defaulted Python function pushes a frame; `Op::Return`
-/// pops one and hands its value to the caller; a raise/trap unwinds across the frames, each
-/// consulting its own `exc_table`. Builtins, bound methods, class init, and dunders run through
-/// [`call_value`], which re-enters this driver -- bounded native recursion, guarded by `depth`.
+/// `Op::Call` / `Op::CallKw` of any Python function pushes a frame -- a plain one, a defaulted one,
+/// a closure, a bound method, and whichever module it comes from, because a frame carries the module
+/// it resolves against; `Op::Return` pops one and hands its value to the caller; a raise/trap
+/// unwinds across the frames, each consulting its own `exc_table`. Builtins, class init, dunders and
+/// generator resumes run through [`call_value`], which re-enters this driver -- bounded native
+/// recursion, guarded by `depth`.
 ///
 /// GC: the collector traces EVERY frame on the stack, so a mid-call collection sees all roots
-/// (the fix for the old one-frame-at-a-time root gap). `is_module` marks the entry frame as the
-/// module body (its `StoreFast`s mirror into the globals). The explicit stack is bounded by
-/// [`MAX_CALL_DEPTH`] frames -> `RecursionError`; `depth` bounds the native callback recursion.
+/// (the fix for the old one-frame-at-a-time root gap). **That is why the module rides the frame:
+/// a call that re-entered this driver put its frames somewhere the safe point could not reach, so a
+/// program whose work lives in an imported module reclaimed nothing until the call returned.**
+/// `is_module` marks the entry frame as the module body (its `StoreFast`s mirror into the globals).
+/// The explicit stack is bounded by [`MAX_CALL_DEPTH`] frames -> a catchable `RecursionError`;
+/// `depth` bounds the native callback recursion.
 #[allow(clippy::too_many_arguments)]
 fn run_frames(
     entry: &CodeObject,
@@ -2961,7 +3376,7 @@ fn run_frames(
     }
     let saved_module = model.set_current_module(module_id);
     let mut frames: Vec<Frame> = Vec::new();
-    let outcome = match new_frame(entry, CodeId::Entry, args, is_module, cells, model) {
+    let outcome = match new_frame(entry, CodeId::Entry, args, is_module, cells, module_id, model) {
         Ok(frame) => {
             frames.push(frame);
             drive(&mut frames, entry, functions, model, depth)
@@ -2981,6 +3396,11 @@ fn run_frames(
 /// (seeded with the entry frame) and [`resume_generator`] (seeded with a generator's suspended
 /// frame). `entry` resolves the bottom frame's [`CodeId::Entry`]; a resume's frames are all
 /// [`CodeId::Func`], so it passes the generator's own code and `entry` is never consulted.
+///
+/// Announces this loop to the model and un-announces it on EVERY exit path, so whether a loop is the
+/// outermost one is decided by the nesting that actually happened rather than by a number its caller
+/// passed in. That distinction is the collector's safe point (see [`ObjectModel::enter_drive`]); keeping
+/// the bookkeeping here means a call site cannot get it wrong.
 fn drive(
     frames: &mut Vec<Frame>,
     entry: &CodeObject,
@@ -2988,9 +3408,49 @@ fn drive(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<DriveOutcome, Trap> {
+    #[cfg(feature = "gc-collect")]
+    let outermost = model.enter_drive();
+    #[cfg(not(feature = "gc-collect"))]
+    let outermost = false;
+    let outcome = drive_frames(frames, entry, functions, model, depth, outermost);
+    #[cfg(feature = "gc-collect")]
+    model.leave_drive();
+    outcome
+}
+
+/// The loop itself. `outermost` says whether this is the only driver loop running, which is what the
+/// safe point requires; [`drive`] is the only caller and computes it. Without the collector there is no
+/// safe point, so nothing reads it.
+#[cfg_attr(not(feature = "gc-collect"), allow(unused_variables))]
+fn drive_frames(
+    frames: &mut Vec<Frame>,
+    entry: &CodeObject,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+    outermost: bool,
+) -> Result<DriveOutcome, Trap> {
+    let mut current_module = u16::MAX;
+    let mut home_funcs: Option<Rc<[CodeObject]>> = None;
+    let mut home_body: Option<Rc<CodeObject>> = None;
     loop {
+        #[cfg(feature = "gc-collect")]
+        if outermost && model.under_memory_pressure() {
+            model.collect(&mut |visit| {
+                for frame in frames.iter_mut() {
+                    frame.trace(visit);
+                }
+            });
+        }
         let top = frames.len() - 1;
-        let code = resolve_code(frames[top].code, entry, functions);
+        if frames[top].module != current_module {
+            current_module = frames[top].module;
+            home_funcs = model.managed_functions_rc(current_module);
+            home_body = model.managed_module_body_rc(current_module);
+            model.set_current_module(current_module);
+        }
+        let functions: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+        let code = resolve_code(frames[top].code, entry, functions, home_body.as_deref())?;
         let faulting_ip = frames[top].ip as u32;
         let op = *code.ops.get(frames[top].ip).ok_or(Trap::Malformed)?;
         frames[top].ip += 1;
@@ -3194,7 +3654,9 @@ fn drive(
                 let value = frame.pop()?;
                 if let Some(method) = model.find_dunder(container, "__setitem__") {
                     call_value(method, &[index, value], functions, model, depth + 1)?;
-                } else if model.is_slice(index) && model.is_list(container) {
+                } else if model.is_slice(index)
+                    && (model.is_list(container) || model.is_bytearray(container))
+                {
                     let elements = crate::builtins::collect_iterable(model, &[value], functions, depth)?;
                     model.seq_setitem_slice(container, index, elements)?;
                 } else {
@@ -3268,43 +3730,30 @@ fn drive(
                 }
                 call_args.reverse();
                 let callee = frame.pop()?;
-                if (callee.as_function_index().is_some() || model.is_py_function(callee))
-                    && model.function_home(callee) != model.current_module()
+                if callee.as_builtin_id() == Some(crate::builtins::Builtin::Locals.id())
+                    && call_args.is_empty()
                 {
-                    let result = call_value(callee, &call_args, functions, model, depth + 1)?;
+                    let result = build_frame_locals(frame, code, model)?;
                     frame.push(result);
-                } else if let Some(index) = callee.as_function_index() {
-                    let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-                    let bound = if callee_code.has_varargs
-                        || callee_code.has_varkwargs
-                        || callee_code.kwonly_count > 0
-                    {
-                        bind_arguments(callee_code, &call_args, &[], &[], Value::NONE, model)?
-                    } else {
-                        call_args
-                    };
-                    if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &[], model)?;
-                        frame.push(model.new_generator(generator, model.current_module())?);
-                    } else {
-                        return Ok(Flow::Call { index, args: bound, cells: Vec::new() });
-                    }
-                } else if model.is_py_function(callee) {
-                    let index = model.py_function_index(callee);
-                    let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-                    let defaults = model.py_function_defaults(callee);
-                    let kwdefaults = model.py_function_kwdefaults(callee);
-                    let bound = bind_arguments(callee_code, &call_args, &[], &defaults, kwdefaults, model)?;
-                    let cells = model.py_function_cells(callee);
-                    if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
-                        frame.push(model.new_generator(generator, model.current_module())?);
-                    } else {
-                        return Ok(Flow::Call { index, args: bound, cells });
-                    }
+                } else if callee.as_builtin_id() == Some(crate::builtins::Builtin::Dir.id())
+                    && call_args.is_empty()
+                {
+                    let bindings = build_frame_locals(frame, code, model)?;
+                    let result = model.sorted_key_names(bindings)?;
+                    frame.push(result);
                 } else {
-                    let result = call_value(callee, &call_args, functions, model, depth + 1)?;
-                    frame.push(result);
+                    match plan_py_call(callee, call_args, &[], functions, model)? {
+                        PyCallPlan::Frame(pending) if pending.is_generator => {
+                            let module = pending.module;
+                            let generator = new_planned_frame(&pending, functions, model)?;
+                            frame.push(model.new_generator(generator, module)?);
+                        }
+                        PyCallPlan::Frame(pending) => return Ok(Flow::Call(pending)),
+                        PyCallPlan::NotAFrame(call_args) => {
+                            let result = call_value(callee, &call_args, functions, model, depth + 1)?;
+                            frame.push(result);
+                        }
+                    }
                 }
             }
             Op::Return => return Ok(Flow::Return(frame.pop()?)),
@@ -3321,17 +3770,16 @@ fn drive(
                     let value = frame.pop()?;
                     model.raise_value(value)?
                 } else {
-                    match frame.active_exception {
+                    match frame.handling() {
                         Some(active) => active,
                         None => {
-                            let class =
-                                model.exception_class("RuntimeError").ok_or(Trap::Malformed)?;
-                            model.new_object(class)?
+                            let message = "No active exception to reraise";
+                            return Err(model.raise_named_exception("RuntimeError", message));
                         }
                     }
                 };
                 if argc != 0 {
-                    if let Some(active) = frame.active_exception {
+                    if let Some(active) = frame.handling() {
                         if active != exception {
                             model.py_setattr_instance(exception, "__context__", active)?;
                         }
@@ -3342,7 +3790,7 @@ fn drive(
             }
             Op::MatchExc => {
                 let exc_type = frame.pop()?;
-                let active = frame.active_exception.ok_or(Trap::Malformed)?;
+                let active = frame.handling().ok_or(Trap::Malformed)?;
                 let matched = if let Some(types) = model.seq_value(exc_type).cloned() {
                     types.iter().any(|&ty| model.exception_isinstance(active, ty))
                 } else {
@@ -3351,14 +3799,14 @@ fn drive(
                 frame.push(Value::from_bool(matched));
             }
             Op::LoadExc => {
-                let active = frame.active_exception.ok_or(Trap::Malformed)?;
+                let active = frame.handling().ok_or(Trap::Malformed)?;
                 frame.push(active);
             }
             Op::PopExcept => {
-                frame.active_exception = None;
+                frame.handled.pop();
             }
             Op::Reraise => {
-                let active = frame.active_exception.ok_or(Trap::Malformed)?;
+                let active = frame.handling().ok_or(Trap::Malformed)?;
                 model.set_pending_exception(active);
                 return Err(Trap::Raised);
             }
@@ -3411,38 +3859,18 @@ fn drive(
                 let callee = frame.pop()?;
                 let kwargs: Vec<(&str, Value)> =
                     names.iter().map(|s| s.as_str()).zip(kwvals).collect();
-                if (callee.as_function_index().is_some() || model.is_py_function(callee))
-                    && model.function_home(callee) != model.current_module()
-                {
-                    let result =
-                        call_value_kw(callee, &call_args, &kwargs, functions, model, depth + 1)?;
-                    frame.push(result);
-                } else if let Some(index) = callee.as_function_index() {
-                    let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-                    let bound = bind_arguments(callee_code, &call_args, &kwargs, &[], Value::NONE, model)?;
-                    if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &[], model)?;
-                        frame.push(model.new_generator(generator, model.current_module())?);
-                    } else {
-                        return Ok(Flow::Call { index, args: bound, cells: Vec::new() });
+                match plan_py_call(callee, call_args, &kwargs, functions, model)? {
+                    PyCallPlan::Frame(pending) if pending.is_generator => {
+                        let module = pending.module;
+                        let generator = new_planned_frame(&pending, functions, model)?;
+                        frame.push(model.new_generator(generator, module)?);
                     }
-                } else if model.is_py_function(callee) {
-                    let index = model.py_function_index(callee);
-                    let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-                    let defaults = model.py_function_defaults(callee);
-                    let kwdefaults = model.py_function_kwdefaults(callee);
-                    let bound = bind_arguments(callee_code, &call_args, &kwargs, &defaults, kwdefaults, model)?;
-                    let cells = model.py_function_cells(callee);
-                    if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
-                        frame.push(model.new_generator(generator, model.current_module())?);
-                    } else {
-                        return Ok(Flow::Call { index, args: bound, cells });
+                    PyCallPlan::Frame(pending) => return Ok(Flow::Call(pending)),
+                    PyCallPlan::NotAFrame(call_args) => {
+                        let result =
+                            call_value_kw(callee, &call_args, &kwargs, functions, model, depth + 1)?;
+                        frame.push(result);
                     }
-                } else {
-                    let result =
-                        call_value_kw(callee, &call_args, &kwargs, functions, model, depth + 1)?;
-                    frame.push(result);
                 }
             }
             Op::CallEx {
@@ -3494,8 +3922,19 @@ fn drive(
                 }
                 let kwargs: Vec<(&str, Value)> =
                     kw_owned.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-                let result = call_value_kw(callee, &posargs, &kwargs, functions, model, depth + 1)?;
-                frame.push(result);
+                match plan_py_call(callee, posargs, &kwargs, functions, model)? {
+                    PyCallPlan::Frame(pending) if pending.is_generator => {
+                        let module = pending.module;
+                        let generator = new_planned_frame(&pending, functions, model)?;
+                        frame.push(model.new_generator(generator, module)?);
+                    }
+                    PyCallPlan::Frame(pending) => return Ok(Flow::Call(pending)),
+                    PyCallPlan::NotAFrame(posargs) => {
+                        let result =
+                            call_value_kw(callee, &posargs, &kwargs, functions, model, depth + 1)?;
+                        frame.push(result);
+                    }
+                }
             }
             Op::Yield => {
                 return Ok(Flow::Yield(frame.pop()?));
@@ -3550,8 +3989,12 @@ fn drive(
             }
             Op::ImportName(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
-                let module = resolve_import(name, model)?;
-                frame.push(module);
+                match begin_import(name, model)? {
+                    ImportOutcome::Ready(module) => frame.push(module),
+                    ImportOutcome::RunBody { module_id, completion } => {
+                        return Ok(Flow::ImportBody { module_id, completion })
+                    }
+                }
             }
             Op::ImportFrom(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
@@ -3562,6 +4005,43 @@ fn drive(
             Op::ImportStar => {
                 let module = frame.pop()?;
                 model.import_star(module)?;
+            }
+            Op::BuildClassKw { kwnames } => {
+                let names = match code.consts.get(kwnames as usize) {
+                    Some(Const::KwNames(names)) => names.clone(),
+                    _ => return Err(Trap::Malformed),
+                };
+                let namespace = match frame.class_namespace.take() {
+                    Some(namespace) => namespace,
+                    None => frame.pop()?,
+                };
+                let mut values = Vec::with_capacity(names.len());
+                for _ in 0..names.len() {
+                    values.push(frame.pop()?);
+                }
+                values.reverse();
+                let bases = frame.pop()?;
+                let name = frame.pop()?;
+                let class = model.new_class(name, bases, namespace)?;
+                model.set_class_module(class, model.current_module())?;
+                for (name_value, hook) in model.set_name_hooks(class) {
+                    call_value(hook, &[class, name_value], functions, model, depth + 1)?;
+                }
+                let kwargs: Vec<(&str, Value)> =
+                    names.iter().map(alloc::string::String::as_str).zip(values).collect();
+                match model.inherited_init_subclass(class) {
+                    Some(hook) => {
+                        call_value_kw(hook, &[class], &kwargs, functions, model, depth + 1)?;
+                    }
+                    None => {
+                        let class_name = model.class_display_name(class);
+                        let message = alloc::format!(
+                            "{class_name}.__init_subclass__() takes no keyword arguments"
+                        );
+                        return Err(model.raise_named_exception("TypeError", &message));
+                    }
+                }
+                frame.push(class);
             }
             Op::BuildClass => {
                 let namespace = match frame.class_namespace.take() {
@@ -3661,8 +4141,31 @@ fn drive(
             }
             Op::LoadSuper(name_idx) => {
                 let class_name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
-                let class = model.get_global(class_name).ok_or(Trap::NameError)?;
                 let self_value = frame.load_local(0)?;
+                let class = match model.current_module_global(class_name) {
+                    Some(class) => class,
+                    None => {
+                        let verified = class_name
+                            .rsplit_once('.')
+                            .and_then(|(_, own)| model.current_module_global(own))
+                            .filter(|&candidate| model.is_class(candidate))
+                            .filter(|&candidate| {
+                                model.is_instance_of(self_value, candidate)
+                                    || (model.is_class(self_value)
+                                        && model.is_subclass_of(self_value, candidate))
+                            });
+                        match verified {
+                            Some(class) => class,
+                            None => {
+                                let message = alloc::format!(
+                                    "super(): cannot resolve the enclosing class '{class_name}' -- \
+                                     a class defined inside a function is not supported yet"
+                                );
+                                return Err(model.raise_named_exception("RuntimeError", &message));
+                            }
+                        }
+                    }
+                };
                 frame.push(model.new_super(class, self_value)?);
             }
             Op::BuildSet(count) => {
@@ -3693,23 +4196,61 @@ fn drive(
         match flow {
             Ok(Flow::Next) => {}
             Ok(Flow::Return(value)) => {
-                if let Some(done) = frames.pop() {
+                let mut import = None;
+                if let Some(mut done) = frames.pop() {
+                    import = done.finishes_import.take().map(|pending| (done.module, pending));
                     model.recycle_frame(done);
                 }
+                let handed = match import {
+                    Some((module_id, pending)) => match finish_import(module_id, pending, model) {
+                        Ok(module) => module,
+                        Err(trap) => {
+                            let ip = frames.last().map_or(0, |f| (f.ip as u32).saturating_sub(1));
+                            unwind_exception(trap, frames, ip, entry, functions, model)?;
+                            continue;
+                        }
+                    },
+                    None => value,
+                };
                 match frames.last_mut() {
-                    Some(caller) => caller.push(value),
-                    None => return Ok(DriveOutcome::Returned(value)),
+                    Some(caller) => caller.push(handed),
+                    None => return Ok(DriveOutcome::Returned(handed)),
                 }
             }
             Ok(Flow::Yield(value)) => return Ok(DriveOutcome::Yielded(value)),
-            Ok(Flow::Call { index, args, cells }) => {
-                let callee = functions.get(index as usize).ok_or(Trap::Malformed)?;
-                if frames.len() >= MAX_CALL_DEPTH {
-                    return Err(Trap::RecursionError);
+            Ok(Flow::Call(pending)) => {
+                let trap = if frames.len() >= MAX_CALL_DEPTH {
+                    Some(Trap::RecursionError)
+                } else {
+                    new_planned_frame(&pending, functions, model).map_or_else(Some, |new| {
+                        frames.push(new);
+                        None
+                    })
+                };
+                if let Some(trap) = trap {
+                    unwind_exception(trap, frames, faulting_ip, entry, functions, model)?;
                 }
-                match new_frame(callee, CodeId::Func(index), &args, false, &cells, model) {
-                    Ok(new) => frames.push(new),
-                    Err(trap) => unwind_exception(trap, frames, faulting_ip, entry, functions, model)?,
+            }
+            Ok(Flow::ImportBody { module_id, completion }) => {
+                let name = completion.name.clone();
+                let trap = if frames.len() >= MAX_CALL_DEPTH {
+                    Some(Trap::RecursionError)
+                } else {
+                    match model.managed_module_body_rc(module_id) {
+                        None => Some(Trap::Malformed),
+                        Some(body) => {
+                            new_frame(&body, CodeId::ModuleBody, &[], true, &[], module_id, model)
+                                .map_or_else(Some, |mut new| {
+                                    new.finishes_import = Some(completion);
+                                    frames.push(new);
+                                    None
+                                })
+                        }
+                    }
+                };
+                if let Some(trap) = trap {
+                    model.uncache_module(&name);
+                    unwind_exception(trap, frames, faulting_ip, entry, functions, model)?;
                 }
             }
             Err(trap) => unwind_exception(trap, frames, faulting_ip, entry, functions, model)?,
@@ -3738,19 +4279,22 @@ fn unwind_exception(
             None => return Err(trap),
         },
     };
-    if let Some(active) = frames.last().and_then(|f| f.active_exception) {
+    if let Some(active) = frames.last().and_then(Frame::handling) {
         model.chain_context_if_unset(exception, active)?;
     }
     let mut search_ip = faulting_ip;
     loop {
         let top = frames.len() - 1;
-        let code = resolve_code(frames[top].code, entry, functions);
+        let home_funcs = model.managed_functions_rc(frames[top].module);
+        let home_body = model.managed_module_body_rc(frames[top].module);
+        let functions: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+        let code = resolve_code(frames[top].code, entry, functions, home_body.as_deref())?;
         if let Some(handler) = find_handler(&code.exc_table, search_ip) {
-            let frame = &mut frames[top];
-            frame.stack.truncate(handler.depth as usize);
-            frame.active_exception = Some(exception);
-            frame.ip = handler.target as usize;
+            frames[top].enter_handler(exception, handler);
             return Ok(());
+        }
+        if let Some(pending) = frames[top].finishes_import.take() {
+            model.uncache_module(&pending.name);
         }
         frames.pop();
         match frames.last() {
@@ -3773,10 +4317,10 @@ mod tests {
     fn frame_pool_recycles_buffers() {
         let mut model = no_objects();
         let c = code(2, 0, vec![], vec![], 0, vec![]);
-        let f1 = new_frame(&c, CodeId::Entry, &[], false, &[], &mut model).unwrap();
+        let f1 = new_frame(&c, CodeId::Entry, &[], false, &[], 0, &mut model).unwrap();
         let cap = f1.locals.capacity();
         model.recycle_frame(f1);
-        let f2 = new_frame(&c, CodeId::Func(0), &[], false, &[], &mut model).unwrap();
+        let f2 = new_frame(&c, CodeId::Func(0), &[], false, &[], 0, &mut model).unwrap();
         assert_eq!(f2.locals.len(), 2);
         assert!(f2.locals.iter().all(|v| v.is_unbound()));
         assert_eq!(f2.locals.capacity(), cap);
@@ -3825,6 +4369,7 @@ mod tests {
                     ty: StaticType::Dynamic,
                 })
                 .collect(),
+            doc: None,
             posonly_count: 0,
             kwonly_count: 0,
             is_generator: false,
@@ -3928,8 +4473,21 @@ mod tests {
         assert_eq!(bind_arguments(&c, &[f(1)], &[], &[], Value::NONE, &mut m), Err(Trap::Raised));
         let exc = m.take_pending_exception().unwrap();
         assert_eq!(m.exception_type_name(exc), Some("TypeError"));
-        assert_eq!(bind_arguments(&c, &[f(1)], &[("nope", f(2))], &[], Value::NONE, &mut m), Err(Trap::TypeError));
-        assert_eq!(bind_arguments(&c, &[f(1)], &[("a0", f(2))], &[], Value::NONE, &mut m), Err(Trap::TypeError));
+        assert_eq!(bind_arguments(&c, &[f(1)], &[("nope", f(2))], &[], Value::NONE, &mut m), Err(Trap::Raised));
+        let exc = m.take_pending_exception().unwrap();
+        assert_eq!(m.exception_type_name(exc), Some("TypeError"));
+        assert!(
+            m.repr(exc).contains("got an unexpected keyword argument 'nope'"),
+            "the unexpected keyword is named: {}",
+            m.repr(exc)
+        );
+        assert_eq!(bind_arguments(&c, &[f(1)], &[("a0", f(2))], &[], Value::NONE, &mut m), Err(Trap::Raised));
+        let exc = m.take_pending_exception().unwrap();
+        assert!(
+            m.repr(exc).contains("got multiple values for argument 'a0'"),
+            "the doubly-bound parameter is named: {}",
+            m.repr(exc)
+        );
     }
 
     #[test]
@@ -5073,13 +5631,11 @@ mod tests {
         let exc_addr_before = exc.as_ref().unwrap();
 
         let mut frame = Frame::new(0, 0);
-        frame.active_exception = Some(exc);
+        frame.enter_handler(exc, ExcEntry { start: 0, end: 1, target: 0, depth: 0 });
 
         model.heap_mut().collect(|visit| frame.trace(visit));
 
-        let relocated = frame
-            .active_exception
-            .expect("the in-flight exception survives the collection");
+        let relocated = frame.handling().expect("the in-flight exception survives the collection");
         assert!(relocated.is_pointer());
         assert_ne!(
             relocated.as_ref().unwrap(),

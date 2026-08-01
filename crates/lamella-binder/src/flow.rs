@@ -636,6 +636,35 @@ fn mark_field_write(expr: &BoundExpr, writes: &mut FieldSet) {
     }
 }
 
+/// Marks every field on the RECEIVER CHAIN of an assignment target as written, not merely read.
+///
+/// `o.I.V = 40` assigns `V`, but reaching `V` takes the ADDRESS of `o.I`, and mutating a member of
+/// a struct mutates the struct -- so csc counts `I` as assigned too. Walking the receiver as an
+/// ordinary expression records it as a READ only, which made `Outer.I` look never-assigned and
+/// produced a CS0649 on code csc compiles clean. That is the shape this exists to prevent.
+///
+/// DELIBERATELY IMPRECISE, IN THE SAFE DIRECTION. Whether the receiver field is a value type
+/// decides it -- `c.Obj.Field = 1` through a CLASS-typed `Obj` does NOT assign `Obj` -- and this
+/// walk has no model to ask. So it marks the whole chain, which can only ever SUPPRESS a CS0649
+/// that csc would report: a missed warning, never an invented one. The precise form wants the
+/// field's type resolved, which means threading the model into the flow pass.
+fn mark_target_chain_written(receiver: &BoundExpr, writes: &mut FieldSet) {
+    let BoundExprKind::FieldAccess {
+        receiver: inner,
+        field,
+        ..
+    } = &receiver.kind
+    else {
+        return;
+    };
+    if let Some(field) = field {
+        if let Some(key) = field_type_key(&field.declaring_type) {
+            writes.insert((key, field.name.clone()));
+        }
+    }
+    mark_target_chain_written(inner, writes);
+}
+
 pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes: &mut FieldSet) {
     match &expr.kind {
         BoundExprKind::Assignment {
@@ -654,6 +683,7 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
                     if let Some(key) = field_type_key(&field.declaring_type) {
                         writes.insert((key, field.name.clone()));
                     }
+                    mark_target_chain_written(receiver, writes);
                     collect_field_uses(receiver, reads, writes);
                     collect_field_uses(value, reads, writes);
                     return;

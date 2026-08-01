@@ -7,7 +7,8 @@ use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::resolve::{TypeTable, resolve_type};
 use crate::special::SpecialType;
 use crate::symbols::{
-    Accessibility, EventSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind,
+    Accessibility, EventSymbol, MethodSymbol, Model, ParameterMode, PropertySymbol, TypeInfo,
+    TypeKind,
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
@@ -576,6 +577,14 @@ struct PrivateField {
     /// Whether the field is eligible for the CS0169 "never used" warning: additionally a
     /// resolved type, no initializer, and not a duplicate.
     eligible_never_used: bool,
+    /// Whether the field is `private`, which decides WHICH of the three warnings it can draw.
+    ///
+    /// CS0169 (never used) and CS0414 (assigned, never read) are private-only, because a
+    /// non-private field may be used by an assembly this compilation cannot see -- so "unused" is
+    /// not a claim we can make. CS0649 (never ASSIGNED) has no such excuse and csc reports it at
+    /// every accessibility: a field nothing writes keeps its default value whoever can read it.
+    /// Measured across public, protected, internal, protected internal, static and readonly.
+    is_private: bool,
     /// The rendered default value, for the CS0649 message.
     default_value: Box<str>,
 }
@@ -646,6 +655,20 @@ impl Binder {
         self.diagnostics.push(diagnostic);
     }
 
+    /// Marks every diagnostic reported since `first` as BODY phase, so the declaration gate can
+    /// withhold them (see [`crate::withhold_body_diagnostics_after_declaration_error`]).
+    ///
+    /// TAGGING A RANGE ON THE WAY OUT, rather than at each of the ~200 construction sites, is what
+    /// keeps this from touching the whole binder -- and it is also the only form that survives the
+    /// speculative binds. Several paths bind an expression, dislike the result and `truncate` the
+    /// diagnostics back to a checkpoint; marking as we go would leave tags on entries that no
+    /// longer exist. Marking afterwards, over whatever survived, cannot.
+    fn mark_body_phase(&mut self, first: usize) {
+        for diagnostic in &mut self.diagnostics[first..] {
+            diagnostic.phase = crate::diagnostic::DiagnosticPhase::Body;
+        }
+    }
+
     /// Records a private, non-const field (its declaring type, name, declarator span, and CS0169
     /// eligibility) as a candidate for the unused-field warnings, judged in the final pass.
     pub(crate) fn record_private_field(
@@ -655,6 +678,7 @@ impl Binder {
         span: Span,
         shared_prefix: Span,
         eligible_never_used: bool,
+        is_private: bool,
         default_value: Box<str>,
     ) {
         if let Some(declaring) = crate::flow::field_type_key(declaring) {
@@ -664,8 +688,26 @@ impl Binder {
                 span,
                 shared_prefix,
                 eligible_never_used,
+                is_private,
                 default_value,
             });
+        }
+    }
+
+    /// Records that an attribute named argument (`[A(F = 1)]`) both READS and WRITES the field it
+    /// names, so none of the three unused-field warnings fires for it.
+    ///
+    /// BOTH, and neither is padding. It is an assignment, so CS0649 ("never assigned") must not
+    /// fire -- that is the false positive this exists to prevent, and it appeared the moment
+    /// CS0649 stopped being private-only, because an attribute argument is the one assignment
+    /// that lives outside every method body. It is also a USE, so CS0169 ("never used") stays
+    /// silent, matching csc: a private field named only by an attribute draws CS0122 alone.
+    /// Recording only the write would trade one wrong warning for another (CS0414, "assigned but
+    /// never read").
+    pub(crate) fn record_attribute_named_argument(&mut self, declaring: &TypeSymbol, field: &str) {
+        if let Some(key) = crate::flow::field_type_key(declaring) {
+            self.field_reads.insert((key.clone(), field.into()));
+            self.field_writes.insert((key, field.into()));
         }
     }
 
@@ -685,6 +727,7 @@ impl Binder {
     /// read set is complete -- including a read from a nested type on either side of the field's
     /// declaration, which a per-type pass would miss.
     pub(crate) fn report_unused_fields(&mut self) {
+        let first_unused_field_diagnostic = self.diagnostics.len();
         let declaration_errors: alloc::vec::Vec<Span> =
             self.diagnostics.iter().map(|d| d.span).collect();
         let suppressed = |field: &PrivateField| {
@@ -702,6 +745,7 @@ impl Binder {
                 name,
                 span,
                 eligible_never_used,
+                is_private,
                 default_value,
                 ..
             } = field;
@@ -711,15 +755,15 @@ impl Binder {
             }
             let read = self.field_reads.contains(&key);
             let written = self.field_writes.contains(&key);
-            let kind = if written && !read {
+            let kind = if is_private && written && !read {
                 Some(DiagnosticKind::UnusedField {
                     field: format!("{declaring}.{name}").into(),
                 })
-            } else if eligible_never_used && !written && !read {
+            } else if is_private && eligible_never_used && !written && !read {
                 Some(DiagnosticKind::FieldNeverUsed {
                     field: format!("{declaring}.{name}").into(),
                 })
-            } else if eligible_never_used && read && !written {
+            } else if eligible_never_used && !written {
                 Some(DiagnosticKind::FieldNeverAssigned {
                     field: format!("{declaring}.{name}").into(),
                     default: default_value,
@@ -731,6 +775,7 @@ impl Binder {
                 self.report(Diagnostic::new(kind, span));
             }
         }
+        self.mark_body_phase(first_unused_field_diagnostic);
         self.field_reads.clear();
         self.field_writes.clear();
         self.fields_with_errors.clear();
@@ -1290,14 +1335,6 @@ impl Binder {
         }
     }
 
-    /// Whether a type is an interface -- a value type boxes when converted to one (13.1.4).
-    fn is_interface(&self, ty: &TypeSymbol) -> bool {
-        matches!(
-            self.type_info_of(ty).map(|info| info.kind),
-            Some(TypeKind::Interface)
-        )
-    }
-
     /// The result of `==`/`!=` when one operand is the null literal (14.9.6): the null type
     /// is reference-comparable with any reference type (and with the null type itself),
     /// giving `bool`. It is not comparable with a value type -- which has no null -- so that
@@ -1481,6 +1518,7 @@ impl Binder {
         let return_type = self.canonicalize(&return_type);
         let returns_value = !return_type.is_void();
         let body_span = body.span;
+        let diagnostics_before_body = self.diagnostics.len();
         self.current_type = enclosing_type;
         self.current_method = Some(MethodContext {
             name: name.into(),
@@ -1528,6 +1566,7 @@ impl Binder {
             .extend(crate::flow::check_unreachable(&bound));
         self.diagnostics.extend(crate::flow::check_labels(&bound));
         crate::flow::collect_field_accesses(&bound, &mut self.field_reads, &mut self.field_writes);
+        self.mark_body_phase(diagnostics_before_body);
         self.current_method = None;
         self.current_type = None;
         bound
@@ -1713,6 +1752,7 @@ impl Binder {
         parameters: &[(Box<str>, TypeSymbol)],
         initializer: &lamella_syntax::ast::ConstructorInitializer,
     ) -> Option<(MethodReference, Vec<BoundExpr>)> {
+        let diagnostics_before = self.diagnostics.len();
         self.current_type = Some(enclosing.clone());
         self.enter_scope();
         for (name, ty) in parameters {
@@ -1725,6 +1765,7 @@ impl Binder {
             .collect();
         self.exit_scope();
         self.current_type = None;
+        self.mark_body_phase(diagnostics_before);
         let target = match initializer.kind {
             lamella_syntax::ast::ConstructorInitializerKind::This => enclosing.clone(),
             lamella_syntax::ast::ConstructorInitializerKind::Base => {
@@ -1756,12 +1797,21 @@ impl Binder {
 
     /// Binds a field initializer in `enclosing`'s context and checks it converts
     /// to the field's type (`CS0029`).
+    ///
+    /// `is_const` decides which side of the declaration/body line the initializer falls on, and
+    /// the two cases genuinely differ: a `const` field's value is part of the DECLARATION -- other
+    /// declarations are checked against it -- while an instance field's initializer is code that
+    /// runs in a constructor. csc splits them exactly there, which is measurable: a const
+    /// initializer's type error withholds an unrelated body diagnostic and an instance one does
+    /// not. They look identical in the source, which is why this is a parameter rather than
+    /// something inferred here.
     pub fn bind_field_initializer(
         &mut self,
         enclosing: TypeSymbol,
         field_name: &str,
         field_type: &TypeSymbol,
         initializer: &Expr,
+        is_const: bool,
     ) {
         self.current_type = Some(enclosing.clone());
         self.enter_scope();
@@ -1773,6 +1823,9 @@ impl Binder {
         self.in_field_initializer = was_in_initializer;
         self.exit_scope();
         self.current_type = None;
+        if !is_const {
+            self.mark_body_phase(diagnostics_before);
+        }
         let initializer_referenced_self = self.diagnostics[diagnostics_before..]
             .iter()
             .any(|diagnostic| {
@@ -3687,6 +3740,16 @@ impl Binder {
         match self.resolve_member(&receiver.ty, name) {
             MemberResolution::Field(field) => {
                 self.check_accessible(&field.declaring_type, field.accessibility, name, span);
+                self.check_protected_qualifier(
+                    &field.declaring_type,
+                    field.accessibility,
+                    field.is_static,
+                    receiver_category(&receiver),
+                    &receiver.ty,
+                    name,
+                    None,
+                    span,
+                );
                 self.check_static_instance(
                     receiver_kind,
                     field.is_static,
@@ -3710,6 +3773,16 @@ impl Binder {
                 is_static,
             } => {
                 self.check_accessible(&declaring_type, accessibility, name, span);
+                self.check_protected_qualifier(
+                    &declaring_type,
+                    accessibility,
+                    is_static,
+                    receiver_category(&receiver),
+                    &receiver.ty,
+                    name,
+                    None,
+                    span,
+                );
                 self.check_static_instance(receiver_kind, is_static, &declaring_type, name, span);
                 let (getter_declaring, setter_declaring) =
                     self.property_accessor_declarers(&receiver.ty, name);
@@ -3837,6 +3910,10 @@ impl Binder {
             }),
             _ => None,
         };
+        let written_receiver = match &callee.kind {
+            BoundExprKind::MethodGroup { receiver, .. } => Some(receiver_category(receiver)),
+            _ => None,
+        };
         let mut params_method = false;
         let has_method_group = arguments
             .iter()
@@ -3860,13 +3937,27 @@ impl Binder {
                         &candidates,
                         &argument_types,
                         &arg_constants,
+                        &arguments,
                         span,
                     )
                 };
                 chosen.map(|method| {
                     params_method = method.is_params;
+                    self.check_argument_modes(&method, &arguments, span);
                     let declaring_type =
                         self.declaring_type_in_chain(&receiver_ty, &method.name, &method.parameters);
+                    if let Some(written) = written_receiver {
+                        self.check_protected_qualifier(
+                            &declaring_type,
+                            method.accessibility,
+                            method.is_static,
+                            written,
+                            &receiver_ty,
+                            &method.name,
+                            Some(&method.parameters),
+                            span,
+                        );
+                    }
                     MethodReference {
                         declaring_type,
                         is_vararg: method.is_vararg,
@@ -3998,6 +4089,124 @@ impl Binder {
         bound
     }
 
+    /// Reports `CS1620` for an argument that reached a by-reference parameter under the wrong
+    /// modifier -- `Take(out v)` against `Take(ref int)`, or the reverse.
+    ///
+    /// THIS RUNS AFTER RESOLUTION, NOT DURING IT, and that is csc's order too: given both
+    /// `T(ref int)` and `T(int)`, `T(out v)` resolves to the BYREF overload and is then faulted
+    /// for its modifier, rather than being told no overload matches. Resolution cannot make this
+    /// call anyway -- `ref x` and `out x` give the argument the same `ByRef` type, so the two are
+    /// indistinguishable until the parameter's recorded mode is consulted.
+    ///
+    /// The mode is only consulted where BOTH sides are byref. An argument whose byref-ness does
+    /// not match the parameter at all never gets here: it is not applicable, so the call fails
+    /// resolution and reports `CS1503`. csc says `CS1620`/`CS1615` for those, which is a better
+    /// code on an outcome we already agree about -- tracked, and not fixed here, because closing
+    /// it means making a byref parameter applicable to an unmodified argument, and that is a
+    /// change to overload resolution rather than a diagnostic added beside it.
+    fn check_argument_modes(
+        &mut self,
+        method: &MethodSymbol,
+        arguments: &[BoundExpr],
+        span: Span,
+    ) {
+        for (index, argument) in arguments.iter().enumerate() {
+            let BoundExprKind::Ref { out, .. } = &argument.kind else {
+                continue;
+            };
+            let Some(mode) = method.parameter_mode(index) else {
+                continue;
+            };
+            let wanted = match mode {
+                ParameterMode::Ref => "ref",
+                ParameterMode::Out => "out",
+                ParameterMode::Value => continue,
+            };
+            if *out == matches!(mode, ParameterMode::Out) {
+                continue;
+            }
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::ArgumentModeRequired {
+                    index: index as u32 + 1,
+                    keyword: wanted.into(),
+                },
+                span,
+            ));
+        }
+    }
+
+    /// The diagnostic for a call that failed ONLY because of by-reference modifiers -- csc's
+    /// `CS1620` (the parameter wants a keyword the argument did not write) and `CS1615` (the
+    /// argument wrote one the parameter does not take).
+    ///
+    /// THIS RUNS ONLY AFTER NORMAL RESOLUTION HAS ALREADY FAILED, which is what keeps it from
+    /// disturbing overload choice. A modified argument and a byref parameter do not share a type
+    /// -- `int` against `ref int` -- so a call like `T(v)` against `T(ref int)` finds nothing
+    /// applicable and would report `CS1503`, describing a conversion when the real complaint is a
+    /// missing keyword. Rather than making a byref parameter applicable to a bare argument (which
+    /// WOULD change resolution, and would make `T(v)` ambiguous wherever `T(int)` also exists),
+    /// the candidates are re-examined here with by-reference-ness ignored.
+    ///
+    /// THE TEST IS BY-REFERENCE SHAPE ALONE, NOT BY TYPE, and I had that wrong at first. csc
+    /// reports the modifier whenever NO same-arity candidate accepts the argument's byref-ness at
+    /// that position -- even when the type would not convert either. `Take(ref s)` with a `string`
+    /// against `Take(int)` is `CS1615`, not the conversion complaint: the keyword is wrong at every
+    /// candidate, so it is the first thing to fix. Only when SOME candidate does accept that shape
+    /// does the conversion get reported instead, which is why `Take(ref s)` against a group holding
+    /// `Take(ref int)` stays `CS1503` -- there the modifier was fine and the type was not.
+    ///
+    /// Positions are examined left to right, so a good first argument and a bad second reports the
+    /// second, as csc does.
+    fn modifier_mismatch(
+        &self,
+        candidates: &[MethodSymbol],
+        argument_types: &[TypeSymbol],
+        arguments: &[BoundExpr],
+    ) -> Option<DiagnosticKind> {
+        let is_byref = |ty: &TypeSymbol| matches!(ty, TypeSymbol::ByRef(_));
+        let same_arity: Vec<&MethodSymbol> = candidates
+            .iter()
+            .filter(|candidate| {
+                !candidate.is_vararg
+                    && !candidate.is_params
+                    && candidate.parameters.len() == argument_types.len()
+            })
+            .collect();
+        if same_arity.is_empty() {
+            return None;
+        }
+        for (index, argument) in argument_types.iter().enumerate() {
+            let argument_is_byref = is_byref(argument);
+            if same_arity
+                .iter()
+                .any(|candidate| is_byref(&candidate.parameters[index]) == argument_is_byref)
+            {
+                continue;
+            }
+            return Some(if argument_is_byref {
+                DiagnosticKind::ArgumentModeForbidden {
+                    index: index as u32 + 1,
+                    keyword: match arguments.get(index).map(|argument| &argument.kind) {
+                        Some(BoundExprKind::Ref { out: true, .. }) => "out".into(),
+                        _ => "ref".into(),
+                    },
+                }
+            } else {
+                DiagnosticKind::ArgumentModeRequired {
+                    index: index as u32 + 1,
+                    keyword: match same_arity
+                        .iter()
+                        .find_map(|candidate| candidate.parameter_mode(index))
+                    {
+                        Some(ParameterMode::Out) => "out".into(),
+                        _ => "ref".into(),
+                    },
+                }
+            });
+        }
+        None
+    }
+
     /// Resolves a call to a method group by overload resolution (14.4.2),
     /// reporting the appropriate diagnostic and returning the chosen method.
     fn resolve_call(
@@ -4007,9 +4216,17 @@ impl Binder {
         candidates: &[MethodSymbol],
         argument_types: &[TypeSymbol],
         arg_constants: &[Option<i64>],
+        arguments: &[BoundExpr],
         span: Span,
     ) -> Option<MethodSymbol> {
-        match resolve_overload(&self.model, candidates, argument_types, arg_constants) {
+        let resolution = resolve_overload(&self.model, candidates, argument_types, arg_constants);
+        if matches!(resolution, OverloadResult::BadArgument { .. }) {
+            if let Some(kind) = self.modifier_mismatch(candidates, argument_types, arguments) {
+                self.diagnostics.push(Diagnostic::new(kind, span));
+                return None;
+            }
+        }
+        match resolution {
             OverloadResult::Resolved(method) => {
                 let declaring_type = self.declaring_type_in_chain(declaring, name, &method.parameters);
                 self.check_accessible(&declaring_type, method.accessibility, name, span);
@@ -4036,6 +4253,21 @@ impl Binder {
                         span,
                     ));
                     return None;
+                }
+                if let [only] = candidates {
+                    if argument_types.len() < only.parameters.len() {
+                        self.diagnostics.push(Diagnostic::new(
+                            DiagnosticKind::MissingArgumentForParameter {
+                                parameter: only
+                                    .parameter_name(argument_types.len())
+                                    .unwrap_or("value")
+                                    .into(),
+                                method: qualified_method_with_modes(declaring, name, only),
+                            },
+                            span,
+                        ));
+                        return None;
+                    }
                 }
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::NoOverloadForArgumentCount {
@@ -4208,6 +4440,7 @@ impl Binder {
             &candidates,
             &argument_types,
             &arg_constants,
+            &arguments,
             span,
         )?;
         let declaring_type =
@@ -4662,6 +4895,25 @@ impl Binder {
                     ));
                     return None;
                 }
+                if let [only] = constructors {
+                    if argument_types.len() < only.parameters.len() {
+                        self.diagnostics.push(Diagnostic::new(
+                            DiagnosticKind::MissingArgumentForParameter {
+                                parameter: only
+                                    .parameter_name(argument_types.len())
+                                    .unwrap_or("value")
+                                    .into(),
+                                method: qualified_method_with_modes(
+                                    target,
+                                    &simple_type_name(target),
+                                    only,
+                                ),
+                            },
+                            span,
+                        ));
+                        return None;
+                    }
+                }
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::NoConstructor {
                         type_name: target.to_string().into(),
@@ -4723,13 +4975,39 @@ impl Binder {
             Accessibility::Public => true,
             Accessibility::Internal => !self.type_is_external(declaring),
             Accessibility::ProtectedInternal => {
-                !self.type_is_external(declaring) || self.derives_from(from, declaring)
+                !self.type_is_external(declaring)
+                    || self.protected_vantage(from, declaring).is_some()
             }
             Accessibility::Private => self.within_private_scope(from, declaring),
             Accessibility::Protected => {
-                self.within_private_scope(from, declaring) || self.derives_from(from, declaring)
+                self.within_private_scope(from, declaring)
+                    || self.protected_vantage(from, declaring).is_some()
             }
         }
+    }
+
+    /// The innermost type at or enclosing `from` that derives from `declaring` -- the class whose
+    /// derivation grants access to `declaring`'s `protected` members, and the class a qualifier
+    /// must therefore be an instance of (10.5.3). `None` when no enclosing type derives, so the
+    /// member is simply out of reach.
+    ///
+    /// THE ENCLOSING WALK IS THE POINT, not a refinement. A nested type is written inside its
+    /// enclosing class's program text, so it reaches that class's inherited protected members
+    /// exactly as the class itself does. Asking only whether `from` derives refused correct code
+    /// the moment an access was written in a nested helper -- `class D : B { class N { ... } }`
+    /// drew CS0122 where csc compiles it -- and the walk is transitive because the nesting can be.
+    fn protected_vantage(&self, from: &TypeSymbol, declaring: &TypeSymbol) -> Option<TypeSymbol> {
+        let mut current = Some(from.clone());
+        while let Some(ty) = current {
+            if self.derives_from(&ty, declaring) {
+                return Some(ty);
+            }
+            let enclosing = self
+                .type_info_of(&ty)
+                .and_then(|info| info.enclosing.clone());
+            current = enclosing.map(|name| named_symbol_from_dotted(&name));
+        }
+        None
     }
 
     /// Whether `ty` comes from a referenced assembly (so its `internal` members are not
@@ -4763,15 +5041,6 @@ impl Binder {
         false
     }
 
-    /// Whether the current type derives from `declaring` -- the extra scope a `protected`
-    /// member adds (a simplification of 10.5.3; the access-through-an-instance-of-the-derived-
-    /// type rule is not enforced).
-    fn current_derives_from(&self, declaring: &TypeSymbol) -> bool {
-        self.current_type
-            .as_ref()
-            .is_some_and(|current| self.derives_from(current, declaring))
-    }
-
     /// Whether `from` derives (directly or transitively) from `declaring`.
     fn derives_from(&self, from: &TypeSymbol, declaring: &TypeSymbol) -> bool {
         let mut info = self.type_info_of(from);
@@ -4803,6 +5072,117 @@ impl Binder {
                 span,
             ));
         }
+    }
+
+    /// Reports `CS1540` when a `protected` INSTANCE member is reached from a derived class through
+    /// a qualifier whose type is not that class or one derived from it (10.5.3). Deriving from `B`
+    /// lets `D` touch `B`'s protected members *on a `D`* -- not on an arbitrary `B`, which may be
+    /// some unrelated subclass's instance. Runs only where [`Self::check_accessible`] found the
+    /// member reachable, so the two never both fire.
+    ///
+    /// The message names `current_type` -- for an access written in a nested class, the NESTED
+    /// type, though a qualifier of the ENCLOSING class is what actually satisfies the rule. That
+    /// is csc's own wording and it was measured rather than inferred: `class D : B { class N { ...
+    /// } }` reports "must be of type 'D.N'" while accepting a `D` qualifier.
+    fn check_protected_qualifier(
+        &mut self,
+        declaring: &TypeSymbol,
+        accessibility: Accessibility,
+        is_static: bool,
+        receiver: Receiver,
+        qualifier_ty: &TypeSymbol,
+        member: &str,
+        parameters: Option<&[TypeSymbol]>,
+        span: Span,
+    ) {
+        if is_static || !matches!(receiver, Receiver::Instance) {
+            return;
+        }
+        match accessibility {
+            Accessibility::Protected => {}
+            Accessibility::ProtectedInternal if self.type_is_external(declaring) => {}
+            _ => return,
+        }
+        let Some(current) = self.current_type.clone() else {
+            return;
+        };
+        if self.within_private_scope(&current, declaring) {
+            return;
+        }
+        let Some(vantage) = self.protected_vantage(&current, declaring) else {
+            return;
+        };
+        if qualifier_ty == &vantage || self.derives_from(qualifier_ty, &vantage) {
+            return;
+        }
+        self.report(Diagnostic::new(
+            DiagnosticKind::ProtectedQualifier {
+                member: match parameters {
+                    Some(parameters) => qualified_method(declaring, member, parameters),
+                    None => qualified_member(declaring, member),
+                },
+                qualifier: qualifier_ty.to_string().into(),
+                accessing: current.to_string().into(),
+            },
+            span,
+        ));
+    }
+
+    /// How a named attribute argument's name resolves against the attribute class -- which decides
+    /// which of three diagnostics it draws. csc separates them because the repairs differ: rename
+    /// it, widen it, or pick a different member.
+    ///
+    /// THE SPLIT IS MEASURED, and it does not follow the CS0617 message. That message says named
+    /// arguments must be "fields which are not readonly, static, or const, or read-write properties
+    /// which are public and not static" -- it mentions `public` only for properties. csc requires
+    /// it of fields too: an `internal` field draws CS0617, while a `private` or `protected` one
+    /// draws CS0122 instead, because that one is not reachable at all. Reachable-but-unusable and
+    /// unreachable are different answers, so they are different variants here.
+    pub(crate) fn named_attribute_argument_target(
+        &self,
+        attribute_type: &TypeSymbol,
+        name: &str,
+    ) -> NamedArgumentTarget {
+        let mut current = Some(attribute_type.clone());
+        while let Some(ty) = current {
+            let Some(info) = self.type_info_of(&ty) else {
+                return NamedArgumentTarget::Missing;
+            };
+            if let Some(field) = info.fields.iter().find(|field| &*field.name == name) {
+                return if !self.is_accessible(&ty, field.accessibility) {
+                    NamedArgumentTarget::Inaccessible(ty.clone())
+                } else if field.accessibility == Accessibility::Public
+                    && !field.is_static
+                    && !field.is_readonly
+                    && field.constant.is_none()
+                {
+                    NamedArgumentTarget::Valid(ty.clone())
+                } else {
+                    NamedArgumentTarget::NotAValidTarget(ty.clone())
+                };
+            }
+            if let Some(property) = info.properties.iter().find(|p| &*p.name == name) {
+                return if !self.is_accessible(&ty, property.accessibility) {
+                    NamedArgumentTarget::Inaccessible(ty.clone())
+                } else if property.accessibility == Accessibility::Public
+                    && !property.is_static
+                    && property.has_getter
+                    && property.has_setter
+                {
+                    NamedArgumentTarget::Valid(ty.clone())
+                } else {
+                    NamedArgumentTarget::NotAValidTarget(ty.clone())
+                };
+            }
+            if info.methods.iter().any(|method| &*method.name == name) {
+                return NamedArgumentTarget::NotAValidTarget(ty.clone());
+            }
+            if self.model.get(&ty.to_string(), name).is_some() {
+                return NamedArgumentTarget::NotAValidTarget(ty.clone());
+            }
+            current = self.type_info_of(&ty).and_then(|info| info.base.clone());
+        }
+        NamedArgumentTarget::Missing
     }
 
     /// Whether the method currently being bound is a `static` method with no `this` --
@@ -4909,7 +5289,7 @@ impl Binder {
         !self.in_private_scope_of(declaring)
     }
 
-    fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
+    pub(crate) fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
         let lookup = member_lookup_type(ty);
         let Some(is_interface) = self
             .type_info_of(&lookup)
@@ -5066,6 +5446,89 @@ impl Binder {
         self.type_info_of(declaring)
             .and_then(|info| info.fields.iter().find(|field| &*field.name == name))
             .is_some_and(|field| field.is_readonly)
+    }
+
+    /// Reports the IMPLICIT `: base()` that no base constructor can accept -- `CS7036` naming the
+    /// first unsupplied parameter when the base declares exactly one constructor, `CS1729` when it
+    /// declares several. Both measured against csc.
+    ///
+    /// A constructor chaining to `: this(...)` does not call the base and is skipped. Only ARITY is
+    /// checked here: an inaccessible base constructor is `CS0122`, a separate rule, and reporting
+    /// this one in its place would be a wrong code on a real error.
+    pub(crate) fn check_base_constructor_call(
+        &mut self,
+        class_ty: &TypeSymbol,
+        declaration: &lamella_syntax::ast::TypeDecl,
+    ) {
+        if !matches!(declaration.kind, lamella_syntax::ast::TypeKind::Class) {
+            return;
+        }
+        let Some(base) = self.type_info_of(class_ty).and_then(|info| info.base.clone()) else {
+            return;
+        };
+        let Some(base_info) = self.type_info_of(&base) else {
+            return;
+        };
+        let constructors = base_info.constructors.clone();
+        if constructors.is_empty() {
+            return;
+        }
+        let mut sites: Vec<(Span, usize)> = Vec::new();
+        let mut declared_any = false;
+        for member in &declaration.members {
+            if let lamella_syntax::ast::Member::Constructor {
+                modifiers,
+                initializer,
+                span,
+                ..
+            } = member
+            {
+                if modifiers
+                    .iter()
+                    .any(|m| matches!(m, lamella_syntax::ast::Modifier::Static))
+                {
+                    continue;
+                }
+                declared_any = true;
+                match initializer {
+                    Some(init)
+                        if matches!(
+                            init.kind,
+                            lamella_syntax::ast::ConstructorInitializerKind::This
+                        ) => {}
+                    Some(init) => sites.push((*span, init.arguments.len())),
+                    None => sites.push((*span, 0)),
+                }
+            }
+        }
+        if !declared_any {
+            sites.push((declaration.span, 0));
+        }
+        for (span, argc) in sites {
+            if constructors.iter().any(|constructor| {
+                constructor.parameters.len() == argc
+                    || (constructor.is_params && argc + 1 >= constructor.parameters.len())
+            }) {
+                continue;
+            }
+            let diagnostic = match constructors.as_slice() {
+                [only] if argc < only.parameters.len() => {
+                    DiagnosticKind::MissingArgumentForParameter {
+                        parameter: only.parameter_name(argc).unwrap_or("value").into(),
+                        method: qualified_method_with_modes(
+                            &base,
+                            &simple_type_name(&base),
+                            only,
+                        ),
+                    }
+                }
+                _ => DiagnosticKind::NoConstructor {
+                    type_name: base.to_string().into(),
+                    count: argc as u32,
+                },
+            };
+            self.diagnostics.push(Diagnostic::new(diagnostic, span));
+        }
     }
 
     /// Reports `CS0535` for each interface member a concrete class/struct does not
@@ -5848,6 +6311,12 @@ impl Binder {
     /// interfaces: the interface's own abstract declaration must not be mistaken for its
     /// implementation (that is the CS0535 the caller reports). The explicit check is lenient (any
     /// `.<member>` impl) so a real explicit impl is never falsely flagged.
+    ///
+    /// TEST-ONLY, and safely so: it collapses [`Self::interface_member_status`] to a boolean, so a
+    /// test asking the yes/no question still exercises the four-state routine the diagnostics use.
+    /// The production callers all want to know WHICH failure it was, because each names a different
+    /// repair (`CS0535` / `CS0737` / `CS0738`) -- so none of them can use this shape.
+    #[cfg(test)]
     fn implements_interface_member(&self, class_ty: &TypeSymbol, member: &MethodSymbol) -> bool {
         matches!(
             self.interface_member_status(class_ty, member),
@@ -6132,7 +6601,7 @@ impl Binder {
         if candidates.is_empty() {
             return None;
         }
-        let chosen = self.resolve_call(name, receiver_ty, &candidates, &[], &[], span)?;
+        let chosen = self.resolve_call(name, receiver_ty, &candidates, &[], &[], &[], span)?;
         let declaring_type =
             self.declaring_type_in_chain(receiver_ty, &chosen.name, &chosen.parameters);
         Some(MethodReference {
@@ -6778,7 +7247,101 @@ fn qualified_member(declaring: &TypeSymbol, member: &str) -> Box<str> {
     qualified.into()
 }
 
-enum MemberResolution {
+/// `Type.method(p1, p2)`, for a diagnostic message that names a METHOD -- csc spells a method
+/// member with its parameter type list, so `B.F` alone is not the same string as `B.F(int, string)`
+/// and a message quoting the bare name is not byte-identical.
+///
+/// A `ref`/`out` parameter renders as `ref T` either way: `MethodSymbol.parameters` records
+/// by-reference-ness but not WHICH of the two spellings the source wrote, so an `out` parameter
+/// prints `ref`. That is the same missing fact that blocks CS1620 and CS7036, asserted here rather
+/// than papered over, and it moves the day parameter modes join the symbol table.
+/// A type's own name without its namespace or enclosing types -- `Inner` for `C.Inner`. A
+/// constructor's display name is the type's simple name, so `C.Inner`'s reads `C.Inner.Inner(...)`.
+fn simple_type_name(ty: &TypeSymbol) -> String {
+    match ty {
+        TypeSymbol::Named(parts) => parts.last().map(|part| part.to_string()).unwrap_or_default(),
+        other => other.to_string(),
+    }
+}
+
+/// A member's display signature with each parameter's MODIFIER, e.g. `C.M(int, out int)` or
+/// `B.B(params int[])` -- what csc puts in `CS7036`.
+///
+/// This is [`qualified_method`] with the modes filled in. The two are kept apart on purpose: the
+/// older one renders from a bare `&[TypeSymbol]`, which is all a `MethodReference` carries, and
+/// its callers are at parity today. Once every one of them holds a `MethodSymbol` they should
+/// collapse into this.
+fn qualified_method_with_modes(
+    declaring: &TypeSymbol,
+    member: &str,
+    method: &MethodSymbol,
+) -> Box<str> {
+    let mut qualified = declaring.to_string();
+    qualified.push('.');
+    qualified.push_str(member);
+    qualified.push('(');
+    for (index, parameter) in method.parameters.iter().enumerate() {
+        if index > 0 {
+            qualified.push_str(", ");
+        }
+        if method.is_params && index + 1 == method.parameters.len() {
+            qualified.push_str("params ");
+        }
+        match method.parameter_mode(index) {
+            Some(ParameterMode::Out) => {
+                qualified.push_str("out ");
+                qualified.push_str(&strip_byref(parameter));
+            }
+            _ => qualified.push_str(&parameter.to_string()),
+        }
+    }
+    qualified.push(')');
+    qualified.into()
+}
+
+/// A by-reference parameter's type rendered WITHOUT its `ref` prefix, so an `out` parameter can
+/// be spelled `out int` rather than `out ref int`.
+fn strip_byref(parameter: &TypeSymbol) -> alloc::string::String {
+    match parameter {
+        TypeSymbol::ByRef(inner) => inner.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn qualified_method(declaring: &TypeSymbol, member: &str, parameters: &[TypeSymbol]) -> Box<str> {
+    let mut qualified = declaring.to_string();
+    qualified.push('.');
+    qualified.push_str(member);
+    qualified.push('(');
+    for (index, parameter) in parameters.iter().enumerate() {
+        if index > 0 {
+            qualified.push_str(", ");
+        }
+        qualified.push_str(&parameter.to_string());
+    }
+    qualified.push(')');
+    qualified.into()
+}
+
+/// What a named attribute argument's name turned out to be, from
+/// [`Binder::named_attribute_argument_target`].
+/// Each "found" variant carries the type that DECLARES the member, which is not always the
+/// attribute class -- an inherited field is declared by a base. The unused-field pass keys on the
+/// declaring type, so recording the attribute's own type instead would leave an inherited field
+/// looking unassigned.
+pub(crate) enum NamedArgumentTarget {
+    /// A public, instance, writable field or read-write property: legal, report nothing.
+    Valid(TypeSymbol),
+    /// Reachable in principle but not from here -- `CS0122`.
+    Inaccessible(TypeSymbol),
+    /// Reachable and unusable: a non-public, static, readonly or const field; a property that is
+    /// not public, is static, or lacks an accessor; a method; a nested type -- `CS0617`.
+    NotAValidTarget(TypeSymbol),
+    /// No member of that name anywhere in the attribute class's chain -- `CS0246`.
+    Missing,
+}
+
+pub(crate) enum MemberResolution {
     /// A field, with its resolved reference.
     Field(FieldReference),
     /// A property, with its declaring type, type, accessibility, and staticness.
@@ -8148,6 +8711,7 @@ mod tests {
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
+            parameter_info: Vec::new(),
             is_static: false,
             is_params: false,
             is_vararg: false,
@@ -8275,6 +8839,7 @@ mod tests {
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
+            parameter_info: Vec::new(),
             is_static: false,
             is_params: false,
             is_vararg: false,
@@ -8707,6 +9272,7 @@ mod tests {
                 name: name.into(),
                 return_type,
                 parameters,
+                parameter_info: Vec::new(),
                 is_static: false,
                 is_params: false,
                 is_vararg: false,
@@ -8778,7 +9344,7 @@ mod tests {
         assert!(call_codes("c.P(\"s\", 1, 2)").is_empty());
         assert_eq!(call_codes("c.P(1, 2, 3)"), [1503]);
         assert_eq!(call_codes("c.P(\"s\", 1, \"x\")"), [1503]);
-        assert_eq!(call_codes("c.P()"), [1501]);
+        assert_eq!(call_codes("c.P()"), [7036]);
     }
 
     #[test]
@@ -8923,6 +9489,7 @@ mod tests {
             name: name.into(),
             return_type: int(),
             parameters,
+            parameter_info: Vec::new(),
             is_static: false,
             is_params: false,
             is_vararg: false,
@@ -9813,6 +10380,7 @@ mod tests {
             name: "F".into(),
             return_type: int.clone(),
             parameters: alloc::vec![int.clone()],
+            parameter_info: Vec::new(),
             is_static: false,
             is_params: false,
             is_vararg: false,

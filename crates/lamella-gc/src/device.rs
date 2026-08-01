@@ -472,6 +472,7 @@ mod tests {
             return_pc: 0x100,
             frame_size: 32,
             ref_offsets: vec![4, 12],
+            pinned_offsets: vec![],
         };
         let maps = StackMapTable::from_entries(vec![entry]);
         let mut stack = vec![0u8; 32 + 4];

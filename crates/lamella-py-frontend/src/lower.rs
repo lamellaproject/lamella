@@ -1197,7 +1197,9 @@ fn stack_exit(stack: &[StackEntry]) -> Result<Vec<(ValueId, MirType)>, LowerErro
             StackEntry::Tuple(_) | StackEntry::EmptyList | StackEntry::ListAppend(_) => {
                 Err(LowerError::DynamicOperation)
             }
-            StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => Err(LowerError::DynamicOperation),
+            StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) | StackEntry::ConstStr => {
+                Err(LowerError::DynamicOperation)
+            }
         })
         .collect()
 }
@@ -1592,6 +1594,11 @@ enum StackEntry {
     /// (`except (A, B):`). Only `MatchExc` consumes it (testing the in-flight tag against the UNION of
     /// the members' subtype closures); anywhere else it is a real tuple value -> the dynamic path.
     ExcTypeTuple(Vec<String>),
+    /// A STRING constant, carried inert. The typed lane has no string values, so this is not one:
+    /// it exists only so `raise E("...")` can reach its `Call`, which discards it (see the
+    /// `ExcType` arm of `Op::Call`). Any other consumer falls to the dynamic path, exactly as a
+    /// string literal did before it was representable at all.
+    ConstStr,
 }
 
 fn pop(stack: &mut Vec<StackEntry>) -> Result<StackEntry, LowerError> {
@@ -1608,7 +1615,9 @@ fn pop_value(stack: &mut Vec<StackEntry>) -> Result<(ValueId, MirType), LowerErr
         StackEntry::Tuple(_) | StackEntry::EmptyList | StackEntry::ListAppend(_) => {
             Err(LowerError::DynamicOperation)
         }
-        StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => Err(LowerError::DynamicOperation),
+        StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) | StackEntry::ConstStr => {
+            Err(LowerError::DynamicOperation)
+        }
     }
 }
 
@@ -1631,6 +1640,10 @@ fn lower_op(
                 .consts
                 .get(*k as usize)
                 .ok_or(LowerError::BadConstIndex(*k))?;
+            if matches!(c, bc::Const::Str(_)) {
+                stack.push(StackEntry::ConstStr);
+                return Ok(());
+            }
             if let bc::Const::Float(bits) = c {
                 let id = values.fresh(MirType::F64);
                 insts.push((id, Inst::ConstInt {
@@ -1686,6 +1699,14 @@ fn lower_op(
                 if info.kind == SeqKind::FixedTuple && matches!(stack.last(), Some(StackEntry::Tuple(_))) {
                     let StackEntry::Tuple(elems) = pop(stack)? else { unreachable!() };
                     let obj = materialize_array(values, insts, arrays, &elems, info.elem, info.kind)?;
+                    locals[slot] = obj;
+                    return Ok(());
+                }
+                if info.kind == SeqKind::FixedList
+                    && matches!(stack.last(), Some(StackEntry::EmptyList))
+                {
+                    pop(stack)?;
+                    let obj = materialize_array(values, insts, arrays, &[], info.elem, info.kind)?;
                     locals[slot] = obj;
                     return Ok(());
                 }
@@ -2083,6 +2104,7 @@ fn lower_op(
         | bc::Op::YieldFrom
         | bc::Op::CallEx { .. }
         | bc::Op::BuildClass
+        | bc::Op::BuildClassKw { .. }
         | bc::Op::SetAttr { .. }
         | bc::Op::ListAppend
         | bc::Op::SetAdd
@@ -2133,6 +2155,17 @@ fn lower_op(
         }
         bc::Op::Call(argc) => {
             let argc = *argc as usize;
+            if stack.len() > argc {
+                let callee_at = stack.len() - argc - 1;
+                if matches!(stack[callee_at], StackEntry::ExcType(_))
+                    && stack[callee_at + 1..]
+                        .iter()
+                        .all(|e| matches!(e, StackEntry::ConstStr))
+                {
+                    stack.truncate(callee_at + 1);
+                    return Ok(());
+                }
+            }
             let mut typed_args = Vec::with_capacity(argc);
             for _ in 0..argc {
                 typed_args.push(pop_value(stack)?);
@@ -2387,7 +2420,7 @@ fn lower_op(
                 StackEntry::Value(..) | StackEntry::Tuple(_) | StackEntry::EmptyList => {
                     return Err(LowerError::CallTargetNotCallable);
                 }
-                StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => {
+                StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) | StackEntry::ConstStr => {
                     return Err(LowerError::DynamicOperation);
                 }
             }
@@ -2426,7 +2459,7 @@ fn lower_op(
                 | StackEntry::ListAppend(_) => {
                     return Err(LowerError::CallTargetNotCallable);
                 }
-                StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => {
+                StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) | StackEntry::ConstStr => {
                     return Err(LowerError::DynamicOperation);
                 }
             };
@@ -3398,6 +3431,53 @@ def sign(n: int) -> int:
     }
 
     #[test]
+    fn an_annotated_empty_list_is_a_zero_length_array() {
+        let f = lower_named(
+            "def main() -> int:\n    xs: list[int] = []\n    return len(xs)\n",
+            "main",
+        );
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::AllocArray { element_size: 4, .. })),
+            1
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayStore { .. })), 0);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn an_unannotated_empty_list_is_still_not_a_typed_array() {
+        let module = compile_str("test", "def main() -> int:\n    xs = []\n    return len(xs)\n")
+            .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn raising_a_constructed_exception_lowers_to_the_same_tag() {
+        let constructed = lower_named(
+            "def main() -> int:\n    try:\n        raise ValueError(\"empty\")\n    except ValueError:\n        return 42\n    return 0\n",
+            "main",
+        );
+        let bare = lower_named(
+            "def main() -> int:\n    try:\n        raise ValueError\n    except ValueError:\n        return 42\n    return 0\n",
+            "main",
+        );
+        assert_eq!(tag_stores(&constructed), tag_stores(&bare));
+        assert_eq!(count_insts(&constructed, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+        assert_eq!(count_insts(&constructed, |i| matches!(i, Inst::Call { .. })), 0);
+        assert_eq!(tag_loads(&constructed), tag_loads(&bare) + 1);
+    }
+
+    #[test]
+    fn a_string_constant_is_not_a_value_anywhere_else() {
+        let module = compile_str("test", "def main() -> int:\n    s = \"hello\"\n    return 0\n")
+            .expect("compiles");
+        assert!(
+            lower_module(&module).is_err(),
+            "a string local must stay dynamic"
+        );
+    }
+
+    #[test]
     fn typed_raise_catch_threads_a_caught_local() {
         let f = lower_named(
             "def main() -> int:\n    x = 1\n    try:\n        raise IndexError\n    except IndexError:\n        x = 42\n    return x\n",
@@ -3648,7 +3728,7 @@ def main() -> int:
                 i,
                 Inst::Alloc { handle, payload_size: GROWLIST_PAYLOAD_SIZE, ref_offsets }
                     if *handle == GROWLIST_HEADER_TYPE_HANDLE
-                        && &ref_offsets[..] == [GROWLIST_BACKING_OFFSET]
+                        && ref_offsets[..] == [GROWLIST_BACKING_OFFSET]
             )),
             1
         );

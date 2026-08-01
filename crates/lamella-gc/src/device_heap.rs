@@ -308,16 +308,31 @@ impl DeviceHeap {
     where
         R: FnMut(&mut dyn FnMut(&mut Ref)),
     {
+        self.collect_with_pins(enumerate_roots, &[]);
+    }
+
+    /// [`Self::collect`], with `pinned` naming the payload addresses (region-relative, as a
+    /// [`Ref`] carries them) of objects the compaction must leave WHERE THEY ARE -- what a C#
+    /// `fixed` statement's holder slot promises. See [`crate::heap::Heap::collect_with_pins`] for
+    /// the semantics and the space cost; the engine is the same one.
+    #[cfg(feature = "gc-collect")]
+    pub fn collect_with_pins<R>(&mut self, enumerate_roots: R, pinned: &[u32])
+    where
+        R: FnMut(&mut dyn FnMut(&mut Ref)),
+    {
         let top = self.top;
-        self.top = mark_compact(self.region, top, &PtrResolver, enumerate_roots);
+        self.top = mark_compact(self.region, top, &PtrResolver, enumerate_roots, pinned);
     }
 
     /// Collects using the live AOT call stack, for the safepoint-collect path: walks the
     /// frames from the top safepoint (`top_sp` = SP-at-the-call, `top_return_pc` = the
     /// safepoint return address) down through each caller via `stack_maps`, reclaims the
     /// unreachable, compacts the survivors, and writes every relocated reference back
-    /// into `stack`. The frame-walk convention is identical to [`crate::heap::Heap::
-    /// collect_stack`]; only the heap's type lookup differs (pointer, not table index).
+    /// into `stack`. Pinned roots (a `fixed` statement's holder slot) keep their addresses.
+    ///
+    /// The walk itself is the SHARED one ([`crate::heap::visit_stack_roots`]) rather than a second
+    /// copy of it: the host rehearsal and the device collection must not be able to walk
+    /// differently, and only the heap's type lookup differs (pointer, not table index).
     #[cfg(feature = "gc-collect")]
     pub fn collect_stack(
         &mut self,
@@ -326,37 +341,13 @@ impl DeviceHeap {
         top_return_pc: u32,
         stack_maps: &StackMapTable,
     ) {
-        const MAX_FRAMES: u32 = 4096;
-        self.collect(|visit| {
-            let mut sp = top_sp;
-            let mut return_pc = top_return_pc;
-            let mut frames = 0u32;
-            while let Some(entry) = stack_maps.lookup(return_pc) {
-                for &ref_offset in &entry.ref_offsets {
-                    let at = (sp + u32::from(ref_offset)) as usize;
-                    let mut reference = Ref(u32::from_le_bytes([
-                        stack[at],
-                        stack[at + 1],
-                        stack[at + 2],
-                        stack[at + 3],
-                    ]));
-                    visit(&mut reference);
-                    stack[at..at + 4].copy_from_slice(&reference.0.to_le_bytes());
-                }
-                let saved_lr_at = (sp + u32::from(entry.frame_size)) as usize;
-                return_pc = u32::from_le_bytes([
-                    stack[saved_lr_at],
-                    stack[saved_lr_at + 1],
-                    stack[saved_lr_at + 2],
-                    stack[saved_lr_at + 3],
-                ]);
-                sp = sp + u32::from(entry.frame_size) + 4;
-                frames += 1;
-                if frames >= MAX_FRAMES {
-                    break;
-                }
-            }
-        });
+        let pinned = crate::heap::pinned_stack_roots(stack, top_sp, top_return_pc, stack_maps);
+        self.collect_with_pins(
+            |visit| {
+                crate::heap::visit_stack_roots(stack, top_sp, top_return_pc, stack_maps, visit)
+            },
+            &pinned,
+        );
     }
 
     /// Turns a payload offset (a [`Ref`]) into the real `*mut u8` the backend's emitted

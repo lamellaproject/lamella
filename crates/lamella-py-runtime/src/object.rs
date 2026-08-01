@@ -211,6 +211,28 @@ const EXC_INIT: u32 = u32::MAX;
 /// args and returns `None`, so idiomatic `super().__init__()` / `super().__init_subclass__(**kw)`
 /// terminate cleanly at the (implicit) object base.
 const OBJECT_NOOP: u32 = u32::MAX - 1;
+/// A synthetic method id for an UNBOUND built-in-exception `__init__` (`ValueError.__init__(self,
+/// msg)`): the receiver is the call's FIRST argument (not a fixed bound self), so it sets `self.args`
+/// on whatever instance is passed -- the unbound twin of [`EXC_INIT`], for a subclass that calls the
+/// base initializer explicitly instead of via `super().__init__`.
+const EXC_INIT_UNBOUND: u32 = u32::MAX - 2;
+/// A synthetic method id for `callable.__call__`: dispatched by the interpreter's `call_value` (it
+/// needs the driver), it invokes the bound receiver with the call's arguments (`f.__call__(x)` == `f(x)`).
+pub(crate) const CALL_DUNDER: u32 = u32::MAX - 3;
+/// A synthetic method id for an iterator's `__next__`: dispatched by the interpreter's `call_value`,
+/// it advances the bound iterator like `next(it)` (raising `StopIteration` at exhaustion).
+pub(crate) const NEXT_DUNDER: u32 = u32::MAX - 4;
+/// A synthetic method id for `object.__getstate__` -- the instance state a copy of it must carry:
+/// the instance `__dict__`, or `None` when there is nothing in it. A FULLY-SLOTTED instance has no
+/// `__dict__` to hand out, so its state is the `(dict, slots)` pair CPython uses for one, with the
+/// slot values in the second half.
+pub(crate) const OBJECT_GETSTATE: u32 = u32::MAX - 6;
+/// A synthetic method id for `object.__new__` -- the allocator every `__new__` chain terminates in.
+/// It takes the class to instantiate from the call's FIRST ARGUMENT rather than a bound receiver,
+/// because `__new__` is an implicit STATIC method: `object.__new__(cls)`, `Cls.__new__(Cls)` and
+/// `super().__new__(cls)` all name the class explicitly, and the class named there is the one
+/// allocated (which is how a `__new__` returning a subclass instance works).
+pub(crate) const OBJECT_NEW: u32 = u32::MAX - 5;
 const SET_UNION: u32 = 0;
 const SET_INTERSECTION: u32 = 1;
 const SET_DIFFERENCE: u32 = 2;
@@ -284,6 +306,7 @@ const DEQUE_ROTATE: u32 = 6;
 const DEQUE_CLEAR: u32 = 7;
 const DEQUE_COUNT: u32 = 8;
 const DEQUE_REMOVE: u32 = 9;
+const DEQUE_COPY: u32 = 10;
 
 /// The method id for a `collections.deque` method `name`.
 fn deque_method_id(name: &str) -> Option<u32> {
@@ -298,6 +321,7 @@ fn deque_method_id(name: &str) -> Option<u32> {
         "clear" => Some(DEQUE_CLEAR),
         "count" => Some(DEQUE_COUNT),
         "remove" => Some(DEQUE_REMOVE),
+        "copy" => Some(DEQUE_COPY),
         _ => None,
     }
 }
@@ -438,6 +462,9 @@ const BYTES_RPARTITION: u32 = 36;
 const BYTES_SPLITLINES: u32 = 37;
 const BYTES_EXPANDTABS: u32 = 38;
 const BYTES_RSPLIT: u32 = 39;
+/// `bytearray.copy()` -- a mutable bytearray with the same bytes. Only a bytearray has it: a `bytes`
+/// cannot change, so CPython gives it none.
+const BYTEARRAY_COPY: u32 = 40;
 
 /// The method id for a `bytes`/`bytearray` method `name` (`mutating` allows the bytearray-only ones).
 fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
@@ -457,6 +484,7 @@ fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
         "rstrip" => Some(BYTES_RSTRIP),
         "append" if mutating => Some(BYTEARRAY_APPEND),
         "extend" if mutating => Some(BYTEARRAY_EXTEND),
+        "copy" if mutating => Some(BYTEARRAY_COPY),
         "isalpha" => Some(BYTES_ISALPHA),
         "isdigit" => Some(BYTES_ISDIGIT),
         "isalnum" => Some(BYTES_ISALNUM),
@@ -628,6 +656,17 @@ fn bytes_predicate(method_id: u32, data: &[u8]) -> bool {
 const MV_TOBYTES: u32 = 0;
 const MV_TOLIST: u32 = 1;
 const MV_HEX: u32 = 2;
+
+/// `slice.indices(length)` -- the slice's only method.
+const SLICE_INDICES: u32 = 0;
+
+/// The method id for a `slice` method `name`.
+fn slice_method_id(name: &str) -> Option<u32> {
+    match name {
+        "indices" => Some(SLICE_INDICES),
+        _ => None,
+    }
+}
 
 /// The method id for a `memoryview` method `name`.
 fn memoryview_method_id(name: &str) -> Option<u32> {
@@ -808,6 +847,28 @@ fn float_supports_dunder(name: &str) -> bool {
                 | "__repr__"
                 | "__str__"
         )
+}
+
+/// The dunders a BUILTIN TYPE OBJECT resolves to an unbound method (`int.__add__`, `str.__len__`),
+/// mirroring the per-VALUE gate so `T.__d__` exists exactly when an instance of `T` exposes `__d__`
+/// (the unbound dispatch re-resolves the dunder on the first argument, which must find a bound one).
+/// Kept in step with [`int_supports_dunder`] / [`float_supports_dunder`] and `container_supports_dunder`.
+fn type_object_supports_dunder(builtin: Builtin, name: &str) -> bool {
+    use Builtin::*;
+    let iter_contains = matches!(name, "__contains__" | "__iter__" | "__len__");
+    let subscript = matches!(name, "__getitem__");
+    let mutable_item = matches!(name, "__setitem__" | "__delitem__");
+    let seq_arith = matches!(name, "__add__" | "__mul__" | "__rmul__");
+    match builtin {
+        Int | Bool => int_supports_dunder(name),
+        Float => float_supports_dunder(name),
+        Str | Bytes | Tuple => iter_contains || subscript || seq_arith,
+        List | Bytearray => iter_contains || subscript || mutable_item || seq_arith,
+        Dict => iter_contains || subscript || mutable_item,
+        Range => iter_contains || subscript,
+        Set | Frozenset => iter_contains,
+        _ => false,
+    }
 }
 
 /// `float.hex()`: CPython's exact hexadecimal rendering of a double -- `[sign] 0xL.MMMMMMMMMMMMMp±E`,
@@ -1644,6 +1705,216 @@ struct I2cSimDevice {
     read_auto_increment: bool,
 }
 
+/// What one handle-indexed arena costs, split by WHICH of its two costs it is.
+///
+/// **The split is not a nicety: the two halves are reclaimed by different mechanisms and one of them is
+/// easy to overlook.** A handle is an index into a `Vec`, so every object of that kind costs a SLOT in
+/// the outer vector plus a PAYLOAD hanging off it. Releasing a dead object's payload while keeping its
+/// slot -- which keeps every outstanding handle valid, and is what makes such a release cheap -- recovers
+/// the payload and nothing else. **The slot is charged per ALLOCATION, not per live object**, so a loop
+/// that allocates forever grows the slot vector forever even when every payload is released the instant
+/// it dies. Measured on a four-element list loop, 2026-07-30: 98,304 bytes of slots against 64,000 of
+/// payload, so payload release alone would recover 39 percent of a table that must stop growing entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Arena {
+    /// The handle table itself -- the outer vector's reserved slots, live and dead alike. Falls only
+    /// when handles are REUSED (a free list), never when a payload is dropped.
+    pub slots: usize,
+    /// What the slots point at: a string's bytes, a container's elements, a bignum's limbs.
+    pub payload: usize,
+}
+
+impl Arena {
+    /// Both halves.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.slots + self.payload
+    }
+}
+
+/// What a running program costs, broken down by where the bytes are -- the answer to
+/// [`ObjectModel::footprint`].
+///
+/// **The breakdown is the point, not a convenience.** The object heap is the only part a collection
+/// reclaims, and it is the smaller part of what a program costs on a device -- an ordinary program's
+/// tables can hold an order of magnitude more than its heap. A single total would let a figure that is
+/// mostly side table be read as a heap figure, which is the exact mistake this type exists to prevent.
+///
+/// Every figure is CAPACITY rather than length: a buffer that grew and shrank still owns what it
+/// reserved, and an allocator it was taken from does not know the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Footprint {
+    /// Live bytes in the object heap -- what a collection moves. Not its capacity: a device pays that
+    /// once, up front, as a single block, which is a cost of the CONFIGURATION rather than of the run.
+    pub objects: usize,
+    /// The `str` arena: every string's bytes.
+    pub strings: Arena,
+    /// The `list`/`tuple`/`deque` arena: every container's elements.
+    pub sequences: Arena,
+    /// The `dict` arena: every dict's key/value pairs.
+    pub dicts: Arena,
+    /// The `set`/`frozenset` arena: every set's members.
+    pub sets: Arena,
+    /// The arbitrary-precision `int` arena: every bignum's limbs.
+    pub bigints: Arena,
+    /// The `bytes`/`bytearray` arena: every buffer's bytes.
+    pub byte_buffers: Arena,
+    /// The namespaces: the entry module's globals, every managed module's, the import cache, the
+    /// exception classes and the per-function attribute dicts -- names as well as values.
+    pub namespaces: usize,
+    /// Suspended generators' frames and the returned-frame pool: locals, evaluation stacks, inline
+    /// caches, open handlers and closure cells.
+    pub frames: usize,
+    /// Captured `print` output still waiting to be drained. Zero once an embedder installs a console,
+    /// because the text leaves as it is produced -- see [`ObjectModel::set_console`].
+    pub stdout: usize,
+}
+
+impl Footprint {
+    /// The six handle-indexed arenas, in the order this type declares them.
+    #[must_use]
+    pub fn arenas(&self) -> [Arena; 6] {
+        [self.strings, self.sequences, self.dicts, self.sets, self.bigints, self.byte_buffers]
+    }
+
+    /// Every byte accounted for above. **This is the quantity the unlimited-timespan bar is about**: a
+    /// program with a bounded live set, allocating in a loop, must hold this steady rather than climb.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.objects
+            + self.arenas().iter().map(Arena::total).sum::<usize>()
+            + self.namespaces
+            + self.frames
+            + self.stdout
+    }
+
+    /// Everything OUTSIDE the object heap -- the part a collection does not touch today.
+    #[must_use]
+    pub fn beside_the_heap(&self) -> usize {
+        self.total() - self.objects
+    }
+
+    /// The six arenas' handle tables, added up -- the part that only handle REUSE can bring down.
+    #[must_use]
+    pub fn arena_slots(&self) -> usize {
+        self.arenas().iter().map(|arena| arena.slots).sum()
+    }
+
+    /// The six arenas' payloads, added up -- the part releasing a dead object's contents brings down.
+    #[must_use]
+    pub fn arena_payload(&self) -> usize {
+        self.arenas().iter().map(|arena| arena.payload).sum()
+    }
+}
+
+/// The freed slot of each handle arena, one list per arena. See [`ObjectModel::freed_slots`].
+#[derive(Debug, Default)]
+struct FreedSlots {
+    strings: Vec<u32>,
+    seqs: Vec<u32>,
+    dicts: Vec<u32>,
+    sets: Vec<u32>,
+    bigints: Vec<u32>,
+    byte_buffers: Vec<u32>,
+}
+
+/// Which handle arena a heap object's first payload word indexes into.
+/// See [`ObjectModel::arena_of`].
+#[cfg(feature = "gc-collect")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArenaKind {
+    Strings,
+    Seqs,
+    Dicts,
+    Sets,
+    Bigints,
+    ByteBuffers,
+}
+
+/// One flag per slot of each arena while [`ObjectModel::release_dead_arena_slots`] walks the
+/// survivors: set means some surviving object still names that slot.
+#[cfg(feature = "gc-collect")]
+struct LiveSlots {
+    strings: Vec<bool>,
+    seqs: Vec<bool>,
+    dicts: Vec<bool>,
+    sets: Vec<bool>,
+    bigints: Vec<bool>,
+    byte_buffers: Vec<bool>,
+}
+
+#[cfg(feature = "gc-collect")]
+impl LiveSlots {
+    /// Records that `index` of `arena` is still in use. Out-of-range is ignored rather than a panic:
+    /// the arenas can only have grown since the flags were sized, and a slot beyond the end was made
+    /// after this pass began looking.
+    fn mark(&mut self, arena: ArenaKind, index: usize) {
+        let flags = match arena {
+            ArenaKind::Strings => &mut self.strings,
+            ArenaKind::Seqs => &mut self.seqs,
+            ArenaKind::Dicts => &mut self.dicts,
+            ArenaKind::Sets => &mut self.sets,
+            ArenaKind::Bigints => &mut self.bigints,
+            ArenaKind::ByteBuffers => &mut self.byte_buffers,
+        };
+        if let Some(flag) = flags.get_mut(index) {
+            *flag = true;
+        }
+    }
+
+    /// Marks every slot that is already on a free list, so this pass cannot free one twice.
+    fn mark_all(&mut self, freed: &FreedSlots) {
+        for (flags, indices) in [
+            (&mut self.strings, &freed.strings),
+            (&mut self.seqs, &freed.seqs),
+            (&mut self.dicts, &freed.dicts),
+            (&mut self.sets, &freed.sets),
+            (&mut self.bigints, &freed.bigints),
+            (&mut self.byte_buffers, &freed.byte_buffers),
+        ] {
+            for &index in indices {
+                if let Some(flag) = flags.get_mut(index as usize) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+}
+
+/// Replaces every dead slot's payload with an empty one and offers the slot for reuse.
+///
+/// The payload is dropped IN PLACE and the slot keeps its index, so no handle anywhere is invalidated
+/// and nothing is renumbered -- the pattern `generators` already uses. Handing the index to `freed` is
+/// the other half, and the half that bounds the table: without it a slot is charged per allocation and
+/// the arena grows forever however promptly payloads are released.
+#[cfg(feature = "gc-collect")]
+fn empty_dead_slots<T>(arena: &mut [T], live: &[bool], freed: &mut Vec<u32>, empty: impl Fn() -> T) {
+    for (index, in_use) in live.iter().enumerate() {
+        if !in_use {
+            arena[index] = empty();
+            freed.push(index as u32);
+        }
+    }
+}
+
+/// Takes a slot in a handle arena to hold `payload`, REUSING one a collection freed if there is one.
+///
+/// A free function over the two vectors rather than a method, because every caller holds `&mut self`
+/// and needs to name one arena and its list as disjoint borrows.
+fn take_arena_slot<T>(arena: &mut Vec<T>, freed: &mut Vec<u32>, payload: T) -> u32 {
+    match freed.pop() {
+        Some(index) => {
+            arena[index as usize] = payload;
+            index
+        }
+        None => {
+            let index = arena.len() as u32;
+            arena.push(payload);
+            index
+        }
+    }
+}
+
 /// The dynamic object space: the shared heap plus the type table that gives each
 /// heap object's header word a Python meaning.
 ///
@@ -1701,6 +1972,19 @@ pub struct ObjectModel {
     /// holds an index into this. (Iteration order is insertion, not CPython's hash order -- a
     /// documented divergence; differential tests compare sets as sets, e.g. via `sorted`.)
     sets: Vec<Vec<Value>>,
+    /// Slots in each arena above whose owner has died, ready to be handed out again.
+    ///
+    /// **Reuse is what bounds a handle table by the peak LIVE count instead of by the total number
+    /// of allocations, and without it the arenas grow forever however promptly payloads are
+    /// released.** A slot is charged per allocation: measured over a loop holding at most one object,
+    /// the slot half of these arenas was 43 to 83 percent of their cost and quadrupled exactly when
+    /// the pass count did. Emptying a dead slot recovers only the other half.
+    ///
+    /// Filled by [`ObjectModel::release_dead_arena_slots`], which runs after a collection and can
+    /// therefore see which slots no surviving object still names. Drained by
+    /// [`take_arena_slot`]. Empty when nothing has ever been collected, so a build with no
+    /// collector behaves exactly as it did.
+    freed_slots: FreedSlots,
     /// The GC type-descriptor id of a `list`; it follows the slice.
     list_type_id: u32,
     /// The GC type-descriptor id of a `tuple`; it follows the list.
@@ -1730,6 +2014,17 @@ pub struct ObjectModel {
     /// The exception currently in flight while it propagates to a handler (set by a `raise`
     /// and carried across call frames -- a [`Trap::Raised`] is the signal, this is the object).
     pending_exception: Option<Value>,
+    /// A `MemoryError` instance built IN ADVANCE, so that running out of memory can be reported.
+    ///
+    /// **Telling a program it is out of memory costs an allocation -- a class chain and an instance --
+    /// at the one moment there may be nothing to allocate from.** Built during a collection instead,
+    /// which happens at a safe point while a quarter of the heap is still free, and held here until it
+    /// is needed. A GC root while it waits, or the collection that built it would take it straight back.
+    ///
+    /// Taken when it is handed to a raise, and rebuilt by the next collection. A program that exhausts
+    /// memory twice with no collection in between gets the old behavior for the second one, which is a
+    /// fatal trap; that is a narrower gap than the one this closes and it is not pretended away.
+    memory_error_reserve: Option<Value>,
     /// The module namespace (top-level name -> value): classes and other top-level bindings the
     /// module body produces, which a function reaches by `LoadGlobal`. The body mirrors its locals
     /// here as it binds them.
@@ -1750,6 +2045,10 @@ pub struct ObjectModel {
     /// (cheap) to run the callee against its OWN function table, disjoint from the `&mut self` borrow.
     /// Built once by [`ObjectModel::set_managed_modules`] alongside the registry.
     managed_functions: Vec<Rc<[CodeObject]>>,
+    /// Each managed module's top-level BODY as a shared `Rc`, indexed by `module_id - 1`. A module
+    /// body runs on the importer's own frame stack (so the collector's safe point reaches it), which
+    /// means its code is resolved once per op and cannot be a borrow into the registry.
+    managed_bodies: Vec<Rc<CodeObject>>,
     /// The ENTRY module's function table (module 0) as a shared `Rc`, set by [`run_bundle`] before the
     /// entry runs. The entry's own code threads its `functions` slice, but a MANAGED module calling an
     /// entry-defined function value (home 0) reaches its code through this `Rc` -- else it would resolve
@@ -1802,6 +2101,9 @@ pub struct ObjectModel {
     i2c_bus_type_id: u32,
     /// The GC type-descriptor id of the `adc` module singleton (the clean ADC API).
     adc_type_id: u32,
+    /// The GC type-descriptor id of an open FILE: `[handle@0 (raw; u32::MAX once closed), mode@4
+    /// (raw; the packed mode flags), name@8 (tagged str)]`.
+    file_type_id: u32,
     /// The GC type-descriptor id of a board ADC resource (`board.A0`): `(channel, pin)` raw words.
     adc_resource_type_id: u32,
     /// The GC type-descriptor id of an open ADC `Channel` (a GC leaf of raw config/state words).
@@ -1895,6 +2197,9 @@ pub struct ObjectModel {
     /// one-slot payload holding the method NAME. Called with the receiver as the first argument
     /// (`str.lower(s)` == `s.lower()`), so it works as a `key=`/`map` function.
     unbound_method_type_id: u32,
+    /// The GC type-descriptor id of a bare `object()` instance -- an attribute-less identity token
+    /// (the `object()` sentinel). Its only observable trait is its own address (`is` / `id`).
+    object_base_type_id: u32,
     /// The suspended frames of live generators, indexed by a generator object's payload word.
     /// `None` = the generator is exhausted (its body returned) or currently running; `Some(frame)`
     /// = it is fresh (ip 0) or suspended at a `yield`. A suspended frame holds tagged Values
@@ -1910,6 +2215,12 @@ pub struct ObjectModel {
     gpio_claimed: Vec<u32>,
     /// App-claimed UART instances -- one owner per port, same fail-loud rule as pins.
     uart_claimed: Vec<u32>,
+    /// The register facts of the open UART role, for a board whose values come from its generated
+    /// module rather than a table in this crate. Resolved once when the role is opened -- BEFORE
+    /// the bring-up sequence runs, so the host sim models the right registers from the first write
+    /// -- and `None` until then, because such a board has no second source of addresses to fall
+    /// back on. (One entry: the bound family exposes a single UART role.)
+    resolved_uart_facts: Option<crate::tables::uart_samd21::Samd21UartFacts>,
     /// App-claimed SPI bus instances -- one owner per bus, same fail-loud rule.
     spi_claimed: Vec<u32>,
     /// App-claimed I2C bus instances -- one owner per bus, same fail-loud rule.
@@ -1922,6 +2233,43 @@ pub struct ObjectModel {
     gpio_reserved: Vec<u32>,
     /// The volatile MMIO write seam: on device the runner installs `lamella_mmio::write32`; on
     /// the host it is unset and writes fall to the simulated register file.
+    /// The host's clocks and its sleep, installed by whatever is embedding this runtime -- a host
+    /// program, or a device's timer. There is no fallback: a runtime with no clock cannot answer
+    /// what time it is, and returning zero would be a wrong answer rather than a missing one.
+    /// Wall clock, in nanoseconds since the Unix epoch.
+    /// Collect at every safe point rather than under pressure -- a test instrument (see
+    /// `set_gc_stress`), and how the root enumeration is held honest.
+    #[cfg(feature = "gc-collect")]
+    gc_stress: bool,
+    /// Whether a safe point collects under pressure. ON by default -- see `under_memory_pressure`.
+    #[cfg(feature = "gc-collect")]
+    collect_when_full: bool,
+    /// How many interpreter drive loops are running, maintained by the driver itself. The safe point
+    /// needs to know whether the loop reaching it is the OUTERMOST one, because only that loop's frame
+    /// stack is every frame there is; see `is_outermost_drive`.
+    #[cfg(feature = "gc-collect")]
+    drive_nesting: u32,
+    /// The embedder's console, if it installed one: `print` writes straight through instead of
+    /// accumulating. `None` = capture in `stdout` and hand it over on request.
+    console_fn: Option<fn(&str)>,
+    /// The embedder's view of the memory this model is allocated OUT OF, as `(used, capacity)` bytes:
+    /// a device's bump-arena frontier, answered in constant time by whoever owns that arena. `None` on
+    /// a host, where there is no such bound -- see [`ObjectModel::set_arena_probe`].
+    ///
+    /// Only a build that can COLLECT has anything to do with the answer: without the collector, arena
+    /// pressure is not actionable, since an allocation-only tier has nothing to reclaim.
+    #[cfg(feature = "gc-collect")]
+    arena_probe: Option<fn() -> (usize, usize)>,
+    /// The host filesystem, installed by the embedder. `None` = no storage: every file verb REFUSES
+    /// by name rather than answering an empty read or dropping a write, which would be indistinguishable
+    /// from success at the call site.
+    file_ops: Option<crate::fileio::FileOps>,
+    clock_fn: Option<fn() -> i64>,
+    /// A monotonic source, in nanoseconds from an arbitrary origin. Separate from the wall clock
+    /// because only this one is guaranteed not to jump when the system clock is adjusted.
+    monotonic_fn: Option<fn() -> i64>,
+    /// Blocks for a count of nanoseconds.
+    sleep_fn: Option<fn(i64)>,
     mmio_write_fn: Option<fn(u32, u32)>,
     /// The volatile MMIO read seam (device: `lamella_mmio::read32`; host: the sim).
     mmio_read_fn: Option<fn(u32) -> u32>,
@@ -2308,6 +2656,12 @@ impl ObjectModel {
             ref_offsets: Vec::new(),
             tagged_offsets: alloc::vec![0],
         });
+        let object_base_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
         let long_type_id = descs.len() as u32;
         descs.push(TypeDesc {
             payload_size: 16,
@@ -2382,6 +2736,12 @@ impl ObjectModel {
             ref_offsets: Vec::new(),
             tagged_offsets: Vec::new(),
         });
+        let file_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 12,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![8],
+        });
         let adc_resource_type_id = descs.len() as u32;
         descs.push(TypeDesc {
             payload_size: 8,
@@ -2445,6 +2805,7 @@ impl ObjectModel {
             bigints: Vec::new(),
             byte_buffers: Vec::new(),
             sets: Vec::new(),
+            freed_slots: FreedSlots::default(),
             str_type_id,
             bytes_type_id,
             bytearray_type_id,
@@ -2469,10 +2830,12 @@ impl ObjectModel {
             frozenset_type_id,
             exception_classes: Vec::new(),
             pending_exception: None,
+            memory_error_reserve: None,
             globals: Vec::new(),
             modules: Vec::new(),
             managed_modules: Vec::new(),
             managed_functions: Vec::new(),
+            managed_bodies: Vec::new(),
             entry_functions: None,
             managed_globals: Vec::new(),
             current_module: 0,
@@ -2491,6 +2854,17 @@ impl ObjectModel {
             i2c_resource_type_id,
             i2c_bus_type_id,
             adc_type_id,
+            file_type_id,
+            #[cfg(feature = "gc-collect")]
+            gc_stress: false,
+            #[cfg(feature = "gc-collect")]
+            collect_when_full: true,
+            #[cfg(feature = "gc-collect")]
+            drive_nesting: 0,
+            console_fn: None,
+            #[cfg(feature = "gc-collect")]
+            arena_probe: None,
+            file_ops: None,
             adc_resource_type_id,
             adc_channel_type_id,
             spi_shim_factory_type_id,
@@ -2526,14 +2900,19 @@ impl ObjectModel {
             ntinstance_type_id,
             property_type_id,
             unbound_method_type_id,
+            object_base_type_id,
             generators: Vec::new(),
             frame_pool: Vec::new(),
             gpio_claimed: Vec::new(),
             uart_claimed: Vec::new(),
+            resolved_uart_facts: None,
             spi_claimed: Vec::new(),
             i2c_claimed: Vec::new(),
             adc_channels_open: Vec::new(),
             gpio_reserved: Vec::new(),
+            clock_fn: None,
+            monotonic_fn: None,
+            sleep_fn: None,
             mmio_write_fn: None,
             mmio_read_fn: None,
             board: crate::gpio::Board::default(),
@@ -2599,8 +2978,7 @@ impl ObjectModel {
     /// Allocates a `str` from `s`, returning a heap-pointer Value. The content is interned
     /// in the string arena and the heap object holds its index.
     pub fn new_str(&mut self, s: &str) -> Result<Value, Trap> {
-        let index = self.strings.len() as u32;
-        self.strings.push(String::from(s));
+        let index = take_arena_slot(&mut self.strings, &mut self.freed_slots.strings, String::from(s));
         let reference = self.alloc_object(self.str_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
@@ -2655,18 +3033,16 @@ impl ObjectModel {
     /// A new immutable `bytes` object over `data`.
     pub fn new_bytes(&mut self, data: Vec<u8>) -> Result<Value, Trap> {
         let reference = self.alloc_object(self.bytes_type_id).ok_or(Trap::OutOfMemory)?;
-        let index = self.byte_buffers.len();
-        self.byte_buffers.push(data);
-        self.heap.write_u32(reference.0, index as u32);
+        let index = take_arena_slot(&mut self.byte_buffers, &mut self.freed_slots.byte_buffers, data);
+        self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
 
     /// A new mutable `bytearray` object over `data`.
     pub fn new_bytearray(&mut self, data: Vec<u8>) -> Result<Value, Trap> {
         let reference = self.alloc_object(self.bytearray_type_id).ok_or(Trap::OutOfMemory)?;
-        let index = self.byte_buffers.len();
-        self.byte_buffers.push(data);
-        self.heap.write_u32(reference.0, index as u32);
+        let index = take_arena_slot(&mut self.byte_buffers, &mut self.freed_slots.byte_buffers, data);
+        self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
 
@@ -3029,6 +3405,25 @@ impl ObjectModel {
     /// `"a" == 1` is `False`, `"a" < 1` raises). `Ok(None)` when neither operand is an
     /// object, so the caller falls back to the numeric / identity path.
     pub fn py_compare(&self, op: CmpOp, lhs: Value, rhs: Value) -> Result<Option<Value>, Trap> {
+        if self.is_range(lhs) && self.is_range(rhs) && matches!(op, CmpOp::Eq | CmpOp::Ne) {
+            let (a_start, a_stop, a_step) = self.range_bounds(lhs);
+            let (b_start, b_stop, b_step) = self.range_bounds(rhs);
+            let length = |start: i64, stop: i64, step: i64| -> i64 {
+                if step > 0 && start < stop {
+                    (stop - start - 1) / step + 1
+                } else if step < 0 && start > stop {
+                    (start - stop - 1) / (-step) + 1
+                } else {
+                    0
+                }
+            };
+            let a_len = length(a_start, a_stop, a_step);
+            let b_len = length(b_start, b_stop, b_step);
+            let equal = a_len == b_len
+                && (a_len == 0 || (a_start == b_start && (a_len == 1 || a_step == b_step)));
+            let holds = if op == CmpOp::Eq { equal } else { !equal };
+            return Ok(Some(Value::from_bool(holds)));
+        }
         if self.is_set(lhs) || self.is_frozenset(lhs) {
             return Ok(Some(self.set_compare(op, lhs, rhs)?));
         }
@@ -3577,8 +3972,7 @@ impl ObjectModel {
                 None => entries.push((key, value)),
             }
         }
-        let index = self.dicts.len() as u32;
-        self.dicts.push(entries);
+        let index = take_arena_slot(&mut self.dicts, &mut self.freed_slots.dicts, entries);
         let reference = self.alloc_object(self.defaultdict_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         self.heap.write_u32(reference.0 + 4, factory.bits());
@@ -3594,8 +3988,7 @@ impl ObjectModel {
     /// Allocates a `collections.Counter` over `entries` (already deduped/counted by the caller --
     /// the constructor and the operator arms fold counts before allocating).
     pub(crate) fn new_counter(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, Trap> {
-        let index = self.dicts.len() as u32;
-        self.dicts.push(entries);
+        let index = take_arena_slot(&mut self.dicts, &mut self.freed_slots.dicts, entries);
         let reference = self.alloc_object(self.counter_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
@@ -3633,8 +4026,7 @@ impl ObjectModel {
                 None => entries.push((key, value)),
             }
         }
-        let index = self.dicts.len() as u32;
-        self.dicts.push(entries);
+        let index = take_arena_slot(&mut self.dicts, &mut self.freed_slots.dicts, entries);
         let reference = self.alloc_object(self.ordereddict_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
@@ -3658,8 +4050,7 @@ impl ObjectModel {
                 elements.drain(..elements.len() - m);
             }
         }
-        let index = self.seqs.len() as u32;
-        self.seqs.push(elements);
+        let index = take_arena_slot(&mut self.seqs, &mut self.freed_slots.seqs, elements);
         let reference = self.alloc_object(self.deque_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         self.heap.write_u32(reference.0 + 4, maxlen.map_or(u32::MAX, |m| m as u32));
@@ -3769,8 +4160,7 @@ impl ObjectModel {
     /// Allocates a namedtuple INSTANCE of `class` over `elements` (already bound to the fields by
     /// the caller). A tuple subtype: the elements live in the seqs arena at offset 0.
     pub(crate) fn new_ntinstance(&mut self, class: Value, elements: Vec<Value>) -> Result<Value, Trap> {
-        let index = self.seqs.len() as u32;
-        self.seqs.push(elements);
+        let index = take_arena_slot(&mut self.seqs, &mut self.freed_slots.seqs, elements);
         let reference = self.alloc_object(self.ntinstance_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         self.heap.write_u32(reference.0 + 4, class.bits());
@@ -3891,6 +4281,14 @@ impl ObjectModel {
                 }
                 self.seqs[slot].clear();
                 Ok(Value::NONE)
+            }
+            DEQUE_COPY => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let elements = self.seqs[slot].clone();
+                let maxlen = self.deque_maxlen(receiver).unwrap_or(None);
+                self.new_deque(elements, maxlen)
             }
             DEQUE_COUNT => {
                 let [element] = args else {
@@ -4035,8 +4433,7 @@ impl ObjectModel {
     /// Allocates a `list` over `elements` (a mutable sequence). The elements live in the
     /// backing arena; the heap object holds the index.
     pub fn new_list(&mut self, elements: Vec<Value>) -> Result<Value, Trap> {
-        let index = self.seqs.len() as u32;
-        self.seqs.push(elements);
+        let index = take_arena_slot(&mut self.seqs, &mut self.freed_slots.seqs, elements);
         let reference = self.alloc_object(self.list_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
@@ -4066,8 +4463,7 @@ impl ObjectModel {
 
     /// Allocates a `tuple` over `elements` (an immutable sequence).
     pub fn new_tuple(&mut self, elements: Vec<Value>) -> Result<Value, Trap> {
-        let index = self.seqs.len() as u32;
-        self.seqs.push(elements);
+        let index = take_arena_slot(&mut self.seqs, &mut self.freed_slots.seqs, elements);
         let reference = self.alloc_object(self.tuple_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
@@ -4090,8 +4486,7 @@ impl ObjectModel {
     /// Allocates a `dict` over already-deduped `entries` -- the shared tail of [`ObjectModel::new_dict`]
     /// (value-equality dedup) and [`ObjectModel::new_dict_dyn`] (interp-aware `__eq__` dedup).
     fn alloc_dict(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, Trap> {
-        let index = self.dicts.len() as u32;
-        self.dicts.push(entries);
+        let index = take_arena_slot(&mut self.dicts, &mut self.freed_slots.dicts, entries);
         let reference = self.alloc_object(self.dict_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
@@ -4169,8 +4564,7 @@ impl ObjectModel {
                 deduped.push(element);
             }
         }
-        let index = self.sets.len() as u32;
-        self.sets.push(deduped);
+        let index = take_arena_slot(&mut self.sets, &mut self.freed_slots.sets, deduped);
         let reference = self.alloc_object(type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
@@ -4367,6 +4761,10 @@ impl ObjectModel {
             self.byte_buffers[slot][offset + at as usize] = byte as u8;
             return Ok(());
         }
+        if self.is_bytes(container) {
+            let message = "'bytes' object does not support item assignment";
+            return Err(self.raise_named_exception("TypeError", message));
+        }
         if self.is_bytearray(container) {
             let slot = self.byte_buffer_slot(container).ok_or(Trap::TypeError)?;
             let len = self.byte_buffers[slot].len() as i64;
@@ -4402,12 +4800,32 @@ impl ObjectModel {
         Err(Trap::TypeError)
     }
 
-    /// `list[slice] = elements` (`Op::Setitem` with a slice index): replaces the slice with the
-    /// already-collected RHS `elements`. A step-1 slice SPLICES (the list may change length --
-    /// `xs[1:3] = [a, b, c]`); an extended slice (step != 1) assigns element-wise and requires the
-    /// RHS length to equal the slice length (else a `ValueError`). Bounds resolve exactly like a
-    /// slice read (clamping, negative indices). The RHS is collected by the caller (it may be any
-    /// iterable, including a generator, which needs the interpreter).
+    /// The collected right-hand side of a bytearray slice assignment, as bytes. Every element must
+    /// be an int in `0..=255` -- which is also what makes `b[i:j] = "text"` a TypeError rather than
+    /// a surprise encoding.
+    fn elements_as_bytes(&mut self, elements: &[Value]) -> Result<alloc::vec::Vec<u8>, Trap> {
+        let mut bytes = alloc::vec::Vec::with_capacity(elements.len());
+        for element in elements {
+            let Some(byte) = element.as_int() else {
+                let message =
+                    "can assign only bytes, buffers, or iterables of ints in range(0, 256)";
+                return Err(self.raise_named_exception("TypeError", message));
+            };
+            if !(0..=255).contains(&byte) {
+                let message = "byte must be in range(0, 256)";
+                return Err(self.raise_named_exception("ValueError", message));
+            }
+            bytes.push(byte as u8);
+        }
+        Ok(bytes)
+    }
+
+    /// `list[slice] = elements` / `bytearray[slice] = elements` (`Op::Setitem` with a slice index):
+    /// replaces the slice with the already-collected RHS `elements`. A step-1 slice SPLICES (the
+    /// container may change length -- `xs[1:3] = [a, b, c]`); an extended slice (step != 1) assigns
+    /// element-wise and requires the RHS length to equal the slice length (else a `ValueError`).
+    /// Bounds resolve exactly like a slice read (clamping, negative indices). The RHS is collected
+    /// by the caller (it may be any iterable, including a generator, which needs the interpreter).
     pub fn seq_setitem_slice(&mut self, container: Value, slice: Value, elements: Vec<Value>) -> Result<(), Trap> {
         let reference = slice.as_ref().ok_or(Trap::TypeError)?;
         let start_v = Value::from_bits(self.heap.read_u32(reference.0));
@@ -4422,6 +4840,38 @@ impl ObjectModel {
             }
             step
         };
+        if self.is_bytearray(container) {
+            let slot = self.byte_buffer_slot(container).ok_or(Trap::TypeError)?;
+            let len = self.byte_buffers[slot].len() as i64;
+            let bytes = self.elements_as_bytes(&elements)?;
+            let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
+            if step == 1 {
+                let low = start.clamp(0, len) as usize;
+                let high = stop.clamp(start, len) as usize;
+                self.byte_buffers[slot].splice(low..high, bytes);
+                return Ok(());
+            }
+            let mut indices = Vec::new();
+            let mut at = start;
+            while (step > 0 && at < stop) || (step < 0 && at > stop) {
+                if at >= 0 && at < len {
+                    indices.push(at as usize);
+                }
+                at += step;
+            }
+            if indices.len() != bytes.len() {
+                let message = alloc::format!(
+                    "attempt to assign bytes of size {} to extended slice of size {}",
+                    bytes.len(),
+                    indices.len()
+                );
+                return Err(self.with_message(Trap::ValueError, &message));
+            }
+            for (index, byte) in indices.into_iter().zip(bytes) {
+                self.byte_buffers[slot][index] = byte;
+            }
+            return Ok(());
+        }
         let i = self.container_slot(container, self.list_type_id).ok_or(Trap::TypeError)?;
         let len = self.seqs[i].len() as i64;
         let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
@@ -4468,6 +4918,25 @@ impl ObjectModel {
             self.seqs[slot].remove(at as usize);
             return Ok(());
         }
+        if self.is_bytes(container) {
+            let message = "'bytes' object doesn't support item deletion";
+            return Err(self.raise_named_exception("TypeError", message));
+        }
+        if self.is_bytearray(container) {
+            if self.is_slice(index) {
+                return self.seq_delitem_slice(container, index);
+            }
+            let slot = self.byte_buffer_slot(container).ok_or(Trap::TypeError)?;
+            let len = self.byte_buffers[slot].len() as i64;
+            let at = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if at < 0 { at + len } else { at };
+            if at < 0 || at >= len {
+                let message = "bytearray index out of range";
+                return Err(self.with_message(Trap::IndexError, message));
+            }
+            self.byte_buffers[slot].remove(at as usize);
+            return Ok(());
+        }
         if let Some(i) = self.container_slot(container, self.list_type_id) {
             if self.is_slice(index) {
                 return self.seq_delitem_slice(container, index);
@@ -4512,6 +4981,30 @@ impl ObjectModel {
             }
             step
         };
+        if self.is_bytearray(container) {
+            let slot = self.byte_buffer_slot(container).ok_or(Trap::TypeError)?;
+            let len = self.byte_buffers[slot].len() as i64;
+            let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
+            if step == 1 {
+                let low = start.clamp(0, len) as usize;
+                let high = stop.clamp(start, len) as usize;
+                self.byte_buffers[slot].drain(low..high);
+                return Ok(());
+            }
+            let mut indices = Vec::new();
+            let mut at = start;
+            while (step > 0 && at < stop) || (step < 0 && at > stop) {
+                if at >= 0 && at < len {
+                    indices.push(at as usize);
+                }
+                at += step;
+            }
+            indices.sort_unstable();
+            for index in indices.into_iter().rev() {
+                self.byte_buffers[slot].remove(index);
+            }
+            return Ok(());
+        }
         let i = self.container_slot(container, self.list_type_id).ok_or(Trap::TypeError)?;
         let len = self.seqs[i].len() as i64;
         let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
@@ -4705,6 +5198,28 @@ impl ObjectModel {
         if value.is_not_implemented() {
             return String::from("NotImplemented");
         }
+        if self.is_object_base(value) {
+            let addr = value.as_ref().map_or(0, |r| r.0);
+            return alloc::format!("<object object at 0x{addr:016x}>");
+        }
+        if self.is_user_function(value) {
+            let qualname = self.function_qualname(value).unwrap_or_default();
+            let shown = if qualname.contains("<lambda") { String::from("<lambda>") } else { qualname };
+            return alloc::format!("<function {shown} at 0x{:016x}>", value.bits());
+        }
+        if self.is_py_bound(value) {
+            let func = self.bound_func(value);
+            let qualname = self.function_qualname(func).unwrap_or_default();
+            let receiver = self.repr(self.bound_self(value));
+            return alloc::format!("<bound method {qualname} of {receiver}>");
+        }
+        if self.is_bound_method(value) || self.is_unbound_method(value) {
+            let kind = self.type_name_of(self.bound_receiver(value));
+            return alloc::format!("<built-in method of {kind} object at 0x{:016x}>", value.bits());
+        }
+        if self.is_file(value) {
+            return self.file_repr(value);
+        }
         if let Some(n) = value.as_fixnum() {
             return alloc::format!("{n}");
         }
@@ -4884,7 +5399,13 @@ impl ObjectModel {
                     .unwrap_or_default();
                 return alloc::format!("{name}({args})");
             }
-            return alloc::format!("<{name} object>");
+            let class = self.read_slot(value, 0);
+            let module = self
+                .find_in_class(class, "__module__")
+                .and_then(|m| self.str_value(m))
+                .unwrap_or("builtins");
+            let addr = value.as_ref().map_or(0, |r| r.0);
+            return alloc::format!("<{module}.{name} object at 0x{addr:016x}>");
         }
         alloc::format!("{value:?}")
     }
@@ -4980,6 +5501,11 @@ impl ObjectModel {
             }
             return Ok(hash);
         }
+        if self.is_object_base(value) {
+            if let Some(reference) = value.as_ref() {
+                return Ok(reference.0.wrapping_mul(2_654_435_761));
+            }
+        }
         Err(Trap::TypeError)
     }
 
@@ -5065,9 +5591,8 @@ impl ObjectModel {
             return self.new_long(n);
         }
         let reference = self.alloc_object(self.bigint_type_id).ok_or(Trap::OutOfMemory)?;
-        let index = self.bigints.len();
-        self.bigints.push(value);
-        self.heap.write_u32(reference.0, index as u32);
+        let index = take_arena_slot(&mut self.bigints, &mut self.freed_slots.bigints, value);
+        self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
 
@@ -5289,6 +5814,7 @@ impl ObjectModel {
             .iter()
             .map(|m| Rc::from(m.functions.clone().into_boxed_slice()))
             .collect();
+        self.managed_bodies = modules.iter().map(|m| Rc::new(m.body.clone())).collect();
         self.managed_globals = modules.iter().map(|_| Vec::new()).collect();
         self.managed_modules = modules;
     }
@@ -5303,11 +5829,15 @@ impl ObjectModel {
             .map(|i| (i + 1) as u16)
     }
 
-    /// A CLONE of managed module `module_id`'s top-level body code, or `None`. Cloned so its body runs
-    /// against `&mut self` without a borrow into the registry (once, on the module's first import).
+    /// A shared clone of managed module `module_id`'s top-level body code, or `None`.
+    ///
+    /// An `Rc` rather than a copy because the body is resolved ONCE PER OP while its frame is on the
+    /// driver's stack -- the module body runs there like any other frame, so the collector's safe
+    /// point sees it -- and it has to be reachable without a borrow into the registry, which the
+    /// running code is free to mutate.
     #[must_use]
-    pub(crate) fn managed_module_body(&self, module_id: u16) -> Option<CodeObject> {
-        self.managed_modules.get((module_id.checked_sub(1)?) as usize).map(|m| m.body.clone())
+    pub(crate) fn managed_module_body_rc(&self, module_id: u16) -> Option<Rc<CodeObject>> {
+        self.managed_bodies.get((module_id.checked_sub(1)?) as usize).cloned()
     }
 
     /// A shared clone of module `module_id`'s function table, or `None` for an out-of-range id (or the
@@ -5462,6 +5992,17 @@ impl ObjectModel {
             pairs.push((key, value));
         }
         self.new_dict(pairs)
+    }
+
+    /// The current module's global namespace as (name, value) pairs -- module 0 (the entry) reads
+    /// `self.globals`; a managed module reads its own stored globals. Backs `globals()` and the
+    /// module-scope `locals()`.
+    pub(crate) fn current_module_globals(&self) -> Vec<(String, Value)> {
+        if self.current_module() == 0 {
+            self.globals.clone()
+        } else {
+            self.managed_module_globals(self.current_module())
+        }
     }
 
     /// Replaces module object `module`'s namespace dict (slot 0) -- used once, after a managed body
@@ -5736,6 +6277,19 @@ impl ObjectModel {
         Value::from_bits(self.heap.read_u32(reference.0))
     }
 
+    /// A bare `object()` instance -- an attribute-less identity token (the sentinel idiom). Each call
+    /// returns a distinct object, so `object() is object()` is False.
+    pub fn new_object_base(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.object_base_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a bare `object()` instance.
+    #[must_use]
+    pub fn is_object_base(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.object_base_type_id)
+    }
+
     /// A property's accessors as `(fget, fset, fdel)` (each a function or `None`).
     pub fn property_accessors(&self, value: Value) -> (Value, Value, Value) {
         let reference = value.as_ref().expect("a property");
@@ -5885,13 +6439,14 @@ impl ObjectModel {
     /// Allocates a class object `[name, base, namespace]` (`Op::BuildClass`). `base` is a
     /// class or `None`; `namespace` is the class body's dict (methods + class attributes).
     pub fn new_class(&mut self, name: Value, bases: Value, namespace: Value) -> Result<Value, Trap> {
-        let base_list: Vec<Value> = if self.is_tuple(bases) {
+        let mut base_list: Vec<Value> = if self.is_tuple(bases) {
             self.seq_value(bases).cloned().unwrap_or_default()
         } else if self.is_class(bases) {
             alloc::vec![bases]
         } else {
             Vec::new()
         };
+        base_list.retain(|b| b.as_builtin_id() != Some(crate::builtins::Builtin::Object.id()));
         for &b in &base_list {
             if !self.is_class(b) {
                 return Err(Trap::TypeError);
@@ -5968,12 +6523,212 @@ impl ObjectModel {
         Ok(Value::from_ref(reference))
     }
 
+    /// `object.__new__(class, *args, **kwargs)`: the allocator every `__new__` chain terminates in.
+    /// Reached both as the default construction of a class that overrides no `__new__` and as an
+    /// explicit `object.__new__(cls)` / `super().__new__(cls)` inside one that does.
+    ///
+    /// Extra arguments are only tolerated when something downstream will consume them, which is what
+    /// makes `C(5)` legal for a class whose `__init__` takes a value and an error for one that takes
+    /// nothing. The two messages are CPython's own and say different things: reaching the allocator
+    /// with arguments it cannot use is the CALLER's mistake when `__new__` was overridden (that
+    /// `__new__` should have consumed them), and the CLASS's when nothing was overridden at all.
+    pub fn object_new(
+        &mut self,
+        class: Value,
+        posargs: &[Value],
+        kwargs: &[(&str, Value)],
+    ) -> Result<Value, Trap> {
+        if !self.is_class(class) {
+            let kind = self.type_name_of(class);
+            let message = alloc::format!("object.__new__(X): X is not a type object ({kind})");
+            return Err(self.raise_named_exception("TypeError", &message));
+        }
+        if !posargs.is_empty() || !kwargs.is_empty() {
+            if self.find_in_class(class, "__new__").is_some() {
+                let message =
+                    "object.__new__() takes exactly one argument (the type to instantiate)";
+                return Err(self.raise_named_exception("TypeError", message));
+            }
+            if self.find_in_class(class, "__init__").is_none() && !self.is_exception_class(class) {
+                let name = String::from(self.str_value(self.read_slot(class, 0)).unwrap_or("object"));
+                let message = alloc::format!("{name}() takes no arguments");
+                return Err(self.raise_named_exception("TypeError", &message));
+            }
+        }
+        self.new_object(class)
+    }
+
+    /// Every attribute name `value` actually has, sorted -- what `dir(value)` reports.
+    ///
+    /// **Every name it returns resolves.** That is the property that makes the answer usable, and it is
+    /// what CPython's own `dir` does NOT promise: its list is documented as a convenience rather than a
+    /// rigorously defined set, and for a runtime whose object model is smaller than CPython's the
+    /// choice is between a list that describes THIS runtime and a list that names things `getattr`
+    /// would then refuse. A name that is not there is a gap someone can see; a name that is there and
+    /// does not work is a bug someone has to debug.
+    ///
+    /// For an instance, a class or a module the answer is EXHAUSTIVE, because their names live in
+    /// dictionaries this can read. For a built-in value it is the method surface of its type plus the
+    /// dunders that type exposes -- maintained as a list, and a test asserts every entry resolves.
+    #[cfg(feature = "introspection")]
+    pub fn dir_names(&mut self, value: Value) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if self.is_instance(value) {
+            let dict = self.read_slot(value, 1);
+            if let Some(entries) = self.dict_value(dict) {
+                for (key, _) in entries.clone() {
+                    if let Some(name) = self.str_value(key) {
+                        names.push(String::from(name));
+                    }
+                }
+            }
+            let class = self.read_slot(value, 0);
+            names.extend(self.class_dir_names(class));
+            if self.instance_slots(value).is_none() {
+                names.push(String::from("__dict__"));
+            }
+            names.extend(INSTANCE_DUNDERS.iter().map(|n| String::from(*n)));
+            if self.is_exception_value(value) {
+                names.extend(EXCEPTION_ATTRIBUTES.iter().map(|n| String::from(*n)));
+            }
+            return sorted_unique(names);
+        }
+        if self.is_class(value) {
+            names.extend(self.class_dir_names(value));
+            names.extend(CLASS_ATTRIBUTES.iter().map(|n| String::from(*n)));
+            return sorted_unique(names);
+        }
+        if self.is_module_object(value) {
+            if let Some(entries) = self.dict_value(self.module_namespace(value)) {
+                for (key, _) in entries.clone() {
+                    if let Some(name) = self.str_value(key) {
+                        names.push(String::from(name));
+                    }
+                }
+            }
+            return sorted_unique(names);
+        }
+        if self.is_user_function(value) {
+            names.extend(FUNCTION_ATTRIBUTES.iter().map(|n| String::from(*n)));
+            if let Some(dict) = self.function_dicts.iter().find(|(k, _)| *k == value.bits()) {
+                if let Some(entries) = self.dict_value(dict.1) {
+                    for (key, _) in entries.clone() {
+                        if let Some(name) = self.str_value(key) {
+                            names.push(String::from(name));
+                        }
+                    }
+                }
+            }
+            return sorted_unique(names);
+        }
+        if self.is_py_bound(value) {
+            names.extend(BOUND_METHOD_ATTRIBUTES.iter().map(|n| String::from(*n)));
+            return sorted_unique(names);
+        }
+        for name in builtin_type_method_names(self, value) {
+            names.push(String::from(name));
+        }
+        for name in crate::object::DUNDER_NAMES.iter() {
+            if self.builtin_supports_dunder(value, name) {
+                names.push(String::from(*name));
+            }
+        }
+        names.push(String::from("__class__"));
+        sorted_unique(names)
+    }
+
+    /// The str keys of `mapping`, sorted -- what a no-argument `dir()` reports over the frame's
+    /// bindings. Kept beside `dir_names` because it answers the same question about a different source.
+    pub fn sorted_key_names(&mut self, mapping: Value) -> Result<Value, Trap> {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(entries) = self.dict_value(mapping) {
+            for (key, _) in entries.clone() {
+                if let Some(name) = self.str_value(key) {
+                    names.push(String::from(name));
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            entries.push(self.new_str(&name)?);
+        }
+        self.new_list(entries)
+    }
+
+    /// The names a class and its bases provide -- the MRO's namespaces, in order.
+    #[cfg(feature = "introspection")]
+    fn class_dir_names(&mut self, class: Value) -> Vec<String> {
+        let mut names = Vec::new();
+        for ancestor in self.class_mro_vec(class) {
+            let namespace = self.read_slot(ancestor, 2);
+            if let Some(entries) = self.dict_value(namespace) {
+                for (key, _) in entries.clone() {
+                    if let Some(name) = self.str_value(key) {
+                        names.push(String::from(name));
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// `object.__getstate__()`: the instance state a copy has to carry over, in the shape CPython
+    /// gives it. An ordinary instance's state is its `__dict__`, or `None` when the instance has
+    /// nothing set -- `None` rather than an empty dict, so a caller can tell "no state" from "state
+    /// that happens to be empty" without inspecting it.
+    ///
+    /// A FULLY-SLOTTED instance has no `__dict__` to hand out, so its state is the `(dict, slots)`
+    /// PAIR: `None` for the absent dict and a SNAPSHOT of the slot values in the second half. That is
+    /// the shape CPython gives a slotted object, and a caller that restores state has to handle both
+    /// halves anyway, because a class can acquire `__slots__` without its readers changing.
+    ///
+    /// The dict half is the instance's own dict, not a snapshot of it -- the same object `__dict__`
+    /// hands out, as in CPython, so state read before a later attribute write reflects it.
+    pub fn object_getstate(&mut self, instance: Value) -> Result<Value, Trap> {
+        if !self.is_instance(instance) {
+            return Ok(Value::NONE);
+        }
+        let dict = self.read_slot(instance, 1);
+        let entries = self.dict_value(dict).cloned().unwrap_or_default();
+        if self.instance_slots(instance).is_some() {
+            let slots = self.new_dict(entries)?;
+            return self.new_tuple(alloc::vec![Value::NONE, slots]);
+        }
+        if entries.is_empty() {
+            return Ok(Value::NONE);
+        }
+        Ok(dict)
+    }
+
+    /// The `__new__` in `class`'s MRO, ready to be called WITH THE CLASS AS ITS FIRST ARGUMENT --
+    /// `None` when the chain terminates in [`Self::object_new`]. `__new__` is an implicit STATIC
+    /// method, so a plainly written one is returned raw (its `cls` parameter is an ordinary first
+    /// parameter) and an explicit `staticmethod` unwraps to the same shape; an explicit
+    /// `classmethod` keeps its bound class, which is how CPython ends up passing the class twice.
+    pub(crate) fn find_new(&mut self, class: Value) -> Result<Option<Value>, Trap> {
+        let Some(found) = self.find_in_class(class, "__new__") else {
+            return Ok(None);
+        };
+        if self.is_method_wrapper(found) {
+            let func = self.method_wrapper_func(found);
+            if self.method_wrapper_is_class(found) {
+                return Ok(Some(self.new_py_bound(class, func)?));
+            }
+            return Ok(Some(func));
+        }
+        Ok(Some(found))
+    }
+
     /// The default construction of a class that has NO user `__init__` but is called with arguments:
     /// a `BaseException` subclass stores its positional args (so `str(exc)` renders the message and
-    /// `exc.args` works, like `BaseException.__init__`); any other class ignores them (a lenient
-    /// divergence from CPython's "takes no arguments" TypeError).
+    /// `exc.args` works, like `BaseException.__init__`); any other class ignores them, which
+    /// [`Self::object_new`] has already refused for a class that overrides nothing.
     pub fn init_default_args(&mut self, instance: Value, args: &[Value]) -> Result<(), Trap> {
-        self.ensure_exception_types();
+        if self.exception_classes.is_empty() {
+            return Ok(());
+        }
         let base_exception = self.exc_class_lookup("BaseException").ok_or(Trap::Malformed)?;
         if self.is_instance_of(instance, base_exception) {
             let args_tuple = self.new_tuple(args.to_vec())?;
@@ -6249,12 +7004,24 @@ impl ObjectModel {
                 if name == "__init__" && self.is_exception_value(receiver) {
                     return self.new_bound_method(receiver, EXC_INIT);
                 }
+                if name == "__new__" {
+                    return self.new_bound_method(Value::NONE, OBJECT_NEW);
+                }
                 if matches!(name, "__init__" | "__init_subclass__") {
                     return self.new_bound_method(receiver, OBJECT_NOOP);
                 }
                 return Err(Trap::AttributeError);
             }
         };
+        if self.is_method_wrapper(found) {
+            let func = self.method_wrapper_func(found);
+            return if self.method_wrapper_is_class(found) {
+                let through = if self.is_class(receiver) { receiver } else { instance_type };
+                self.new_py_bound(through, func)
+            } else {
+                Ok(func)
+            };
+        }
         if self.is_user_function(found) {
             self.new_py_bound(receiver, found)
         } else {
@@ -6307,6 +7074,22 @@ impl ObjectModel {
         }
         if name == "__suppress_context__" && self.is_exception_value(instance) {
             return Ok(Value::FALSE);
+        }
+        if name == "__init__" {
+            if self.is_exception_value(instance) {
+                return self.new_bound_method(instance, EXC_INIT);
+            }
+            return self.new_bound_method(instance, OBJECT_NOOP);
+        }
+        if name == "__new__" {
+            let class = self.read_slot(instance, 0);
+            return match self.find_new(class)? {
+                Some(new) => Ok(new),
+                None => self.new_bound_method(Value::NONE, OBJECT_NEW),
+            };
+        }
+        if name == "__getstate__" {
+            return self.new_bound_method(instance, OBJECT_GETSTATE);
         }
         if name == "value"
             && self
@@ -6423,6 +7206,22 @@ impl ObjectModel {
         };
         let functions = self.managed_functions_rc(self.function_home(func))?;
         functions.get(index as usize).map(|code| code.name.clone())
+    }
+
+    /// The docstring on `func`'s code object, or `None` when it has none (or is not a user function).
+    /// Resolved against the function's HOME module exactly as its qualified name is, so a cross-module
+    /// function reports its own.
+    #[must_use]
+    fn function_doc(&self, func: Value) -> Option<String> {
+        let index = if let Some(idx) = func.as_function_index() {
+            idx
+        } else if self.is_py_function(func) {
+            self.py_function_index(func)
+        } else {
+            return None;
+        };
+        let functions = self.managed_functions_rc(self.function_home(func))?;
+        functions.get(index as usize)?.doc.clone()
     }
 
     /// The value of function attribute `name` (`f.tag`), or `None` if `func` has no such attribute.
@@ -6625,6 +7424,12 @@ impl ObjectModel {
     /// exception (so `except IndexError:` catches a real index error); `None` for the
     /// internal/fatal traps, which are not catchable Python exceptions.
     pub fn trap_to_exception(&mut self, trap: Trap) -> Option<Value> {
+        if matches!(trap, Trap::OutOfMemory) {
+            if let Some(reserved) = self.memory_error_reserve.take() {
+                self.pending_trap_arg = None;
+                return Some(reserved);
+            }
+        }
         let name = match trap {
             Trap::TypeError => "TypeError",
             Trap::AttributeError => "AttributeError",
@@ -6636,11 +7441,8 @@ impl ObjectModel {
             Trap::UnboundLocal => "UnboundLocalError",
             Trap::RecursionError => "RecursionError",
             Trap::Overflow => "OverflowError",
-            Trap::Raised
-            | Trap::StackUnderflow
-            | Trap::Unsupported
-            | Trap::OutOfMemory
-            | Trap::Malformed => {
+            Trap::OutOfMemory => "MemoryError",
+            Trap::Raised | Trap::StackUnderflow | Trap::Unsupported | Trap::Malformed => {
                 return None;
             }
         };
@@ -7078,6 +7880,17 @@ impl ObjectModel {
             .is_some_and(|base| self.is_instance_of(value, base))
     }
 
+    /// Whether `value` is an exception CLASS -- a class object with `BaseException` in its MRO
+    /// (`ValueError`, or a user subclass of one). The class twin of [`is_exception_value`], which
+    /// tests an exception INSTANCE. Assumes the hierarchy is built (an exception class value implies it).
+    fn is_exception_class(&self, value: Value) -> bool {
+        if !self.is_class(value) {
+            return false;
+        }
+        self.exc_class_lookup("BaseException")
+            .is_some_and(|base| self.class_mro_vec(value).contains(&base))
+    }
+
     /// The str message of an exception instance: `str(arg)` for a single stored arg, `""` for none,
     /// else the args tuple's repr (Python's `BaseException.__str__`).
     fn exception_message(&self, instance: Value) -> String {
@@ -7155,19 +7968,361 @@ impl ObjectModel {
         Ok(())
     }
 
-    /// Appends a `print()` line (already formatted) plus a newline to the captured output.
+    /// Whether the arena is under enough pressure to be worth collecting -- asked at a SAFE POINT, not
+    /// at an allocation, because a collection needs the interpreter's live frames as roots and an
+    /// allocation deep inside this model cannot see them.
+    ///
+    /// Three quarters full by default. Under the stress knob, ALWAYS: see [`Self::set_gc_stress`].
+    #[cfg(feature = "gc-collect")]
+    #[must_use]
+    pub fn under_memory_pressure(&self) -> bool {
+        if self.gc_stress {
+            return true;
+        }
+        if !self.collect_when_full {
+            return false;
+        }
+        if let Some(probe) = self.arena_probe {
+            let (used, capacity) = probe();
+            if used.saturating_mul(4) >= capacity.saturating_mul(3) {
+                return true;
+            }
+        }
+        let used = self.heap.used() as usize;
+        let capacity = self.heap.capacity();
+        used.saturating_mul(4) >= capacity.saturating_mul(3)
+    }
+
+    /// Installs the embedder's view of the memory this model is allocated out of, as
+    /// `(used, capacity)` bytes -- so a collection can be driven by what is actually running out.
+    ///
+    /// **Without one, pressure is judged by the object heap, which is the smaller part of what a
+    /// program costs on a device and can sit comfortably below its trigger while the arena around it
+    /// fills.** Every allocation this model makes beyond the heap block -- a string's bytes, a
+    /// container's elements, a namespace -- comes from the embedder's allocator, and only the embedder
+    /// knows how much of it is left. A firmware answers from its bump pointer in constant time.
+    ///
+    /// The same shape as [`Self::set_clock`], [`Self::set_console`] and [`Self::set_file_ops`]: absent
+    /// by default, and its absence changes behavior rather than being papered over. What a host gets
+    /// instead is the heap ratio alone, which is sound there because a host arena has no bound to be
+    /// near -- and which still bounds a device, one allocation per heap object, just not tightly.
+    #[cfg(feature = "gc-collect")]
+    pub fn set_arena_probe(&mut self, probe: fn() -> (usize, usize)) {
+        self.arena_probe = Some(probe);
+    }
+
+    /// Records that a driver loop has started, and answers whether it is the OUTERMOST one -- the
+    /// question the safe point actually needs, and the reason it is asked here rather than computed by
+    /// the driver.
+    ///
+    /// A collection needs EVERY live frame as a root, and a driver loop can only see the frames it owns.
+    /// The interpreter's loop is re-entered for a cross-module call, a generator resume and a dunder
+    /// dispatch, so a nested loop that collected would reclaim the locals of the loops beneath it. What
+    /// makes a loop the outermost is therefore a property of the RUNTIME NESTING, and this counter is the
+    /// only thing that observes it directly: the call depth a driver is handed is passed in by its
+    /// caller, so a call site that forgets to increment it makes a nested loop claim to be the outermost
+    /// one -- which is unsound, and which no reading of that call site reveals. Three corpus rows failed
+    /// exactly that way. Counting here cannot be forgotten, because a loop that does not announce itself
+    /// does not run.
+    #[cfg(feature = "gc-collect")]
+    pub(crate) fn enter_drive(&mut self) -> bool {
+        self.drive_nesting += 1;
+        self.drive_nesting == 1
+    }
+
+    /// Records that a driver loop has finished. Pairs with [`Self::enter_drive`] on every exit path.
+    #[cfg(feature = "gc-collect")]
+    pub(crate) fn leave_drive(&mut self) {
+        self.drive_nesting = self.drive_nesting.saturating_sub(1);
+    }
+
+    /// Whether a safe point collects once the arena is three quarters full. **ON by default.** Turning
+    /// it off makes the arena grow-only, so it must hold a program's TOTAL allocation rather than its
+    /// live set -- which is what a setup-then-loop device tier may prefer, since an arena that fills up
+    /// is a clean failure and a collection is work at an unpredictable moment.
+    #[cfg(feature = "gc-collect")]
+    pub fn set_collect_when_full(&mut self, on: bool) {
+        self.collect_when_full = on;
+    }
+
+    /// Collects at EVERY safe point instead of under pressure. **A test instrument, and the reason the
+    /// root set can be trusted**: a root that is not enumerated is only a defect when a collection
+    /// happens while it holds the only reference to something, which under normal pressure might be one
+    /// run in a thousand. Collecting on every op turns that into every run, so the whole corpus becomes
+    /// a root-coverage test.
+    #[cfg(feature = "gc-collect")]
+    pub fn set_gc_stress(&mut self, on: bool) {
+        self.gc_stress = on;
+    }
+
+    /// Reclaims unreachable objects, moving the survivors down -- **except those a container arena's
+    /// slot still holds alive, which includes every reference CYCLE.** `extra_roots` reports the roots
+    /// this model cannot see: the interpreter's live frame stack, which lives in the driver.
+    ///
+    /// **Every field below is a root because container CONTENTS live outside the arena**: a list's
+    /// elements are a host-side `Vec<Value>` and only its small header is an arena object, so a moving
+    /// collector has to be told about the Vec. That is why this is an enumeration rather than a graph
+    /// walk, and why a missed field would silently reclaim live data -- which is what
+    /// [`Self::set_gc_stress`] exists to catch.
+    ///
+    /// **What that enumeration costs, stated because a caller cannot see it from the name.** Every
+    /// slot of the `seqs`/`dicts`/`sets` arenas is reported unconditionally, so a container is rooted
+    /// whether or not anything can still reach it. An ACYCLIC dead container is reclaimed anyway --
+    /// its own header is not reachable from any slot, so the header dies, its slot is cleared, and its
+    /// contents stop being rooted one collection later. A CYCLE is not: for `a -> b -> a`, `a`'s slot
+    /// marks `b`'s header and `b`'s slot marks `a`'s, so neither header dies, neither slot clears, and
+    /// the pair survives every collection there will ever be. A parent/child link is enough to make
+    /// one. Reachability from the genuine roots is what would decide this correctly; the arenas being
+    /// roots is what stands in for it today.
+    ///
+    /// The heap calls its root closure TWICE (once to mark, once to relocate), so this must report the
+    /// same slots both times. It does: nothing here consumes what it visits.
+    #[cfg(feature = "gc-collect")]
+    pub fn collect(&mut self, extra_roots: &mut ExtraRoots<'_>) {
+        self.reserve_memory_error();
+        let ObjectModel {
+            heap,
+            seqs,
+            dicts,
+            sets,
+            exception_classes,
+            pending_exception,
+            memory_error_reserve,
+            globals,
+            modules,
+            managed_globals,
+            function_dicts,
+            generators,
+            frame_pool,
+            pending_trap_arg,
+            generator_return,
+            yield_from_throw,
+            ..
+        } = self;
+        heap.collect(|visit| {
+            for seq in seqs.iter_mut() {
+                for slot in seq.iter_mut() {
+                    Value::trace_slot(slot, visit);
+                }
+            }
+            for dict in dicts.iter_mut() {
+                for (key, value) in dict.iter_mut() {
+                    Value::trace_slot(key, visit);
+                    Value::trace_slot(value, visit);
+                }
+            }
+            for set in sets.iter_mut() {
+                for slot in set.iter_mut() {
+                    Value::trace_slot(slot, visit);
+                }
+            }
+            for (_, value) in globals.iter_mut() {
+                Value::trace_slot(value, visit);
+            }
+            for namespace in managed_globals.iter_mut() {
+                for (_, value) in namespace.iter_mut() {
+                    Value::trace_slot(value, visit);
+                }
+            }
+            for (_, value) in modules.iter_mut() {
+                Value::trace_slot(value, visit);
+            }
+            for (_, value) in exception_classes.iter_mut() {
+                Value::trace_slot(value, visit);
+            }
+            for (_, value) in function_dicts.iter_mut() {
+                Value::trace_slot(value, visit);
+            }
+            for slot in [
+                pending_exception.as_mut(),
+                pending_trap_arg.as_mut(),
+                generator_return.as_mut(),
+                yield_from_throw.as_mut(),
+                memory_error_reserve.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                Value::trace_slot(slot, visit);
+            }
+            for suspended in generators.iter_mut().flatten() {
+                suspended.trace(visit);
+            }
+            for pooled in frame_pool.iter_mut() {
+                pooled.trace(visit);
+            }
+            extra_roots(visit);
+        });
+        self.release_dead_arena_slots();
+    }
+
+    /// Empties every handle-arena slot no surviving object still names, and returns the slot itself
+    /// for reuse. **Without this a collection reclaims the object heap and nothing beside it, which on
+    /// a device is the smaller part of what a program costs.**
+    ///
+    /// ## Why this runs AFTER the collection instead of computing liveness itself
+    ///
+    /// The plan this came from had the model mark its own object graph first, and then hand only the
+    /// live slots to `heap.collect`. That would free a dead slot one collection sooner, and it would do
+    /// it by REIMPLEMENTING REACHABILITY -- a second root enumeration, able to disagree with the first,
+    /// where a root left out silently frees a slot that is still in use. This crate has already paid
+    /// for one root list that could go stale and did not need a second.
+    ///
+    /// So liveness is not recomputed here: it is READ OFF the collection that just ran. Compaction
+    /// leaves the survivors packed from the base to the bump pointer, each one a header word followed
+    /// by its payload, so walking them costs one pass and cannot disagree with the collector about what
+    /// is alive -- **it is the collector's own answer.**
+    ///
+    /// The price is one cycle of lag, and only for the three arenas whose payloads hold `Value`s: a
+    /// dead container's ELEMENTS were traced as roots during the collection that has just finished, so
+    /// they outlive it by one round and die in the next, once this pass has emptied the slot that was
+    /// keeping them. `strings`, `bigints` and `byte_buffers` hold no `Value`s and have no lag at all.
+    /// The high-water stays bounded either way, which is what the bar asks.
+    ///
+    /// ## What it depends on, stated because it is another crate's shape
+    ///
+    /// That the heap packs survivors contiguously from [`lamella_gc::heap::ALIGN`], each object being
+    /// [`lamella_gc::heap::HEADER_SIZE`] bytes of header plus a payload padded to `ALIGN`. All of it is
+    /// public API, and only a PINNED survivor would break it by leaving a gap -- which this model never
+    /// asks for, because it calls `collect` and not `collect_with_pins`. **The walk asserts it lands
+    /// exactly on the bump pointer**, so if that shape ever changes this fails loudly and immediately
+    /// rather than quietly freeing a slot that belongs to somebody.
+    #[cfg(feature = "gc-collect")]
+    fn release_dead_arena_slots(&mut self) {
+        let mut live = LiveSlots {
+            strings: alloc::vec![false; self.strings.len()],
+            seqs: alloc::vec![false; self.seqs.len()],
+            dicts: alloc::vec![false; self.dicts.len()],
+            sets: alloc::vec![false; self.sets.len()],
+            bigints: alloc::vec![false; self.bigints.len()],
+            byte_buffers: alloc::vec![false; self.byte_buffers.len()],
+        };
+        live.mark_all(&self.freed_slots);
+
+        let top = self.heap.top();
+        let mut header_addr = lamella_gc::heap::ALIGN;
+        while header_addr < top {
+            let type_id = self.heap.read_u32(header_addr);
+            let payload_addr = header_addr + lamella_gc::heap::HEADER_SIZE;
+            if let Some(arena) = self.arena_of(type_id) {
+                live.mark(arena, self.heap.read_u32(payload_addr) as usize);
+            }
+            let payload_size = self.heap.type_descs()[type_id as usize].payload_size;
+            header_addr = payload_addr + payload_size.next_multiple_of(lamella_gc::heap::ALIGN);
+        }
+        assert_eq!(
+            header_addr, top,
+            "the survivor walk overran the bump pointer, so the heap no longer packs objects the way \
+             this pass assumes and slots would be freed at random -- refusing to guess"
+        );
+
+        empty_dead_slots(&mut self.strings, &live.strings, &mut self.freed_slots.strings, String::new);
+        empty_dead_slots(&mut self.seqs, &live.seqs, &mut self.freed_slots.seqs, Vec::new);
+        empty_dead_slots(&mut self.dicts, &live.dicts, &mut self.freed_slots.dicts, Vec::new);
+        empty_dead_slots(&mut self.sets, &live.sets, &mut self.freed_slots.sets, Vec::new);
+        empty_dead_slots(&mut self.bigints, &live.bigints, &mut self.freed_slots.bigints, BigInt::zero);
+        empty_dead_slots(
+            &mut self.byte_buffers,
+            &live.byte_buffers,
+            &mut self.freed_slots.byte_buffers,
+            Vec::new,
+        );
+    }
+
+    /// The handle arena a heap object of `type_id` indexes into, or `None` for a type that owns its
+    /// whole payload. Every arena-backed type keeps that index in its FIRST payload word, which is what
+    /// lets one walk serve all six.
+    ///
+    /// **A type missing from this list has its slot freed while it is still in use**, and the two
+    /// things that catch it are the same two that hold the root enumeration honest: the whole corpus
+    /// under `LAMELLA_GC_STRESS=1`, where a reused slot makes a small program answer wrongly, and
+    /// `arena_slot_reuse.rs`, which builds one of every arena-backed kind and reads it back across a
+    /// collection.
+    #[cfg(feature = "gc-collect")]
+    fn arena_of(&self, type_id: u32) -> Option<ArenaKind> {
+        if type_id == self.str_type_id {
+            return Some(ArenaKind::Strings);
+        }
+        if type_id == self.list_type_id
+            || type_id == self.tuple_type_id
+            || type_id == self.deque_type_id
+            || type_id == self.ntinstance_type_id
+        {
+            return Some(ArenaKind::Seqs);
+        }
+        if type_id == self.dict_type_id
+            || type_id == self.defaultdict_type_id
+            || type_id == self.counter_type_id
+            || type_id == self.ordereddict_type_id
+        {
+            return Some(ArenaKind::Dicts);
+        }
+        if type_id == self.set_type_id || type_id == self.frozenset_type_id {
+            return Some(ArenaKind::Sets);
+        }
+        if type_id == self.bigint_type_id {
+            return Some(ArenaKind::Bigints);
+        }
+        if type_id == self.bytes_type_id || type_id == self.bytearray_type_id {
+            return Some(ArenaKind::ByteBuffers);
+        }
+        None
+    }
+
+    /// Builds the `MemoryError` that will be handed over when the heap runs out, if one is not already
+    /// waiting. See [`ObjectModel::memory_error_reserve`].
+    ///
+    /// Costs nothing until the first collection, so a program that never comes near the limit never
+    /// pays for the exception hierarchy -- the same laziness the built-in exception classes already
+    /// have. Failure to build is silently accepted: it means the heap was too full even here, which is
+    /// the state this exists to report and not one it can do anything about.
+    #[cfg(feature = "gc-collect")]
+    fn reserve_memory_error(&mut self) {
+        if self.memory_error_reserve.is_some() {
+            return;
+        }
+        if let Some(class) = self.exception_class("MemoryError") {
+            if let Ok(instance) = self.new_object(class) {
+                self.memory_error_reserve = Some(instance);
+            }
+        }
+    }
+
+    /// Installs a console the embedder owns: every `print` goes STRAIGHT to it and nothing is retained.
+    ///
+    /// Without one, output accumulates until [`Self::take_stdout`] drains it, which is what a host
+    /// harness and a browser want -- they ask for a whole run's output at the end. **A device cannot
+    /// afford that**: the accumulation is a program's TOTAL output held in an arena measured in tens of
+    /// kilobytes, and a program that runs until the power goes off has no end at which to hand it over.
+    /// A firmware installs its UART here and the text leaves as it is produced.
+    pub fn set_console(&mut self, console: fn(&str)) {
+        self.console_fn = Some(console);
+    }
+
+    /// Appends a `print()` line (already formatted) plus a newline to the captured output, or writes it
+    /// straight through to an installed console.
     pub fn write_line(&mut self, line: &str) {
+        if let Some(console) = self.console_fn {
+            console(line);
+            console("\n");
+            return;
+        }
         self.stdout.push_str(line);
         self.stdout.push('\n');
     }
 
     /// Appends `text` to the captured output WITHOUT a trailing newline -- for `print(..., end=s)`,
-    /// which supplies its own terminator.
+    /// which supplies its own terminator -- or writes it straight through to an installed console.
     pub fn write(&mut self, text: &str) {
+        if let Some(console) = self.console_fn {
+            console(text);
+            return;
+        }
         self.stdout.push_str(text);
     }
 
-    /// Drains the captured `print` output.
+    /// Drains the captured `print` output. Always EMPTY when a console is installed, because nothing
+    /// was captured -- the text already left through it.
     pub fn take_stdout(&mut self) -> String {
         core::mem::take(&mut self.stdout)
     }
@@ -7238,6 +8393,103 @@ impl ObjectModel {
         &mut self.heap
     }
 
+    /// What this model currently costs, broken down by where the bytes are.
+    ///
+    /// **Ask this rather than the heap's occupancy, and the difference is not a refinement.** A host
+    /// hands [`ObjectModel::new`] an arena that IS the object heap, so on a host the heap's occupancy
+    /// looks like a RAM budget and is not one; a device takes the heap as ONE block from an arena and
+    /// then allocates every table below out of what is left. A program whose heap occupancy is flat
+    /// while its string arena climbs is on its way to exhausting a device and looks perfectly steady
+    /// from the heap. That is the observed case rather than a hypothetical one.
+    ///
+    /// **What this does NOT count, stated so the number is not read as more than it is:** the decoded
+    /// bundle (`managed_modules` / `managed_functions` -- a program's CODE, fixed once the program is
+    /// loaded, and the largest thing left out: importing one bundled module costs tens of kilobytes),
+    /// the type table (built whole at construction and never grown), the host-only peripheral
+    /// simulators, and the heap's unused capacity. Everything counted here is data a running program
+    /// produces, which is the part that can climb.
+    ///
+    /// **Cost, and the reason it is a walk rather than a running counter.** It is O(live slots), which
+    /// is cheap where it is asked -- a gate, a report, a check before a large allocation -- and far too
+    /// expensive to ask per op, so it is deliberately NOT what the collector's trigger consults.
+    /// A counter maintained at every arena mutation would be O(1), and it was rejected: it would make
+    /// this number depend on every present and future mutation site remembering to update it, and a
+    /// property that lives in a convention across dozens of call sites is not a property -- the same
+    /// lesson the drive-nesting counter came from. The quantity a trigger actually needs is the arena's
+    /// own frontier, which an embedder can answer exactly and in constant time; a number reconstructed
+    /// here could at best agree with it.
+    ///
+    /// Held to the system allocator by `tests/footprint_accounting.rs`, which weighs a program's run on
+    /// a scale this model does not control: a table added and not accounted for shows up there as an
+    /// allocator delta with no matching footprint delta, without anyone having thought of the table.
+    #[must_use]
+    pub fn footprint(&self) -> Footprint {
+        let strings = Arena {
+            slots: self.strings.capacity() * size_of::<String>(),
+            payload: self.strings.iter().map(String::capacity).sum(),
+        };
+        let sequences = Arena {
+            slots: self.seqs.capacity() * size_of::<Vec<Value>>(),
+            payload: self.seqs.iter().map(|seq| seq.capacity() * size_of::<Value>()).sum(),
+        };
+        let dicts = Arena {
+            slots: self.dicts.capacity() * size_of::<Vec<(Value, Value)>>(),
+            payload: self
+                .dicts
+                .iter()
+                .map(|dict| dict.capacity() * size_of::<(Value, Value)>())
+                .sum(),
+        };
+        let sets = Arena {
+            slots: self.sets.capacity() * size_of::<Vec<Value>>(),
+            payload: self.sets.iter().map(|set| set.capacity() * size_of::<Value>()).sum(),
+        };
+        let bigints = Arena {
+            slots: self.bigints.capacity() * size_of::<BigInt>(),
+            payload: self.bigints.iter().map(BigInt::footprint).sum(),
+        };
+        let byte_buffers = Arena {
+            slots: self.byte_buffers.capacity() * size_of::<Vec<u8>>(),
+            payload: self.byte_buffers.iter().map(Vec::capacity).sum(),
+        };
+
+        let named = |entries: &[(String, Value)]| -> usize {
+            entries.iter().map(|(name, _)| name.capacity()).sum::<usize>()
+        };
+        let namespaces = self.globals.capacity() * size_of::<(String, Value)>()
+            + named(&self.globals)
+            + self.managed_globals.capacity() * size_of::<Vec<(String, Value)>>()
+            + self
+                .managed_globals
+                .iter()
+                .map(|namespace| {
+                    namespace.capacity() * size_of::<(String, Value)>() + named(namespace)
+                })
+                .sum::<usize>()
+            + self.modules.capacity() * size_of::<(String, Value)>()
+            + named(&self.modules)
+            + self.exception_classes.capacity() * size_of::<(&'static str, Value)>()
+            + self.function_dicts.capacity() * size_of::<(u32, Value)>();
+
+        let frames = self.generators.capacity() * size_of::<Option<Frame>>()
+            + self.generators.iter().flatten().map(Frame::footprint).sum::<usize>()
+            + self.frame_pool.capacity() * size_of::<Frame>()
+            + self.frame_pool.iter().map(Frame::footprint).sum::<usize>();
+
+        Footprint {
+            objects: self.heap.used() as usize,
+            strings,
+            sequences,
+            dicts,
+            sets,
+            bigints,
+            byte_buffers,
+            namespaces,
+            frames,
+            stdout: self.stdout.capacity(),
+        }
+    }
+
     /// The type with id `type_id`, if any.
     #[must_use]
     pub fn type_of(&self, type_id: u32) -> Option<&PyType> {
@@ -7285,6 +8537,12 @@ impl ObjectModel {
                 return Ok(class);
             }
         }
+        if name == "__call__" && crate::builtins::value_is_callable(obj, self) {
+            return self.new_bound_method(obj, CALL_DUNDER);
+        }
+        if name == "__next__" && (self.is_iter(obj) || self.is_lazy_iter(obj)) {
+            return self.new_bound_method(obj, NEXT_DUNDER);
+        }
         if let Some(id) = builtin_dunder_id(name) {
             if self.builtin_supports_dunder(obj, name) {
                 return self.new_bound_method(obj, id);
@@ -7298,6 +8556,9 @@ impl ObjectModel {
                 if let Some(stdlib_name) = crate::stdlib::stdlib_name(id) {
                     return self.new_str(stdlib_name);
                 }
+            }
+            if id == Builtin::Object.id() && name == "__new__" {
+                return self.new_bound_method(Value::NONE, OBJECT_NEW);
             }
             if id == Builtin::Dict.id() && name == "fromkeys" {
                 return Ok(Value::builtin_ref(Builtin::DictFromkeys.id()));
@@ -7320,6 +8581,11 @@ impl ObjectModel {
             if unbound {
                 return self.new_unbound_method(name);
             }
+            if let Some(builtin) = Builtin::from_id(id) {
+                if type_object_supports_dunder(builtin, name) {
+                    return self.new_unbound_method(name);
+                }
+            }
             return Err(Trap::AttributeError);
         }
         if self.is_int(obj) {
@@ -7333,6 +8599,8 @@ impl ObjectModel {
                 }
                 "denominator" => return Value::fixnum(1).ok_or(Trap::Overflow),
                 "imag" => return Value::fixnum(0).ok_or(Trap::Overflow),
+                "is_integer" => return Ok(Value::builtin_ref(Builtin::IntIsInteger.id())),
+                "from_bytes" => return Ok(Value::builtin_ref(Builtin::IntFromBytes.id())),
                 _ => {}
             }
             let method_id = int_method_id(name).ok_or(Trap::AttributeError)?;
@@ -7350,6 +8618,12 @@ impl ObjectModel {
         if self.is_user_function(obj) {
             if let Some(value) = self.function_attr(obj, name) {
                 return Ok(value);
+            }
+            if name == "__doc__" {
+                return match self.function_doc(obj) {
+                    Some(doc) => self.new_str(&doc),
+                    None => Ok(Value::NONE),
+                };
             }
             if matches!(name, "__name__" | "__qualname__") {
                 if let Some(qualname) = self.function_qualname(obj) {
@@ -7402,7 +8676,10 @@ impl ObjectModel {
                 "start" => Ok(start),
                 "stop" => Ok(stop),
                 "step" => Ok(step),
-                _ => Err(Trap::AttributeError),
+                _ => {
+                    let method_id = slice_method_id(name).ok_or(Trap::AttributeError)?;
+                    self.new_bound_method(obj, method_id)
+                }
             };
         }
         if type_id == self.range_type_id {
@@ -7628,6 +8905,13 @@ impl ObjectModel {
             let method_id = crate::adc::adc_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
+        if type_id == self.file_type_id {
+            if crate::fileio::file_attribute(name) {
+                return self.file_attribute_value(obj, name);
+            }
+            let method_id = crate::fileio::file_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
         if type_id == self.adc_channel_type_id {
             match name {
                 "bits" => {
@@ -7776,6 +9060,21 @@ impl ObjectModel {
             if name == "__dict__" {
                 return Ok(self.read_slot(obj, 2));
             }
+            if name == "__init__"
+                && self.is_exception_class(obj)
+                && self.find_in_class(obj, "__init__").is_none()
+            {
+                return self.new_bound_method(Value::NONE, EXC_INIT_UNBOUND);
+            }
+            if name == "__init__" && self.find_in_class(obj, "__init__").is_none() {
+                return self.new_bound_method(Value::NONE, OBJECT_NOOP);
+            }
+            if name == "__init_subclass__" && self.find_in_class(obj, "__init_subclass__").is_none() {
+                return self.new_bound_method(obj, OBJECT_NOOP);
+            }
+            if name == "__new__" && self.find_in_class(obj, "__new__").is_none() {
+                return self.new_bound_method(Value::NONE, OBJECT_NEW);
+            }
             let found = self.find_in_class(obj, name).ok_or(Trap::AttributeError)?;
             return self.bind_class_member(found, obj, obj);
         }
@@ -7784,6 +9083,18 @@ impl ObjectModel {
         }
         if type_id == self.super_type_id {
             return self.py_getattr_super(obj, name);
+        }
+        if type_id == self.py_bound_type_id {
+            let func = self.bound_func(obj);
+            return match name {
+                "__func__" => Ok(func),
+                "__self__" => Ok(self.bound_self(obj)),
+                "__doc__" | "__name__" | "__qualname__" => {
+                    let mut inner = InlineCache::empty();
+                    self.getattr(func, name, &mut inner)
+                }
+                _ => Err(Trap::AttributeError),
+            };
         }
         let slot = match cache.lookup(type_id) {
             Some(slot) => slot,
@@ -7820,6 +9131,548 @@ impl ObjectModel {
         self.mmio_read_fn = Some(read);
     }
 
+    /// `_fs.listdir(path)` -- the names directly inside a directory, as a list of str.
+    pub fn fs_listdir(&mut self, path: &str) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        match (ops.listdir)(path) {
+            Ok(names) => {
+                let mut entries = Vec::with_capacity(names.len());
+                for name in names {
+                    entries.push(self.new_str(&name)?);
+                }
+                self.new_list(entries)
+            }
+            Err(error) => Err(self.file_error(error, path)),
+        }
+    }
+
+    /// `_fs.remove(path)` -- delete a file.
+    pub fn fs_remove(&mut self, path: &str) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        match (ops.remove)(path) {
+            Ok(()) => Ok(Value::NONE),
+            Err(error) => Err(self.file_error(error, path)),
+        }
+    }
+
+    /// `_fs.mkdir(path)` -- create a directory (its parent must exist).
+    pub fn fs_mkdir(&mut self, path: &str) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        match (ops.mkdir)(path) {
+            Ok(()) => Ok(Value::NONE),
+            Err(error) => Err(self.file_error(error, path)),
+        }
+    }
+
+    /// `_fs.rmdir(path)` -- remove an EMPTY directory.
+    pub fn fs_rmdir(&mut self, path: &str) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        match (ops.rmdir)(path) {
+            Ok(()) => Ok(Value::NONE),
+            Err(error) => Err(self.file_error(error, path)),
+        }
+    }
+
+    /// `_fs.rename(src, dst)`.
+    pub fn fs_rename(&mut self, from: &str, to: &str) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        match (ops.rename)(from, to) {
+            Ok(()) => Ok(Value::NONE),
+            Err(error) => Err(self.file_error(error, from)),
+        }
+    }
+
+    /// `_fs.kind(path)` -- `(is_directory, size)`. The one call `os.path`'s predicates are built on:
+    /// asking what a path IS answers exists / isfile / isdir / getsize at once, and raising for a
+    /// path that is not there is what lets `exists()` be written as a caught refusal.
+    pub fn fs_kind(&mut self, path: &str) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        match (ops.kind)(path) {
+            Ok(crate::fileio::PathKind::Directory) => {
+                let size = Value::fixnum(0).ok_or(Trap::Overflow)?;
+                self.new_tuple(alloc::vec![Value::TRUE, size])
+            }
+            Ok(crate::fileio::PathKind::File(size)) => {
+                let size = Value::fixnum(size as i32).ok_or(Trap::Overflow)?;
+                self.new_tuple(alloc::vec![Value::FALSE, size])
+            }
+            Err(error) => Err(self.file_error(error, path)),
+        }
+    }
+
+    /// Installs the host filesystem. A host program passes its own; a device passes its storage
+    /// driver; firmware with no storage passes nothing, and every file verb then refuses by name.
+    pub fn set_file_ops(&mut self, ops: crate::fileio::FileOps) {
+        self.file_ops = Some(ops);
+    }
+
+    /// The installed filesystem, or the refusal for a runtime that has none.
+    fn require_file_ops(&mut self) -> Result<crate::fileio::FileOps, Trap> {
+        match self.file_ops {
+            Some(ops) => Ok(ops),
+            None => {
+                let message = "no filesystem is available in this runtime";
+                Err(self.raise_named_exception("OSError", message))
+            }
+        }
+    }
+
+    /// The exception a failed host operation raises: CPython's `[Errno n] text: 'path'`, under
+    /// CPython's class for that errno -- so a program catching `FileNotFoundError` catches ours.
+    fn file_error(&mut self, error: crate::fileio::FileError, path: &str) -> Trap {
+        let (number, text) = error.errno();
+        let message = alloc::format!("[Errno {number}] {text}: '{path}'");
+        self.raise_named_exception(error.exception(), &message)
+    }
+
+    /// `open(path, mode)`: opens the host file and returns the object that reads or writes it.
+    pub fn open_file(&mut self, path: &str, mode: crate::fileio::FileMode) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        let handle = match (ops.open)(path, mode) {
+            Ok(handle) => handle,
+            Err(error) => return Err(self.file_error(error, path)),
+        };
+        let name = self.new_str(path)?;
+        let reference = self.alloc_object(self.file_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, handle);
+        self.heap.write_u32(reference.0 + 4, pack_file_mode(mode));
+        self.heap.write_u32(reference.0 + 8, name.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is an open-or-closed file object.
+    #[must_use]
+    pub fn is_file(&self, value: Value) -> bool {
+        self.is_type(value, self.file_type_id)
+    }
+
+    /// A file's host handle, or `None` once it has been closed.
+    fn file_handle(&self, file: Value) -> Option<u32> {
+        let reference = file.as_ref()?;
+        let raw = self.heap.read_u32(reference.0);
+        (raw != u32::MAX).then_some(raw)
+    }
+
+    /// A file's mode.
+    fn file_mode(&self, file: Value) -> crate::fileio::FileMode {
+        let raw = file.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + 4));
+        unpack_file_mode(raw)
+    }
+
+    /// A file's `name` -- the path as it was given to `open`.
+    fn file_name_value(&self, file: Value) -> Value {
+        file.as_ref().map_or(Value::NONE, |r| Value::from_bits(self.heap.read_u32(r.0 + 8)))
+    }
+
+    /// The path a file was opened with, for an error message.
+    fn file_path(&self, file: Value) -> String {
+        self.str_value(self.file_name_value(file)).map(String::from).unwrap_or_default()
+    }
+
+    /// `repr(file)` -- CPython's, including the wrapper class it would be an instance of, so a
+    /// printed file is recognizable to someone who knows CPython's.
+    pub(crate) fn file_repr(&self, file: Value) -> String {
+        let mode = self.file_mode(file);
+        let path = self.file_path(file);
+        if self.file_handle(file).is_none() {
+            return alloc::format!("<_io.{} name='{path}' mode='{}' [closed]>",
+                file_wrapper_name(mode), mode.as_str());
+        }
+        if mode.binary {
+            alloc::format!("<_io.{} name='{path}' mode='{}'>", file_wrapper_name(mode), mode.as_str())
+        } else {
+            alloc::format!(
+                "<_io.{} name='{path}' mode='{}' encoding='utf-8'>",
+                file_wrapper_name(mode),
+                mode.as_str()
+            )
+        }
+    }
+
+    /// Reads up to `limit` bytes (all of it when `None`), through the seam in chunks.
+    fn file_read_bytes(&mut self, file: Value, limit: Option<usize>) -> Result<Vec<u8>, Trap> {
+        let ops = self.require_file_ops()?;
+        let handle = match self.file_handle(file) {
+            Some(handle) => handle,
+            None => return Err(crate::fileio::closed_file_error(self)),
+        };
+        if !self.file_mode(file).read {
+            let message = "not readable";
+            return Err(self.raise_named_exception("OSError", message));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let want = match limit {
+                Some(limit) => {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    core::cmp::min(limit - out.len(), chunk.len())
+                }
+                None => chunk.len(),
+            };
+            match (ops.read)(handle, &mut chunk[..want]) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(error) => {
+                    let path = self.file_path(file);
+                    return Err(self.file_error(error, &path));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Turns bytes just read into what the mode says they are: `bytes`, or a `str` with newlines
+    /// translated. Invalid UTF-8 in text mode is a UnicodeDecodeError rather than a replacement
+    /// character, because silently substituting one changes data.
+    fn file_decode(&mut self, file: Value, data: Vec<u8>) -> Result<Value, Trap> {
+        if self.file_mode(file).binary {
+            return self.new_bytes(data);
+        }
+        let translated = crate::fileio::translate_newlines(&data);
+        match core::str::from_utf8(&translated) {
+            Ok(text) => self.new_str(text),
+            Err(e) => {
+                let at = e.valid_up_to();
+                let message = alloc::format!(
+                    "'utf-8' codec can't decode byte 0x{:02x} in position {at}: invalid start byte",
+                    translated.get(at).copied().unwrap_or(0)
+                );
+                Err(self.raise_named_exception("ValueError", &message))
+            }
+        }
+    }
+
+    /// Reads one line, INCLUDING its newline; an empty result means end of file.
+    fn file_read_line(&mut self, file: Value, limit: Option<usize>) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        let handle = match self.file_handle(file) {
+            Some(handle) => handle,
+            None => return Err(crate::fileio::closed_file_error(self)),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut one = [0u8; 1];
+        loop {
+            if limit.is_some_and(|limit| out.len() >= limit) {
+                break;
+            }
+            match (ops.read)(handle, &mut one) {
+                Ok(0) => break,
+                Ok(_) => {
+                    out.push(one[0]);
+                    if one[0] == b'\n' {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let path = self.file_path(file);
+                    return Err(self.file_error(error, &path));
+                }
+            }
+        }
+        self.file_decode(file, out)
+    }
+
+    /// Writes `value` (a str in text mode, bytes-like in binary), returning the count CPython
+    /// returns: characters for text, bytes for binary.
+    fn file_write_value(&mut self, file: Value, value: Value) -> Result<Value, Trap> {
+        let ops = self.require_file_ops()?;
+        let handle = match self.file_handle(file) {
+            Some(handle) => handle,
+            None => return Err(crate::fileio::closed_file_error(self)),
+        };
+        let mode = self.file_mode(file);
+        if !mode.write {
+            let message = "not writable";
+            return Err(self.raise_named_exception("OSError", message));
+        }
+        let (data, reported) = if mode.binary {
+            let bytes = match self.bytes_value(value) {
+                Some(bytes) => bytes.to_vec(),
+                None => {
+                    let kind = self.type_name_of(value);
+                    let message =
+                        alloc::format!("a bytes-like object is required, not '{kind}'");
+                    return Err(self.raise_named_exception("TypeError", &message));
+                }
+            };
+            let count = bytes.len();
+            (bytes, count)
+        } else {
+            let text = match self.str_value(value) {
+                Some(text) => String::from(text),
+                None => {
+                    let kind = self.type_name_of(value);
+                    let message = alloc::format!("write() argument must be str, not {kind}");
+                    return Err(self.raise_named_exception("TypeError", &message));
+                }
+            };
+            let count = text.chars().count();
+            (text.into_bytes(), count)
+        };
+        let mut written = 0;
+        while written < data.len() {
+            match (ops.write)(handle, &data[written..]) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(error) => {
+                    let path = self.file_path(file);
+                    return Err(self.file_error(error, &path));
+                }
+            }
+        }
+        Value::fixnum(reported as i32).ok_or(Trap::Overflow)
+    }
+
+    /// Dispatches a file method. The context-manager pair and the iterator protocol are here too:
+    /// `with open(...)` and `for line in f` are how a file is used, not extras.
+    pub(crate) fn call_file_method(
+        &mut self,
+        file: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        use crate::fileio::*;
+        match method_id {
+            FILE_READ => {
+                let limit = match args {
+                    [] => None,
+                    [n] if n.is_none() => None,
+                    [n] => {
+                        let want = n.as_int().ok_or(Trap::TypeError)?;
+                        if want < 0 {
+                            None
+                        } else {
+                            Some(want as usize)
+                        }
+                    }
+                    _ => return Err(Trap::TypeError),
+                };
+                let data = self.file_read_bytes(file, limit)?;
+                self.file_decode(file, data)
+            }
+            FILE_READLINE => {
+                let limit = match args {
+                    [] => None,
+                    [n] => {
+                        let want = n.as_int().ok_or(Trap::TypeError)?;
+                        (want >= 0).then_some(want as usize)
+                    }
+                    _ => return Err(Trap::TypeError),
+                };
+                self.file_read_line(file, limit)
+            }
+            FILE_READLINES => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let mut lines: Vec<Value> = Vec::new();
+                loop {
+                    let line = self.file_read_line(file, None)?;
+                    if self.file_line_is_empty(line) {
+                        break;
+                    }
+                    lines.push(line);
+                }
+                self.new_list(lines)
+            }
+            FILE_WRITE => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                self.file_write_value(file, *value)
+            }
+            FILE_WRITELINES => {
+                let [values] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let items = self.seq_value(*values).cloned().ok_or(Trap::TypeError)?;
+                for item in items {
+                    self.file_write_value(file, item)?;
+                }
+                Ok(Value::NONE)
+            }
+            FILE_CLOSE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                if let Some(handle) = self.file_handle(file) {
+                    let ops = self.require_file_ops()?;
+                    let result = (ops.close)(handle);
+                    if let Some(reference) = file.as_ref() {
+                        self.heap.write_u32(reference.0, u32::MAX);
+                    }
+                    if let Err(error) = result {
+                        let path = self.file_path(file);
+                        return Err(self.file_error(error, &path));
+                    }
+                }
+                Ok(Value::NONE)
+            }
+            FILE_FLUSH => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let ops = self.require_file_ops()?;
+                match self.file_handle(file) {
+                    Some(handle) => match (ops.flush)(handle) {
+                        Ok(()) => Ok(Value::NONE),
+                        Err(error) => {
+                            let path = self.file_path(file);
+                            Err(self.file_error(error, &path))
+                        }
+                    },
+                    None => Err(crate::fileio::closed_file_error(self)),
+                }
+            }
+            FILE_SEEK => {
+                let (offset, whence) = match args {
+                    [offset] => (offset.as_int().ok_or(Trap::TypeError)?, 0),
+                    [offset, whence] => (
+                        offset.as_int().ok_or(Trap::TypeError)?,
+                        whence.as_int().ok_or(Trap::TypeError)?,
+                    ),
+                    _ => return Err(Trap::TypeError),
+                };
+                if !(0..=2).contains(&whence) {
+                    let message = alloc::format!("invalid whence ({whence}, should be 0, 1 or 2)");
+                    return Err(self.raise_named_exception("ValueError", &message));
+                }
+                let ops = self.require_file_ops()?;
+                match self.file_handle(file) {
+                    Some(handle) => match (ops.seek)(handle, offset, whence as u8) {
+                        Ok(position) => Value::fixnum(position as i32).ok_or(Trap::Overflow),
+                        Err(error) => {
+                            let path = self.file_path(file);
+                            Err(self.file_error(error, &path))
+                        }
+                    },
+                    None => Err(crate::fileio::closed_file_error(self)),
+                }
+            }
+            FILE_TELL => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let ops = self.require_file_ops()?;
+                match self.file_handle(file) {
+                    Some(handle) => match (ops.tell)(handle) {
+                        Ok(position) => Value::fixnum(position as i32).ok_or(Trap::Overflow),
+                        Err(error) => {
+                            let path = self.file_path(file);
+                            Err(self.file_error(error, &path))
+                        }
+                    },
+                    None => Err(crate::fileio::closed_file_error(self)),
+                }
+            }
+            FILE_TRUNCATE => {
+                let message = "truncate() is not supported by this runtime";
+                Err(self.raise_named_exception("OSError", message))
+            }
+            FILE_ENTER => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                Ok(file)
+            }
+            FILE_EXIT => {
+                self.call_file_method(file, FILE_CLOSE, &[])?;
+                Ok(Value::FALSE)
+            }
+            FILE_ITER => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                Ok(file)
+            }
+            FILE_NEXT => {
+                let line = self.file_read_line(file, None)?;
+                if self.file_line_is_empty(line) {
+                    return Err(self.raise_named_exception("StopIteration", ""));
+                }
+                Ok(line)
+            }
+            FILE_READABLE => Ok(Value::from_bool(self.file_mode(file).read)),
+            FILE_WRITABLE => Ok(Value::from_bool(self.file_mode(file).write)),
+            FILE_SEEKABLE => Ok(Value::TRUE),
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Whether a line just read is the empty one that means end of file -- in either mode, since a
+    /// text read yields a `str` and a binary read `bytes`.
+    fn file_line_is_empty(&self, line: Value) -> bool {
+        if let Some(text) = self.str_value(line) {
+            return text.is_empty();
+        }
+        self.bytes_value(line).is_none_or(<[u8]>::is_empty)
+    }
+
+    /// A file's read-only attributes: the path it was opened with, its mode string, and whether it
+    /// has been closed.
+    fn file_attribute_value(&mut self, file: Value, name: &str) -> Result<Value, Trap> {
+        match name {
+            "name" => Ok(self.file_name_value(file)),
+            "mode" => {
+                let mode = self.file_mode(file);
+                self.new_str(mode.as_str())
+            }
+            "closed" => Ok(Value::from_bool(self.file_handle(file).is_none())),
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Installs the host's clocks and sleep: a wall clock in nanoseconds since the Unix epoch, a
+    /// monotonic source in nanoseconds from any origin, and a blocking sleep. A host program passes
+    /// its own; a device passes its timer.
+    ///
+    /// This crate cannot read a clock itself -- it has no platform underneath it -- so leaving these
+    /// unset means `time` REPORTS that it has no clock rather than answering with a zero that a
+    /// caller would have no way to recognize as fabricated.
+    pub fn set_clock(&mut self, clock: fn() -> i64, monotonic: fn() -> i64, sleep: fn(i64)) {
+        self.clock_fn = Some(clock);
+        self.monotonic_fn = Some(monotonic);
+        self.sleep_fn = Some(sleep);
+    }
+
+    /// The wall clock, or a loud error naming what is missing.
+    pub(crate) fn now_ns(&mut self) -> Result<i64, Trap> {
+        match self.clock_fn {
+            Some(clock) => Ok(clock()),
+            None => Err(self.no_clock()),
+        }
+    }
+
+    /// The monotonic clock, or a loud error.
+    pub(crate) fn monotonic_ns(&mut self) -> Result<i64, Trap> {
+        match self.monotonic_fn {
+            Some(clock) => Ok(clock()),
+            None => Err(self.no_clock()),
+        }
+    }
+
+    /// Blocks for `nanos`, or a loud error. A non-positive count returns at once, as a sleep of no
+    /// time should.
+    pub(crate) fn sleep_ns(&mut self, nanos: i64) -> Result<(), Trap> {
+        match self.sleep_fn {
+            Some(sleep) => {
+                if nanos > 0 {
+                    sleep(nanos);
+                }
+                Ok(())
+            }
+            None => Err(self.no_clock()),
+        }
+    }
+
+    fn no_clock(&mut self) -> Trap {
+        let message = "this runtime has no clock installed, so it cannot tell the time";
+        self.raise_named_exception("OSError", message)
+    }
+
     /// Selects the target board whose register map the gpio layer drives (`board.LED` resolution + the
     /// drive/direction/clock registers). Set once by the deployment before running.
     /// Orthogonal to the MMIO seam (which is host-sim vs on-device).
@@ -7837,7 +9690,7 @@ impl ObjectModel {
         }
         #[cfg(not(target_os = "none"))]
         {
-            if let Some(facts) = self.board.uart_facts(0) {
+            if let Some(facts) = self.board.uart_facts(0, self.resolved_uart_facts.as_ref()) {
                 if address == facts.fifo {
                     self.uart_sim_tx.push((value & 0xFF) as u8);
                 }
@@ -7871,7 +9724,7 @@ impl ObjectModel {
                     return self.reset_done_bits;
                 }
             }
-            if let Some(facts) = self.board.uart_facts(0) {
+            if let Some(facts) = self.board.uart_facts(0, self.resolved_uart_facts.as_ref()) {
                 match facts.status {
                     crate::uart::UartStatus::Counts { status, rx_shift, rx_mask, tx_shift, tx_mask }
                         if address == status =>
@@ -7882,6 +9735,12 @@ impl ObjectModel {
                     }
                     crate::uart::UartStatus::Flags { flags, rx_empty_mask } if address == flags => {
                         return if self.uart_sim_rx.is_empty() { rx_empty_mask } else { 0 };
+                    }
+                    crate::uart::UartStatus::FlagsReady { flags, tx_ready_mask, rx_ready_mask }
+                        if address == flags =>
+                    {
+                        let rx = if self.uart_sim_rx.is_empty() { 0 } else { rx_ready_mask };
+                        return tx_ready_mask | rx;
                     }
                     _ => {}
                 }
@@ -8008,6 +9867,9 @@ impl ObjectModel {
             crate::uart::UartStatus::Flags { flags, rx_empty_mask } => {
                 u32::from(self.mmio_read(flags) & rx_empty_mask == 0)
             }
+            crate::uart::UartStatus::FlagsReady { flags, rx_ready_mask, .. } => {
+                u32::from(self.mmio_read(flags) & rx_ready_mask != 0)
+            }
         }
     }
 
@@ -8101,7 +9963,10 @@ impl ObjectModel {
             return Err(self.with_message(Trap::ValueError, "I/O operation on closed port"));
         }
         let instance = self.port_word(port, PORT_W_INSTANCE);
-        let facts = self.board.uart_facts(instance).ok_or(Trap::Malformed)?;
+        let facts = self
+            .board
+            .uart_facts(instance, self.resolved_uart_facts.as_ref())
+            .ok_or(Trap::Malformed)?;
         Ok((instance, facts))
     }
 
@@ -8114,8 +9979,27 @@ impl ObjectModel {
             let message = "open() takes exactly one positional argument (the board UART resource)";
             return Err(self.with_message(Trap::TypeError, message));
         };
-        let Some(instance) = self.uart_resource_instance(*resource) else {
-            let message = "open() expects a board UART resource (e.g. board.UART0)";
+        let instance = if let Some(role) =
+            self.str_value(*resource).map(alloc::string::ToString::to_string)
+        {
+            match self.board {
+                crate::gpio::Board::Samd21Xpro => {
+                    let facts = crate::board_binding::samd21_uart_facts(self, &role)?;
+                    self.resolved_uart_facts = Some(facts);
+                    0
+                }
+                _ => {
+                    let message =
+                        "this board's uart does not take a role handle yet -- name its port \
+                         (e.g. board.UART0)";
+                    return Err(self.with_message(Trap::Unsupported, message));
+                }
+            }
+        } else if let Some(instance) = self.uart_resource_instance(*resource) {
+            instance
+        } else {
+            let message = "open() expects a board UART role handle (e.g. board.VCP) or port \
+                           (e.g. board.UART0)";
             return Err(self.with_message(Trap::TypeError, message));
         };
         let mut config = UartConfig::default();
@@ -8165,13 +10049,20 @@ impl ObjectModel {
             let message = alloc::format!("UART{instance} in use");
             return Err(self.raise_named_exception("OSError", &message));
         }
-        let ops = match self.board.uart_open_ops(instance, &config) {
+        let ops = match self
+            .board
+            .uart_open_ops(instance, &config, self.resolved_uart_facts.as_ref())
+        {
             None => {
                 let message = "uart is not supported on this board yet";
                 return Err(self.with_message(Trap::Unsupported, message));
             }
             Some(Err(crate::uart::UartConfigError::BaudOutOfRange)) => {
                 let message = "baudrate out of range for this uart";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Err(crate::uart::UartConfigError::ParityNotTabled)) => {
+                let message = "this uart does not support the requested data bits / parity / stop bits";
                 return Err(self.with_message(Trap::ValueError, message));
             }
             Some(Ok(ops)) => ops,
@@ -8355,8 +10246,9 @@ impl ObjectModel {
                 };
                 let (instance, _facts) = self.port_require_open(port)?;
                 let board = self.board;
+                let resolved = self.resolved_uart_facts;
                 for &byte in &data {
-                    for op in board.uart_tx_byte_ops(instance, byte) {
+                    for op in board.uart_tx_byte_ops(instance, byte, resolved.as_ref()) {
                         self.apply_uart_op(op);
                     }
                 }
@@ -8368,7 +10260,8 @@ impl ObjectModel {
                 }
                 let (instance, _facts) = self.port_require_open(port)?;
                 let board = self.board;
-                for op in board.uart_flush_ops(instance) {
+                let resolved = self.resolved_uart_facts;
+                for op in board.uart_flush_ops(instance, resolved.as_ref()) {
                     self.apply_uart_op(op);
                 }
                 Ok(Value::NONE)
@@ -10906,14 +12799,75 @@ impl ObjectModel {
             || self.is_deque(obj)
             || self.is_dict_view(obj);
         let mutable_item = self.is_list(obj) || self.is_dict(obj) || self.is_bytearray(obj);
+        let sequence =
+            self.is_str(obj) || self.byte_view(obj).is_some() || self.seq_value(obj).is_some();
         match name {
             "__len__" => self.py_len(obj).is_ok(),
             "__getitem__" => subscriptable,
             "__setitem__" | "__delitem__" => mutable_item,
             "__contains__" => iterable,
             "__iter__" => iterable,
+            "__add__" | "__mul__" | "__rmul__" => sequence,
+            "__eq__" | "__ne__" | "__lt__" | "__le__" | "__gt__" | "__ge__" => {
+                self.is_str(obj)
+                    || self.byte_view(obj).is_some()
+                    || self.seq_value(obj).is_some()
+                    || self.is_dict(obj)
+                    || self.is_set(obj)
+                    || self.is_frozenset(obj)
+                    || self.is_range(obj)
+                    || self.is_deque(obj)
+            }
+            "__and__" | "__or__" | "__xor__" | "__sub__" | "__rand__" | "__ror__" | "__rxor__"
+            | "__rsub__" => self.is_set(obj) || self.is_frozenset(obj),
             _ => false,
         }
+    }
+
+    /// Whether a COMPARISON dunder on `receiver` acts on `other` directly, or defers with
+    /// NotImplemented. A builtin container compares only with its own kind: `[1].__eq__((1,))` is
+    /// NotImplemented, not False -- the False a program sees from `==` comes later, after BOTH
+    /// sides have declined and the default identity comparison answers.
+    /// The comparison a builtin value's exposed dunder performs, when it is one. The interpreter
+    /// uses this to route `[1].__eq__([1])` through the FULL comparison path rather than the
+    /// model-only one -- comparing two lists may have to call an element's own `__eq__`, which
+    /// needs the driver.
+    pub(crate) fn builtin_dunder_comparison(&self, method_id: u32) -> Option<CmpOp> {
+        cmpop_of_dunder(dunder_name_of(method_id)?)
+    }
+
+    pub(crate) fn comparison_dunder_accepts(&self, receiver: Value, other: Value) -> bool {
+        if self.is_int(receiver) || self.is_float(receiver) {
+            return self.numeric_dunder_accepts(receiver, other);
+        }
+        if self.is_str(receiver) {
+            return self.is_str(other);
+        }
+        if self.is_bytes(receiver) {
+            return self.is_bytes(other);
+        }
+        if self.is_bytearray(receiver) {
+            return self.is_bytearray(other);
+        }
+        if self.is_list(receiver) {
+            return self.is_list(other);
+        }
+        if self.is_tuple(receiver) {
+            return self.is_tuple(other);
+        }
+        if self.is_dict(receiver) {
+            return self.is_dict(other);
+        }
+        if self.is_set(receiver) || self.is_frozenset(receiver) {
+            return self.is_set(other) || self.is_frozenset(other);
+        }
+        if self.is_range(receiver) {
+            return self.is_range(other);
+        }
+        if self.is_deque(receiver) {
+            return self.is_deque(other);
+        }
+        false
     }
 
     /// Whether a numeric dunder on `receiver` handles `other` DIRECTLY, else it is `NotImplemented`
@@ -10976,10 +12930,24 @@ impl ObjectModel {
             let [other] = args else {
                 return Err(Trap::TypeError);
             };
+            let (a, b) = if reflected { (*other, receiver) } else { (receiver, *other) };
+            if !self.is_int(receiver) && !self.is_float(receiver) {
+                return match self.full_binary(op, a, b) {
+                    Ok(value) => Ok(value),
+                    Err(Trap::TypeError) if matches!(name, "__mul__" | "__rmul__") => {
+                        let message = alloc::format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            self.type_name_of(*other)
+                        );
+                        Err(self.with_message(Trap::TypeError, &message))
+                    }
+                    Err(Trap::TypeError) => Err(self.binop_type_error(op, a, b)),
+                    Err(other) => Err(other),
+                };
+            }
             if !self.numeric_dunder_accepts(receiver, *other) {
                 return Ok(Value::NOT_IMPLEMENTED);
             }
-            let (a, b) = if reflected { (*other, receiver) } else { (receiver, *other) };
             return match self.full_binary(op, a, b) {
                 Ok(value) => Ok(value),
                 Err(Trap::TypeError) => Ok(Value::NOT_IMPLEMENTED),
@@ -10990,10 +12958,17 @@ impl ObjectModel {
             let [other] = args else {
                 return Err(Trap::TypeError);
             };
-            if !self.numeric_dunder_accepts(receiver, *other) {
+            if !self.comparison_dunder_accepts(receiver, *other) {
                 return Ok(Value::NOT_IMPLEMENTED);
             }
-            return crate::interp::compare(op, receiver, *other, self);
+            if self.is_dict(receiver) && !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                return Ok(Value::NOT_IMPLEMENTED);
+            }
+            return match crate::interp::compare(op, receiver, *other, self) {
+                Ok(value) => Ok(value),
+                Err(Trap::TypeError) => Ok(Value::NOT_IMPLEMENTED),
+                Err(other) => Err(other),
+            };
         }
         match name {
             "__divmod__" | "__rdivmod__" => {
@@ -11090,11 +13065,36 @@ impl ObjectModel {
             self.init_default_args(receiver, args)?;
             return Ok(Value::NONE);
         }
+        if method_id == EXC_INIT_UNBOUND {
+            let (instance, rest) = args.split_first().ok_or(Trap::TypeError)?;
+            self.init_default_args(*instance, rest)?;
+            return Ok(Value::NONE);
+        }
+        if method_id == OBJECT_GETSTATE {
+            if !args.is_empty() {
+                let message = "__getstate__() takes no arguments";
+                return Err(self.raise_named_exception("TypeError", message));
+            }
+            return self.object_getstate(receiver);
+        }
+        if method_id == OBJECT_NEW {
+            let (class, rest) = match args.split_first() {
+                Some(split) => split,
+                None => {
+                    let message = "object.__new__(): not enough arguments";
+                    return Err(self.raise_named_exception("TypeError", message));
+                }
+            };
+            return self.object_new(*class, rest, &[]);
+        }
         if method_id == OBJECT_NOOP {
             return Ok(Value::NONE);
         }
         if dunder_name_of(method_id).is_some() {
             return self.dispatch_builtin_dunder(receiver, method_id, args);
+        }
+        if self.is_file(receiver) {
+            return self.call_file_method(receiver, method_id, args);
         }
         if self.is_list(receiver) {
             return self.call_list_method(receiver, method_id, args);
@@ -11120,6 +13120,9 @@ impl ObjectModel {
         }
         if self.is_memoryview(receiver) {
             return self.call_memoryview_method(receiver, method_id, args);
+        }
+        if self.is_slice(receiver) {
+            return self.call_slice_method(receiver, method_id, args);
         }
         if self.is_int(receiver) {
             return self.call_int_method(receiver, method_id, args);
@@ -11971,6 +13974,15 @@ impl ObjectModel {
             }
             DICT_COPY => {
                 let copy = self.dicts[index].clone();
+                if let Some(factory) = self.defaultdict_factory(dict) {
+                    return self.new_defaultdict(factory, copy);
+                }
+                if self.is_counter(dict) {
+                    return self.new_counter(copy);
+                }
+                if self.is_ordereddict(dict) {
+                    return self.new_ordereddict(copy);
+                }
                 self.new_dict(copy)
             }
             DICT_POPITEM => {
@@ -12342,42 +14354,152 @@ impl ObjectModel {
             }
             INT_TO_BYTES => {
                 let (length, byteorder) = match args {
+                    [] => (1, String::from("big")),
+                    [len] => (len.as_int().ok_or(Trap::TypeError)?, String::from("big")),
                     [len, order] => (
                         len.as_int().ok_or(Trap::TypeError)?,
                         self.str_value(*order).map(String::from).ok_or(Trap::TypeError)?,
                     ),
                     _ => return Err(Trap::TypeError),
                 };
-                if length < 0 {
-                    return Err(Trap::ValueError);
-                }
-                let n = self.as_i128(receiver).ok_or(Trap::Overflow)?;
-                if n < 0 {
-                    return Err(Trap::Unsupported);
-                }
-                let length = length as usize;
-                let mut bytes = alloc::vec![0u8; length];
-                let mut value = n as u128;
-                for byte in &mut bytes {
-                    *byte = (value & 0xff) as u8;
-                    value >>= 8;
-                }
-                if value != 0 {
-                    return Err(Trap::Overflow);
-                }
-                match byteorder.as_str() {
-                    "little" => {}
-                    "big" => bytes.reverse(),
-                    _ => return Err(Trap::ValueError),
-                }
-                self.new_bytes(bytes)
+                self.int_to_bytes(receiver, length, &byteorder, false)
             }
             _ => Err(Trap::AttributeError),
         }
     }
 
+    /// `int.to_bytes` for any int tier, including a bignum. Works in [`BigInt`] throughout rather
+    /// than a machine word, because the whole point of the verb is producing a byte string wider
+    /// than one -- an `i128` route would refuse exactly the values worth converting.
+    pub(crate) fn int_to_bytes(
+        &mut self,
+        receiver: Value,
+        length: i64,
+        byteorder: &str,
+        signed: bool,
+    ) -> Result<Value, Trap> {
+        if length < 0 {
+            let message = "length argument must be non-negative";
+            return Err(self.raise_named_exception("ValueError", message));
+        }
+        if byteorder != "little" && byteorder != "big" {
+            let message = "byteorder must be either 'little' or 'big'";
+            return Err(self.raise_named_exception("ValueError", message));
+        }
+        let value = self.as_bigint(receiver).ok_or(Trap::TypeError)?;
+        let length = length as usize;
+        let bits = 8 * length as u64;
+        let span = BigInt::from_i128(1).shl(bits);
+        let zero = BigInt::from_i128(0);
+
+        if value < zero && !signed {
+            let message = "can't convert negative int to unsigned";
+            return Err(self.raise_named_exception("OverflowError", message));
+        }
+        let (low, high) = if !signed {
+            (zero.clone(), span.sub(&BigInt::from_i128(1)))
+        } else if bits == 0 {
+            (zero.clone(), zero.clone())
+        } else {
+            let half = BigInt::from_i128(1).shl(bits - 1);
+            (half.neg(), half.sub(&BigInt::from_i128(1)))
+        };
+        if value < low || value > high {
+            let message = "int too big to convert";
+            return Err(self.raise_named_exception("OverflowError", message));
+        }
+
+        let mut encoded = if value < zero { value.add(&span) } else { value };
+        let base = BigInt::from_i128(256);
+        let mut bytes = alloc::vec![0u8; length];
+        for byte in bytes.iter_mut() {
+            let (quotient, remainder) = encoded.divmod(&base).ok_or(Trap::Malformed)?;
+            *byte = remainder.to_i128().unwrap_or(0) as u8;
+            encoded = quotient;
+        }
+        if byteorder == "big" {
+            bytes.reverse();
+        }
+        self.new_bytes(bytes)
+    }
+
+    /// `int.from_bytes` for any width, signed or not.
+    pub(crate) fn int_from_bytes(
+        &mut self,
+        data: &[u8],
+        byteorder: &str,
+        signed: bool,
+    ) -> Result<Value, Trap> {
+        if byteorder != "little" && byteorder != "big" {
+            let message = "byteorder must be either 'little' or 'big'";
+            return Err(self.raise_named_exception("ValueError", message));
+        }
+        let mut big_endian: alloc::vec::Vec<u8> = data.to_vec();
+        if byteorder == "little" {
+            big_endian.reverse();
+        }
+        let base = BigInt::from_i128(256);
+        let mut result = BigInt::from_i128(0);
+        for byte in &big_endian {
+            result = result.mul(&base).add(&BigInt::from_i128(i128::from(*byte)));
+        }
+        if signed && big_endian.first().is_some_and(|top| top & 0x80 != 0) {
+            let span = BigInt::from_i128(1).shl(8 * big_endian.len() as u64);
+            result = result.sub(&span);
+        }
+        self.new_bigint(result)
+    }
+
     /// Dispatches a `memoryview` method (all no-argument): `tobytes()` copies out to `bytes`,
     /// `tolist()` to a list of ints, `hex()` to the lowercase hex string.
+    /// `slice.indices(length)` -- the `(start, stop, step)` a slice resolves to over a sequence of
+    /// that length, with negatives folded in and the ends clamped. This is what a container written
+    /// in Python calls to implement its own slicing, so the arithmetic belongs here once rather than
+    /// in each of them.
+    fn call_slice_method(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        if method_id != SLICE_INDICES {
+            return Err(Trap::AttributeError);
+        }
+        let [length] = args else {
+            return Err(Trap::TypeError);
+        };
+        let Some(length) = self.as_i128(*length) else {
+            return Err(Trap::TypeError);
+        };
+        if length < 0 {
+            let message = "length should not be negative";
+            return Err(self.raise_named_exception("ValueError", message));
+        }
+        let (start, stop, step) = self.slice_components(receiver);
+        let step = match self.as_i128(step) {
+            None => 1,
+            Some(0) => {
+                let message = "slice step cannot be zero";
+                return Err(self.raise_named_exception("ValueError", message));
+            }
+            Some(n) => n,
+        };
+        let (lower, upper) = if step < 0 { (-1, length - 1) } else { (0, length) };
+        let resolve = |value: Option<i128>, default: i128| -> i128 {
+            match value {
+                None => default,
+                Some(n) if n < 0 => core::cmp::max(n + length, lower),
+                Some(n) => core::cmp::min(n, upper),
+            }
+        };
+        let start = resolve(self.as_i128(start), if step < 0 { upper } else { lower });
+        let stop = resolve(self.as_i128(stop), if step < 0 { lower } else { upper });
+        let start = self.new_bigint(BigInt::from_i128(start))?;
+        let stop = self.new_bigint(BigInt::from_i128(stop))?;
+        let step = self.new_bigint(BigInt::from_i128(step))?;
+        self.new_tuple(alloc::vec![start, stop, step])
+    }
+
     fn call_memoryview_method(&mut self, receiver: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
         if !args.is_empty() {
             return Err(Trap::TypeError);
@@ -12461,6 +14583,13 @@ impl ObjectModel {
                 let slot = self.byte_buffer_slot(receiver).ok_or(Trap::TypeError)?;
                 self.byte_buffers[slot].push(byte as u8);
                 Ok(Value::NONE)
+            }
+            BYTEARRAY_COPY => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let bytes = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                self.new_bytearray(bytes)
             }
             BYTEARRAY_EXTEND => {
                 let [source] = args else {
@@ -13241,7 +15370,23 @@ impl ObjectModel {
         }
     }
 
-    /// Whether `callee` is a bound `list.sort` method -- the one built-in method with a keyword
+    /// Whether `callee` is a bound `int.to_bytes` -- an int method with a keyword surface
+    /// (`signed`, which CPython makes keyword-only, so it can be reached no other way).
+    #[must_use]
+    /// The RECEIVER's type has to be checked, not just the method id: ids are numbered per type, so
+    /// `INT_TO_BYTES` is also `LIST_SORT`, `STR_STARTSWITH` and a dozen others. Matching the id
+    /// alone silently hijacks every one of them.
+    pub fn is_int_to_bytes_bound(&self, callee: Value) -> bool {
+        callee.as_ref().is_some_and(|reference| {
+            self.heap.type_id_of(reference) == self.bound_method_type_id && {
+                let receiver = Value::from_bits(self.heap.read_u32(reference.0));
+                let method_id = self.heap.read_u32(reference.0 + 4);
+                self.is_int(receiver) && method_id == INT_TO_BYTES
+            }
+        })
+    }
+
+    /// Whether `callee` is a bound `list.sort` method -- a built-in method with a keyword
     /// surface (`sort(key=None, reverse=False)`), which the interpreter's `CallKw` routes specially.
     #[must_use]
     pub fn is_list_sort_bound(&self, callee: Value) -> bool {
@@ -13353,6 +15498,175 @@ impl ObjectModel {
                 Ok(())
             }
         }
+    }
+}
+
+/// The method names each built-in type answers, for `dir()`. GENERATED FROM the method-id tables in
+/// this file rather than typed out, and a test asserts every entry still resolves through the table it
+/// came from -- so a list cannot drift into naming a method that is not there, which is the one thing
+/// `dir()` must never do.
+#[cfg(feature = "introspection")]
+const STR_METHOD_NAMES: &[&str] = &["capitalize", "casefold", "center", "count", "encode", "endswith", "expandtabs", "find", "format", "format_map", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit", "isidentifier", "islower", "isnumeric", "isprintable", "isspace", "istitle", "isupper", "join", "ljust", "lower", "lstrip", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "translate", "upper", "zfill"];
+
+#[cfg(feature = "introspection")]
+const LIST_METHOD_NAMES: &[&str] = &["append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove", "reverse", "sort"];
+
+#[cfg(feature = "introspection")]
+const DICT_METHOD_NAMES: &[&str] = &["clear", "copy", "get", "items", "keys", "pop", "popitem", "setdefault", "update", "values"];
+
+#[cfg(feature = "introspection")]
+const SET_METHOD_NAMES: &[&str] = &["copy", "difference", "intersection", "isdisjoint", "issubset", "issuperset", "symmetric_difference", "union"];
+
+/// The six a `set` has and a `frozenset` does not, because they mutate. Split for the same reason the
+/// bytearray-only names are: one method table serves both types, and one of them refuses these.
+#[cfg(feature = "introspection")]
+const SET_ONLY_METHOD_NAMES: &[&str] = &["add", "clear", "discard", "pop", "remove", "update"];
+
+#[cfg(feature = "introspection")]
+const TUPLE_METHOD_NAMES: &[&str] = &["count", "index"];
+
+#[cfg(feature = "introspection")]
+const INT_METHOD_NAMES: &[&str] = &["__index__", "as_integer_ratio", "bit_count", "bit_length", "conjugate", "denominator", "from_bytes", "imag", "is_integer", "numerator", "real", "to_bytes"];
+
+#[cfg(feature = "introspection")]
+const FLOAT_METHOD_NAMES: &[&str] = &["as_integer_ratio", "conjugate", "hex", "imag", "is_integer", "real"];
+
+#[cfg(feature = "introspection")]
+const BYTES_METHOD_NAMES: &[&str] = &["capitalize", "center", "count", "decode", "endswith", "expandtabs", "find", "hex", "index", "isalnum", "isalpha", "isdigit", "islower", "isspace", "istitle", "isupper", "join", "ljust", "lower", "lstrip", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "upper", "zfill"];
+
+/// The three a BYTEARRAY has and `bytes` does not, because they mutate. Listing them for `bytes`
+/// would name attributes it refuses -- the one thing this list must never do.
+#[cfg(feature = "introspection")]
+const BYTEARRAY_ONLY_METHOD_NAMES: &[&str] = &["append", "copy", "extend"];
+
+#[cfg(feature = "introspection")]
+const DEQUE_METHOD_NAMES: &[&str] = &["append", "appendleft", "clear", "copy", "count", "extend", "extendleft", "pop", "popleft", "remove", "rotate"];
+
+#[cfg(feature = "introspection")]
+const COUNTER_METHOD_NAMES: &[&str] = &["elements", "most_common", "subtract", "total", "update"];
+
+#[cfg(feature = "introspection")]
+const ODICT_METHOD_NAMES: &[&str] = &["move_to_end", "popitem"];
+
+/// The method names of `value`'s built-in type. A dict SUBTYPE reports its own methods AND the dict
+/// surface it inherits, which is what makes `dir(Counter())` include both `most_common` and `keys`.
+#[cfg(feature = "introspection")]
+fn builtin_type_method_names(model: &ObjectModel, value: Value) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    if model.is_str(value) {
+        names.extend_from_slice(STR_METHOD_NAMES);
+    } else if model.is_bytes(value) || model.is_bytearray(value) {
+        names.extend_from_slice(BYTES_METHOD_NAMES);
+        if model.is_bytearray(value) {
+            names.extend_from_slice(BYTEARRAY_ONLY_METHOD_NAMES);
+        }
+    } else if model.is_list(value) {
+        names.extend_from_slice(LIST_METHOD_NAMES);
+    } else if model.is_deque(value) {
+        names.extend_from_slice(DEQUE_METHOD_NAMES);
+    } else if model.is_dict(value) {
+        if model.is_counter(value) {
+            names.extend_from_slice(COUNTER_METHOD_NAMES);
+        }
+        if model.is_ordereddict(value) {
+            names.extend_from_slice(ODICT_METHOD_NAMES);
+        }
+        if model.is_defaultdict(value) {
+            names.push("default_factory");
+        }
+        names.extend_from_slice(DICT_METHOD_NAMES);
+    } else if model.is_set(value) || model.is_frozenset(value) {
+        names.extend_from_slice(SET_METHOD_NAMES);
+        if model.is_set(value) {
+            names.extend_from_slice(SET_ONLY_METHOD_NAMES);
+        }
+    } else if model.is_tuple(value) {
+        names.extend_from_slice(TUPLE_METHOD_NAMES);
+    } else if model.is_int(value) {
+        names.extend_from_slice(INT_METHOD_NAMES);
+    } else if model.is_float(value) {
+        names.extend_from_slice(FLOAT_METHOD_NAMES);
+    }
+    names
+}
+
+/// Roots the model cannot see, reported by the caller: the interpreter's live frame stack. Named
+/// because the nesting reads badly inline -- it is a function that is handed the collector's visitor and
+/// calls it once per slot it owns.
+#[cfg(feature = "gc-collect")]
+pub type ExtraRoots<'a> = dyn FnMut(&mut dyn FnMut(&mut lamella_gc::Ref)) + 'a;
+
+/// The dunders EVERY instance answers, whatever its class wrote -- the object base's own surface as
+/// this runtime actually has it. Deliberately NOT CPython's full 24: `__reduce__`/`__reduce_ex__`
+/// (the pickle protocol -- and `copy` refuses an object that defines one, so claiming every object
+/// has them would break that refusal), `__weakref__` (there are no weak references here),
+/// `__subclasshook__` (no abstract base classes), and `__doc__`/`__firstlineno__`/
+/// `__static_attributes__` (compile-time metadata the code object does not carry) are absent from
+/// this list because they are absent from the runtime.
+#[cfg(feature = "introspection")]
+const INSTANCE_DUNDERS: &[&str] = &["__class__", "__getstate__", "__init__", "__new__"];
+
+/// What a user function answers: its identity from the code object, plus anything set on it.
+#[cfg(feature = "introspection")]
+const FUNCTION_ATTRIBUTES: &[&str] = &["__doc__", "__name__", "__qualname__"];
+
+/// What a method bound to an instance answers -- the function's identity, and the two halves it was
+/// made of.
+#[cfg(feature = "introspection")]
+const BOUND_METHOD_ATTRIBUTES: &[&str] =
+    &["__doc__", "__func__", "__name__", "__qualname__", "__self__"];
+
+/// What every class answers, beyond its own namespace and its bases'.
+#[cfg(feature = "introspection")]
+const CLASS_ATTRIBUTES: &[&str] = &[
+    "__class__", "__dict__", "__init__", "__init_subclass__", "__module__", "__name__", "__new__",
+    "__qualname__",
+];
+
+/// What an exception instance answers beyond an ordinary one.
+#[cfg(feature = "introspection")]
+const EXCEPTION_ATTRIBUTES: &[&str] = &["__cause__", "__context__", "__suppress_context__", "args"];
+
+/// Sorts and de-duplicates the collected names, which is the order `dir()` reports.
+#[cfg(feature = "introspection")]
+fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Packs a file mode into the raw word a file object stores.
+fn pack_file_mode(mode: crate::fileio::FileMode) -> u32 {
+    u32::from(mode.read)
+        | u32::from(mode.write) << 1
+        | u32::from(mode.append) << 2
+        | u32::from(mode.binary) << 3
+        | u32::from(mode.exclusive) << 4
+        | u32::from(mode.truncate) << 5
+}
+
+/// Unpacks what [`pack_file_mode`] stored.
+fn unpack_file_mode(raw: u32) -> crate::fileio::FileMode {
+    crate::fileio::FileMode {
+        read: raw & 1 != 0,
+        write: raw & 2 != 0,
+        append: raw & 4 != 0,
+        binary: raw & 8 != 0,
+        exclusive: raw & 16 != 0,
+        truncate: raw & 32 != 0,
+    }
+}
+
+/// The CPython wrapper class a file with this mode would be an instance of -- used only for `repr`,
+/// so a printed file is recognizable to a reader who knows CPython's.
+fn file_wrapper_name(mode: crate::fileio::FileMode) -> &'static str {
+    if !mode.binary {
+        return "TextIOWrapper";
+    }
+    match (mode.read, mode.write) {
+        (true, true) => "BufferedRandom",
+        (false, true) => "BufferedWriter",
+        _ => "BufferedReader",
     }
 }
 

@@ -57,6 +57,21 @@ pub const STACKMAP_KIND_TAGGED: u16 = 3;
 /// layout -- `InitStruct`/`FieldLoad`/`FieldStore`/`FieldAddr` are all size/offset-based.
 pub(crate) const REF_CELL_HANDLE: lamella_ir::TypeHandle = lamella_ir::TypeHandle(0xFFFF_FFFF);
 
+/// The sentinel `ValueType` layout handle marking a frame-materialized EXCEPTION OBJECT cell: the
+/// `[TypeDesc*][payload...]` slot a binding `catch` lays so the caught exception is an object rather
+/// than a bare tag (see `cil::materialize_catch_binding`). Like [`REF_CELL_HANDLE`] it lives outside
+/// the metadata-token space and is never looked up for layout -- `InitStruct`/`FieldAddr` are
+/// size-and-offset-based.
+///
+/// **IT IS DELIBERATELY NOT `REF_CELL_HANDLE`, and the difference is the whole point of a second
+/// sentinel.** A ref cell's word is enumerated as an `ObjectRef` root because it holds a reference the
+/// collector must trace and relocate. This cell's words are a DESCRIPTOR ADDRESS and zeroed fields --
+/// neither is a heap reference, and a mark-compact collector REWRITES what it accepts as a root, so
+/// enumerating them would corrupt the header. A plain value-type cell is invisible to the type-keyed
+/// root walk, which is exactly the treatment this one needs.
+pub(crate) const EXCEPTION_CELL_HANDLE: lamella_ir::TypeHandle =
+    lamella_ir::TypeHandle(0xFFFF_FFFE);
+
 /// Whether `ty` is a [`REF_CELL_HANDLE`] reference cell -- a memory-homed reference local whose word
 /// the GC must trace as an object reference. Used by the entry zero-init and the root record builder.
 pub(crate) fn is_ref_cell(ty: MirType) -> bool {
@@ -66,8 +81,8 @@ pub(crate) fn is_ref_cell(ty: MirType) -> bool {
 /// The runtime-support seams a green thread can be switched away inside (or a collection can run
 /// inside): the ANCHOR-writing externs. A frame that passes a `RefToInt`-derived raw pointer into
 /// one of these can be parked there arbitrarily long, so the source ObjectRef's slot is emitted
-/// [`STACKMAP_KIND_PINNED`]. This list mirrors the anchor shims in `tools/runtime-support` (and
-/// their `tools/runtime-support-riscv` twins -- the seam NAMES are target-independent); the two
+/// [`STACKMAP_KIND_PINNED`]. This list mirrors the anchor shims in `tools/runtime/runtime-support` (and
+/// their `tools/runtime/runtime-support-riscv` twins -- the seam NAMES are target-independent); the two
 /// sides are welded by the walk contract, not by code -- keep them in step.
 pub(crate) const ANCHOR_SEAM_EXTERNS: &[&str] = &[
     "lamella_thread_yield",

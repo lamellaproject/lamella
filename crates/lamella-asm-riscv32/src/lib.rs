@@ -6,6 +6,25 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+/// The machine CSR numbers this encoder's callers need, for [`Encoder::csrr`] / [`Encoder::csrw`].
+///
+/// A trap handler is the reason these exist: without an `mtvec` a fault jumps to address zero and
+/// keeps faulting, which on QEMU is an image that HANGS rather than one that reports. Naming the
+/// four here keeps the magic numbers out of every harness that installs one.
+pub mod csr {
+    /// `mstatus` -- machine status.
+    pub const MSTATUS: u16 = 0x300;
+    /// `mtvec` -- the machine trap-vector base. The low two bits are the MODE field, so a handler
+    /// address written here must be 4-byte aligned and MODE 0 means "direct: every trap goes to
+    /// BASE".
+    pub const MTVEC: u16 = 0x305;
+    /// `mepc` -- the PC the trap was taken on.
+    pub const MEPC: u16 = 0x341;
+    /// `mcause` -- why the trap was taken (2 = illegal instruction, 5 = load access fault,
+    /// 7 = store access fault, and the high bit set means an interrupt rather than an exception).
+    pub const MCAUSE: u16 = 0x342;
+}
+
 /// One of the 32 RISC-V integer registers, by its number (`x0`-`x31`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Reg(u8);
@@ -86,8 +105,20 @@ impl BranchCond {
 pub enum AssembleError {
     /// A [`Label`] was referenced but never bound to a position.
     UnboundLabel(Label),
-    /// A branch or jump target is out of the encoding's reach.
-    BranchOutOfRange,
+    /// A branch or jump target is out of the encoding's reach, WITH THE SITE AND THE DISTANCE.
+    ///
+    /// A bare marker was survivable while nothing relaxed: the whole image simply refused. It is not
+    /// survivable while diagnosing WHICH branch overflows and by how much -- a conditional branch
+    /// reaches +/-4 KB and a jump +/-1 MB, so "out of range" alone cannot even say which tier was
+    /// asked for. The ARM encoder learned this first and names its site too.
+    BranchOutOfRange {
+        /// The byte offset of the instruction whose target could not be reached.
+        at: u32,
+        /// The distance it needed to cover, in bytes, signed (negative = backwards).
+        offset: i64,
+        /// The reach the encoding actually has, in bytes, as `+/-limit`.
+        limit: i64,
+    },
 }
 
 /// The finished machine-code image.
@@ -95,7 +126,15 @@ pub enum AssembleError {
 pub struct Assembled {
     /// The little-endian RV32 byte image.
     pub bytes: Vec<u8>,
+    /// The insertions branch relaxation made, `(position, bytes grown)`, ascending by position.
+    /// EMPTY when nothing relaxed, which is the ordinary case. Feed a pre-relaxation offset through
+    /// [`shift_position`] to find where it landed.
+    pub shifts: Vec<(u32, u32)>,
 }
+
+/// `jal x0, 0` -- an unconditional jump with its offset still to patch (opcode `0x6f`, rd = x0),
+/// the exact word [`Encoder::jal`] emits for [`Encoder::j`]. Spliced in to widen a far branch.
+const JAL_X0_PLACEHOLDER: u32 = 0x0000_006f;
 
 #[derive(Debug, Clone, Copy)]
 enum Fixup {
@@ -114,6 +153,30 @@ pub struct Encoder {
     fixups: Vec<(u32, Fixup, u32)>,
     /// `emit_word_diff` sites: `(word offset, base label, target label)` patched to `target - base`.
     diffs: Vec<(u32, u32, u32)>,
+    /// Every insertion branch relaxation made, as `(position, bytes grown)`, in the order made.
+    ///
+    /// The encoder shifts what it OWNS (labels, fixups, diffs) itself. It cannot shift what it does
+    /// not own, and this backend's caller records descriptor/call relocations against
+    /// `position()` in its own vectors -- so relaxation would move every one of them off its
+    /// instruction. Handing the insertions back lets the caller re-point them
+    /// ([`Assembled::shifts`], applied with [`shift_position`]).
+    shifts: Vec<(u32, u32)>,
+}
+
+/// Re-points a byte offset recorded BEFORE relaxation to where it sits AFTER, given the insertions
+/// [`Assembled::shifts`] reports. An offset moves by the total inserted at or before it.
+///
+/// A site exactly AT an insertion point moves too: the relaxation splices the unconditional jump
+/// AFTER the branch it widens, so anything recorded at that address belonged to the following
+/// instruction and has to travel with it.
+#[must_use]
+pub fn shift_position(shifts: &[(u32, u32)], position: u32) -> u32 {
+    shifts
+        .iter()
+        .filter(|(at, _)| *at <= position)
+        .map(|(_, grow)| *grow)
+        .sum::<u32>()
+        + position
 }
 
 impl Encoder {
@@ -409,9 +472,101 @@ impl Encoder {
         self.emit_word(0x0010_0073);
     }
 
+
+    /// `csrrw rd, csr, rs1` -- atomically write `rs1` into `csr` and read the OLD value into `rd`.
+    /// With `rd = x0` the read is suppressed, which is the `csrw` pseudo-instruction
+    /// ([`Encoder::csrw`]).
+    pub fn csrrw(&mut self, rd: Reg, csr: u16, rs1: Reg) {
+        self.i_type(i32::from(csr), rs1, 1, rd, 0x73);
+    }
+
+    /// `csrrs rd, csr, rs1` -- read `csr` into `rd` and SET the bits `rs1` names. With `rs1 = x0`
+    /// nothing is written, which is the `csrr` pseudo-instruction ([`Encoder::csrr`]).
+    pub fn csrrs(&mut self, rd: Reg, csr: u16, rs1: Reg) {
+        self.i_type(i32::from(csr), rs1, 2, rd, 0x73);
+    }
+
+    /// `csrw csr, rs` -- write a CSR, discarding its old value (`csrrw x0, csr, rs`).
+    pub fn csrw(&mut self, csr: u16, rs: Reg) {
+        self.csrrw(Reg::ZERO, csr, rs);
+    }
+
+    /// `csrr rd, csr` -- read a CSR without writing it (`csrrs rd, csr, x0`).
+    pub fn csrr(&mut self, rd: Reg, csr: u16) {
+        self.csrrs(rd, csr, Reg::ZERO);
+    }
+
+    /// Inserts `insert` at `at`, carrying everything the encoder owns past it: a label, fixup site
+    /// or diff site AT OR AFTER the insertion belongs to code that just moved. Records the growth so
+    /// the caller can carry ITS relocations too (see [`Encoder::shifts`]).
+    fn splice_in(&mut self, at: u32, insert: &[u8]) {
+        let grow = insert.len() as u32;
+        let pos = at as usize;
+        self.bytes.splice(pos..pos, insert.iter().copied());
+        for slot in self.labels.iter_mut().flatten() {
+            if *slot >= at {
+                *slot += grow;
+            }
+        }
+        for (site, _, _) in &mut self.fixups {
+            if *site >= at {
+                *site += grow;
+            }
+        }
+        for (site, _, _) in &mut self.diffs {
+            if *site >= at {
+                *site += grow;
+            }
+        }
+        self.shifts.push((at, grow));
+        self.shifts.sort_unstable();
+    }
+
+    /// Widens ONE conditional branch that cannot reach its target, and reports whether it did.
+    ///
+    /// A B-type branch reaches +/-4 KB; a J-type jump reaches +/-1 MB. So a far branch becomes the
+    /// INVERTED branch over an unconditional jump to the real target: the taken path falls into the
+    /// jump, the not-taken path skips it. Inverting is one bit -- `beq`/`bne`, `blt`/`bge`,
+    /// `bltu`/`bgeu` differ only in funct3 bit 0.
+    ///
+    /// One per call, because the splice moves every later site and a second far branch has to be
+    /// re-measured against the new layout rather than the old. [`Encoder::finish`] loops to a
+    /// fixpoint.
+    fn widen_far_conditional_branch(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (site, fixup, label_id) = self.fixups[idx];
+            if !matches!(fixup, Fixup::Branch) {
+                continue;
+            }
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            if (-4096..=4094).contains(&(target as i64 - site as i64)) {
+                continue;
+            }
+            self.splice_in(site + 4, &JAL_X0_PLACEHOLDER.to_le_bytes());
+            let s = site as usize;
+            let word = u32::from_le_bytes([
+                self.bytes[s],
+                self.bytes[s + 1],
+                self.bytes[s + 2],
+                self.bytes[s + 3],
+            ]);
+            self.bytes[s..s + 4].copy_from_slice(&(word ^ (1 << 12)).to_le_bytes());
+            let skip = self.new_label();
+            self.labels[skip.0 as usize] = Some(site + 8);
+            self.fixups[idx].2 = skip.0;
+            self.fixups.push((site + 4, Fixup::Jump, label_id));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Resolves every label reference and returns the finished image, or an error if a label is
     /// unbound or a target is out of range.
     pub fn finish(mut self) -> Result<Assembled, AssembleError> {
+        while self.widen_far_conditional_branch()? {}
         for &(site, base_label, target_label) in &self.diffs {
             let base = self
                 .labels
@@ -463,7 +618,11 @@ impl Encoder {
             let imm = match fixup {
                 Fixup::Branch => {
                     if !(-4096..=4094).contains(&offset) {
-                        return Err(AssembleError::BranchOutOfRange);
+                        return Err(AssembleError::BranchOutOfRange {
+                            at: site,
+                            offset,
+                            limit: 4096,
+                        });
                     }
                     let off = offset as u32;
                     ((off >> 12) & 1) << 31
@@ -473,7 +632,11 @@ impl Encoder {
                 }
                 Fixup::Jump => {
                     if !(-1_048_576..=1_048_574).contains(&offset) {
-                        return Err(AssembleError::BranchOutOfRange);
+                        return Err(AssembleError::BranchOutOfRange {
+                            at: site,
+                            offset,
+                            limit: 1_048_576,
+                        });
                     }
                     let off = offset as u32;
                     ((off >> 20) & 1) << 31
@@ -486,13 +649,65 @@ impl Encoder {
             let patched = (base | imm).to_le_bytes();
             self.bytes[site as usize..site as usize + 4].copy_from_slice(&patched);
         }
-        Ok(Assembled { bytes: self.bytes })
+        Ok(Assembled {
+            bytes: self.bytes,
+            shifts: self.shifts,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_far_conditional_branch_widens_into_an_inverted_branch_over_a_jump() {
+        let mut enc = Encoder::new();
+        let far = enc.new_label();
+        enc.branch(BranchCond::Eq, Reg::T0, Reg::T1, far);
+        for _ in 0..2000 {
+            enc.addi(Reg::ZERO, Reg::ZERO, 0);
+        }
+        enc.bind_label(far);
+        let out = enc.finish().expect("a far branch widens instead of refusing");
+        let word = |i: usize| {
+            u32::from_le_bytes([
+                out.bytes[i],
+                out.bytes[i + 1],
+                out.bytes[i + 2],
+                out.bytes[i + 3],
+            ])
+        };
+        assert_eq!(word(0) & 0x7f, 0x63, "the first instruction is still a branch");
+        assert_eq!(
+            (word(0) >> 12) & 7,
+            1,
+            "beq must have inverted to bne, so the NOT-taken path skips the jump"
+        );
+        assert_eq!(word(4) & 0x7f, 0x6f, "a jal must follow it");
+        assert_eq!((word(4) >> 7) & 0x1f, 0, "the jal links into x0 -- an unconditional jump");
+        let imm = ((word(0) >> 8) & 0xf) << 1 | ((word(0) >> 25) & 0x3f) << 5 | ((word(0) >> 7) & 1) << 11;
+        assert_eq!(imm, 8, "the inverted branch lands just past the jump");
+        assert_eq!(
+            out.shifts.as_slice(),
+            &[(4u32, 4u32)][..],
+            "one 4-byte insertion, reported to the caller"
+        );
+    }
+
+    #[test]
+    fn a_reachable_branch_is_left_exactly_as_it_was() {
+        let mut enc = Encoder::new();
+        let near = enc.new_label();
+        enc.branch(BranchCond::Eq, Reg::T0, Reg::T1, near);
+        enc.addi(Reg::ZERO, Reg::ZERO, 0);
+        enc.bind_label(near);
+        let out = enc.finish().expect("a near branch assembles");
+        assert_eq!(out.bytes.len(), 8, "no instruction was inserted");
+        assert!(out.shifts.is_empty(), "nothing moved, so nothing to re-point");
+        let w = u32::from_le_bytes([out.bytes[0], out.bytes[1], out.bytes[2], out.bytes[3]]);
+        assert_eq!((w >> 12) & 7, 0, "beq stays beq");
+    }
 
     #[test]
     fn encodes_addi_and_add() {
@@ -504,6 +719,18 @@ mod tests {
         assert_eq!(&bytes[0..4], &0x0280_0293u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &0x0020_0313u32.to_le_bytes());
         assert_eq!(&bytes[8..12], &0x0062_8533u32.to_le_bytes());
+    }
+
+    #[test]
+    fn csr_access_matches_the_reference_assembler() {
+        let mut enc = Encoder::new();
+        enc.csrw(csr::MTVEC, Reg::T0);
+        enc.csrr(Reg::A0, csr::MCAUSE);
+        enc.csrr(Reg::A0, csr::MEPC);
+        let bytes = enc.finish().unwrap().bytes;
+        assert_eq!(&bytes[0..4], &0x3052_9073u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0x3420_2573u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &0x3410_2573u32.to_le_bytes());
     }
 
     #[test]

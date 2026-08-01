@@ -177,7 +177,8 @@ mod tests {
         assert_eq!(diagnostics[0].code(), 246);
         assert_eq!(
             diagnostics[0].kind.to_string(),
-            "The type or namespace name 'Nope' could not be found"
+            "The type or namespace name 'Nope' could not be found \
+             (are you missing a using directive or an assembly reference?)"
         );
     }
 

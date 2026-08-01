@@ -119,6 +119,7 @@ fn type_info(
                 .iter()
                 .map(|parameter| sigtype_to_symbol(assembly, parameter))
                 .collect(),
+            parameter_info: imported_parameter_info(&method, signature.parameters.len()),
             is_static: !signature.has_this,
             is_params: method
                 .params()
@@ -185,6 +186,53 @@ fn type_info(
 /// Maps a referenced member's access flags (the low 3 bits) to an accessibility, over the full
 /// `MemberAccess` mask (II.23.1.5 / II.23.1.10). `FamANDAssem` maps to the most restrictive
 /// answer, since it is inaccessible from another assembly whatever the reference says.
+/// The declared names and `ref`/`out` modes of an imported method's parameters, read from the
+/// `Param` table (II.22.33).
+///
+/// TWO DETAILS THAT ARE NOT OPTIONAL. **`Sequence` 0 is the RETURN value**, not the first
+/// parameter, and parameters are numbered from 1 -- so the rows are placed BY SEQUENCE rather than
+/// by iteration order, or every name would be off by one for any method whose return value carries
+/// a row. And **`ref` and `out` are the same type in a signature** (`T&`); only the `Out` flag
+/// (0x0002) separates them, which is exactly the fact CS1620 exists to report.
+///
+/// A row may be absent or unnamed -- a reference assembly is not obliged to carry names -- so any
+/// slot it does not fill stays empty, and [`MethodSymbol::parameter_name`] reports that as "not
+/// known" rather than as a name. Returns EMPTY when no row supplied anything, which keeps the
+/// vector's invariant honest: absent, not fabricated.
+fn imported_parameter_info(
+    method: &lamella_metadata::Method,
+    count: usize,
+) -> Vec<crate::symbols::ParameterInfo> {
+    use crate::symbols::{ParameterInfo, ParameterMode};
+    const PARAM_OUT: u32 = 0x0002;
+    let mut info = alloc::vec![
+        ParameterInfo {
+            name: "".into(),
+            mode: ParameterMode::Value,
+        };
+        count
+    ];
+    let mut any = false;
+    for param in method.params() {
+        let sequence = param.sequence();
+        if sequence == 0 {
+            continue;
+        }
+        let Some(slot) = info.get_mut(sequence as usize - 1) else {
+            continue;
+        };
+        if let Some(name) = param.name() {
+            slot.name = name.into();
+            any = true;
+        }
+        if param.flags() & PARAM_OUT != 0 {
+            slot.mode = ParameterMode::Out;
+            any = true;
+        }
+    }
+    if any { info } else { Vec::new() }
+}
+
 fn member_accessibility(flags: u32) -> Accessibility {
     match flags & 0x0007 {
         0x0000 => Accessibility::Private,

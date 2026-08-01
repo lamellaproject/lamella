@@ -316,6 +316,320 @@ pub mod deploy {
     pub const WINC_FW_RESULT: u8 = 0x2d;
 }
 
+/// Lamella Link message types for a BUNDLE -- an artifact a target loads through a different front end
+/// than a baked image, in the same two shapes an image has: run it now, or persist it so it boots.
+///
+/// RESERVED: no firmware implements these yet. **The identifiers are claimed here so nothing else takes
+/// them and breaks the wire when they land**, which is the same reason the telemetry range above is
+/// claimed rather than left to whoever gets there first.
+///
+/// # Why a distinct OP rather than a kind byte on the image ops
+///
+/// A target that refuses an op it does not implement fails better than one that ACCEPTS a payload it
+/// cannot interpret. The refusal happens at the op, before the payload crosses the wire at all, and it
+/// names the thing that is missing; the alternative gets as far as a loader deciding it does not
+/// recognize a header, on a target with no good way to say so. It is the same rule as a hardware
+/// binding refusing to bind rather than simulating, and a runtime seam refusing rather than returning
+/// zero.
+///
+/// # Two consequences worth stating rather than leaving to be inferred
+///
+/// * **[`lamella_wire::PROTOCOL_VERSION`] does NOT change.** Adding an op is additive: a target that
+///   predates these answers the existing refusal, which is the designed behavior rather than a version
+///   break. Reusing an existing op with a new payload shape WOULD have changed the meaning of bytes
+///   already shipping under the current version.
+/// * **A bundle NEVER travels under [`deploy::DEPLOY_CHUNK`].** [`DEPLOY_BUNDLE`] carries
+///   `[offset u32][total u32][bytes]` ALWAYS, and a bundle that fits one frame is the degenerate
+///   one-chunk case (`offset = 0`, `total = len`). It costs eight bytes on a small bundle and buys two
+///   properties worth more than that: there is only ONE payload shape, so the single-frame and chunked
+///   paths are the same code on both sides; and **the artifact kind rides EVERY frame rather than only
+///   the committing one**, so a transfer interrupted partway cannot be misread as a partial baked image
+///   and a target reassembling bytes never holds them in a kind-unknown state. The commit rule is the
+///   image path's: complete when `offset + len == total`.
+///
+/// # A host gates on the CAPABILITY
+///
+/// [`lamella_wire::Capabilities::BUNDLE`] is the bit a target sets when it implements these, and it
+/// rides in the `HELLO_ACK` a session already exchanges -- so gating on it costs no round-trip. Probing
+/// by sending one also works now that an unimplemented type is refused rather than dropped
+/// ([`lamella_wire::error`]), but it costs a round-trip per question and answers only one of them.
+///
+/// # These two FILL the 0x20 block
+///
+/// The block held run, deploy, and a module-firmware transfer, and 0x2e/0x2f were the last free pair
+/// in it. **A third op in this family needs a range decision rather than the next number**, which is
+/// worth knowing before the question is urgent.
+pub mod bundle {
+    /// Host -> target: run a bundle from RAM now, without persisting it. Payload = the bundle's bytes.
+    /// The run-from-RAM counterpart of [`super::repl::RUN_IMAGE`], answered the same way by
+    /// [`super::repl::RUN_RESULT`]. RESERVED.
+    pub const RUN_BUNDLE: u8 = 0x2e;
+    /// Host -> target: persist a bundle to the deploy region so the target boots it on reset. The
+    /// counterpart of [`deploy::DEPLOY_IMAGE`], answered the same way by [`deploy::DEPLOY_RESULT`].
+    ///
+    /// **Payload is ALWAYS `[offset u32][total u32][bytes]`**, one shape for both the single-frame and
+    /// the chunked case -- see the module docs for why that is worth eight bytes on a small bundle.
+    ///
+    /// **The asymmetry with [`RUN_BUNDLE`] is deliberate rather than an oversight:** running from RAM
+    /// does not chunk today, so it takes the bare bytes, and giving it a header it does not need would
+    /// be inventing a shape ahead of a use for it. If it ever chunks, this is the shape to copy.
+    /// RESERVED.
+    pub const DEPLOY_BUNDLE: u8 = 0x2f;
+}
+
+/// Lamella Link message types for the LIVE debug agent (the 0x60 range): read and write the
+/// target's memory **while a deployed app is still running**, without stopping it.
+///
+/// This is the on-target half of a host-side REPL evaluating against a live program: the host runs
+/// the interpreter and redirects its loads and stores over the wire to here. It is deliberately the
+/// smallest thing that can answer that question -- an address and a length -- because that primitive
+/// is the same on every tier. An interpreted app's state lives on a heap the host cannot name and an
+/// AOT app's lives at addresses a symbol map does name, and neither changes what this op does.
+///
+/// # Why this is a distinct range from the 0x10 DEBUG ops rather than more of them
+///
+/// The 0x10 range is a HALTED channel. [`super::debug::DBG_LOCALS`] says so in its own contract:
+/// accepted while halted, because "between stops the values are in motion". Every op there presumes
+/// a program stopped at a known point, and several of them ([`super::debug::DBG_STEP`],
+/// [`super::debug::DBG_RESUME`]) have no meaning otherwise. These two ops presume the opposite.
+/// Mixing them would give one range two contracts, with nothing in a message type to say which one
+/// a target is honoring.
+///
+/// # What a running target's answer does NOT promise, and why that is stated here
+///
+/// **A multi-word read is not atomic with respect to the program.** The agent is serviced between
+/// the app's instructions, so a structure the app updates in more than one store can be read
+/// half-updated. A host that renders such a value as though it were consistent is worse than one
+/// that refuses: a REPL showing a torn value is a wrong answer presented as a right one. Nothing on
+/// the target can fix this -- the target does not know which words belong together -- so the host
+/// must either read something it knows is single-word, or read twice and compare, or say plainly
+/// that the value was in motion.
+///
+/// **A write may not be what the program reads next.** On a compiled tier the app may hold the
+/// location in a register across the write, so the store lands in memory and the program keeps using
+/// the stale copy. That is a property of the app's code, not of this op.
+///
+/// Both are reasons for a host to be careful, not reasons for a target to refuse: the alternative to
+/// an inexact live read is halting a controller, which for a machine that is actually running
+/// something is the more expensive of the two.
+pub mod live {
+    /// Host -> target: read target memory WITHOUT stopping the running app. Payload =
+    /// `addr(u32 LE) | len(u16 LE)`. Answered by [`LIVE_DATA`]. Served both while an app runs
+    /// (the point of the op) and while the target is serving, so a host gets the same answer
+    /// either way -- which is what lets it tell an app that has stopped from an agent that has.
+    pub const LIVE_READ: u8 = 0x60;
+    /// Target -> host: `status(u8)` then, on [`status::OK`], the `len` bytes that were read.
+    /// A nonzero status carries no bytes.
+    pub const LIVE_DATA: u8 = 0x61;
+    /// Host -> target: write target memory WITHOUT stopping the running app. Payload =
+    /// `addr(u32 LE) | bytes[tail]`. Answered by [`LIVE_WROTE`].
+    pub const LIVE_WRITE: u8 = 0x62;
+    /// Target -> host: `status(u8) | written(u16 LE)` -- the byte count written, 0 on any nonzero
+    /// status. A partial write never happens: the whole span is checked before the first byte.
+    pub const LIVE_WROTE: u8 = 0x63;
+
+    /// Why a [`LIVE_READ`] or [`LIVE_WRITE`] was refused. Byte 0 of [`LIVE_DATA`] / [`LIVE_WROTE`].
+    ///
+    /// A refusal is per-request and in-band, distinct from [`lamella_wire::msg::ERROR`]: the op IS
+    /// implemented, and the target is saying this particular address or length is not one it will
+    /// touch. The two failures need different repairs -- a different firmware versus a different
+    /// address -- so they are different answers.
+    pub mod status {
+        /// The request was served.
+        pub const OK: u8 = 0;
+        /// This firmware declares no live window, so it carries no agent. A build that never calls
+        /// [`crate::set_live_window`] answers every request this way rather than dereferencing an
+        /// address a host asked for -- the difference between a refusal and a bus fault.
+        pub const NO_WINDOW: u8 = 1;
+        /// The requested span is not entirely inside the declared window.
+        pub const OUT_OF_WINDOW: u8 = 2;
+        /// The payload is malformed, the length is zero, or a read exceeds [`super::MAX_READ`].
+        pub const BAD_REQUEST: u8 = 3;
+    }
+
+    /// The most bytes one [`LIVE_READ`] may ask for.
+    ///
+    /// The bound is not about buffer space; it is about the app. Servicing a read is time the
+    /// deployed program is not running, and that time is proportional to the length, so bounding the
+    /// length is the only way the target bounds the stall it imposes on a program it is supposed to
+    /// be leaving alone. A host inspecting a variable needs a handful of bytes; one that wants a
+    /// region asks repeatedly and lets the app run in between.
+    pub const MAX_READ: usize = 256;
+
+    /// Whether `msg_type` is one of this range's REQUESTS (the two a target serves).
+    #[must_use]
+    pub fn is_request(msg_type: u8) -> bool {
+        msg_type == LIVE_READ || msg_type == LIVE_WRITE
+    }
+}
+
+#[cfg(test)]
+mod device_portability {
+    /// This file's own text. Read rather than reasoned about, for the same reason [`op_numbers`]
+    /// reads it: the mistake is one line that looks correct everywhere it is reviewed.
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The types that do not exist on a 32-bit-atomic target.
+    const ABSENT_ON_THUMBV7EM: [&str; 3] = ["AtomicU64", "AtomicI64", "AtomicF64"];
+
+    /// The source split into (SHIPPED, TEST-ONLY) lines.
+    ///
+    /// Test-only code is genuinely exempt -- it is compiled for the host and never linked into a
+    /// firmware -- and the exemption is load-bearing rather than a convenience: the interpreter, the
+    /// network stack, and the WiFi driver all legitimately use a 64-bit atomic in a `#[cfg(test)]`
+    /// clock stand-in, so a check without it would report four defects that are not defects, and be
+    /// switched off.
+    fn partition() -> (alloc::vec::Vec<&'static str>, alloc::vec::Vec<&'static str>) {
+        let mut shipped = alloc::vec::Vec::new();
+        let mut test_only = alloc::vec::Vec::new();
+        let mut in_test = false;
+        for line in SOURCE.lines() {
+            if line.starts_with("#[cfg(") && line.contains("test") {
+                in_test = true;
+            }
+            if in_test {
+                test_only.push(line);
+                if line == "}" {
+                    in_test = false;
+                }
+            } else {
+                shipped.push(line);
+            }
+        }
+        (shipped, test_only)
+    }
+
+    #[test]
+    fn no_64_bit_atomic_reaches_a_device_build() {
+        let (shipped, test_only) = partition();
+
+        assert!(
+            shipped.len() > test_only.len(),
+            "the partition put {} lines in shipped and {} in test -- it is broken, not the source",
+            shipped.len(),
+            test_only.len()
+        );
+        assert!(
+            shipped.iter().any(|line| line.contains("RESIDENT_CORLIB_HASH_LO")),
+            "the shipped side does not contain the statics that replaced the AtomicU64 -- the \
+             partition is not reading shipped code"
+        );
+        assert!(
+            test_only.iter().any(|line| line.contains("fn no_two_message_types_claim_the_same_byte")),
+            "the test side does not contain a known test -- the partition is not finding cfg(test)"
+        );
+
+        for line in shipped {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for absent in ABSENT_ON_THUMBV7EM {
+                assert!(
+                    !code.contains(absent),
+                    "shipped code uses {absent}, which does not exist on thumbv7em \
+                     (max-atomic-width 32): every device firmware linking this crate will fail to \
+                     build, and no host gate will notice. Use two 32-bit halves.\n    {line}"
+                );
+            }
+        }
+    }
+}
+
+/// That no two message types claim the same byte.
+///
+/// # Why this is a test and not a convention
+///
+/// The ranges are grouped by family and allocated by whoever adds a feature, months apart, and a
+/// collision is not a compile error -- two names for one byte is legal Rust. **It is also not visible in
+/// review**: the tables are hundreds of lines apart, a new op is one line, and the obvious next number
+/// after a family's last one is frequently already taken by a family that grew into the gap. This check
+/// exists because that has now been proposed once.
+#[cfg(test)]
+mod op_numbers {
+    use lamella_wire::msg;
+
+    use super::deploy;
+
+    /// This file's own text, so the check reads the TABLE rather than a copy of it.
+    ///
+    /// A list maintained by hand cannot catch the allocation that forgot to update the list, which is
+    /// the only mistake worth catching here.
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The modules that allocate MESSAGE TYPES.
+    ///
+    /// `debug::val` and `debug::reason` are deliberately absent: they are different namespaces -- a
+    /// value's kind, a stop reason -- which legitimately reuse the same small numbers, and folding them
+    /// in here would report collisions that are not collisions.
+    const OP_MODULES: [&str; 7] =
+        ["repl", "debug", "profile", "telemetry", "deploy", "bundle", "live"];
+
+    /// Every message type this file allocates, as its name and byte.
+    fn allocated() -> alloc::vec::Vec<(&'static str, u8)> {
+        let mut found = alloc::vec::Vec::new();
+        let mut module = "";
+        for line in SOURCE.lines() {
+            let text = line.trim();
+            if let Some(rest) = text.strip_prefix("pub mod ") {
+                module = rest.trim_end_matches('{').trim();
+            }
+            if !OP_MODULES.contains(&module) {
+                continue;
+            }
+            let Some(rest) = text.strip_prefix("pub const ") else { continue };
+            let Some((name, value)) = rest.split_once(": u8 = ") else { continue };
+            let literal = value
+                .split_once(';')
+                .unwrap_or_else(|| panic!("{name}: no terminating semicolon"))
+                .0
+                .trim();
+            let byte = literal
+                .strip_prefix("0x")
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .unwrap_or_else(|| panic!("{name} = {literal}: not a hexadecimal byte"));
+            found.push((name, byte));
+        }
+        found
+    }
+
+    #[test]
+    fn no_two_message_types_claim_the_same_byte() {
+        let ops = allocated();
+        assert!(
+            ops.len() >= 25,
+            "only {} message types were extracted -- the reader is broken, not the table",
+            ops.len()
+        );
+        for (index, (name, byte)) in ops.iter().enumerate() {
+            for (other, other_byte) in ops.iter().skip(index + 1) {
+                assert_ne!(byte, other_byte, "{name} and {other} both claim {byte:#04x}");
+            }
+        }
+    }
+
+    /// The core types belong to the transport rather than to any feature range, so a feature that
+    /// allocated one of them would be answered as a handshake.
+    #[test]
+    fn no_feature_range_claims_a_core_type() {
+        let core = [msg::HELLO, msg::HELLO_ACK, msg::NAK, msg::ERROR, msg::PING, msg::PONG];
+        for (name, byte) in allocated() {
+            assert!(!core.contains(&byte), "{name} claims the core type {byte:#04x}");
+        }
+    }
+
+    /// **The block this family lives in is FULL**, which is a fact worth failing on rather than
+    /// discovering: the next op in it has to go somewhere else, and the cheapest moment to know that is
+    /// before someone picks the next number.
+    #[test]
+    fn the_run_and_deploy_block_has_no_room_left() {
+        let taken: alloc::vec::Vec<u8> =
+            allocated().into_iter().map(|(_, byte)| byte).filter(|byte| (0x20..=0x2f).contains(byte)).collect();
+        assert_eq!(taken.len(), 16, "the 0x20 block is full; a new op here needs a new range");
+        assert!(taken.contains(&deploy::DEPLOY_CHUNK));
+    }
+}
+
 /// Re-exported for a deploy host: read a baked image's content checksum from its header, to compare
 /// against what a target already holds (content-addressed deploy-skip) without a direct dependency on
 /// the interpreter crate.
@@ -343,6 +657,20 @@ pub trait FlashSink {
     fn program_chunk(&mut self, offset: usize, chunk: &[u8], total: usize) -> bool {
         let _ = (offset, chunk, total);
         false
+    }
+
+    /// The corlib this firmware holds RESIDENT in flash, if any -- what a deployed bare PE
+    /// resolves its corlib references against ([`load_deployed`]).
+    ///
+    /// It belongs on this seam, beside the region it resolves against, rather than in each
+    /// caller's arguments: booting the deployed artifact and debugging it must accept the SAME
+    /// artifacts, and a target where one path resolves a program PE and another does not is one
+    /// that runs a program it then refuses to debug. One answer, on the seam both already take.
+    ///
+    /// Defaulted to `None`, so a firmware carrying no corlib is unchanged and a bare PE is refused
+    /// by name on every path at once.
+    fn resident_corlib(&self) -> Option<&'static [u8]> {
+        None
     }
 }
 
@@ -436,7 +764,7 @@ impl RunResult {
 /// trap is exit 70 (matching the interpreter's abort convention).
 #[must_use]
 pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
-    #[cfg(feature = "baked-image")]
+    #[cfg(any(feature = "baked-image", feature = "corlib-lazy"))]
     let (corlib_bytes, program_bytes): (&'static [u8], &'static [u8]) = (
         Box::leak(corlib_bytes.to_vec().into_boxed_slice()),
         Box::leak(program_bytes.to_vec().into_boxed_slice()),
@@ -484,6 +812,14 @@ fn failure(reason: &str) -> RunResult {
 /// -- this build's identity always carries the structured board/chip fields, even when a
 /// firmware left them `0` = unknown.
 fn serve_caps() -> lamella_wire::Capabilities {
+    serve_caps_with(RESIDENT_CORLIB_PRESENT.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`serve_caps`] with the resident-corlib answer supplied rather than read from the static, so the
+/// advertisement rule is checkable without a test having to reach into process-wide state -- which
+/// would make every other test in the process depend on whether that one had run yet.
+#[cfg(feature = "baked-image")]
+fn serve_caps_with(resident_corlib: bool) -> lamella_wire::Capabilities {
     use lamella_wire::Capabilities;
     Capabilities(
         Capabilities::BAKED_IMAGE
@@ -491,8 +827,89 @@ fn serve_caps() -> lamella_wire::Capabilities {
             | Capabilities::BREAKPOINTS
             | Capabilities::STEPPING
             | Capabilities::LOCALS
-            | Capabilities::PROFILE_CHIPID,
+            | Capabilities::PROFILE_CHIPID
+            | if resident_corlib { Capabilities::RESIDENT_CORLIB } else { 0 },
     )
+}
+
+/// Whether this firmware holds a resident corlib, and that corlib's content hash.
+///
+/// Statics for the same reason the board/chip words below are: it is a property of the running
+/// FIRMWARE, not of a request. **The hash is computed ONCE** -- a corlib is a couple of hundred
+/// kilobytes of flash and a `HELLO` is answered on the reclaim path, where a host is waiting.
+#[cfg(feature = "baked-image")]
+static RESIDENT_CORLIB_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "baked-image")]
+static RESIDENT_CORLIB_HASH_LO: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "baked-image")]
+static RESIDENT_CORLIB_HASH_HI: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Records the resident corlib a serve path was handed, so the advertisement can describe it.
+///
+/// Called at the entry of every serve path that answers a `HELLO`, which is what makes the identity
+/// correct on the FIRST frame of a session -- a `HELLO` is often the first frame, and an identity that
+/// gained the corlib only afterwards would advertise two different surfaces for one firmware.
+#[cfg(feature = "baked-image")]
+fn note_resident_corlib(corlib: Option<&'static [u8]>) {
+    use core::sync::atomic::Ordering;
+    let Some(bytes) = corlib else { return };
+    if RESIDENT_CORLIB_PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
+    let hash = fnv1a(FNV_OFFSET, bytes);
+    RESIDENT_CORLIB_HASH_LO.store(hash as u32, Ordering::Relaxed);
+    RESIDENT_CORLIB_HASH_HI.store((hash >> 32) as u32, Ordering::Relaxed);
+    RESIDENT_CORLIB_PRESENT.store(true, Ordering::Relaxed);
+}
+
+/// The resident surface's content hash: the intrinsic registry's fingerprint, continued over the
+/// resident corlib's digest when there is one.
+///
+/// One continued fold rather than two schemes stitched together -- the registry's fingerprint is
+/// FNV-1a, so this is the same walk carried on. A target with no resident corlib reports the
+/// fingerprint unchanged, which is what every such firmware reported before this existed.
+#[cfg(feature = "baked-image")]
+fn resident_surface_hash() -> u64 {
+    use core::sync::atomic::Ordering;
+    resident_surface_hash_of(RESIDENT_CORLIB_PRESENT.load(Ordering::Relaxed).then(|| {
+        u64::from(RESIDENT_CORLIB_HASH_LO.load(Ordering::Relaxed))
+            | (u64::from(RESIDENT_CORLIB_HASH_HI.load(Ordering::Relaxed)) << 32)
+    }))
+}
+
+/// The hash RULE, with the resident corlib's digest supplied rather than read from the statics.
+///
+/// Split out so a test exercises the shipped arithmetic instead of a copy of it: a test that
+/// reimplemented this rule would agree with a broken version of it, which is the same trap as proving a
+/// codec against a transcription of itself. Reaching the statics from a test is the alternative, and it
+/// would make every other test in the process depend on whether that one had run.
+#[cfg(feature = "baked-image")]
+fn resident_surface_hash_of(resident_corlib: Option<u64>) -> u64 {
+    let registry = lamella_cil_runtime::intrinsic_registry::registry_fingerprint();
+    match resident_corlib {
+        Some(corlib) => fnv1a(registry, &corlib.to_le_bytes()),
+        None => registry,
+    }
+}
+
+/// FNV-1a's offset basis and prime, matching the intrinsic registry's fingerprint.
+#[cfg(feature = "baked-image")]
+const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+#[cfg(feature = "baked-image")]
+const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+/// FNV-1a over `bytes`, continuing from `seed`.
+#[cfg(feature = "baked-image")]
+fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+    let mut hash = seed;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// The board/chip identity words the firmware installed at boot ([`set_board_identity`]):
@@ -520,24 +937,220 @@ pub fn set_board_identity(board_model: u16, chip_idcode: u32, chip_devid: u32) {
     CHIP_DEVID.store(chip_devid, Ordering::Relaxed);
 }
 
-/// [`serve_caps`] plus the deploy tier's extras: a target with a persistent image region
-/// also debugs it in place ([`debug::DBG_ATTACH`]).
+/// The span of the target's address space the LIVE debug agent ([`live`]) will read and write:
+/// base, and length in bytes. `(0, 0)` -- the default -- means no window, and every live request
+/// is refused ([`live::status::NO_WINDOW`]).
+///
+/// # Why the agent needs a declared window rather than the whole address space
+///
+/// An unmapped address is not a quiet zero on this architecture; dereferencing one is a bus fault,
+/// and a bus fault inside the service callback takes down the FIRMWARE -- so a host's typo would
+/// stop the very program the op exists to leave running. Worse, it would stop it in the way that
+/// looks exactly like the answer we are trying to measure. A window converts that into a two-byte
+/// refusal.
+///
+/// # Why the firmware installs it rather than this crate knowing it
+///
+/// Which spans of an address space are readable is a PER-CHIP fact, and this crate is shared by
+/// every target. The firmware knows its own part; it also knows the linker script it was built
+/// with, which is where the number actually comes from. Same shape as the other boot-installed
+/// seams ([`set_board_identity`]).
 #[cfg(feature = "baked-image")]
-fn deploy_caps() -> lamella_wire::Capabilities {
-    lamella_wire::Capabilities(serve_caps().0 | lamella_wire::Capabilities::DEBUG_ATTACH)
+static LIVE_WINDOW_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "baked-image")]
+static LIVE_WINDOW_LEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Declares the address span the LIVE debug agent may read and write (see [`LIVE_WINDOW_BASE`]),
+/// and by doing so turns the agent on: until this is called, every [`live`] request is refused.
+/// Call once at boot, before serving.
+///
+/// A `len` of 0 leaves the agent off. A span that wraps the end of the address space is rejected
+/// here rather than at request time, so a bad window can never widen into an unbounded one.
+#[cfg(feature = "baked-image")]
+pub fn set_live_window(base: u32, len: u32) {
+    use core::sync::atomic::Ordering;
+    let Some((base, len)) = checked_window(base, len) else { return };
+    LIVE_WINDOW_BASE.store(base, Ordering::Relaxed);
+    LIVE_WINDOW_LEN.store(len, Ordering::Relaxed);
 }
 
-/// This build's resident-profile identity: the intrinsic-ABI level +
-/// the registry fingerprint as the surface hash + the surface's name, all derived in
-/// `intrinsic_registry` from the one feature set that shapes the registry. A Tier-2 target
-/// folds its resident corlib's content hash in once one is resident.
+/// A window that does not wrap the end of the address space, or `None`.
+///
+/// Split from [`set_live_window`] so the rule is checkable without a test writing the statics --
+/// process-wide state would make every other test in the process depend on whether that one had
+/// run yet, the same reason [`serve_caps_with`] exists.
+#[cfg(feature = "baked-image")]
+fn checked_window(base: u32, len: u32) -> Option<(u32, u32)> {
+    base.checked_add(len).map(|_| (base, len))
+}
+
+/// The live window the firmware declared, as `(base, len)`.
+#[cfg(feature = "baked-image")]
+fn live_window() -> (u32, u32) {
+    use core::sync::atomic::Ordering;
+    (LIVE_WINDOW_BASE.load(Ordering::Relaxed), LIVE_WINDOW_LEN.load(Ordering::Relaxed))
+}
+
+/// Whether the span `[addr, addr + len)` lies entirely inside `window`, and the window exists at
+/// all. `Err(status)` names which of those failed, so a host is told the difference between a
+/// firmware without an agent and an address it should not have asked for.
+#[cfg(feature = "baked-image")]
+fn live_span_ok(window: (u32, u32), addr: u32, len: usize) -> Result<(), u8> {
+    let (base, window) = window;
+    if window == 0 {
+        return Err(live::status::NO_WINDOW);
+    }
+    let Ok(len) = u32::try_from(len) else {
+        return Err(live::status::BAD_REQUEST);
+    };
+    let Some(end) = addr.checked_add(len) else {
+        return Err(live::status::OUT_OF_WINDOW);
+    };
+    if addr < base || end > base.saturating_add(window) {
+        return Err(live::status::OUT_OF_WINDOW);
+    }
+    Ok(())
+}
+
+/// The byte-level access the LIVE agent makes into the target's address space.
+///
+/// A seam rather than a direct call for the same reason the interpreter's MMIO is one: the real
+/// implementation dereferences an address a host chose, which is only meaningful on the device, and
+/// a HOST cannot even express a target address -- a 64-bit test machine has no buffer whose address
+/// fits the `u32` the wire carries. Without this the byte loop, the reply shape, and the
+/// whole-or-nothing write rule would be provable only on silicon, which means provable only when
+/// someone remembers to run a board.
+#[cfg(feature = "baked-image")]
+trait LiveMemory {
+    fn read8(&self, address: u32) -> u8;
+    fn write8(&mut self, address: u32, value: u8);
+}
+
+/// The real one: a volatile byte access at a raw address, through the crate that owns that unsafe
+/// (this one forbids it). VOLATILE is load-bearing -- the app is mutating this memory concurrently,
+/// so each byte must be fetched where it is asked for rather than folded or hoisted.
+#[cfg(feature = "baked-image")]
+struct TargetMemory;
+
+#[cfg(feature = "baked-image")]
+impl LiveMemory for TargetMemory {
+    fn read8(&self, address: u32) -> u8 {
+        lamella_mmio::read8(address)
+    }
+
+    fn write8(&mut self, address: u32, value: u8) {
+        lamella_mmio::write8(address, value);
+    }
+}
+
+/// Serve one LIVE debug-agent request ([`live::LIVE_READ`] / [`live::LIVE_WRITE`]) -- read or write
+/// the target's memory and answer, WITHOUT stopping anything.
+///
+/// This is the whole of the on-target agent. It is called from two places on purpose: from the
+/// deployed app's service callback ([`run_deployed_with`], the point of the op) and from the serve
+/// loop ([`serve_deploy_frame`], where no app is running). **Answering identically in both is what
+/// makes the op usable as its own control**: a host that keeps reading a location and sees the
+/// answers stop CHANGING, while the answers keep ARRIVING, has learned that the app stopped -- not
+/// that the link or the agent did. Serving it in only the running case would leave those two
+/// indistinguishable, which is the confound that makes a "it kept running" claim unfalsifiable.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier. A refused REQUEST is not an error: it is an
+/// ordinary reply carrying a [`live::status`] byte.
+#[cfg(feature = "baked-image")]
+fn serve_live_frame(
+    transport: &mut impl Transport,
+    frame: &lamella_wire::Frame,
+    window: (u32, u32),
+    memory: &mut dyn LiveMemory,
+) -> Result<(), TransportError> {
+    match frame.msg_type {
+        live::LIVE_READ => {
+            let payload = &frame.payload;
+            let request = if payload.len() >= 6 {
+                let addr = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let len = u16::from_le_bytes([payload[4], payload[5]]);
+                if len == 0 || usize::from(len) > live::MAX_READ {
+                    Err(live::status::BAD_REQUEST)
+                } else {
+                    live_span_ok(window, addr, usize::from(len)).map(|()| (addr, len))
+                }
+            } else {
+                Err(live::status::BAD_REQUEST)
+            };
+            match request {
+                Ok((addr, len)) => {
+                    let mut reply = Vec::with_capacity(usize::from(len) + 1);
+                    reply.push(live::status::OK);
+                    for address in addr..addr + u32::from(len) {
+                        reply.push(memory.read8(address));
+                    }
+                    transport.send(live::LIVE_DATA, frame.seq, &reply)?;
+                }
+                Err(status) => transport.send(live::LIVE_DATA, frame.seq, &[status])?,
+            }
+        }
+        live::LIVE_WRITE => {
+            let payload = &frame.payload;
+            let request = if payload.len() >= 5 {
+                let addr = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                live_span_ok(window, addr, payload.len() - 4).map(|()| addr)
+            } else {
+                Err(live::status::BAD_REQUEST)
+            };
+            let (status, written) = match request {
+                Ok(addr) => {
+                    for (address, byte) in (addr..).zip(payload[4..].iter()) {
+                        memory.write8(address, *byte);
+                    }
+                    (live::status::OK, payload.len() - 4)
+                }
+                Err(status) => (status, 0),
+            };
+            let count = u16::try_from(written).unwrap_or(u16::MAX).to_le_bytes();
+            transport.send(live::LIVE_WROTE, frame.seq, &[status, count[0], count[1]])?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// [`serve_caps`] plus the deploy tier's extras: a target with a persistent image region
+/// also debugs it in place ([`debug::DBG_ATTACH`]), and -- when the firmware declared a live
+/// window ([`set_live_window`]) -- answers the LIVE agent's memory ops while a deployed app runs.
+///
+/// The live bit is conditional on the window because the bit is a promise a host acts on: a
+/// firmware that carries the code but declares no window would refuse every request it advertised.
+#[cfg(feature = "baked-image")]
+fn deploy_caps() -> lamella_wire::Capabilities {
+    deploy_caps_with(serve_caps(), live_window().1)
+}
+
+/// The [`deploy_caps`] RULE with both inputs supplied rather than read from statics, so the
+/// advertisement is checkable without a test reaching into process-wide state.
+#[cfg(feature = "baked-image")]
+fn deploy_caps_with(
+    base: lamella_wire::Capabilities,
+    live_window_len: u32,
+) -> lamella_wire::Capabilities {
+    let live = if live_window_len == 0 { 0 } else { lamella_wire::Capabilities::LIVE_MEMORY };
+    lamella_wire::Capabilities(base.0 | lamella_wire::Capabilities::DEBUG_ATTACH | live)
+}
+
+/// This build's resident-profile identity: the intrinsic-ABI level + the resident surface's content
+/// hash + the surface's name, mostly derived in `intrinsic_registry` from the one feature set that
+/// shapes the registry.
+///
+/// **The surface hash folds in a resident corlib's contents when the target holds one** (see
+/// [`resident_surface_hash`]), which this doc said a Tier-2 target would do and which nothing did until
+/// there was a resident corlib to fold.
 #[cfg(feature = "baked-image")]
 fn profile_identity() -> lamella_wire::ProfileIdentity {
     use core::sync::atomic::Ordering;
     use lamella_cil_runtime::intrinsic_registry;
     lamella_wire::ProfileIdentity::new(
         intrinsic_registry::INTRINSIC_ABI,
-        intrinsic_registry::registry_fingerprint(),
+        resident_surface_hash(),
         intrinsic_registry::profile_name(),
     )
     .with_chip(
@@ -886,7 +1499,7 @@ fn run_until_stop(
     session: &mut lamella_cil_runtime::Session,
     caps: lamella_wire::Capabilities,
 ) -> Result<RunStop, TransportError> {
-    use lamella_cil_runtime::Status;
+    use lamella_cil_runtime::{PendingOp, Status};
     loop {
         for _ in 0..RUN_SERVICE_STEPS {
             match session.step(module, vm) {
@@ -907,26 +1520,84 @@ fn run_until_stop(
                     }
                 }
             }
-        }
-        if let Some(frame) = transport.poll()? {
-            match frame.msg_type {
-                debug::DBG_PAUSE => return Ok(RunStop::Paused),
-                lamella_wire::msg::HELLO => {
-                    hello_reply_caps(transport, &frame, caps)?;
-                    return Ok(RunStop::Reclaimed);
+            match lamella_cil_runtime::take_pending_op(vm) {
+                PendingOp::None | PendingOp::Yield => {}
+                PendingOp::SleepUntil(deadline) => {
+                    if let Some(stop) = wait_until(transport, vm, session, deadline, caps)? {
+                        return Ok(stop);
+                    }
                 }
-                debug::DBG_DETACH => {
-                    transport.send(debug::DBG_ACK, frame.seq, &[])?;
-                    return Ok(RunStop::Detached);
+                PendingOp::NeedsScheduler(what) => {
+                    return Ok(RunStop::Trap(RunResult {
+                        exit: 70,
+                        stdout: format!(
+                            "{}{what} needs the scheduler, which a debug session does not run: \
+                             attach steps ONE thread. Deploy and run it (DEPLOY_RUN) to use threads.",
+                            String::from_utf16_lossy(vm.output())
+                        ),
+                    }));
                 }
-                debug::DBG_BREAK => {
-                    apply_breakpoints(session, &frame.payload);
-                    transport.send(debug::DBG_ACK, frame.seq, &[])?;
-                }
-                _ => {}
             }
         }
+        if let Some(stop) = service_wire(transport, session, caps)? {
+            return Ok(stop);
+        }
     }
+}
+
+/// Hold the session until `deadline` (monotonic ms), keeping the carrier serviced.
+///
+/// A sleeping program executes no instructions, so the burst loop's poll never comes round: without
+/// this the target would stop answering for the length of the sleep, and a host could neither pause
+/// it nor take it back. `None` means the deadline arrived; a `Some` is the host ending the run.
+///
+/// It spins on the clock rather than asking the board to sleep, which keeps the poll continuous --
+/// there is nothing else for this tier to run while one thread waits.
+#[cfg(feature = "baked-image")]
+fn wait_until(
+    transport: &mut impl Transport,
+    vm: &mut Vm,
+    session: &mut lamella_cil_runtime::Session,
+    deadline: u64,
+    caps: lamella_wire::Capabilities,
+) -> Result<Option<RunStop>, TransportError> {
+    while vm.now_millis().is_some_and(|now| now < deadline) {
+        if let Some(stop) = service_wire(transport, session, caps)? {
+            return Ok(Some(stop));
+        }
+    }
+    Ok(None)
+}
+
+/// One pass of the mid-run wire contract, shared by the burst loop and the sleep wait so the two
+/// cannot drift: a `DBG_PAUSE` stops, a `HELLO` reclaims, a `DBG_DETACH` acks and ends, breakpoints
+/// may be edited without pausing first, and anything else is dropped. `None` = keep running.
+#[cfg(feature = "baked-image")]
+fn service_wire(
+    transport: &mut impl Transport,
+    session: &mut lamella_cil_runtime::Session,
+    caps: lamella_wire::Capabilities,
+) -> Result<Option<RunStop>, TransportError> {
+    let Some(frame) = transport.poll()? else {
+        return Ok(None);
+    };
+    match frame.msg_type {
+        debug::DBG_PAUSE => return Ok(Some(RunStop::Paused)),
+        lamella_wire::msg::HELLO => {
+            hello_reply_caps(transport, &frame, caps)?;
+            return Ok(Some(RunStop::Reclaimed));
+        }
+        debug::DBG_DETACH => {
+            transport.send(debug::DBG_ACK, frame.seq, &[])?;
+            return Ok(Some(RunStop::Detached));
+        }
+        debug::DBG_BREAK => {
+            apply_breakpoints(session, &frame.payload);
+            transport.send(debug::DBG_ACK, frame.seq, &[])?;
+        }
+        _ => {}
+    }
+    Ok(None)
 }
 
 /// Debug a baked image over the wire: boot it HALTED at the entry, report
@@ -943,7 +1614,7 @@ pub fn run_debug_session(
     image_seq: u16,
 ) -> Result<(), TransportError> {
     let image: &'static [u8] = Box::leak(image.into_boxed_slice());
-    run_debug_session_static(transport, image, image_seq, serve_caps(), &mut |_| {})
+    run_debug_session_static(transport, image, None, image_seq, serve_caps(), &mut |_| {})
 }
 
 /// [`run_debug_session`] over an ALREADY-RESIDENT image -- the [`debug::DBG_ATTACH`] arm:
@@ -960,21 +1631,18 @@ pub fn run_debug_session(
 pub fn run_debug_session_static(
     transport: &mut impl Transport,
     image: &'static [u8],
+    corlib: Option<&'static [u8]>,
     image_seq: u16,
     caps: lamella_wire::Capabilities,
     configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<(), TransportError> {
     use debug::reason;
-    use lamella_cil_runtime::{Module, Session, Status};
+    use lamella_cil_runtime::{Session, Status};
 
-    let (module, entry) = match Module::from_baked(image) {
-        Ok((module, Some(entry))) => (module, entry),
-        Ok((_, None)) => {
-            let result = failure("image records no entry point");
-            return send_stopped(transport, image_seq, reason::TRAP, (0, 0), Some(&result));
-        }
-        Err(error) => {
-            let result = failure(&format!("image does not boot: {error:?}"));
+    let (module, entry) = match load_deployed(image, corlib) {
+        Ok(booted) => booted,
+        Err(why) => {
+            let result = failure(&why);
             return send_stopped(transport, image_seq, reason::TRAP, (0, 0), Some(&result));
         }
     };
@@ -990,10 +1658,13 @@ pub fn run_debug_session_static(
     );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     configure(&mut vm);
-    if let Err(trap) = boot_static_ctors(&module, &mut vm) {
-        let result = failure(&format!("static constructor: {trap:?}"));
-        return send_stopped(transport, image_seq, reason::TRAP, (0, 0), Some(&result));
-    }
+    let entry = match lamella_cil_runtime::boot_baked(&module, &mut vm, entry) {
+        Ok(entry) => entry,
+        Err(trap) => {
+            let result = failure(&format!("static constructor: {trap:?}"));
+            return send_stopped(transport, image_seq, reason::TRAP, (0, 0), Some(&result));
+        }
+    };
     let mut session = match Session::new(&module, entry, Vec::new()) {
         Ok(session) => session,
         Err(trap) => {
@@ -1132,9 +1803,20 @@ pub fn run_debug_session_static(
 /// case that must fail loudly rather than silently: it names the situation instead of trapping later
 /// on the first unresolved corlib call.
 ///
+/// # How the PE's corlib references are resolved
+///
+/// By default, EAGERLY: the whole resident corlib is loaded into RAM and the program binds against
+/// it. That costs about a megabyte and is the right answer on a host or a roomy part.
+///
+/// Under `corlib-lazy` it is the constrained tier's resolution instead -- the corlib stays in flash
+/// and only the members the program reaches are materialized, which is what a 256 KB part can
+/// afford. The two produce the same output and the same exit value; they differ in RAM and in when
+/// an unresolvable member is reported (the lazy path names it here, rather than trapping at run).
+///
 /// # Errors
 /// A message naming what was wrong: an unrecognized artifact, a PE with no resident corlib to
-/// resolve against, a malformed assembly, or an image that records no entry point.
+/// resolve against, a malformed assembly, an image that records no entry point, or -- on the
+/// constrained tier -- a corlib member the resident corlib does not carry.
 #[cfg(feature = "baked-image")]
 pub fn load_deployed(
     artifact: &'static [u8],
@@ -1156,8 +1838,12 @@ pub fn load_deployed(
                 .map_err(|error| format!("resident corlib does not parse: {error:?}"))?;
             let program = Assembly::read(artifact)
                 .map_err(|error| format!("deployed PE does not parse: {error:?}"))?;
+            #[cfg(not(feature = "corlib-lazy"))]
             let loaded = load_with_corlib(&corlib, &program)
                 .map_err(|error| format!("deployed PE does not load: {error:?}"))?;
+            #[cfg(feature = "corlib-lazy")]
+            let loaded = lamella_load::load_program_lazy_corlib(&corlib, &program)
+                .map_err(|error| format!("deployed PE does not load: {error}"))?;
             Ok((loaded.module, loaded.entry))
         }
         _ => Err(String::from(
@@ -1185,7 +1871,7 @@ pub fn run_image(image: Vec<u8>) -> RunResult {
 #[cfg(feature = "baked-image")]
 #[must_use]
 pub fn run_image_with(image: Vec<u8>, configure: &mut dyn FnMut(&mut Vm)) -> RunResult {
-    run_image_serviced(image, configure, &mut || {})
+    run_image_serviced(image, None, configure, &mut || {})
 }
 
 /// [`run_image_with`] plus a `service` callback the interpreter fires at every scheduler quantum
@@ -1197,16 +1883,14 @@ pub fn run_image_with(image: Vec<u8>, configure: &mut dyn FnMut(&mut Vm)) -> Run
 #[must_use]
 pub fn run_image_serviced(
     image: Vec<u8>,
+    corlib: Option<&'static [u8]>,
     configure: &mut dyn FnMut(&mut Vm),
     service: &mut dyn FnMut(),
 ) -> RunResult {
     let image: &'static [u8] = Box::leak(image.into_boxed_slice());
-    let (module, entry) = match lamella_cil_runtime::Module::from_baked(image) {
+    let (module, entry) = match load_deployed(image, corlib) {
         Ok(booted) => booted,
-        Err(error) => return failure(&format!("image does not boot: {error:?}")),
-    };
-    let Some(entry) = entry else {
-        return failure("image records no entry point");
+        Err(why) => return failure(&why),
     };
     let mut vm = Vm::default();
     #[cfg(target_os = "none")]
@@ -1220,9 +1904,9 @@ pub fn run_image_serviced(
     );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     configure(&mut vm);
-    if boot_static_ctors(&module, &mut vm).is_err() {
+    let Ok(entry) = lamella_cil_runtime::boot_baked(&module, &mut vm, entry) else {
         return RunResult { exit: 70, stdout: String::from_utf16_lossy(vm.output()) };
-    }
+    };
     let outcome = lamella_cil_runtime::run_serviced(&module, &mut vm, entry, Vec::new(), service);
     let exit = match outcome {
         Ok(Some(Value::Int32(code))) => code,
@@ -1230,28 +1914,6 @@ pub fn run_image_serviced(
         Err(_) => 70,
     };
     RunResult { exit, stdout: String::from_utf16_lossy(vm.output()) }
-}
-
-/// Boots a baked image's static constructors EAGERLY (the lazy-trigger tables
-/// of II.10.5.3 are loader-built and not part of the baked format), then marks every type
-/// initialized. EVERY baked-image entry path must run this before the entry method --
-/// transient RUN_IMAGE, the flash boot-run, and a debug session alike; a path that skips it
-/// runs the program with null corlib statics (`IPAddress.Any`, `Encoding.ASCII`, ...).
-///
-/// # Errors
-/// The first trapping constructor's [`lamella_cil_runtime::Trap`] (its console output is in
-/// the [`Vm`] for the caller to flush).
-#[cfg(feature = "baked-image")]
-fn boot_static_ctors(
-    module: &lamella_cil_runtime::Module,
-    vm: &mut Vm,
-) -> Result<(), lamella_cil_runtime::Trap> {
-    for &cctor in module.static_ctors() {
-        lamella_cil_runtime::Session::new(module, cctor, Vec::new())
-            .and_then(|mut session| session.run(module, vm))?;
-    }
-    vm.mark_all_cctors_run(module);
-    Ok(())
 }
 
 /// Serve one pending request on a PE-less BAKED-IMAGE target: a `HELLO` gets a `HELLO_ACK`
@@ -1265,10 +1927,27 @@ fn boot_static_ctors(
 /// Propagates a [`TransportError`] from the carrier.
 #[cfg(feature = "baked-image")]
 pub fn serve_one_baked(transport: &mut impl Transport) -> Result<bool, TransportError> {
+    serve_one_baked_with(transport, &mut |_vm| {})
+}
+
+/// [`serve_one_baked`] with the firmware's [`Vm`]-configure hook (see [`run_image_with`]): every
+/// evaluation this serve runs gets the board's seams installed.
+///
+/// A board with no deploy region still needs it, for the same reason a deploy-capable one does: the
+/// CLOCK arrives through this hook, and an evaluation that runs without one computes a
+/// `Thread.Sleep` deadline that has already passed and does not wait.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn serve_one_baked_with(
+    transport: &mut impl Transport,
+    configure: &mut dyn FnMut(&mut Vm),
+) -> Result<bool, TransportError> {
     let Some(frame) = transport.poll()? else {
         return Ok(false);
     };
-    serve_frame_baked(transport, frame, &mut |_vm| {})?;
+    serve_frame_baked(transport, frame, None, configure)?;
     Ok(true)
 }
 
@@ -1281,20 +1960,22 @@ pub fn serve_one_baked(transport: &mut impl Transport) -> Result<bool, Transport
 fn serve_frame_baked(
     transport: &mut impl Transport,
     frame: lamella_wire::Frame,
+    corlib: Option<&'static [u8]>,
     configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<(), TransportError> {
     use lamella_wire::msg;
+    note_resident_corlib(corlib);
     match frame.msg_type {
         msg::HELLO => hello_reply(transport, &frame)?,
         repl::RUN_IMAGE => {
-            let result = run_image_serviced(frame.payload, configure, &mut || {
+            let result = run_image_serviced(frame.payload, corlib, configure, &mut || {
                 let _ = transport.poll();
             });
             transport.send(repl::RUN_RESULT, frame.seq, &result.encode())?;
         }
         debug::DBG_IMAGE => {
             let image: &'static [u8] = alloc::boxed::Box::leak(frame.payload.into_boxed_slice());
-            run_debug_session_static(transport, image, frame.seq, serve_caps(), configure)?;
+            run_debug_session_static(transport, image, corlib, frame.seq, serve_caps(), configure)?;
         }
         profile::GET_PROFILE => {
             let manifest = lamella_wire::ProfileManifest {
@@ -1303,7 +1984,11 @@ fn serve_frame_baked(
             };
             transport.send(profile::PROFILE_MANIFEST, frame.seq, &manifest.encode())?;
         }
-        _ => {}
+        other => transport.send(
+            lamella_wire::msg::ERROR,
+            frame.seq,
+            &lamella_wire::error::unknown_message_type(other),
+        )?,
     }
     Ok(())
 }
@@ -1360,6 +2045,7 @@ fn serve_deploy_frame(
     configure: &mut dyn FnMut(&mut Vm),
     mut winc: Option<&mut dyn WincFlasher>,
 ) -> Result<Served, TransportError> {
+    note_resident_corlib(flash.resident_corlib());
     match frame.msg_type {
         deploy::DEPLOY_IMAGE => {
             let ok = flash.program(&frame.payload);
@@ -1414,10 +2100,11 @@ fn serve_deploy_frame(
             transport.send(deploy::WINC_FW_RESULT, frame.seq, &[u8::from(ok)])?;
         }
         deploy::DEPLOY_STATUS => {
-            let (present, checksum) = match baked_image_checksum(flash.image_slice()) {
-                Some(sum) => (1u8, sum),
-                None => (0u8, 0u64),
-            };
+            let (present, checksum) =
+                match lamella_cil_runtime::verified_image_checksum(flash.image_slice()) {
+                    Some(sum) => (1u8, sum),
+                    None => (0u8, 0u64),
+                };
             let mut payload = [0u8; 9];
             payload[0] = present;
             payload[1..].copy_from_slice(&checksum.to_le_bytes());
@@ -1427,10 +2114,20 @@ fn serve_deploy_frame(
             return Ok(Served::RunRequested);
         }
         lamella_wire::msg::HELLO => hello_reply_caps(transport, &frame, deploy_caps())?,
-        debug::DBG_ATTACH => {
-            run_debug_session_static(transport, flash.image_slice(), frame.seq, deploy_caps(), configure)?;
+        live::LIVE_READ | live::LIVE_WRITE => {
+            serve_live_frame(transport, &frame, live_window(), &mut TargetMemory)?;
         }
-        _ => serve_frame_baked(transport, frame, configure)?,
+        debug::DBG_ATTACH => {
+            run_debug_session_static(
+                transport,
+                flash.image_slice(),
+                flash.resident_corlib(),
+                frame.seq,
+                deploy_caps(),
+                configure,
+            )?;
+        }
+        _ => serve_frame_baked(transport, frame, flash.resident_corlib(), configure)?,
     }
     Ok(Served::Handled)
 }
@@ -1466,6 +2163,7 @@ pub fn serve_one_deploy_repl_with(
     let Some(frame) = transport.poll()? else {
         return Ok(Served::Nothing);
     };
+    note_resident_corlib(corlib);
     match frame.msg_type {
         repl::REPL_OPEN | repl::REPL_DELTA | repl::REPL_CLOSE | repl::REPL_PING => {
             serve_repl_frame(transport, frame, session, corlib, configure)?;
@@ -1514,7 +2212,6 @@ pub fn run_deployed_with(
     entry: lamella_cil_runtime::MethodId,
     configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<Deployed, TransportError> {
-    use lamella_cil_runtime::{Session, Status};
     use lamella_wire::msg;
     let mut vm = Vm::default();
     #[cfg(target_os = "none")]
@@ -1528,42 +2225,51 @@ pub fn run_deployed_with(
     );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     configure(&mut vm);
-    if let Err(trap) = boot_static_ctors(module, &mut vm) {
-        return Ok(Deployed::Completed(RunResult {
-            exit: 70,
-            stdout: format!(
-                "{}BOOT TRAP (static constructor): {trap:?}",
-                String::from_utf16_lossy(vm.output())
-            ),
-        }));
-    }
-    let mut session = match Session::new(module, entry, Vec::new()) {
-        Ok(session) => session,
+    let entry = match lamella_cil_runtime::boot_baked(module, &mut vm, entry) {
+        Ok(entry) => entry,
         Err(trap) => {
-            return Ok(Deployed::Completed(failure(&format!("session: {trap:?}"))));
+            return Ok(Deployed::Completed(RunResult {
+                exit: 70,
+                stdout: format!(
+                    "{}BOOT TRAP (static constructor): {trap:?}",
+                    String::from_utf16_lossy(vm.output())
+                ),
+            }));
         }
     };
-    loop {
-        for _ in 0..RUN_SERVICE_STEPS {
-            match session.step(module, &mut vm) {
-                Ok(Status::Done(value)) => {
-                    return Ok(Deployed::Completed(run_result_of(&vm, &value)));
+    let mut carrier: Result<(), TransportError> = Ok(());
+    let outcome = lamella_cil_runtime::run_interruptible(module, &mut vm, entry, Vec::new(), &mut || {
+        match transport.poll() {
+            Ok(Some(frame)) if frame.msg_type == msg::HELLO => {
+                carrier = hello_reply_caps(transport, &frame, deploy_caps());
+                false
+            }
+            Ok(Some(frame)) if live::is_request(frame.msg_type) => {
+                match serve_live_frame(transport, &frame, live_window(), &mut TargetMemory) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        carrier = Err(error);
+                        false
+                    }
                 }
-                Err(trap) => {
-                    return Ok(Deployed::Completed(RunResult {
-                        exit: 70,
-                        stdout: format!("{}TRAP: {trap:?}", String::from_utf16_lossy(vm.output())),
-                    }));
-                }
-                Ok(_) => {}
+            }
+            Ok(_) => true,
+            Err(error) => {
+                carrier = Err(error);
+                false
             }
         }
-        if let Some(frame) = transport.poll()? {
-            if frame.msg_type == msg::HELLO {
-                hello_reply_caps(transport, &frame, deploy_caps())?;
-                return Ok(Deployed::Interrupted);
-            }
+    });
+    carrier?;
+    match outcome {
+        Ok(lamella_cil_runtime::Ran::Finished(value)) => {
+            Ok(Deployed::Completed(run_result_of(&vm, &value)))
         }
+        Ok(lamella_cil_runtime::Ran::Interrupted) => Ok(Deployed::Interrupted),
+        Err(trap) => Ok(Deployed::Completed(RunResult {
+            exit: 70,
+            stdout: format!("{}TRAP: {trap:?}", String::from_utf16_lossy(vm.output())),
+        })),
     }
 }
 
@@ -2025,9 +2731,13 @@ fn serve_repl_frame(
         }
         lamella_wire::msg::HELLO => hello_reply_repl(transport, &frame)?,
         #[cfg(feature = "baked-image")]
-        _ => serve_frame_baked(transport, frame, configure)?,
+        _ => serve_frame_baked(transport, frame, corlib, configure)?,
         #[cfg(not(feature = "baked-image"))]
-        _ => {}
+        other => transport.send(
+            lamella_wire::msg::ERROR,
+            frame.seq,
+            &lamella_wire::error::unknown_message_type(other),
+        )?,
     }
     Ok(())
 }
@@ -2176,6 +2886,197 @@ mod headroom_tests {
 mod tests {
     use super::*;
 
+    /// The LIVE agent's refusals, the shape of them, and the one that is a bounds check.
+    ///
+    /// Every case here is stated against the RULE functions rather than the statics: the window is
+    /// process-wide, and a test that wrote it would decide the outcome of every other test in the
+    /// process depending on which ran first.
+    #[cfg(feature = "baked-image")]
+    mod live_agent {
+        use super::super::{
+            LiveMemory, checked_window, deploy_caps_with, live, live_span_ok, serve_live_frame,
+        };
+        use alloc::vec;
+        use alloc::vec::Vec;
+        use lamella_wire::{Capabilities, Frame, MemTransport, Transport};
+
+        /// A 1 KiB window at a plausible SRAM base.
+        const WINDOW: (u32, u32) = (0x2000_0000, 1024);
+
+        /// A fake address space: `bytes` live at `base`, and anything outside PANICS.
+        ///
+        /// Panicking rather than returning zero is the point. On the device an address outside the
+        /// declared window is a bus fault, so a test whose fake quietly answered 0 would pass while
+        /// the shipped code faulted -- the bounds tests below would be checking nothing, and their
+        /// green would be the most misleading kind.
+        struct FakeMemory {
+            base: u32,
+            bytes: Vec<u8>,
+        }
+
+        impl FakeMemory {
+            fn new(base: u32, bytes: Vec<u8>) -> Self {
+                Self { base, bytes }
+            }
+
+            fn offset(&self, address: u32) -> usize {
+                let offset = address
+                    .checked_sub(self.base)
+                    .map(|offset| offset as usize)
+                    .filter(|offset| *offset < self.bytes.len());
+                offset.unwrap_or_else(|| {
+                    panic!("the agent touched {address:#010x}, outside the fake address space")
+                })
+            }
+        }
+
+        impl LiveMemory for FakeMemory {
+            fn read8(&self, address: u32) -> u8 {
+                self.bytes[self.offset(address)]
+            }
+
+            fn write8(&mut self, address: u32, value: u8) {
+                let offset = self.offset(address);
+                self.bytes[offset] = value;
+            }
+        }
+
+        #[test]
+        fn a_firmware_with_no_window_refuses_rather_than_dereferencing() {
+            assert_eq!(live_span_ok((0, 0), 0x2000_0000, 4), Err(live::status::NO_WINDOW));
+            assert_eq!(live_span_ok((0x2000_0000, 0), 0x2000_0000, 4), Err(live::status::NO_WINDOW));
+        }
+
+        #[test]
+        fn a_span_must_lie_wholly_inside_the_window() {
+            assert_eq!(live_span_ok(WINDOW, 0x2000_0000, 1024), Ok(()));
+            assert_eq!(live_span_ok(WINDOW, 0x2000_03fc, 4), Ok(()));
+            assert_eq!(live_span_ok(WINDOW, 0x2000_03fd, 4), Err(live::status::OUT_OF_WINDOW));
+            assert_eq!(live_span_ok(WINDOW, 0x1fff_fffc, 8), Err(live::status::OUT_OF_WINDOW));
+            assert_eq!(live_span_ok(WINDOW, 0x4000_0000, 4), Err(live::status::OUT_OF_WINDOW));
+        }
+
+        #[test]
+        fn a_span_that_wraps_the_address_space_is_refused() {
+            assert_eq!(
+                live_span_ok((0, u32::MAX), 0xffff_fffe, 8),
+                Err(live::status::OUT_OF_WINDOW)
+            );
+            assert_eq!(checked_window(0xffff_ff00, 0x200), None);
+            assert_eq!(checked_window(0x2000_0000, 256 * 1024), Some((0x2000_0000, 256 * 1024)));
+        }
+
+        #[test]
+        fn the_capability_bit_follows_the_window_not_the_code() {
+            let base = Capabilities(Capabilities::BAKED_IMAGE);
+            assert!(!deploy_caps_with(base, 0).has(Capabilities::LIVE_MEMORY));
+            assert!(deploy_caps_with(base, 1024).has(Capabilities::LIVE_MEMORY));
+            assert!(deploy_caps_with(base, 0).has(Capabilities::DEBUG_ATTACH));
+        }
+
+        /// Serve one live request against `window` and return the reply frame. The fake address
+        /// space spans the window exactly, so any access the agent makes outside it panics.
+        fn serve(msg_type: u8, payload: &[u8], window: (u32, u32)) -> Frame {
+            serve_against(msg_type, payload, window, &mut FakeMemory::new(window.0, vec![0; 1024]))
+        }
+
+        /// [`serve`] with the address space supplied, for a test that inspects it afterwards.
+        fn serve_against(
+            msg_type: u8,
+            payload: &[u8],
+            window: (u32, u32),
+            memory: &mut FakeMemory,
+        ) -> Frame {
+            let mut transport = MemTransport::new();
+            let frame = Frame { msg_type, seq: 77, payload: payload.to_vec() };
+            serve_live_frame(&mut transport, &frame, window, memory).expect("the carrier held");
+            let sent = transport.take_sent();
+            transport.feed(&sent);
+            transport.poll().expect("the carrier held").expect("the agent answered")
+        }
+
+        #[test]
+        fn a_read_returns_the_bytes_that_are_there() {
+            let window = (WINDOW.0, 8);
+            let mut memory = FakeMemory::new(window.0, vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4]);
+
+            let mut request = (window.0 + 2).to_le_bytes().to_vec();
+            request.extend_from_slice(&4u16.to_le_bytes());
+            let reply = serve_against(live::LIVE_READ, &request, window, &mut memory);
+            assert_eq!(reply.msg_type, live::LIVE_DATA);
+            assert_eq!(reply.seq, 77, "the reply answers the request's sequence");
+            assert_eq!(reply.payload, [live::status::OK, 0xbe, 0xef, 1, 2]);
+
+            let mut whole = window.0.to_le_bytes().to_vec();
+            whole.extend_from_slice(&8u16.to_le_bytes());
+            let reply = serve_against(live::LIVE_READ, &whole, window, &mut memory);
+            assert_eq!(reply.payload, [live::status::OK, 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn a_refused_read_carries_a_status_and_no_bytes() {
+            let mut request = 0x2000_0000u32.to_le_bytes().to_vec();
+            request.extend_from_slice(&4u16.to_le_bytes());
+            let reply = serve(live::LIVE_READ, &request, (0, 0));
+            assert_eq!(reply.msg_type, live::LIVE_DATA);
+            assert_eq!(reply.payload, [live::status::NO_WINDOW], "a refusal carries no data");
+        }
+
+        #[test]
+        fn a_read_longer_than_the_bound_is_refused_before_the_window_is_consulted() {
+            let mut request = WINDOW.0.to_le_bytes().to_vec();
+            let over = u16::try_from(live::MAX_READ + 1).expect("the bound fits a u16");
+            request.extend_from_slice(&over.to_le_bytes());
+            let reply = serve(live::LIVE_READ, &request, WINDOW);
+            assert_eq!(reply.payload, [live::status::BAD_REQUEST]);
+
+            let mut zero = WINDOW.0.to_le_bytes().to_vec();
+            zero.extend_from_slice(&0u16.to_le_bytes());
+            assert_eq!(serve(live::LIVE_READ, &zero, WINDOW).payload, [live::status::BAD_REQUEST]);
+        }
+
+        #[test]
+        fn a_write_lands_whole_or_not_at_all() {
+            let base = WINDOW.0;
+            let mut memory = FakeMemory::new(base, vec![0; 8]);
+
+            let mut over = base.to_le_bytes().to_vec();
+            over.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+            let reply = serve_against(live::LIVE_WRITE, &over, (base, 4), &mut memory);
+            assert_eq!(reply.msg_type, live::LIVE_WROTE);
+            assert_eq!(reply.payload, [live::status::OUT_OF_WINDOW, 0, 0]);
+            assert_eq!(memory.bytes, [0; 8], "a refused write touched nothing");
+
+            let mut ok = (base + 2).to_le_bytes().to_vec();
+            ok.extend_from_slice(&[9, 8, 7, 6]);
+            let reply = serve_against(live::LIVE_WRITE, &ok, (base, 8), &mut memory);
+            assert_eq!(reply.payload, [live::status::OK, 4, 0]);
+            assert_eq!(memory.bytes, [0, 0, 9, 8, 7, 6, 0, 0]);
+        }
+
+        #[test]
+        fn a_truncated_request_is_refused_rather_than_read_short() {
+            assert_eq!(
+                serve(live::LIVE_READ, &[0, 0, 0, 0x20, 4], WINDOW).payload,
+                [live::status::BAD_REQUEST]
+            );
+            assert_eq!(
+                serve(live::LIVE_WRITE, &WINDOW.0.to_le_bytes(), WINDOW).payload,
+                [live::status::BAD_REQUEST, 0, 0]
+            );
+        }
+
+        #[test]
+        fn only_the_two_requests_are_this_ranges_business() {
+            assert!(live::is_request(live::LIVE_READ));
+            assert!(live::is_request(live::LIVE_WRITE));
+            assert!(!live::is_request(live::LIVE_DATA));
+            assert!(!live::is_request(live::LIVE_WROTE));
+            assert!(!live::is_request(lamella_wire::msg::HELLO));
+            assert!(!live::is_request(super::super::debug::DBG_PAUSE));
+        }
+    }
+
     #[test]
     fn run_result_round_trips() {
         let result = RunResult { exit: 7, stdout: "hi\n".to_string() };
@@ -2265,6 +3166,119 @@ mod tests {
         assert_eq!(result.stdout, "hi\n");
     }
 
+    /// **A message type no target implements is REFUSED, not dropped.** The refusal names the type, so
+    /// a host learns which thing is missing rather than that something is.
+    ///
+    /// This is the property three lanes' feature detection assumes, and until now the target did the
+    /// opposite: it dropped the frame, and the host waited out a timeout it could not tell from a board
+    /// that had stopped answering.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn an_unimplemented_message_type_is_refused_and_the_refusal_names_it() {
+        use lamella_wire::{MemTransport, error, msg};
+
+        let asked = bundle::RUN_BUNDLE;
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        driver.send(asked, 11, b"a bundle this target cannot load").unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(serve_one_baked(&mut runner).unwrap(), "the target handled the frame");
+        driver.feed(&runner.take_sent());
+
+        let reply = driver.poll().unwrap().expect("the target answered rather than going quiet");
+        assert_eq!(reply.msg_type, msg::ERROR);
+        assert_eq!(reply.seq, 11, "the refusal answers the frame that caused it");
+        assert_eq!(
+            error::refused_message_type(&reply.payload),
+            Some(asked),
+            "the refusal names the type it refused"
+        );
+    }
+
+    /// **THE DEFECT THIS CLOSES, STATED AS A TEST: two firmwares differing only in the corlib they hold
+    /// resident used to advertise the SAME surface hash.** A host cannot detect that difference any other
+    /// way, and getting it wrong is silent -- a corlib declaring a seam the firmware compiled out still
+    /// loads, and the method keeps a placeholder body that returns zero.
+    ///
+    /// Exercised on the hash function rather than through two serve loops, because the statics behind it
+    /// are set once per process and a test cannot un-set them without making the others order-dependent.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn the_surface_hash_distinguishes_two_different_resident_corlibs() {
+        let registry = lamella_cil_runtime::intrinsic_registry::registry_fingerprint();
+        let one = fnv1a(FNV_OFFSET, b"a corlib");
+        let other = fnv1a(FNV_OFFSET, b"a DIFFERENT corlib");
+        assert_ne!(one, other, "different bytes hash differently");
+
+        let with_one = resident_surface_hash_of(Some(one));
+        let with_other = resident_surface_hash_of(Some(other));
+        assert_ne!(with_one, with_other, "the surface hash must follow the resident corlib");
+        assert_ne!(with_one, registry, "a resident corlib must change the advertised surface");
+        assert_ne!(with_other, registry);
+        assert_eq!(resident_surface_hash_of(None), registry);
+    }
+
+    /// A target holding a resident corlib says so, so a host chooses the bare-program path only where it
+    /// is provably available instead of sending one speculatively and falling back on every board that
+    /// has none -- which is most of them.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_resident_corlib_is_advertised_and_only_when_there_is_one() {
+        use lamella_wire::Capabilities;
+        assert!(serve_caps_with(true).has(Capabilities::RESIDENT_CORLIB));
+        assert!(!serve_caps_with(false).has(Capabilities::RESIDENT_CORLIB));
+        for resident in [true, false] {
+            assert!(serve_caps_with(resident).has(Capabilities::BAKED_IMAGE));
+            assert!(serve_caps_with(resident).has(Capabilities::PROFILE_CHIPID));
+        }
+    }
+
+    /// A type the target DOES implement still gets its own reply -- so the refusal above was added at the
+    /// terminal arm and did not swallow the dispatch above it.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn an_implemented_message_type_is_still_answered_normally() {
+        use lamella_wire::{Capabilities, Hello, MemTransport, PROTOCOL_VERSION, ProtocolRange, msg};
+
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        let hello = Hello {
+            range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+            caps: Capabilities(Capabilities::BAKED_IMAGE),
+        };
+        driver.send(msg::HELLO, 12, &hello.encode()).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(serve_one_baked(&mut runner).unwrap());
+        driver.feed(&runner.take_sent());
+        let reply = driver.poll().unwrap().expect("a reply arrived");
+        assert_eq!(reply.msg_type, msg::HELLO_ACK, "not a refusal");
+    }
+
+    /// **The refusal must not spread to the drops that are DELIBERATE.** A frame arriving while a
+    /// program runs is dropped on purpose -- the host contract is one in-flight resume, and the type is
+    /// usually one this target implements perfectly well, so refusing it would be a lie about the type
+    /// rather than a fact about the moment.
+    ///
+    /// Asserted on the source rather than by running a program mid-flight, because reaching that arm
+    /// needs a live run and the property being protected is which arm the refusal was added to.
+    #[test]
+    fn the_deliberate_mid_run_drop_stays_silent() {
+        let source = include_str!("lib.rs");
+        let service = source
+            .split_once("fn service_wire(")
+            .expect("service_wire is where a mid-run frame is dropped")
+            .1;
+        let body = service.split_once("\n}\n").expect("its body ends").0;
+        assert!(
+            body.contains("_ => {}"),
+            "service_wire must keep dropping a mid-run frame silently"
+        );
+        assert!(
+            !body.contains("msg::ERROR"),
+            "a mid-run drop must not be reported as an unimplemented type"
+        );
+    }
+
     #[cfg(feature = "baked-image")]
     #[test]
     fn hello_ack_and_get_profile_report_the_resident_surface() {
@@ -2293,7 +3307,7 @@ mod tests {
             .profile
             .expect("the ack advertises an identity");
         assert_eq!(identity.abi, intrinsic_registry::INTRINSIC_ABI);
-        assert_eq!(identity.hash, intrinsic_registry::registry_fingerprint());
+        assert_eq!(identity.hash, resident_surface_hash());
         assert_eq!(identity.name(), intrinsic_registry::profile_name());
 
         let frame = driver.poll().unwrap().expect("a manifest reply");
@@ -2339,7 +3353,7 @@ mod tests {
         driver.send(msg::HELLO, 8, &hello.encode()).unwrap();
         target.feed(&driver.take_sent());
 
-        run_debug_session_static(&mut target, image, 3, serve_caps(), &mut |_| {})
+        run_debug_session_static(&mut target, image, None, 3, serve_caps(), &mut |_| {})
             .expect("the session ends instead of spinning forever");
         driver.feed(&target.take_sent());
 

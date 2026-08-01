@@ -44,11 +44,42 @@ pub struct BlockTable {
     pub calibrations: Vec<Calibration>,
 }
 
+impl BlockRegister {
+    /// This register's field named `name`, when declared.
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+}
+
 impl BlockTable {
     /// The register named `name`, when declared.
     #[must_use]
     pub fn register(&self, name: &str) -> Option<&BlockRegister> {
         self.registers.iter().find(|r| r.name == name)
+    }
+
+    /// A `value` placed in register `register`'s field `field`, shifted and checked to fit.
+    ///
+    /// Composition goes through the TABLE's own field positions rather than through a shift
+    /// written into the generator, so a field that moves in the manual moves the emitted word
+    /// with it -- and a value too wide for its field is refused here rather than silently
+    /// overwriting its neighbor, which is the failure mode of a hand-composed configuration word.
+    pub fn place(&self, register: &str, field: &str, value: i64) -> Result<i64, String> {
+        let Some(reg) = self.register(register) else {
+            return Err(format!("block {}: no register '{register}'", self.block));
+        };
+        let Some(spec) = reg.field(field) else {
+            return Err(format!("block {}: register {register} has no field '{field}'", self.block));
+        };
+        let limit = 1i64 << spec.width;
+        if value < 0 || value >= limit {
+            return Err(format!(
+                "block {}: {value} does not fit {register}.{field}, which is {} bit(s) wide",
+                self.block, spec.width
+            ));
+        }
+        Ok(value << spec.lsb)
     }
 
     /// The named block constant's value, when declared.
@@ -223,7 +254,7 @@ impl Default for ControlPin {
 /// A module CSP: a host part plus fixed internal wiring, inherited by carrying boards.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleTable {
-    /// The module id (`atsamw25`).
+    /// The module id (`samw25`).
     pub module: String,
     /// The host family id.
     pub family: String,
@@ -287,11 +318,94 @@ impl Plan {
     }
 }
 
+/// One memory region a board fits: a base, a size, and -- when the board brings it up itself --
+/// the controller instance that must be configured before the region may be touched.
+///
+/// A region is NOT a number, and external memory makes that concrete three ways
+/// at once: two regions rather than one, an address space of its own for each, and an ACCESSIBLE
+/// size that differs from the fitted device's own (a 128-Mbit part with only its low 16 data
+/// lines wired is 8 Mbytes, and the headline number is the wrong one to quote).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryRegion {
+    /// The region id, board-scoped (`flash`, `qspi`, `sdram`).
+    pub name: String,
+    /// `flash` or `ram`. Load-bearing rather than descriptive: what may hold code, and what an
+    /// allocator may place data in, are different questions with the same shape.
+    pub kind: String,
+    /// Where the region appears in the address space; -1 when the board does not state one (the
+    /// chip's own fixed XIP window, which is chip truth and not the board's to repeat).
+    pub base: i64,
+    /// The ACCESSIBLE size in bytes -- what a program may actually use.
+    pub size: i64,
+    /// The fitted device's own size, when it differs from the accessible size (-1 = the same).
+    /// Stated so the difference is a fact rather than a discrepancy someone re-derives.
+    pub device_size: i64,
+    /// The instance a program must bring up before touching the region (empty when the chip maps
+    /// it with no help). An access before that is a bus fault, not a wrong value, so the
+    /// precondition belongs in the facts rather than in a comment.
+    pub controller: String,
+    /// Whether the board runs without the region.
+    pub optional: bool,
+    /// The controller block's constant this region's `base` is a SECOND statement of (empty when
+    /// there is none). A board states where its region appears because that is what every
+    /// consumer reads; the block states where the controller puts it. Naming the constant is what
+    /// turns the board's citation into a checked fact -- the two are held equal at generation
+    /// time rather than trusted to have been copied correctly.
+    pub window: String,
+    /// The FITTED DEVICE's shape, as named integer facts: what the controller must be told about
+    /// the part this board soldered on. Which keys are legal depends on the controller, so the
+    /// reader takes any scalar and RESOLUTION enforces the set -- the knowledge of what an SDRAM
+    /// is lives with the derivation, not with the parser.
+    pub device: Vec<(String, Int)>,
+    /// The device's read configurations, in table order (a flash region; empty otherwise).
+    pub reads: Vec<MemoryRead>,
+}
+
+/// One read configuration of a fitted flash: the command, how many lines each phase uses, and
+/// the dummy-cycle count MEASURED at a stated interface clock.
+///
+/// THE DUMMY COUNT IS THE ONE NUMBER IN THE STRATA THAT NOTHING CAN DERIVE. A dummy phase covers
+/// the device's internal latency in TIME, so the number of CYCLES that covers it falls as the
+/// interface clock falls -- a part whose datasheet states eight at its own rating reads correctly
+/// with six at half that. Neither figure is wrong, and neither is a property of the part alone.
+///
+/// And a wrong count does not fail: it shifts every byte, so the flash returns plausible garbage.
+/// That is why the count here is an ANCHOR rather than an answer -- it is emitted carrying the
+/// name of the plan it was measured under, beside the range a driver walks when it asks the part
+/// directly. A number that can only be checked against a payload the caller already knows is a
+/// number a table must not pretend to know.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryRead {
+    /// The configuration id, region-scoped (`read`, `fast_read`, `quad_io`).
+    pub name: String,
+    /// The device command byte.
+    pub instruction: i64,
+    /// Lines the instruction phase uses. Stated rather than assumed single: a device that takes
+    /// its commands on four lines exists, and a configuration named "quad" that still sends its
+    /// command on one line is the normal case, not the exception.
+    pub instruction_lines: i64,
+    /// Lines the address phase uses (1, 2 or 4).
+    pub address_lines: i64,
+    /// Lines the data phase uses (1, 2 or 4).
+    pub data_lines: i64,
+    /// The dummy count the part answered to, at `clock_hz`. -1 = not measured.
+    pub dummy: i64,
+    /// The count the device's own datasheet states at its full rating (-1 = not stated). Kept
+    /// beside the measured one because the DIFFERENCE is the fact, not either number.
+    pub dummy_datasheet: i64,
+    /// The interface clock `dummy` was measured at.
+    pub clock_hz: i64,
+}
+
 /// A board BSP: the bindings, carrier, plans, and identity of one product.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoardTable {
     /// The board id (`samd21-xpro`).
     pub board: String,
+    /// Who MADE the board (`raspberry-pi`), kebab-cased like every other id here. Board truth:
+    /// the same chip ships on boards from a dozen vendors, and a product name is unambiguous only
+    /// within one of them -- several vendors ship a board whose name is an ordinary English word.
+    pub vendor: String,
     /// The family id, when the board names a bare chip (exclusive with `module`).
     pub family: String,
     /// The module id, when the board carries a module (exclusive with `family`).
@@ -300,9 +414,9 @@ pub struct BoardTable {
     pub part: String,
     /// The `lamella_wire::board_model` wire code.
     pub board_model: i64,
-    /// The board's soldered external-XIP flash in bytes (the closed `[memory]`
-    /// section, source-cited). 0 = no record: the part's own parts row is the memory truth.
-    pub memory_flash: i64,
+    /// The memory regions the board fits, in table order. Empty = no record: the part's own
+    /// parts row is the whole memory truth.
+    pub memory: Vec<MemoryRegion>,
     /// The DEFAULT carrier -- the wire a bare deploy reaches for. Kept as a single record because
     /// every emitter reads it, and the default pair is what they derive from; the full set lives
     /// in `carriers`. Empty `kind` means the board declares no wire at all (a bare chip).
@@ -325,6 +439,36 @@ impl BoardTable {
     pub fn default_plan(&self) -> Option<&Plan> {
         self.plans.iter().find(|p| p.default)
     }
+
+    /// The size of the region a program's code is XIP'd from -- the board's own flash region that
+    /// the chip maps with no bring-up. 0 when the board fits none, in which case the part's parts
+    /// row is the memory truth. An external flash the board must configure ITSELF is deliberately
+    /// not this: a linker script does not lay a program into a region that is not there at reset.
+    #[must_use]
+    pub fn xip_flash(&self) -> i64 {
+        self.memory
+            .iter()
+            .find(|region| region.kind == "flash" && region.controller.is_empty())
+            .map_or(0, |region| region.size)
+    }
+}
+
+impl MemoryRegion {
+    /// The fitted device's size -- its own when it differs from what the board can reach,
+    /// otherwise the accessible size.
+    #[must_use]
+    pub fn fitted_size(&self) -> i64 {
+        if self.device_size >= 0 { self.device_size } else { self.size }
+    }
+
+    /// A named device fact's value, when the region states one.
+    #[must_use]
+    pub fn fact(&self, key: &str) -> Option<i64> {
+        self.device.iter().find(|(k, _)| k == key).map(|(_, v)| v.value)
+    }
+}
+
+impl BoardTable {
 
     /// Every DISTINCT plan some carrier runs under, in table order -- the clock-tree twin of
     /// [`Self::carrier_points`]. A board's clock block is a property of an operating point a
@@ -373,6 +517,206 @@ impl BoardTable {
     }
 }
 
+
+/// One bus a part can be reached over. The register MAP is shared between a part's buses; the
+/// ADDRESS TRANSFORM is not, so each bus carries its own as a NAMED DISPATCH rather than an
+/// expression (a part that declared only a bus kind would produce an SPI path wrong by 0x80,
+/// and wrong only on writes).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceBus {
+    /// The bus id (the `[buses.*]` key).
+    pub name: String,
+    /// The bus kind (`i2c`, `spi`).
+    pub kind: String,
+    /// The named transform applied to a register address on a READ.
+    pub register_read_transform: String,
+    /// The named transform applied to a register address on a WRITE.
+    pub register_write_transform: String,
+    /// The named read protocol the bus follows.
+    pub read_protocol: String,
+    /// The supported bus modes, in table order (SPI mode numbers; empty when not applicable).
+    pub modes: Vec<Int>,
+}
+
+/// One address strap: which pin contributes which address bit, and the address each tie yields.
+/// The part states the model; a CARRIER fixes the strap. A default here would be a guess that
+/// compiles, so the strap is deliberately never defaulted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressStrap {
+    /// The part's pin name (`SDO`).
+    pub pin: String,
+    /// The address bit this pin contributes.
+    pub bit: i64,
+    /// The address when the pin is tied low.
+    pub low: Int,
+    /// The address when the pin is tied high.
+    pub high: Int,
+}
+
+/// A part's address model: a base plus the straps that move it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceAddress {
+    /// The bus the address belongs to.
+    pub bus: String,
+    /// The base address with every strap tied low.
+    pub base: Int,
+    /// The straps, in table order.
+    pub straps: Vec<AddressStrap>,
+}
+
+/// A part's identity register and the SET of values that register may answer. A one-value check
+/// rejects a genuine engineering sample, and a rejected part reads as "no sensor there" -- so
+/// the accepted values are a set, and every part must state one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// The register that answers the identity.
+    pub reg: Int,
+    /// The access width in bits.
+    pub width: u32,
+    /// Every accepted value, in table order.
+    pub values: Vec<Int>,
+}
+
+/// One device register. `reg` is an OPERAND written on the wire, never an offset added to an
+/// instance base -- the distinction is load-bearing, because a chip block's `offset` composes as
+/// `base + *_OFF` and a device register composed that way would emit and be silently wrong.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceRegister {
+    /// The register name (the `[registers.*]` key).
+    pub name: String,
+    /// The register address written on the wire.
+    pub reg: Int,
+    /// The width in bits. NOT restricted to a machine access width the way a chip block's is:
+    /// a device's multi-byte quantity is read as one burst from a starting register, so a
+    /// 20-bit left-justified reading is a single 24-bit register here.
+    pub width: u32,
+    /// The declared access (`read-only`, `write-only`, `read-write`).
+    pub access: String,
+    /// The declared fields, in table order.
+    pub fields: Vec<Field>,
+}
+
+/// A named encoding table (`[enums.*]`): member name -> code. A member REPLACES an inherited
+/// enum whole rather than merging into it -- two family members can give one register's codes
+/// different meanings, and a half-inherited encoding is wrong for one of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceEnum {
+    /// The encoding name (the `[enums.*]` key).
+    pub name: String,
+    /// The members, in table order.
+    pub members: Vec<(String, Int)>,
+}
+
+/// One trimming-parameter read: which register, what width, what signedness, and how the value
+/// is packed when it does not occupy whole registers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CalibrationRead {
+    /// The parameter name (`dig_T1`).
+    pub name: String,
+    /// The starting register.
+    pub reg: Int,
+    /// The value width in bits (12 for a nibble-packed parameter).
+    pub width: u32,
+    /// Whether the value is signed. Not uniform within a record, and getting it backwards
+    /// yields a driver that compiles, runs, and reports a plausible wrong answer.
+    pub signed: bool,
+    /// The named packing form, when the value does not occupy whole registers.
+    pub packing: String,
+}
+
+/// A part's calibration record. Trimming parameters are READ from the part rather than being
+/// constants, so what is described is the READ; `form` stays a NAMED DISPATCH into hand-written
+/// per-language arithmetic (generating a struct reader is in scope, generating the compensation
+/// math is not).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceCalibration {
+    /// The record name (the `[calibration.*]` key).
+    pub name: String,
+    /// The conversion form -- selects which hand-written formula consumes the parameters.
+    pub form: String,
+    /// The multi-byte byte order (`little`).
+    pub byte_order: String,
+    /// The named scale of the compensated output.
+    pub output_scale: String,
+    /// Records whose result this one consumes, in table order.
+    pub depends_on: Vec<String>,
+    /// The described reads, in table order.
+    pub reads: Vec<CalibrationRead>,
+}
+
+/// One declarative step of a part sequence. The vocabulary is the table's, and the description
+/// is transport agnostic: one step list describes an I2C transaction, an SPI one, and a call
+/// through a host import alike.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceStep {
+    /// The step verb (`write-field`, `poll-field-until`, `burst-read`).
+    pub step: String,
+    /// The register the step touches (field steps).
+    pub register: String,
+    /// The field within that register (field steps).
+    pub field: String,
+    /// The literal the step writes or waits for.
+    pub value: Option<Int>,
+    /// Whether a poll is bounded, so an absent or wedged part surfaces as an error not a hang.
+    pub bounded: bool,
+    /// The register a burst starts at (burst steps).
+    pub from: String,
+    /// The table reference stating the burst length (burst steps) -- RESOLVED at emission.
+    pub length_from: String,
+}
+
+/// One part table: `kind = "device"` (an emitted part) or `"device-base"` (an authoring
+/// convenience a member names with `base`, never emitted on its own).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceTable {
+    /// The part family id.
+    pub family: String,
+    /// The part id (empty on a base).
+    pub part: String,
+    /// The base this member inherits from. AUTHORING ONLY: nothing downstream reads an
+    /// inherited value, because a value that is only ever inherited is pinned in no emitted
+    /// artifact and so cannot be checked for drift between languages.
+    pub base: String,
+    /// Whether this table is a base rather than a part.
+    pub is_base: bool,
+    /// The buses the part answers on, in table order.
+    pub buses: Vec<DeviceBus>,
+    /// The address model, when stated.
+    pub address: Option<DeviceAddress>,
+    /// The identity register and its accepted values, when stated.
+    pub identity: Option<DeviceIdentity>,
+    /// The registers, in table order.
+    pub registers: Vec<DeviceRegister>,
+    /// The named encodings, in table order.
+    pub enums: Vec<DeviceEnum>,
+    /// The measurement burst length in bytes (-1 = unstated).
+    pub burst_length: i64,
+    /// The calibration records, in table order.
+    pub calibrations: Vec<DeviceCalibration>,
+    /// The named sequences, in table order.
+    pub sequences: Vec<(String, Vec<DeviceStep>)>,
+}
+
+impl DeviceTable {
+    /// The bus named `name`, when declared.
+    #[must_use]
+    pub fn bus(&self, name: &str) -> Option<&DeviceBus> {
+        self.buses.iter().find(|b| b.name == name)
+    }
+
+    /// The register named `name`, when declared.
+    #[must_use]
+    pub fn register(&self, name: &str) -> Option<&DeviceRegister> {
+        self.registers.iter().find(|r| r.name == name)
+    }
+
+    /// The named encoding, when declared.
+    #[must_use]
+    pub fn enumeration(&self, name: &str) -> Option<&DeviceEnum> {
+        self.enums.iter().find(|e| e.name == name)
+    }
+}
+
 /// One parsed v2 strata file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Strata {
@@ -388,6 +732,8 @@ pub enum Strata {
     Module(ModuleTable),
     /// A board BSP.
     Board(BoardTable),
+    /// A part table from the `parts/` tree.
+    Device(DeviceTable),
 }
 
 
@@ -549,6 +895,8 @@ pub fn parse(text: &str) -> Result<Strata, String> {
         "parts" => build_parts(&header, rest).map(Strata::Parts),
         "module" => build_module(&header, rest).map(Strata::Module),
         "board" => build_board(&header, rest).map(Strata::Board),
+        "device" => build_device(&header, rest, false).map(Strata::Device),
+        "device-base" => build_device(&header, rest, true).map(Strata::Device),
         other => Err(format!("unknown strata kind '{other}'")),
     }
 }
@@ -769,6 +1117,319 @@ fn build_block(
             return Err(format!(
                 "block {}/{}: register {} declares no width -- widths are data, not prose",
                 table.block, table.mode, register.name
+            ));
+        }
+    }
+    Ok(table)
+}
+
+/// An enum member key may be written quoted (`"0" = 500`) when the code is numeric, since a bare
+/// digit is not a key. The quotes are spelling, not name, and the scanner hands them through.
+fn unquote(key: &str) -> &str {
+    key.strip_prefix('"').and_then(|k| k.strip_suffix('"')).unwrap_or(key)
+}
+
+/// Refuses a non-integer number ANYWHERE in a device table, at any array/inline-table depth.
+/// A part catalogue's premise is the no-float tier: one `0.5` in one row would force a float
+/// into every emitted language, so a fact that is not an integer must be restated as one (the
+/// standby codes are microseconds for exactly this reason) or expressed as a named dispatch.
+fn reject_floats(line: usize, key: &str, value: &RawValue) -> Result<(), String> {
+    match value {
+        RawValue::Float(text) => Err(err(
+            line,
+            &format!("'{key}' is the non-integer {text} -- a part table carries integers and named dispatch only, never a float"),
+        )),
+        RawValue::Array(items) => items.iter().try_for_each(|item| reject_floats(line, key, item)),
+        RawValue::Inline(entries) => {
+            entries.iter().try_for_each(|(k, v)| reject_floats(line, &format!("{key}.{k}"), v))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn as_int_array(line: usize, key: &str, value: &RawValue) -> Result<Vec<Int>, String> {
+    let RawValue::Array(items) = value else {
+        return Err(err(line, &format!("'{key}' must be an array of integers")));
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            RawValue::Int(int) => Ok(*int),
+            _ => Err(err(line, &format!("'{key}' must be an array of integers"))),
+        })
+        .collect()
+}
+
+fn as_str_array(line: usize, key: &str, value: &RawValue) -> Result<Vec<String>, String> {
+    let RawValue::Array(items) = value else {
+        return Err(err(line, &format!("'{key}' must be an array of strings")));
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            RawValue::Str(text) => Ok(text.clone()),
+            _ => Err(err(line, &format!("'{key}' must be an array of strings"))),
+        })
+        .collect()
+}
+
+fn build_fields(line: usize, value: &RawValue) -> Result<Vec<Field>, String> {
+    let RawValue::Inline(entries) = value else {
+        return Err(err(line, "'fields' must be an inline table of { name = [lsb, width] }"));
+    };
+    let mut fields = Vec::new();
+    for (name, spec) in entries {
+        let ints = as_int_array(line, "field spec", spec)?;
+        if ints.len() != 2 {
+            return Err(err(line, "field spec must be [lsb, width]"));
+        }
+        fields.push(Field { name: name.clone(), lsb: ints[0].value as u32, width: ints[1].value as u32 });
+    }
+    Ok(fields)
+}
+
+/// Parses a `parts/` device table: `kind = "device"` (a part) or `"device-base"` (the authoring
+/// convenience its members name with `base`). Every section has a closed key set, and two
+/// refusals are load-bearing rather than defensive:
+///
+/// - a `[registers.*]` may not spell `offset`. A chip block's `offset` composes as
+///   `base + *_OFF`; a device register is an OPERAND written on the wire. The same name would
+///   invite one wrong line that compiles.
+/// - no fact may be a non-integer number, at any depth (see [`reject_floats`]).
+///
+/// Prose keys (`notes` everywhere, `[measurement] resolution_bits`) are accepted and carried no
+/// further: a facts table emits values, and a sentence is not one.
+fn build_device(
+    header: &[(usize, String, RawValue)],
+    items: &[(usize, Item)],
+    is_base: bool,
+) -> Result<DeviceTable, String> {
+    header_reject_unknown(header, &["kind", "family", "part", "base", "sources", "notes"])?;
+    let mut table = DeviceTable {
+        family: header_str(header, "family")?,
+        part: header_str_opt(header, "part")?,
+        base: header_str_opt(header, "base")?,
+        is_base,
+        burst_length: -1,
+        ..DeviceTable::default()
+    };
+    if is_base && !table.base.is_empty() {
+        return Err(format!(
+            "part base '{}' names a base of its own -- inheritance is one level, so that a member \
+             states its deltas against exactly one table",
+            table.family
+        ));
+    }
+    if !is_base && table.part.is_empty() {
+        return Err("a device table must declare its part id".to_string());
+    }
+
+    enum At {
+        None,
+        Bus(usize),
+        Address,
+        Strap(usize),
+        Identity,
+        Register(usize),
+        Enum(usize),
+        Measurement,
+        Calibration(usize),
+        CalibrationRead(usize),
+        Sequence(usize),
+    }
+    let mut at = At::None;
+    for (line, item) in items {
+        match item {
+            Item::Section(name) => {
+                at = match name.as_str() {
+                    "address" => {
+                        table.address = Some(DeviceAddress::default());
+                        At::Address
+                    }
+                    "identity" => {
+                        table.identity.get_or_insert_with(DeviceIdentity::default);
+                        At::Identity
+                    }
+                    "measurement" => At::Measurement,
+                    _ => {
+                        if let Some(bus) = name.strip_prefix("buses.") {
+                            table.buses.push(DeviceBus { name: bus.to_string(), ..DeviceBus::default() });
+                            At::Bus(table.buses.len() - 1)
+                        } else if let Some(reg) = name.strip_prefix("registers.") {
+                            table.registers.push(DeviceRegister {
+                                name: reg.to_string(),
+                                ..DeviceRegister::default()
+                            });
+                            At::Register(table.registers.len() - 1)
+                        } else if let Some(id) = name.strip_prefix("enums.") {
+                            table.enums.push(DeviceEnum { name: id.to_string(), ..DeviceEnum::default() });
+                            At::Enum(table.enums.len() - 1)
+                        } else if let Some(record) = name.strip_prefix("calibration.") {
+                            table.calibrations.push(DeviceCalibration {
+                                name: record.to_string(),
+                                ..DeviceCalibration::default()
+                            });
+                            At::Calibration(table.calibrations.len() - 1)
+                        } else {
+                            return Err(err(*line, &format!("unexpected section '[{name}]' in a part file -- the key set is closed")));
+                        }
+                    }
+                };
+            }
+            Item::ArraySection(name) => {
+                if name == "address.straps" {
+                    let Some(address) = table.address.as_mut() else {
+                        return Err(err(*line, "a strap must follow the [address] it moves"));
+                    };
+                    address.straps.push(AddressStrap::default());
+                    at = At::Strap(address.straps.len() - 1);
+                    continue;
+                }
+                if let Some(record) = name.strip_prefix("calibration.").and_then(|r| r.strip_suffix(".read")) {
+                    let Some(index) = table.calibrations.iter().position(|c| c.name == record) else {
+                        return Err(err(*line, &format!("a read must follow its [calibration.{record}] record")));
+                    };
+                    table.calibrations[index].reads.push(CalibrationRead::default());
+                    at = At::CalibrationRead(index);
+                    continue;
+                }
+                let Some(sequence) = name.strip_prefix("sequences.") else {
+                    return Err(err(*line, &format!("unexpected [[{name}]] in a part file -- the key set is closed")));
+                };
+                if table.sequences.last().is_none_or(|(n, _)| n != sequence) {
+                    table.sequences.push((sequence.to_string(), Vec::new()));
+                }
+                table.sequences.last_mut().expect("just ensured").1.push(DeviceStep::default());
+                at = At::Sequence(table.sequences.len() - 1);
+            }
+            Item::KeyValue(key, value) => {
+                reject_floats(*line, key, value)?;
+                match &at {
+                    At::None => return Err(err(*line, "key outside any section")),
+                    At::Bus(index) => {
+                        let bus = &mut table.buses[*index];
+                        match (key.as_str(), value) {
+                            ("kind", v) => bus.kind = as_str(*line, key, v)?,
+                            ("register_read_transform", v) => bus.register_read_transform = as_str(*line, key, v)?,
+                            ("register_write_transform", v) => bus.register_write_transform = as_str(*line, key, v)?,
+                            ("read_protocol", v) => bus.read_protocol = as_str(*line, key, v)?,
+                            ("modes", v) => bus.modes = as_int_array(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected bus key '{other}'"))),
+                        }
+                    }
+                    At::Address => {
+                        let address = table.address.as_mut().expect("open address");
+                        match (key.as_str(), value) {
+                            ("bus", v) => address.bus = as_str(*line, key, v)?,
+                            ("base", v) => address.base = as_int(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected address key '{other}'"))),
+                        }
+                    }
+                    At::Strap(index) => {
+                        let strap = &mut table.address.as_mut().expect("open address").straps[*index];
+                        match (key.as_str(), value) {
+                            ("pin", v) => strap.pin = as_str(*line, key, v)?,
+                            ("bit", v) => strap.bit = as_int(*line, key, v)?.value,
+                            ("low", v) => strap.low = as_int(*line, key, v)?,
+                            ("high", v) => strap.high = as_int(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected strap key '{other}'"))),
+                        }
+                    }
+                    At::Identity => {
+                        let identity = table.identity.as_mut().expect("open identity");
+                        match (key.as_str(), value) {
+                            ("reg", v) => identity.reg = as_int(*line, key, v)?,
+                            ("width", v) => identity.width = as_int(*line, key, v)?.value as u32,
+                            ("values", v) => identity.values = as_int_array(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected identity key '{other}'"))),
+                        }
+                    }
+                    At::Register(index) => {
+                        let register = &mut table.registers[*index];
+                        match (key.as_str(), value) {
+                            ("offset", _) => {
+                                return Err(err(*line, &format!(
+                                    "register '{}' spells 'offset' -- a device register is an OPERAND written on the wire, so the key is 'reg'; 'offset' means base-relative and would compose as base + offset",
+                                    register.name
+                                )));
+                            }
+                            ("reg", v) => register.reg = as_int(*line, key, v)?,
+                            ("width", v) => register.width = as_int(*line, key, v)?.value as u32,
+                            ("access", v) => register.access = as_str(*line, key, v)?,
+                            ("fields", v) => register.fields = build_fields(*line, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected register key '{other}'"))),
+                        }
+                    }
+                    At::Enum(index) => {
+                        let encoding = &mut table.enums[*index];
+                        match (key.as_str(), value) {
+                            ("notes", _) => {}
+                            (member, RawValue::Int(int)) => {
+                                encoding.members.push((unquote(member).to_string(), *int));
+                            }
+                            (other, _) => {
+                                return Err(err(*line, &format!("enum member '{other}' must be an integer code")));
+                            }
+                        }
+                    }
+                    At::Measurement => match (key.as_str(), value) {
+                        ("burst_length", v) => table.burst_length = as_int(*line, key, v)?.value,
+                        ("resolution_bits", _) | ("notes", _) => {}
+                        (other, _) => return Err(err(*line, &format!("unexpected measurement key '{other}'"))),
+                    },
+                    At::Calibration(index) => {
+                        let record = &mut table.calibrations[*index];
+                        match (key.as_str(), value) {
+                            ("form", v) => record.form = as_str(*line, key, v)?,
+                            ("byte_order", v) => record.byte_order = as_str(*line, key, v)?,
+                            ("output_scale", v) => record.output_scale = as_str(*line, key, v)?,
+                            ("depends_on", v) => record.depends_on = as_str_array(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected calibration key '{other}'"))),
+                        }
+                    }
+                    At::CalibrationRead(index) => {
+                        let read = table.calibrations[*index].reads.last_mut().expect("open read");
+                        match (key.as_str(), value) {
+                            ("name", v) => read.name = as_str(*line, key, v)?,
+                            ("reg", v) => read.reg = as_int(*line, key, v)?,
+                            ("width", v) => read.width = as_int(*line, key, v)?.value as u32,
+                            ("signed", v) => read.signed = as_int(*line, key, v)?.value != 0,
+                            ("packing", v) => read.packing = as_str(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected calibration-read key '{other}'"))),
+                        }
+                    }
+                    At::Sequence(index) => {
+                        let step = table.sequences[*index].1.last_mut().expect("open step");
+                        match (key.as_str(), value) {
+                            ("step", v) => step.step = as_str(*line, key, v)?,
+                            ("register", v) => step.register = as_str(*line, key, v)?,
+                            ("field", v) => step.field = as_str(*line, key, v)?,
+                            ("value", v) => step.value = Some(as_int(*line, key, v)?),
+                            ("bounded", v) => step.bounded = as_int(*line, key, v)?.value != 0,
+                            ("from", v) => step.from = as_str(*line, key, v)?,
+                            ("length_from", v) => step.length_from = as_str(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected step key '{other}'"))),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for register in &table.registers {
+        if register.width == 0 {
+            return Err(format!(
+                "part {}: register {} declares no width -- widths are data, not prose",
+                if table.part.is_empty() { &table.family } else { &table.part },
+                register.name
             ));
         }
     }
@@ -1043,10 +1704,11 @@ fn build_board(
 ) -> Result<BoardTable, String> {
     header_reject_unknown(
         header,
-        &["kind", "board", "family", "module", "part", "board_model", "sources", "notes"],
+        &["kind", "board", "vendor", "family", "module", "part", "board_model", "sources", "notes"],
     )?;
     let mut table = BoardTable {
         board: header_str(header, "board")?,
+        vendor: header_str(header, "vendor")?,
         family: header_str_opt(header, "family")?,
         module: header_str_opt(header, "module")?,
         part: header_str_opt(header, "part")?,
@@ -1060,6 +1722,12 @@ fn build_board(
     if table.family.is_empty() == table.module.is_empty() {
         return Err("a board names exactly one of family/module".to_string());
     }
+    if pascal(&table.vendor).is_empty() || !pascal(&table.vendor).chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "board '{}' states vendor '{}', which does not make a namespace segment -- kebab-case ASCII, as `raspberry-pi` does",
+            table.board, table.vendor
+        ));
+    }
     if !table.family.is_empty() && table.part.is_empty() {
         return Err("a family board must name its exact part".to_string());
     }
@@ -1068,6 +1736,10 @@ fn build_board(
         None,
         Carrier,
         Memory,
+        /// A named region's fitted-device record (`[memory.<region>.device]`).
+        MemoryDevice(usize),
+        /// One read configuration of a named region (`[[memory.<region>.reads]]`).
+        MemoryRead(usize),
         Binding,
         Plan,
         Device,
@@ -1084,7 +1756,12 @@ fn build_board(
                 table.carriers.push(Carrier::default());
                 at = At::Carrier;
             }
-            Item::Section(name) if name == "memory" => at = At::Memory,
+            Item::Section(name) | Item::ArraySection(name) if name == "memory" => {
+                table
+                    .memory
+                    .push(MemoryRegion { base: -1, device_size: -1, ..MemoryRegion::default() });
+                at = At::Memory;
+            }
             Item::ArraySection(name) if name == "bindings" => {
                 table.bindings.push(build_binding(*line));
                 at = At::Binding;
@@ -1096,6 +1773,38 @@ fn build_board(
             Item::ArraySection(name) if name == "devices" => {
                 table.devices.push(ControlPin::default());
                 at = At::Device;
+            }
+            Item::Section(name) | Item::ArraySection(name)
+                if name.starts_with("memory.") && name.matches('.').count() == 2 =>
+            {
+                let mut parts = name.splitn(3, '.');
+                let (_, region, leaf) = (parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let Some(index) = table.memory.iter().position(|r| r.name == region) else {
+                    return Err(err(*line, &format!(
+                        "'[{name}]' names region '{region}', which no [[memory]] row above it declares"
+                    )));
+                };
+                at = match (leaf, item) {
+                    ("device", Item::Section(_)) => At::MemoryDevice(index),
+                    ("reads", Item::ArraySection(_)) => {
+                        table.memory[index].reads.push(MemoryRead {
+                            instruction: -1,
+                            instruction_lines: -1,
+                            address_lines: -1,
+                            data_lines: -1,
+                            dummy: -1,
+                            dummy_datasheet: -1,
+                            clock_hz: -1,
+                            ..MemoryRead::default()
+                        });
+                        At::MemoryRead(index)
+                    }
+                    _ => {
+                        return Err(err(*line, &format!(
+                            "'{name}' is not a memory record -- a region takes [memory.<region>.device] and [[memory.<region>.reads]]"
+                        )));
+                    }
+                };
             }
             Item::Section(name) | Item::ArraySection(name) => {
                 return Err(err(*line, &format!("unexpected section '{name}' in a board file -- the key set is closed")));
@@ -1118,15 +1827,72 @@ fn build_board(
                     }
                 }
                 At::Memory => match (key.as_str(), value) {
-                    ("flash", RawValue::Int(i)) => table.memory_flash = i.value,
+                    ("flash", RawValue::Int(i)) => {
+                        let region = table.memory.last_mut().expect("open region");
+                        region.name = "flash".to_string();
+                        region.kind = "flash".to_string();
+                        region.size = i.value;
+                    }
+                    ("name", RawValue::Str(s)) => table.memory.last_mut().expect("open region").name = s.clone(),
+                    ("kind", RawValue::Str(s)) => table.memory.last_mut().expect("open region").kind = s.clone(),
+                    ("base", RawValue::Int(i)) => table.memory.last_mut().expect("open region").base = i.value,
+                    ("size", RawValue::Int(i)) => table.memory.last_mut().expect("open region").size = i.value,
+                    ("device_size", RawValue::Int(i)) => {
+                        table.memory.last_mut().expect("open region").device_size = i.value;
+                    }
+                    ("controller", RawValue::Str(s)) => {
+                        table.memory.last_mut().expect("open region").controller = s.clone();
+                    }
+                    ("optional", RawValue::Int(i)) => {
+                        table.memory.last_mut().expect("open region").optional = i.value != 0;
+                    }
+                    ("window", RawValue::Str(s)) => {
+                        table.memory.last_mut().expect("open region").window = s.clone();
+                    }
                     ("source", RawValue::Str(_)) => memory_source_cited = true,
                     (other, _) => {
                         return Err(err(
                             *line,
-                            &format!("unexpected [memory] key '{other}' (the closed [memory] record takes flash + source only)"),
+                            &format!("unexpected memory key '{other}' -- a region takes name/kind/base/size/device_size/controller/optional/window/source"),
                         ));
                     }
                 },
+                At::MemoryDevice(index) => match (key.as_str(), value) {
+                    ("part" | "source" | "notes", RawValue::Str(_)) => {}
+                    (fact, RawValue::Int(i)) => {
+                        let region = &mut table.memory[index];
+                        if region.device.iter().any(|(k, _)| k == fact) {
+                            return Err(err(*line, &format!(
+                                "region '{}' states device fact '{fact}' twice", region.name
+                            )));
+                        }
+                        region.device.push((fact.to_string(), *i));
+                    }
+                    (fact, _) => {
+                        return Err(err(*line, &format!(
+                            "device fact '{fact}' must be an integer -- a shape the controller is told is a number, and a word for it is prose"
+                        )));
+                    }
+                },
+                At::MemoryRead(index) => {
+                    let read = table.memory[index].reads.last_mut().expect("open read");
+                    match (key.as_str(), value) {
+                        ("name", RawValue::Str(s)) => read.name = s.clone(),
+                        ("instruction", RawValue::Int(i)) => read.instruction = i.value,
+                        ("instruction_lines", RawValue::Int(i)) => read.instruction_lines = i.value,
+                        ("address_lines", RawValue::Int(i)) => read.address_lines = i.value,
+                        ("data_lines", RawValue::Int(i)) => read.data_lines = i.value,
+                        ("dummy", RawValue::Int(i)) => read.dummy = i.value,
+                        ("dummy_datasheet", RawValue::Int(i)) => read.dummy_datasheet = i.value,
+                        ("clock_hz", RawValue::Int(i)) => read.clock_hz = i.value,
+                        ("source", RawValue::Str(_)) => {}
+                        (other, _) => {
+                            return Err(err(*line, &format!(
+                                "unexpected read key '{other}' -- a read configuration takes name/instruction/instruction_lines/address_lines/data_lines/dummy/dummy_datasheet/clock_hz/source"
+                            )));
+                        }
+                    }
+                }
                 At::Binding => {
                     binding_key(*line, table.bindings.last_mut().expect("open"), key, value)?;
                 }
@@ -1167,11 +1933,34 @@ fn build_board(
             table.board
         ));
     }
-    if table.memory_flash > 0 && !memory_source_cited {
-        return Err(format!(
-            "board {}: [memory] flash must be SOURCE-CITED",
-            table.board
-        ));
+    if !table.memory.is_empty() && !memory_source_cited {
+        return Err(format!("board {}: a memory region must be SOURCE-CITED", table.board));
+    }
+    for (at, region) in table.memory.iter().enumerate() {
+        if region.name.is_empty() {
+            return Err(format!("board {}: memory region {at} states no name", table.board));
+        }
+        if !["flash", "ram"].contains(&region.kind.as_str()) {
+            return Err(format!(
+                "board {}: memory region '{}' is kind '{}' -- a region holds code or it holds data, so the kinds are flash and ram",
+                table.board, region.name, region.kind
+            ));
+        }
+        if region.size <= 0 {
+            return Err(format!("board {}: memory region '{}' states no size", table.board, region.name));
+        }
+        if region.device_size >= 0 && region.device_size < region.size {
+            return Err(format!(
+                "board {}: memory region '{}' reaches 0x{:X} bytes of a 0x{:X}-byte device -- the accessible size cannot exceed the part",
+                table.board, region.name, region.size, region.device_size
+            ));
+        }
+        if table.memory.iter().filter(|other| other.name == region.name).count() > 1 {
+            return Err(format!(
+                "board {}: two memory regions are named '{}'",
+                table.board, region.name
+            ));
+        }
     }
     if let Some(default) = table.carriers.iter().find(|c| c.default) {
         table.carrier = default.clone();
@@ -1290,6 +2079,12 @@ fn validate_family(set: &FamilySet) -> Result<(), String> {
         if set.instances.row(&row.instance).is_none() {
             return Err(format!("pins: '{}' names unknown instance '{}'", row.pin, row.instance));
         }
+        if !set.parts.rows.is_empty() && !set.parts.rows.iter().any(|p| p.has_pin(&row.pin)) {
+            return Err(format!(
+                "pins: '{}' is in no part's present-list (if the pin exists on silicon, grow the parts row from the datasheet)",
+                row.pin
+            ));
+        }
     }
     for module in &set.modules {
         if !set.parts.rows.iter().any(|p| p.part == module.part) {
@@ -1388,11 +2183,23 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
     let Some(part_row) = set.parts.rows.iter().find(|p| p.part == part) else {
         return Err(format!("board {}: part '{}' is not in parts.toml", board.board, part));
     };
-    if board.memory_flash > 0 && part_row.flash != 0 {
-        return Err(format!(
-            "board {}: [memory] flash stated but part '{}' has internal flash (part flash = 0x{:X}) -- a second home for a chip fact refuses; the [memory] record is for external-XIP parts",
-            board.board, part, part_row.flash
-        ));
+    if part_row.flash != 0 {
+        if let Some(region) =
+            board.memory.iter().find(|r| r.kind == "flash" && r.controller.is_empty())
+        {
+            return Err(format!(
+                "board {}: memory region '{}' is the part's program flash, but part '{}' already states one (0x{:X}) -- a second home for a chip fact refuses. An EXTERNAL region names the controller that brings it up.",
+                board.board, region.name, part, part_row.flash
+            ));
+        }
+    }
+    for region in &board.memory {
+        if !region.controller.is_empty() && set.instances.row(&region.controller).is_none() {
+            return Err(format!(
+                "board {}: memory region '{}' is brought up by '{}', which csp/{}/instances.toml does not place",
+                board.board, region.name, region.controller, set.family
+            ));
+        }
     }
     validate_bindings(set, &bindings, &part, &board.board)?;
     let mut pin_claims: Vec<(&str, String)> = Vec::new();
@@ -1464,6 +2271,21 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
         }
     }
     Ok(ResolvedBoard { board, part, bindings, module_pins })
+}
+
+/// True when a row list still holds something a doc comment could document.
+fn documents_something(rest: &[Row]) -> bool {
+    rest.iter().any(|row| !matches!(row, Row::Blank | Row::Comment(_)))
+}
+
+/// Renders a section comment with ONE MARKER PER LINE, at a given indent.
+///
+/// A doc comment must document something, so a comment nothing follows keeps the ordinary marker
+/// -- an empty trailing doc comment is not valid Rust.
+fn push_section_comment(out: &mut String, indent: &str, marker: &str, comment: &str) {
+    for line in comment.split('\n') {
+        out.push_str(&format!("{indent}{marker} {line}\n"));
+    }
 }
 
 fn emit_header(out: &mut String, class: &str, what: &str, sources: &[String], regen: &str) {
@@ -1587,6 +2409,17 @@ pub fn emit_layout_csharp(block: &BlockTable, source: &str, regen: &str) -> Resu
     }
     finish_class(&mut out)?;
     Ok(out)
+}
+
+/// The vendor segment a board contributes to a published identifier: the namespace its C# class
+/// declares, and the segment its assembly name carries. `raspberry-pi` becomes `RaspberryPi`.
+///
+/// Public because it has two consumers that must not disagree -- the emitter writes it into
+/// `BOARD_VENDOR`, and the gate holds each hand-written board class's `namespace` equal to it.
+/// One function rather than one rule applied twice.
+#[must_use]
+pub fn vendor_segment(vendor: &str) -> String {
+    pascal(vendor)
 }
 
 /// The generated instances class name for a family: `Samd21Instances`.
@@ -2556,7 +3389,7 @@ fn resolve_uart_esp32c6(
     })
 }
 
-/// One resolved sam3x-family uart-binding emission (the SAM3X UART shape; the first sam3x board):
+/// One resolved sam3x-family uart-binding emission (the SAM3X UART shape):
 /// the uart base and peripheral id, the PMC clock gate the id resolves to (PCER0 register + the
 /// id's bit), the PIO mux cell the pins resolve to (the port's PDR/ABSR registers + the combined
 /// line mask + the function letter's ABSR value), the plan's MCK, and the carrier rate's BRGR
@@ -2681,14 +3514,35 @@ fn resolve_uart_sam3x(
     })
 }
 
+/// The GPIO facts for ONE bound pin: which port gate to open, and the two read-modify-writes
+/// that put the pin in alternate-function mode on the right function number.
+///
+/// PER PIN RATHER THAN PER BINDING, and that is the whole point of the shape. A uart's two pins
+/// need not share anything: the F746G-DISCO transmits on port A and receives on port B, so its
+/// two pins have different port gates, different MODER registers and different alternate-function
+/// registers. An earlier shape folded both pins into one mask per register -- one write covering
+/// both -- which is a real optimization and is only valid when the pins happen to coincide. This
+/// states each pin on its own terms; where they do coincide, the two writes hit the same register
+/// and the result is identical.
+struct StUartPin {
+    port_rcc_en_reg: i64,
+    port_rcc_en_mask: i64,
+    moder_reg: i64,
+    moder_mask: i64,
+    moder_value: i64,
+    /// AFRL or AFRH, selected by the pin's index -- see [`st_uart_pin`].
+    afr_reg: i64,
+    afr_mask: i64,
+    afr_value: i64,
+}
+
 /// One resolved st-usart binding emission (the modern ST USART IP, shared across the ST
-/// families): the usart base, the RCC enable (register, mask) pairs for the instance and its
-/// port -- resolved through the [base, rcc_en_off, rcc_en_bit] instance record, which is what
-/// makes the F0/L4 RCC-bank split DATA (L4: GPIOAEN = AHB2ENR bit 0; F0: IOPAEN = AHBENR
-/// bit 17) and lets ONE arm serve both families -- the GPIO MODER/AFRL registers with the
-/// per-pin-pair masks and set values derived from the bound pins + AF number, the plan's PCLK1
-/// rate, and the carrier rate's BRR divisor (16x oversampling, ROUNDED division: e.g. 0x23 @
-/// 4 MHz, 0x45 @ 8 MHz, 139 @ 16 MHz).
+/// families): the usart base, the RCC enable (register, mask) pair for the instance -- resolved
+/// through the [base, rcc_en_off, rcc_en_bit] instance record, which is what makes the RCC-bank
+/// split between ST lines DATA (one line's GPIOAEN is an AHB2 bit where another's IOPAEN is an
+/// AHB bit) and lets ONE arm serve them all -- the per-pin GPIO facts, the APB rate feeding this
+/// instance, and the carrier rate's BRR divisor (16x oversampling, ROUNDED division: e.g. 0x23 @
+/// 4 MHz, 0x45 @ 8 MHz, 0x8B @ 16 MHz).
 struct StUartEmission {
     prefix: String,
     role: String,
@@ -2696,18 +3550,70 @@ struct StUartEmission {
     base: i64,
     rcc_en_reg: i64,
     rcc_en_mask: i64,
-    port_rcc_en_reg: i64,
-    port_rcc_en_mask: i64,
-    moder_reg: i64,
-    moder_mask: i64,
-    moder_value: i64,
-    afrl_reg: i64,
-    afrl_mask: i64,
-    afrl_value: i64,
-    pclk1_hz: i64,
+    tx: StUartPin,
+    rx: StUartPin,
+    pclk_hz: i64,
     /// (`BRR_<rate>_<PLAN>` suffix, divisor), one per carrier whose wire rides this binding,
     /// under THAT carrier's plan; empty when no carrier rides it.
     bauds: Vec<(String, i64)>,
+}
+
+/// One muxed ST pin's facts, shared by every binding kind on these lines.
+///
+/// MODER holds 2 bits per pin at [2n]; the alternate-function nibble is 4 bits, but WHICH
+/// register holds it is decided by the pin index and the nibble is counted from THAT register's
+/// own base -- pins 0..7 in AFRL at [4n], pins 8..15 in AFRH at [4*(n-8)]. Getting that split
+/// wrong is silent: the write lands in a real register, on a real pin, and muxes the wrong one.
+///
+/// `who` names the claimant for the error, because every failure here is a board fact being
+/// wrong rather than a bug -- a pin index off the end of a port, a port the family does not
+/// place, an AFR half the block table does not state.
+fn st_mux_pin(
+    set: &FamilySet,
+    board: &str,
+    rcc_base: i64,
+    gpio: &BlockTable,
+    af: i64,
+    who: &str,
+    pin: &PinRef,
+) -> Result<StUartPin, String> {
+    let moder = gpio.register("MODER").ok_or_else(|| format!("{board}: gpio has no MODER"))?;
+    let mode_af = gpio
+        .constant("MODER_MODE_AF")
+        .ok_or_else(|| format!("{board}: gpio block has no MODER_MODE_AF constant"))?;
+    let (port, index) = split_pin(&pin.pin).ok_or_else(|| format!("{board}: bad pin {}", pin.pin))?;
+    if index > 15 {
+        return Err(format!("{board}: {who} pin index {index} exceeds a port's 16 pins"));
+    }
+    let group = format!("gpio{port}");
+    let group_base = set
+        .instances
+        .value(&group, "base")
+        .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+    let off = set
+        .instances
+        .value(&group, "rcc_en_off")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance '{group}' has no rcc_en_off"))?;
+    let bit = set
+        .instances
+        .value(&group, "rcc_en_bit")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance '{group}' has no rcc_en_bit"))?;
+    let (afr_name, nibble) = if index > 7 { ("AFRH", index - 8) } else { ("AFRL", index) };
+    let afr = gpio
+        .register(afr_name)
+        .ok_or_else(|| format!("{board}: gpio has no {afr_name} (needed by {who} pin {})", pin.pin))?;
+    Ok(StUartPin {
+        port_rcc_en_reg: rcc_base + off,
+        port_rcc_en_mask: 1i64 << bit,
+        moder_reg: group_base + moder.offset.value,
+        moder_mask: 0b11 << (2 * index),
+        moder_value: mode_af << (2 * index),
+        afr_reg: group_base + afr.offset.value,
+        afr_mask: 0xF << (4 * nibble),
+        afr_value: af << (4 * nibble),
+    })
 }
 
 fn resolve_uart_stm32(
@@ -2740,34 +3646,7 @@ fn resolve_uart_stm32(
     let (Some(tx), Some(rx)) = (tx, rx) else {
         return Err(format!("{board}: uart binding '{}' needs tx and rx pins", binding.role));
     };
-    let (tx_port, tx_index) = split_pin(&tx.pin).ok_or_else(|| format!("{board}: bad pin {}", tx.pin))?;
-    let (rx_port, rx_index) = split_pin(&rx.pin).ok_or_else(|| format!("{board}: bad pin {}", rx.pin))?;
-    if tx_port != rx_port {
-        return Err(format!(
-            "{board}: uart binding '{}' pins {}/{} sit on different ports -- per-port emission is the growth path; add it with the board that needs it",
-            binding.role, tx.pin, rx.pin
-        ));
-    }
-    for (label, index) in [("tx", tx_index), ("rx", rx_index)] {
-        if index > 7 {
-            return Err(format!(
-                "{board}: uart binding '{}' {label} pin index {index} needs AFRH emission -- not implemented",
-                binding.role
-            ));
-        }
-    }
-    let group = format!("gpio{tx_port}");
-    let group_base = instances
-        .value(&group, "base")
-        .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
-    let (port_rcc_en_reg, port_rcc_en_mask) = rcc_enable(&group)?;
-
     let gpio = set.block("gpio", "").ok_or_else(|| format!("{board}: no gpio block table"))?;
-    let moder = gpio.register("MODER").ok_or_else(|| format!("{board}: gpio has no MODER"))?;
-    let afrl = gpio.register("AFRL").ok_or_else(|| format!("{board}: gpio has no AFRL"))?;
-    let mode_af = gpio
-        .constant("MODER_MODE_AF")
-        .ok_or_else(|| format!("{board}: gpio block has no MODER_MODE_AF constant"))?;
     let af = binding
         .function
         .strip_prefix("AF")
@@ -2775,14 +3654,13 @@ fn resolve_uart_stm32(
         .ok_or_else(|| {
             format!("{board}: uart binding '{}' function '{}' is not AF<n>", binding.role, binding.function)
         })?;
-    let moder_mask = (0b11 << (2 * tx_index)) | (0b11 << (2 * rx_index));
-    let moder_value = (mode_af << (2 * tx_index)) | (mode_af << (2 * rx_index));
-    let afrl_mask = (0xF << (4 * tx_index)) | (0xF << (4 * rx_index));
-    let afrl_value = (af << (4 * tx_index)) | (af << (4 * rx_index));
+
+    let tx_pin = st_mux_pin(set, board, rcc_base, gpio, af, &format!("uart binding '{}' tx", binding.role), tx)?;
+    let rx_pin = st_mux_pin(set, board, rcc_base, gpio, af, &format!("uart binding '{}' rx", binding.role), rx)?;
 
     let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
-    let pclk1_hz = plan.rate("pclk1_hz").ok_or_else(|| {
-        format!("{board}: default plan '{}' states no pclk1_hz rate", plan.name)
+    let pclk1_hz = plan.rate("pclk_hz").ok_or_else(|| {
+        format!("{board}: default plan '{}' states no pclk_hz rate", plan.name)
     })?;
     let source_key = format!("{}_hz", plan.source);
     let source_hz = plan.rate(&source_key).ok_or_else(|| {
@@ -2797,8 +3675,8 @@ fn resolve_uart_stm32(
 
     let mut bauds = Vec::new();
     for (carrier, carrier_plan) in resolved.board.carrier_points(&binding.role) {
-        let pclk1 = carrier_plan.rate("pclk1_hz").ok_or_else(|| {
-            format!("{board}: plan '{}' states no pclk1_hz rate", carrier_plan.name)
+        let pclk1 = carrier_plan.rate("pclk_hz").ok_or_else(|| {
+            format!("{board}: plan '{}' states no pclk_hz rate", carrier_plan.name)
         })?;
         let rate = carrier.baud;
         let divisor = (pclk1 + rate / 2) / rate;
@@ -2812,16 +3690,140 @@ fn resolve_uart_stm32(
         base,
         rcc_en_reg,
         rcc_en_mask,
-        port_rcc_en_reg,
-        port_rcc_en_mask,
-        moder_reg: group_base + moder.offset.value,
-        moder_mask,
-        moder_value,
-        afrl_reg: group_base + afrl.offset.value,
-        afrl_mask,
-        afrl_value,
-        pclk1_hz,
+        tx: tx_pin,
+        rx: rx_pin,
+        pclk_hz: pclk1_hz,
         bauds,
+    })
+}
+
+/// One resolved st-i2c binding emission (the newer ST I2C, the one with TIMINGR).
+///
+/// Two things here that a uart binding on the same part does not need:
+///
+/// * BOTH PINS ARE OPEN DRAIN, and that is not a preference. A push-pull output cannot be pulled
+///   low by the device at the other end, so a target's acknowledge is fought instead of seen and
+///   the controller reads a bus where nothing ever answers -- with the mux perfectly correct.
+/// * The rate is not a divisor and is not derived from one. This block's timing is five separate
+///   counts, and the manual TABULATES the compliant sets per kernel-clock rate rather than giving
+///   a formula that works without knowing the bus's rise time -- which is a board's electrical
+///   property, not a chip fact. So generation composes the word for each point the block states
+///   AT THIS PLAN'S KERNEL RATE, the driver picks a speed, and no one writes a divisor down.
+///
+/// Whether an internal pull-up is wanted is deliberately NOT emitted: an open-drain bus needs a
+/// pull somewhere, and whether the board already has one is board wiring nothing here states.
+struct StI2cEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    base: i64,
+    rcc_en_reg: i64,
+    rcc_en_mask: i64,
+    scl: StUartPin,
+    sda: StUartPin,
+    /// (register address, bit mask) of each pin's output-type bit -- ONE bit per pin, so the
+    /// shift is the pin index and not twice it. Setting the bit is open drain.
+    otyper: (i64, i64, i64),
+    kernel_hz: i64,
+    /// (`TIMINGR_<rate>_<PLAN>` suffix, composed word) for every operating point the block
+    /// tabulates at this kernel rate.
+    timings: Vec<(String, i64)>,
+}
+
+fn resolve_i2c_stm32(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<StI2cEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let name = &binding.instance;
+    let base = instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    let rcc_base = instances
+        .value("rcc", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'rcc'"))?;
+    let off = instances
+        .value(name, "rcc_en_off")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance '{name}' has no rcc_en_off"))?;
+    let bit = instances
+        .value(name, "rcc_en_bit")
+        .filter(|v| *v >= 0)
+        .ok_or_else(|| format!("{board}: instance '{name}' has no rcc_en_bit"))?;
+
+    let scl = binding.pins.iter().find(|(s, _)| s == "scl").map(|(_, p)| p);
+    let sda = binding.pins.iter().find(|(s, _)| s == "sda").map(|(_, p)| p);
+    let (Some(scl), Some(sda)) = (scl, sda) else {
+        return Err(format!("{board}: i2c binding '{}' needs scl and sda pins", binding.role));
+    };
+    let gpio = set.block("gpio", "").ok_or_else(|| format!("{board}: no gpio block table"))?;
+    let af = binding
+        .function
+        .strip_prefix("AF")
+        .and_then(|d| d.parse::<i64>().ok())
+        .ok_or_else(|| {
+            format!("{board}: i2c binding '{}' function '{}' is not AF<n>", binding.role, binding.function)
+        })?;
+    let scl_pin = st_mux_pin(set, board, rcc_base, gpio, af, &format!("i2c binding '{}' scl", binding.role), scl)?;
+    let sda_pin = st_mux_pin(set, board, rcc_base, gpio, af, &format!("i2c binding '{}' sda", binding.role), sda)?;
+
+    let (scl_port, scl_index) = split_pin(&scl.pin).expect("validated by st_mux_pin");
+    let (sda_port, sda_index) = split_pin(&sda.pin).expect("validated by st_mux_pin");
+    if scl_port != sda_port {
+        return Err(format!(
+            "{board}: i2c binding '{}' has {} and {} in different ports -- the output-type bits would need one register address each, which is the named growth path",
+            binding.role, scl.pin, sda.pin
+        ));
+    }
+    let otyper = gpio.register("OTYPER").ok_or_else(|| format!("{board}: gpio has no OTYPER"))?;
+    let group_base = instances
+        .value(&format!("gpio{scl_port}"), "base")
+        .expect("validated by st_mux_pin");
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let kernel_hz = plan.rate("pclk_hz").ok_or_else(|| {
+        format!("{board}: default plan '{}' states no pclk_hz rate", plan.name)
+    })?;
+    let i2c = set.block("i2c", "").ok_or_else(|| format!("{board}: no i2c block table"))?;
+    let clock_label = format!("{}MHZ", kernel_hz / 1_000_000);
+    let mut timings = Vec::new();
+    for rate in ["100K", "400K"] {
+        let field = |name: &str| i2c.constant(&format!("TIMING_{rate}_{clock_label}_{name}"));
+        let (Some(presc), Some(scldel), Some(sdadel), Some(sclh), Some(scll)) =
+            (field("PRESC"), field("SCLDEL"), field("SDADEL"), field("SCLH"), field("SCLL"))
+        else {
+            continue;
+        };
+        let word = i2c.place("TIMINGR", "PRESC", presc)?
+            | i2c.place("TIMINGR", "SCLDEL", scldel)?
+            | i2c.place("TIMINGR", "SDADEL", sdadel)?
+            | i2c.place("TIMINGR", "SCLH", sclh)?
+            | i2c.place("TIMINGR", "SCLL", scll)?;
+        timings.push((format!("TIMINGR_{rate}_{}", upper_snake(&plan.name)), word));
+    }
+    if timings.is_empty() {
+        return Err(format!(
+            "{board}: i2c binding '{}' runs from a {kernel_hz} Hz kernel clock, and the i2c block tabulates no compliant timing at that rate -- add the point with its source rather than interpolating one",
+            binding.role
+        ));
+    }
+
+    Ok(StI2cEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        base,
+        rcc_en_reg: rcc_base + off,
+        rcc_en_mask: 1i64 << bit,
+        scl: scl_pin,
+        sda: sda_pin,
+        otyper: (
+            group_base + otyper.offset.value,
+            1i64 << scl_index,
+            1i64 << sda_index,
+        ),
+        kernel_hz,
+        timings,
     })
 }
 
@@ -3054,6 +4056,7 @@ struct BoardEmissions {
     esp_uarts: Vec<EspUartEmission>,
     sam3x_uarts: Vec<Sam3xUartEmission>,
     st_uarts: Vec<StUartEmission>,
+    st_i2cs: Vec<StI2cEmission>,
     sercom_spis: Vec<SpiEmission>,
     sercom_i2cs: Vec<SercomI2cEmission>,
     pl022_spis: Vec<SpiPl022Emission>,
@@ -3071,6 +4074,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         esp_uarts: Vec::new(),
         sam3x_uarts: Vec::new(),
         st_uarts: Vec::new(),
+        st_i2cs: Vec::new(),
         sercom_spis: Vec::new(),
         sercom_i2cs: Vec::new(),
         pl022_spis: Vec::new(),
@@ -3087,7 +4091,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                 "rp2350" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, true)?),
                 "esp32c6" => emissions.esp_uarts.push(resolve_uart_esp32c6(set, resolved, binding)?),
                 "sam3x" => emissions.sam3x_uarts.push(resolve_uart_sam3x(set, resolved, binding)?),
-                "stm32l476" | "stm32f091" => {
+                "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" => {
                     emissions.st_uarts.push(resolve_uart_stm32(set, resolved, binding)?);
                 }
                 other => {
@@ -3113,6 +4117,9 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                     emissions.nrf_twis.push(resolve_i2c_nrf(set, resolved, binding)?)
                 }
                 "rp2350" => emissions.dw_i2cs.push(resolve_i2c_dw(set, resolved, binding)?),
+                "stm32l476" | "stm32f091" | "stm32f7" => {
+                    emissions.st_i2cs.push(resolve_i2c_stm32(set, resolved, binding)?);
+                }
                 other => {
                     return Err(format!(
                         "{}: no i2c emission shape for family '{other}' -- add its derivation path first",
@@ -3152,6 +4159,7 @@ pub fn emit_board_csharp(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_i2cs,
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
@@ -3176,6 +4184,7 @@ pub fn emit_board_csharp(
 
     out.push_str("\n        // -- identity --\n");
     push_const(&mut out, "int", "BOARD_MODEL", &resolved.board.board_model.to_string());
+    push_const(&mut out, "string", "BOARD_VENDOR", &format!("\"{}\"", vendor_segment(&resolved.board.vendor)));
     if resolved.board.carrier.usb_vid > 0 {
         push_const(&mut out, "uint", "CARRIER_USB_VID", &format!("0x{:04X}", resolved.board.carrier.usb_vid));
     }
@@ -3257,15 +4266,17 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", uart.base));
         push_const(&mut out, "uint", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", uart.rcc_en_reg));
         push_const(&mut out, "uint", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", uart.rcc_en_mask));
-        push_const(&mut out, "uint", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", uart.port_rcc_en_reg));
-        push_const(&mut out, "uint", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", uart.port_rcc_en_mask));
-        push_const(&mut out, "uint", &format!("{p}_MODER_REG"), &format!("0x{:X}", uart.moder_reg));
-        push_const(&mut out, "uint", &format!("{p}_MODER_MASK"), &format!("0x{:X}", uart.moder_mask));
-        push_const(&mut out, "uint", &format!("{p}_MODER_VALUE"), &format!("0x{:X}", uart.moder_value));
-        push_const(&mut out, "uint", &format!("{p}_AFRL_REG"), &format!("0x{:X}", uart.afrl_reg));
-        push_const(&mut out, "uint", &format!("{p}_AFRL_MASK"), &format!("0x{:X}", uart.afrl_mask));
-        push_const(&mut out, "uint", &format!("{p}_AFRL_VALUE"), &format!("0x{:X}", uart.afrl_value));
-        push_const(&mut out, "uint", &format!("{p}_PCLK1_HZ"), &uart.pclk1_hz.to_string());
+        for (side, pin) in [("TX", &uart.tx), ("RX", &uart.rx)] {
+            push_const(&mut out, "uint", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        push_const(&mut out, "uint", &format!("{p}_PCLK_HZ"), &uart.pclk_hz.to_string());
         for (suffix, divisor) in &uart.bauds {
             push_const(&mut out, "uint", &format!("{p}_{suffix}"), &format!("0x{divisor:X}"));
         }
@@ -3326,6 +4337,30 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_SSPCLK_HZ"), &spi.sspclk_hz.to_string());
     }
 
+    for i2c in &st_i2cs {
+        let p = &i2c.prefix;
+        out.push_str(&format!("\n        // -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n        // a push-pull output cannot be pulled low by the device at the other end, so an\n        // acknowledge is fought instead of seen and nothing ever answers, with the mux\n        // perfectly correct. The timing words are the manual's own compliant points at\n        // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
+        push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", i2c.base));
+        push_const(&mut out, "uint", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", i2c.rcc_en_reg));
+        push_const(&mut out, "uint", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", i2c.rcc_en_mask));
+        for (side, pin) in [("SCL", &i2c.scl), ("SDA", &i2c.sda)] {
+            push_const(&mut out, "uint", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        push_const(&mut out, "uint", &format!("{p}_OTYPER_REG"), &format!("0x{:X}", i2c.otyper.0));
+        push_const(&mut out, "uint", &format!("{p}_OTYPER_SCL_MASK"), &format!("0x{:X}", i2c.otyper.1));
+        push_const(&mut out, "uint", &format!("{p}_OTYPER_SDA_MASK"), &format!("0x{:X}", i2c.otyper.2));
+        push_const(&mut out, "uint", &format!("{p}_KERNEL_HZ"), &i2c.kernel_hz.to_string());
+        for (suffix, word) in &i2c.timings {
+            push_const(&mut out, "uint", &format!("{p}_{suffix}"), &format!("0x{word:X}"));
+        }
+    }
     for twi in &nrf_twis {
         let p = &twi.prefix;
         out.push_str(&format!("\n        // -- {p}: an nrf-twi binding descriptor --\n"));
@@ -3401,34 +4436,461 @@ pub fn emit_board_csharp(
         }
     }
 
+    let rows_at = memory_rows(set, resolved)?;
+    for (at, row) in rows_at.iter().enumerate() {
+        let documents = documents_something(&rows_at[at + 1..]);
+        match row {
+            Row::Blank => out.push('\n'),
+            Row::Comment(comment) => push_section_comment(&mut out, "        ", if documents { "///" } else { "//" }, comment),
+            Row::Uint(name, value) => push_const(&mut out, "uint", name, value),
+            Row::Int(name, value) => push_const(&mut out, "int", name, value),
+            Row::Str(name, value) => push_const(&mut out, "string", name, &format!("\"{value}\"")),
+        }
+    }
+
     finish_class(&mut out)?;
     Ok(out)
 }
 
-/// A control pin's GPIO-group row base + pin index. Lettered/numbered ports resolve as
-/// `port<x>` instance rows (`porta`, `port0`); the rp-family's bank-less GP pins are driven
+/// A control pin's GPIO-group row base + pin index. The rp-family's bank-less GP pins are driven
 /// through the SIO block (the vendor's own instance name, base SIO 0xd0000000).
+///
+/// EVERY OTHER FAMILY RESOLVES A LETTERED OR NUMBERED PORT BY NAME, AND THE NAME IS THE VENDOR'S.
+/// Microchip and Nordic call a GPIO group a PORT (`porta`, `port0`); ST calls it a GPIO (`gpioa`).
+/// Both spellings mean the same thing, and an instance row keeps whichever name the part's own
+/// manual uses rather than taking one vendor's word across all of them, so both are accepted. The
+/// alternative is renaming a family's rows, which moves every emitted `PORTA_BASE` / `GPIOA_BASE`
+/// constant and every driver that reads one -- a spelling preference paid for in published names.
+///
+/// NEITHER FIELD PREDICTS THE OTHER, so a row cannot be found from its block alone: Nordic's ports
+/// place a block called `gpio` and are named `port0` and `port1`. A family that spells a group a
+/// third way is a row here, and the error below names both spellings it looked for.
 fn control_pin_group_base(set: &FamilySet, board: &str, pin: &str) -> Result<(i64, u32), String> {
     let Some((port, index)) = split_pin(pin) else {
         return Err(format!("{board}: bad control pin {pin}"));
     };
-    let group = if port == 'g' && set.family.starts_with("rp") {
-        "sio".to_string()
-    } else {
-        format!("port{port}")
-    };
-    let group_base = set
-        .instances
-        .value(&group, "base")
-        .ok_or_else(|| format!("{board}: no instance row for '{group}'"))?;
-    Ok((group_base, index))
+    if port == 'g' && set.family.starts_with("rp") {
+        let base = set
+            .instances
+            .value("sio", "base")
+            .ok_or_else(|| format!("{board}: no instance row for 'sio'"))?;
+        return Ok((base, index));
+    }
+    let spellings = [format!("port{port}"), format!("gpio{port}")];
+    for group in &spellings {
+        if let Some(base) = set.instances.value(group, "base") {
+            return Ok((base, index));
+        }
+    }
+    Err(format!(
+        "{board}: no instance row for '{}' or '{}' (the port control pin {pin} needs)",
+        spellings[0], spellings[1]
+    ))
 }
 
 
+/// Writes a generated Rust module's header as an INNER DOC comment (`//!`), not a plain `//`.
+///
+/// Measured, not assumed: the published drop strips ordinary `//` comments from every `.rs`,
+/// and keeps a module's `//!` block only as far as its first blank `//!` line. A plain-`//`
+/// header therefore vanished entirely, and every generated Rust module shipped opening on a
+/// bare `pub const` with nothing saying it was generated -- so the one edit a reader must not
+/// make was the one the file did not warn against. As `//!`, the banner and the regenerate
+/// line survive and the fuller prose below the blank line does not, which is the right split.
+/// The memory-region facts a board emits, as one ordered row list the typed emitters share.
+///
+/// An absent `_BASE` means the chip's own fixed window, which is chip truth and not the board's to
+/// repeat. An absent `_CONTROLLER` means the chip maps the region with no help.
+fn memory_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>, String> {
+    let board = &resolved.board;
+    let mut rows = Vec::new();
+    if board.memory.is_empty() {
+        return Ok(rows);
+    }
+    section(
+        &mut rows,
+        "-- memory regions the board fits: SIZE is what a program may reach, which a device's own\nsize may exceed; a region with a CONTROLLER does not exist until that instance is brought\nup, and touching it first is a bus fault rather than a wrong value --".to_string(),
+    );
+    uint(&mut rows, "MEMORY_REGION_COUNT".to_string(), board.memory.len().to_string());
+    for region in &board.memory {
+        let prefix = format!("MEMORY_{}", upper_snake(&region.name));
+        text(&mut rows, format!("{prefix}_KIND"), &region.kind);
+        if region.base >= 0 {
+            uint(&mut rows, format!("{prefix}_BASE"), format!("0x{:X}", region.base));
+        }
+        uint(&mut rows, format!("{prefix}_SIZE"), format!("0x{:X}", region.size));
+        if region.device_size >= 0 && region.device_size != region.size {
+            uint(&mut rows, format!("{prefix}_DEVICE_SIZE"), format!("0x{:X}", region.device_size));
+        }
+        if !region.controller.is_empty() {
+            text(&mut rows, format!("{prefix}_CONTROLLER"), &region.controller);
+        }
+        uint(&mut rows, format!("{prefix}_OPTIONAL"), u32::from(region.optional).to_string());
+    }
+    for region in &board.memory {
+        rows.extend(memory_device_rows(set, resolved, region)?);
+    }
+    Ok(rows)
+}
+
+/// The block a region's controller instance places, when the region names one AND the family has
+/// a table for it. A region may legally name a controller the family places without a block table
+/// -- that is the state this family's two memory controllers were in until a driver needed them
+/// -- so an absent table is "nothing to derive", never an error.
+fn region_block<'a>(set: &'a FamilySet, region: &MemoryRegion) -> Option<&'a BlockTable> {
+    let row = set.instances.row(&region.controller)?;
+    set.block(&row.block, "")
+}
+
+/// One region's FITTED-DEVICE emission: the configuration words its controller has to be told,
+/// derived here rather than written down.
+///
+/// THIS IS WHERE THE THIRD STRATUM SHOWS ITSELF. A bring-up has three kinds of fact in it and
+/// only two of them have a home in the file that states them:
+///
+/// * the ORDER is chip truth and rides the controller's block table;
+/// * the DEVICE SHAPE is board truth and rides the region below;
+/// * and SOME OF THE NUMBERS ARE NEITHER -- they are properties of a device AT A CLOCK, wrong at
+///   every other operating point, so neither may be a bare constant. A baud
+///   divisor is derived from a (carrier, plan) pair and never stated; a refresh count is derived
+///   from a (device, plan) pair for exactly the same reason.
+///
+/// One of them cannot even be derived. A quad-SPI read's dummy-cycle count covers the device's
+/// internal latency in TIME, so no formula over the chip's facts and the board's facts produces
+/// it -- and a wrong count does not fail, it shifts every byte and returns plausible garbage. So
+/// the emission carries the range a driver walks and the count that was MEASURED, named for the
+/// plan it was measured under, and the driver asks the part.
+fn memory_device_rows(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    region: &MemoryRegion,
+) -> Result<Vec<Row>, String> {
+    let board = &resolved.board.board;
+    let mut rows = Vec::new();
+    if region.device.is_empty() && region.reads.is_empty() && region.window.is_empty() {
+        return Ok(rows);
+    }
+    let prefix = format!("MEMORY_{}", upper_snake(&region.name));
+    let Some(block) = region_block(set, region) else {
+        return Err(format!(
+            "{board}: region '{}' states a fitted device, but its controller '{}' has no block table to configure -- the shape has nowhere to be written",
+            region.name, region.controller
+        ));
+    };
+
+    if !region.window.is_empty() {
+        let Some(window) = block.constant(&region.window) else {
+            return Err(format!(
+                "{board}: region '{}' names window constant '{}', which block '{}' does not declare",
+                region.name, region.window, block.block
+            ));
+        };
+        if window != region.base {
+            return Err(format!(
+                "{board}: region '{}' states base 0x{:X} but block '{}' puts {} at 0x{:X} -- one number, two statements, and they disagree",
+                region.name, region.base, block.block, region.window, window
+            ));
+        }
+    }
+
+    match block.block.as_str() {
+        "quadspi" => quadspi_device_rows(resolved, region, block, &prefix, &mut rows)?,
+        "fmc" => fmc_device_rows(resolved, region, block, &prefix, &mut rows)?,
+        other => {
+            return Err(format!(
+                "{board}: region '{}' is brought up by a '{other}' controller, which has no device-shape derivation yet -- add its path before a board states one",
+                region.name
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+/// A region's required device facts, refused by NAME when one is missing. The set is per
+/// controller because what an SDRAM is and what a NOR flash is are different questions, and
+/// stating that in the reader would put the knowledge two files away from the arithmetic.
+fn require_facts(
+    board: &str,
+    region: &MemoryRegion,
+    required: &[&str],
+) -> Result<(), String> {
+    for key in required {
+        if region.fact(key).is_none() {
+            return Err(format!(
+                "{board}: region '{}' states no '{key}' -- its controller cannot be configured without it",
+                region.name
+            ));
+        }
+    }
+    for (key, _) in &region.device {
+        if !required.contains(&key.as_str()) {
+            return Err(format!(
+                "{board}: region '{}' states device fact '{key}', which its controller does not take",
+                region.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The AHB rate the default plan runs at -- what both memory controllers divide down from.
+fn hclk_hz(resolved: &ResolvedBoard, plan: &Plan) -> Result<i64, String> {
+    plan.rate("hclk_hz").ok_or_else(|| {
+        format!(
+            "{}: plan '{}' states no hclk_hz -- a memory controller's own clock is derived from the bus clock, so the point has to state it",
+            resolved.board.board, plan.name
+        )
+    })
+}
+
+fn quadspi_device_rows(
+    resolved: &ResolvedBoard,
+    region: &MemoryRegion,
+    block: &BlockTable,
+    prefix: &str,
+    rows: &mut Vec<Row>,
+) -> Result<(), String> {
+    let board = &resolved.board.board;
+    require_facts(board, region, &["identity", "address_bits", "chip_select_high_cycles", "clock_idle"])?;
+    let fact = |key: &str| region.fact(key).expect("required above");
+
+    let fitted = region.fitted_size();
+    if fitted <= 0 || fitted & (fitted - 1) != 0 {
+        return Err(format!(
+            "{board}: region '{}' is 0x{fitted:X} bytes, which is not a power of two -- the controller states a device's size as an exponent and cannot express this",
+            region.name
+        ));
+    }
+    let fsize = i64::from(fitted.trailing_zeros()) - 1;
+    let dcr = block.place("DCR", "FSIZE", fsize)?
+        | block.place("DCR", "CSHT", fact("chip_select_high_cycles") - 1)?
+        | block.place("DCR", "CKMODE", fact("clock_idle"))?;
+
+    section(rows, format!(
+        "-- the flash fitted to '{}': what the controller must be told about the DEVICE, as\nopposed to how the controller itself is brought up (which is chip truth and lives in the\nblock layout). FSIZE is derived from the size above rather than stated beside it --\n2^(FSIZE+1) bytes -- so a size and an exponent cannot drift apart --",
+        region.name
+    ));
+    uint(rows, format!("{prefix}_DEVICE_ID"), format!("0x{:X}", fact("identity")));
+    uint(rows, format!("{prefix}_ADDRESS_BITS"), fact("address_bits").to_string());
+    uint(rows, format!("{prefix}_FSIZE"), fsize.to_string());
+    uint(rows, format!("{prefix}_DCR"), format!("0x{dcr:X}"));
+
+    if region.reads.is_empty() {
+        return Ok(());
+    }
+    section(rows, format!(
+        "-- read configurations. Each word below is a COMPLETE command EXCEPT two fields, and\nwhich two is the point: the functional mode is the driver's choice (indirect or\nmemory-mapped, both in the block layout), and THE DUMMY COUNT IS THE PART'S ANSWER.\nA dummy phase covers the device's internal latency in TIME, so the cycles that cover it\nfall with the interface clock -- and a wrong count does not fail, it shifts every byte\nand returns plausible garbage. Walk the range and keep the first count that reads back a\npayload you already know; the anchors below say what this board answered, and at what --"
+    ));
+    uint(rows, format!("{prefix}_READ_CONFIGURATIONS"), region.reads.len().to_string());
+    uint(rows, format!("{prefix}_DUMMY_MIN"), block.constant("CCR_DCYC_MIN").unwrap_or(0).to_string());
+    uint(rows, format!("{prefix}_DUMMY_MAX"), block.constant("CCR_DCYC_MAX").unwrap_or(0).to_string());
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let hclk = hclk_hz(resolved, plan)?;
+    let lines = |what: &str, count: i64| -> Result<i64, String> {
+        match count {
+            1 => block.constant("CCR_MODE_SINGLE"),
+            2 => block.constant("CCR_MODE_DUAL"),
+            4 => block.constant("CCR_MODE_QUAD"),
+            _ => None,
+        }
+        .ok_or_else(|| format!("{board}: region '{}' states {what} on {count} lines, which the controller has no encoding for", region.name))
+    };
+    for read in &region.reads {
+        if read.name.is_empty() {
+            return Err(format!("{board}: region '{}' has a read configuration with no name", region.name));
+        }
+        for (what, value) in [
+            ("instruction", read.instruction),
+            ("instruction_lines", read.instruction_lines),
+            ("address_lines", read.address_lines),
+            ("data_lines", read.data_lines),
+            ("clock_hz", read.clock_hz),
+            ("dummy", read.dummy),
+        ] {
+            if value < 0 {
+                return Err(format!(
+                    "{board}: region '{}' read '{}' states no {what}",
+                    region.name, read.name
+                ));
+            }
+        }
+        let read_prefix = format!("{prefix}_{}", upper_snake(&read.name));
+        let address_size = (read.address_lines > 0).then_some(()).and(match region.fact("address_bits") {
+            Some(24) => block.constant("CCR_ADSIZE_24"),
+            Some(32) => block.constant("CCR_ADSIZE_32"),
+            Some(16) => block.constant("CCR_ADSIZE_16"),
+            Some(8) => block.constant("CCR_ADSIZE_8"),
+            _ => None,
+        }).ok_or_else(|| format!(
+            "{board}: region '{}' states {} address bits, which the controller has no size encoding for",
+            region.name, region.fact("address_bits").unwrap_or(-1)
+        ))?;
+        let phases = block.place("CCR", "INSTRUCTION", read.instruction)?
+            | block.place("CCR", "IMODE", lines("its instruction", read.instruction_lines)?)?
+            | block.place("CCR", "ADMODE", lines("an address", read.address_lines)?)?
+            | block.place("CCR", "ADSIZE", address_size)?
+            | block.place("CCR", "DMODE", lines("its data", read.data_lines)?)?;
+        if read.clock_hz <= 0 || hclk % read.clock_hz != 0 {
+            return Err(format!(
+                "{board}: region '{}' read '{}' is qualified at {} Hz, which {hclk} Hz does not divide exactly -- the controller can only halve, third, quarter (and so on) the bus clock",
+                region.name, read.name, read.clock_hz
+            ));
+        }
+        uint(rows, format!("{read_prefix}_INSTRUCTION"), format!("0x{:X}", read.instruction));
+        uint(rows, format!("{read_prefix}_CCR_PHASES"), format!("0x{phases:X}"));
+        uint(rows, format!("{read_prefix}_PRESCALER_{}", upper_snake(&plan.name)), (hclk / read.clock_hz - 1).to_string());
+        uint(rows, format!("{read_prefix}_CLOCK_HZ_{}", upper_snake(&plan.name)), read.clock_hz.to_string());
+        uint(rows, format!("{read_prefix}_DUMMY_{}", upper_snake(&plan.name)), read.dummy.to_string());
+        if read.dummy_datasheet >= 0 {
+            uint(rows, format!("{read_prefix}_DUMMY_DATASHEET"), read.dummy_datasheet.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn fmc_device_rows(
+    resolved: &ResolvedBoard,
+    region: &MemoryRegion,
+    block: &BlockTable,
+    prefix: &str,
+    rows: &mut Vec<Row>,
+) -> Result<(), String> {
+    let board = &resolved.board.board;
+    require_facts(board, region, &[
+        "bank", "column_bits", "row_bits", "banks", "data_bits", "device_data_bits", "cas_latency",
+        "sdclk_hclk_periods", "read_burst", "mode_register", "refresh_period_ns", "refresh_rows",
+        "refresh_burst", "settle_us",
+        "tmrd_ns", "txsr_ns", "tras_ns", "trc_ns", "twr_ns", "trp_ns", "trcd_ns",
+    ])?;
+    let fact = |key: &str| region.fact(key).expect("required above");
+
+    let cells = 1i64 << (fact("row_bits") + fact("column_bits"));
+    let accessible = cells * fact("banks") * fact("data_bits") / 8;
+    if accessible != region.size {
+        return Err(format!(
+            "{board}: region '{}' is {} rows x {} columns x {} banks x {} bits = 0x{accessible:X} bytes, but states size 0x{:X}",
+            region.name, 1i64 << fact("row_bits"), 1i64 << fact("column_bits"), fact("banks"), fact("data_bits"), region.size
+        ));
+    }
+    let fitted = cells * fact("banks") * fact("device_data_bits") / 8;
+    if fitted != region.fitted_size() {
+        return Err(format!(
+            "{board}: region '{}' fits a {} bit device = 0x{fitted:X} bytes, but states device_size 0x{:X}",
+            region.name, fact("device_data_bits"), region.fitted_size()
+        ));
+    }
+
+    let encoded = |what: &str, name: String| -> Result<i64, String> {
+        block.constant(&name).ok_or_else(|| format!(
+            "{board}: region '{}' states {what}, which block '{}' has no '{name}' encoding for",
+            region.name, block.block
+        ))
+    };
+    let geometry_register = if fact("bank") == 2 { "SDCR2" } else { "SDCR1" };
+    let geometry = block.place(geometry_register, "NC", encoded("its column count", format!("SDCR_NC_{}_COLUMN_BITS", fact("column_bits")))?)?
+        | block.place(geometry_register, "NR", encoded("its row count", format!("SDCR_NR_{}_ROW_BITS", fact("row_bits")))?)?
+        | block.place(geometry_register, "MWID", encoded("its bus width", format!("SDCR_MWID_{}", fact("data_bits")))?)?
+        | block.place(geometry_register, "NB", encoded("its internal bank count", match fact("banks") { 4 => "SDCR_NB_FOUR".to_string(), _ => "SDCR_NB_TWO".to_string() })?)?
+        | block.place(geometry_register, "CAS", encoded("its CAS latency", format!("SDCR_CAS_{}", fact("cas_latency")))?)?;
+    let controller = block.place("SDCR1", "SDCLK", encoded("its clock period", format!("SDCR_SDCLK_HCLK_PERIODS_{}", fact("sdclk_hclk_periods")))?)?
+        | block.place("SDCR1", "RBURST", fact("read_burst"))?;
+    let sdcr1 = if fact("bank") == 2 { controller } else { geometry | controller };
+
+    let target = match fact("bank") {
+        1 => block.place("SDCMR", "CTB1", 1)?,
+        2 => block.place("SDCMR", "CTB2", 1)?,
+        other => return Err(format!("{board}: region '{}' names SDRAM bank {other}; the controller has two", region.name)),
+    };
+    let command = |mode: &str, extra: i64| -> Result<i64, String> {
+        let value = block.constant(mode).ok_or_else(|| format!("{board}: block '{}' has no '{mode}'", block.block))?;
+        Ok(block.place("SDCMR", "MODE", value)? | target | extra)
+    };
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let hclk = hclk_hz(resolved, plan)?;
+    let sdclk = hclk / fact("sdclk_hclk_periods");
+    let margin = block.constant("SDRTR_COUNT_MARGIN").unwrap_or(0);
+    let floor = block.constant("SDRTR_COUNT_MIN").unwrap_or(0);
+    let period_cycles = fact("refresh_period_ns") * sdclk / (fact("refresh_rows") * 1_000_000_000);
+    let count = period_cycles - margin;
+    if count < floor {
+        return Err(format!(
+            "{board}: region '{}' refreshes every {period_cycles} cycles at {sdclk} Hz, which leaves {count} after the controller's {margin}-cycle margin -- below the {floor} it requires. The clock is too slow for this device's retention time",
+            region.name
+        ));
+    }
+    let cycles = |key: &str| -> Result<i64, String> {
+        let ns = fact(key);
+        if ns <= 0 {
+            return Err(format!("{board}: region '{}' states {key} = {ns}; a timing is a positive minimum", region.name));
+        }
+        Ok((ns * sdclk + 999_999_999) / 1_000_000_000)
+    };
+    let timing_register = if fact("bank") == 2 { "SDTR2" } else { "SDTR1" };
+    let timing = |register: &str, field: &str, key: &str| -> Result<i64, String> {
+        block.place(register, field, cycles(key)? - 1)
+    };
+    let bank_timings = timing(timing_register, "TMRD", "tmrd_ns")?
+        | timing(timing_register, "TXSR", "txsr_ns")?
+        | timing(timing_register, "TRAS", "tras_ns")?
+        | timing(timing_register, "TWR", "twr_ns")?
+        | timing(timing_register, "TRCD", "trcd_ns")?;
+    let controller_timings = timing("SDTR1", "TRC", "trc_ns")? | timing("SDTR1", "TRP", "trp_ns")?;
+    let sdtr1 = if fact("bank") == 2 { controller_timings } else { bank_timings | controller_timings };
+
+    let (twr, tras, trc, trcd, trp) =
+        (cycles("twr_ns")?, cycles("tras_ns")?, cycles("trc_ns")?, cycles("trcd_ns")?, cycles("trp_ns")?);
+    for (floor, how) in [(tras - trcd, "TRAS - TRCD"), (trc - trcd - trp, "TRC - TRCD - TRP")] {
+        if twr < floor {
+            return Err(format!(
+                "{board}: region '{}' derives TWR {twr} cycles, below the {floor} the manual requires ({how}) at this plan's {sdclk} Hz memory clock -- raise twr_ns to at least {} ns",
+                region.name,
+                (floor - 1) * 1_000_000_000 / sdclk + 1
+            ));
+        }
+    }
+
+    let forbidden = cycles("twr_ns")? + cycles("trp_ns")? + cycles("trc_ns")? + cycles("trcd_ns")? + 4;
+    if count == forbidden {
+        return Err(format!(
+            "{board}: region '{}' derives refresh count {count}, which is exactly TWR + TRP + TRC + TRCD + 4 at this plan's {sdclk} Hz memory clock -- the one value the manual forbids",
+            region.name
+        ));
+    }
+
+    section(rows, format!(
+        "-- the SDRAM fitted to '{}': the shape its controller has to be told. The geometry and\nthe two sizes above are one fact stated twice and are checked against each other --\nrows x columns x banks x width IS the size, and a column count off by one halves the\nmemory, aliases every address above the first row, and passes a write-then-read --",
+        region.name
+    ));
+    uint(rows, format!("{prefix}_BANK"), fact("bank").to_string());
+    uint(rows, format!("{prefix}_SDCR1"), format!("0x{sdcr1:X}"));
+    if fact("bank") == 2 {
+        uint(rows, format!("{prefix}_SDCR2"), format!("0x{geometry:X}"));
+    }
+    uint(rows, format!("{prefix}_SDCMR_CLOCK_ENABLE"), format!("0x{:X}", command("SDCMR_MODE_CLOCK_ENABLE", 0)?));
+    uint(rows, format!("{prefix}_SDCMR_PRECHARGE_ALL"), format!("0x{:X}", command("SDCMR_MODE_PRECHARGE_ALL", 0)?));
+    uint(rows, format!("{prefix}_SDCMR_AUTO_REFRESH"), format!("0x{:X}", command("SDCMR_MODE_AUTO_REFRESH", block.place("SDCMR", "NRFS", fact("refresh_burst") - 1)?)?));
+    uint(rows, format!("{prefix}_SDCMR_LOAD_MODE"), format!("0x{:X}", command("SDCMR_MODE_LOAD_MODE", block.place("SDCMR", "MRD", fact("mode_register"))?)?));
+    uint(rows, format!("{prefix}_SETTLE_US"), fact("settle_us").to_string());
+    section(rows, format!(
+        "-- and the numbers that are NOT constants of anything. Each is derived from a formula\nthat is the CHIP's, a specification that is the DEVICE's, and a clock that is this PLAN's\n-- write any one of the three down and it is wrong at the other two's next value. They\ncarry the plan's name for that reason. The timings round UP, because a timing is a floor:\na cycle short is a violation and a cycle long is only throughput --"
+    ));
+    uint(rows, format!("{prefix}_SDCLK_HZ_{}", upper_snake(&plan.name)), sdclk.to_string());
+    uint(rows, format!("{prefix}_REFRESH_COUNT_{}", upper_snake(&plan.name)), count.to_string());
+    uint(rows, format!("{prefix}_SDRTR_{}", upper_snake(&plan.name)), format!("0x{:X}", block.place("SDRTR", "COUNT", count)?));
+    uint(rows, format!("{prefix}_SDTR1_{}", upper_snake(&plan.name)), format!("0x{sdtr1:X}"));
+    if fact("bank") == 2 {
+        uint(rows, format!("{prefix}_SDTR2_{}", upper_snake(&plan.name)), format!("0x{bank_timings:X}"));
+    }
+    Ok(())
+}
+
 fn emit_rust_header(out: &mut String, what: &str, sources: &[String], regen: &str) {
     out.push_str(&format!(
-        "// GENERATED by lamella-bsp-gen from {list} -- DO NOT EDIT.\n// Regenerate: {regen}\n//\n// {what}\n",
+        "//! GENERATED by lamella-bsp-gen from {list} -- DO NOT EDIT.\n//! Regenerate: {regen}\n//!\n//! {what}\n",
         list = sources.join(" + "),
+        what = what.replace("\n//", "\n//!"),
     ));
 }
 
@@ -3450,6 +4912,143 @@ fn finish_rust(out: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Emits a block layout as a Rust `pub const` module: the SAME names and value spellings as
+/// [`emit_layout_csharp`] (offsets, access widths, shifted field masks + shifts, block constants,
+/// the channel map and the calibration records), so a Rust driver composes its words from exactly
+/// the constants a C# driver does. C# `uint` and `int` map to `u32` and `i32`.
+///
+/// ONE FILE PER BLOCK, because in Rust the file IS the namespace. A family's blocks reuse register
+/// names freely -- two of them having a `CR` is ordinary -- so one module per family would collide
+/// on names that are only unique within a block.
+///
+/// A FLOAT FACT IS NOT EMITTED, and the header names the ones withheld. A facts table carries
+/// integers and named dispatch; offering a `f64` to a tier with no floating point would be
+/// carrying that debt one language further rather than reporting it.
+pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let withheld: Vec<&str> = block
+        .facts
+        .iter()
+        .filter(|(_, fact)| matches!(fact, Fact::Float(_)))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let what = format!(
+        "The {} {}{} BLOCK layout as Rust consts, name/value-identical to {}.g.cs:\n// offsets are instance-base-relative (`base + *_OFF`) and the instance bases live in\n// {}_instances.rs. Widths are access widths.",
+        block.family,
+        block.block,
+        if block.mode.is_empty() { String::new() } else { format!(" ({} mode)", block.mode) },
+        layout_class(block),
+        snake(&block.family),
+    );
+    let withheld_note = if withheld.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n/// WITHHELD from this language: the float fact(s) {}. A facts table carries integers\n/// and named dispatch, and this tier has no floating point.",
+            withheld.join(", ")
+        )
+    };
+    emit_rust_header(&mut out, &what, &[source.to_string()], regen);
+
+    let header = std::mem::take(&mut out);
+
+    let has_integer_facts = block.facts.iter().any(|(_, fact)| matches!(fact, Fact::Int(_)));
+    if !block.registers.is_empty() {
+        out.push_str("\n/// -- register offsets (block-relative) + access widths --");
+        if !has_integer_facts {
+            out.push_str(&withheld_note);
+        }
+        out.push('\n');
+        for register in &block.registers {
+            push_rust_const(&mut out, "u32", &format!("{}_OFF", register.name), &format_int(register.offset));
+            push_rust_const(&mut out, "i32", &format!("{}_WIDTH", register.name), &register.width.to_string());
+        }
+    }
+
+    if block.registers.iter().any(|register| !register.fields.is_empty()) {
+        out.push_str("\n/// -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --\n");
+        for register in &block.registers {
+            for field in &register.fields {
+                push_rust_const(&mut out, "u32", &format!("{}_{}", register.name, field.name), &format!("0x{:X}", field.mask()));
+                push_rust_const(&mut out, "u32", &format!("{}_{}_LSB", register.name, field.name), &field.lsb.to_string());
+            }
+        }
+    }
+
+    if !block.constants.is_empty() {
+        out.push_str("\n/// -- block constants --\n");
+        for (name, value) in &block.constants {
+            let kind = if value.value < 0 { "i32" } else { "u32" };
+            push_rust_const(&mut out, kind, name, &format_int(*value));
+        }
+    }
+
+    let integers: Vec<(&String, &Int)> = block
+        .facts
+        .iter()
+        .filter_map(|(name, fact)| match fact {
+            Fact::Int(value) => Some((name, value)),
+            Fact::Float(_) => None,
+        })
+        .collect();
+    if !integers.is_empty() {
+        out.push_str("\n/// -- facts as data (chip/electrical facts conversions read) --");
+        out.push_str(&withheld_note);
+        out.push('\n');
+        for (name, value) in integers {
+            let kind = if value.value < 0 { "i32" } else { "u32" };
+            push_rust_const(&mut out, kind, &pascal(name), &format_int(*value));
+        }
+    }
+
+    if !block.channels.is_empty() {
+        out.push_str("\n/// -- channel map: Channel_<source> = the mux/AINSEL index; Channel<i>_Pin = the\n/// GPIO index a pin-fed channel taps; ChannelCount = the package's mux width --\n");
+        for channel in &block.channels {
+            push_rust_const(&mut out, "i32", &format!("Channel_{}", pascal(&channel.source)), &channel.index.to_string());
+        }
+        for channel in &block.channels {
+            if let Some(('g', pin_index)) = split_pin(&channel.source) {
+                push_rust_const(&mut out, "i32", &format!("Channel{}_Pin", channel.index), &pin_index.to_string());
+            }
+        }
+        push_rust_const(&mut out, "i32", "ChannelCount", &block.channels.len().to_string());
+    }
+
+    for record in &block.calibrations {
+        out.push_str(&format!(
+            "\n/// -- calibration '{}' (form: {}); integer coefficients, no hardcoding downstream --\n",
+            record.name, record.form
+        ));
+        for (coefficient, value) in &record.coefficients {
+            let kind = if value.value < 0 { "i32" } else { "u32" };
+            push_rust_const(&mut out, kind, &format!("{}_{}", pascal(&record.name), pascal(coefficient)), &format_int(*value));
+        }
+    }
+
+    let mixed_case = out.lines().any(|line| {
+        line.strip_prefix("pub const ")
+            .and_then(|rest| rest.split(':').next())
+            .is_some_and(|name| name.chars().any(|c| c.is_ascii_lowercase()))
+    });
+    let mut file = header;
+    if mixed_case {
+        file.push_str("\n#![allow(non_upper_case_globals)]\n");
+    }
+    file.push_str(&out);
+    finish_rust(&file)?;
+    Ok(file)
+}
+
+/// The generated Rust layout module's file stem for a block: `stm32f7_fmc_layout`.
+#[must_use]
+pub fn layout_module(block: &BlockTable) -> String {
+    if block.mode.is_empty() {
+        format!("{}_{}_layout", snake(&block.family), snake(&block.block))
+    } else {
+        format!("{}_{}_{}_layout", snake(&block.family), snake(&block.block), snake(&block.mode))
+    }
+}
+
 /// Emits a family's instances as a Rust `pub const` module: the SAME names and value
 /// spellings as [`emit_instances_csharp`] (every value a single resolved literal), so a Rust
 /// firmware and a C# driver can never disagree on a placed-instance fact.
@@ -3460,7 +5059,7 @@ pub fn emit_instances_rust(
 ) -> Result<String, String> {
     let mut out = String::new();
     let what = format!(
-        "The {} INSTANCE map as Rust consts, name/value-identical to {}.g.cs.\n// Block-register offsets are NOT emitted for Rust: firmware hand-codes its\n// own block constants and includes this file for every placed-instance fact.",
+        "The {} INSTANCE map as Rust consts, name/value-identical to {}.g.cs.\n// WHERE each block copy sits; WHAT is inside one is the per-block layout module\n// beside this file. A driver includes both and composes from neither's literals.",
         instances.family,
         instances_class(&instances.family),
     );
@@ -3506,6 +5105,7 @@ pub fn emit_board_rust(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_i2cs,
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
@@ -3531,6 +5131,7 @@ pub fn emit_board_rust(
 
     out.push_str("\n// -- identity --\n");
     push_rust_const(&mut out, "u16", "BOARD_MODEL", &resolved.board.board_model.to_string());
+    push_rust_const(&mut out, "&str", "BOARD_VENDOR", &format!("\"{}\"", vendor_segment(&resolved.board.vendor)));
     if resolved.board.carrier.usb_vid > 0 {
         push_rust_const(&mut out, "u16", "CARRIER_USB_VID", &format!("0x{:04X}", resolved.board.carrier.usb_vid));
     }
@@ -3612,15 +5213,17 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", uart.base));
         push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", uart.rcc_en_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", uart.rcc_en_mask));
-        push_rust_const(&mut out, "u32", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", uart.port_rcc_en_reg));
-        push_rust_const(&mut out, "u32", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", uart.port_rcc_en_mask));
-        push_rust_const(&mut out, "u32", &format!("{p}_MODER_REG"), &format!("0x{:X}", uart.moder_reg));
-        push_rust_const(&mut out, "u32", &format!("{p}_MODER_MASK"), &format!("0x{:X}", uart.moder_mask));
-        push_rust_const(&mut out, "u32", &format!("{p}_MODER_VALUE"), &format!("0x{:X}", uart.moder_value));
-        push_rust_const(&mut out, "u32", &format!("{p}_AFRL_REG"), &format!("0x{:X}", uart.afrl_reg));
-        push_rust_const(&mut out, "u32", &format!("{p}_AFRL_MASK"), &format!("0x{:X}", uart.afrl_mask));
-        push_rust_const(&mut out, "u32", &format!("{p}_AFRL_VALUE"), &format!("0x{:X}", uart.afrl_value));
-        push_rust_const(&mut out, "u32", &format!("{p}_PCLK1_HZ"), &uart.pclk1_hz.to_string());
+        for (side, pin) in [("TX", &uart.tx), ("RX", &uart.rx)] {
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_PCLK_HZ"), &uart.pclk_hz.to_string());
         for (suffix, divisor) in &uart.bauds {
             push_rust_const(&mut out, "u32", &format!("{p}_{suffix}"), &format!("0x{divisor:X}"));
         }
@@ -3681,6 +5284,30 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_SSPCLK_HZ"), &spi.sspclk_hz.to_string());
     }
 
+    for i2c in &st_i2cs {
+        let p = &i2c.prefix;
+        out.push_str(&format!("\n// -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n// a push-pull output cannot be pulled low by the device at the other end, so an\n// acknowledge is fought instead of seen and nothing ever answers, with the mux\n// perfectly correct. The timing words are the manual's own compliant points at\n// this plan's kernel rate, composed here: five counts, not a divisor --\n"));
+        push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", i2c.base));
+        push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", i2c.rcc_en_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", i2c.rcc_en_mask));
+        for (side, pin) in [("SCL", &i2c.scl), ("SDA", &i2c.sda)] {
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_OTYPER_REG"), &format!("0x{:X}", i2c.otyper.0));
+        push_rust_const(&mut out, "u32", &format!("{p}_OTYPER_SCL_MASK"), &format!("0x{:X}", i2c.otyper.1));
+        push_rust_const(&mut out, "u32", &format!("{p}_OTYPER_SDA_MASK"), &format!("0x{:X}", i2c.otyper.2));
+        push_rust_const(&mut out, "u32", &format!("{p}_KERNEL_HZ"), &i2c.kernel_hz.to_string());
+        for (suffix, word) in &i2c.timings {
+            push_rust_const(&mut out, "u32", &format!("{p}_{suffix}"), &format!("0x{word:X}"));
+        }
+    }
     for twi in &nrf_twis {
         let p = &twi.prefix;
         out.push_str(&format!("\n// -- {p}: an nrf-twi binding descriptor --\n"));
@@ -3756,6 +5383,18 @@ pub fn emit_board_rust(
         }
     }
 
+    let rows_at = memory_rows(set, resolved)?;
+    for (at, row) in rows_at.iter().enumerate() {
+        let documents = documents_something(&rows_at[at + 1..]);
+        match row {
+            Row::Blank => out.push('\n'),
+            Row::Comment(comment) => push_section_comment(&mut out, "", if documents { "///" } else { "//" }, comment),
+            Row::Uint(name, value) => push_rust_const(&mut out, "u32", name, value),
+            Row::Int(name, value) => push_rust_const(&mut out, "i32", name, value),
+            Row::Str(name, value) => push_rust_const(&mut out, "&str", name, &format!("\"{value}\"")),
+        }
+    }
+
     finish_rust(&out)?;
     Ok(out)
 }
@@ -3763,7 +5402,8 @@ pub fn emit_board_rust(
 
 /// The families whose strata additionally emit the Swift projection. The emitters are
 /// family-generic; each family joins this list deliberately as its Swift consumers arrive.
-const SWIFT_FAMILIES: &[&str] = &["nrf51", "nrf52833", "rp2040", "rp2350", "samd21", "stm32l476"];
+const SWIFT_FAMILIES: &[&str] =
+    &["nrf51", "nrf52833", "rp2040", "rp2350", "samd21", "stm32f7", "stm32l476"];
 
 fn emit_swift_header(out: &mut String, what: &str, sources: &[String], regen: &str) {
     out.push_str(&format!(
@@ -3944,6 +5584,7 @@ pub fn emit_board_swift(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_i2cs,
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
@@ -3970,6 +5611,7 @@ pub fn emit_board_swift(
 
     out.push_str("    // -- identity --\n");
     push_swift_const(&mut out, "UInt16", "BOARD_MODEL", &resolved.board.board_model.to_string());
+    push_swift_const(&mut out, "String", "BOARD_VENDOR", &format!("\"{}\"", vendor_segment(&resolved.board.vendor)));
     if resolved.board.carrier.usb_vid > 0 {
         push_swift_const(&mut out, "UInt16", "CARRIER_USB_VID", &format!("0x{:04X}", resolved.board.carrier.usb_vid));
     }
@@ -4051,15 +5693,17 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", uart.base));
         push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", uart.rcc_en_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", uart.rcc_en_mask));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", uart.port_rcc_en_reg));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", uart.port_rcc_en_mask));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_MODER_REG"), &format!("0x{:X}", uart.moder_reg));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_MODER_MASK"), &format!("0x{:X}", uart.moder_mask));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_MODER_VALUE"), &format!("0x{:X}", uart.moder_value));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_AFRL_REG"), &format!("0x{:X}", uart.afrl_reg));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_AFRL_MASK"), &format!("0x{:X}", uart.afrl_mask));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_AFRL_VALUE"), &format!("0x{:X}", uart.afrl_value));
-        push_swift_const(&mut out, "UInt32", &format!("{p}_PCLK1_HZ"), &uart.pclk1_hz.to_string());
+        for (side, pin) in [("TX", &uart.tx), ("RX", &uart.rx)] {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PCLK_HZ"), &uart.pclk_hz.to_string());
         for (suffix, divisor) in &uart.bauds {
             push_swift_const(&mut out, "UInt32", &format!("{p}_{suffix}"), &format!("0x{divisor:X}"));
         }
@@ -4120,6 +5764,30 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_SSPCLK_HZ"), &spi.sspclk_hz.to_string());
     }
 
+    for i2c in &st_i2cs {
+        let p = &i2c.prefix;
+        out.push_str(&format!("\n    // -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n    // a push-pull output cannot be pulled low by the device at the other end, so an\n    // acknowledge is fought instead of seen and nothing ever answers, with the mux\n    // perfectly correct. The timing words are the manual's own compliant points at\n    // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", i2c.base));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", i2c.rcc_en_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", i2c.rcc_en_mask));
+        for (side, pin) in [("SCL", &i2c.scl), ("SDA", &i2c.sda)] {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_OTYPER_REG"), &format!("0x{:X}", i2c.otyper.0));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_OTYPER_SCL_MASK"), &format!("0x{:X}", i2c.otyper.1));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_OTYPER_SDA_MASK"), &format!("0x{:X}", i2c.otyper.2));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_KERNEL_HZ"), &i2c.kernel_hz.to_string());
+        for (suffix, word) in &i2c.timings {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{suffix}"), &format!("0x{word:X}"));
+        }
+    }
     for twi in &nrf_twis {
         let p = &twi.prefix;
         out.push_str(&format!("\n    // -- {p}: an nrf-twi binding descriptor --\n"));
@@ -4195,6 +5863,17 @@ pub fn emit_board_swift(
         }
     }
 
+    let rows_at = memory_rows(set, resolved)?;
+    for row in rows_at.iter() {
+        match row {
+            Row::Blank => out.push('\n'),
+            Row::Comment(comment) => push_section_comment(&mut out, "    ", "//", comment),
+            Row::Uint(name, value) => push_swift_const(&mut out, "UInt32", name, value),
+            Row::Int(name, value) => push_swift_const(&mut out, "Int32", name, value),
+            Row::Str(name, value) => push_swift_const(&mut out, "StaticString", name, &format!("\"{value}\"")),
+        }
+    }
+
     out.push_str("}\n");
     finish_swift(&out)?;
     Ok(out)
@@ -4222,6 +5901,7 @@ pub fn emit_board_python(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_i2cs,
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
@@ -4245,6 +5925,7 @@ pub fn emit_board_python(
     out.push('\n');
     out.push_str(&format!("BOARD = \"{}\"\n", resolved.board.board));
     out.push_str(&format!("BOARD_MODEL = {}\n", resolved.board.board_model));
+    out.push_str(&format!("BOARD_VENDOR = \"{}\"\n", vendor_segment(&resolved.board.vendor)));
 
     let mut roles: Vec<(&str, Vec<(String, String)>)> = Vec::new();
     for uart in &sercom_uarts {
@@ -4325,6 +6006,33 @@ pub fn emit_board_python(
         }
         roles.push((&uart.role, rows));
     }
+    for i2c in &st_i2cs {
+        let mut rows = vec![
+            ("kind".to_string(), "\"i2c\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", i2c.instance)),
+            ("base".to_string(), format!("0x{:X}", i2c.base)),
+            ("rcc_en_reg".to_string(), format!("0x{:X}", i2c.rcc_en_reg)),
+            ("rcc_en_mask".to_string(), format!("0x{:X}", i2c.rcc_en_mask)),
+            ("kernel_hz".to_string(), i2c.kernel_hz.to_string()),
+        ];
+        for (side, pin) in [("scl", &i2c.scl), ("sda", &i2c.sda)] {
+            rows.push((format!("{side}_port_rcc_en_reg"), format!("0x{:X}", pin.port_rcc_en_reg)));
+            rows.push((format!("{side}_port_rcc_en_mask"), format!("0x{:X}", pin.port_rcc_en_mask)));
+            rows.push((format!("{side}_moder_reg"), format!("0x{:X}", pin.moder_reg)));
+            rows.push((format!("{side}_moder_mask"), format!("0x{:X}", pin.moder_mask)));
+            rows.push((format!("{side}_moder_value"), format!("0x{:X}", pin.moder_value)));
+            rows.push((format!("{side}_afr_reg"), format!("0x{:X}", pin.afr_reg)));
+            rows.push((format!("{side}_afr_mask"), format!("0x{:X}", pin.afr_mask)));
+            rows.push((format!("{side}_afr_value"), format!("0x{:X}", pin.afr_value)));
+        }
+        rows.push(("otyper_reg".to_string(), format!("0x{:X}", i2c.otyper.0)));
+        rows.push(("otyper_scl_mask".to_string(), format!("0x{:X}", i2c.otyper.1)));
+        rows.push(("otyper_sda_mask".to_string(), format!("0x{:X}", i2c.otyper.2)));
+        for (suffix, word) in &i2c.timings {
+            rows.push((suffix.to_ascii_lowercase(), format!("0x{word:X}")));
+        }
+        roles.push((&i2c.role, rows));
+    }
     for uart in &st_uarts {
         let mut rows = vec![
             ("kind".to_string(), "\"uart\"".to_string()),
@@ -4332,16 +6040,18 @@ pub fn emit_board_python(
             ("base".to_string(), format!("0x{:X}", uart.base)),
             ("rcc_en_reg".to_string(), format!("0x{:X}", uart.rcc_en_reg)),
             ("rcc_en_mask".to_string(), format!("0x{:X}", uart.rcc_en_mask)),
-            ("port_rcc_en_reg".to_string(), format!("0x{:X}", uart.port_rcc_en_reg)),
-            ("port_rcc_en_mask".to_string(), format!("0x{:X}", uart.port_rcc_en_mask)),
-            ("moder_reg".to_string(), format!("0x{:X}", uart.moder_reg)),
-            ("moder_mask".to_string(), format!("0x{:X}", uart.moder_mask)),
-            ("moder_value".to_string(), format!("0x{:X}", uart.moder_value)),
-            ("afrl_reg".to_string(), format!("0x{:X}", uart.afrl_reg)),
-            ("afrl_mask".to_string(), format!("0x{:X}", uart.afrl_mask)),
-            ("afrl_value".to_string(), format!("0x{:X}", uart.afrl_value)),
-            ("pclk1_hz".to_string(), uart.pclk1_hz.to_string()),
+            ("pclk_hz".to_string(), uart.pclk_hz.to_string()),
         ];
+        for (side, pin) in [("tx", &uart.tx), ("rx", &uart.rx)] {
+            rows.push((format!("{side}_port_rcc_en_reg"), format!("0x{:X}", pin.port_rcc_en_reg)));
+            rows.push((format!("{side}_port_rcc_en_mask"), format!("0x{:X}", pin.port_rcc_en_mask)));
+            rows.push((format!("{side}_moder_reg"), format!("0x{:X}", pin.moder_reg)));
+            rows.push((format!("{side}_moder_mask"), format!("0x{:X}", pin.moder_mask)));
+            rows.push((format!("{side}_moder_value"), format!("0x{:X}", pin.moder_value)));
+            rows.push((format!("{side}_afr_reg"), format!("0x{:X}", pin.afr_reg)));
+            rows.push((format!("{side}_afr_mask"), format!("0x{:X}", pin.afr_mask)));
+            rows.push((format!("{side}_afr_value"), format!("0x{:X}", pin.afr_value)));
+        }
         for (suffix, divisor) in &uart.bauds {
             rows.push((suffix.to_ascii_lowercase(), format!("0x{divisor:X}")));
         }
@@ -4523,6 +6233,765 @@ pub fn emit_board_python(
         ));
     }
     out.push_str("}\n");
+
+    if !resolved.board.memory.is_empty() {
+        out.push_str(
+            "\n# Memory regions the board fits. A region with a \"controller\" does not exist until\n# that instance is brought up; touching it first is a bus fault, not a wrong value.\nMEMORY = {\n",
+        );
+        for region in &resolved.board.memory {
+            let mut entry = format!("    \"{}\": {{\"kind\": \"{}\"", region.name, region.kind);
+            if region.base >= 0 {
+                entry.push_str(&format!(", \"base\": 0x{:X}", region.base));
+            }
+            entry.push_str(&format!(", \"size\": 0x{:X}", region.size));
+            if region.device_size >= 0 && region.device_size != region.size {
+                entry.push_str(&format!(", \"device_size\": 0x{:X}", region.device_size));
+            }
+            if !region.controller.is_empty() {
+                entry.push_str(&format!(", \"controller\": \"{}\"", region.controller));
+            }
+            entry.push_str(&format!(
+                ", \"optional\": {}",
+                if region.optional { "True" } else { "False" }
+            ));
+            let device: Vec<String> = memory_device_rows(set, resolved, region)?
+                .iter()
+                .filter_map(|row| {
+                    let head = format!("MEMORY_{}_", upper_snake(&region.name));
+                    match row {
+                        Row::Uint(name, value) | Row::Int(name, value) => {
+                            Some(format!("\"{}\": {value}", name.strip_prefix(&head)?.to_lowercase()))
+                        }
+                        Row::Str(name, value) => {
+                            Some(format!("\"{}\": \"{value}\"", name.strip_prefix(&head)?.to_lowercase()))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            if !device.is_empty() {
+                entry.push_str(&format!(", \"device\": {{{}}}", device.join(", ")));
+            }
+            entry.push_str("},\n");
+            out.push_str(&entry);
+        }
+        out.push_str("}\n");
+    }
+    Ok(out)
+}
+
+
+/// One part family's tables: the optional authoring base plus every part that is emitted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceSet {
+    /// The part family id (the `parts/<family>/` directory name).
+    pub family: String,
+    /// The family's authoring base, when it has one.
+    pub base: Option<DeviceTable>,
+    /// The emitted parts, sorted by part id.
+    pub parts: Vec<DeviceTable>,
+}
+
+/// Loads `parts/<family>/*.toml` -- the authoring base (at most one) and every part.
+pub fn load_device_family(repo_root: &std::path::Path, family: &str) -> Result<DeviceSet, String> {
+    let dir = repo_root.join("parts").join(family);
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    paths.sort();
+
+    let mut set = DeviceSet { family: family.to_string(), ..DeviceSet::default() };
+    for path in &paths {
+        let Strata::Device(table) = parse(&read(path)?)? else {
+            return Err(format!("{}: expected kind = \"device\" or \"device-base\"", path.display()));
+        };
+        if table.family != family {
+            return Err(format!("{}: part belongs to family '{}'", path.display(), table.family));
+        }
+        if table.is_base {
+            if set.base.is_some() {
+                return Err(format!(
+                    "{}: family '{family}' declares a second base -- a member states its deltas against exactly one table",
+                    path.display()
+                ));
+            }
+            set.base = Some(table);
+        } else {
+            set.parts.push(table);
+        }
+    }
+    if set.parts.is_empty() {
+        return Err(format!("parts/{family}: no part declares kind = \"device\""));
+    }
+    set.parts.sort_by(|a, b| a.part.cmp(&b.part));
+    Ok(set)
+}
+
+/// Merges a named-section list: the base's rows in base order, each REPLACED WHOLE by a
+/// member's row of the same name, and the member's new rows appended in member order.
+///
+/// Whole replacement rather than a per-key merge is the load-bearing choice. Two members of one
+/// family can give the same register's codes different meanings -- the BMx280 standby codes
+/// '110'/'111' are 2 s / 4 s on one member and 10 ms / 20 ms on the other -- and a half-inherited
+/// encoding is silently wrong for one of them.
+fn merge_named<T: Clone>(base: &[T], member: &[T], name: impl Fn(&T) -> String) -> Vec<T> {
+    let mut out: Vec<T> = base.to_vec();
+    for row in member {
+        match out.iter().position(|existing| name(existing) == name(row)) {
+            Some(at) => out[at] = row.clone(),
+            None => out.push(row.clone()),
+        }
+    }
+    out
+}
+
+/// Resolves a part against its family base and returns a FULLY FLATTENED table.
+///
+/// Inheritance is an authoring convenience and stops here: nothing downstream ever reads an
+/// inherited value, because a value that is only ever inherited is pinned in no emitted artifact
+/// and so cannot be checked for drift between languages.
+///
+/// Every section merges by whole named row (see [`merge_named`]) -- except `[identity]`, which
+/// merges per key, because it is the one section the schema deliberately SPLITS: the base states
+/// where to look and each member states what to accept there.
+pub fn resolve_device(set: &DeviceSet, part: &DeviceTable) -> Result<DeviceTable, String> {
+    let base = match part.base.as_str() {
+        "" => None,
+        named => {
+            let base = set.base.as_ref().filter(|b| b.family == named).ok_or_else(|| {
+                format!(
+                    "part '{}' names base '{named}', which is not this family's `kind = \"device-base\"` table",
+                    part.part
+                )
+            })?;
+            Some(base)
+        }
+    };
+    let Some(base) = base else { return Ok(part.clone()) };
+
+    let mut identity = base.identity.clone().unwrap_or_default();
+    if let Some(member) = &part.identity {
+        if member.reg.value != 0 || member.width != 0 {
+            identity.reg = member.reg;
+            identity.width = member.width;
+        }
+        if !member.values.is_empty() {
+            identity.values = member.values.clone();
+        }
+    }
+
+    Ok(DeviceTable {
+        family: part.family.clone(),
+        part: part.part.clone(),
+        base: part.base.clone(),
+        is_base: false,
+        buses: merge_named(&base.buses, &part.buses, |b| b.name.clone()),
+        address: part.address.clone().or_else(|| base.address.clone()),
+        identity: Some(identity),
+        registers: merge_named(&base.registers, &part.registers, |r| r.name.clone()),
+        enums: merge_named(&base.enums, &part.enums, |e| e.name.clone()),
+        burst_length: if part.burst_length >= 0 { part.burst_length } else { base.burst_length },
+        calibrations: merge_named(&base.calibrations, &part.calibrations, |c| c.name.clone()),
+        sequences: merge_named(&base.sequences, &part.sequences, |(n, _)| n.clone()),
+    })
+}
+
+/// Checks a FLATTENED part: what a driver would otherwise discover only when the part failed to
+/// answer, and what a reference from one section to another would otherwise emit as a dangling
+/// name that compiles.
+fn validate_device(part: &DeviceTable) -> Result<(), String> {
+    let who = format!("part '{}'", part.part);
+    let identity = part
+        .identity
+        .as_ref()
+        .ok_or_else(|| format!("{who} states no [identity] -- it is what tells two parts sharing a footprint apart"))?;
+    if identity.width == 0 {
+        return Err(format!("{who}: the identity register declares no width"));
+    }
+    if identity.values.is_empty() {
+        return Err(format!(
+            "{who}: the identity accepts no value -- a part states the SET its identity register may answer, and a part rejected for answering an unlisted value reads as no part at all"
+        ));
+    }
+    if let Some(mapped) = part.registers.iter().find(|r| r.reg.value == identity.reg.value) {
+        if mapped.width != identity.width {
+            return Err(format!(
+                "{who}: [identity] reads register 0x{:X} as {} bits and [registers.{}] declares it {} bits",
+                identity.reg.value, identity.width, mapped.name, mapped.width
+            ));
+        }
+    }
+    if part.buses.is_empty() {
+        return Err(format!("{who} declares no bus -- there is no way to reach it"));
+    }
+    if let Some(address) = &part.address {
+        if part.bus(&address.bus).is_none() {
+            return Err(format!("{who}: [address] rides bus '{}', which the part does not declare", address.bus));
+        }
+    }
+    for record in &part.calibrations {
+        if record.form.is_empty() {
+            return Err(format!("{who}: calibration '{}' names no form", record.name));
+        }
+        for depends in &record.depends_on {
+            if !part.calibrations.iter().any(|c| &c.name == depends) {
+                return Err(format!(
+                    "{who}: calibration '{}' depends on '{depends}', which the part does not describe",
+                    record.name
+                ));
+            }
+        }
+        for read in &record.reads {
+            if read.width == 0 {
+                return Err(format!("{who}: calibration read '{}' declares no width", read.name));
+            }
+        }
+    }
+    for (sequence, steps) in &part.sequences {
+        for (at, step) in steps.iter().enumerate() {
+            if step.step.is_empty() {
+                return Err(format!("{who}: sequence '{sequence}' step {at} names no step"));
+            }
+            let target = if step.register.is_empty() { &step.from } else { &step.register };
+            if target.is_empty() {
+                return Err(format!("{who}: sequence '{sequence}' step {at} names no register"));
+            }
+            let Some(register) = part.register(target) else {
+                return Err(format!(
+                    "{who}: sequence '{sequence}' step {at} names register '{target}', which the part does not declare"
+                ));
+            };
+            if !step.field.is_empty() && !register.fields.iter().any(|f| f.name == step.field) {
+                return Err(format!(
+                    "{who}: sequence '{sequence}' step {at} names field '{}.{}', which the register does not declare",
+                    target, step.field
+                ));
+            }
+            if !step.length_from.is_empty() && device_length(part, &step.length_from).is_none() {
+                return Err(format!(
+                    "{who}: sequence '{sequence}' step {at} takes its length from '{}', which resolves to nothing",
+                    step.length_from
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves a step's `length_from` reference against the flattened table. The reference exists
+/// so a base can state WHERE a burst length comes from while each member states the value; it
+/// is resolved here so no emitted artifact carries a name a reader has to chase.
+fn device_length(part: &DeviceTable, reference: &str) -> Option<i64> {
+    match reference {
+        "measurement.burst_length" if part.burst_length >= 0 => Some(part.burst_length),
+        _ => None,
+    }
+}
+
+/// The generated class name for a part: `Bme280Part`. The `Part` suffix names the stratum the
+/// way `Layout` / `Instances` / `Bindings` name theirs, and keeps the generated table from ever
+/// colliding with a hand-written driver of the part's own name.
+#[must_use]
+pub fn part_class(part: &str) -> String {
+    format!("{}Part", pascal(part))
+}
+
+/// One line of a part's emission. The four emitters render this ONE ordered list rather than
+/// each composing its own, so a part's names and values are identical across languages by
+/// construction and not by four code paths agreeing.
+enum Row {
+    /// A section comment (each language spells its own marker).
+    Comment(String),
+    /// A blank separator line.
+    Blank,
+    /// An unsigned integer constant: name, and the value EXACTLY as spelled.
+    Uint(String, String),
+    /// A signed integer constant.
+    Int(String, String),
+    /// A string constant -- a named dispatch, an access, or a provenance name.
+    Str(String, String),
+}
+
+fn uint(rows: &mut Vec<Row>, name: String, value: String) {
+    rows.push(Row::Uint(name, value));
+}
+
+fn text(rows: &mut Vec<Row>, name: String, value: &str) {
+    rows.push(Row::Str(name, value.to_string()));
+}
+
+fn number(rows: &mut Vec<Row>, name: String, value: Int) {
+    if value.value < 0 {
+        rows.push(Row::Int(name, format_int(value)));
+    } else {
+        rows.push(Row::Uint(name, format_int(value)));
+    }
+}
+
+fn section(rows: &mut Vec<Row>, comment: String) {
+    rows.push(Row::Blank);
+    rows.push(Row::Comment(comment));
+}
+
+/// Builds the flattened part's emission rows, in one order every language follows.
+fn device_rows(part: &DeviceTable) -> Result<Vec<Row>, String> {
+    validate_device(part)?;
+    let mut rows = Vec::new();
+    text(&mut rows, "PART".to_string(), &part.part);
+    text(&mut rows, "FAMILY".to_string(), &part.family);
+
+    let identity = part.identity.as_ref().expect("validated present");
+    section(
+        &mut rows,
+        "identity: the accepted values are a SET. A driver that accepts only one of them rejects a genuine part, and a rejected part reads as no part at all -- so on a mismatch, name the id received AND this set.".to_string(),
+    );
+    number(&mut rows, "IDENTITY_REG".to_string(), identity.reg);
+    uint(&mut rows, "IDENTITY_WIDTH".to_string(), identity.width.to_string());
+    uint(&mut rows, "IDENTITY_VALUE_COUNT".to_string(), identity.values.len().to_string());
+    for (at, value) in identity.values.iter().enumerate() {
+        number(&mut rows, format!("IDENTITY_VALUE_{at}"), *value);
+    }
+
+    if let Some(address) = &part.address {
+        section(
+            &mut rows,
+            "address: a base plus which pin contributes which bit. The part states the range; a carrier fixes the straps, so no strap is defaulted here.".to_string(),
+        );
+        text(&mut rows, "ADDRESS_BUS".to_string(), &address.bus);
+        number(&mut rows, "ADDRESS_BASE".to_string(), address.base);
+        uint(&mut rows, "ADDRESS_STRAP_COUNT".to_string(), address.straps.len().to_string());
+        for strap in &address.straps {
+            let prefix = format!("ADDRESS_STRAP_{}", upper_snake(&strap.pin));
+            uint(&mut rows, format!("{prefix}_BIT"), strap.bit.to_string());
+            number(&mut rows, format!("{prefix}_LOW"), strap.low);
+            number(&mut rows, format!("{prefix}_HIGH"), strap.high);
+        }
+    }
+
+    section(
+        &mut rows,
+        "buses: the register MAP is shared between a part's buses; the ADDRESS TRANSFORM is not, so each states its own as a named dispatch. A path that took the wrong one is wrong by a fixed bit, and on one direction only.".to_string(),
+    );
+    uint(&mut rows, "BUS_COUNT".to_string(), part.buses.len().to_string());
+    for bus in &part.buses {
+        let prefix = format!("BUS_{}", upper_snake(&bus.name));
+        text(&mut rows, format!("{prefix}_KIND"), &bus.kind);
+        text(&mut rows, format!("{prefix}_REGISTER_READ_TRANSFORM"), &bus.register_read_transform);
+        text(&mut rows, format!("{prefix}_REGISTER_WRITE_TRANSFORM"), &bus.register_write_transform);
+        text(&mut rows, format!("{prefix}_READ_PROTOCOL"), &bus.read_protocol);
+        if !bus.modes.is_empty() {
+            uint(&mut rows, format!("{prefix}_MODE_COUNT"), bus.modes.len().to_string());
+            for (at, mode) in bus.modes.iter().enumerate() {
+                number(&mut rows, format!("{prefix}_MODE_{at}"), *mode);
+            }
+        }
+    }
+
+    section(
+        &mut rows,
+        "registers: `_REG` is the address written on the wire -- an operand, NOT an offset to add to an instance base. Fields carry the shifted mask and its shift.".to_string(),
+    );
+    for register in &part.registers {
+        let prefix = upper_snake(&register.name);
+        number(&mut rows, format!("{prefix}_REG"), register.reg);
+        uint(&mut rows, format!("{prefix}_WIDTH"), register.width.to_string());
+        if !register.access.is_empty() {
+            text(&mut rows, format!("{prefix}_ACCESS"), &register.access);
+        }
+        for field in &register.fields {
+            let name = format!("{prefix}_{}", upper_snake(&field.name));
+            uint(&mut rows, name.clone(), format!("0x{:X}", field.mask()));
+            uint(&mut rows, format!("{name}_LSB"), field.lsb.to_string());
+        }
+    }
+
+    if !part.enums.is_empty() {
+        section(&mut rows, "encodings: the codes a field takes, as this part reads them.".to_string());
+        for encoding in &part.enums {
+            let prefix = upper_snake(&encoding.name);
+            for (member, code) in &encoding.members {
+                number(&mut rows, format!("{prefix}_{}", upper_snake(member)), *code);
+            }
+        }
+    }
+
+    if part.burst_length >= 0 {
+        section(
+            &mut rows,
+            "measurement: the part holds a whole data block steady for the duration of one burst, so a byte-at-a-time read can mix two conversions.".to_string(),
+        );
+        uint(&mut rows, "BURST_LENGTH".to_string(), part.burst_length.to_string());
+    }
+
+    for record in &part.calibrations {
+        let prefix = upper_snake(&record.name);
+        section(
+            &mut rows,
+            format!(
+                "calibration '{}': these parameters are READ from the part and are per-device -- they are not constants and must not be baked into a driver. `_FORM` selects hand-written per-language arithmetic; signedness is not uniform, and reading it backwards yields a plausible wrong answer rather than an error.",
+                record.name
+            ),
+        );
+        text(&mut rows, format!("{prefix}_FORM"), &record.form);
+        if !record.byte_order.is_empty() {
+            text(&mut rows, format!("{prefix}_BYTE_ORDER"), &record.byte_order);
+        }
+        if !record.output_scale.is_empty() {
+            text(&mut rows, format!("{prefix}_OUTPUT_SCALE"), &record.output_scale);
+        }
+        if !record.depends_on.is_empty() {
+            uint(&mut rows, format!("{prefix}_DEPENDS_ON_COUNT"), record.depends_on.len().to_string());
+            for (at, depends) in record.depends_on.iter().enumerate() {
+                text(&mut rows, format!("{prefix}_DEPENDS_ON_{at}"), depends);
+            }
+        }
+        uint(&mut rows, format!("{prefix}_READ_COUNT"), record.reads.len().to_string());
+        for read in &record.reads {
+            let name = format!("{prefix}_{}", upper_snake(&read.name));
+            number(&mut rows, format!("{name}_REG"), read.reg);
+            uint(&mut rows, format!("{name}_WIDTH"), read.width.to_string());
+            uint(&mut rows, format!("{name}_SIGNED"), u32::from(read.signed).to_string());
+            if !read.packing.is_empty() {
+                text(&mut rows, format!("{name}_PACKING"), &read.packing);
+            }
+        }
+    }
+
+    for (name, steps) in &part.sequences {
+        let prefix = upper_snake(name);
+        section(
+            &mut rows,
+            format!(
+                "sequence '{name}': declarative steps, resolved here so a step carries its own register and mask. The description is transport agnostic -- one step list describes an I2C transaction, an SPI one, and a call through a host import alike."
+            ),
+        );
+        uint(&mut rows, format!("{prefix}_STEP_COUNT"), steps.len().to_string());
+        for (at, step) in steps.iter().enumerate() {
+            let name = format!("{prefix}_STEP_{at}");
+            text(&mut rows, format!("{name}_OP"), &step.step);
+            let target = if step.register.is_empty() { &step.from } else { &step.register };
+            let register = part.register(target).expect("validated present");
+            if step.field.is_empty() {
+                text(&mut rows, format!("{name}_TARGET"), target);
+            } else {
+                text(&mut rows, format!("{name}_TARGET"), &format!("{target}.{}", step.field));
+            }
+            number(&mut rows, format!("{name}_REG"), register.reg);
+            if let Some(field) = register.fields.iter().find(|f| f.name == step.field) {
+                uint(&mut rows, format!("{name}_MASK"), format!("0x{:X}", field.mask()));
+                uint(&mut rows, format!("{name}_LSB"), field.lsb.to_string());
+            }
+            if let Some(value) = step.value {
+                number(&mut rows, format!("{name}_VALUE"), value);
+            }
+            if !step.length_from.is_empty() {
+                let length = device_length(part, &step.length_from).expect("validated resolvable");
+                uint(&mut rows, format!("{name}_LENGTH"), length.to_string());
+            }
+            uint(&mut rows, format!("{name}_BOUNDED"), u32::from(step.bounded).to_string());
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for row in &rows {
+        let name = match row {
+            Row::Uint(name, _) | Row::Int(name, _) | Row::Str(name, _) => name,
+            _ => continue,
+        };
+        if !seen.insert(name.clone()) {
+            return Err(format!("part '{}': two facts emit the constant '{name}'", part.part));
+        }
+        if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!(
+                "part '{}': the fact '{name}' does not spell an identifier -- a part's key becomes a constant name in every emitted language",
+                part.part
+            ));
+        }
+    }
+    for row in &rows {
+        if let Row::Str(name, value) = row {
+            if value.contains('"') || value.contains('\\') {
+                return Err(format!(
+                    "part '{}': the value of '{name}' carries a quote or a backslash, which no emitted string literal can hold",
+                    part.part
+                ));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// The generated class name for a family's INVARIANT facts: `Bmx280Common`.
+#[must_use]
+pub fn common_class(family: &str) -> String {
+    format!("{}Common", pascal(family))
+}
+
+/// The rows every member of a family emits IDENTICALLY -- same name, same kind, same value.
+///
+/// Why this exists, and why it is an intersection rather than the authoring base emitted. A part
+/// FAMILY has a hand-written driver base in every language (the parts share a register map, so
+/// their drivers share code), and a per-part-only emission gives that base nothing to reference:
+/// it would have to name one member's class arbitrarily, or reach every fact through a dozen
+/// virtual properties.
+///
+/// Emitting the authoring base would be the wrong fix, because a member may OVERRIDE a shared
+/// register and a base that carried the pre-override value would be silently wrong for exactly
+/// that member. An intersection cannot be: the day a member overrides a fact, that fact LEAVES
+/// this class, and the shared driver base that used it stops compiling -- which is the failure
+/// that is wanted, at the moment it becomes true.
+///
+/// The section comments of the first member are carried only where a fact under them survived.
+fn common_rows(parts: &[DeviceTable]) -> Result<Vec<Row>, String> {
+    let per_part: Vec<Vec<Row>> = parts.iter().map(device_rows).collect::<Result<_, _>>()?;
+    let Some((first, rest)) = per_part.split_first() else { return Ok(Vec::new()) };
+
+    let key = |row: &Row| match row {
+        Row::Uint(name, value) => Some((name.clone(), format!("u{value}"))),
+        Row::Int(name, value) => Some((name.clone(), format!("i{value}"))),
+        Row::Str(name, value) => Some((name.clone(), format!("s{value}"))),
+        _ => None,
+    };
+    let shared: std::collections::HashSet<(String, String)> = rest
+        .iter()
+        .map(|rows| rows.iter().filter_map(key).collect::<std::collections::HashSet<_>>())
+        .fold(first.iter().filter_map(key).collect(), |acc, next| {
+            acc.intersection(&next).cloned().collect()
+        });
+
+    let mut out: Vec<Row> = Vec::new();
+    let mut pending: Vec<Row> = Vec::new();
+    for row in first {
+        match row {
+            Row::Blank | Row::Comment(_) => pending.push(match row {
+                Row::Comment(text) => Row::Comment(text.clone()),
+                _ => Row::Blank,
+            }),
+            _ => {
+                if key(row).is_some_and(|k| shared.contains(&k)) {
+                    out.append(&mut pending);
+                    out.push(match row {
+                        Row::Uint(n, v) => Row::Uint(n.clone(), v.clone()),
+                        Row::Int(n, v) => Row::Int(n.clone(), v.clone()),
+                        Row::Str(n, v) => Row::Str(n.clone(), v.clone()),
+                        _ => unreachable!("matched a constant row"),
+                    });
+                } else {
+                    pending.clear();
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What a family's invariant emission says it is.
+fn common_what(family: &str, parts: &[DeviceTable]) -> String {
+    let members: Vec<&str> = parts.iter().map(|p| p.part.as_str()).collect();
+    format!(
+        "The facts every {family} member emits IDENTICALLY -- the family's INVARIANT subset,\n\
+         // computed across {}. A part family's driver base is shared code in every language, and\n\
+         // this is what it may rely on. A fact is here only while EVERY member agrees on it, so the\n\
+         // day one member states its own value the fact LEAVES this class and the shared code that\n\
+         // used it stops compiling. Nothing here is inherited: each member's own table spells all\n\
+         // of it too, flattened.",
+        members.join(", "),
+    )
+}
+
+/// What every language's header says a part emission is. Written with the C#/Rust/Swift comment
+/// marker; the Python emitter rewrites the continuations to its own.
+fn device_what(part: &DeviceTable) -> String {
+    format!(
+        "The {} part table, FLATTENED: every value it inherited is spelled out here, because a\n\
+         // value that is only ever inherited is pinned in no emitted artifact and so cannot be\n\
+         // checked for drift between languages. A part is something we talk TO rather than a chip\n\
+         // we run on -- a board states which buses exist, this table states the part's identity,\n\
+         // and a probe joins the two at run time.",
+        part.part,
+    )
+}
+
+/// Renders a row list as a C# facts class.
+fn render_csharp(
+    class: &str,
+    what: &str,
+    rows: &[Row],
+    sources: &[String],
+    regen: &str,
+) -> Result<String, String> {
+    let mut out = String::new();
+    emit_header(&mut out, class, what, sources, regen);
+    let rows_at = rows;
+    for (at, row) in rows_at.iter().enumerate() {
+        let documents = documents_something(&rows_at[at + 1..]);
+        match row {
+            Row::Blank => out.push('\n'),
+            Row::Comment(comment) => push_section_comment(&mut out, "        ", if documents { "///" } else { "//" }, comment),
+            Row::Uint(name, value) => push_const(&mut out, "uint", name, value),
+            Row::Int(name, value) => push_const(&mut out, "int", name, value),
+            Row::Str(name, value) => push_const(&mut out, "string", name, &format!("\"{value}\"")),
+        }
+    }
+    finish_class(&mut out)?;
+    Ok(out)
+}
+
+/// Renders a row list as a Rust `pub const` module, name/value-identical to the C#.
+fn render_rust(what: &str, rows: &[Row], sources: &[String], regen: &str) -> Result<String, String> {
+    let mut out = String::new();
+    emit_rust_header(&mut out, what, sources, regen);
+    let rows_at = rows;
+    for (at, row) in rows_at.iter().enumerate() {
+        let documents = documents_something(&rows_at[at + 1..]);
+        match row {
+            Row::Blank => out.push('\n'),
+            Row::Comment(comment) => push_section_comment(&mut out, "", if documents { "///" } else { "//" }, comment),
+            Row::Uint(name, value) => push_rust_const(&mut out, "u32", name, value),
+            Row::Int(name, value) => push_rust_const(&mut out, "i32", name, value),
+            Row::Str(name, value) => push_rust_const(&mut out, "&str", name, &format!("\"{value}\"")),
+        }
+    }
+    finish_rust(&out)?;
+    Ok(out)
+}
+
+/// Renders a row list as a Swift caseless-enum namespace, name/value-identical to the C#. A
+/// named dispatch rides `StaticString`, which a Swift image with no heap can hold.
+fn render_swift(
+    class: &str,
+    what: &str,
+    rows: &[Row],
+    sources: &[String],
+    regen: &str,
+) -> Result<String, String> {
+    let mut out = String::new();
+    emit_swift_header(&mut out, what, sources, regen);
+    out.push_str(&format!("\npublic enum {class} {{\n"));
+    let rows_at = rows;
+    for row in rows_at.iter() {
+        match row {
+            Row::Blank => out.push('\n'),
+            Row::Comment(comment) => push_section_comment(&mut out, "    ", "//", comment),
+            Row::Uint(name, value) => push_swift_const(&mut out, "UInt32", name, value),
+            Row::Int(name, value) => push_swift_const(&mut out, "Int32", name, value),
+            Row::Str(name, value) => push_swift_const(&mut out, "StaticString", name, &format!("\"{value}\"")),
+        }
+    }
+    out.push_str("}\n");
+    finish_swift(&out)?;
+    Ok(out)
+}
+
+/// Renders a row list as a Python module of the SAME names and value spellings. A part has no
+/// roles, so unlike a board's `board.py` this is flat -- one truth, one shape.
+fn render_python(what: &str, rows: &[Row], sources: &[String], regen: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# GENERATED by lamella-bsp-gen from {list} -- DO NOT EDIT.\n# Regenerate: {regen}\n#\n# {what}\n",
+        list = sources.join(" + "),
+        what = what.replace("\n//", "\n#"),
+    ));
+    let rows_at = rows;
+    for row in rows_at.iter() {
+        match row {
+            Row::Blank => out.push('\n'),
+            Row::Comment(comment) => push_section_comment(&mut out, "", "#", comment),
+            Row::Uint(name, value) | Row::Int(name, value) => {
+                out.push_str(&format!("{name} = {value}\n"));
+            }
+            Row::Str(name, value) => out.push_str(&format!("{name} = \"{value}\"\n")),
+        }
+    }
+    out
+}
+
+/// Emits the flattened part table as a C# facts class.
+pub fn emit_part_csharp(part: &DeviceTable, sources: &[String], regen: &str) -> Result<String, String> {
+    render_csharp(&part_class(&part.part), &device_what(part), &device_rows(part)?, sources, regen)
+}
+
+/// Emits the flattened part table as a Rust `pub const` module.
+pub fn emit_part_rust(part: &DeviceTable, sources: &[String], regen: &str) -> Result<String, String> {
+    render_rust(&device_what(part), &device_rows(part)?, sources, regen)
+}
+
+/// Emits the flattened part table as a Swift caseless-enum namespace.
+pub fn emit_part_swift(part: &DeviceTable, sources: &[String], regen: &str) -> Result<String, String> {
+    render_swift(&part_class(&part.part), &device_what(part), &device_rows(part)?, sources, regen)
+}
+
+/// Emits the flattened part table as a Python module.
+pub fn emit_part_python(part: &DeviceTable, sources: &[String], regen: &str) -> Result<String, String> {
+    Ok(render_python(&device_what(part), &device_rows(part)?, sources, regen))
+}
+
+/// Generates every artifact of a part family: per part, the flattened table in all four
+/// languages boards emit today. Every part emits every language deliberately -- gate B's whole
+/// value is that a concrete value cannot drift between languages, which only holds for a
+/// language the value is actually spelled in.
+pub fn generate_parts(repo_root: &std::path::Path, family: &str) -> Result<Vec<Generated>, String> {
+    let regen = format!("cargo run -p lamella-bsp-gen -- gen-parts . {family}");
+    let set = load_device_family(repo_root, family)?;
+    let mut out = Vec::new();
+    let mut resolved_parts = Vec::new();
+    for part in &set.parts {
+        let resolved = resolve_device(&set, part)?;
+        let mut sources = vec![format!("parts/{family}/{}.toml", part.part)];
+        if !part.base.is_empty() {
+            sources.push(format!("parts/{family}/{}.toml", part.base));
+        }
+        let id = &resolved.part;
+        out.push(Generated {
+            path: format!("parts/{family}/csharp/{}.g.cs", part_class(id)),
+            contents: emit_part_csharp(&resolved, &sources, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("parts/{family}/rust/{}_part.rs", snake(id)),
+            contents: emit_part_rust(&resolved, &sources, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("parts/{family}/swift/{}.swift", part_class(id)),
+            contents: emit_part_swift(&resolved, &sources, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("parts/{family}/python/{}.py", snake(id)),
+            contents: emit_part_python(&resolved, &sources, &regen)?,
+        });
+        resolved_parts.push(resolved);
+    }
+
+    if resolved_parts.len() >= 2 {
+        let rows = common_rows(&resolved_parts)?;
+        let what = common_what(family, &resolved_parts);
+        let mut sources: Vec<String> =
+            resolved_parts.iter().map(|p| format!("parts/{family}/{}.toml", p.part)).collect();
+        if let Some(base) = &set.base {
+            sources.push(format!("parts/{family}/{}.toml", base.family));
+        }
+        let class = common_class(family);
+        out.push(Generated {
+            path: format!("parts/{family}/csharp/{class}.g.cs"),
+            contents: render_csharp(&class, &what, &rows, &sources, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("parts/{family}/rust/{}_common.rs", snake(family)),
+            contents: render_rust(&what, &rows, &sources, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("parts/{family}/swift/{class}.swift"),
+            contents: render_swift(&class, &what, &rows, &sources, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("parts/{family}/python/{}_common.py", snake(family)),
+            contents: render_python(&what, &rows, &sources, &regen),
+        });
+    }
     Ok(out)
 }
 
@@ -4552,6 +7021,10 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
         out.push(Generated {
             path: format!("csp/{family}/csharp/{}.g.cs", layout_class(block)),
             contents: emit_layout_csharp(block, &source, &regen)?,
+        });
+        out.push(Generated {
+            path: format!("csp/{family}/rust/{}.rs", layout_module(block)),
+            contents: emit_layout_rust(block, &source, &regen)?,
         });
         if swift {
             out.push(Generated {
@@ -4596,26 +7069,36 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
             continue;
         }
         let id = board.board.clone();
+        let dir = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(|| format!("{}: has no board directory", path.display()))?;
+        if dir != id && !dir.ends_with(&format!("-{id}")) {
+            return Err(format!(
+                "bsp/{dir}/board.toml states board = \"{id}\" -- a board directory is its id, or its id behind a vendor prefix"
+            ));
+        }
         let resolved = resolve_board(&set, board)?;
-        let mut sources = vec![format!("bsp/{id}/board.toml"), format!("csp/{family}/ strata")];
+        let mut sources = vec![format!("bsp/{dir}/board.toml"), format!("csp/{family}/ strata")];
         if !resolved.board.module.is_empty() {
             sources.insert(1, format!("csp/{}/module.toml", resolved.board.module));
         }
         out.push(Generated {
-            path: format!("bsp/{id}/csharp/{}.g.cs", bindings_class(&id)),
+            path: format!("bsp/{dir}/csharp/{}.g.cs", bindings_class(&id)),
             contents: emit_board_csharp(&set, &resolved, &sources, &regen)?,
         });
         out.push(Generated {
-            path: format!("bsp/{id}/rust/{}_bindings.rs", snake(&id)),
+            path: format!("bsp/{dir}/rust/{}_bindings.rs", snake(&id)),
             contents: emit_board_rust(&set, &resolved, &sources, &regen)?,
         });
         out.push(Generated {
-            path: format!("bsp/{id}/python/board.py"),
+            path: format!("bsp/{dir}/python/board.py"),
             contents: emit_board_python(&set, &resolved, &sources, &regen)?,
         });
         if swift {
             out.push(Generated {
-                path: format!("bsp/{id}/swift/{}.swift", bindings_class(&id)),
+                path: format!("bsp/{dir}/swift/{}.swift", bindings_class(&id)),
                 contents: emit_board_swift(&set, &resolved, &sources, &regen)?,
             });
         }
@@ -4672,6 +7155,7 @@ value = 0x2
 [table]
 kind = "board"
 board = "b"
+vendor = "vend"
 family = "fam"
 part = "p"
 board_model = 1
@@ -4694,6 +7178,7 @@ baud_divisor = 0x1234
 [table]
 kind = "board"
 board = "b"
+vendor = "vend"
 family = "fam"
 part = "p"
 board_model = 1
@@ -4720,6 +7205,7 @@ source = "s"
 [table]
 kind = "board"
 board = "b"
+vendor = "vend"
 family = "fam"
 part = "p"
 board_model = 1
@@ -4756,6 +7242,7 @@ source = "s"
 [table]
 kind = "board"
 board = "b"
+vendor = "vend"
 family = "fam"
 part = "p"
 board_model = 1
@@ -4803,6 +7290,7 @@ source = "s"
 [table]
 kind = "board"
 board = "b"
+vendor = "vend"
 family = "fam"
 part = "p"
 board_model = 1
@@ -4847,6 +7335,7 @@ source = "s"
 [table]
 kind = "board"
 board = "bare"
+vendor = "vend"
 family = "fam"
 part = "p"
 board_model = 1
@@ -4868,6 +7357,7 @@ source = "s"
 [table]
 kind = "board"
 board = "b"
+vendor = "vend"
 family = "fam"
 part = "p"
 board_model = 1
@@ -4880,13 +7370,72 @@ default = true
 source = "s"
 "#;
         let Strata::Board(board) = parse(good).expect("parses") else { panic!("kind") };
-        assert_eq!(board.memory_flash, 0x200000);
+        assert_eq!(board.memory.len(), 1);
+        assert_eq!(board.memory[0].name, "flash");
+        assert_eq!(board.memory[0].kind, "flash");
+        assert_eq!(board.memory[0].size, 0x200000);
+        assert_eq!(board.memory[0].base, -1, "the chip's own XIP window is not the board's to state");
+        assert_eq!(board.xip_flash(), 0x200000);
         let bad_key = good.replace("flash = 0x200000", "ram = 0x1000");
-        let error = parse(&bad_key).unwrap_err();
-        assert!(error.contains("[memory]"), "{error}");
+        assert!(parse(&bad_key).unwrap_err().contains("unexpected memory key 'ram'"));
         let uncited = good.replace("source = \"board datasheet\"\n", "");
-        let error = parse(&uncited).unwrap_err();
-        assert!(error.contains("SOURCE-CITED"), "{error}");
+        assert!(parse(&uncited).unwrap_err().contains("SOURCE-CITED"));
+    }
+
+    #[test]
+    fn a_board_may_fit_several_memory_regions() {
+        let source = r#"
+[table]
+kind = "board"
+board = "b"
+vendor = "vend"
+family = "fam"
+part = "p"
+board_model = 1
+
+[[memory]]
+name = "qspi"
+kind = "flash"
+base = 0x90000000
+size = 0x1000000
+controller = "quadspi"
+optional = true
+source = "the board user manual"
+
+[[memory]]
+name = "sdram"
+kind = "ram"
+base = 0xC0000000
+size = 0x800000
+device_size = 0x1000000
+controller = "fmc"
+optional = true
+source = "the board user manual"
+
+[[plans]]
+name = "n"
+default = true
+source = "s"
+"#;
+        let Strata::Board(board) = parse(source).expect("parses") else { panic!("kind") };
+        assert_eq!(board.memory.len(), 2);
+        assert_eq!(board.memory[0].base, 0x9000_0000);
+        assert_eq!(board.memory[0].controller, "quadspi");
+        assert!(board.memory[0].optional);
+        assert_eq!(board.xip_flash(), 0, "an externally-controlled flash is not the XIP window");
+        assert_eq!(board.memory[1].size, 0x80_0000);
+        assert_eq!(board.memory[1].device_size, 0x100_0000);
+        assert_eq!(board.memory[1].fitted_size(), 0x100_0000);
+        assert_eq!(board.memory[0].fitted_size(), 0x100_0000, "unstated device_size means the same");
+
+        let widened = source.replace("size = 0x800000\ndevice_size = 0x1000000", "size = 0x1000000\ndevice_size = 0x800000");
+        assert!(parse(&widened).unwrap_err().contains("cannot exceed the part"));
+        let unkinded = source.replace("kind = \"ram\"", "kind = \"eeprom\"");
+        assert!(parse(&unkinded).unwrap_err().contains("holds code or it holds data"));
+        let unnamed = source.replace("name = \"sdram\"\n", "");
+        assert!(parse(&unnamed).unwrap_err().contains("states no name"));
+        let collided = source.replace("name = \"sdram\"", "name = \"qspi\"");
+        assert!(parse(&collided).unwrap_err().contains("two memory regions are named"));
     }
 
     #[test]
@@ -4920,6 +7469,55 @@ base = 0x1000
         assert!(!row.has_pin("PB10"));
     }
 
+    /// A pin-map row naming a pin no part of the family carries. THE DEFECT: the present-list and
+    /// the pin map are two statements about the same silicon, and until this check existed only
+    /// pins a BINDING reached were held equal -- so a bus with thirty-eight muxed cells and no
+    /// binding could name a pin the part does not have, and every gate would stay green.
+    #[test]
+    fn a_pin_map_row_outside_every_part_present_list_is_refused() {
+        let mut set = FamilySet {
+            family: "fam".into(),
+            instances: InstancesTable {
+                family: "fam".into(),
+                record: vec!["base".into()],
+                rows: vec![InstanceRow {
+                    name: "fmc".into(),
+                    block: "fmc".into(),
+                    values: vec![0xA000_0000],
+                }],
+                ..Default::default()
+            },
+            parts: PartsTable {
+                family: "fam".into(),
+                rows: vec![PartRow {
+                    part: "p".into(),
+                    package: "LQFP144".into(),
+                    flash: 0,
+                    ram: 0,
+                    pins: vec!["PF0-PF5".into()],
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let row = |pin: &str| PinRow {
+            pin: pin.into(),
+            function: "AF12".into(),
+            instance: "fmc".into(),
+            signal: "a0".into(),
+        };
+
+        set.pins = PinsTable { family: "fam".into(), rows: vec![row("PF3")], ..Default::default() };
+        assert!(validate_family(&set).is_ok(), "a pin inside the present-list is fine");
+
+        set.pins = PinsTable { family: "fam".into(), rows: vec![row("PF9")], ..Default::default() };
+        let error = validate_family(&set).unwrap_err();
+        assert!(error.contains("'PF9' is in no part's present-list"), "{error}");
+
+        set.parts.rows.clear();
+        assert!(validate_family(&set).is_ok(), "a family with no parts row states no present-list");
+    }
+
     #[test]
     fn rust_instances_mirror_the_csharp_names_and_spellings() {
         let table = InstancesTable {
@@ -4948,7 +7546,7 @@ base = 0x1000
             assert!(csharp.contains(csharp_line), "missing: {csharp_line}\n{csharp}");
         }
         assert!(!rust.contains("GCLK_GCLK_CORE_ID"), "-1 fields must emit nothing");
-        assert!(rust.starts_with("// GENERATED by lamella-bsp-gen from src.toml -- DO NOT EDIT."));
+        assert!(rust.starts_with("//! GENERATED by lamella-bsp-gen from src.toml -- DO NOT EDIT."));
     }
 
     #[test]
@@ -4987,5 +7585,389 @@ base = 0x1000
         assert_eq!(snake("samd21-xpro"), "samd21_xpro");
         assert_eq!(snake("arduino-zero"), "arduino_zero");
         assert_eq!(snake("samd21"), "samd21");
+    }
+
+
+    const DEVICE_BASE: &str = r#"
+[table]
+kind = "device-base"
+family = "fam"
+sources = ["a vendor datasheet"]
+notes = ["shared by both members"]
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+
+[buses.spi]
+kind = "spi"
+register_read_transform = "set-bit7"
+register_write_transform = "clear-bit7"
+read_protocol = "single-chip-select-address-then-clock-data"
+modes = [0, 3]
+
+[address]
+bus = "i2c"
+base = 0x76
+
+[[address.straps]]
+pin = "SDO"
+bit = 0
+low = 0x76
+high = 0x77
+
+[identity]
+reg = 0xD0
+width = 8
+
+[registers.ctrl_meas]
+reg = 0xF4
+width = 8
+access = "read-write"
+fields = { mode = [0, 2], osrs_p = [2, 3] }
+notes = "prose"
+
+[registers.status]
+reg = 0xF3
+width = 8
+access = "read-only"
+fields = { measuring = [3, 1] }
+
+[registers.press]
+reg = 0xF7
+width = 24
+access = "read-only"
+fields = { press_msb = [16, 8], press_lsb = [8, 8], press_xlsb = [4, 4] }
+
+[enums.mode]
+sleep = 0
+forced = 1
+normal = 3
+notes = "value 2 also selects forced"
+
+[calibration.temperature]
+form = "fam-t-int32"
+byte_order = "little"
+output_scale = "centi-degrees-celsius"
+
+[[calibration.temperature.read]]
+name = "dig_T1"
+reg = 0x88
+width = 16
+signed = false
+
+[[calibration.temperature.read]]
+name = "dig_T2"
+reg = 0x8A
+width = 16
+signed = true
+
+[[sequences.forced_measurement]]
+step = "write-field"
+register = "ctrl_meas"
+field = "mode"
+value = 1
+
+[[sequences.forced_measurement]]
+step = "poll-field-until"
+register = "status"
+field = "measuring"
+value = 0
+bounded = true
+
+[[sequences.forced_measurement]]
+step = "burst-read"
+from = "press"
+length_from = "measurement.burst_length"
+"#;
+
+    const DEVICE_MEMBER: &str = r#"
+[table]
+kind = "device"
+family = "fam"
+part = "one"
+base = "fam"
+
+[identity]
+reg = 0xD0
+width = 8
+values = [0x56, 0x57, 0x58]
+
+[measurement]
+burst_length = 6
+resolution_bits = "16..20, depending only on the oversampling setting"
+
+[enums.standby_us]
+"0" = 500
+"6" = 2000000
+"7" = 4000000
+"#;
+
+    fn device(text: &str) -> DeviceTable {
+        match parse(text).expect("the part table parses") {
+            Strata::Device(table) => table,
+            other => panic!("expected a device table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_device_base() {
+        let table = device(DEVICE_BASE);
+        assert!(table.is_base);
+        assert_eq!(table.family, "fam");
+        assert!(table.part.is_empty());
+
+        assert_eq!(table.buses.len(), 2);
+        let spi = table.bus("spi").expect("the spi bus");
+        assert_eq!(spi.register_read_transform, "set-bit7");
+        assert_eq!(spi.register_write_transform, "clear-bit7");
+        assert_eq!(spi.modes, vec![Int { value: 0, hex: false }, Int { value: 3, hex: false }]);
+        assert_eq!(table.bus("i2c").expect("the i2c bus").register_read_transform, "identity");
+
+        let address = table.address.as_ref().expect("an address model");
+        assert_eq!(address.base.value, 0x76);
+        assert_eq!(address.straps.len(), 1);
+        assert_eq!(address.straps[0].pin, "SDO");
+        assert_eq!(address.straps[0].high.value, 0x77);
+
+        let identity = table.identity.as_ref().expect("an identity");
+        assert_eq!(identity.reg.value, 0xD0);
+        assert!(identity.values.is_empty(), "a base states where to look, not what to accept");
+
+        let ctrl = table.register("ctrl_meas").expect("ctrl_meas");
+        assert_eq!(ctrl.reg.value, 0xF4);
+        assert_eq!(ctrl.access, "read-write");
+        assert_eq!(ctrl.fields.len(), 2);
+        assert_eq!(ctrl.fields[1].name, "osrs_p");
+        assert_eq!(ctrl.fields[1].mask(), 0x1C);
+
+        let mode = table.enumeration("mode").expect("the mode encoding");
+        assert_eq!(mode.members.len(), 3, "`notes` is prose, never a member");
+        assert_eq!(mode.members[2], ("normal".to_string(), Int { value: 3, hex: false }));
+
+        let record = &table.calibrations[0];
+        assert_eq!(record.form, "fam-t-int32");
+        assert_eq!(record.reads.len(), 2);
+        assert_eq!(record.reads[0].name, "dig_T1");
+        assert!(!record.reads[0].signed, "dig_T1 is unsigned and its sibling is not");
+        assert!(record.reads[1].signed);
+
+        let (name, steps) = &table.sequences[0];
+        assert_eq!(name, "forced_measurement");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].value, Some(Int { value: 1, hex: false }));
+        assert!(steps[1].bounded, "an unbounded poll on an absent part is a hang");
+        assert_eq!(steps[2].length_from, "measurement.burst_length");
+    }
+
+    #[test]
+    fn parses_a_device_member_with_a_value_set_and_numeric_enum_keys() {
+        let table = device(DEVICE_MEMBER);
+        assert!(!table.is_base);
+        assert_eq!(table.part, "one");
+        assert_eq!(table.base, "fam");
+        assert_eq!(table.burst_length, 6);
+
+        let identity = table.identity.as_ref().expect("an identity");
+        assert_eq!(
+            identity.values,
+            vec![
+                Int { value: 0x56, hex: true },
+                Int { value: 0x57, hex: true },
+                Int { value: 0x58, hex: true },
+            ]
+        );
+
+        let standby = table.enumeration("standby_us").expect("the standby encoding");
+        assert_eq!(standby.members[0], ("0".to_string(), Int { value: 500, hex: false }));
+        assert_eq!(standby.members[2], ("7".to_string(), Int { value: 4_000_000, hex: false }));
+    }
+
+    #[test]
+    fn a_device_register_may_not_spell_offset() {
+        let text = "[table]\nkind = \"device\"\nfamily = \"f\"\npart = \"p\"\n\
+                    [registers.id]\noffset = 0xD0\nwidth = 8\n";
+        let error = parse(text).expect_err("offset is refused");
+        assert!(error.contains("'offset'"), "the message names the key: {error}");
+        assert!(error.contains("'reg'"), "the message names the repair: {error}");
+    }
+
+    #[test]
+    fn a_device_table_refuses_a_float_at_any_depth() {
+        let bare = "[table]\nkind = \"device\"\nfamily = \"f\"\npart = \"p\"\n\
+                    [enums.standby]\n\"6\" = 0.5\n";
+        let error = parse(bare).expect_err("a bare float is refused");
+        assert!(error.contains("never a float"), "{error}");
+        let nested = "[table]\nkind = \"device\"\nfamily = \"f\"\npart = \"p\"\n\
+                      [buses.spi]\nkind = \"spi\"\nmodes = [0, 3.5]\n";
+        assert!(parse(nested).expect_err("a float inside an array is refused").contains("never a float"));
+    }
+
+    #[test]
+    fn a_device_file_refuses_what_is_outside_its_closed_key_set() {
+        let section = "[table]\nkind = \"device\"\nfamily = \"f\"\npart = \"p\"\n[regions]\nR = 0x1000\n";
+        assert!(parse(section).is_err(), "a chip block's section is not a part's");
+        let key = "[table]\nkind = \"device\"\nfamily = \"f\"\npart = \"p\"\n\
+                   [identity]\nreg = 0xD0\nwidth = 8\nvalue = 0x60\n";
+        assert!(parse(key).is_err(), "the singular 'value' is not the identity key set");
+        let widthless = "[table]\nkind = \"device\"\nfamily = \"f\"\npart = \"p\"\n\
+                         [registers.id]\nreg = 0xD0\n";
+        assert!(parse(widthless).expect_err("a register needs a width").contains("widths are data"));
+        let unnamed = "[table]\nkind = \"device\"\nfamily = \"f\"\n";
+        assert!(parse(unnamed).expect_err("a part needs an id").contains("part id"));
+        let chained = "[table]\nkind = \"device-base\"\nfamily = \"f\"\nbase = \"g\"\n";
+        assert!(parse(chained).expect_err("a base has no base").contains("one level"));
+        let orphan = "[table]\nkind = \"device\"\nfamily = \"f\"\npart = \"p\"\n\
+                      [[calibration.temperature.read]]\nname = \"dig_T1\"\nreg = 0x88\nwidth = 16\n";
+        assert!(parse(orphan).expect_err("a read needs its record").contains("[calibration.temperature]"));
+    }
+
+
+    fn flattened(member: &str) -> DeviceTable {
+        let set = DeviceSet {
+            family: "fam".into(),
+            base: Some(device(DEVICE_BASE)),
+            parts: vec![device(member)],
+        };
+        resolve_device(&set, &set.parts[0]).expect("the member resolves against its base")
+    }
+
+    fn emissions(part: &DeviceTable) -> [String; 4] {
+        let sources = vec!["member.toml".to_string(), "base.toml".to_string()];
+        [
+            emit_part_csharp(part, &sources, "regen").expect("C# emits"),
+            emit_part_rust(part, &sources, "regen").expect("rust emits"),
+            emit_part_swift(part, &sources, "regen").expect("swift emits"),
+            emit_part_python(part, &sources, "regen").expect("python emits"),
+        ]
+    }
+
+    #[test]
+    fn a_member_emits_its_base_flattened() {
+        let part = flattened(DEVICE_MEMBER);
+        let [csharp, ..] = emissions(&part);
+        for line in [
+            "public const uint CTRL_MEAS_REG = 0xF4;",
+            "public const uint CTRL_MEAS_OSRS_P = 0x1C;",
+            "public const string BUS_SPI_REGISTER_READ_TRANSFORM = \"set-bit7\";",
+            "public const uint ADDRESS_STRAP_SDO_HIGH = 0x77;",
+            "public const string TEMPERATURE_FORM = \"fam-t-int32\";",
+            "public const uint TEMPERATURE_DIG_T2_SIGNED = 1;",
+            "public const uint IDENTITY_VALUE_COUNT = 3;",
+            "public const uint IDENTITY_VALUE_2 = 0x58;",
+            "public const uint BURST_LENGTH = 6;",
+            "public const uint STANDBY_US_6 = 2000000;",
+            "public const uint IDENTITY_REG = 0xD0;",
+        ] {
+            assert!(csharp.contains(line), "missing: {line}\n{csharp}");
+        }
+        assert!(!csharp.contains("Bmx280"), "the base is resolved away, not referenced");
+    }
+
+    #[test]
+    fn an_inherited_encoding_is_replaced_whole_and_never_merged() {
+        let member = "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
+                      [identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x60]\n\
+                      [measurement]\nburst_length = 6\n\
+                      [enums.mode]\nsleep = 0\nforced = 2\n";
+        let part = flattened(member);
+        let [csharp, ..] = emissions(&part);
+        assert!(csharp.contains("public const uint MODE_FORCED = 2;"), "the member's code wins");
+        assert!(
+            !csharp.contains("MODE_NORMAL"),
+            "a code the member did not restate must NOT survive from the base:\n{csharp}"
+        );
+    }
+
+    #[test]
+    fn the_four_languages_spell_the_same_names_and_values() {
+        let part = flattened(DEVICE_MEMBER);
+        let [csharp, rust, swift, python] = emissions(&part);
+        let pairs = |text: &str, strip: &str, name_of: fn(&str) -> String| -> Vec<(String, String)> {
+            text.lines()
+                .filter_map(|line| line.trim().strip_prefix(strip).map(str::to_string))
+                .filter_map(|line| {
+                    let (declared, value) = line.split_once(" = ")?;
+                    Some((name_of(declared), value.trim_end_matches(';').trim().to_string()))
+                })
+                .collect()
+        };
+        let after_type = |declared: &str| declared.split_whitespace().last().unwrap_or_default().to_string();
+        let before_type = |declared: &str| declared.split(':').next().unwrap_or_default().trim().to_string();
+        let cs = pairs(&csharp, "public const ", after_type);
+        let rs = pairs(&rust, "pub const ", before_type);
+        let sw = pairs(&swift, "public static let ", before_type);
+        let py: Vec<(String, String)> = python
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .filter_map(|line| line.split_once(" = "))
+            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+            .collect();
+
+        assert!(cs.len() > 60, "the sample part emits a real table, got {}", cs.len());
+        assert_eq!(cs.len(), rs.len(), "C# and rust emit a different number of facts");
+        assert_eq!(cs.len(), sw.len(), "C# and swift emit a different number of facts");
+        assert_eq!(cs.len(), py.len(), "C# and python emit a different number of facts");
+        for (at, (name, value)) in cs.iter().enumerate() {
+            assert_eq!((name, value), (&rs[at].0, &rs[at].1), "rust differs at row {at}");
+            assert_eq!((name, value), (&sw[at].0, &sw[at].1), "swift differs at row {at}");
+            assert_eq!((name, value), (&py[at].0, &py[at].1), "python differs at row {at}");
+        }
+    }
+
+    #[test]
+    fn a_sequence_step_carries_its_own_resolved_register_mask_and_length() {
+        let part = flattened(DEVICE_MEMBER);
+        let [csharp, ..] = emissions(&part);
+        for line in [
+            "public const string FORCED_MEASUREMENT_STEP_1_OP = \"poll-field-until\";",
+            "public const string FORCED_MEASUREMENT_STEP_1_TARGET = \"status.measuring\";",
+            "public const uint FORCED_MEASUREMENT_STEP_1_REG = 0xF3;",
+            "public const uint FORCED_MEASUREMENT_STEP_1_MASK = 0x8;",
+            "public const uint FORCED_MEASUREMENT_STEP_1_LSB = 3;",
+            "public const uint FORCED_MEASUREMENT_STEP_1_BOUNDED = 1;",
+            "public const uint FORCED_MEASUREMENT_STEP_2_LENGTH = 6;",
+        ] {
+            assert!(csharp.contains(line), "missing: {line}\n{csharp}");
+        }
+        assert!(!csharp.contains("LENGTH_FROM"), "a reference the generator can resolve is resolved");
+    }
+
+    #[test]
+    fn a_flattened_part_is_refused_when_a_reference_goes_nowhere() {
+        let with = |body: &str| -> String {
+            format!(
+                "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
+                 [identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x60]\n[measurement]\nburst_length = 6\n{body}"
+            )
+        };
+        let set = |text: &str| DeviceSet {
+            family: "fam".into(),
+            base: Some(device(DEVICE_BASE)),
+            parts: vec![device(text)],
+        };
+        let emit = |text: &str| -> Result<String, String> {
+            let s = set(text);
+            let part = resolve_device(&s, &s.parts[0])?;
+            emit_part_csharp(&part, &["m.toml".to_string()], "regen")
+        };
+
+        let dangling = with("[[sequences.reset]]\nstep = \"write-field\"\nregister = \"nowhere\"\nvalue = 1\n");
+        assert!(emit(&dangling).expect_err("a dangling register is refused").contains("nowhere"));
+
+        let bad_field = with("[[sequences.reset]]\nstep = \"write-field\"\nregister = \"status\"\nfield = \"nope\"\nvalue = 1\n");
+        assert!(emit(&bad_field).expect_err("a dangling field is refused").contains("status.nope"));
+
+        let bad_depends = with("[calibration.humidity]\nform = \"h\"\ndepends_on = [\"nowhere\"]\n");
+        assert!(emit(&bad_depends).expect_err("a dangling dependency is refused").contains("nowhere"));
+
+        let no_values = "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n";
+        assert!(emit(no_values).expect_err("an empty identity is refused").contains("accepts no value"));
+
+        let mismatch = "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
+                        [identity]\nreg = 0xF4\nwidth = 16\nvalues = [0x60]\n";
+        assert!(emit(mismatch).expect_err("a width disagreement is refused").contains("[registers.ctrl_meas]"));
     }
 }

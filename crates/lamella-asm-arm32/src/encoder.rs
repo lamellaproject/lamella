@@ -28,12 +28,6 @@ pub enum RelocKind {
     /// take the halfword-scaled PC-relative offset (A6.7.10), a reach of about
     /// +/-256 bytes.
     ThumbBranchCond8,
-    /// A relaxed conditional branch occupying TWO halfwords: an inverted `B<!c>`
-    /// over a following `B` (encoding T2). [`Encoder::finish`] grows a
-    /// [`RelocKind::ThumbBranchCond8`] into this when its +/-256-byte reach is
-    /// exceeded -- ARMv6-M has no wide conditional branch, so the condition is
-    /// inverted to skip an unconditional `B` with the wider +/-2 KB reach.
-    ThumbBranchCond8Long,
     /// A PC-relative literal load (`LDR` (literal), encoding T1): the low 8 bits
     /// take the word-scaled distance from `Align(PC, 4)` to the pool entry
     /// (Armv6-M ARM (DDI 0419E), A6.7.27), which must lie ahead within about 1 KB.
@@ -88,10 +82,18 @@ pub enum AssembleError {
     /// An operand cannot be represented in the chosen encoding, such as a high
     /// register where a 16-bit Thumb form admits only R0-R7.
     UnencodableOperand,
-    /// A branch's target is too far away, or misaligned, for its encoding.
+    /// A reference's target is too far away, or misaligned, for its encoding -- after every
+    /// relaxation and veneer this encoder can apply.
     BranchOutOfRange {
-        /// Byte offset of the branch instruction that cannot reach its target.
+        /// Byte offset of the reference that cannot reach its target.
         at: u32,
+        /// WHICH KIND of reference gave up. The remedies differ by kind and do not overlap, so a
+        /// bare "out of range" leaves a caller disassembling the image to learn what it already
+        /// knew here: a [`RelocKind::ThumbLdrLit8`] pool word islands beside its load, an `ADR`
+        /// veneers to an unbounded computed address, and an unconditional branch veneers through
+        /// the pool -- which is also how a far conditional branch ends up rescued, since widening
+        /// leaves it as a plain [`RelocKind::ThumbBranch11`] the veneer can see.
+        kind: RelocKind,
     },
 }
 
@@ -1344,6 +1346,18 @@ impl Encoder {
     /// inverted-skip form (ARMv6-M has no wide `B<c>`): `B<!cond>` over a following `B`, which
     /// reaches +/-2 KB. Returns whether one grew; the caller re-checks from the top because the
     /// spliced halfword shifts every later reference and can push another branch out of range.
+    ///
+    /// The grown form is left as the TWO ORDINARY REFERENCES it is made of -- a conditional branch
+    /// to a skip label just past the pair, and a plain `ThumbBranch11` to the real target -- rather
+    /// than one fused two-halfword kind. That is what lets the inner branch relax AGAIN: it is the
+    /// only halfword here that can still be out of reach, and as a `ThumbBranch11` the existing
+    /// v6-M veneer ([`Encoder::veneer_far_unconditional_branch`]) picks it up like any other far
+    /// branch. Fused, it could not be seen by anything, which made a conditional branch past 2 KB
+    /// the one reference on this target with no further tier -- and that single gap accounted for
+    /// EVERY deferred method in the corpus.
+    ///
+    /// The emitted bytes are unchanged for a branch that already fitted: the skip label sits at
+    /// `at + 6`, so the conditional's resolved immediate is 1, exactly what the fused form baked in.
     fn widen_far_conditional_branch(&mut self) -> Result<bool, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
@@ -1359,7 +1373,18 @@ impl Encoder {
                 continue;
             }
             self.splice_in(at + 2, &[0x00, 0xE0, 0x00, 0xBF]);
-            self.fixups[idx].1 = RelocKind::ThumbBranchCond8Long;
+            let cond = self
+                .bytes
+                .get(at as usize..at as usize + 2)
+                .map_or(0, |s| (u16::from_le_bytes([s[0], s[1]]) >> 8) & 0xF);
+            if let Some(slot) = self.bytes.get_mut(at as usize..at as usize + 2) {
+                slot.copy_from_slice(&(0xD000 | ((cond ^ 1) << 8)).to_le_bytes());
+            }
+            let skip = self.new_label();
+            self.labels[skip.0 as usize] = Some(at + 6);
+            self.fixups[idx].2 = skip.0;
+            self.fixups
+                .push((at + 2, RelocKind::ThumbBranch11, label_id));
             return Ok(true);
         }
         Ok(false)
@@ -1392,7 +1417,7 @@ impl Encoder {
             }
             let word = match self.bytes.get(target as usize..target as usize + 4) {
                 Some(b) => [b[0], b[1], b[2], b[3]],
-                None => return Err(AssembleError::BranchOutOfRange { at }),
+                None => return Err(AssembleError::BranchOutOfRange { at, kind: RelocKind::ThumbLdrLit8 }),
             };
             let carried = self.relocs.iter().find(|r| r.at == target).copied();
             let ins = at + 2;
@@ -1456,7 +1481,7 @@ impl Encoder {
             let from = target - prefix;
             let blob = match self.bytes.get(from as usize..(target + blob_len) as usize) {
                 Some(b) => b.to_vec(),
-                None => return Err(AssembleError::BranchOutOfRange { at }),
+                None => return Err(AssembleError::BranchOutOfRange { at, kind: RelocKind::ThumbAdrWide }),
             };
             let carried: Vec<Reloc> = self
                 .relocs
@@ -1497,14 +1522,19 @@ impl Encoder {
     /// bound.
     pub fn finish(mut self) -> Result<Assembled, AssembleError> {
         self.relax()?;
-        let branch_offset =
-            |at: u32, target: u32, min: i64, max: i64| -> Result<u16, AssembleError> {
-                let offset = i64::from(target) - (i64::from(at) + 4);
-                if offset % 2 != 0 || offset < min || offset > max {
-                    return Err(AssembleError::BranchOutOfRange { at });
-                }
-                Ok((offset >> 1) as u16)
-            };
+        let branch_offset = |site: u32,
+                             kind: RelocKind,
+                             at: u32,
+                             target: u32,
+                             min: i64,
+                             max: i64|
+         -> Result<u16, AssembleError> {
+            let offset = i64::from(target) - (i64::from(at) + 4);
+            if offset % 2 != 0 || offset < min || offset > max {
+                return Err(AssembleError::BranchOutOfRange { at: site, kind });
+            }
+            Ok((offset >> 1) as u16)
+        };
         for (at, kind, label_id) in &self.fixups {
             let target = match self.labels.get(*label_id as usize) {
                 Some(Some(offset)) => *offset,
@@ -1518,37 +1548,23 @@ impl Encoder {
                     }
                 }
                 RelocKind::ThumbBranch11 => {
-                    let imm = branch_offset(*at, target, -2048, 2046)?;
+                    let imm = branch_offset(*at, RelocKind::ThumbBranch11, *at, target, -2048, 2046)?;
                     if let Some(slot) = self.bytes.get_mut(site..site + 2) {
                         slot.copy_from_slice(&(0xE000 | (imm & 0x07FF)).to_le_bytes());
                     }
                 }
                 RelocKind::ThumbBranchCond8 => {
-                    let imm = branch_offset(*at, target, -256, 254)?;
+                    let imm = branch_offset(*at, RelocKind::ThumbBranchCond8, *at, target, -256, 254)?;
                     if let Some(slot) = self.bytes.get_mut(site..site + 2) {
                         let base = u16::from_le_bytes([slot[0], slot[1]]) & 0xFF00;
                         slot.copy_from_slice(&(base | (imm & 0x00FF)).to_le_bytes());
-                    }
-                }
-                RelocKind::ThumbBranchCond8Long => {
-                    let cond = self
-                        .bytes
-                        .get(site..site + 2)
-                        .map_or(0, |s| (u16::from_le_bytes([s[0], s[1]]) >> 8) & 0xF);
-                    let inverted = cond ^ 1;
-                    if let Some(slot) = self.bytes.get_mut(site..site + 2) {
-                        slot.copy_from_slice(&(0xD000 | (inverted << 8) | 1).to_le_bytes());
-                    }
-                    let imm = branch_offset(*at + 2, target, -2048, 2046)?;
-                    if let Some(slot) = self.bytes.get_mut(site + 2..site + 4) {
-                        slot.copy_from_slice(&(0xE000 | (imm & 0x07FF)).to_le_bytes());
                     }
                 }
                 RelocKind::ThumbLdrLit8 => {
                     let pc = i64::from((*at + 4) & !3u32);
                     let offset = i64::from(target) - pc;
                     if !(0..=1020).contains(&offset) || offset % 4 != 0 {
-                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                        return Err(AssembleError::BranchOutOfRange { at: *at, kind: *kind });
                     }
                     let imm8 = (offset / 4) as u16;
                     if let Some(slot) = self.bytes.get_mut(site..site + 2) {
@@ -1560,7 +1576,7 @@ impl Encoder {
                 RelocKind::ThumbCall => {
                     let off = i64::from(target) - (i64::from(*at) + 4);
                     if off % 2 != 0 || !(-16_777_216..=16_777_214).contains(&off) {
-                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                        return Err(AssembleError::BranchOutOfRange { at: *at, kind: *kind });
                     }
                     let s = ((off >> 24) & 1) as u16;
                     let i1 = ((off >> 23) & 1) as u16;
@@ -1579,7 +1595,7 @@ impl Encoder {
                 RelocKind::ThumbBranch24 => {
                     let off = i64::from(target) - (i64::from(*at) + 4);
                     if off % 2 != 0 || !(-16_777_216..=16_777_214).contains(&off) {
-                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                        return Err(AssembleError::BranchOutOfRange { at: *at, kind: *kind });
                     }
                     let s = ((off >> 24) & 1) as u16;
                     let i1 = ((off >> 23) & 1) as u16;
@@ -1604,7 +1620,7 @@ impl Encoder {
                     let delta = i64::from(target) - pc;
                     let (add, mag) = if delta >= 0 { (true, delta) } else { (false, -delta) };
                     if !(0..=4095).contains(&mag) {
-                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                        return Err(AssembleError::BranchOutOfRange { at: *at, kind: *kind });
                     }
                     let mag = mag as u16;
                     let i = (mag >> 11) & 1;
@@ -2645,10 +2661,24 @@ mod tests {
             e.nop();
         }
         e.bind_label(l);
-        assert!(matches!(
-            e.finish(),
-            Err(AssembleError::BranchOutOfRange { .. })
-        ));
+        let out = e.finish().expect("a far conditional branch relaxes then veneers");
+        let first = u16::from_le_bytes([out.bytes[0], out.bytes[1]]);
+        assert_eq!(first & 0xF000, 0xD000, "a 16-bit conditional branch");
+        assert_eq!(
+            (first >> 8) & 0xF,
+            u16::from(Cond::Ne.encoding()),
+            "the condition is inverted so the NOT-taken path skips"
+        );
+        let skip = 4 + 2 * i32::from(first & 0xFF);
+        assert!(
+            skip > 4,
+            "the skip clears the veneer body, not just the original halfword pair (landed at {skip})"
+        );
+        assert_eq!(
+            u16::from_le_bytes([out.bytes[2], out.bytes[3]]),
+            0xB081,
+            "the inner branch veneered rather than staying a 16-bit B"
+        );
     }
 
     #[test]

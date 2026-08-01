@@ -1,6 +1,6 @@
 //! The clean, first-class Lamella Python UART layer -- and the per-chip facts behind it.
 
-use crate::tables::{uart_esp32c6, uart_rp2040, uart_rp2350};
+use crate::tables::{uart_esp32c6, uart_rp2040, uart_rp2350, uart_samd21};
 use alloc::vec::Vec;
 
 /// Method ids for the `uart` module object (dispatched in `ObjectModel::call_uart_method`).
@@ -123,12 +123,18 @@ pub(crate) enum UartStatus {
     /// FLAG bits only (PL011 style): an rx-empty bit, no count -- `any()` honestly reports
     /// 0 or 1 ("at least one byte is immediately readable"), matching what the silicon can say.
     Flags { flags: u32, rx_empty_mask: u32 },
+    /// FLAG bits where a SET bit means READY (SAMD21 SERCOM style): one INTFLAG register carries both
+    /// TX-ready (DRE) and RX-ready (RXC). `any()` reports readable = the rx-ready bit is set -- the
+    /// OPPOSITE polarity to `Flags`'s rx-empty bit.
+    FlagsReady { flags: u32, tx_ready_mask: u32, rx_ready_mask: u32 },
 }
 
 /// A config-rejected-by-this-chip reason (validation the generic layer cannot do).
 pub(crate) enum UartConfigError {
     /// The divisor cannot express the requested baudrate.
     BaudOutOfRange,
+    /// A data-bits / parity / stop-bits combination this chip's driver does not program.
+    ParityNotTabled,
 }
 
 /// The per-instance registers every per-op path needs (FIFO push/pop, the status shape), plus
@@ -155,7 +161,8 @@ impl crate::gpio::Board {
         match self {
             crate::gpio::Board::Esp32c6
             | crate::gpio::Board::Rp2040
-            | crate::gpio::Board::Rp2350 => match name {
+            | crate::gpio::Board::Rp2350
+            | crate::gpio::Board::Samd21Xpro => match name {
                 "UART0" => Some(0),
                 _ => None,
             },
@@ -165,11 +172,21 @@ impl crate::gpio::Board {
 
     /// The per-op register facts for `instance`, or `None` when this board has no UART arm (or
     /// no such instance).
-    pub(crate) fn uart_facts(self, instance: u32) -> Option<UartFacts> {
+    ///
+    /// `resolved` carries the board-resolved register facts for the families whose values come
+    /// from the generated board module rather than a table here; it is `Some` from the moment that
+    /// instance is opened, and those families report no facts before then -- there is no fallback
+    /// set of addresses to report, which is the point.
+    pub(crate) fn uart_facts(
+        self,
+        instance: u32,
+        resolved: Option<&uart_samd21::Samd21UartFacts>,
+    ) -> Option<UartFacts> {
         match self {
             crate::gpio::Board::Esp32c6 if instance == 0 => Some(uart_esp32c6::facts()),
             crate::gpio::Board::Rp2040 if instance == 0 => Some(uart_rp2040::facts()),
             crate::gpio::Board::Rp2350 if instance == 0 => Some(uart_rp2350::facts()),
+            crate::gpio::Board::Samd21Xpro if instance == 0 => resolved.map(uart_samd21::facts),
             _ => None,
         }
     }
@@ -181,21 +198,33 @@ impl crate::gpio::Board {
         self,
         instance: u32,
         config: &UartConfig,
+        resolved: Option<&uart_samd21::Samd21UartFacts>,
     ) -> Option<Result<Vec<UartOp>, UartConfigError>> {
         match self {
             crate::gpio::Board::Esp32c6 if instance == 0 => Some(uart_esp32c6::open_ops(config)),
             crate::gpio::Board::Rp2040 if instance == 0 => Some(uart_rp2040::open_ops(config)),
             crate::gpio::Board::Rp2350 if instance == 0 => Some(uart_rp2350::open_ops(config)),
+            crate::gpio::Board::Samd21Xpro if instance == 0 => {
+                resolved.map(|facts| uart_samd21::open_ops(facts, config))
+            }
             _ => None,
         }
     }
 
     /// The per-byte transmit sequence (FIFO-room poll + the push).
-    pub(crate) fn uart_tx_byte_ops(self, instance: u32, byte: u8) -> Vec<UartOp> {
+    pub(crate) fn uart_tx_byte_ops(
+        self,
+        instance: u32,
+        byte: u8,
+        resolved: Option<&uart_samd21::Samd21UartFacts>,
+    ) -> Vec<UartOp> {
         match self {
             crate::gpio::Board::Esp32c6 if instance == 0 => uart_esp32c6::tx_byte_ops(byte),
             crate::gpio::Board::Rp2040 if instance == 0 => uart_rp2040::tx_byte_ops(byte),
             crate::gpio::Board::Rp2350 if instance == 0 => uart_rp2350::tx_byte_ops(byte),
+            crate::gpio::Board::Samd21Xpro if instance == 0 => resolved
+                .map(|facts| uart_samd21::tx_byte_ops(facts, byte))
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -213,11 +242,18 @@ impl crate::gpio::Board {
     }
 
     /// The transmit-drained poll (`flush`).
-    pub(crate) fn uart_flush_ops(self, instance: u32) -> Vec<UartOp> {
+    pub(crate) fn uart_flush_ops(
+        self,
+        instance: u32,
+        resolved: Option<&uart_samd21::Samd21UartFacts>,
+    ) -> Vec<UartOp> {
         match self {
             crate::gpio::Board::Esp32c6 if instance == 0 => uart_esp32c6::flush_ops(),
             crate::gpio::Board::Rp2040 if instance == 0 => uart_rp2040::flush_ops(),
             crate::gpio::Board::Rp2350 if instance == 0 => uart_rp2350::flush_ops(),
+            crate::gpio::Board::Samd21Xpro if instance == 0 => resolved
+                .map(uart_samd21::flush_ops)
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }

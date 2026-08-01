@@ -1766,15 +1766,25 @@ impl Parser {
     fn parse_classdef(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwClass, "'class'")?;
         let name = self.expect_name()?;
+        let mut keywords: Vec<(String, Expr)> = Vec::new();
         let bases = if self.eat(&Tok::LParen) {
             let mut bases = Vec::new();
             while !self.at(&Tok::RParen) {
-                if matches!(self.peek(), Tok::Name(_)) && matches!(self.peek2(), Tok::Assign) {
-                    return Err(
-                        self.error("a keyword class argument (e.g. `metaclass=`) is out of the subset")
-                    );
+                if let (Tok::Name(kw), Tok::Assign) = (self.peek().clone(), self.peek2()) {
+                    if kw == "metaclass" {
+                        return Err(self.error("`metaclass=` is out of the subset"));
+                    }
+                    self.advance();
+                    self.advance();
+                    keywords.push((kw, self.parse_expr()?));
+                } else {
+                    if !keywords.is_empty() {
+                        return Err(
+                            self.error("a base class cannot follow a keyword argument in a class header")
+                        );
+                    }
+                    bases.push(self.parse_expr()?);
                 }
-                bases.push(self.parse_expr()?);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -1800,7 +1810,12 @@ impl Parser {
                 ));
             }
         }
-        Ok(Stmt::ClassDef { name, bases, body })
+        Ok(Stmt::ClassDef {
+            name,
+            bases,
+            keywords,
+            body,
+        })
     }
 
     /// Only `range(stop)`, `range(start, stop)`, or `range(start, stop, step)` are
@@ -4112,7 +4127,7 @@ mod tests {
     #[test]
     fn class_def_parses() {
         let m = parse_ok("class C(Base):\n    k = 1\n    def m(self):\n        return self.k\n");
-        let Stmt::ClassDef { name, bases, body } = &m.body[0] else {
+        let Stmt::ClassDef { name, bases, body, .. } = &m.body[0] else {
             panic!("expected a class def");
         };
         assert_eq!(name, "C");
@@ -4706,6 +4721,7 @@ else:
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn float_literals_and_true_division_parse() {
         let m = parse_ok("x = 3.14\n");
         let Stmt::Assign(a) = &m.body[0] else {

@@ -95,6 +95,18 @@ pub(crate) fn descriptor_symbol(handle: u32, qualifiers: &DescQualifiers) -> Str
     }
 }
 
+/// A type's namespace-qualified name: `Ns.Name`, or the bare name when the namespace is empty.
+///
+/// This is the text .NET's `Object.ToString()` produces -- it returns `GetType().ToString()`, which is
+/// the FULL name -- so a global-namespace `Square` renders as `Square` and not as `.Square`.
+pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::boxed::Box<str> {
+    if namespace.is_empty() {
+        alloc::boxed::Box::from(name)
+    } else {
+        alloc::format!("{namespace}.{name}").into_boxed_str()
+    }
+}
+
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
 pub struct MetadataResolver<'a> {
     assembly: &'a Assembly<'a>,
@@ -363,6 +375,25 @@ impl<'a> MetadataResolver<'a> {
         result
     }
 
+    /// The slot index at which `type_def`'s vtable carries the PARAMETERLESS virtual method `name` --
+    /// the index a `callvirt` of it dispatches through on a receiver of this type.
+    ///
+    /// It answers through [`vtable_methods`](Self::vtable_methods), the same walk
+    /// [`vtables`](Self::vtables) builds the EMITTED table from, so the index cannot disagree with the
+    /// table it indexes. That is the whole point of asking here rather than counting slots at the call
+    /// site: a synthesized body placed at a hardcoded index is a wrong method dispatched under a right
+    /// name, and nothing downstream can tell.
+    ///
+    /// The key is NAME plus the empty parameter list, which is what distinguishes `ToString()` from an
+    /// overload of it. `None` when the type has no such slot (it inherits no virtuals -- e.g. an enum
+    /// built with no corlib attached, whose base `System.Enum` cannot be resolved).
+    #[must_use]
+    pub fn nullary_vtable_slot(&self, type_def: TypeDef<'a>, name: &str) -> Option<usize> {
+        self.vtable_methods(type_def)
+            .iter()
+            .position(|slot| slot.name == Some(name) && slot.key.is_empty())
+    }
+
     /// Every this-module type's `type_tag` for the TypeDesc the AOT emits: `exception_tag_for_name`
     /// of its full name (the shared FNV-1a32 scheme, so an exception type's `type_tag` EQUALS its
     /// exception tag -- one tag space for all types). The interpreter computes the same from metadata,
@@ -419,6 +450,17 @@ impl<'a> MetadataResolver<'a> {
                 Some((TypeHandle(type_def.token().0), w.into_boxed_slice()))
             })
             .collect();
+        let names: Vec<(TypeHandle, alloc::boxed::Box<str>)> = self
+            .assembly
+            .type_defs()
+            .filter_map(|type_def| {
+                let name = self.assembly.type_token_name(type_def.token())?;
+                Some((
+                    TypeHandle(type_def.token().0),
+                    qualified_type_name(name.namespace, name.name),
+                ))
+            })
+            .collect();
         self.type_tags()
             .into_iter()
             .map(|(handle, type_tag)| {
@@ -448,6 +490,10 @@ impl<'a> MetadataResolver<'a> {
                         .assembly
                         .type_def(handle.0 & 0x00ff_ffff)
                         .is_some_and(|type_def| type_def.is_public() || type_def.is_nested()),
+                    full_name: names
+                        .iter()
+                        .find(|(h, _)| *h == handle)
+                        .map(|(_, n)| n.clone()),
                 }
             })
             .collect()
@@ -546,6 +592,7 @@ impl<'a> MetadataResolver<'a> {
         Some(TypeMeta {
             handle,
             type_tag: exception_tag_for_name(name.namespace, name.name),
+            full_name: Some(qualified_type_name(name.namespace, name.name)),
             vtable,
             itable: self.reference_itable(reference, type_def),
             base,
@@ -770,13 +817,21 @@ impl<'a> MetadataResolver<'a> {
             let impls = self.vtable_methods(type_def);
             let mut entries: Vec<(u32, VtableEntry)> = Vec::new();
             for iface_token in self.interface_closure(type_def) {
-                if iface_token.table() != table::TYPE_DEF {
-                    continue;
-                }
-                let Some(iface) = self.assembly.type_def(iface_token.row()) else {
+                let Some((iface_assembly, iface)) = (match iface_token.table() {
+                    table::TYPE_DEF => self
+                        .assembly
+                        .type_def(iface_token.row())
+                        .map(|td| (self.assembly, td)),
+                    table::TYPE_REF => self
+                        .assembly
+                        .type_token_name(iface_token)
+                        .and_then(|n| self.find_reference_type(n.namespace, n.name))
+                        .map(|(_, owner, td)| (owner, td)),
+                    _ => None,
+                }) else {
                     continue;
                 };
-                let Some(iface_name) = self.assembly.type_token_name(iface.token()) else {
+                let Some(iface_name) = iface_assembly.type_token_name(iface.token()) else {
                     continue;
                 };
                 for method in iface.methods() {
@@ -786,7 +841,7 @@ impl<'a> MetadataResolver<'a> {
                         .map(|sig| sig.parameters)
                         .unwrap_or_default();
                     let tag = interface_method_tag(&iface_name, name, &params);
-                    let key = param_key(self.assembly, &params);
+                    let key = param_key(iface_assembly, &params);
                     let Some(slot) = impls
                         .iter()
                         .find(|slot| slot.name == Some(name) && slot.key == key)
@@ -1150,6 +1205,15 @@ pub struct TypeMeta {
     /// [`words`](Self::words) here, for the emitter to lay locally when something in THIS build
     /// reaches it.
     pub exported: bool,
+    /// The type's namespace-qualified name -- `Ns.Outer` for a namespaced type, the bare name for one
+    /// in the global namespace -- which is what `Object.ToString()` answers with and what the
+    /// descriptor's NAME word points at. `None` for a handle no metadata row names (a synthetic array
+    /// handle, a minimal stand-in), whose descriptor then carries a name word of 0.
+    ///
+    /// It rides here, beside the vtable and itable, because it is per-TYPE data every object-emitting
+    /// backend already receives -- the alternative, a parallel table threaded to each `lower_object_*`
+    /// entry point, is a second source keyed by the same handle.
+    pub full_name: Option<alloc::boxed::Box<str>>,
 }
 
 impl<'a> MetadataResolver<'a> {
@@ -1724,8 +1788,8 @@ impl CallResolver for MetadataResolver<'_> {
         match token.table() {
             table::FIELD => static_field_slots(self.assembly)
                 .into_iter()
-                .find(|(row, _)| *row == token.row())
-                .map(|(_, slot)| (StaticOwner::Own, slot * 4)),
+                .find(|(row, _, _)| *row == token.row())
+                .map(|(_, slot, _)| (StaticOwner::Own, slot * 4)),
             table::MEMBER_REF => {
                 let member = self.assembly.member_ref(token.row())?;
                 if !member.is_field() {
@@ -1742,8 +1806,8 @@ impl CallResolver for MetadataResolver<'_> {
                     .row();
                 let slot = static_field_slots(owner)
                     .into_iter()
-                    .find(|(row, _)| *row == field_row)
-                    .map(|(_, slot)| slot)?;
+                    .find(|(row, _, _)| *row == field_row)
+                    .map(|(_, slot, _)| slot)?;
                 Some((StaticOwner::Reference(u8::try_from(ordinal).ok()?), slot * 4))
             }
             _ => None,
@@ -1840,6 +1904,25 @@ impl CallResolver for MetadataResolver<'_> {
             }
         }
         tags
+    }
+
+    fn catch_binding_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let target = self.type_token_of(*token)?;
+        if !self.is_exception_type(target) {
+            return None;
+        }
+        if target.table() == table::TYPE_DEF {
+            let type_def = self.assembly.type_def(target.row())?;
+            return self.reference_layout_of(self.assembly, type_def);
+        }
+        let name = self.assembly.type_token_name(target)?;
+        let (ordinal, reference, type_def) = self.find_reference_type(name.namespace, name.name)?;
+        let mut layout = self.reference_layout_of(reference, type_def)?;
+        layout.handle = reference_handle(ordinal, type_def.token().0);
+        Some(layout)
     }
 
     fn cast_subtype_handles(&self, operand: &Operand) -> Vec<TypeHandle> {
@@ -2083,6 +2166,46 @@ impl CallResolver for MetadataResolver<'_> {
             _ => None,
         }
     }
+
+    fn constrained_call(&self, constrained: &Operand, method: &Operand) -> Option<CallInfo> {
+        let (Operand::Token(type_token), Operand::Token(method_token)) = (constrained, method)
+        else {
+            return None;
+        };
+        if type_token.table() != table::TYPE_DEF {
+            return None;
+        }
+        let type_def = self.assembly.type_def(type_token.row())?;
+        let target = self.assembly.resolve_method(*method_token)?;
+        let name = target.name?;
+        let signature = target.signature.as_ref()?;
+        let key = param_key(self.assembly, &signature.parameters);
+        let own = type_def.methods().find(|m| {
+            m.is_virtual()
+                && m.name() == Some(name)
+                && param_key(
+                    self.assembly,
+                    &m.signature().map(|sig| sig.parameters).unwrap_or_default(),
+                ) == key
+        })?;
+        let has_result = !matches!(signature.return_type, SigType::Void);
+        Some(CallInfo {
+            args: signature.parameters.len() + 1,
+            has_result,
+            result_type: has_result
+                .then(|| {
+                    mir_type(
+                        &signature.return_type,
+                        self.assembly,
+                        &TargetLayout::ilp32(),
+                    )
+                })
+                .flatten(),
+            target: CallTarget::Internal(
+                self.function_index(own.rid()).unwrap_or_else(|| own.rid()),
+            ),
+        })
+    }
 }
 
 /// The byte width and signedness of a primitive 2-D array element (a sub-word `Get` sign- or
@@ -2116,6 +2239,7 @@ fn mir_type(sig: &SigType, assembly: &Assembly, target: &TargetLayout) -> Option
         SigType::R4 => MirType::F32,
         SigType::R8 => MirType::F64,
         SigType::IntPtr | SigType::UIntPtr => MirType::NativeInt,
+        SigType::Pointer(_) => MirType::NativeInt,
         SigType::Class(_) | SigType::Object | SigType::String => MirType::ObjectRef,
         SigType::SzArray(_) | SigType::Array { .. } => MirType::ObjectRef,
         SigType::ValueType(token) => match enum_underlying(assembly, *token, &[], target) {
@@ -2137,21 +2261,58 @@ fn mir_type(sig: &SigType, assembly: &Assembly, target: &TargetLayout) -> Option
 /// `ldsfld` naming one fails the offset lookup LOUD rather than reading a phantom slot. This is
 /// the ONE source for both the `ldsfld`/`stsfld` lowering ([`CallResolver::static_field_offset`])
 /// and the mode-2 statics stack-map record (`build::assembly_statics`) -- the two must never
-/// drift, or the collector walks the wrong words. Each slot is 4 bytes; a wider static (i64/f64/
-/// struct) still gets ONE slot because the lowering moves one word (a pre-existing truncation,
-/// unchanged by the dense layout -- widening slots buys nothing until the lowering moves more).
-pub(crate) fn static_field_slots(assembly: &Assembly) -> Vec<(u32, u32)> {
+/// drift, or the collector walks the wrong words. Each entry carries its WIDTH IN WORDS: an
+/// `int64`/`double` static reserves TWO, everything else one.
+///
+/// The width predicate is [`mir_type`] -- the SAME function [`CallResolver::field_type`] types the
+/// `ldsfld`/`stsfld` value with -- so the reservation and the lowering cannot disagree about which
+/// static is 64-bit. That matters in three directions, and each is safe:
+/// * an OWN-assembly static reads the same signature blob through the same function, so the two
+///   answers are identical by construction (this covers an enum with a `long` underlying type,
+///   which `mir_type` folds to `I64` for both);
+/// * a CROSS-assembly `long`/`double` encodes as the same primitive in the MemberRef blob, so the
+///   two agree there too;
+/// * a CROSS-assembly ENUM static resolves in the owner but not through the referencing
+///   assembly's TypeRef, where `field_type` already answers `None` and the lowering refuses LOUD --
+///   so the owner reserving two words leaves a HOLE, never an overlap.
+///
+/// A struct-typed static still gets ONE word and its lowering still moves one: that truncation is
+/// unchanged here and wants the multi-word static copy the two backends do not emit yet.
+///
+/// Slot 0 (region offset 0) is RESERVED, because offset 0 is the MIR-level EH-tag marker
+/// (`cil::G_EXCEPTION_TAG_OFFSET`) and a field slot there would alias every throw/catch.
+pub(crate) fn static_field_slots(assembly: &Assembly) -> Vec<(u32, u32, u32)> {
     let mut slots = Vec::new();
     let mut next = 1u32;
     for type_def in assembly.type_defs() {
         for field in type_def.fields() {
             if field.is_static() && !field.is_literal() {
-                slots.push((field.token().row(), next));
-                next += 1;
+                let words = match field
+                    .signature()
+                    .and_then(|sig| mir_type(&sig, assembly, &TargetLayout::ilp32()))
+                {
+                    Some(MirType::I64 | MirType::F64) => 2,
+                    _ => 1,
+                };
+                slots.push((field.token().row(), next, words));
+                next += words;
             }
         }
     }
     slots
+}
+
+/// The word count one assembly's static region spans, INCLUDING the reserved word 0 -- the one
+/// derivation of its size, so a region and the offsets written into it come from the same walk.
+/// Gated with its only caller (`build::assembly_statics`): the WASM path places its statics at a
+/// fixed base and emits no region record, so a wasm-only build would carry this unused.
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+pub(crate) fn static_region_words(assembly: &Assembly) -> u32 {
+    static_field_slots(assembly)
+        .iter()
+        .map(|(_, slot, words)| slot + words)
+        .max()
+        .unwrap_or(1)
 }
 
 /// A type's dotted full name (`namespace.name`, or just `name` in the global namespace) -- what a
@@ -2300,8 +2461,23 @@ pub(crate) fn enum_underlying<'x>(
 ///
 /// Errors if a method has no CIL body, or if a body cannot be lowered.
 pub fn lower_methods(assembly: &Assembly, methods: &[Method]) -> Result<Vec<Function>, CilError> {
+    lower_methods_with_references(assembly, methods, &[])
+}
+
+/// As [`lower_methods`], but with the REFERENCED assemblies attached -- which is what the object
+/// build does, and therefore what a diagnostic must do to reproduce the build's typing.
+///
+/// Without them the resolver types a program as though corlib did not exist, so a cross-assembly
+/// `ValueType`/enum resolves differently and a whole family of type answers changes. That makes the
+/// reference-less form capable of FINDING a verifier error and incapable of certifying one is
+/// absent -- which is a distinction a tool built to explain refusals has to get right.
+pub fn lower_methods_with_references<'a>(
+    assembly: &'a Assembly<'a>,
+    methods: &[Method<'a>],
+    references: &[&'a Assembly<'a>],
+) -> Result<Vec<Function>, CilError> {
     let rids: Vec<u32> = methods.iter().map(Method::rid).collect();
-    let resolver = MetadataResolver::for_module(assembly, &rids);
+    let resolver = MetadataResolver::for_module(assembly, &rids).with_references(references);
     let target = TargetLayout::ilp32();
     methods
         .iter()

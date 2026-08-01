@@ -480,7 +480,8 @@ impl Vm {
     }
 
     /// The current monotonic millisecond count, if a clock seam is set.
-    fn now_millis(&self) -> Option<u64> {
+    #[must_use]
+    pub fn now_millis(&self) -> Option<u64> {
         self.now_millis_fn.map(|now| now())
     }
 
@@ -1018,6 +1019,19 @@ impl Vm {
         }
     }
 
+    /// Extends static storage to cover `defaults`, seeding ONLY the slots that did not exist
+    /// before and leaving every existing value untouched.
+    ///
+    /// [`Vm::init_statics`] replaces the whole vector when it grows, which is right for sizing a
+    /// fresh VM and wrong for a module that gains static fields while the VM is live -- an
+    /// incremental session materializing a corlib member gains storage the running VM has not got,
+    /// and a `stsfld` into a slot past the end is silently dropped.
+    pub fn grow_statics(&mut self, defaults: &[Value]) {
+        if defaults.len() > self.statics.len() {
+            self.statics.extend_from_slice(&defaults[self.statics.len()..]);
+        }
+    }
+
     /// The not-yet-run `.cctor` of `type_id`, marking it run (II.10.5.3 lazy
     /// initialization). `None` if the type has no cctor or it already ran in this VM.
     /// Marking happens HERE -- before the caller pushes the cctor's frame -- so a
@@ -1040,6 +1054,21 @@ impl Vm {
                 self.cctors_run.insert(type_id);
             }
         }
+    }
+
+    /// Whether every `.cctor` in `module`'s eager list has been marked run in this VM.
+    ///
+    /// The exact dual of [`Vm::mark_all_cctors_run`]: it reads what that writes, by the same
+    /// lookup, so a module the marker has been run over always reports `true`. A cctor whose
+    /// declaring type does not resolve counts as marked, because the marker skips it too --
+    /// the pair cannot disagree, and no correctly-booted module can be refused by mistake.
+    #[must_use]
+    pub fn all_cctors_run(&self, module: &Module) -> bool {
+        module.static_ctors().iter().all(|&cctor| {
+            module
+                .method_type(cctor)
+                .is_none_or(|type_id| self.cctors_run.contains(&type_id))
+        })
     }
 
     /// The value of static field `slot`, if storage holds it.
@@ -1776,6 +1805,9 @@ fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
 enum ThreadStatus {
     Done(Option<Value>),
     Yielded,
+    /// The service callback asked the scheduler to stop -- the embedder is taking the machine back
+    /// (a host `HELLO` reclaiming a board from the app it deployed).
+    Interrupted,
 }
 
 /// Runs `module`'s `entry` (with `args`) to completion, returning its result.
@@ -1798,6 +1830,31 @@ pub fn run(
     run_serviced(module, vm, entry, args, &mut || {})
 }
 
+/// Boots a BAKED module ([`Module::from_baked`]): runs its static constructors in order,
+/// marks them run, and hands `entry` back so the entry point a caller runs is the one that
+/// came out of the boot.
+///
+/// A baked image restores the ordered `.cctor` list but not the lazy-trigger map, so the
+/// II.10.5.3 first-access initialization cannot fire on it. Without this call no static ever
+/// initializes and every `static readonly` reads its zero value -- so [`run`] refuses such a
+/// module instead of running it that way, and this is the call that satisfies it.
+///
+/// Configure the [`Vm`] FIRST -- board seams, console, heap. A static constructor observes
+/// the VM it is booted on, so a seam installed afterwards is not there when it runs.
+///
+/// Harmless on a loaded (non-baked) module, whose cctors would otherwise fire lazily; it
+/// makes their order deterministic rather than first-touch.
+///
+/// # Errors
+/// Propagates a [`Trap`] from any static constructor.
+pub fn boot_baked(module: &Module, vm: &mut Vm, entry: MethodId) -> Result<MethodId, Trap> {
+    vm.mark_all_cctors_run(module);
+    for &cctor in module.static_ctors() {
+        run(module, vm, cctor, Vec::new())?;
+    }
+    Ok(entry)
+}
+
 /// [`run`] plus a `service` callback fired at EVERY scheduler quantum boundary (every
 /// [`TIME_SLICE_QUANTUM`] instructions), single- OR multi-threaded. A device serve passes a
 /// USB-poll closure so a running program's tight loop cannot starve the POLLED Lamella Link: a
@@ -1814,6 +1871,94 @@ pub fn run_serviced(
     args: Vec<Value>,
     service: &mut dyn FnMut(),
 ) -> Result<Option<Value>, Trap> {
+    match run_interruptible(module, vm, entry, args, &mut || {
+        service();
+        true
+    })? {
+        Ran::Finished(value) => Ok(value),
+        Ran::Interrupted => Ok(None),
+    }
+}
+
+/// A thread operation a program raised, in the shape a SINGLE-SESSION driver can act on.
+///
+/// A [`Session`] only ADVANCES instructions. The threading intrinsics do not block: they record a
+/// request on the [`Vm`] for the scheduler to act on, and a driver that steps a session without
+/// asking for that request drops every one of them -- silently, because the program simply carries
+/// on as if the call had returned. That is what a `Thread.Sleep` under the debugger's resume was
+/// doing: not a mis-measured delay, no delay at all.
+///
+/// A single-session driver has no thread set, so it cannot honor everything the scheduler can. This
+/// splits what it CAN do from what it cannot, so the second class is REPORTED rather than dropped:
+/// "this tier cannot start a thread" is a fact a user can act on, and silence is not.
+pub enum PendingOp {
+    /// Nothing was raised.
+    None,
+    /// `Thread.Sleep`: this session must not advance again until this monotonic-millisecond
+    /// deadline, already resolved against the [`Vm`]'s clock.
+    SleepUntil(u64),
+    /// A cooperative yield with nobody to yield to -- carry on.
+    Yield,
+    /// An operation that needs the thread set only the scheduler owns, named for the caller to
+    /// report.
+    NeedsScheduler(&'static str),
+}
+
+/// Take the pending thread operation in single-session form -- see [`PendingOp`].
+///
+/// A `Thread.Sleep` on a machine with no clock seam becomes [`PendingOp::Yield`], which is the same
+/// degradation the scheduler makes (it computes a deadline of 0, immediately wakeable): a board with
+/// no clock cannot wait, and pretending otherwise here would only move where it fails to.
+pub fn take_pending_op(vm: &mut Vm) -> PendingOp {
+    let Some(op) = vm.take_thread_op() else {
+        return PendingOp::None;
+    };
+    match op {
+        ThreadOp::SleepFor(millis) => match vm.now_millis() {
+            Some(now) => PendingOp::SleepUntil(now.saturating_add(millis)),
+            None => PendingOp::Yield,
+        },
+        ThreadOp::Yield => PendingOp::Yield,
+        ThreadOp::WakeThread { .. } => PendingOp::Yield,
+        ThreadOp::Spawn { .. } => PendingOp::NeedsScheduler("Thread.Start"),
+        ThreadOp::Join { .. } => PendingOp::NeedsScheduler("Thread.Join"),
+        ThreadOp::BlockOnLock { .. } => PendingOp::NeedsScheduler("a contended Monitor lock"),
+        ThreadOp::BlockOnIo { .. } => PendingOp::NeedsScheduler("a blocking socket operation"),
+    }
+}
+
+/// How an [`run_interruptible`] run ended.
+pub enum Ran {
+    /// The program ran to completion, with the entry's result.
+    Finished(Option<Value>),
+    /// The service callback asked to stop before the program finished.
+    Interrupted,
+}
+
+/// [`run_serviced`] whose `service` callback can also STOP the run by answering `false`.
+///
+/// It exists because a device that DEPLOYS a program must be able to take it back. The firmware
+/// pumps its carrier in this callback anyway; letting the same call say "stop" is what makes a
+/// deployed run interruptible without the firmware having to drive the interpreter itself -- which
+/// is what it used to do, stepping a bare [`Session`] in bursts, and a bare session runs no
+/// scheduler at all: every thread operation the program raised (`Sleep`, `Start`, `Join`, a
+/// contended `Monitor`) was left on the [`Vm`] and silently dropped.
+///
+/// The callback is also fired around the idle block, so a program that is merely SLEEPING keeps its
+/// carrier pumped and stays reclaimable.
+///
+/// # Errors
+/// Propagates a [`Trap`] from any thread's execution.
+pub fn run_interruptible(
+    module: &Module,
+    vm: &mut Vm,
+    entry: MethodId,
+    args: Vec<Value>,
+    service: &mut dyn FnMut() -> bool,
+) -> Result<Ran, Trap> {
+    if module.is_baked() && !vm.all_cctors_run(module) && !module.static_ctors().contains(&entry) {
+        return Err(Trap::StaticCtorsNotRun);
+    }
     let mut threads = alloc::vec![ThreadSlot {
         id: 0,
         session: Session::new(module, entry, args)?,
@@ -1831,7 +1976,13 @@ pub fn run_serviced(
             break;
         }
         let Some(index) = next_ready_thread(&threads, cursor) else {
+            if !service() {
+                return Ok(Ran::Interrupted);
+            }
             if idle_wait(&mut threads, vm) {
+                if !service() {
+                    return Ok(Ran::Interrupted);
+                }
                 continue;
             }
             break;
@@ -1840,6 +1991,7 @@ pub fn run_serviced(
         vm.set_current_thread(threads[index].id);
         vm.set_live_thread_count(live);
         match threads[index].session.run_until_yield(module, vm, service)? {
+            ThreadStatus::Interrupted => return Ok(Ran::Interrupted),
             ThreadStatus::Done(value) => {
                 let finished = threads[index].id;
                 threads[index].result = Some(value);
@@ -1913,7 +2065,7 @@ pub fn run_serviced(
             collect_all_threads(&mut threads, module, vm);
         }
     }
-    Ok(threads.into_iter().next().and_then(|slot| slot.result).flatten())
+    Ok(Ran::Finished(threads.into_iter().next().and_then(|slot| slot.result).flatten()))
 }
 
 /// A steppable, inspectable execution: the foundation the debugger drives.
@@ -2192,7 +2344,7 @@ impl Session {
         &mut self,
         module: &Module,
         vm: &mut Vm,
-        service: &mut dyn FnMut(),
+        service: &mut dyn FnMut() -> bool,
     ) -> Result<ThreadStatus, Trap> {
         let mut quantum = TIME_SLICE_QUANTUM;
         loop {
@@ -2205,7 +2357,9 @@ impl Session {
             }
             quantum -= 1;
             if quantum == 0 {
-                service();
+                if !service() {
+                    return Ok(ThreadStatus::Interrupted);
+                }
                 if vm.live_thread_count() > 1 {
                     return Ok(ThreadStatus::Yielded);
                 }
@@ -2864,10 +3018,13 @@ impl Session {
                 Ok(Status::Running)
             }
             Flow::InitObj { location, kind } => {
-                let value = match module
+                let defaults = module
                     .type_id_of(asm, kind)
-                    .and_then(|type_id| module.type_field_defaults(type_id))
-                {
+                    .and_then(|type_id| module.type_field_defaults(type_id));
+                let value = match defaults {
+                    Some(defaults) if module.is_enum_by_handle(asm_key(asm, kind.0)) => {
+                        defaults.into_iter().next().unwrap_or(Value::Int32(0))
+                    }
                     Some(defaults) => Value::Struct(defaults.into_boxed_slice()),
                     None => Value::Int32(0),
                 };
@@ -8083,6 +8240,132 @@ mod tests {
         assert_eq!(
             super::run(&module, &mut Vm::new(), main, Vec::new()),
             Ok(Some(Value::Int32(2)))
+        );
+    }
+
+    /// `static readonly int Answer = 7;` in the shape the interpreter runs it: a `.cctor` that
+    /// writes the field and an entry that reads it. 7 rather than 0 is the whole point -- an
+    /// uninitialized static reads its ZERO value, so a program that returns 0 has not failed,
+    /// it has answered wrongly.
+    fn static_readonly_program() -> (Module, MethodId) {
+        let field = Token(0x0400_0011);
+        let mut module = Module::new();
+        let holder = module.add_type(Vec::new());
+        module.bind_static_field(0, field, Value::Int32(0));
+        module.bind_static_slot_range(0, 1, holder);
+
+        let cctor = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(7)),
+                Instruction::new(Opcode::Stsfld, Operand::Token(field)),
+                ret(),
+            ]),
+            0,
+        );
+        module.set_method_type(cctor, holder);
+        module.add_static_ctor(cctor);
+
+        let main = module.add_method_image(
+            0,
+            method(vec![Instruction::new(Opcode::Ldsfld, Operand::Token(field)), ret()]),
+            0,
+        );
+        (module, main)
+    }
+
+    /// The same program with a `.cctor` that INCREMENTS rather than assigns, so running it twice
+    /// is visible. `static_readonly_program` cannot see that: assigning 7 twice still reads 7.
+    fn counting_cctor_program() -> (Module, MethodId) {
+        let field = Token(0x0400_0012);
+        let mut module = Module::new();
+        let holder = module.add_type(Vec::new());
+        module.bind_static_field(0, field, Value::Int32(0));
+        module.bind_static_slot_range(0, 1, holder);
+
+        let cctor = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Ldsfld, Operand::Token(field)),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Add),
+                Instruction::new(Opcode::Stsfld, Operand::Token(field)),
+                ret(),
+            ]),
+            0,
+        );
+        module.set_method_type(cctor, holder);
+        module.add_static_ctor(cctor);
+
+        let main = module.add_method_image(
+            0,
+            method(vec![Instruction::new(Opcode::Ldsfld, Operand::Token(field)), ret()]),
+            0,
+        );
+        (module, main)
+    }
+
+    /// The eager boot and the lazy trigger are two routes to one initialization, and a module
+    /// must not take both: II.10.5.3 runs a type's constructor ONCE. A constructor with a side
+    /// effect -- a counter, a device register write, a queued allocation -- is where a second
+    /// run stops being invisible.
+    #[test]
+    fn booting_a_loaded_module_runs_each_constructor_exactly_once() {
+        let (module, main) = counting_cctor_program();
+        let mut vm = Vm::new();
+        let main = super::boot_baked(&module, &mut vm, main).expect("the cctors boot");
+        assert_eq!(
+            super::run(&module, &mut vm, main, Vec::new()),
+            Ok(Some(Value::Int32(1))),
+            "2 means the eager boot ALSO fired the lazy trigger and the cctor ran twice"
+        );
+    }
+
+    /// THE CONTROL, and it is what makes the refusal next door legitimate rather than blanket:
+    /// on a LOADED module -- the normal host mode -- the lazy trigger of II.10.5.3 still fires
+    /// on first static access, so nothing has to be booted eagerly and nothing is refused.
+    #[test]
+    fn a_loaded_module_initializes_its_statics_lazily_and_is_never_refused() {
+        let (module, main) = static_readonly_program();
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Int32(7))),
+            "the lazy path is untouched: no eager boot, and the static still holds 7"
+        );
+    }
+
+    /// THE DEFECT, STATED AS A TEST. A baked image restores the ordered `.cctor` list but NOT
+    /// the lazy-trigger map, so on a baked module the trigger above can never fire: without an
+    /// eager boot the entry reads 0 and reports success. No other test in the tree can express
+    /// this -- every one either boots eagerly or runs unbaked, so all of them return the right
+    /// answer for a program that fails on a device.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_baked_image_refuses_to_run_before_its_static_constructors() {
+        let (mut module, main) = static_readonly_program();
+        let image = module.write_baked(Some(main)).expect("bake");
+        let image: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, entry) = Module::from_baked(image).expect("boot");
+        let entry = entry.expect("the image records its entry point");
+
+        assert!(baked.is_baked(), "a module out of from_baked is baked");
+        assert!(
+            baked.cctor_of_type(0).is_none(),
+            "the lazy trigger map is NOT restored -- the mechanism the refusal exists for"
+        );
+
+        assert_eq!(
+            super::run(&baked, &mut Vm::new(), entry, Vec::new()),
+            Err(Trap::StaticCtorsNotRun),
+            "a baked module refuses its entry point until its cctors have run"
+        );
+
+        let mut vm = Vm::new();
+        let entry = super::boot_baked(&baked, &mut vm, entry).expect("the cctors boot");
+        assert_eq!(
+            super::run(&baked, &mut vm, entry, Vec::new()),
+            Ok(Some(Value::Int32(7))),
+            "after boot_baked the static holds what its constructor wrote"
         );
     }
 

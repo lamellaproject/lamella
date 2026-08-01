@@ -929,16 +929,17 @@ fn emit_call(
     let is_base_call = matches!(receiver, Some(r) if matches!(r.kind, BoundExprKind::Base));
     let inherited_value_call =
         matches!(value_type_receiver, Some(ty) if !same_type(&method.declaring_type, ty));
+    let mut constrained_token = None;
     if !method.is_static {
         match &callee.kind {
             BoundExprKind::MethodGroup { receiver, .. } => {
                 if inherited_value_call {
-                    emit_expression(receiver, frame, tokens, out)?;
-                    let box_token =
-                        tokens.type_token(&receiver.ty).ok_or(EmitError::Unsupported(
+                    emit_value_type_receiver(receiver, frame, tokens, out)?;
+                    constrained_token = Some(tokens.type_token(&receiver.ty).ok_or(
+                        EmitError::Unsupported(
                             "a virtual call on a value type with no metadata token",
-                        ))?;
-                    out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
+                        ),
+                    )?);
                 } else if value_type_receiver.is_some() {
                     emit_value_type_receiver(receiver, frame, tokens, out)?;
                 } else {
@@ -980,6 +981,12 @@ fn emit_call(
     } else {
         Opcode::Callvirt
     };
+    if let Some(constrained) = constrained_token {
+        out.push(Instruction::new(
+            Opcode::Constrained,
+            Operand::Token(constrained),
+        ));
+    }
     out.push(Instruction::new(opcode, Operand::Token(token)));
     Ok(())
 }

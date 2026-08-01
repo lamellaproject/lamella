@@ -65,6 +65,11 @@ pub enum Trap {
     OutOfMemory,
     /// An exception propagated out of the entry method with no matching handler.
     UnhandledException,
+    /// A BAKED module's entry point was run before its static constructors. A baked image
+    /// carries the ordered `.cctor` list but not the lazy-trigger map a loaded module uses,
+    /// so no static would ever initialize on first access and every `static readonly` would
+    /// read its zero value. Boot the module with [`crate::boot_baked`] first.
+    StaticCtorsNotRun,
     /// A `System.String` could not be constructed because the build's string storage cannot
     /// hold one of its code units -- a lone surrogate on the well-formed UTF-8 tier (the
     /// `System.Text.EncoderFallbackException` site). Carries the offending unit and its
@@ -127,6 +132,9 @@ impl fmt::Display for Trap {
             Trap::CallStackOverflow => f.write_str("call stack overflow"),
             Trap::OutOfMemory => f.write_str("out of memory"),
             Trap::UnhandledException => f.write_str("unhandled exception"),
+            Trap::StaticCtorsNotRun => {
+                f.write_str("baked module run before its static constructors")
+            }
             Trap::EncoderFallback {
                 char_unknown,
                 index,

@@ -116,6 +116,17 @@ pub enum ConvKind {
     /// Reinterpret an `ObjectRef` as an `int32` -- the inverse no-op of [`ConvKind::IntToRef`], so a
     /// reference can enter integer (bitmask) arithmetic. `isinst` masks the object pointer this way.
     RefToInt,
+    /// Produce a NATIVE INT from any one-word value -- `conv.i`/`conv.u`, and the implicit
+    /// conversion when a reference or byref is assigned to an unmanaged pointer.
+    ///
+    /// A no-op at the machine level on a 32-bit target, but NOT at the type level, and the type is
+    /// the whole content: from a reference or managed pointer this is the instruction at which the
+    /// collector stops tracking the word. It exists apart from [`ConvKind::RefToInt`] because that
+    /// one yields `int32` for bitmask arithmetic, whereas a pointer is a `NativeInt`.
+    ///
+    /// On a 64-bit target the two sources part company -- a reference would still be a move while an
+    /// `int32` would need extending -- so a port must split this, not widen it.
+    ToNativeInt,
 }
 
 impl ConvKind {
@@ -133,6 +144,7 @@ impl ConvKind {
             | ConvKind::UIntToFloat64
             | ConvKind::ULongToFloat64 => MirType::F64,
             ConvKind::IntToRef => MirType::ObjectRef,
+            ConvKind::ToNativeInt => MirType::NativeInt,
             ConvKind::SignExtend8
             | ConvKind::ZeroExtend8
             | ConvKind::SignExtend16
@@ -448,6 +460,26 @@ pub enum Inst {
         /// The sought interface-method tag, derived from the interface's name and one of its methods --
         /// the same derivation [`Inst::CallInterface`] uses, so the two agree by construction.
         tag: u32,
+    },
+    /// The TYPE NAME string of `descriptor`'s type, as a `System.String` reference -- what
+    /// `Object.ToString()` returns for a type that does not override it. 0 (null) when the build laid
+    /// no name for that type, which is every build with the name knob off.
+    ///
+    /// Reads the NAME word the descriptor carries after its itable, at
+    /// `desc + 16 + nrefs * 4 + 4 + 8 * itable_count` -- the same arithmetic
+    /// [`Inst::CallInterface`] already does to find the itable, plus one step past it. Nothing in the
+    /// descriptor moves to make room, which is why an existing consumer is unaffected.
+    ///
+    /// THE NAME TRAVELS WITH THE TYPE, and that is the whole reason it lives in the descriptor rather
+    /// than in a per-assembly table. `Object.ToString()` is answered for the receiver's RUNTIME type,
+    /// which routinely comes from another assembly; a cascade over the compiling assembly's types --
+    /// the shape a `castclass` uses -- structurally cannot answer for a type it never saw. This is the
+    /// same argument that made [`Inst::InterfaceHasTag`] read the itable instead of comparing against
+    /// every implementer.
+    TypeName {
+        /// The object's TypeDesc address (from [`Inst::LoadTypeDesc`]; 0 for a null reference, which
+        /// answers null rather than dereferencing).
+        descriptor: ValueId,
     },
     /// A dynamic-object operation from Python's abstract object protocol -- the `op`-selected
     /// operation over `args` (receiver-first). Lowers to a call into the Python runtime-support

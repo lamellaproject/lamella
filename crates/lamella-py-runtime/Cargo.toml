@@ -8,8 +8,10 @@ authors.workspace = true
 description = "Lamella's Python runtime: the bytecode interpreter, the dynamic object model, and built-ins."
 
 [features]
-default = ["gc-collect", "complex"]
+default = ["gc-collect", "complex", "bundled-stdlib", "introspection"]
 complex = []
+bundled-stdlib = []
+introspection = []
 gc-collect = ["lamella-gc/gc-collect"]
 gc-none = []
 

@@ -411,7 +411,7 @@ mod tests {
     fn declared_type_emits_a_typedef_then_later_submissions_reference_it() {
         let mut session = Session::new(&[]);
 
-        let decl = session.compile_submission("class Foo { public int X; }");
+        let decl = session.compile_submission("class Foo { public int X; public Foo() { X = 1; } }");
         assert!(decl.diagnostics.is_empty(), "{:?}", decl.diagnostics);
         let d1 = read_delta(decl.delta.as_ref().expect("delta 1"));
         assert!(

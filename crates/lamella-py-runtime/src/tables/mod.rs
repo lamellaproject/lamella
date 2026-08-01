@@ -9,6 +9,7 @@ pub(crate) mod gpio_stm32f4;
 pub(crate) mod uart_esp32c6;
 pub(crate) mod uart_rp2040;
 pub(crate) mod uart_rp2350;
+pub(crate) mod uart_samd21;
 pub(crate) mod spi_rp2350;
 pub(crate) mod i2c_rp2350;
 pub(crate) mod adc_rp2350;

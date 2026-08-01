@@ -37,6 +37,31 @@ pub fn parameter_symbol(parameter: &Parameter) -> TypeSymbol {
     }
 }
 
+/// The DECLARATION facts for a parameter list -- each parameter's name and whether it is `ref` or
+/// `out` -- parallel to the types [`parameter_symbol`] produces, and the same length by
+/// construction.
+///
+/// SEPARATE FROM THE SIGNATURE ON PURPOSE. `parameter_symbol` answers "what does overload
+/// resolution compare", and for that `ref` and `out` are the same thing (`T&`) and the name is
+/// nothing at all. This answers "what did the programmer write", which is what a DIAGNOSTIC has to
+/// quote: CS0181 names the offending parameter, CS7036 names the one with no argument, and CS1620
+/// exists solely to tell `ref` and `out` apart. Neither question is a refinement of the other.
+#[must_use]
+pub fn parameter_infos(parameters: &[Parameter]) -> alloc::vec::Vec<crate::symbols::ParameterInfo> {
+    use crate::symbols::{ParameterInfo, ParameterMode};
+    parameters
+        .iter()
+        .map(|parameter| ParameterInfo {
+            name: parameter.name.clone(),
+            mode: match parameter.modifier {
+                Some(ParameterModifier::Ref) => ParameterMode::Ref,
+                Some(ParameterModifier::Out) => ParameterMode::Out,
+                _ => ParameterMode::Value,
+            },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
