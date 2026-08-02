@@ -4499,6 +4499,11 @@ fn control_pin_group_base(set: &FamilySet, board: &str, pin: &str) -> Result<(i6
 /// line survive and the fuller prose below the blank line does not, which is the right split.
 /// The memory-region facts a board emits, as one ordered row list the typed emitters share.
 ///
+/// A board's `[memory]` record is emitted rather than merely validated against the linker
+/// scripts. A region has more in it than a size, and every
+/// part of it is something firmware would otherwise hand-type: where the region appears, how much
+/// of it is reachable, and which controller must be running first.
+///
 /// An absent `_BASE` means the chip's own fixed window, which is chip truth and not the board's to
 /// repeat. An absent `_CONTROLLER` means the chip maps the region with no help.
 fn memory_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>, String> {
@@ -6179,10 +6184,9 @@ pub fn emit_board_python(
     }
     out.push_str("}\n");
 
-    out.push_str(&format!(
-        "\n# Per-role descriptor dicts: the same values the C# {} class carries as consts,\n# under one mechanical renaming rule -- an UPPER_SNAKE const there is a lowercase key here,\n# grouped by the role it belongs to.\nFACTS = {{\n",
-        bindings_class(&resolved.board.board)
-    ));
+    out.push_str(
+        "\n# Per-role descriptor dicts, grouped by the role each belongs to.\n# Emitted from this board's facts, like every other language's support for it:\n# an UPPER_SNAKE name in the shared facts is a lowercase key here.\nFACTS = {\n",
+    );
     for (role, rows) in &roles {
         out.push_str(&format!("    \"{role}\": {{\n"));
         for (key, value) in rows {
@@ -6209,7 +6213,7 @@ pub fn emit_board_python(
     out.push_str("}\n");
 
     out.push_str(
-        "\n# On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/\n# _ACTIVE_LOW consts, dict-shaped): PORT group base + pin index + mask + polarity.\nDEVICES = {\n",
+        "\n# On-board devices + module control lines: PORT group base + pin index + mask + polarity.\n# Emitted from this board's facts; each supported language states the same set in its\n# own idiom.\nDEVICES = {\n",
     );
     for control in resolved.module_pins.iter().chain(resolved.board.devices.iter()) {
         let kind = if control.kind.is_empty() {

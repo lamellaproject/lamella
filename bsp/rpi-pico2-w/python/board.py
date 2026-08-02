@@ -17,9 +17,9 @@ CARRIER = {
     "kind": "native-usb",
 }
 
-# Per-role descriptor dicts: the same values the C# Pico2WBindings class carries as consts,
-# under one mechanical renaming rule -- an UPPER_SNAKE const there is a lowercase key here,
-# grouped by the role it belongs to.
+# Per-role descriptor dicts, grouped by the role each belongs to.
+# Emitted from this board's facts, like every other language's support for it:
+# an UPPER_SNAKE name in the shared facts is a lowercase key here.
 FACTS = {
     "uart0": {
         "kind": "uart",
@@ -76,8 +76,9 @@ PLANS = {
     "pll-150-48": {"default": True, "source": "xosc", "xosc_hz": 12000000, "clk_peri_hz": 12000000, "clk_sys_hz": 150000000, "clk_usb_hz": 48000000, "clk_adc_hz": 48000000, "pll_sys_fbdiv": 125, "pll_sys_postdiv1": 5, "pll_sys_postdiv2": 2, "pll_usb_fbdiv": 100, "pll_usb_postdiv1": 5, "pll_usb_postdiv2": 5},
 }
 
-# On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/
-# _ACTIVE_LOW consts, dict-shaped): PORT group base + pin index + mask + polarity.
+# On-board devices + module control lines: PORT group base + pin index + mask + polarity.
+# Emitted from this board's facts; each supported language states the same set in its
+# own idiom.
 DEVICES = {
     "cyw43439-wl-reg-on": {"port_base": 0xD0000000, "pin": 23, "mask": 0x800000, "active_low": False},
     "cyw43439-data": {"port_base": 0xD0000000, "pin": 24, "mask": 0x1000000, "active_low": False},

@@ -14,9 +14,9 @@ CARRIER = {
     "kind": "daplink-vcp",
 }
 
-# Per-role descriptor dicts: the same values the C# MicroBitV1Bindings class carries as consts,
-# under one mechanical renaming rule -- an UPPER_SNAKE const there is a lowercase key here,
-# grouped by the role it belongs to.
+# Per-role descriptor dicts, grouped by the role each belongs to.
+# Emitted from this board's facts, like every other language's support for it:
+# an UPPER_SNAKE name in the shared facts is a lowercase key here.
 FACTS = {
     "i2c": {
         "kind": "i2c",
@@ -33,8 +33,9 @@ PLANS = {
     "hfclk-default": {"default": True, "source": "hfclk"},
 }
 
-# On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/
-# _ACTIVE_LOW consts, dict-shaped): PORT group base + pin index + mask + polarity.
+# On-board devices + module control lines: PORT group base + pin index + mask + polarity.
+# Emitted from this board's facts; each supported language states the same set in its
+# own idiom.
 DEVICES = {
     "display-row1": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 13, "mask": 0x2000, "active_low": False},
     "display-row2": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 14, "mask": 0x4000, "active_low": False},

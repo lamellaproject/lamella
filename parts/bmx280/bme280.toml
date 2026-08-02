@@ -1,0 +1,111 @@
+# PART: Bosch BME280 humidity, pressure and temperature sensor.
+#
+# A BMP280 plus humidity. Everything not stated here is inherited from the family base and is
+# FLATTENED INTO THE EMITTED TABLE by the generator, so a reader of the emitted artifact never has
+# to chase a base to see the whole truth.
+
+[table]
+kind = "device"
+family = "bmx280"
+part = "bme280"
+base = "bmx280"
+sources = [
+    "Bosch BST-BME280-DS001 rev 1.24 (February 2024): humidity registers ch 5.4.5 / 5.4.7, trimming parameter layout table 16, humidity compensation ch 4.2.3, ctrl_hum ordering constraint ch 5.4.3, standby encoding table 27.",
+]
+notes = [
+    "Register and readout compatible with the BMP280 for pressure and temperature; the differences are the humidity channel, the standby encoding, and the identity value.",
+]
+
+[identity]
+reg = 0xD0
+width = 8
+values = [0x60]
+
+# --- what humidity adds ------------------------------------------------------------------------
+
+[registers.ctrl_hum]
+reg = 0xF2
+width = 8
+access = "read-write"
+fields = { osrs_h = [0, 3] }
+notes = "WRITE ORDER IS LOAD-BEARING: a change here takes effect only on a subsequent write to ctrl_meas, so ctrl_hum must be written FIRST. Reversing the two leaves the humidity oversampling at its previous value, which presents as a stuck reading rather than as an error."
+
+[registers.hum]
+reg = 0xFD
+width = 16
+access = "read-only"
+fields = { hum_msb = [8, 8], hum_lsb = [0, 8] }
+notes = "16 bits, MSB first: (msb << 8) | lsb. Unlike pressure and temperature it is not left justified."
+
+[measurement]
+# The burst covers pressure, temperature AND humidity -- 0xF7..0xFE.
+burst_length = 8
+resolution_bits = "16..20 with the filter off, always 20 with the filter enabled"
+
+# --- the standby encoding this member does NOT share --------------------------------------------
+#
+# MICROSECONDS, as integers. The catalogue has to work on a no-float tier, so a facts table that
+# carried 0.5 as a float would force a float into every emitted language for the sake of one row.
+
+[enums.standby_us]
+"0" = 500
+"1" = 62500
+"2" = 125000
+"3" = 250000
+"4" = 500000
+"5" = 1000000
+"6" = 10000
+"7" = 20000
+notes = "Codes 6 and 7 differ from the BMP280's, which uses 2 s and 4 s for the same two codes. A shared standby table across the family would be wrong for one member or the other."
+
+# --- humidity calibration ------------------------------------------------------------------------
+#
+# The humidity trimming parameters are NOT contiguous with the temperature and pressure block, and
+# two of them are 12-bit values that SHARE the nibbles of a single register. That packing is the
+# most error-prone read in the part and is the reason the read is described field by field rather
+# than as a block plus a struct layout.
+
+[calibration.humidity]
+form = "bmx280-h-int32"
+byte_order = "little"
+output_scale = "q22.10-percent-relative-humidity"
+depends_on = ["temperature"]
+notes = "Consumes the fine-resolution temperature, so a humidity reading is meaningless unless a temperature has been compensated from the same measurement. The compensated result is clamped to the range 0..419430400 before scaling, which is part of the vendor's own calculation and not a driver's defensive choice."
+
+[[calibration.humidity.read]]
+name = "dig_H1"
+reg = 0xA1
+width = 8
+signed = false
+
+[[calibration.humidity.read]]
+name = "dig_H2"
+reg = 0xE1
+width = 16
+signed = true
+
+[[calibration.humidity.read]]
+name = "dig_H3"
+reg = 0xE3
+width = 8
+signed = false
+
+[[calibration.humidity.read]]
+name = "dig_H4"
+reg = 0xE4
+width = 12
+signed = true
+packing = "high8-at-0xE4-low4-in-low-nibble-of-0xE5"
+
+[[calibration.humidity.read]]
+name = "dig_H5"
+reg = 0xE6
+width = 12
+signed = true
+packing = "high8-at-0xE6-low4-in-high-nibble-of-0xE5"
+
+[[calibration.humidity.read]]
+name = "dig_H6"
+reg = 0xE7
+width = 8
+signed = true

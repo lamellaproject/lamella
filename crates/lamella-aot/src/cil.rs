@@ -64,7 +64,7 @@ pub enum CilError {
     ///
     /// This is a REFUSAL, not a limitation of the lowering: the alternative is a dangling pointer
     /// that reads whatever the next call left on the stack, which no test would catch and no user
-    /// could diagnose. The safe uses are the ones [`classify_catch_binding`] whitelists; a program
+    /// could diagnose. The safe uses are the ones [`classify_catch_binding`] allows; a program
     /// that needs more wants a heap-allocated exception object, which is a scope decision above this
     /// crate.
     ExceptionBindingEscapes,
@@ -1849,7 +1849,8 @@ fn addr_base(
 /// The box is not an optimization the prefix lets us skip -- it is what the standard requires, and
 /// for the same reason on this tier as on a JIT: the callee is a base-class body reached through the
 /// object's TypeDesc (`object::ToString` answers the descriptor's name word), and a bare `&T` carries
-/// no header to read one from. 
+/// no header to read one from. On .NET 8, `constrained.` on an inherited `ToString()` costs the same
+/// 24 bytes as an explicit `box`, so the prefix buys no allocation either.
 ///
 /// The emitted pair is exactly [`Opcode::Box`]'s -- an `Alloc` plus a `FieldStore` of the value at
 /// offset 0 -- so a call the front end used to spell `ldloc; box; callvirt` lowers identically when
@@ -4030,7 +4031,7 @@ enum CatchBinding {
 /// reference outlives the frame, and the ways a reference can escape are open-ended (a field, an
 /// array element, a call argument whose callee stores it, a return). Enumerating the ESCAPES would
 /// make every unlisted opcode silently safe; enumerating the SAFE uses makes every unlisted opcode a
-/// refusal. The whitelist is deliberately small -- a nullary instance call on the binding, a field
+/// refusal. The allowlist is deliberately small -- a nullary instance call on the binding, a field
 /// read, a null test, a discard -- which is every use the corpus and `libs/` actually make of a
 /// caught exception, and it grows by measurement rather than by guess.
 ///

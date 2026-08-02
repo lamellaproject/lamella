@@ -18,9 +18,9 @@ CARRIER = {
     "role": "vcp",
 }
 
-# Per-role descriptor dicts: the same values the C# Samw25XproBindings class carries as consts,
-# under one mechanical renaming rule -- an UPPER_SNAKE const there is a lowercase key here,
-# grouped by the role it belongs to.
+# Per-role descriptor dicts, grouped by the role each belongs to.
+# Emitted from this board's facts, like every other language's support for it:
+# an UPPER_SNAKE name in the shared facts is a lowercase key here.
 FACTS = {
     "vcp": {
         "kind": "uart",
@@ -67,8 +67,9 @@ PLANS = {
     "usb-48mhz": {"default": False, "source": "dfll48m-usb-recovery", "gclk1_hz": 48000000},
 }
 
-# On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/
-# _ACTIVE_LOW consts, dict-shaped): PORT group base + pin index + mask + polarity.
+# On-board devices + module control lines: PORT group base + pin index + mask + polarity.
+# Emitted from this board's facts; each supported language states the same set in its
+# own idiom.
 DEVICES = {
     "winc-reset_n": {"port_base": 0x41004400, "pin": 27, "mask": 0x8000000, "active_low": True},
     "winc-chip_en": {"port_base": 0x41004400, "pin": 28, "mask": 0x10000000, "active_low": False},

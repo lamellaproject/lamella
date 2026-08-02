@@ -40,6 +40,32 @@ pub unsafe extern "C" fn lamella_run(ptr: *const u8, len: usize) -> *mut u8 {
     result_buffer(to_json(&run_bytes(assembly)).into_bytes())
 }
 
+/// Runs the managed assembly at `ptr..ptr + len` WITH the managed corlib at
+/// `corlib_ptr..corlib_ptr + corlib_len` loaded alongside it. Same result buffer as [`lamella_run`]:
+/// `[u32 little-endian length][UTF-8 JSON]`, freed with `lamella_dealloc(result, 4 + length)`.
+///
+/// **Prefer this over [`lamella_run`] whenever the host has a corlib.** A corlib-less run resolves only
+/// what the loader intrinsic-binds, which covers enough (`Console.WriteLine`, `String.ToUpper`,
+/// `Math.Max`) to look complete while any MANAGED corlib method -- `Thread.Sleep` is the one a user hit
+/// -- resolves to nothing and traps mid-run. Passing a corlib is strictly more resolving power: the
+/// loader falls back to an intrinsic only where the corlib's name index has no match.
+///
+/// [`lamella_run`] is kept for hosts that have no corlib to hand, and is unchanged.
+///
+/// # Safety
+/// Both pointer/length pairs must be buffers the host filled via prior [`lamella_alloc`] calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_run_with_corlib(
+    corlib_ptr: *const u8,
+    corlib_len: usize,
+    ptr: *const u8,
+    len: usize,
+) -> *mut u8 {
+    let corlib = unsafe { core::slice::from_raw_parts(corlib_ptr, corlib_len) };
+    let assembly = unsafe { core::slice::from_raw_parts(ptr, len) };
+    result_buffer(to_json(&crate::run_bytes_with_corlib(corlib, assembly)).into_bytes())
+}
+
 /// Compiles the Python source at `ptr..ptr + len` (UTF-8) and runs its `main()`,
 /// returning `[u32 little-endian length][UTF-8 JSON]` (`{stdout, exitCode, diagnostics}`)
 /// like [`lamella_run`]; free it with `lamella_dealloc(result, 4 + length)`. Behind the
@@ -78,6 +104,9 @@ pub unsafe extern "C" fn lamella_py_check(ptr: *const u8, len: usize) -> *mut u8
 /// caller gets the REASON by calling [`lamella_py_check`] on the same source -- both go through the same
 /// private `compile`, so they cannot disagree about why. Keeping the binary result binary avoids
 /// base64-inflating a payload whose whole purpose is to cross a wire.
+///
+/// This is the seam that lets a browser hand Python to a BOARD rather than only run it in the page:
+/// it is the only way a caller out here obtains a `Bundle` for the encoder and the chunked deploy.
 ///
 /// # Safety
 /// `ptr`/`len` must be the UTF-8 buffer the host filled via a prior [`lamella_alloc`].

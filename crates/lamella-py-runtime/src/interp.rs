@@ -2740,8 +2740,7 @@ fn resume_generator(
     if depth > MAX_CALL_DEPTH {
         return Err(Trap::RecursionError);
     }
-    let close_mode = matches!(resume, Resume::Close);
-    let mut frame = match model.take_generator_frame(generator) {
+    let frame = match model.take_generator_frame(generator) {
         Some(frame) => frame,
         None => {
             return match resume {
@@ -2757,6 +2756,24 @@ fn resume_generator(
             };
         }
     };
+    let outcome = drive_taken_generator(generator, frame, resume, functions, model, depth);
+    model.end_generator_resume(generator);
+    outcome
+}
+
+/// One resume, with the frame already OUT of the model's table (and its slot reserved).
+///
+/// Split from [`resume_generator`] for that reservation alone: every exit here is an exit from a
+/// function whose caller releases it, rather than another place to remember to.
+fn drive_taken_generator(
+    generator: Value,
+    mut frame: Frame,
+    resume: Resume,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let close_mode = matches!(resume, Resume::Close);
     let module_id = model.generator_module(generator);
     let gen_functions_rc = model.managed_functions_rc(module_id);
     let gen_functions: &[CodeObject] = gen_functions_rc.as_deref().unwrap_or(functions);

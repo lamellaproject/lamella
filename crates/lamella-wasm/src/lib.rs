@@ -16,7 +16,7 @@ pub mod py;
 #[cfg(feature = "repl")]
 pub mod repl;
 
-use lamella_load::load;
+use lamella_load::{load, load_with_corlib};
 use lamella_cil_runtime::{Value, Vm, run};
 
 /// A diagnostic surfaced to the embedder. For Tier 1 these are runtime issues
@@ -51,15 +51,50 @@ pub struct RunResult {
 /// input: malformed bytes become a diagnostic.
 #[must_use]
 pub fn run_bytes(assembly_bytes: &[u8]) -> RunResult {
-    abi::with_static(assembly_bytes, run_static)
+    abi::with_static(assembly_bytes, |bytes| run_static(bytes, None))
 }
 
-fn run_static(assembly_bytes: &'static [u8]) -> RunResult {
+/// [`run_bytes`] with a managed corlib loaded alongside the program -- the shape the REPL has always
+/// used, now reachable from the one-shot run path too.
+///
+/// # Why this exists: a corlib-less run resolves ONLY what the loader intrinsic-binds
+///
+/// Without a corlib, every cross-assembly `MemberRef` a program makes has to hit one of the loader's
+/// intrinsic bindings or it resolves to nothing. That covers a great deal -- `Console.WriteLine`,
+/// `String.ToUpper`, `Math.Max` -- so a corlib-less run LOOKS complete, which is exactly what made
+/// this hard to see. It is not complete: any corlib method whose body is MANAGED C# has no binding.
+///
+/// `System.Threading.Thread.Sleep` is the case a user hit. The loader binds the PRIVATE
+/// `Thread.SleepThread` intrinsic, and the corlib's public `Sleep(int)` is one line of managed IL
+/// that calls it -- so with no corlib there is nothing to resolve `Sleep` to, and the program traps
+/// with `call token 0x0A... resolved to no method` AFTER printing, mid-run.
+///
+/// Passing a corlib is strictly more resolving power, never less: [`load_with_corlib`] resolves each
+/// `MemberRef` against the corlib's name index and **falls back to a Rust intrinsic only when the
+/// index has no match**. So every program that ran before runs the same way, and the ones that
+/// trapped now find their method.
+#[must_use]
+pub fn run_bytes_with_corlib(corlib_bytes: &[u8], assembly_bytes: &[u8]) -> RunResult {
+    abi::with_static(corlib_bytes, |corlib| {
+        abi::with_static(assembly_bytes, |bytes| run_static(bytes, Some(corlib)))
+    })
+}
+
+fn run_static(assembly_bytes: &'static [u8], corlib_bytes: Option<&'static [u8]>) -> RunResult {
     let assembly = match lamella_metadata::Assembly::read(assembly_bytes) {
         Ok(assembly) => assembly,
         Err(error) => return failure("LAMELLA-PARSE", format!("{error:?}")),
     };
-    let program = match load(&assembly) {
+    let corlib = match corlib_bytes.map(lamella_metadata::Assembly::read) {
+        None => None,
+        Some(Ok(corlib)) => Some(corlib),
+        Some(Err(error)) => return failure("LAMELLA-CORLIB", format!("the corlib did not parse: {error:?}")),
+    };
+    let program = match corlib.as_ref() {
+        Some(corlib) => load_with_corlib(corlib, &assembly),
+        None => load(&assembly),
+    };
+    let program = match program {
         Ok(program) => program,
         Err(error) => return failure("LAMELLA-LOAD", format!("{error}")),
     };

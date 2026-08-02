@@ -836,6 +836,10 @@ fn append_enum_to_string(
 /// than a baked literal. Corlib declares 43 exception types and NONE of them overrides `Message`, so
 /// all 43 inherit this one slot and each still reports its own name.
 ///
+/// SCOPE, stated because each limit is a printed answer rather than an error:
+/// - **The message text of `throw new E("boom")` is not retained on this tier.** This returns `E`'s name, which
+///   is what `exception_strings = type-name` means and is closer to .NET than the null it replaces
+///   (.NET's own message-less default is "Exception of type 'E' was thrown.").
 /// - **`_message` is not consulted, because on this tier it can never be set.** No constructor runs at
 ///   a throw, and a `newobj E` that is NOT thrown is still lowered to a tag rather than an object. When
 ///   that second case becomes a real allocation, this body wants a `_message != null` arm ahead of the
@@ -1757,6 +1761,12 @@ pub struct UnsynthesizedSeam {
     /// Whether this seam OCCUPIES A VTABLE SLOT of some type in this assembly -- so a `callvirt` on
     /// that type reaches it with no `call` naming its rid, and the call-edge audit
     /// ([`LibraryBuildReport::silent_seam_edges`]) structurally cannot see it.
+    ///
+    /// The failure this guards against: `System.Object::ToString` reached through every type's slot
+    /// as an unsynthesized seam whose body returns `null` is refused by no build, so every AOT image
+    /// answers `null` for a type name. A SILENT seam in a slot is therefore the
+    /// worst row in this census rather than a milder one -- the loud guard is the one thing that
+    /// does not apply to it.
     pub in_vtable_slot: bool,
 }
 

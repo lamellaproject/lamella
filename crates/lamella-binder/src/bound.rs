@@ -5080,10 +5080,30 @@ impl Binder {
     /// some unrelated subclass's instance. Runs only where [`Self::check_accessible`] found the
     /// member reachable, so the two never both fire.
     ///
+    /// EVERY SILENCE HERE IS MEASURED AGAINST csc, and each one is load-bearing -- this rule makes
+    /// lcsc stricter, so a missing exemption refuses correct code:
+    /// - `this.m` / `base.m` and an unqualified `m` are not qualified accesses at all;
+    /// - a STATIC protected member named through its type is a different rule, not this one;
+    /// - inside the declaring type's own program text the member is in private scope and the
+    ///   qualifier is unconstrained (`B` itself may reach `d.m` through any `B`);
+    /// - `protected internal` reached from the SAME assembly is accessible AS INTERNAL, so the
+    ///   protected clause never governs it. That is the exemption most likely to bite: the two
+    ///   spellings are mutually exclusive across an assembly boundary, and same-assembly code
+    ///   spells it `protected internal` precisely to be reachable without derivation.
+    ///
     /// The message names `current_type` -- for an access written in a nested class, the NESTED
     /// type, though a qualifier of the ENCLOSING class is what actually satisfies the rule. That
     /// is csc's own wording and it was measured rather than inferred: `class D : B { class N { ...
     /// } }` reports "must be of type 'D.N'" while accepting a `D` qualifier.
+    ///
+    /// TWO LIMITS, both measured and neither papered over. An OVERLOADED protected method is named
+    /// differently: csc reports during member LOOKUP and so names the FIRST-DECLARED overload,
+    /// while this reports after resolution and names the one the call actually binds to. Matching
+    /// would mean quoting a signature the call does not use, so the divergence is deliberate.
+    /// And a protected INDEXER is not covered at all -- `resolve_indexer_accessor` returns a
+    /// `MethodReference`, which carries no accessibility, so the check has nothing to test. That
+    /// is an UNDER-report: it accepts what csc rejects, which blocks nobody and reads as a gap
+    /// rather than as a compiler that refuses correct code.
     fn check_protected_qualifier(
         &mut self,
         declaring: &TypeSymbol,
@@ -5451,6 +5471,14 @@ impl Binder {
     /// Reports the IMPLICIT `: base()` that no base constructor can accept -- `CS7036` naming the
     /// first unsupplied parameter when the base declares exactly one constructor, `CS1729` when it
     /// declares several. Both measured against csc.
+    ///
+    /// This is the quietest shape in the family, because nothing in the source mentions the call:
+    /// `class D : B { public D() { } }` where `B` only has `B(int)` names no base call, and neither
+    /// does a `D` declaring NO constructor at all, whose synthesized default carries the same
+    /// implicit one. The explicit `: base(...)` spelling was silent for a
+    /// DIFFERENT reason -- `bind_constructor_chain` resolves it from the emitter, where a
+    /// diagnostic reaches no one -- so its arity is checked here too, and the two spellings answer
+    /// with one rule instead of two.
     ///
     /// A constructor chaining to `: this(...)` does not call the base and is skipped. Only ARITY is
     /// checked here: an inaccessible base constructor is `CS0122`, a separate rule, and reporting
@@ -7271,6 +7299,14 @@ fn simple_type_name(ty: &TypeSymbol) -> String {
 /// older one renders from a bare `&[TypeSymbol]`, which is all a `MethodReference` carries, and
 /// its callers are at parity today. Once every one of them holds a `MethodSymbol` they should
 /// collapse into this.
+///
+/// KNOWN GAP, measured: csc qualifies the type MINIMALLY FOR THE ERROR SITE, so a method in
+/// `namespace N { class C }` reported from inside `C` reads `C.M(int)` where this renders
+/// `N.C.M(int)`. Enclosing TYPES are kept by both (`C.Inner.Inner(int, int)`) -- it is only the
+/// namespace that csc drops, and only when the site can see the type without it. Closing this
+/// needs the using-scope at the report site, not a different string builder, so it is written
+/// down rather than approximated: dropping the namespace unconditionally would be wrong for a
+/// type the site could NOT have named unqualified.
 fn qualified_method_with_modes(
     declaring: &TypeSymbol,
     member: &str,

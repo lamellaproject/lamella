@@ -1717,8 +1717,13 @@ struct I2cSimDevice {
 /// payload, so payload release alone would recover 39 percent of a table that must stop growing entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Arena {
-    /// The handle table itself -- the outer vector's reserved slots, live and dead alike. Falls only
-    /// when handles are REUSED (a free list), never when a payload is dropped.
+    /// The handle table itself -- the outer vector's reserved slots, live and dead alike -- plus the
+    /// list of freed slots waiting to be handed out again. Falls only when handles are REUSED, never
+    /// when a payload is dropped.
+    ///
+    /// The free list is counted here rather than left out because it is bookkeeping the table itself
+    /// requires, it is reserved out of the same memory, and its high-water tracks the table's: at worst
+    /// four bytes per slot, on top of the slot.
     pub slots: usize,
     /// What the slots point at: a string's bytes, a container's elements, a bignum's limbs.
     pub payload: usize,
@@ -1816,6 +1821,7 @@ struct FreedSlots {
     sets: Vec<u32>,
     bigints: Vec<u32>,
     byte_buffers: Vec<u32>,
+    generators: Vec<u32>,
 }
 
 /// Which handle arena a heap object's first payload word indexes into.
@@ -1829,6 +1835,7 @@ enum ArenaKind {
     Sets,
     Bigints,
     ByteBuffers,
+    Generators,
 }
 
 /// One flag per slot of each arena while [`ObjectModel::release_dead_arena_slots`] walks the
@@ -1841,6 +1848,7 @@ struct LiveSlots {
     sets: Vec<bool>,
     bigints: Vec<bool>,
     byte_buffers: Vec<bool>,
+    generators: Vec<bool>,
 }
 
 #[cfg(feature = "gc-collect")]
@@ -1856,6 +1864,7 @@ impl LiveSlots {
             ArenaKind::Sets => &mut self.sets,
             ArenaKind::Bigints => &mut self.bigints,
             ArenaKind::ByteBuffers => &mut self.byte_buffers,
+            ArenaKind::Generators => &mut self.generators,
         };
         if let Some(flag) = flags.get_mut(index) {
             *flag = true;
@@ -1871,6 +1880,7 @@ impl LiveSlots {
             (&mut self.sets, &freed.sets),
             (&mut self.bigints, &freed.bigints),
             (&mut self.byte_buffers, &freed.byte_buffers),
+            (&mut self.generators, &freed.generators),
         ] {
             for &index in indices {
                 if let Some(flag) = flags.get_mut(index as usize) {
@@ -1927,7 +1937,7 @@ pub struct ObjectModel {
     heap: Heap,
     types: Vec<PyType>,
     /// The runtime string arena: a `str`'s heap object holds an index into this, and the
-    /// string bytes live here. The arena grows monotonically (strings are not reclaimed).
+    /// string bytes live here. A dead string's slot is emptied and reused -- see [`FreedSlots`].
     strings: Vec<String>,
     /// The GC type-descriptor id of the `str` type; it follows the user types.
     str_type_id: u32,
@@ -1963,7 +1973,7 @@ pub struct ObjectModel {
     /// preserve insertion order). A dict's heap object holds an index into this.
     dicts: Vec<Vec<(Value, Value)>>,
     /// The runtime backing for `bigint`: each arbitrary-precision int's heap object holds an index
-    /// into this. Grows monotonically (str-arena pattern; the values are immutable).
+    /// into this (str-arena pattern; the values are immutable).
     bigints: Vec<BigInt>,
     /// The runtime backing for `bytes`/`bytearray`: each object holds an index into this. A `bytes`
     /// buffer never mutates; a `bytearray` mutates its `Vec<u8>` in place (list-arena pattern).
@@ -2201,11 +2211,27 @@ pub struct ObjectModel {
     /// (the `object()` sentinel). Its only observable trait is its own address (`is` / `id`).
     object_base_type_id: u32,
     /// The suspended frames of live generators, indexed by a generator object's payload word.
-    /// `None` = the generator is exhausted (its body returned) or currently running; `Some(frame)`
-    /// = it is fresh (ip 0) or suspended at a `yield`. A suspended frame holds tagged Values
-    /// (locals, eval stack) that are GC roots, so a moving collector traces each frame here. The
-    /// interpreter does not auto-collect, so a finished generator's slot is not reclaimed.
+    /// `None` = the generator is exhausted (its body returned), currently running, or the slot is
+    /// free; `Some(frame)` = it is fresh (ip 0) or suspended at a `yield`. A suspended frame holds
+    /// tagged Values (locals, eval stack) that are GC roots, so a moving collector traces each frame
+    /// here.
+    ///
+    /// **This is the seventh handle arena and it is released like the other six**
+    /// ([`ObjectModel::release_dead_arena_slots`]): a collection empties the slot of any generator
+    /// object that did not survive and hands the index back. Both halves matter and for different
+    /// reasons -- the FRAME is what makes a dead suspended generator's locals immortal, and the SLOT
+    /// is `size_of::<Option<Frame>>()` charged per generator ever created, which is the larger number
+    /// for a program whose generators run to exhaustion.
     generators: Vec<Option<Frame>>,
+    /// The `generators` slots whose frame is OUT of the table because a resume is running it, innermost
+    /// last. **A reservation, not a root**: it stops [`ObjectModel::release_dead_arena_slots`] handing
+    /// a slot to a new generator while an in-flight resume still intends to suspend a frame back into
+    /// it, which would give two generators one slot and each the other's state.
+    ///
+    /// Empty except during a resume, and a resume cannot reach a safe point today (it is a nested
+    /// drive), so nothing can collect while this is non-empty. It exists so that the slot half is
+    /// already right when that changes, rather than depending on it.
+    resuming: Vec<u32>,
     /// A pool of returned call frames, kept for their Vec allocations (locals/eval-stack/caches) so a
     /// hot call/return cycle reuses buffers instead of allocating a fresh frame each call. Bounded;
     /// every pooled frame is cleared of Values (holds nothing to trace).
@@ -2902,6 +2928,7 @@ impl ObjectModel {
             unbound_method_type_id,
             object_base_type_id,
             generators: Vec::new(),
+            resuming: Vec::new(),
             frame_pool: Vec::new(),
             gpio_claimed: Vec::new(),
             uart_claimed: Vec::new(),
@@ -6857,8 +6884,8 @@ impl ObjectModel {
     /// resume; the frame lives in the `generators` arena and the heap object holds its index +
     /// `home_module` (the module whose functions + globals a resume runs the body against).
     pub fn new_generator(&mut self, frame: Frame, home_module: u16) -> Result<Value, Trap> {
-        let index = self.generators.len() as u32;
-        self.generators.push(Some(frame));
+        let index =
+            take_arena_slot(&mut self.generators, &mut self.freed_slots.generators, Some(frame));
         let reference = self.alloc_object(self.generator_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         self.heap.write_u32(reference.0 + 4, u32::from(home_module));
@@ -6897,13 +6924,39 @@ impl ObjectModel {
     /// Takes the suspended frame OUT of generator `gen` (leaving the slot `None`), or `None` if it
     /// has already been taken -- the generator is exhausted, or is currently running (a re-entrant
     /// resume). Pair with [`ObjectModel::put_generator_frame`] to suspend it again after a yield.
+    ///
+    /// **A frame handed out here RESERVES its slot until [`ObjectModel::end_generator_resume`]**, so a
+    /// collection during the resume cannot hand that slot to a new generator. The two calls are a pair
+    /// with one call site ([`crate::interp::resume_generator`], which brackets the whole resume around
+    /// it); forgetting the second one pins one slot, which is what the arena did for every generator
+    /// before it had a free list at all, and never gives one slot to two owners.
     pub fn take_generator_frame(&mut self, generator: Value) -> Option<Frame> {
         let reference = generator.as_ref()?;
         if self.heap.type_id_of(reference) != self.generator_type_id {
             return None;
         }
         let index = self.heap.read_u32(reference.0) as usize;
-        self.generators.get_mut(index)?.take()
+        let frame = self.generators.get_mut(index)?.take()?;
+        self.resuming.push(index as u32);
+        Some(frame)
+    }
+
+    /// Releases the slot reservation [`ObjectModel::take_generator_frame`] made, whatever the resume
+    /// did with the frame -- suspended it back, exhausted it, or dropped it on a raise.
+    ///
+    /// Resumes nest (a generator delegating with `yield from`, or one whose body drives another), so
+    /// the reservations are a stack and this asserts it is unwinding in order. Out of order would mean
+    /// a resume ended somewhere other than where it began, and the slot this released would belong to
+    /// a generator still running -- the one failure a free list makes possible that no amount of
+    /// leaking does.
+    pub fn end_generator_resume(&mut self, generator: Value) {
+        let expected = generator.as_ref().map(|reference| self.heap.read_u32(reference.0));
+        let released = self.resuming.pop();
+        assert_eq!(
+            released, expected,
+            "a generator resume ended out of order: released slot {released:?} but the generator \
+             being resumed holds slot {expected:?} -- refusing to guess which one is running"
+        );
     }
 
     /// Suspends `frame` back into generator `gen` after it yielded, so the next resume continues
@@ -8173,11 +8226,13 @@ impl ObjectModel {
     /// by its payload, so walking them costs one pass and cannot disagree with the collector about what
     /// is alive -- **it is the collector's own answer.**
     ///
-    /// The price is one cycle of lag, and only for the three arenas whose payloads hold `Value`s: a
-    /// dead container's ELEMENTS were traced as roots during the collection that has just finished, so
-    /// they outlive it by one round and die in the next, once this pass has emptied the slot that was
-    /// keeping them. `strings`, `bigints` and `byte_buffers` hold no `Value`s and have no lag at all.
-    /// The high-water stays bounded either way, which is what the bar asks.
+    /// The price is one cycle of lag, and only for the four arenas whose payloads hold `Value`s: a dead
+    /// container's ELEMENTS, and a dead generator's LOCALS, were traced as roots during the collection
+    /// that has just finished, so they outlive it by one round and die in the next, once this pass has
+    /// emptied the slot that was keeping them. `strings`, `bigints` and `byte_buffers` hold no `Value`s
+    /// and have no lag at all. The high-water stays bounded either way, which is what the bar asks --
+    /// but it does mean one collection is not a settled reading, and a measurement that wants the live
+    /// set has to drive two.
     ///
     /// ## What it depends on, stated because it is another crate's shape
     ///
@@ -8196,8 +8251,12 @@ impl ObjectModel {
             sets: alloc::vec![false; self.sets.len()],
             bigints: alloc::vec![false; self.bigints.len()],
             byte_buffers: alloc::vec![false; self.byte_buffers.len()],
+            generators: alloc::vec![false; self.generators.len()],
         };
         live.mark_all(&self.freed_slots);
+        for &index in &self.resuming {
+            live.mark(ArenaKind::Generators, index as usize);
+        }
 
         let top = self.heap.top();
         let mut header_addr = lamella_gc::heap::ALIGN;
@@ -8227,11 +8286,17 @@ impl ObjectModel {
             &mut self.freed_slots.byte_buffers,
             Vec::new,
         );
+        empty_dead_slots(
+            &mut self.generators,
+            &live.generators,
+            &mut self.freed_slots.generators,
+            || None,
+        );
     }
 
     /// The handle arena a heap object of `type_id` indexes into, or `None` for a type that owns its
     /// whole payload. Every arena-backed type keeps that index in its FIRST payload word, which is what
-    /// lets one walk serve all six.
+    /// lets one walk serve all seven.
     ///
     /// **A type missing from this list has its slot freed while it is still in use**, and the two
     /// things that catch it are the same two that hold the root enumeration honest: the whole corpus
@@ -8265,6 +8330,9 @@ impl ObjectModel {
         }
         if type_id == self.bytes_type_id || type_id == self.bytearray_type_id {
             return Some(ArenaKind::ByteBuffers);
+        }
+        if type_id == self.generator_type_id {
+            return Some(ArenaKind::Generators);
         }
         None
     }
@@ -8424,16 +8492,18 @@ impl ObjectModel {
     /// allocator delta with no matching footprint delta, without anyone having thought of the table.
     #[must_use]
     pub fn footprint(&self) -> Footprint {
+        let freed = |list: &Vec<u32>| list.capacity() * size_of::<u32>();
         let strings = Arena {
-            slots: self.strings.capacity() * size_of::<String>(),
+            slots: self.strings.capacity() * size_of::<String>() + freed(&self.freed_slots.strings),
             payload: self.strings.iter().map(String::capacity).sum(),
         };
         let sequences = Arena {
-            slots: self.seqs.capacity() * size_of::<Vec<Value>>(),
+            slots: self.seqs.capacity() * size_of::<Vec<Value>>() + freed(&self.freed_slots.seqs),
             payload: self.seqs.iter().map(|seq| seq.capacity() * size_of::<Value>()).sum(),
         };
         let dicts = Arena {
-            slots: self.dicts.capacity() * size_of::<Vec<(Value, Value)>>(),
+            slots: self.dicts.capacity() * size_of::<Vec<(Value, Value)>>()
+                + freed(&self.freed_slots.dicts),
             payload: self
                 .dicts
                 .iter()
@@ -8441,15 +8511,16 @@ impl ObjectModel {
                 .sum(),
         };
         let sets = Arena {
-            slots: self.sets.capacity() * size_of::<Vec<Value>>(),
+            slots: self.sets.capacity() * size_of::<Vec<Value>>() + freed(&self.freed_slots.sets),
             payload: self.sets.iter().map(|set| set.capacity() * size_of::<Value>()).sum(),
         };
         let bigints = Arena {
-            slots: self.bigints.capacity() * size_of::<BigInt>(),
+            slots: self.bigints.capacity() * size_of::<BigInt>() + freed(&self.freed_slots.bigints),
             payload: self.bigints.iter().map(BigInt::footprint).sum(),
         };
         let byte_buffers = Arena {
-            slots: self.byte_buffers.capacity() * size_of::<Vec<u8>>(),
+            slots: self.byte_buffers.capacity() * size_of::<Vec<u8>>()
+                + freed(&self.freed_slots.byte_buffers),
             payload: self.byte_buffers.iter().map(Vec::capacity).sum(),
         };
 
@@ -8473,6 +8544,8 @@ impl ObjectModel {
 
         let frames = self.generators.capacity() * size_of::<Option<Frame>>()
             + self.generators.iter().flatten().map(Frame::footprint).sum::<usize>()
+            + freed(&self.freed_slots.generators)
+            + self.resuming.capacity() * size_of::<u32>()
             + self.frame_pool.capacity() * size_of::<Frame>()
             + self.frame_pool.iter().map(Frame::footprint).sum::<usize>();
 

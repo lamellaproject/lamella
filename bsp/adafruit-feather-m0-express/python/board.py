@@ -13,9 +13,9 @@ CARRIER = {
     "kind": "native-usb",
 }
 
-# Per-role descriptor dicts: the same values the C# FeatherM0ExpressBindings class carries as consts,
-# under one mechanical renaming rule -- an UPPER_SNAKE const there is a lowercase key here,
-# grouped by the role it belongs to.
+# Per-role descriptor dicts, grouped by the role each belongs to.
+# Emitted from this board's facts, like every other language's support for it:
+# an UPPER_SNAKE name in the shared facts is a lowercase key here.
 FACTS = {
 }
 
@@ -23,8 +23,9 @@ PLANS = {
     "osc8m-8mhz": {"default": True, "source": "osc8m", "gclk0_hz": 8000000},
 }
 
-# On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/
-# _ACTIVE_LOW consts, dict-shaped): PORT group base + pin index + mask + polarity.
+# On-board devices + module control lines: PORT group base + pin index + mask + polarity.
+# Emitted from this board's facts; each supported language states the same set in its
+# own idiom.
 DEVICES = {
     "led": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 17, "mask": 0x20000, "active_low": False},
     "neopixel": {"kind": "gpio-out", "port_base": 0x41004400, "pin": 6, "mask": 0x40, "active_low": False},

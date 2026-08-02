@@ -15,9 +15,9 @@ CARRIER = {
     "role": "vcp",
 }
 
-# Per-role descriptor dicts: the same values the C# Stm32f429iDiscoBindings class carries as consts,
-# under one mechanical renaming rule -- an UPPER_SNAKE const there is a lowercase key here,
-# grouped by the role it belongs to.
+# Per-role descriptor dicts, grouped by the role each belongs to.
+# Emitted from this board's facts, like every other language's support for it:
+# an UPPER_SNAKE name in the shared facts is a lowercase key here.
 FACTS = {
     "vcp": {
         "kind": "uart",
@@ -50,8 +50,9 @@ PLANS = {
     "hsi-16mhz": {"default": True, "source": "hsi", "hsi_hz": 16000000, "hclk_hz": 16000000, "pclk_hz": 16000000},
 }
 
-# On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/
-# _ACTIVE_LOW consts, dict-shaped): PORT group base + pin index + mask + polarity.
+# On-board devices + module control lines: PORT group base + pin index + mask + polarity.
+# Emitted from this board's facts; each supported language states the same set in its
+# own idiom.
 DEVICES = {
     "led-green": {"kind": "gpio-out", "port_base": 0x40021800, "pin": 13, "mask": 0x2000, "active_low": False},
     "led-red": {"kind": "gpio-out", "port_base": 0x40021800, "pin": 14, "mask": 0x4000, "active_low": False},

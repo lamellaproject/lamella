@@ -1,0 +1,259 @@
+# BOARD binding: the ST 32F746GDISCOVERY. Board truth ONLY: role bindings, the carrier, and the
+# clock plan. Chip truth lives in csp/stm32f7/.
+#
+# The VCP is the only role stated. The board carries a great deal more -- an LCD-TFT with a
+# capacitive touch panel, SDRAM and QSPI on the memory controller, Ethernet, audio and a camera
+# connector -- and none of it is here, because a board file states what a binding resolves rather
+# than what the hardware has.
+
+[table]
+kind = "board"
+board = "stm32f746g-disco"
+vendor = "st"
+family = "stm32f7"
+part = "stm32f746ng"
+board_model = 20            # lamella_wire::board_model::STM32F746G_DISCO
+sources = [
+    "Discovery kit user manual UM1907: the pin assignment table gives PA9 = VCP_TX and PB7 = VCP_RX; the ST-LINK/V2-1 provides the virtual COM port over USB",
+    "UM1907 introduction: the kit's microcontroller is the STM32F746NG (STM32F746NGH6 order code)",
+]
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge (a vendor carrier kind); its fixed
+role = "vcp"                # USB identity is stated once host tooling pins the ids with evidence.
+baud = 115200
+plan = "hsi-16mhz"
+default = true
+
+# THE TWO VCP PINS SIT ON DIFFERENT GPIO PORTS -- PA9 transmits, PB7 receives. That is unusual
+# enough to call out: every other uart binding here has both pins on one port, and it is the reason
+# this binding resolves per-pin port facts rather than one shared set.
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart1"
+function = "AF7"
+tx = { pin = "PA9" }
+rx = { pin = "PB7" }
+
+# THE BOARD MANUAL DISAGREES WITH ITSELF ABOUT THIS BUS, AND SILICON SETTLED IT. Its prose says
+# the audio codec shares a bus with the camera module and the I2C extension connector, which reads
+# as I2C1 -- the extension connector is PB8/PB9. Its own pin table says I2C3_SCL is PH7 and
+# I2C3_SDA is PH8. Both cannot be true.
+#
+# A run walked every address of BOTH buses. I2C1 answered nothing, which is the right answer for a
+# connector with nothing plugged into it; I2C3 answered at 0x1A. THE PIN TABLE WINS, and that is
+# the rule to carry forward for this document rather than a one-off correction.
+[[bindings]]
+role = "codec-i2c"
+kind = "i2c"
+instance = "i2c3"
+function = "AF4"
+scl = { pin = "PH7" }
+sda = { pin = "PH8" }
+
+# THE BOARD IS ITS OWN ORACLE FOR THIS BUS, which is worth stating because almost no board is.
+# The codec is soldered on, so a bus check here needs nothing plugged in and nothing wired -- and
+# its register 0 reads back a value that SPELLS ITS OWN PART NUMBER. A value like that cannot be
+# matched by accident, so reporting it proves the controller addressed a real device, clocked it,
+# turned the bus around with a repeated start, and read two bytes back. It is a positive control,
+# and a bus scan that has only ever reported nothing cannot tell "empty" from "broken" without one.
+[[devices]]
+name = "wm8994"
+kind = "i2c-device"
+role = "codec-i2c"
+address = 0x1A
+source = "UM1907 Rev 7 section 6.8 (the board carries an audio codec) with its pin assignment table (I2C3_SCL = PH7, I2C3_SDA = PH8), the two read together and the pin table preferred where they conflict. Found on silicon: 100 trials of 100 walked all 112 addresses of both buses, with a device answering at 0x1A whose register 0 reads 0x8994; the negative control disconnected the bus lines and failed 5 times out of 5."
+
+# --- external memory -----------------------------------------------------------------------
+#
+# THIS BOARD HAS MEMORY OUTSIDE THE CHIP, and it is two regions rather than one.
+# Both are OPTIONAL: the board boots, serves and runs a program with neither brought up, which is
+# why they are regions a program may enable rather than part of its memory budget.
+#
+# Neither region exists at reset. Each appears only once its controller is configured, and an
+# access before that is a bus fault rather than a wrong value -- so the controller is stated as a
+# fact and not as a comment, and `optional` means "may be absent", never "may be skipped".
+#
+# EACH REGION NAMES THE BLOCK CONSTANT ITS BASE IS A SECOND STATEMENT OF. The base is written here
+# because it is what every consumer of this file reads; the controller's block states where that
+# controller puts its window. Naming the constant is what turns a citation into a checked fact --
+# generation holds the two equal rather than trusting that a number was copied correctly.
+
+[[memory]]
+name = "qspi"
+kind = "flash"
+base = 0x90000000
+window = "MEMORY_MAPPED_BASE"
+size = 0x1000000            # 16 MB, all of it reachable.
+controller = "quadspi"
+optional = true
+source = "UM1907 Rev 7 section 6.14 (128-Mbit quad-SPI NOR); RM0385 Rev 9 section 14.3.7 for the memory-mapped bank at 0x90000000 and its execute-in-place support, and the memory map for the QUADSPI window. Read out on silicon over 400 cold bring-ups across four read configurations, each with a negative control that had to fail first."
+
+[[memory]]
+name = "sdram"
+kind = "ram"
+base = 0xC0000000           # FMC SDRAM BANK 1. Bank 2 is 0xD0000000 and is not wired here.
+window = "SDRAM_BANK1_BASE"
+size = 0x800000             # 8 MB -- what a program may REACH, and the number to use.
+device_size = 0x1000000     # the fitted part is 16 MB. The board wires only the low 16 of its 32
+                            # data lines, the rest sitting on pull-downs, so half the device is
+                            # unreachable. Stating both is the point: the headline figure is the
+                            # one a datasheet leads with and the one that would be wrong here.
+controller = "fmc"
+optional = true
+source = "UM1907 Rev 7 section 6.13: a 128-Mbit SDRAM of which 'only the lowest 16-bit data is used (64-Mbit accessible)', DQ16 to DQ31 unused and pulled down; SDNE0 and SDCKE0 wired, so this is FMC SDRAM bank 1. Swept word by word over all 8 Mbytes and held across 100 cold bring-ups, each ending in a read after a wait longer than the device's retention time -- the check that proves refresh is running."
+
+# --- the fitted devices -----------------------------------------------------------------------
+#
+# A CONTROLLER IS BROUGHT UP IN AN ORDER, AND THAT ORDER IS A CHIP FACT: it is written once, in
+# the controller's own block table, and it is the same on every board with this part. What is NOT
+# the same is WHICH DEVICE was soldered on, and that is what these two records carry.
+#
+# The chip's own manual draws the line for us. Three steps of its SDRAM initialization say "refer
+# to the SDRAM datasheet" for their number -- the settling delay, the auto-refresh burst, and the
+# mode-register word -- and those are exactly the three that appear below rather than there.
+#
+# AND TWO OF THESE NUMBERS ARE NOT CONSTANTS OF ANYTHING, which is the reason this is a stratum
+# and not a paragraph. Both are properties of a device AT A CLOCK:
+#
+#   * The SDRAM's REFRESH COUNT is derived, never stated. Its formula belongs to the controller,
+#     its retention specification to the device, and its clock to the plan -- so the record below
+#     states the retention specification and nothing else, and generation does the arithmetic per
+#     plan. Written down as a number it would be wrong the moment this board runs its bus faster.
+#   * The quad-SPI's DUMMY COUNT cannot be derived, and IT IS NOT EVEN REPRODUCIBLE ON THIS BOARD.
+#     One firmware, one board, one interface clock, measured on two days: it answered 6 / 6 / 6 for
+#     the three fast configurations and then 8 / 8 / 10. Both runs read a known payload back byte
+#     for byte a hundred times; neither is a mistake; and no clock changed between them, so the
+#     clock is not what separates them. Whatever does -- a volatile setting inside the device that
+#     another program can write, or margin that moves -- is a property of the part's CURRENT STATE
+#     rather than of the part.
+#
+#     So the counts recorded below are DATED OBSERVATIONS, not values to use. What a driver may
+#     rely on is the RANGE, and the walk: try each count and keep the first that reads back a
+#     payload you already know. That is the only check that can tell a right count from a wrong
+#     one, because a wrong count does not fail -- it shifts every byte and returns plausible
+#     garbage. A driver that wrote the observation below instead of walking would have worked in
+#     July and returned garbage in the same month.
+
+[memory.qspi.device]
+part = "16-Mbyte quad-SPI NOR"
+identity = 0x20BA18         # the JEDEC identity, read off the wire rather than transcribed.
+address_bits = 24
+chip_select_high_cycles = 2 # the MINIMUM CYCLE COUNT, not the field: the controller's field is
+                            # one less, so this becomes a field value of 1. A device property is
+                            # a count of cycles; turning it into a biased field is the
+                            # controller's business and generation's job.
+clock_idle = 0              # the clock rests LOW while chip select is high (the controller calls
+                            # this mode 0). A device expecting the other misreads its first bit.
+source = "Read on silicon over 400 cold bring-ups, in four read configurations, each preceded by a negative control that had to fail: the identity is what the part answered, and the configuration is the one that executed instructions out of the memory-mapped window 100 times out of 100."
+
+# The four read configurations, weakest to fastest. The instruction phase stays SINGLE-LINE in all
+# of them -- a quad read means quad DATA (and, for the last, quad address); the command that asks
+# for it is still sent one bit at a time, which is why the line counts are stated per phase rather
+# than as one "quad" flag.
+
+[[memory.qspi.reads]]
+name = "read"
+instruction = 0x03
+instruction_lines = 1
+address_lines = 1
+data_lines = 1
+clock_hz = 8000000
+dummy = 0                   # this command has NO dummy phase, which is what makes it the one a
+                            # driver can read a reference payload with before it knows any count.
+source = "100 of 100 cold bring-ups at an 8 MHz interface clock; the count was found by asking the part rather than by stating it, and the part answered 0."
+
+[[memory.qspi.reads]]
+name = "fast_read"
+instruction = 0x0B
+instruction_lines = 1
+address_lines = 1
+data_lines = 1
+clock_hz = 16000000
+dummy = 6
+dummy_datasheet = 8
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, where the part answered 6. Measured again on 2026-07-29 by the same firmware at the same clock, walking every count in the range rather than every second one, it answered 8 -- its datasheet's own figure -- and read back 100 of 100 at that. Both counts are observations of this part; the count is not a constant of it."
+
+[[memory.qspi.reads]]
+name = "quad_output_read"
+instruction = 0x6B
+instruction_lines = 1
+address_lines = 1
+data_lines = 4
+clock_hz = 16000000
+dummy = 6
+dummy_datasheet = 8
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, data on four lines and the address still on one, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 8 and read back 100 of 100 at that."
+
+[[memory.qspi.reads]]
+name = "quad_io_read"
+instruction = 0xEB
+instruction_lines = 1
+address_lines = 4
+data_lines = 4
+clock_hz = 16000000
+dummy = 6
+dummy_datasheet = 8
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, address and data both on four lines, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 10 -- the figure associated with this part's full-rate quad I/O -- and read back 100 of 100 at that. The largest gap of the four, on the fastest configuration."
+
+[memory.sdram.device]
+part = "128-Mbit SDRAM, 16 of its 32 data lines wired"
+bank = 1                    # SDNE0 and SDCKE0 are the wired pair, so this is the controller's
+                            # bank 1. Bank 2 would answer at a different window and does not exist.
+column_bits = 8
+row_bits = 12
+banks = 4                   # the device's own internal banks, which are not the controller's.
+data_bits = 16              # what this board WIRED.
+device_data_bits = 32       # what the device HAS. The two sizes above are this pair's arithmetic,
+                            # and generation checks that rather than taking either on trust.
+cas_latency = 2
+sdclk_hclk_periods = 2      # the memory clock's period is twice the bus clock's, so the memory
+                            # runs at half the bus. It reads like a multiplier and divides.
+read_burst = 1
+# THE SEVEN TIMINGS, IN NANOSECONDS, because a timing is a minimum in TIME and the controller's
+# fields are cycles. Generation converts at this plan's memory clock and ROUNDS UP, which is the
+# only direction that stays safe; a figure that needs more cycles than a field can hold is REFUSED
+# rather than truncated, so a board cannot quietly run this bus faster than its numbers allow.
+#
+# THESE ARE BOUNDS, NOT THE FITTED PART'S DATASHEET FIGURES, and the difference matters to anyone
+# reading them. This board's SDRAM part number has not been transcribed. Every figure below is an
+# order of magnitude longer than any device of this class requires, which puts timing off the list
+# of explanations for a failed bring-up at the cost of throughput nobody is measuring. When the
+# part's own numbers arrive this is a transcription, and every one of them will be smaller.
+tmrd_ns = 250               # load mode register to active
+txsr_ns = 875               # exit self-refresh to active
+tras_ns = 500               # row active time
+trc_ns = 875                # row cycle delay
+twr_ns = 375                # write recovery. NOT a device figure like its neighbors: the controller
+                            # requires TWR to cover the row it closes -- at least TRAS - TRCD and at
+                            # least TRC - TRCD - TRP -- and the second of those is 3 cycles here. A
+                            # shorter recovery is not refused by the controller and need not fail a
+                            # memory test, so this is the one timing set by a relation rather than
+                            # by the part.
+trp_ns = 250                # row precharge
+trcd_ns = 250               # row to column
+mode_register = 0x220       # the word loaded into the DEVICE's own mode register: burst length 1,
+                            # sequential, CAS 2, single-location writes. The one value here that
+                            # the chip's manual cannot tell you, because it is not the chip's.
+refresh_period_ns = 64000000 # the device holds a row for 64 ms...
+refresh_rows = 4096          # ...across 4096 of them. THE COUNT IS NOT HERE: it follows from
+                             # these two and the plan's memory clock, and stating it would fix
+                             # this board at one operating point.
+refresh_burst = 8
+settle_us = 100
+source = "All 8 accessible Mbytes swept word by word, then 100 cold bring-ups out of 100, each ending in a read after a wait of 300 ms -- several times the 64 ms the device is specified to hold for, which is the only check that proves refresh is running rather than that the memory has not decayed yet. The negative control drove the bank's select line as a plain output held high and failed 5 times out of 5. The settling delay and the auto-refresh burst are the reference manual's TYPICAL figures, not the fitted device's own: this board's part number has not been transcribed, and both are values where longer and more are safe."
+
+[[plans]]
+name = "hsi-16mhz"
+default = true
+source = "hsi"
+hsi_hz = 16000000           # the F7 reset clock: HSI at 16 MHz, no PLL, prescalers 1.
+hclk_hz = 16000000          # the AHB clock. Both memory controllers derive their own clock from
+                            # it -- the quad-SPI by a prescaler, the SDRAM by a period multiple --
+                            # so an operating point that binds external memory has to state it.
+                            # Under reset prescalers it equals HSI, which the generator verifies.
+pclk_hz = 16000000          # the APB clock feeding this board's bound USART. USART1 sits on
+                            # APB2, so this is PCLK2 -- which is exactly why the key is not
+                            # named for a bus number. Under reset prescalers it equals HSI,
+                            # which the generator verifies rather than takes.

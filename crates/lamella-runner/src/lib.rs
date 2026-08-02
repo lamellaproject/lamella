@@ -463,6 +463,30 @@ pub mod live {
     }
 }
 
+/// That nothing this crate SHIPS uses a 64-bit atomic, because the devices it is written for do not
+/// have one.
+///
+/// # Why the width is pinned
+///
+/// `AtomicU64` is not available here. ARMv7-M has no doubleword exclusive, so rustc gives
+/// `thumbv7em-none-eabi` a `max-atomic-width` of 32 and `core::sync::atomic::AtomicU64` DOES
+/// NOT EXIST on it. The type resolves on a host and on wasm and nowhere else -- so it compiles for
+/// every target that is not a microcontroller, and fails for **every device the identity was added
+/// for**.
+///
+/// # Why a source read rather than a build
+///
+/// The honest gate is LINKING A FIRMWARE for a target whose `max-atomic-width` is 32, and this test
+/// is not that. A `#[cfg(target_os = "none")]` binary is compiled by no host test run, so a type
+/// that resolves everywhere except a microcontroller passes every check a workspace test performs.
+/// This reads the source instead, which is a weaker instrument aimed at the same defect: it cannot
+/// prove a firmware links, only that this crate names no doubleword atomic for one to trip over.
+///
+/// What this closes is narrower and worth having anyway: the specific hazard is a KNOWN, NAMED
+/// property of a target this crate is compiled for, the check costs nothing, and it runs in the
+/// DEFAULT gate -- which is the one place the original defect had no chance of being seen.
+/// **It is a tripwire for one cause, not a substitute for building the firmware.** A different
+/// target-width mistake will walk straight past it.
 #[cfg(test)]
 mod device_portability {
     /// This file's own text. Read rather than reasoned about, for the same reason [`op_numbers`]
@@ -2345,10 +2369,10 @@ impl SubmitError {
 #[cfg(feature = "repl-session")]
 pub const OUT_OF_MEMORY_REASON: &str = "session out of memory -- the target must be reset to reclaim it";
 
-/// The room a submission is refused for want of, beyond its own delta PE. Sized from the MEASURED
-/// per-submission cost on a SAME54 -- ~2.8 KiB for a trivial submission, ~3.7 KiB for one that
-/// throws and catches -- with slack, so an ordinary submission clears it and the one that would
-/// have aborted mid-load is turned away first.
+/// The room a submission is refused for want of, beyond its own delta PE. Sized from the observed
+/// per-submission cost -- roughly 2.8 KiB for a trivial submission and 3.7 KiB for one that throws
+/// and catches -- with slack, so an ordinary submission clears it and the one that would have
+/// aborted mid-load is turned away first.
 #[cfg(feature = "repl-session")]
 const SUBMISSION_HEADROOM: usize = 8192;
 
@@ -3169,9 +3193,9 @@ mod tests {
     /// **A message type no target implements is REFUSED, not dropped.** The refusal names the type, so
     /// a host learns which thing is missing rather than that something is.
     ///
-    /// This is the property three lanes' feature detection assumes, and until now the target did the
-    /// opposite: it dropped the frame, and the host waited out a timeout it could not tell from a board
-    /// that had stopped answering.
+    /// This is the property a host's feature detection assumes. The alternative -- dropping the
+    /// frame -- makes the host wait out a timeout it cannot tell from a board that has stopped
+    /// answering.
     #[cfg(feature = "baked-image")]
     #[test]
     fn an_unimplemented_message_type_is_refused_and_the_refusal_names_it() {

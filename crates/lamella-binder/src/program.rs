@@ -910,6 +910,13 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
 /// message is the ordinary "The type or namespace name 'Name' could not be found", measured
 /// against csc rather than predicted, since CS0117 is what the shape suggests.
 ///
+/// MEASURED, AND IT DISSOLVED THE HAZARD THIS RULE WAS EXPECTED TO CARRY. The worry was that a
+/// name like `Missing` would be found as `System.Reflection.Missing` by an unqualified lookup into
+/// an un-imported namespace -- the trap that has cost this lane twice. It does not arise: csc
+/// answers CS0246 for `Missing` and for a pure nonsense name alike, so the diagnostic does not
+/// depend on type lookup at all, and neither does this. The test is membership in the ATTRIBUTE
+/// CLASS, which is a scoped question with one answer.
+///
 /// CS0181: the attribute constructor this application binds to takes a parameter whose type cannot
 /// be encoded as an attribute argument (24.1.3). An attribute's arguments are baked into metadata,
 /// so the legal set is exactly what the blob can carry.

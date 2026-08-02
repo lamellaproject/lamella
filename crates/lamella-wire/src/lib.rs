@@ -44,6 +44,26 @@ pub mod msg {
 
 /// What an [`msg::ERROR`] carries: why a frame was refused.
 ///
+/// # Why a refusal is a message rather than a silence
+///
+/// [`msg::ERROR`] is the answer to a message type a target does not implement. Without one, such a
+/// message is simply dropped and the host waits out its timeout -- and a timeout cannot be told apart from a board that
+/// has stopped answering, which is the single most expensive ambiguity in bringing a target up. The
+/// three explanations for silence are "I do not implement that", "I crashed", and "the cable is bad",
+/// and they are three different repairs.
+///
+/// # The payload shape, and a note on its history
+///
+/// Byte 0 is the reason. **What follows depends on the reason** rather than being free text: for
+/// [`error::UNKNOWN_MESSAGE_TYPE`] it is the one byte that was not understood, which is the whole of the
+/// useful information and needs no strings on a target counting flash.
+///
+/// # A refusal is NOT a [`Nak`]
+///
+/// [`msg::NAK`] answers a [`Hello`] whose version range does not overlap: the session cannot begin at
+/// all. A refusal happens inside a session that negotiated fine, about one frame. Keeping them apart
+/// matters because the remedies are opposite -- one says use a different protocol version, the other
+/// says this target does not do that thing and the rest of the session is unaffected.
 pub mod error {
     /// The message type is not one this target implements. Byte 1 is that type.
     pub const UNKNOWN_MESSAGE_TYPE: u8 = 0x01;

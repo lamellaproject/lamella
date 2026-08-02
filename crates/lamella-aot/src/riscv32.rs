@@ -1173,8 +1173,8 @@ pub fn lower_object_library(
 /// The object bytes are IDENTICAL to [`lower_object_library_statics`]'s; the report is observation
 /// only. It exists because a stub is a SILENT demotion -- a bare `ret` returns its first argument, so
 /// a stubbed predicate reads as `true` and a stubbed getter as a plausible value, indistinguishable
-/// from a real answer at the call site. RISC-V collected no such list until now, which is precisely
-/// how the string markers stayed unlowered on this backend's object path unnoticed. The arm32 twin is
+/// from a real answer at the call site. Without such a list, a string marker can stay unlowered on
+/// this backend's object path unnoticed. The arm32 twin is
 /// [`crate::arm32::lower_object_library_vtables_report`].
 pub fn lower_object_library_statics_report(
     funcs: &[Function],

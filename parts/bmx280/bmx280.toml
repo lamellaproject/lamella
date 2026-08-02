@@ -1,0 +1,284 @@
+# PART FAMILY: Bosch BMx280 environmental sensors -- the shared base of the BMP280 (pressure +
+# temperature) and the BME280 (which adds humidity). The two are register compatible by the
+# vendor's own statement, with a short list of documented exceptions that each member states.
+#
+# A PART IS NOT A CHIP WE RUN ON, which is why this tree is a sibling of csp/ rather than part of
+# it: a board states which BUSES exist, a part states its own IDENTITY, and a probe joins the two
+# at run time. Two boards of the same model can carry different parts at different addresses, so
+# an attachment is discovered rather than declared.
+#
+# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# deltas; the generator RESOLVES the base and emits a fully flattened table per part. Nothing
+# downstream ever reads an inherited value, because a value that is only ever inherited is pinned
+# in no emitted artifact and so cannot be checked for drift between languages.
+
+[table]
+kind = "device-base"
+family = "bmx280"
+sources = [
+    "Bosch BST-BME280-DS001 rev 1.24 (February 2024): memory map ch 5.3 table 18, register descriptions ch 5.4, compensation ch 4.2.3, trimming parameter layout table 16, interface ch 6 (I2C 6.2, SPI 6.3), BMP280 compatibility ch 5.2 table 17. Individual pages of that document still carry a 1.23_012022 footer; the register content cited here is unchanged between them.",
+]
+notes = [
+    "Register width is 8 bits throughout; the interface reads and writes registers, and multi-byte quantities are read as a BURST from a starting register. Reserved registers must not be written.",
+    "A burst read is required rather than convenient for a measurement: the part holds the whole data block steady in a shadow register for the duration of one burst, so byte-at-a-time reads can mix two conversions.",
+    "The trimming parameters are read from the part at start-up and are per-device. They are NOT constants and must not be baked into a driver.",
+]
+
+# --- buses -------------------------------------------------------------------------------------
+#
+# The register MAP is shared by both buses; the ADDRESS TRANSFORM is not. Each bus therefore
+# states its own, as a named dispatch rather than an expression -- a part that declared only a bus
+# kind would produce an SPI path wrong by 0x80, and wrong only on writes.
+
+[buses.i2c]
+kind = "i2c"
+# The register address is written as-is on both paths; a read is a write of the register address
+# followed by a repeated start and the data phase.
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "Releasing the bus between the address and data phases instead of issuing a repeated start allows another master to move the part's internal address pointer between them."
+
+[buses.spi]
+kind = "spi"
+# SPI steals bit 7 of the register byte as the direction flag: 1 reads, 0 writes.
+register_read_transform = "set-bit7"
+register_write_transform = "clear-bit7"
+read_protocol = "single-chip-select-address-then-clock-data"
+modes = [0, 3]
+notes = "The address byte and the data must ride ONE chip-select assertion; deasserting between them aborts the burst. The first byte clocked back is the response to the address byte and carries no data. Both SPI mode 0 and mode 3 are supported; the choice belongs to the board, not to the part."
+
+# --- address -----------------------------------------------------------------------------------
+#
+# The PART states a base address and which pin contributes which bit. Which way a strap is
+# actually tied is CARRIER or BOARD truth and is deliberately absent here -- a default would be a
+# guess that compiles.
+
+[address]
+bus = "i2c"
+base = 0x76
+notes = "The SDO pin cannot be left floating; a floating SDO leaves the address undefined."
+
+[[address.straps]]
+pin = "SDO"
+bit = 0
+low = 0x76
+high = 0x77
+
+# --- identity ----------------------------------------------------------------------------------
+#
+# Required of every part. A member states its own accepted values; the base states only where to
+# look, because the whole point of the register is that the members differ there.
+
+[identity]
+reg = 0xD0
+width = 8
+notes = "Verified before any other access. It is what tells two parts sharing a footprint apart, and what distinguishes a real part from a declared simulator -- a generated simulator answers this register with its own part's value."
+
+# --- registers ---------------------------------------------------------------------------------
+#
+# `reg` is an OPERAND written on the wire, NOT an offset added to an instance base. The distinction
+# is load-bearing: this tree's chip blocks use `offset` for base-relative addressing, and a device
+# register composed as `base + offset` would compile, emit, and be silently wrong.
+
+[registers.id]
+reg = 0xD0
+width = 8
+access = "read-only"
+fields = { chip_id = [0, 8] }
+
+[registers.reset]
+reg = 0xE0
+width = 8
+access = "write-only"
+fields = { reset = [0, 8] }
+notes = "Writing 0xB6 performs a power-on-reset; any other value is ignored. Reads return 0x00."
+
+[registers.status]
+reg = 0xF3
+width = 8
+access = "read-only"
+fields = { im_update = [0, 1], measuring = [3, 1] }
+notes = "measuring is 1 while a conversion is running and returns to 0 when the result has been transferred to the data registers. im_update is 1 while the trimming parameters are being copied out of non-volatile memory."
+
+[registers.ctrl_meas]
+reg = 0xF4
+width = 8
+access = "read-write"
+fields = { mode = [0, 2], osrs_p = [2, 3], osrs_t = [5, 3] }
+notes = "Holds the temperature and pressure oversampling and the power mode."
+
+[registers.config]
+reg = 0xF5
+width = 8
+access = "read-write"
+fields = { spi3w_en = [0, 1], filter = [2, 3], t_sb = [5, 3] }
+notes = "Writes to config in normal mode may be ignored; set it in sleep mode. The t_sb ENCODING DIFFERS BETWEEN FAMILY MEMBERS and is stated by each member rather than here."
+
+[registers.press]
+reg = 0xF7
+width = 24
+access = "read-only"
+fields = { press_msb = [16, 8], press_lsb = [8, 8], press_xlsb = [4, 4] }
+notes = "20 bits, MSB first, left justified: the value is (msb << 12) | (lsb << 4) | (xlsb >> 4)."
+
+[registers.temp]
+reg = 0xFA
+width = 24
+access = "read-only"
+fields = { temp_msb = [16, 8], temp_lsb = [8, 8], temp_xlsb = [4, 4] }
+notes = "20 bits, MSB first, left justified, decoded like press."
+
+# --- enumerations ------------------------------------------------------------------------------
+
+[enums.oversampling]
+skipped = 0
+x1 = 1
+x2 = 2
+x4 = 3
+x8 = 4
+x16 = 5
+notes = "Values 6 and 7 also select x16. Skipped leaves the corresponding output register at its reset value, which is why a driver must refuse the read rather than return it."
+
+[enums.mode]
+sleep = 0
+forced = 1
+normal = 3
+notes = "Value 2 also selects forced mode. Forced takes one measurement and returns to sleep, which is the mode a polled driver uses."
+
+[enums.filter]
+off = 0
+x2 = 1
+x4 = 2
+x8 = 3
+x16 = 4
+
+# The value a driver WRITES to `reset`, stated as data rather than only in that register's prose.
+# It reached this table as a sentence, and a sentence is not something a generated artifact can
+# carry: a driver reading the emission still had to transcribe 0xB6 by hand, which is the one
+# transcription this tree exists to remove. Found by writing a driver against the emitted table.
+[enums.reset_command]
+soft_reset = 0xB6
+notes = "Any other value written to reset is ignored, so this is a command set of exactly one member rather than a field with a range."
+
+# --- calibration ---------------------------------------------------------------------------------
+#
+# Trimming parameters are READ from the part rather than being constants, which is this schema's
+# one genuine departure from a chip block's calibration record. What is described is the READ --
+# which registers, what width, what signedness, what byte order. `form` stays a NAMED DISPATCH into
+# hand-written per-language arithmetic: generating a struct READER is in scope, generating the
+# compensation math is not.
+#
+# SIGNEDNESS IS LOAD-BEARING AND IS NOT UNIFORM: dig_T1 and dig_P1 are UNSIGNED and every other
+# 16-bit word here is SIGNED. Getting the first two backwards yields a driver that compiles, runs,
+# and reports a plausible but wrong pressure.
+
+[calibration.temperature]
+form = "bmx280-t-int32"
+byte_order = "little"
+output_scale = "centi-degrees-celsius"
+notes = "The vendor publishes three compensation paths and marks this fixed-point one the recommended calculation; the floating-point variant is recommended only for PC applications and the simplified 32-bit variant is documented as having reduced accuracy. The integer path is also bit-exact, so per-language versions can be checked against each other on the ARITHMETIC and not only on the constants."
+
+[[calibration.temperature.read]]
+name = "dig_T1"
+reg = 0x88
+width = 16
+signed = false
+
+[[calibration.temperature.read]]
+name = "dig_T2"
+reg = 0x8A
+width = 16
+signed = true
+
+[[calibration.temperature.read]]
+name = "dig_T3"
+reg = 0x8C
+width = 16
+signed = true
+
+[calibration.pressure]
+form = "bmx280-p-int64"
+byte_order = "little"
+output_scale = "q24.8-pascals"
+depends_on = ["temperature"]
+notes = "The pressure compensation consumes the fine-resolution temperature the temperature compensation produces, so a pressure reading is meaningless unless a temperature has been compensated from the SAME measurement. The arithmetic needs 64 bits: the intermediates genuinely exceed 32."
+
+[[calibration.pressure.read]]
+name = "dig_P1"
+reg = 0x8E
+width = 16
+signed = false
+
+[[calibration.pressure.read]]
+name = "dig_P2"
+reg = 0x90
+width = 16
+signed = true
+
+[[calibration.pressure.read]]
+name = "dig_P3"
+reg = 0x92
+width = 16
+signed = true
+
+[[calibration.pressure.read]]
+name = "dig_P4"
+reg = 0x94
+width = 16
+signed = true
+
+[[calibration.pressure.read]]
+name = "dig_P5"
+reg = 0x96
+width = 16
+signed = true
+
+[[calibration.pressure.read]]
+name = "dig_P6"
+reg = 0x98
+width = 16
+signed = true
+
+[[calibration.pressure.read]]
+name = "dig_P7"
+reg = 0x9A
+width = 16
+signed = true
+
+[[calibration.pressure.read]]
+name = "dig_P8"
+reg = 0x9C
+width = 16
+signed = true
+
+[[calibration.pressure.read]]
+name = "dig_P9"
+reg = 0x9E
+width = 16
+signed = true
+
+# --- sequences -----------------------------------------------------------------------------------
+#
+# Declarative steps, so the description is transport agnostic: the same sequence describes an I2C
+# transaction, an SPI one, and a call through a host import.
+
+[[sequences.forced_measurement]]
+step = "write-field"
+register = "ctrl_meas"
+field = "mode"
+value = 1
+
+[[sequences.forced_measurement]]
+step = "poll-field-until"
+register = "status"
+field = "measuring"
+value = 0
+bounded = true
+notes = "Bounded so an absent or wedged part surfaces as an error rather than a hang."
+
+[[sequences.forced_measurement]]
+step = "burst-read"
+from = "press"
+length_from = "measurement.burst_length"
+notes = "The base states WHERE to find the length and each member states the value, the same split the identity register uses -- humidity is what changes it, so the base cannot know it."

@@ -1,0 +1,67 @@
+# PART: Bosch BMP280 pressure and temperature sensor.
+#
+# The family base without humidity. THE POINT OF HOW SHORT THIS FILE IS: the base was drawn around
+# what both members share rather than around the richer member, so the smaller part states only
+# what it genuinely differs by. Drawn the other way, this file would have had to switch features
+# back OFF -- which is the check a family of one member cannot run.
+#
+# SOURCING, AND IT IS SECONDARY. Every fact below comes from the BME280 datasheet's own
+# BMP280-compatibility section: a primary vendor statement about this part, but not this part's
+# own datasheet. Nothing here is written from memory or inferred from a third-party driver, and
+# nothing the family base states about pressure or temperature is contradicted by that section.
+#
+# WHAT THIS PART THEREFORE DOES NOT STATE, because the compatibility section does not cover it:
+# power figures, timing, and the measurement-duration table a non-blocking driver would need.
+# Treat those as absent rather than defaulted.
+
+[table]
+kind = "device"
+family = "bmx280"
+part = "bmp280"
+base = "bmx280"
+sources = [
+    "Bosch BST-BME280-DS001 rev 1.24 (February 2024) ch 5.2 'Register compatibility to BMP280', table 17: the vendor's own statement that pressure and temperature control and readout are identical between the two parts, plus the complete list of exceptions.",
+]
+notes = [
+    "The vendor states the BME280 is downward register compatible with this part: pressure and temperature control and readout are identical. Four registers are documented as differing, and all four are stated here or in the base.",
+]
+
+# --- identity: THREE accepted values, not one ----------------------------------------------------
+#
+# The identity register does NOT hold a single value for this part. Engineering samples answer
+# 0x56 or 0x57 and mass-production parts answer 0x58, all three documented by the vendor as valid
+# chip_id readings for a BMP280. A driver that accepts only the mass-production value rejects a
+# genuine part -- so an identity is a SET, and a schema that models it as one value is wrong for
+# the second part the catalogue describes rather than the hundredth.
+
+[identity]
+reg = 0xD0
+width = 8
+values = [0x56, 0x57, 0x58]
+notes = "0x56 and 0x57 are samples; 0x58 is mass production."
+
+# --- the burst is shorter, because there is no humidity ------------------------------------------
+#
+# The resolution difference is worth recording even though no register moves: on this part the
+# pressure and temperature resolution depends only on osrs_p and osrs_t, whereas on the BME280 that
+# holds only with the filter off. Same registers, different meaning for a given setting.
+
+[measurement]
+burst_length = 6
+resolution_bits = "16..20, depending only on the oversampling setting"
+
+# --- the standby encoding this member does NOT share ---------------------------------------------
+#
+# MICROSECONDS, as integers, for the same reason the sibling gives: the catalogue has to work on a
+# no-float tier, and one 0.5 would force a float into every emitted language.
+
+[enums.standby_us]
+"0" = 500
+"1" = 62500
+"2" = 125000
+"3" = 250000
+"4" = 500000
+"5" = 1000000
+"6" = 2000000
+"7" = 4000000
+notes = "Codes 6 and 7 differ from the BME280's, which uses 10 ms and 20 ms for the same two codes."

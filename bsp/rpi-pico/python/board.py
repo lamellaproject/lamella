@@ -15,9 +15,9 @@ CARRIER = {
     "role": "uart0",
 }
 
-# Per-role descriptor dicts: the same values the C# PicoBindings class carries as consts,
-# under one mechanical renaming rule -- an UPPER_SNAKE const there is a lowercase key here,
-# grouped by the role it belongs to.
+# Per-role descriptor dicts, grouped by the role each belongs to.
+# Emitted from this board's facts, like every other language's support for it:
+# an UPPER_SNAKE name in the shared facts is a lowercase key here.
 FACTS = {
     "uart0": {
         "kind": "uart",
@@ -38,8 +38,9 @@ PLANS = {
     "pll-125-48": {"default": False, "source": "pll_sys + pll_usb", "xosc_hz": 12000000, "clk_sys_hz": 125000000, "pll_sys_fbdiv": 125, "pll_sys_postdiv1": 6, "pll_sys_postdiv2": 2, "clk_usb_hz": 48000000, "pll_usb_fbdiv": 100, "pll_usb_postdiv1": 5, "pll_usb_postdiv2": 5, "clk_peri_hz": 12000000},
 }
 
-# On-board devices + module control lines (the C# <NAME>_PORT_BASE/_PIN/_MASK/
-# _ACTIVE_LOW consts, dict-shaped): PORT group base + pin index + mask + polarity.
+# On-board devices + module control lines: PORT group base + pin index + mask + polarity.
+# Emitted from this board's facts; each supported language states the same set in its
+# own idiom.
 DEVICES = {
 }
 

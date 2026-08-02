@@ -41,8 +41,10 @@ float = ["lamella-load/float"]
 typed-references = ["lamella-load/typed-references"]
 # profile-full's surface WITHOUT floating point: the full NETMF type/exception/collection surface,
 # no `float` and no transcendentals. It exists because a part can be roomy enough for the surface and
-# not for the float BCL on top of it it is spelled out, and the two lists are meant to stay in step
-# apart from `float` / `math-transcendental`.
+# not for the float BCL on top of it -- float costs roughly 62 KiB of flash, which can be the
+# difference between fitting a 256 KB plane and overflowing it. Cargo features are additive, so this cannot be
+# "profile-full minus float"; it is spelled out, and the two lists are meant to stay in step apart
+# from `float` / `math-transcendental`.
 profile-no-float = [
     "lamella-load/NETMFv4_4", "lamella-load/exceptions", "lamella-load/gc",
     "lamella-load/finalizers", "typed-references", "lamella-load/varargs",

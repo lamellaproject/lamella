@@ -1,7 +1,8 @@
 //! The bsp-gen CLI: `gen` writes a v0 table's generated bindings under the bsp root; `check`
 //! verifies the checked-in emission is regeneration-fresh (the CI/no-drift gate);
 //! `gen-family`/`check-family` do the same for a whole v2 family (its layout + instances
-//! classes and every board that names it).
+//! classes and every board that names it); `gen-parts`/`check-parts` do the same for a part
+//! family under `parts/` (each part's flattened table, in every language).
 
 use std::path::Path;
 use std::process::ExitCode;

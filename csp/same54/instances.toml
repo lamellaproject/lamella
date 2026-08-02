@@ -1,7 +1,7 @@
 # INSTANCE map for the SAM E54 family -- identity-first: only the placed block copies
 # appear, bases-only. The E54's per-instance
 # clock routing (MCLK bank enables + GCLK peripheral channels) is richer than the SAMD21's;
-# its record shape is ruled with the family's first generated driver, not guessed here.
+# its record shape is settled alongside the family's first generated driver, not guessed here.
 
 [table]
 kind = "instances"
