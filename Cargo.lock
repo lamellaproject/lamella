@@ -291,12 +291,13 @@ dependencies = [
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
  "lamella-elf",
+ "lamella-generics",
  "lamella-ir",
  "lamella-link",
  "lamella-metadata",
+ "lamella-probe",
  "lamella-probe-core",
  "lamella-token",
- "lamella-usbhid",
 ]
 
 [[package]]
@@ -351,14 +352,24 @@ name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-reactor",
  "lamella-token",
+ "lamella-wtf8",
  "libm",
+]
+
+[[package]]
+name = "lamella-cli"
+version = "0.0.0"
+dependencies = [
+ "lamella-bsp-gen",
 ]
 
 [[package]]
 name = "lamella-cmsis-dap"
 version = "0.0.0"
 dependencies = [
+ "lamella-probe",
  "lamella-probe-core",
  "lamella-usbbulk",
  "lamella-usbhid",
@@ -375,6 +386,7 @@ dependencies = [
  "lamella-firmware",
  "lamella-ir",
  "lamella-link",
+ "lamella-probe",
  "lamella-probe-core",
  "lamella-py-frontend",
  "lamella-usbhid",
@@ -385,6 +397,7 @@ name = "lamella-cmsis-dap-rp2350"
 version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
+ "lamella-probe",
  "lamella-probe-core",
  "lamella-usbbulk",
 ]
@@ -407,6 +420,7 @@ dependencies = [
  "lamella-probe",
  "lamella-probe-core",
  "lamella-stlink",
+ "lamella-usbbulk",
  "lamella-usbhid",
 ]
 
@@ -438,10 +452,12 @@ dependencies = [
  "lamella-aot",
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-nrf",
+ "lamella-cmsis-dap-stm32",
  "lamella-dap",
  "lamella-debug-backend",
  "lamella-metadata",
  "lamella-probe-core",
+ "lamella-stlink",
  "lamella-usbhid",
 ]
 
@@ -489,6 +505,16 @@ name = "lamella-gc"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-generics"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil",
+ "lamella-ir",
+ "lamella-metadata",
+ "lamella-token",
+]
+
+[[package]]
 name = "lamella-heap"
 version = "0.0.0"
 
@@ -507,9 +533,11 @@ dependencies = [
 name = "lamella-load"
 version = "0.0.0"
 dependencies = [
+ "lamella-aot",
  "lamella-cil",
  "lamella-cil-runtime",
  "lamella-fs-fat",
+ "lamella-generics",
  "lamella-metadata",
  "lamella-token",
 ]
@@ -582,6 +610,9 @@ version = "0.0.0"
 [[package]]
 name = "lamella-py-bytecode"
 version = "0.0.0"
+dependencies = [
+ "lamella-wtf8",
+]
 
 [[package]]
 name = "lamella-py-frontend"
@@ -602,9 +633,15 @@ dependencies = [
  "lamella-gc",
  "lamella-py-bytecode",
  "lamella-py-frontend",
+ "lamella-reactor",
  "lamella-unicode",
+ "lamella-wtf8",
  "libm",
 ]
+
+[[package]]
+name = "lamella-reactor"
+version = "0.0.0"
 
 [[package]]
 name = "lamella-repl"
@@ -657,6 +694,7 @@ dependencies = [
 name = "lamella-stlink"
 version = "0.0.0"
 dependencies = [
+ "lamella-cmsis-dap-stm32",
  "lamella-probe-core",
  "lamella-usbbulk",
 ]
@@ -754,6 +792,7 @@ dependencies = [
 name = "lamella-wch-link"
 version = "0.0.0"
 dependencies = [
+ "lamella-probe",
  "lamella-usbbulk",
 ]
 
@@ -787,6 +826,10 @@ dependencies = [
  "serde_json",
  "serialport",
 ]
+
+[[package]]
+name = "lamella-wtf8"
+version = "0.0.0"
 
 [[package]]
 name = "lcsc"

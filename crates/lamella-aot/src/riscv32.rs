@@ -7359,9 +7359,9 @@ mod tests {
     }
 
     /// The emitted OBJECT must carry the literal in THIS BUILD's storage encoding. Asserting on the
-    /// shared blob builder alone would not catch what this is here for: this backend used to pack
-    /// UTF-16 units two per word right here, so `--features riscv32,string-utf8` was accepted and
-    /// silently produced a UTF-16 image. The check has to be on the bytes the backend emits.
+    /// shared blob builder alone would not catch what this is here for: a backend that packed UTF-16
+    /// units two per word right here would accept `--features riscv32,string-utf8` and silently
+    /// produce a UTF-16 image. The check has to be on the bytes the backend emits.
     #[test]
     fn the_emitted_object_carries_the_literal_in_this_builds_storage_tier() {
         let main = Function {

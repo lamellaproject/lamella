@@ -1,0 +1,21 @@
+[package]
+name = "lamella-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The `lamella` command-line tool: the developer-facing surface over the toolchain."
+
+[[bin]]
+name = "lamella"
+path = "src/main.rs"
+
+[dependencies]
+# The chip/board fact strata and the fit verdict computed from them. The CLI is a CONSUMER of
+# that rule, never a second implementation of it: the same function answers the MCP tool and the
+# editor, so a board's budget cannot mean one thing on one surface and another elsewhere.
+lamella-bsp-gen = { path = "../lamella-bsp-gen" }
+
+[lints]
+workspace = true

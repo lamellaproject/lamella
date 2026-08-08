@@ -9,6 +9,7 @@ BOARD_VENDOR = "St"
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
 # below, never through a surface-private enum.
 CODEC_I2C = "codec-i2c"
+HEADER_I2C = "header-i2c"
 VCP = "vcp"
 
 CARRIER = {
@@ -19,9 +20,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "codec-i2c": {
         "kind": "i2c",
+        "driver_family": "stm32f7-i2c",
         "instance": "i2c3",
         "base": 0x40005C00,
         "rcc_en_reg": 0x40023840,
@@ -49,8 +56,39 @@ FACTS = {
         "timingr_100k_hsi_16mhz": 0x30420F13,
         "timingr_400k_hsi_16mhz": 0x10320309,
     },
+    "header-i2c": {
+        "kind": "i2c",
+        "driver_family": "stm32f7-i2c",
+        "instance": "i2c1",
+        "base": 0x40005400,
+        "rcc_en_reg": 0x40023840,
+        "rcc_en_mask": 0x200000,
+        "kernel_hz": 16000000,
+        "scl_port_rcc_en_reg": 0x40023830,
+        "scl_port_rcc_en_mask": 0x2,
+        "scl_moder_reg": 0x40020400,
+        "scl_moder_mask": 0x30000,
+        "scl_moder_value": 0x20000,
+        "scl_afr_reg": 0x40020424,
+        "scl_afr_mask": 0xF,
+        "scl_afr_value": 0x4,
+        "sda_port_rcc_en_reg": 0x40023830,
+        "sda_port_rcc_en_mask": 0x2,
+        "sda_moder_reg": 0x40020400,
+        "sda_moder_mask": 0xC0000,
+        "sda_moder_value": 0x80000,
+        "sda_afr_reg": 0x40020424,
+        "sda_afr_mask": 0xF0,
+        "sda_afr_value": 0x40,
+        "otyper_reg": 0x40020404,
+        "otyper_scl_mask": 0x100,
+        "otyper_sda_mask": 0x200,
+        "timingr_100k_hsi_16mhz": 0x30420F13,
+        "timingr_400k_hsi_16mhz": 0x10320309,
+    },
     "vcp": {
         "kind": "uart",
+        "driver_family": "stm32f7-usart",
         "instance": "usart1",
         "base": 0x40011000,
         "rcc_en_reg": 0x40023844,
@@ -74,6 +112,28 @@ FACTS = {
         "rx_afr_value": 0x70000000,
         "brr_115200_hsi_16mhz": 0x8B,
     },
+}
+
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "usart1": {"block": "usart", "base": 0x40011000, "rcc_en_off": 0x44, "rcc_en_bit": 0x4},
+    "gpioa": {"block": "gpio", "base": 0x40020000, "rcc_en_off": 0x30, "rcc_en_bit": 0x0},
+    "gpiob": {"block": "gpio", "base": 0x40020400, "rcc_en_off": 0x30, "rcc_en_bit": 0x1},
+    "gpioc": {"block": "gpio", "base": 0x40020800, "rcc_en_off": 0x30, "rcc_en_bit": 0x2},
+    "gpiod": {"block": "gpio", "base": 0x40020C00, "rcc_en_off": 0x30, "rcc_en_bit": 0x3},
+    "gpioe": {"block": "gpio", "base": 0x40021000, "rcc_en_off": 0x30, "rcc_en_bit": 0x4},
+    "gpiof": {"block": "gpio", "base": 0x40021400, "rcc_en_off": 0x30, "rcc_en_bit": 0x5},
+    "gpiog": {"block": "gpio", "base": 0x40021800, "rcc_en_off": 0x30, "rcc_en_bit": 0x6},
+    "gpioh": {"block": "gpio", "base": 0x40021C00, "rcc_en_off": 0x30, "rcc_en_bit": 0x7},
+    "rcc": {"block": "rcc", "base": 0x40023800},
+    "i2c1": {"block": "i2c", "base": 0x40005400, "rcc_en_off": 0x40, "rcc_en_bit": 0x15},
+    "i2c3": {"block": "i2c", "base": 0x40005C00, "rcc_en_off": 0x40, "rcc_en_bit": 0x17},
+    "fmc": {"block": "fmc", "base": 0xA0000000, "rcc_en_off": 0x38, "rcc_en_bit": 0x0},
+    "quadspi": {"block": "quadspi", "base": 0xA0001000, "rcc_en_off": 0x38, "rcc_en_bit": 0x1},
 }
 
 PLANS = {

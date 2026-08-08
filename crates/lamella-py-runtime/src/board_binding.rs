@@ -73,7 +73,7 @@ fn require_kind(
 ) -> Result<(), Trap> {
     let actual = model
         .dict_get_str(descriptor, "kind")
-        .and_then(|value| model.str_value(value))
+        .and_then(|value| model.str_name(value))
         .map(alloc::string::ToString::to_string);
     match actual {
         Some(ref found) if found == kind => Ok(()),

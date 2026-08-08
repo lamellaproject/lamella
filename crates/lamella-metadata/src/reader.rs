@@ -709,6 +709,73 @@ impl<'a> Assembly<'a> {
             .filter_map(move |index| self.member_ref(index))
     }
 
+    /// The declared type parameters of a generic type or method, as
+    /// `(number, flags, owner, name)` per `GenericParam` row (ECMA-335 4th ed, II.22.20).
+    ///
+    /// `owner` is the raw `TypeOrMethodDef` coded index, NOT a [`Token`]: it is a 1-bit tag
+    /// (II.24.2.6) with `TypeDef` = 0 and `MethodDef` = 1, so a `TypeDef` row `r` reads as `r << 1`.
+    /// It is returned encoded because decoding it here would silently invent a token for a row
+    /// index that may not exist, and a caller comparing against a known owner does not need it
+    /// decoded.
+    pub fn generic_params(&self) -> impl Iterator<Item = (u32, u32, u32, Option<&'a str>)> + '_ {
+        (1..=self.tables.row_count(table::GENERIC_PARAM)).filter_map(move |index| {
+            let row = self.tables.row(table::GENERIC_PARAM, index)?;
+            Some((
+                row.raw(0),
+                row.raw(1),
+                row.raw(2),
+                self.image.strings().get(row.raw(3)).ok(),
+            ))
+        })
+    }
+
+    /// Every generic METHOD's declared type-parameter names, keyed by the owning `MethodDef` row
+    /// and ordered by the `Number` column -- the `!!0` half of `GenericParam`, where
+    /// [`Assembly::type_parameter_names`] reads the `!0` half.
+    #[must_use]
+    pub fn method_type_parameter_names(&self) -> BTreeMap<u32, Vec<&'a str>> {
+        let mut by_owner: BTreeMap<u32, Vec<(u32, &'a str)>> = BTreeMap::new();
+        for (number, _flags, owner, name) in self.generic_params() {
+            if owner & 1 == 0 {
+                continue;
+            }
+            if let Some(name) = name {
+                by_owner.entry(owner >> 1).or_default().push((number, name));
+            }
+        }
+        by_owner
+            .into_iter()
+            .map(|(owner, mut parameters)| {
+                parameters.sort_by_key(|&(number, _)| number);
+                (owner, parameters.into_iter().map(|(_, name)| name).collect())
+            })
+            .collect()
+    }
+
+    /// Every generic TYPE's declared type-parameter names, keyed by the owning `TypeDef` row and
+    /// ordered by the `Number` column (II.22.20). Indexed once for the whole assembly, like
+    /// [`Assembly::param_array_params`], so a caller walking every type does not rescan the table
+    /// per type. Method type parameters are excluded -- the owner tag selects `TypeDef` only.
+    #[must_use]
+    pub fn type_parameter_names(&self) -> BTreeMap<u32, Vec<&'a str>> {
+        let mut by_owner: BTreeMap<u32, Vec<(u32, &'a str)>> = BTreeMap::new();
+        for (number, _flags, owner, name) in self.generic_params() {
+            if owner & 1 != 0 {
+                continue;
+            }
+            if let Some(name) = name {
+                by_owner.entry(owner >> 1).or_default().push((number, name));
+            }
+        }
+        by_owner
+            .into_iter()
+            .map(|(owner, mut parameters)| {
+                parameters.sort_by_key(|&(number, _)| number);
+                (owner, parameters.into_iter().map(|(_, name)| name).collect())
+            })
+            .collect()
+    }
+
     /// The unmanaged import name of a P/Invoke method -- its `DllImport` entry point -- from the
     /// `ImplMap` table (II.22.22): `[MappingFlags(u16), MemberForwarded, ImportName, ImportScope]`.
     /// Returns the `ImportName` of the row whose `MemberForwarded` is this `MethodDef` rid, or `None`
@@ -799,6 +866,26 @@ impl<'a> Assembly<'a> {
         self.tables
             .row(table::METHOD_SPEC, token.row())
             .map(|row| row.token(0))
+    }
+
+    /// The type ARGUMENTS a `MethodSpec` token supplies at its call site (II.22.29's `Instantiation`
+    /// blob, II.23.2.15) -- the `int` of `Identity<int>(..)`.
+    ///
+    /// The companion to [`method_spec_method`](Self::method_spec_method), which answers WHICH generic
+    /// method a site instantiates; this answers WITH WHAT. A consumer needs both to substitute, and
+    /// having only the first is how a call binds to the open definition and leaves `!!0` unresolved.
+    ///
+    /// `None` if the token is not a `MethodSpec`, is out of range, or its blob does not decode --
+    /// a malformed instantiation is refused rather than reported as zero arguments, which would read
+    /// as a call to a non-generic method.
+    #[must_use]
+    pub fn method_spec_instantiation(&self, token: Token) -> Option<Vec<SigType>> {
+        if token.table() != table::METHOD_SPEC {
+            return None;
+        }
+        let row = self.tables.row(table::METHOD_SPEC, token.row())?;
+        let blob = self.image.blob().get(row.raw(1)).ok()?;
+        crate::signature::parse_method_spec(blob).ok()
     }
 
     /// The raw initializer bytes a `Field` token's RVA points at (II.22.18 `FieldRVA`) --
@@ -1624,6 +1711,21 @@ impl<'a> Method<'a> {
             .tables
             .row(table::METHOD_DEF, self.index)
             .map_or(0, |row| row.raw(0))
+    }
+
+    /// The method's signature as raw blob bytes, undecoded.
+    ///
+    /// For a caller that needs to inspect a signature this build's decoder declines -- a generic one,
+    /// today -- without that refusal becoming an absence. [`Self::signature`] is the decoding
+    /// accessor and answers `None` for exactly those; this answers the bytes either way, and the
+    /// caller does its own walk.
+    #[must_use]
+    pub fn signature_blob(&self) -> &'a [u8] {
+        self.assembly
+            .tables
+            .row(table::METHOD_DEF, self.index)
+            .and_then(|row| self.assembly.image.blob().get(row.raw(4)).ok())
+            .unwrap_or(&[])
     }
 
     /// The method's decoded signature.

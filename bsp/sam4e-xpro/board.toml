@@ -1,0 +1,56 @@
+# BOARD binding: the SAM4E Xplained Pro -- identity-first. No peripheral bindings yet, because the
+# SAM4E family has no generated driver; what this file states beyond identity is the board's two
+# control lines, which need no driver -- a control pin rides no alternate function.
+
+[table]
+kind = "board"
+board = "sam4e-xpro"
+vendor = "atmel"
+family = "sam4e"
+part = "atsam4e16e"
+board_model = 26            # lamella_wire::board_model::SAM4E_XPLAINED_PRO
+sources = [
+    "SAM4E Xplained Pro user guide (Atmel-42216): the mechanical buttons section and its pin table, the LED section and its pin table, and table 4-17 virtual COM port connections.",
+    "SAM4E Series datasheet (Atmel-11157) table 49-1 ordering codes, for the package and memory sizes the part id resolves to.",
+]
+notes = [
+    "The EDBG's virtual COM port reaches the target on PA9 (URXD0) and PA10 (UTXD0). Not a binding: a uart binding needs pin-map rows and this family has none yet, so the pins are recorded here and the binding lands with the family's driver.",
+    "This board's part carries an Ethernet MAC and two CAN controllers that its SAM4S and SAM4N siblings do not have. Nothing here binds them -- a binding needs an emission arm and there is no ethernet or can kind -- but they are the reason this board is worth having beyond a third Xplained Pro.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+#
+# The same EDBG bridge and the same DTR caveat as the family's siblings: the EDBG holds its UART
+# pins tristated until the host asserts DTR, so a board that says nothing is a board whose terminal
+# has not raised DTR rather than one that has not booted.
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG bridge's VCP.
+baud = 115200
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# BOTH ARE ACTIVE LOW AND THE GUIDE SAYS SO IN WORDS: a button "drive[s] the I/O line to GND", and
+# the LED "can be activated by driving the connected I/O line to GND".
+#
+# AND THE GUIDE STATES THE PULL-UP REQUIREMENT OUTRIGHT, which its siblings' guides do not: "in
+# order to read the button status the internal pull-up must be enabled". That is the same fact the
+# SAM4S Xplained's schematic had to be read for -- there the only pull-up in the block is marked
+# do-not-populate -- and it is worth carrying on the row rather than in a driver's memory, because
+# a pin left without it floats and presents as a button randomly already pressed.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PD22"
+active = "low"
+source = "SAM4E Xplained Pro user guide (Atmel-42216), LED connections: one yellow LED0 on PD22, activated by driving the connected I/O line to GND."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA2"
+active = "low"
+source = "SAM4E Xplained Pro user guide (Atmel-42216), mechanical buttons: SW0 on PA2; a button drives the I/O line to GND when pressed, and the guide adds that reading the button status requires the internal pull-up to be enabled. The other mechanical button is RESET, wired to NRST rather than to a port pin, so it is not a row here."

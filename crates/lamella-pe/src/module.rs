@@ -347,6 +347,33 @@ impl ImageBuilder {
         Token::new(table::TYPE_DEF, row)
     }
 
+    /// Adds a `GenericParam` row (ECMA-335 4th ed, II.22.20): one declared type parameter of a
+    /// generic type or generic method.
+    ///
+    /// `owner` is the `TypeDef` or `MethodDef` that declares it, `number` its zero-based position
+    /// left-to-right, `flags` a `GenericParamAttributes` bitmask (II.23.1.7: the variance bits
+    /// `0x0003` and the special-constraint bits `0x001C`), and `name` the parameter's source name --
+    /// which the spec calls "purely descriptive", used only by compilers and Reflection.
+    ///
+    /// **Rows may be added in any order.** Unlike a type's fields and methods, there is no list
+    /// column pointing here: II.22 is explicit that "GenericParam table reference entries in the
+    /// TypeDef table; there is no reference from the TypeDef table to the GenericParam table". The
+    /// finalizer sorts by `Owner`, and because that sort is stable, adding a declaration's
+    /// parameters in `number` order is what satisfies the secondary key.
+    pub fn add_generic_param(&mut self, owner: Token, number: u16, flags: u16, name: &str) -> Token {
+        let name = self.strings.intern(name);
+        let row = self.tables.add_row(
+            table::GENERIC_PARAM,
+            alloc::vec![
+                Column::U16(number),
+                Column::U16(flags),
+                Column::Coded(CodedIndex::TypeOrMethodDef, owner),
+                Column::StringRef(name),
+            ],
+        );
+        Token::new(table::GENERIC_PARAM, row)
+    }
+
     /// Interns a UTF-16 string in the `#US` heap, returning its `ldstr` token (the
     /// `0x70` user-string tag plus the heap offset).
     pub fn user_string(&mut self, text: &[u16]) -> Token {
@@ -378,6 +405,24 @@ impl ImageBuilder {
             .tables
             .add_row(table::TYPE_SPEC, alloc::vec![Column::BlobRef(blob)]);
         Token::new(table::TYPE_SPEC, row)
+    }
+
+    /// A `MethodSpec` row (II.22.29): one CALL SITE's instantiation of a generic method.
+    ///
+    /// `method` is the generic method's own token -- a `MethodDef` in this module or a `MemberRef`
+    /// to one elsewhere, the two members of the `MethodDefOrRef` coded index. `instantiation` is the
+    /// blob from [`method_spec_signature`](crate::method_spec_signature): the type ARGUMENTS at this
+    /// site.
+    pub fn method_spec(&mut self, method: Token, instantiation: &[u8]) -> Token {
+        let blob = self.blobs.intern(instantiation);
+        let row = self.tables.add_row(
+            table::METHOD_SPEC,
+            alloc::vec![
+                Column::Coded(CodedIndex::MethodDefOrRef, method),
+                Column::BlobRef(blob),
+            ],
+        );
+        Token::new(table::METHOD_SPEC, row)
     }
 
     /// A `TypeRef` to `namespace.name` in `mscorlib`, for naming an external type.
@@ -830,6 +875,7 @@ impl ImageBuilder {
         align4(&mut self.bodies);
         self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
         self.tables.sort_by_coded_column(table::METHOD_SEMANTICS, 2);
+        self.tables.sort_by_coded_column(table::GENERIC_PARAM, 2);
         let tables = self.tables.serialize(HeapSizes::default());
         let strings = self.strings.into_bytes();
         let guids = self.guids.into_bytes();
@@ -1022,6 +1068,72 @@ mod tests {
             Some(chain.to_vec())
         );
         assert_eq!(assembly.exception_base_chain(marker), None);
+    }
+
+    #[test]
+    fn a_generic_type_round_trips_its_generic_param_rows() {
+        let mut builder = ImageBuilder::new("generic.dll", "generic");
+        let object_type = builder.type_ref("System", "Object");
+        let boxed = builder.add_type("", "Box`1", object_type, 0x0010_0001);
+        let pair = builder.add_type("", "Pair`2", object_type, 0x0010_0001);
+
+        builder.add_generic_param(pair, 0, 0, "TKey");
+        builder.add_generic_param(boxed, 0, 0, "T");
+        builder.add_generic_param(pair, 1, 0, "TValue");
+
+        let pe = builder.finish(Token::new(0, 0), true);
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+
+        let box_owner = 2 << 1;
+        let pair_owner = 3 << 1;
+        let rows: Vec<(u32, u32, Option<&str>)> = assembly
+            .generic_params()
+            .map(|(number, _flags, owner, name)| (number, owner, name))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (0, box_owner, Some("T")),
+                (0, pair_owner, Some("TKey")),
+                (1, pair_owner, Some("TValue")),
+            ],
+            "sorted by owner, Number ascending within one owner, names intact"
+        );
+    }
+
+    #[test]
+    fn a_method_spec_round_trips_its_arguments_and_its_parent() {
+        use crate::signature::{TypeSig, generic_method_signature, method_spec_signature};
+        use lamella_metadata::SigType;
+
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        let object = builder.type_ref("System", "Object");
+        builder.add_type("", "C", object, 0x0000_0001);
+        let decoy_sig = method_signature(false, &[], &TypeSig::Void);
+        let decoy = builder.add_method("Decoy", &decoy_sig, &[0x2A], 0x0016, 0x0000, &[]);
+        let def_sig = generic_method_signature(false, 1, &[TypeSig::MVar(0)], &TypeSig::MVar(0));
+        let method = builder.add_method("Identity", &def_sig, &[0x2A], 0x0016, 0x0000, &[]);
+        assert_ne!(method, decoy, "the generic method is not the first MethodDef row");
+
+        let int_site = builder.method_spec(method, &method_spec_signature(&[TypeSig::Int32]));
+        let string_site = builder.method_spec(method, &method_spec_signature(&[TypeSig::String]));
+        assert_ne!(int_site, string_site, "two call sites are two rows");
+
+        let pe = builder.finish(Token::new(0, 0), true);
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+
+        for (site, expected) in [(int_site, SigType::I4), (string_site, SigType::String)] {
+            assert_eq!(
+                assembly.method_spec_method(site),
+                Some(method),
+                "the MethodSpec must name the generic method it instantiates"
+            );
+            assert_eq!(
+                assembly.method_spec_instantiation(site),
+                Some(alloc::vec![expected]),
+                "the call site's type argument must survive the blob round trip"
+            );
+        }
     }
 
     #[test]

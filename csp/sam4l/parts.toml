@@ -1,0 +1,23 @@
+# PARTS table for the SAM4L family: this vendor's low-power SAM4, and the one that shares least
+# with the rest of the line. The pin present-list is PARTIAL and evidence-only.
+
+[table]
+kind = "parts"
+family = "sam4l"
+sources = [
+    "ATSAM4L8/L4/L2 datasheet (Atmel-42023) table 44-1 ATSAM4LC8 sub-series ordering information: ATSAM4LC8CA-AU is 512 KB flash, 64 KB RAM, TQFP100",
+    "ATSAM4L8/L4/L2 datasheet (Atmel-42023) device identification table: ATSAM4LC8C (Rev A) is 512K/64K in a 100-pin package, CHIPID 0xAB0B0AE0 / 0x1400000F",
+]
+notes = [
+    "TWO STATEMENTS AGREE ON THE SIZES, which is worth having because the ordering table's size columns are merged cells spanning a row group -- the same shape that yields nothing at all when the SAM4E's is pulled out character by character. Here the device identification table gives 512K/64K independently, so neither reading rests on the other.",
+    "THE CHIP ID PAIR IS RECORDED BUT NOT MODELLED. 0xAB0B0AE0 / 0x1400000F is what this part answers with when its identification registers are read. No schema field carries a part's chip id today, so the pair lives in this note rather than being invented into the row -- and a consumer that wants to confirm which silicon it is talking to has somewhere to read it from in the meantime.",
+    "This part has the smallest RAM of any SAM4 here: 64 KB, against 80 on a SAM4N16C and 128 or 160 on the SAM4S and SAM4E parts. Its flash is half theirs.",
+]
+
+[[parts]]
+part = "atsam4lc8c"
+package = "TQFP100"
+flash = 0x80000
+ram = 0x10000
+pins = ["PC07", "PC24"]
+source = "ATSAM4L8/L4/L2 datasheet (Atmel-42023) table 44-1: ATSAM4LC8CA-AU / ATSAM4LC8CA-AUR, 512 KB flash, 64 KB RAM, TQFP100. The pin list is PARTIAL: PC07 and PC24 are here because a board's control lines place them, each cited on its own row in that board file. The pin names carry the datasheet's leading zero (PC07, not PC7) so that a present-list entry and a device row are the same string."

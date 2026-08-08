@@ -28,7 +28,8 @@ pub use pe::{COMIMAGE_FLAGS_ILONLY, cli_header, write_image, write_image_with_de
 pub use root::metadata_root;
 pub use root::metadata_root_from_streams;
 pub use signature::{
-    TypeSig, field_signature, local_signature, method_signature, property_signature, type_signature,
-    vararg_call_site_signature, vararg_method_signature,
+    TypeSig, field_signature, generic_method_signature, local_signature, method_signature,
+    method_spec_signature, property_signature, type_signature, vararg_call_site_signature,
+    vararg_method_signature,
 };
 pub use tables::{Column, HeapSizes, TableStream};

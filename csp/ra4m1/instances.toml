@@ -1,0 +1,25 @@
+# INSTANCE map: where each RA4M1 block copy sits. Offsets within a block are in blocks/.
+
+[table]
+kind = "instances"
+family = "ra4m1"
+record = ["base"]
+sources = [
+    "Renesas RA4M1 Group User's Manual: Hardware R01UH0887EJ0110 Rev.1.10 (Sep 29, 2023): section 19.2.1 Port Control Register 1 lists a PCNTR1 address per port -- PORT0 4004 0000h, PORT1 4004 0020h, PORT2 4004 0040h, PORT3 4004 0060h, PORT4 4004 0080h, PORT5 4004 00A0h, PORT6 4004 00C0h, PORT7 4004 00E0h, PORT8 4004 0100h, PORT9 4004 0120h",
+    "Renesas RA4M1 Group User's Manual: Hardware R01UH0887EJ0110 Rev.1.10: sections 10.2.2 to 10.2.5 give the Module Stop Control Registers as SYSTEM.MSTPCRA 4001 E01Ch, MSTP.MSTPCRB 4004 7000h, MSTP.MSTPCRC 4004 7004h and MSTP.MSTPCRD 4004 7008h; section 10.4 Module-Stop Function states that setting MSTPmi to 1 stops the module and clearing it to 0 cancels the module-stop state, and that after a reset is canceled all modules other than the DMAC, DTC and SRAMs are in the module-stop state",
+]
+notes = [
+    "The port bases step by 0x20, not by the 0x400 a port block is given on several other vendors' parts. Each port's four control registers occupy 16 bytes of that 32-byte stride.",
+    "Every base here was read from the address list printed at the head of the register's own section rather than stepped from PORT0, and both were then checked against each other: the printed list and a 0x20 stride agree across all ten ports, which is a check rather than a derivation.",
+    "Two ports are placed rather than the ten the part carries, because an instance map here is evidence-only: a row is added when a board reaches the block.",
+]
+
+[[instances]]
+name = "port0"
+block = "port"
+base = 0x40040000
+
+[[instances]]
+name = "port1"
+block = "port"
+base = 0x40040020

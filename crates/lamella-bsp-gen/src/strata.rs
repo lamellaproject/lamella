@@ -98,6 +98,27 @@ pub struct InstanceRow {
     pub block: String,
     /// The record values, in the family's declared record order. `-1` = does not apply.
     pub values: Vec<i64>,
+    /// The pin-name port group this instance IS, when the family states it (`"C"` on a row that
+    /// backs pins named `PC<n>`); empty when it states nothing. See [`InstanceRow::port_char`].
+    ///
+    /// STATED RATHER THAN GUESSED FROM THE INSTANCE NAME. A control pin resolves to a port
+    /// group's base address, and vendors do not agree on what that group is called: `PORTA`,
+    /// `PORT0`, `GPIOA`, `PIOA`, `SIO` and `IO_MUX` all name one, and one of those is numbered
+    /// where the rest are lettered. A derivation that pattern-matches the name has to grow by one
+    /// arm per vendor and is wrong -- silently, at generation time -- for the vendor after that.
+    /// One optional field per row costs a family that states nothing nothing.
+    pub port: String,
+}
+
+impl InstanceRow {
+    /// The port group this instance backs, lowercased to match [`split_pin`]; `None` when the
+    /// row states none.
+    #[must_use]
+    pub fn port_char(&self) -> Option<char> {
+        let mut chars = self.port.chars();
+        let first = chars.next()?.to_ascii_lowercase();
+        chars.next().is_none().then_some(first)
+    }
 }
 
 /// The instance map: every placed block copy of a family.
@@ -126,17 +147,51 @@ impl InstancesTable {
     }
 }
 
-/// One pin-function row: pin x function -> (instance, signal).
+/// The `instance` value a pin row states when NOTHING reaches the cell.
+///
+/// Reserved: an instance map may not place an instance under this name, so the value can never be
+/// read as a routing target that happens to be spelled unusually.
+pub const NO_CONTROLLER: &str = "none";
+
+/// One pin-function row: pin x function -> (instance, signal), or -> nothing.
+///
+/// A row takes ONE OF TWO SHAPES and every field of the shape it takes is required:
+/// - ROUTED: `instance` names an instance the family places, `signal` names the cell's signal.
+/// - UNROUTED: `instance = "none"` and there is no `signal`, because a cell that reaches no
+///   controller has no signal to name.
+///
+/// THE SECOND SHAPE EXISTS BECAUSE AN ABSENCE AND AN OMISSION ARE INDISTINGUISHABLE IN A TABLE
+/// THAT HAS ONLY ONE WAY TO SAY NEITHER. "No controller reaches this cell" is a fact somebody read
+/// out of a pin table; a missing `instance` is a field somebody did not fill in. Rendered as the
+/// same empty string they cannot be told apart, and they want opposite responses -- the first
+/// wants to be believed, the second wants a datasheet opened. The costlier mistake is the silent
+/// one: a cell believed to reach nothing is a cell nobody looks for a conflict on.
+///
+/// The unrouted shape is also the only one that cannot be checked by consequence. A routed row is
+/// held to the binding that uses it and, past that, to silicon; a row saying nothing is here has
+/// nothing downstream to disagree with it, so `source` is REQUIRED on it -- the citation is the
+/// only check it will ever get. Same rule the `[sourcing]` tier holds a part to: a claim that
+/// cannot be falsified by use has to carry its evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinRow {
     /// The pin name (`PA22`).
     pub pin: String,
     /// The mux function letter (`C`).
     pub function: String,
-    /// The instance the (pin, function) cell routes to.
+    /// The instance the (pin, function) cell routes to, or [`NO_CONTROLLER`].
     pub instance: String,
-    /// The signal at that cell (`pad0`).
+    /// The signal at that cell (`pad0`); empty on an unrouted row.
     pub signal: String,
+    /// Where the row was read. Required on every row, and load-bearing on an unrouted one.
+    pub source: String,
+}
+
+impl PinRow {
+    /// True when the row states that no controller reaches the cell.
+    #[must_use]
+    pub fn is_unrouted(&self) -> bool {
+        self.instance == NO_CONTROLLER
+    }
 }
 
 /// The pin-function map (partial, append-only).
@@ -148,8 +203,9 @@ pub struct PinsTable {
     pub rows: Vec<PinRow>,
 }
 
-/// One part row: an orderable chip with its package, memory, and (partial) pin set.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One part row: an orderable chip with its package, memory, (partial) pin set, and -- when the
+/// family states one -- the core's instruction-set profile.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartRow {
     /// The part id (`atsamd21g18a`).
     pub part: String,
@@ -161,6 +217,55 @@ pub struct PartRow {
     pub ram: i64,
     /// Present pins, as names or inclusive same-port ranges (`PA12-PA15`).
     pub pins: Vec<String>,
+    /// The part's PROCESSOR SOCKETS, in boot order, each with the architecture(s) it can run.
+    /// Empty on a single-core part, where the `isa*` fields describe the one core.
+    ///
+    /// A SOCKET RATHER THAN A CORE, and the distinction is forced by silicon rather than invented:
+    /// some silicon lets each socket be an Arm core OR a RISC-V core, selected by a
+    /// register, so "which core is in socket 1" is not a fixed property of the part. Listing the
+    /// admissible architectures per socket states what the part offers; WHICH ONE AN IMAGE USES is
+    /// a target's choice and is not a fact about the chip.
+    pub cores: Vec<(String, Vec<String>)>,
+    /// Whether the sockets reach ONE address space. `None` on a single-core part; REQUIRED once
+    /// `cores` is stated, because it is half of the combinability test and a default would decide
+    /// it silently.
+    pub cores_share_memory: Option<bool>,
+    /// Pins the part carries that A PROGRAM MAY NOT USE, each with the peripheral that owns it.
+    ///
+    /// PRESENT AND UNAVAILABLE ARE DIFFERENT FACTS, and until this existed the model could only
+    /// say the first. The present-list says a part HAS a pin; the pin map's unrouted shape says no
+    /// controller reaches a (pin, FUNCTION) CELL. Neither says a pin is permanently owned by
+    /// something inside the package, which is what a system-in-package states about the pins its
+    /// integrated peripheral is wired through -- and those pins ARE present, so removing them from
+    /// the present-list would be a second lie rather than a fix.
+    pub reserved: Vec<(String, String)>,
+    /// The core's instruction-set profile (`rv32ec`), lowercase; empty when the family has not
+    /// stated one. A part that merely names its architecture tells a code generator nothing it
+    /// can act on, so the two consequences a backend must respect are stated BESIDE the name and
+    /// CHECKED against it -- see `isa_registers` and `isa_muldiv`.
+    pub isa: String,
+    /// The integer register count the profile gives (`16` for an RV32E core, `32` for RV32I);
+    /// 0 when unstated. Not decoration: a register allocator whose pool assumes 32 emits
+    /// references to registers the silicon does not have.
+    pub isa_registers: i64,
+    /// How multiply and divide are reached: `hardware` (the M extension), `multiply-only` (the
+    /// Zmmul extension, which is M's multiply half WITHOUT divide), or `soft` (runtime routines
+    /// for both); empty when unstated. Derived-and-verified against `isa` rather than trusted.
+    ///
+    /// THE MIDDLE VALUE IS NOT A REFINEMENT, IT IS A CASE THAT REALLY OCCURS: a core can have a
+    /// `mul` instruction and no `div`, so a two-value field would have to call such a part either
+    /// hardware (and emit a division that traps) or soft (and give up a multiply it has).
+    pub isa_muldiv: String,
+    /// The widest hardware floating-point the core implements: `double` (the D extension),
+    /// `single` (F alone), or `soft` (neither -- floating point is library routines); empty when
+    /// unstated. Derived-and-verified against `isa` rather than trusted.
+    ///
+    /// THIS RECORDS WHAT THE SILICON HAS, NOT WHAT A BUILD EMITS. A part with an FPU may still be
+    /// compiled soft-float deliberately -- for size, or to keep one image valid across a family
+    /// whose members differ here -- so this field settles what is POSSIBLE and a profile knob
+    /// settles what is CHOSEN. Reading it as permission to emit FP instructions would be a
+    /// mistake in the other direction from ignoring it.
+    pub isa_float: String,
 }
 
 impl PartRow {
@@ -176,6 +281,15 @@ impl PartRow {
                         if lp == port && hp == port && li <= index && index <= hi_i)
             }
         })
+    }
+
+    /// What owns `pin` when the part reserves it, or `None` when a program may use it.
+    ///
+    /// Exact names only, deliberately -- no ranges. A reservation is read off a sentence naming
+    /// specific pins, and a range would let one careless entry lock out a whole port.
+    #[must_use]
+    pub fn reserved_by(&self, pin: &str) -> Option<&str> {
+        self.reserved.iter().find(|(p, _)| p == pin).map(|(_, owner)| owner.as_str())
     }
 }
 
@@ -665,6 +779,41 @@ pub struct DeviceStep {
     pub length_from: String,
 }
 
+/// The values `[sourcing] facts` may take, weakest last.
+pub const SOURCING_FACTS: [&str; 2] = ["primary", "secondary"];
+
+/// The values `[sourcing] validation` may take, weakest first.
+pub const SOURCING_VALIDATION: [&str; 3] = ["none", "identified", "exercised"];
+
+/// Where a part's facts came from, and what a physical part has been made to do.
+///
+/// TWO AXES RATHER THAN ONE LADDER, because they answer different questions and a part can be
+/// strong on one and absent on the other. Two members of one family can differ on where their
+/// facts came from while agreeing that neither has been made to answer, and no single rank could
+/// order that pair without calling one of the two shortfalls the smaller.
+///
+/// Stated per MEMBER and never on the family base. A base's sentences have different provenance
+/// depending on which member reads them -- the BMx280 base is the BME280's own datasheet and the
+/// BMP280's compatibility section -- so any tier written there would be false for one member
+/// whichever value it took.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceSourcing {
+    /// `primary`: the part's own datasheet. `secondary`: a primary vendor statement about this
+    /// part carried by another document, which `derived_from` names.
+    pub facts: String,
+    /// The sibling part whose document carries the facts. Required by `secondary`, and resolved
+    /// against the family so it cannot name a part that is not there.
+    pub derived_from: String,
+    /// `none`: no physical part of this type has been made to answer. `identified`: one answered
+    /// its identity register, against a negative control. `exercised`: one produced measurements
+    /// a driver decoded.
+    pub validation: String,
+    /// What was OBSERVED to earn a validation above `none`: what the part did, not the equipment
+    /// that made it do so. Required above `none`, so a rank cannot be claimed without saying for
+    /// what.
+    pub evidence: String,
+}
+
 /// One part table: `kind = "device"` (an emitted part) or `"device-base"` (an authoring
 /// convenience a member names with `base`, never emitted on its own).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -685,6 +834,9 @@ pub struct DeviceTable {
     pub address: Option<DeviceAddress>,
     /// The identity register and its accepted values, when stated.
     pub identity: Option<DeviceIdentity>,
+    /// How well this part is sourced and how far it has been validated. Required of every
+    /// emitted part; refused on a base.
+    pub sourcing: Option<DeviceSourcing>,
     /// The registers, in table order.
     pub registers: Vec<DeviceRegister>,
     /// The named encodings, in table order.
@@ -1230,6 +1382,7 @@ fn build_device(
         Address,
         Strap(usize),
         Identity,
+        Sourcing,
         Register(usize),
         Enum(usize),
         Measurement,
@@ -1249,6 +1402,10 @@ fn build_device(
                     "identity" => {
                         table.identity.get_or_insert_with(DeviceIdentity::default);
                         At::Identity
+                    }
+                    "sourcing" => {
+                        table.sourcing.get_or_insert_with(DeviceSourcing::default);
+                        At::Sourcing
                     }
                     "measurement" => At::Measurement,
                     _ => {
@@ -1348,6 +1505,17 @@ fn build_device(
                             (other, _) => return Err(err(*line, &format!("unexpected identity key '{other}'"))),
                         }
                     }
+                    At::Sourcing => {
+                        let sourcing = table.sourcing.as_mut().expect("open sourcing");
+                        match (key.as_str(), value) {
+                            ("facts", v) => sourcing.facts = as_str(*line, key, v)?,
+                            ("derived_from", v) => sourcing.derived_from = as_str(*line, key, v)?,
+                            ("validation", v) => sourcing.validation = as_str(*line, key, v)?,
+                            ("evidence", v) => sourcing.evidence = as_str(*line, key, v)?,
+                            ("notes", _) => {}
+                            (other, _) => return Err(err(*line, &format!("unexpected sourcing key '{other}'"))),
+                        }
+                    }
                     At::Register(index) => {
                         let register = &mut table.registers[*index];
                         match (key.as_str(), value) {
@@ -1433,6 +1601,12 @@ fn build_device(
             ));
         }
     }
+    if is_base && table.sourcing.is_some() {
+        return Err(format!(
+            "part base '{}' states [sourcing]. A base's facts are sourced differently for each member that inherits them, so the tier belongs to the member",
+            table.family
+        ));
+    }
     Ok(table)
 }
 
@@ -1459,14 +1633,23 @@ fn build_instances(
         return Err("instances record must start with 'base'".to_string());
     }
 
-    type PendingRow = (usize, String, String, Vec<(String, i64)>);
+    type PendingRow = (usize, String, String, String, Vec<(String, i64)>);
     let mut current: Option<PendingRow> = None;
     let finish = |current: &mut Option<PendingRow>,
                       table: &mut InstancesTable|
      -> Result<(), String> {
-        if let Some((line, name, block, values)) = current.take() {
+        if let Some((line, name, block, port, values)) = current.take() {
             if name.is_empty() || block.is_empty() {
                 return Err(err(line, "an instance row needs name and block"));
+            }
+            if name == NO_CONTROLLER {
+                return Err(err(
+                    line,
+                    &format!(
+                        "'{NO_CONTROLLER}' is reserved: it is what a pin row states when no \
+                         controller reaches the cell, so no instance may be placed under it"
+                    ),
+                ));
             }
             let mut ordered = Vec::new();
             for field in &table.record {
@@ -1483,7 +1666,7 @@ fn build_instances(
                     .collect();
                 return Err(err(line, &format!("instance '{name}' carries off-record fields {extra:?}")));
             }
-            table.rows.push(InstanceRow { name, block, values: ordered });
+            table.rows.push(InstanceRow { name, block, values: ordered, port });
         }
         Ok(())
     };
@@ -1492,18 +1675,19 @@ fn build_instances(
         match item {
             Item::ArraySection(name) if name == "instances" => {
                 finish(&mut current, &mut table)?;
-                current = Some((*line, String::new(), String::new(), Vec::new()));
+                current = Some((*line, String::new(), String::new(), String::new(), Vec::new()));
             }
             Item::Section(name) | Item::ArraySection(name) => {
                 return Err(err(*line, &format!("unexpected section '{name}' in instances -- the key set is closed")));
             }
             Item::KeyValue(key, value) => {
-                let Some((_, name, block, values)) = current.as_mut() else {
+                let Some((_, name, block, port, values)) = current.as_mut() else {
                     return Err(err(*line, "key outside [[instances]]"));
                 };
                 match (key.as_str(), value) {
                     ("name", RawValue::Str(s)) => *name = s.clone(),
                     ("block", RawValue::Str(s)) => *block = s.clone(),
+                    ("port", RawValue::Str(s)) => *port = s.clone(),
                     (field, RawValue::Int(i)) => values.push((field.to_string(), i.value)),
                     (other, _) => return Err(err(*line, &format!("unexpected instance key '{other}'"))),
                 }
@@ -1511,6 +1695,27 @@ fn build_instances(
         }
     }
     finish(&mut current, &mut table)?;
+    let mut claimed: Vec<(char, &str)> = Vec::new();
+    for row in &table.rows {
+        if row.port.is_empty() {
+            continue;
+        }
+        let Some(port) = row.port_char() else {
+            return Err(format!(
+                "instances: '{}' declares port '{}' -- a port group is ONE character, the one a \
+                 pin name carries ('C' for PC10, '0' for P0.13)",
+                row.name, row.port
+            ));
+        };
+        if let Some((_, first)) = claimed.iter().find(|(c, _)| *c == port) {
+            return Err(format!(
+                "instances: '{}' and '{}' both declare port '{port}' -- a pin's port group resolves \
+                 to one instance, so two claims make which one it is a matter of table order",
+                first, row.name
+            ));
+        }
+        claimed.push((port, &row.name));
+    }
     Ok(table)
 }
 
@@ -1529,6 +1734,7 @@ fn build_pins(
                     function: String::new(),
                     instance: String::new(),
                     signal: String::new(),
+                    source: String::new(),
                 });
                 open = true;
             }
@@ -1545,7 +1751,7 @@ fn build_pins(
                     ("function", RawValue::Str(s)) => row.function = s.clone(),
                     ("instance", RawValue::Str(s)) => row.instance = s.clone(),
                     ("signal", RawValue::Str(s)) => row.signal = s.clone(),
-                    ("source", RawValue::Str(_)) => {}
+                    ("source", RawValue::Str(s)) => row.source = s.clone(),
                     (other, _) => return Err(err(*line, &format!("unexpected pin key '{other}'"))),
                 }
             }
@@ -1555,8 +1761,305 @@ fn build_pins(
         if split_pin(&row.pin).is_none() {
             return Err(format!("pins: '{}' is not a P<port><index> pin name", row.pin));
         }
+        validate_pin_row(row)?;
     }
     Ok(table)
+}
+
+/// Hold a pin row to ONE OF THE TWO SHAPES, so that an absence and an omission stop looking alike.
+///
+/// Every field a shape uses is required, which is not tidiness: an empty string is legal in
+/// neither field precisely so that it cannot stand in for a fact. An unrouted cell says what it is
+/// out loud, carrying the citation that is the only check it can ever be given.
+fn validate_pin_row(row: &PinRow) -> Result<(), String> {
+    let pin = &row.pin;
+    if row.function.is_empty() {
+        return Err(format!(
+            "pins: '{pin}' states no function -- a row is a (pin, function) CELL, and a row with no \
+             function names no cell (an omitted function silently matches no binding forever)"
+        ));
+    }
+    if row.instance.is_empty() {
+        return Err(format!(
+            "pins: '{pin}' function {} states no instance. If a controller reaches this cell, name \
+             it; if NOTHING does, say so as a value -- instance = \"{NO_CONTROLLER}\" with the \
+             `source` you read it from. An omitted field is not the same fact as an absent \
+             controller, and only one of the two is checkable.",
+            row.function
+        ));
+    }
+    if row.source.is_empty() {
+        return Err(format!(
+            "pins: '{pin}' function {} states no source -- the pin map is evidence-only, and a row \
+             with no citation cannot be told from one grown out of a binding",
+            row.function
+        ));
+    }
+    if row.is_unrouted() {
+        if !row.signal.is_empty() {
+            return Err(format!(
+                "pins: '{pin}' function {} reaches no controller but names signal '{}' -- a cell \
+                 with no controller has no signal, so the two together state a routing the row \
+                 also denies",
+                row.function, row.signal
+            ));
+        }
+    } else if row.signal.is_empty() {
+        return Err(format!(
+            "pins: '{pin}' function {} routes to {} but names no signal -- which of the \
+             instance's signals the cell carries is the half of the row a binding is checked \
+             against",
+            row.function, row.instance
+        ));
+    }
+    Ok(())
+}
+
+/// Check a part's stated instruction-set profile AGAINST ITSELF.
+///
+/// The profile is stated as a name plus the two consequences a code generator must respect, and
+/// the name is what decides both -- so this derives them from the name and refuses a row whose
+/// three fields disagree. A name alone would not be checkable, and consequences alone would not
+/// say which silicon they came from; stating both is what makes the row wrong out loud instead of
+/// wrong in a register allocator.
+///
+/// The whole profile is optional -- families that have never stated one keep working -- but it is
+/// all-or-nothing: a row that names an ISA must carry its consequences, because a half-stated
+/// profile is the shape a reader would most confidently misread.
+/// The core architectures this check knows. CLOSED on purpose, exactly as the RISC-V profile check
+/// is: an unrecognized name is refused rather than carried, because a name nobody checked is a
+/// name that can be wrong forever. Growing this list is the deliberate act of admitting a core.
+const KNOWN_CORE_ARCHITECTURES: &[&str] = &[
+    "cortex-m0",
+    "cortex-m0plus",
+    "cortex-m3",
+    "cortex-m4",
+    "cortex-m4f",
+    "cortex-m7",
+    "cortex-m7f",
+    "cortex-m33",
+    "hazard3",
+];
+
+/// A part's processor sockets: how many, what each can run, and whether they share memory.
+///
+/// WHAT THIS IS FOR, stated because the fields look redundant beside `isa` and are not. A target
+/// is a selection an IMAGE makes over a part's cores, and one part admits several -- so the facts
+/// layer has to say what there is to select FROM. Two sockets of the same architecture sharing
+/// memory can be driven as one threaded system; two of different architectures need two images
+/// whatever the memory looks like.
+fn validate_part_cores(row: &PartRow) -> Result<(), String> {
+    let part = &row.part;
+    if row.cores.is_empty() {
+        if row.cores_share_memory.is_some() {
+            return Err(format!(
+                "parts: {part} states cores_share_memory without stating `cores` -- there is nothing for the sockets to share"
+            ));
+        }
+        return Ok(());
+    }
+    if row.cores.len() < 2 {
+        return Err(format!(
+            "parts: {part} states one core socket. `cores` describes a part with MORE THAN ONE, and the isa fields already describe a single core -- stating one here says the same thing in a second place"
+        ));
+    }
+    if row.cores_share_memory.is_none() {
+        return Err(format!(
+            "parts: {part} states {} core sockets without stating cores_share_memory. That is half the test for whether they can be driven as ONE threaded system, and a default would decide it silently",
+            row.cores.len()
+        ));
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for (socket, archs) in &row.cores {
+        if socket.is_empty() {
+            return Err(format!("parts: {part} has a core socket with no name"));
+        }
+        if seen.contains(&socket.as_str()) {
+            return Err(format!("parts: {part} names core socket '{socket}' twice"));
+        }
+        seen.push(socket);
+        if archs.is_empty() {
+            return Err(format!(
+                "parts: {part} core socket '{socket}' lists no architecture -- a socket that runs nothing is not a socket"
+            ));
+        }
+        for arch in archs {
+            if arch != &arch.to_ascii_lowercase() {
+                return Err(format!(
+                    "parts: {part} core architecture '{arch}' must be lowercase"
+                ));
+            }
+            if !KNOWN_CORE_ARCHITECTURES.contains(&arch.as_str()) {
+                return Err(format!(
+                    "parts: {part} core socket '{socket}' names architecture '{arch}', which this check does not know -- an unknown name is refused rather than carried, because nothing downstream would ever disagree with it"
+                ));
+            }
+        }
+        let mut unique = archs.clone();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != archs.len() {
+            return Err(format!(
+                "parts: {part} core socket '{socket}' lists an architecture twice"
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl PartRow {
+    /// Whether the part's sockets can be driven as ONE threaded system, and why not when they
+    /// cannot. `None` on a single-core part, which is not asked the question.
+    ///
+    /// THE TEST IS TWO CONDITIONS, NOT ONE: the sockets must reach one
+    /// address space AND run the same architecture. Shared memory alone is not enough -- a part in
+    /// some silicon lets one socket run Arm while the other runs RISC-V over the same memory, with
+    /// atomics interoperating across the two, and its own datasheet says that arrangement "requires
+    /// two separate program images".
+    #[must_use]
+    pub fn cores_combinable(&self) -> Option<Result<(), String>> {
+        if self.cores.is_empty() {
+            return None;
+        }
+        if self.cores_share_memory != Some(true) {
+            return Some(Err("the sockets do not reach one address space".to_string()));
+        }
+        let common = self.cores[0]
+            .1
+            .iter()
+            .find(|arch| self.cores.iter().all(|(_, archs)| archs.contains(arch)));
+        match common {
+            Some(_) => Some(Ok(())),
+            None => Some(Err(
+                "no single architecture is admissible in every socket, so one image cannot run on all of them"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+fn validate_part_isa(row: &PartRow) -> Result<(), String> {
+    let part = &row.part;
+    let stated = !row.isa.is_empty()
+        || row.isa_registers != 0
+        || !row.isa_muldiv.is_empty()
+        || !row.isa_float.is_empty();
+    if !stated {
+        return Ok(());
+    }
+    if row.isa.is_empty() {
+        return Err(format!(
+            "parts: {part} states an ISA consequence (isa_registers/isa_muldiv/isa_float) without \
+             naming the profile in `isa` -- the name is what the others are checked against"
+        ));
+    }
+    if row.isa != row.isa.to_ascii_lowercase() {
+        return Err(format!("parts: {part} isa '{}' must be lowercase", row.isa));
+    }
+    let (single, multi) = match row.isa.split_once('_') {
+        Some((head, tail)) => (head, tail.split('_').collect::<Vec<_>>()),
+        None => (row.isa.as_str(), Vec::new()),
+    };
+    let Some(rest) = single.strip_prefix("rv32").or_else(|| single.strip_prefix("rv64")) else {
+        return Err(format!(
+            "parts: {part} isa '{}' is not a RISC-V profile name (rv32.../rv64...) -- this check \
+             derives the register count and the multiply path from the base letter and the \
+             extension letters, so an unrecognized shape is refused rather than half-checked",
+            row.isa
+        ));
+    };
+    for name in &multi {
+        if !matches!(*name, "zmmul" | "zicsr" | "zifencei") {
+            return Err(format!(
+                "parts: {part} isa '{}' names multi-letter extension '{name}', which this check \
+                 does not know -- an unknown extension is refused rather than ignored, because \
+                 ignoring it would silently accept a profile nobody has checked",
+                row.isa
+            ));
+        }
+    }
+    let mut letters = rest.chars();
+    let base = letters.next().ok_or_else(|| {
+        format!("parts: {part} isa '{}' names no base integer set (expected e or i)", row.isa)
+    })?;
+    let expected_registers = match base {
+        'e' => 16,
+        'i' => 32,
+        other => {
+            return Err(format!(
+                "parts: {part} isa '{}' has base '{other}', which is neither 'e' (16 registers) \
+                 nor 'i' (32)",
+                row.isa
+            ))
+        }
+    };
+    if row.isa_registers != expected_registers {
+        return Err(format!(
+            "parts: {part} isa '{}' is a '{base}' base, so it has {expected_registers} integer \
+             registers, but isa_registers = {} -- the letter and the count must agree",
+            row.isa, row.isa_registers
+        ));
+    }
+    let has_m = letters.clone().any(|c| c == 'm');
+    let has_zmmul = multi.contains(&"zmmul");
+    let expected_muldiv = if has_m {
+        "hardware"
+    } else if has_zmmul {
+        "multiply-only"
+    } else {
+        "soft"
+    };
+    if row.isa_muldiv != expected_muldiv {
+        let reason = if has_m {
+            "carries an 'm' extension (multiply and divide)"
+        } else if has_zmmul {
+            "carries 'zmmul' (multiply WITHOUT divide) and no 'm'"
+        } else {
+            "carries neither 'm' nor 'zmmul'"
+        };
+        return Err(format!(
+            "parts: {part} isa '{}' {reason}, so isa_muldiv must be '{expected_muldiv}', not '{}'",
+            row.isa, row.isa_muldiv
+        ));
+    }
+
+    let has_f = letters.clone().any(|c| c == 'f');
+    let has_d = letters.clone().any(|c| c == 'd');
+    if letters.clone().any(|c| c == 'q') {
+        return Err(format!(
+            "parts: {part} isa '{}' names quad-precision float, which this check has no value for \
+             -- refused rather than silently recorded as double",
+            row.isa
+        ));
+    }
+    if has_d && !has_f {
+        return Err(format!(
+            "parts: {part} isa '{}' names 'd' without 'f', but the double-precision extension is \
+             defined as an extension of the single-precision one -- the name is malformed",
+            row.isa
+        ));
+    }
+    let expected_float = if has_d {
+        "double"
+    } else if has_f {
+        "single"
+    } else {
+        "soft"
+    };
+    if row.isa_float != expected_float {
+        let reason = if has_d {
+            "carries 'd' (double, which subsumes single)"
+        } else if has_f {
+            "carries 'f' (single precision)"
+        } else {
+            "carries no floating-point extension"
+        };
+        return Err(format!(
+            "parts: {part} isa '{}' {reason}, so isa_float must be '{expected_float}', not '{}'",
+            row.isa, row.isa_float
+        ));
+    }
+    Ok(())
 }
 
 fn build_parts(
@@ -1575,6 +2078,13 @@ fn build_parts(
                     flash: 0,
                     ram: 0,
                     pins: Vec::new(),
+                    cores: Vec::new(),
+                    cores_share_memory: None,
+                    reserved: Vec::new(),
+                    isa: String::new(),
+                    isa_registers: 0,
+                    isa_muldiv: String::new(),
+                    isa_float: String::new(),
                 });
                 open = true;
             }
@@ -1591,6 +2101,11 @@ fn build_parts(
                     ("package", RawValue::Str(s)) => row.package = s.clone(),
                     ("flash", RawValue::Int(i)) => row.flash = i.value,
                     ("ram", RawValue::Int(i)) => row.ram = i.value,
+                    ("isa", RawValue::Str(s)) => row.isa = s.clone(),
+                    ("isa_registers", RawValue::Int(i)) => row.isa_registers = i.value,
+                    ("isa_muldiv", RawValue::Str(s)) => row.isa_muldiv = s.clone(),
+                    ("isa_float", RawValue::Str(s)) => row.isa_float = s.clone(),
+                    ("isa_source", RawValue::Str(_)) => {}
                     ("source", RawValue::Str(_)) => {}
                     ("pins", RawValue::Array(parts)) => {
                         for part in parts {
@@ -1600,8 +2115,67 @@ fn build_parts(
                             }
                         }
                     }
+                    ("cores", RawValue::Inline(entries)) => {
+                        for (socket, value) in entries {
+                            let RawValue::Array(items) = value else {
+                                return Err(err(
+                                    *line,
+                                    &format!("core socket '{socket}' must list its architectures as an array, even when there is only one"),
+                                ));
+                            };
+                            let mut archs = Vec::new();
+                            for item in items {
+                                match item {
+                                    RawValue::Str(s) => archs.push(s.clone()),
+                                    _ => {
+                                        return Err(err(
+                                            *line,
+                                            &format!("core socket '{socket}': an architecture must be a string"),
+                                        ));
+                                    }
+                                }
+                            }
+                            row.cores.push((socket.clone(), archs));
+                        }
+                    }
+                    ("cores_share_memory", RawValue::Int(i)) => {
+                        row.cores_share_memory = Some(i.value != 0);
+                    }
+                    ("reserved", RawValue::Inline(entries)) => {
+                        for (pin, owner) in entries {
+                            match owner {
+                                RawValue::Str(s) if !s.is_empty() => {
+                                    row.reserved.push((pin.clone(), s.clone()));
+                                }
+                                RawValue::Str(_) => {
+                                    return Err(err(
+                                        *line,
+                                        &format!("reserved pin '{pin}' states an empty owner -- name the peripheral that holds it, or drop the entry"),
+                                    ));
+                                }
+                                _ => {
+                                    return Err(err(
+                                        *line,
+                                        &format!("reserved pin '{pin}' must name its owner as a string"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     (other, _) => return Err(err(*line, &format!("unexpected part key '{other}'"))),
                 }
+            }
+        }
+    }
+    for row in &table.rows {
+        validate_part_isa(row)?;
+        validate_part_cores(row)?;
+        for (pin, owner) in &row.reserved {
+            if !row.has_pin(pin) {
+                return Err(format!(
+                    "parts: {} reserves {pin} for {owner}, but {pin} is not in its pin list -- a reservation is a statement about a pin the part HAS, and one outside the list could never be checked against anything",
+                    row.part
+                ));
             }
         }
     }
@@ -2076,7 +2650,7 @@ pub fn load_family(repo_root: &std::path::Path, family: &str) -> Result<FamilySe
 
 fn validate_family(set: &FamilySet) -> Result<(), String> {
     for row in &set.pins.rows {
-        if set.instances.row(&row.instance).is_none() {
+        if !row.is_unrouted() && set.instances.row(&row.instance).is_none() {
             return Err(format!("pins: '{}' names unknown instance '{}'", row.pin, row.instance));
         }
         if !set.parts.rows.is_empty() && !set.parts.rows.iter().any(|p| p.has_pin(&row.pin)) {
@@ -2127,6 +2701,12 @@ fn validate_bindings(
                         binding.role, pin.pin, part
                     ));
                 }
+                if let Some(holder) = row.reserved_by(&pin.pin) {
+                    return Err(format!(
+                        "{owner}: binding '{}' claims pin {} ({signal}), which part {} RESERVES for {} -- a binding cannot route a pin the part does not let a program own",
+                        binding.role, pin.pin, part, holder
+                    ));
+                }
             }
             if pin.soft {
                 continue;
@@ -2137,6 +2717,12 @@ fn validate_bindings(
                     binding.role, pin.pin, binding.function
                 ));
             };
+            if cell.is_unrouted() {
+                return Err(format!(
+                    "{owner}: binding '{}' claims {} function {} reaches {}, but pins.toml states that NO controller reaches that cell ({})",
+                    binding.role, pin.pin, binding.function, binding.instance, cell.source
+                ));
+            }
             if cell.instance != binding.instance {
                 return Err(format!(
                     "{owner}: binding '{}' claims {}/{} routes to {}, but pins.toml says {}",
@@ -2202,6 +2788,20 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
         }
     }
     validate_bindings(set, &bindings, &part, &board.board)?;
+    for line in board.devices.iter().chain(module_pins.iter()) {
+        if !line.pin.is_empty() && !part_row.has_pin(&line.pin) {
+            return Err(format!(
+                "board {}: device '{}' is wired to {}, which is not in part {}'s pin list (if the pin exists on silicon, grow the parts row from the datasheet)",
+                board.board, line.name, line.pin, part
+            ));
+        }
+        if let Some(owner) = part_row.reserved_by(&line.pin) {
+            return Err(format!(
+                "board {}: device '{}' is wired to {}, which part {} RESERVES for {} -- the pin exists but a program does not own it, so the write lands on a cell the board cannot drive and the device stays silent",
+                board.board, line.name, line.pin, part, owner
+            ));
+        }
+    }
     let mut pin_claims: Vec<(&str, String)> = Vec::new();
     for binding in &bindings {
         for (_, pin) in &binding.pins {
@@ -2280,6 +2880,11 @@ fn documents_something(rest: &[Row]) -> bool {
 
 /// Renders a section comment with ONE MARKER PER LINE, at a given indent.
 ///
+/// A doc marker, so a section's warning travels with the constants it qualifies rather than being
+/// separable from them -- a caution such as "this dummy-cycle count must be asked of the part, and a
+/// wrong one returns plausible garbage rather than failing" is worth nothing if it can be parted
+/// from the numbers it guards.
+///
 /// A doc comment must document something, so a comment nothing follows keeps the ordinary marker
 /// -- an empty trailing doc comment is not valid Rust.
 fn push_section_comment(out: &mut String, indent: &str, marker: &str, comment: &str) {
@@ -2297,6 +2902,29 @@ fn emit_header(out: &mut String, class: &str, what: &str, sources: &[String], re
 
 fn push_const(out: &mut String, kind: &str, name: &str, value: &str) {
     out.push_str(&format!("        public const {kind} {name} = {value};\n"));
+}
+
+/// What `<ROLE>_DRIVER_FAMILY` means, rendered at a given indent.
+///
+/// A DOC COMMENT RATHER THAN A SECTION COMMENT, because this one has to reach a reader of the
+/// published source: only `///` and `//!` survive stripping in a `.rs` or `.cs`, and a plain `//`
+/// section header does not. This is a new public string, so the sentence that says how to read it
+/// has to travel with it.
+fn driver_family_note(indent: &str) -> String {
+    let lines = [
+        "driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The",
+        "role's `KIND` says what the application asked for -- a uart, an spi -- and two",
+        "peripherals of the same kind can share no register at all, so a consumer that selects a",
+        "driver at run time needs both: KIND is what was asked for, this is what the silicon is.",
+        "Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not",
+        "name a driver; and a uart is a different register map on every family, so the kind does",
+        "not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.",
+    ];
+    let mut out = String::from("\n");
+    for line in lines {
+        out.push_str(&format!("{indent}/// {line}\n"));
+    }
+    out
 }
 
 fn finish_class(out: &mut String) -> Result<(), String> {
@@ -3697,6 +4325,160 @@ fn resolve_uart_stm32(
     })
 }
 
+/// A soft (GPIO-driven) chip select: a plain output the DRIVER toggles, not a muxed cell.
+///
+/// A soft select exists because a board wired the device's select somewhere the controller's own
+/// NSS does not reach -- so it is board truth, and refusing to emit it would push the pin into a
+/// driver as a hand-written constant, which is the one transcription generation exists to remove.
+struct StSoftCs {
+    port_rcc_en_reg: i64,
+    port_rcc_en_mask: i64,
+    moder_reg: i64,
+    moder_mask: i64,
+    moder_value: i64,
+    /// BSRR: the set/reset register. Writing the mask ASSERTS nothing on its own -- the low half
+    /// sets and the high half clears, which is why both words are emitted rather than one mask.
+    bsrr_reg: i64,
+    bsrr_set: i64,
+    bsrr_clear: i64,
+}
+
+/// One resolved st-spi binding emission: the instance, its RCC enable, the three muxed data pins,
+/// and the soft chip select when the board states one.
+///
+/// NO BAUD IS DERIVED HERE, DELIBERATELY, and that is the one design decision in this arm. A
+/// USART binding derives its divisor because the wire rate is a carrier fact the board states. An
+/// SPI master's rate is a property of the ATTACHED DEVICE -- the part's own maximum clock -- and a
+/// binding names a bus, not a part. So this emits the APB rate feeding the instance and the block
+/// table states the eight prescaler codes; the driver, which is the only layer that knows what is
+/// on the other end, picks one. Deriving a rate here would put a device fact in a board file.
+struct StSpiEmission {
+    prefix: String,
+    role: String,
+    instance: String,
+    base: i64,
+    rcc_en_reg: i64,
+    rcc_en_mask: i64,
+    sck: StUartPin,
+    miso: StUartPin,
+    mosi: StUartPin,
+    cs: Option<StSoftCs>,
+    pclk_hz: i64,
+}
+
+fn resolve_spi_stm32(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<StSpiEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let name = &binding.instance;
+    let base = instances.value(name, "base").ok_or_else(|| format!("{board}: no base for {name}"))?;
+    let rcc_base = instances
+        .value("rcc", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'rcc'"))?;
+    let enable = |row: &str| -> Result<(i64, i64), String> {
+        let off = instances
+            .value(row, "rcc_en_off")
+            .filter(|v| *v >= 0)
+            .ok_or_else(|| format!("{board}: instance '{row}' has no rcc_en_off"))?;
+        let bit = instances
+            .value(row, "rcc_en_bit")
+            .filter(|v| *v >= 0)
+            .ok_or_else(|| format!("{board}: instance '{row}' has no rcc_en_bit"))?;
+        Ok((rcc_base + off, 1i64 << bit))
+    };
+    let (rcc_en_reg, rcc_en_mask) = enable(name)?;
+
+    let gpio = set.block("gpio", "").ok_or_else(|| format!("{board}: no gpio block table"))?;
+    let af = binding.function.strip_prefix("AF").and_then(|d| d.parse::<i64>().ok()).ok_or_else(
+        || {
+            format!(
+                "{board}: spi binding '{}' function '{}' is not AF<n>",
+                binding.role, binding.function
+            )
+        },
+    )?;
+    let pin_named = |signal: &str| -> Result<&PinRef, String> {
+        binding
+            .pins
+            .iter()
+            .find(|(s, _)| s == signal)
+            .map(|(_, p)| p)
+            .ok_or_else(|| format!("{board}: spi binding '{}' needs a {signal} pin", binding.role))
+    };
+    let mut muxed = Vec::new();
+    for signal in ["sck", "miso", "mosi"] {
+        let pin = pin_named(signal)?;
+        if pin.soft {
+            return Err(format!(
+                "{board}: spi binding '{}' marks {signal} soft -- only the chip select may be a plain GPIO here; a soft clock or data line is a bit-banged master, not this binding",
+                binding.role
+            ));
+        }
+        let who = format!("spi binding '{}' {signal}", binding.role);
+        muxed.push(st_mux_pin(set, board, rcc_base, gpio, af, &who, pin)?);
+    }
+
+    let cs = match binding.pins.iter().find(|(s, _)| s == "cs").map(|(_, p)| p) {
+        None => None,
+        Some(pin) if !pin.soft => {
+            return Err(format!(
+                "{board}: spi binding '{}' states a hardware chip select. This arm emits a SOFT select only: mark it `soft = true` and let the driver own the level, or leave it out and let the controller frame with its own NSS.",
+                binding.role
+            ));
+        }
+        Some(pin) => {
+            let (port, index) = split_pin(&pin.pin)
+                .ok_or_else(|| format!("{board}: bad chip-select pin {}", pin.pin))?;
+            if index > 15 {
+                return Err(format!("{board}: chip select {} exceeds a port's 16 pins", pin.pin));
+            }
+            let group = format!("gpio{port}");
+            let group_base = instances
+                .value(&group, "base")
+                .ok_or_else(|| format!("{board}: no instance row for port group '{group}'"))?;
+            let (port_rcc_en_reg, port_rcc_en_mask) = enable(&group)?;
+            let moder = gpio.register("MODER").ok_or_else(|| format!("{board}: gpio has no MODER"))?;
+            let bsrr = gpio.register("BSRR").ok_or_else(|| format!("{board}: gpio has no BSRR"))?;
+            let mode_out = gpio
+                .constant("MODER_MODE_OUTPUT")
+                .ok_or_else(|| format!("{board}: gpio block has no MODER_MODE_OUTPUT constant"))?;
+            Some(StSoftCs {
+                port_rcc_en_reg,
+                port_rcc_en_mask,
+                moder_reg: group_base + moder.offset.value,
+                moder_mask: 0b11 << (2 * index),
+                moder_value: mode_out << (2 * index),
+                bsrr_reg: group_base + bsrr.offset.value,
+                bsrr_set: 1i64 << index,
+                bsrr_clear: 1i64 << (index + 16),
+            })
+        }
+    };
+
+    let plan = resolved.board.default_plan().expect("validated: exactly one default plan");
+    let pclk_hz = plan
+        .rate("pclk_hz")
+        .ok_or_else(|| format!("{board}: default plan '{}' states no pclk_hz rate", plan.name))?;
+
+    let mut muxed = muxed.into_iter();
+    Ok(StSpiEmission {
+        prefix: upper_snake(&binding.role),
+        role: binding.role.clone(),
+        instance: binding.instance.clone(),
+        base,
+        rcc_en_reg,
+        rcc_en_mask,
+        sck: muxed.next().expect("three pins resolved"),
+        miso: muxed.next().expect("three pins resolved"),
+        mosi: muxed.next().expect("three pins resolved"),
+        cs,
+        pclk_hz,
+    })
+}
+
 /// One resolved st-i2c binding emission (the newer ST I2C, the one with TIMINGR).
 ///
 /// Two things here that a uart binding on the same part does not need:
@@ -3981,7 +4763,7 @@ fn resolve_spi(
     let cs = signal("cs")?;
     if !cs.soft {
         return Err(format!(
-            "{board}: spi binding '{}' has a MUXED chip select -- only the soft-CS shape is ruled; add the hard-CS emission with its anchor first",
+            "{board}: spi binding '{}' has a MUXED chip select. This emitter states a chip select the driver drives as a plain output, so a peripheral-muxed one has no emission to name",
             binding.role
         ));
     }
@@ -4051,6 +4833,8 @@ fn resolve_spi(
 /// without an emitter -- shared by the C# and Rust emitters so they can never disagree.
 struct BoardEmissions {
     skipped: Vec<String>,
+    /// Per emitted role, `(role, driver family)` -- see [`driver_family`].
+    driver_families: Vec<(String, String)>,
     sercom_uarts: Vec<UartEmission>,
     rp_uarts: Vec<RpUartEmission>,
     esp_uarts: Vec<EspUartEmission>,
@@ -4060,15 +4844,55 @@ struct BoardEmissions {
     sercom_spis: Vec<SpiEmission>,
     sercom_i2cs: Vec<SercomI2cEmission>,
     pl022_spis: Vec<SpiPl022Emission>,
+    st_spis: Vec<StSpiEmission>,
     nrf_twis: Vec<NrfTwiEmission>,
     dw_i2cs: Vec<DwI2cEmission>,
     rp_adcs: Vec<RpAdcEmission>,
     rp_clocks: Vec<RpClockEmission>,
 }
 
+/// The driver family a role's bound instance belongs to: `<family>-<block>`.
+///
+/// A ROLE DESCRIPTOR ALREADY SAYS WHAT SURFACE IT IS, AND NOT WHAT SILICON IT IS. `kind` is what
+/// the application asked for -- a uart, an spi -- and two peripherals with the same `kind` can
+/// share no register whatsoever. So a consumer that picks a driver at run time had only the board
+/// identity to key on, which is the same board-to-driver table one level away, or the shape of the
+/// fact set, which is inference.
+///
+/// This is neither: an instance names the BLOCK it is a copy of, and a block table is per family,
+/// so the pair (family, block) is exactly "which register map". It is derived at generation time
+/// from facts that are already gated, so it can never be transcribed wrongly and can never drift
+/// from the descriptor beside it.
+///
+/// **`kind` AND THIS TOGETHER NAME A DRIVER; NEITHER ALONE DOES.** The SAMD21 is why: its six
+/// SERCOM instances all name the block `sercom`, and a SERCOM is a uart, an spi or an i2c
+/// depending on how it is configured -- three drivers over one register map. So `samd21-sercom`
+/// does not say which driver, and `uart` does not say which silicon. The two fields divide the
+/// question cleanly: **`kind` is what the application asked for, this is what the silicon is.**
+///
+/// Deliberately NOT composed into a single `<family>-<block>-<kind>` string. On families where the
+/// block and the surface share a name that reads `rp2350-uart-uart`, and a spelling with a special
+/// case in it is one that gets written wrongly.
+///
+/// Deliberately NOT an IP name like `pl011`, either. The block id is what the strata state; naming
+/// the IP would be a new fact nobody has checked, and it belongs in a block table as its own
+/// ratifiable column if it is ever wanted. Two families that turn out to share an IP get two keys
+/// pointing at one driver, which is honest -- one key would assert a register-level identity that
+/// has not been established.
+fn driver_family(set: &FamilySet, binding: &Binding) -> Result<String, String> {
+    let instance = set.instances.row(&binding.instance).ok_or_else(|| {
+        format!(
+            "binding '{}' names instance '{}', which csp/{}/instances.toml does not place",
+            binding.role, binding.instance, set.family
+        )
+    })?;
+    Ok(format!("{}-{}", set.family, instance.block))
+}
+
 fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<BoardEmissions, String> {
     let mut emissions = BoardEmissions {
         skipped: Vec::new(),
+        driver_families: Vec::new(),
         sercom_uarts: Vec::new(),
         rp_uarts: Vec::new(),
         esp_uarts: Vec::new(),
@@ -4078,12 +4902,14 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         sercom_spis: Vec::new(),
         sercom_i2cs: Vec::new(),
         pl022_spis: Vec::new(),
+        st_spis: Vec::new(),
         nrf_twis: Vec::new(),
         dw_i2cs: Vec::new(),
         rp_adcs: Vec::new(),
         rp_clocks: resolve_clocks_rp(set, resolved)?,
     };
     for binding in &resolved.bindings {
+        let emitted_before = emissions.skipped.len();
         match binding.kind.as_str() {
             "uart" => match set.family.as_str() {
                 "samd21" => emissions.sercom_uarts.push(resolve_uart(set, resolved, binding)?),
@@ -4091,7 +4917,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                 "rp2350" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, true)?),
                 "esp32c6" => emissions.esp_uarts.push(resolve_uart_esp32c6(set, resolved, binding)?),
                 "sam3x" => emissions.sam3x_uarts.push(resolve_uart_sam3x(set, resolved, binding)?),
-                "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" => {
+                "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
                     emissions.st_uarts.push(resolve_uart_stm32(set, resolved, binding)?);
                 }
                 other => {
@@ -4104,6 +4930,9 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             "spi" => match set.family.as_str() {
                 "samd21" => emissions.sercom_spis.push(resolve_spi(set, resolved, binding)?),
                 "rp2350" => emissions.pl022_spis.push(resolve_spi_pl022(set, resolved, binding)?),
+                "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" => {
+                    emissions.st_spis.push(resolve_spi_stm32(set, resolved, binding)?);
+                }
                 other => {
                     return Err(format!(
                         "{}: no spi emission shape for family '{other}' -- add its derivation path first",
@@ -4138,6 +4967,9 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             },
             other => emissions.skipped.push(format!("{} ({other})", binding.role)),
         }
+        if emissions.skipped.len() == emitted_before {
+            emissions.driver_families.push((binding.role.clone(), driver_family(set, binding)?));
+        }
     }
     Ok(emissions)
 }
@@ -4154,6 +4986,7 @@ pub fn emit_board_csharp(
     let class = bindings_class(&resolved.board.board);
     let BoardEmissions {
         skipped,
+        driver_families,
         sercom_uarts: uarts,
         rp_uarts,
         esp_uarts,
@@ -4163,6 +4996,7 @@ pub fn emit_board_csharp(
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
+        st_spis,
         nrf_twis,
         dw_i2cs,
         rp_adcs,
@@ -4190,6 +5024,18 @@ pub fn emit_board_csharp(
     }
     if resolved.board.carrier.usb_pid > 0 {
         push_const(&mut out, "uint", "CARRIER_USB_PID", &format!("0x{:04X}", resolved.board.carrier.usb_pid));
+    }
+
+    if !driver_families.is_empty() {
+        out.push_str(&driver_family_note("        "));
+        for (role, family) in &driver_families {
+            push_const(
+                &mut out,
+                "string",
+                &format!("{}_DRIVER_FAMILY", upper_snake(role)),
+                &format!("\"{family}\""),
+            );
+        }
     }
 
     for uart in &uarts {
@@ -4337,6 +5183,38 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_SSPCLK_HZ"), &spi.sspclk_hz.to_string());
     }
 
+
+    for spi in &st_spis {
+        let p = &spi.prefix;
+        out.push_str(&format!("
+        // -- {p}: an st-spi binding descriptor. NO baud emits: an SPI master's rate is a property of the ATTACHED DEVICE, and a binding names a bus. The APB rate is here and the block table states the eight prescaler codes; the driver picks --
+"));
+        push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", spi.base));
+        push_const(&mut out, "uint", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", spi.rcc_en_reg));
+        push_const(&mut out, "uint", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", spi.rcc_en_mask));
+        for (side, pin) in [("SCK", &spi.sck), ("MISO", &spi.miso), ("MOSI", &spi.mosi)] {
+            push_const(&mut out, "uint", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_const(&mut out, "uint", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        if let Some(cs) = &spi.cs {
+            push_const(&mut out, "uint", &format!("{p}_CS_PORT_RCC_EN_REG"), &format!("0x{:X}", cs.port_rcc_en_reg));
+            push_const(&mut out, "uint", &format!("{p}_CS_PORT_RCC_EN_MASK"), &format!("0x{:X}", cs.port_rcc_en_mask));
+            push_const(&mut out, "uint", &format!("{p}_CS_MODER_REG"), &format!("0x{:X}", cs.moder_reg));
+            push_const(&mut out, "uint", &format!("{p}_CS_MODER_MASK"), &format!("0x{:X}", cs.moder_mask));
+            push_const(&mut out, "uint", &format!("{p}_CS_MODER_VALUE"), &format!("0x{:X}", cs.moder_value));
+            push_const(&mut out, "uint", &format!("{p}_CS_BSRR_REG"), &format!("0x{:X}", cs.bsrr_reg));
+            push_const(&mut out, "uint", &format!("{p}_CS_BSRR_SET"), &format!("0x{:X}", cs.bsrr_set));
+            push_const(&mut out, "uint", &format!("{p}_CS_BSRR_CLEAR"), &format!("0x{:X}", cs.bsrr_clear));
+        }
+        push_const(&mut out, "uint", &format!("{p}_PCLK_HZ"), &spi.pclk_hz.to_string());
+    }
+
     for i2c in &st_i2cs {
         let p = &i2c.prefix;
         out.push_str(&format!("\n        // -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n        // a push-pull output cannot be pulled low by the device at the other end, so an\n        // acknowledge is fought instead of seen and nothing ever answers, with the mux\n        // perfectly correct. The timing words are the manual's own compliant points at\n        // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
@@ -4476,6 +5354,11 @@ fn control_pin_group_base(set: &FamilySet, board: &str, pin: &str) -> Result<(i6
             .ok_or_else(|| format!("{board}: no instance row for 'sio'"))?;
         return Ok((base, index));
     }
+    if let Some(row) = set.instances.rows.iter().find(|row| row.port_char() == Some(port)) {
+        if let Some(base) = set.instances.value(&row.name, "base") {
+            return Ok((base, index));
+        }
+    }
     let spellings = [format!("port{port}"), format!("gpio{port}")];
     for group in &spellings {
         if let Some(base) = set.instances.value(group, "base") {
@@ -4483,7 +5366,9 @@ fn control_pin_group_base(set: &FamilySet, board: &str, pin: &str) -> Result<(i6
         }
     }
     Err(format!(
-        "{board}: no instance row for '{}' or '{}' (the port control pin {pin} needs)",
+        "{board}: no instance row for '{}' or '{}', and no instance declares `port` for the group \
+         control pin {pin} needs. A family whose ports are named neither way states which instance \
+         is which port as DATA rather than growing this list.",
         spellings[0], spellings[1]
     ))
 }
@@ -4491,12 +5376,9 @@ fn control_pin_group_base(set: &FamilySet, board: &str, pin: &str) -> Result<(i6
 
 /// Writes a generated Rust module's header as an INNER DOC comment (`//!`), not a plain `//`.
 ///
-/// Measured, not assumed: the published drop strips ordinary `//` comments from every `.rs`,
-/// and keeps a module's `//!` block only as far as its first blank `//!` line. A plain-`//`
-/// header therefore vanished entirely, and every generated Rust module shipped opening on a
-/// bare `pub const` with nothing saying it was generated -- so the one edit a reader must not
-/// make was the one the file did not warn against. As `//!`, the banner and the regenerate
-/// line survive and the fuller prose below the blank line does not, which is the right split.
+/// An inner doc comment binds the banner to the module: the DO-NOT-EDIT notice and the line saying
+/// how to regenerate the file are the one thing a reader must see before touching it, and a marker
+/// that can be separated from the constants is a warning that can go missing while they stay.
 /// The memory-region facts a board emits, as one ordered row list the typed emitters share.
 ///
 /// A board's `[memory]` record is emitted rather than merely validated against the linker
@@ -5105,6 +5987,7 @@ pub fn emit_board_rust(
 ) -> Result<String, String> {
     let BoardEmissions {
         skipped,
+        driver_families,
         sercom_uarts: uarts,
         rp_uarts,
         esp_uarts,
@@ -5114,6 +5997,7 @@ pub fn emit_board_rust(
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
+        st_spis,
         nrf_twis,
         dw_i2cs,
         rp_adcs,
@@ -5142,6 +6026,18 @@ pub fn emit_board_rust(
     }
     if resolved.board.carrier.usb_pid > 0 {
         push_rust_const(&mut out, "u16", "CARRIER_USB_PID", &format!("0x{:04X}", resolved.board.carrier.usb_pid));
+    }
+
+    if !driver_families.is_empty() {
+        out.push_str(&driver_family_note(""));
+        for (role, family) in &driver_families {
+            push_rust_const(
+                &mut out,
+                "&str",
+                &format!("{}_DRIVER_FAMILY", upper_snake(role)),
+                &format!("\"{family}\""),
+            );
+        }
     }
 
     for uart in &uarts {
@@ -5287,6 +6183,38 @@ pub fn emit_board_rust(
         }
         push_rust_const(&mut out, "u32", &format!("{p}_FUNCSEL"), &spi.funcsel.to_string());
         push_rust_const(&mut out, "u32", &format!("{p}_SSPCLK_HZ"), &spi.sspclk_hz.to_string());
+    }
+
+
+    for spi in &st_spis {
+        let p = &spi.prefix;
+        out.push_str(&format!("
+// -- {p}: an st-spi binding descriptor. NO baud emits: an SPI master's rate is a property of the ATTACHED DEVICE, and a binding names a bus. The APB rate is here and the block table states the eight prescaler codes; the driver picks --
+"));
+        push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", spi.base));
+        push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", spi.rcc_en_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", spi.rcc_en_mask));
+        for (side, pin) in [("SCK", &spi.sck), ("MISO", &spi.miso), ("MOSI", &spi.mosi)] {
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        if let Some(cs) = &spi.cs {
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_PORT_RCC_EN_REG"), &format!("0x{:X}", cs.port_rcc_en_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_PORT_RCC_EN_MASK"), &format!("0x{:X}", cs.port_rcc_en_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_MODER_REG"), &format!("0x{:X}", cs.moder_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_MODER_MASK"), &format!("0x{:X}", cs.moder_mask));
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_MODER_VALUE"), &format!("0x{:X}", cs.moder_value));
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_BSRR_REG"), &format!("0x{:X}", cs.bsrr_reg));
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_BSRR_SET"), &format!("0x{:X}", cs.bsrr_set));
+            push_rust_const(&mut out, "u32", &format!("{p}_CS_BSRR_CLEAR"), &format!("0x{:X}", cs.bsrr_clear));
+        }
+        push_rust_const(&mut out, "u32", &format!("{p}_PCLK_HZ"), &spi.pclk_hz.to_string());
     }
 
     for i2c in &st_i2cs {
@@ -5584,6 +6512,7 @@ pub fn emit_board_swift(
 ) -> Result<String, String> {
     let BoardEmissions {
         skipped,
+        driver_families,
         sercom_uarts: uarts,
         rp_uarts,
         esp_uarts,
@@ -5593,6 +6522,7 @@ pub fn emit_board_swift(
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
+        st_spis,
         nrf_twis,
         dw_i2cs,
         rp_adcs,
@@ -5622,6 +6552,18 @@ pub fn emit_board_swift(
     }
     if resolved.board.carrier.usb_pid > 0 {
         push_swift_const(&mut out, "UInt16", "CARRIER_USB_PID", &format!("0x{:04X}", resolved.board.carrier.usb_pid));
+    }
+
+    if !driver_families.is_empty() {
+        out.push_str(&driver_family_note("    "));
+        for (role, family) in &driver_families {
+            push_swift_const(
+                &mut out,
+                "String",
+                &format!("{}_DRIVER_FAMILY", upper_snake(role)),
+                &format!("\"{family}\""),
+            );
+        }
     }
 
     for uart in &uarts {
@@ -5769,6 +6711,38 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_SSPCLK_HZ"), &spi.sspclk_hz.to_string());
     }
 
+
+    for spi in &st_spis {
+        let p = &spi.prefix;
+        out.push_str(&format!("
+    // -- {p}: an st-spi binding descriptor. NO baud emits: an SPI master's rate is a property of the ATTACHED DEVICE, and a binding names a bus. The APB rate is here and the block table states the eight prescaler codes; the driver picks --
+"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", spi.base));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", spi.rcc_en_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", spi.rcc_en_mask));
+        for (side, pin) in [("SCK", &spi.sck), ("MISO", &spi.miso), ("MOSI", &spi.mosi)] {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_PORT_RCC_EN_REG"), &format!("0x{:X}", pin.port_rcc_en_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_PORT_RCC_EN_MASK"), &format!("0x{:X}", pin.port_rcc_en_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_REG"), &format!("0x{:X}", pin.moder_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_MASK"), &format!("0x{:X}", pin.moder_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_MODER_VALUE"), &format!("0x{:X}", pin.moder_value));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_REG"), &format!("0x{:X}", pin.afr_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_MASK"), &format!("0x{:X}", pin.afr_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_{side}_AFR_VALUE"), &format!("0x{:X}", pin.afr_value));
+        }
+        if let Some(cs) = &spi.cs {
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_PORT_RCC_EN_REG"), &format!("0x{:X}", cs.port_rcc_en_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_PORT_RCC_EN_MASK"), &format!("0x{:X}", cs.port_rcc_en_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_MODER_REG"), &format!("0x{:X}", cs.moder_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_MODER_MASK"), &format!("0x{:X}", cs.moder_mask));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_MODER_VALUE"), &format!("0x{:X}", cs.moder_value));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_BSRR_REG"), &format!("0x{:X}", cs.bsrr_reg));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_BSRR_SET"), &format!("0x{:X}", cs.bsrr_set));
+            push_swift_const(&mut out, "UInt32", &format!("{p}_CS_BSRR_CLEAR"), &format!("0x{:X}", cs.bsrr_clear));
+        }
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PCLK_HZ"), &spi.pclk_hz.to_string());
+    }
+
     for i2c in &st_i2cs {
         let p = &i2c.prefix;
         out.push_str(&format!("\n    // -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n    // a push-pull output cannot be pulled low by the device at the other end, so an\n    // acknowledge is fought instead of seen and nothing ever answers, with the mux\n    // perfectly correct. The timing words are the manual's own compliant points at\n    // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
@@ -5901,6 +6875,7 @@ pub fn emit_board_python(
 ) -> Result<String, String> {
     let BoardEmissions {
         skipped,
+        driver_families,
         sercom_uarts,
         rp_uarts,
         esp_uarts,
@@ -5910,6 +6885,7 @@ pub fn emit_board_python(
         sercom_spis,
         sercom_i2cs,
         pl022_spis,
+        st_spis,
         nrf_twis,
         dw_i2cs,
         rp_adcs,
@@ -6119,6 +7095,37 @@ pub fn emit_board_python(
         rows.push(("sspclk_hz".to_string(), spi.sspclk_hz.to_string()));
         roles.push((&spi.role, rows));
     }
+    for spi in &st_spis {
+        let mut rows = vec![
+            ("kind".to_string(), "\"spi\"".to_string()),
+            ("instance".to_string(), format!("\"{}\"", spi.instance)),
+            ("base".to_string(), format!("0x{:X}", spi.base)),
+            ("rcc_en_reg".to_string(), format!("0x{:X}", spi.rcc_en_reg)),
+            ("rcc_en_mask".to_string(), format!("0x{:X}", spi.rcc_en_mask)),
+        ];
+        for (side, pin) in [("sck", &spi.sck), ("miso", &spi.miso), ("mosi", &spi.mosi)] {
+            rows.push((format!("{side}_port_rcc_en_reg"), format!("0x{:X}", pin.port_rcc_en_reg)));
+            rows.push((format!("{side}_port_rcc_en_mask"), format!("0x{:X}", pin.port_rcc_en_mask)));
+            rows.push((format!("{side}_moder_reg"), format!("0x{:X}", pin.moder_reg)));
+            rows.push((format!("{side}_moder_mask"), format!("0x{:X}", pin.moder_mask)));
+            rows.push((format!("{side}_moder_value"), format!("0x{:X}", pin.moder_value)));
+            rows.push((format!("{side}_afr_reg"), format!("0x{:X}", pin.afr_reg)));
+            rows.push((format!("{side}_afr_mask"), format!("0x{:X}", pin.afr_mask)));
+            rows.push((format!("{side}_afr_value"), format!("0x{:X}", pin.afr_value)));
+        }
+        if let Some(cs) = &spi.cs {
+            rows.push(("cs_port_rcc_en_reg".to_string(), format!("0x{:X}", cs.port_rcc_en_reg)));
+            rows.push(("cs_port_rcc_en_mask".to_string(), format!("0x{:X}", cs.port_rcc_en_mask)));
+            rows.push(("cs_moder_reg".to_string(), format!("0x{:X}", cs.moder_reg)));
+            rows.push(("cs_moder_mask".to_string(), format!("0x{:X}", cs.moder_mask)));
+            rows.push(("cs_moder_value".to_string(), format!("0x{:X}", cs.moder_value)));
+            rows.push(("cs_bsrr_reg".to_string(), format!("0x{:X}", cs.bsrr_reg)));
+            rows.push(("cs_bsrr_set".to_string(), format!("0x{:X}", cs.bsrr_set)));
+            rows.push(("cs_bsrr_clear".to_string(), format!("0x{:X}", cs.bsrr_clear)));
+        }
+        rows.push(("pclk_hz".to_string(), spi.pclk_hz.to_string()));
+        roles.push((&spi.role, rows));
+    }
     for twi in &nrf_twis {
         roles.push((
             &twi.role,
@@ -6163,6 +7170,17 @@ pub fn emit_board_python(
         ));
     }
 
+    for (role, rows) in &mut roles {
+        let Some((_, family)) = driver_families.iter().find(|(r, _)| r == role) else {
+            return Err(format!(
+                "{}: role '{role}' has a descriptor but no driver family -- the two are recorded together, so one without the other is a generator defect",
+                resolved.board.board
+            ));
+        };
+        let at = rows.iter().position(|(key, _)| key == "kind").map_or(0, |at| at + 1);
+        rows.insert(at, ("driver_family".to_string(), format!("\"{family}\"")));
+    }
+
     out.push_str(
         "\n# Role handles: the ONLY peripheral names an app sees. The value of a\n# role handle is its role-id string; the runtime resolves role -> facts through FACTS\n# below, never through a surface-private enum.\n",
     );
@@ -6185,7 +7203,7 @@ pub fn emit_board_python(
     out.push_str("}\n");
 
     out.push_str(
-        "\n# Per-role descriptor dicts, grouped by the role each belongs to.\n# Emitted from this board's facts, like every other language's support for it:\n# an UPPER_SNAKE name in the shared facts is a lowercase key here.\nFACTS = {\n",
+        "\n# Per-role descriptor dicts, grouped by the role each belongs to.\n# Emitted from this board's facts, like every other language's support for it:\n# an UPPER_SNAKE name in the shared facts is a lowercase key here.\n#\n# \"kind\" and \"driver_family\" are read TOGETHER and neither answers alone: kind is what the\n# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind\n# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not\n# name a driver; a uart is a different register map on every family, so the kind does not either.\nFACTS = {\n",
     );
     for (role, rows) in &roles {
         out.push_str(&format!("    \"{role}\": {{\n"));
@@ -6193,6 +7211,22 @@ pub fn emit_board_python(
             out.push_str(&format!("        \"{key}\": {value},\n"));
         }
         out.push_str("    },\n");
+    }
+    out.push_str("}\n");
+
+    out.push_str(
+        "\n# The chip's instance map: every block this family places, with its base address and\n# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also\n# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock\n# controller, a reset controller -- and those are one per chip, so they are stated once here.\n# Bases only: register offsets and bit encodings belong to the driver that knows the block.\nINSTANCES = {\n",
+    );
+    for row in &set.instances.rows {
+        let mut entry = format!("    \"{}\": {{\"block\": \"{}\"", row.name, row.block);
+        for (at, field) in set.instances.record.iter().enumerate() {
+            let Some(value) = row.values.get(at) else { continue };
+            if *value < 0 {
+                continue;
+            }
+            entry.push_str(&format!(", \"{field}\": 0x{value:X}"));
+        }
+        out.push_str(&format!("{entry}}},\n"));
     }
     out.push_str("}\n");
 
@@ -6362,6 +7396,22 @@ fn merge_named<T: Clone>(base: &[T], member: &[T], name: impl Fn(&T) -> String) 
 /// merges per key, because it is the one section the schema deliberately SPLITS: the base states
 /// where to look and each member states what to accept there.
 pub fn resolve_device(set: &DeviceSet, part: &DeviceTable) -> Result<DeviceTable, String> {
+    if let Some(sourcing) = part.sourcing.as_ref().filter(|s| s.facts == "secondary") {
+        if !sourcing.derived_from.is_empty() {
+            if sourcing.derived_from == part.part {
+                return Err(format!(
+                    "part '{}': [sourcing] derived_from names the part itself, which states nothing about where its facts came from",
+                    part.part
+                ));
+            }
+            if !set.parts.iter().any(|p| p.part == sourcing.derived_from) {
+                return Err(format!(
+                    "part '{}': [sourcing] derived_from names '{}', which is not a part of family '{}'",
+                    part.part, sourcing.derived_from, set.family
+                ));
+            }
+        }
+    }
     let base = match part.base.as_str() {
         "" => None,
         named => {
@@ -6395,6 +7445,7 @@ pub fn resolve_device(set: &DeviceSet, part: &DeviceTable) -> Result<DeviceTable
         buses: merge_named(&base.buses, &part.buses, |b| b.name.clone()),
         address: part.address.clone().or_else(|| base.address.clone()),
         identity: Some(identity),
+        sourcing: part.sourcing.clone(),
         registers: merge_named(&base.registers, &part.registers, |r| r.name.clone()),
         enums: merge_named(&base.enums, &part.enums, |e| e.name.clone()),
         burst_length: if part.burst_length >= 0 { part.burst_length } else { base.burst_length },
@@ -6408,6 +7459,47 @@ pub fn resolve_device(set: &DeviceSet, part: &DeviceTable) -> Result<DeviceTable
 /// name that compiles.
 fn validate_device(part: &DeviceTable) -> Result<(), String> {
     let who = format!("part '{}'", part.part);
+    let sourcing = part.sourcing.as_ref().ok_or_else(|| {
+        format!(
+            "{who} states no [sourcing] -- every part declares where its facts came from and how far it has been validated, so a catalogue can be ranked rather than trusted whole"
+        )
+    })?;
+    if !SOURCING_FACTS.contains(&sourcing.facts.as_str()) {
+        return Err(format!(
+            "{who}: [sourcing] facts is '{}', which is not one of {}",
+            sourcing.facts,
+            SOURCING_FACTS.join(", ")
+        ));
+    }
+    if !SOURCING_VALIDATION.contains(&sourcing.validation.as_str()) {
+        return Err(format!(
+            "{who}: [sourcing] validation is '{}', which is not one of {}",
+            sourcing.validation,
+            SOURCING_VALIDATION.join(", ")
+        ));
+    }
+    if sourcing.facts == "secondary" && sourcing.derived_from.is_empty() {
+        return Err(format!(
+            "{who}: [sourcing] facts is 'secondary' but names no derived_from -- a second-hand fact must name the part whose document carries it"
+        ));
+    }
+    if sourcing.facts == "primary" && !sourcing.derived_from.is_empty() {
+        return Err(format!(
+            "{who}: [sourcing] facts is 'primary' and also names derived_from '{}' -- a part read from its own datasheet derives from nothing",
+            sourcing.derived_from
+        ));
+    }
+    if sourcing.validation != "none" && sourcing.evidence.is_empty() {
+        return Err(format!(
+            "{who}: [sourcing] validation is '{}' but no evidence is stated -- a validation rank names what the part was observed to do",
+            sourcing.validation
+        ));
+    }
+    if sourcing.validation == "none" && !sourcing.evidence.is_empty() {
+        return Err(format!(
+            "{who}: [sourcing] validation is 'none' but evidence is stated -- evidence that earns no rank reads as a validation the table is not claiming"
+        ));
+    }
     let identity = part
         .identity
         .as_ref()
@@ -6546,6 +7638,28 @@ fn device_rows(part: &DeviceTable) -> Result<Vec<Row>, String> {
     let mut rows = Vec::new();
     text(&mut rows, "PART".to_string(), &part.part);
     text(&mut rows, "FAMILY".to_string(), &part.family);
+
+    let sourcing = part.sourcing.as_ref().expect("validated present");
+    section(
+        &mut rows,
+        "sourcing: how far this part is established, on two INDEPENDENT axes -- a part can be \
+         strong on one and absent on the other, which is why they are not one rank. FACTS is \
+         `primary` (read from the part's own datasheet) or `secondary` (a primary vendor statement \
+         about this part carried by another document, named by DERIVED_FROM). VALIDATION is `none` \
+         (no physical part of this type has been made to answer), `identified` (one answered its \
+         identity register, against a negative control that tells the part from the wire) or \
+         `exercised` (one produced measurements a driver decoded). Anything above `none` states \
+         what was observed in EVIDENCE."
+            .to_string(),
+    );
+    text(&mut rows, "SOURCING_FACTS".to_string(), &sourcing.facts);
+    if !sourcing.derived_from.is_empty() {
+        text(&mut rows, "SOURCING_DERIVED_FROM".to_string(), &sourcing.derived_from);
+    }
+    text(&mut rows, "SOURCING_VALIDATION".to_string(), &sourcing.validation);
+    if !sourcing.evidence.is_empty() {
+        text(&mut rows, "SOURCING_EVIDENCE".to_string(), &sourcing.evidence);
+    }
 
     let identity = part.identity.as_ref().expect("validated present");
     section(
@@ -6755,11 +7869,14 @@ fn common_rows(parts: &[DeviceTable]) -> Result<Vec<Row>, String> {
     let per_part: Vec<Vec<Row>> = parts.iter().map(device_rows).collect::<Result<_, _>>()?;
     let Some((first, rest)) = per_part.split_first() else { return Ok(Vec::new()) };
 
-    let key = |row: &Row| match row {
-        Row::Uint(name, value) => Some((name.clone(), format!("u{value}"))),
-        Row::Int(name, value) => Some((name.clone(), format!("i{value}"))),
-        Row::Str(name, value) => Some((name.clone(), format!("s{value}"))),
-        _ => None,
+    let key = |row: &Row| {
+        let ranked = |name: &String| !name.starts_with("SOURCING_");
+        match row {
+            Row::Uint(name, value) if ranked(name) => Some((name.clone(), format!("u{value}"))),
+            Row::Int(name, value) if ranked(name) => Some((name.clone(), format!("i{value}"))),
+            Row::Str(name, value) if ranked(name) => Some((name.clone(), format!("s{value}"))),
+            _ => None,
+        }
     };
     let shared: std::collections::HashSet<(String, String)> = rest
         .iter()
@@ -7466,6 +8583,7 @@ base = 0x1000
             flash: 0,
             ram: 0,
             pins: vec!["PA12-PA15".into(), "PB09".into()],
+            ..Default::default()
         };
         assert!(row.has_pin("PA13"));
         assert!(row.has_pin("PB09"));
@@ -7487,8 +8605,7 @@ base = 0x1000
                 rows: vec![InstanceRow {
                     name: "fmc".into(),
                     block: "fmc".into(),
-                    values: vec![0xA000_0000],
-                }],
+                    values: vec![0xA000_0000], port: String::new() }],
                 ..Default::default()
             },
             parts: PartsTable {
@@ -7499,6 +8616,7 @@ base = 0x1000
                     flash: 0,
                     ram: 0,
                     pins: vec!["PF0-PF5".into()],
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -7509,6 +8627,7 @@ base = 0x1000
             function: "AF12".into(),
             instance: "fmc".into(),
             signal: "a0".into(),
+            source: "a datasheet".into(),
         };
 
         set.pins = PinsTable { family: "fam".into(), rows: vec![row("PF3")], ..Default::default() };
@@ -7522,6 +8641,245 @@ base = 0x1000
         assert!(validate_family(&set).is_ok(), "a family with no parts row states no present-list");
     }
 
+    /// A board's WIRED CONTROL LINE naming a pin its part does not carry -- the third list stating
+    /// pins about a part, and the last one nothing checked.
+    ///
+    /// Measured when this check landed: eight control lines across three rp2040 boards named pins
+    /// that family's parts row did not carry, and every gate was green.
+    #[test]
+    fn a_board_control_line_outside_its_parts_present_list_is_refused() {
+        let set = FamilySet {
+            family: "fam".into(),
+            parts: PartsTable {
+                family: "fam".into(),
+                rows: vec![PartRow {
+                    part: "p".into(),
+                    package: "LQFP144".into(),
+                    pins: vec!["PB0".into(), "PB7".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let board = |pin: &str| BoardTable {
+            board: "b".into(),
+            family: "fam".into(),
+            part: "p".into(),
+            devices: vec![ControlPin {
+                name: "led0".into(),
+                kind: "gpio-out".into(),
+                pin: pin.into(),
+                active: "high".into(),
+                address: -1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(resolve_board(&set, board("PB7")).is_ok(), "a pin inside the present-list is fine");
+
+        let error = resolve_board(&set, board("PA3")).unwrap_err();
+        assert!(error.contains("device 'led0' is wired to PA3"), "{error}");
+        assert!(error.contains("not in part p's pin list"), "{error}");
+
+        let error = resolve_board(&set, board("PB3")).unwrap_err();
+        assert!(error.contains("device 'led0' is wired to PB3"), "{error}");
+    }
+
+    /// A board wiring a control line to a pin the PART RESERVES for something inside the package.
+    #[test]
+    fn a_reserved_pin_is_refused_to_a_board_and_to_a_binding() {
+        let part = |reserved: Vec<(String, String)>| PartRow {
+            part: "p".into(),
+            package: "QFN48".into(),
+            pins: vec!["PA10".into(), "PB7".into()],
+            reserved,
+            ..Default::default()
+        };
+        let set = |row: PartRow| FamilySet {
+            family: "fam".into(),
+            parts: PartsTable { family: "fam".into(), rows: vec![row], ..Default::default() },
+            ..Default::default()
+        };
+        let board = |pin: &str| BoardTable {
+            board: "b".into(),
+            family: "fam".into(),
+            part: "p".into(),
+            devices: vec![ControlPin {
+                name: "led0".into(),
+                kind: "gpio-out".into(),
+                pin: pin.into(),
+                active: "high".into(),
+                address: -1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            resolve_board(&set(part(Vec::new())), board("PA10")).is_ok(),
+            "an unreserved pin in the present-list is fine -- without this the test below proves nothing"
+        );
+
+        let reserved = vec![("PA10".to_string(), "the integrated radio's RFCTRL".to_string())];
+        let error = resolve_board(&set(part(reserved.clone())), board("PA10")).unwrap_err();
+        assert!(error.contains("device 'led0' is wired to PA10"), "{error}");
+        assert!(error.contains("RESERVES for the integrated radio's RFCTRL"), "{error}");
+
+        let mut with_binding = set(part(reserved));
+        with_binding.instances = InstancesTable {
+            family: "fam".into(),
+            record: vec!["base".into()],
+            rows: vec![InstanceRow {
+                name: "sercom4".into(),
+                block: "sercom".into(),
+                values: vec![0x4200_0000],
+                port: String::new(),
+            }],
+            ..Default::default()
+        };
+        let binding = Binding {
+            role: "radio".into(),
+            kind: "spi".into(),
+            instance: "sercom4".into(),
+            function: "F".into(),
+            pins: vec![("mosi".to_string(), PinRef { pin: "PA10".into(), ..Default::default() })],
+            gclk_gen: -1,
+            reference_uv: -1,
+        };
+        let error = validate_bindings(&with_binding, &[binding], "p", "b").unwrap_err();
+        assert!(error.contains("claims pin PA10"), "{error}");
+        assert!(error.contains("RESERVES"), "{error}");
+    }
+
+    /// A part's core sockets, and the combinability test that decides them.
+    ///
+    /// THE RULE: a target is a selection an IMAGE makes over a part's cores, and
+    /// one part admits several -- each core can be an individual target, and two cores "of the same
+    /// architecture sharing the same memory space" can also be driven as ONE threaded system.
+    #[test]
+    fn core_sockets_are_combinable_only_on_one_architecture_and_one_address_space() {
+        let part = |cores: Vec<(&str, Vec<&str>)>, shared: Option<bool>| PartRow {
+            part: "p".into(),
+            cores: cores
+                .into_iter()
+                .map(|(s, a)| (s.to_string(), a.into_iter().map(String::from).collect()))
+                .collect(),
+            cores_share_memory: shared,
+            ..Default::default()
+        };
+
+        assert!(part(vec![], None).cores_combinable().is_none());
+
+        let symmetric = part(
+            vec![("core0", vec!["cortex-m0plus"]), ("core1", vec!["cortex-m0plus"])],
+            Some(true),
+        );
+        assert_eq!(symmetric.cores_combinable(), Some(Ok(())));
+
+        let selectable = part(
+            vec![
+                ("core0", vec!["cortex-m33", "hazard3"]),
+                ("core1", vec!["cortex-m33", "hazard3"]),
+            ],
+            Some(true),
+        );
+        assert_eq!(selectable.cores_combinable(), Some(Ok(())));
+
+        let mixed = part(
+            vec![("core0", vec!["cortex-m33"]), ("core1", vec!["hazard3"])],
+            Some(true),
+        );
+        let Some(Err(why)) = mixed.cores_combinable() else { panic!("mixed pair reported combinable") };
+        assert!(why.contains("no single architecture"), "{why}");
+
+        let split = part(
+            vec![("core0", vec!["cortex-m7f"]), ("core1", vec!["cortex-m7f"])],
+            Some(false),
+        );
+        let Some(Err(why)) = split.cores_combinable() else { panic!("split memory reported combinable") };
+        assert!(why.contains("one address space"), "{why}");
+    }
+
+    /// The core-set table refuses what it cannot check, in the same spirit as the ISA profile.
+    #[test]
+    fn a_core_set_states_its_sockets_completely_or_is_refused() {
+        let base = "\
+[table]
+kind = \"parts\"
+family = \"fam\"
+
+[[parts]]
+part = \"p\"
+package = \"QFN-56\"
+flash = 0
+ram = 0x1000
+pins = [\"GP0\"]
+";
+        let with = |line: &str| format!("{base}{line}\nsource = \"a datasheet\"\n");
+
+        assert!(
+            parse(&with(
+                "cores = { core0 = [\"cortex-m0plus\"], core1 = [\"cortex-m0plus\"] }\ncores_share_memory = true"
+            ))
+            .is_ok(),
+            "two sockets with a shared-memory statement is the whole valid shape"
+        );
+
+        let error = parse(&with(
+            "cores = { core0 = [\"cortex-m0plus\"], core1 = [\"cortex-m0plus\"] }",
+        ))
+        .unwrap_err();
+        assert!(error.contains("without stating cores_share_memory"), "{error}");
+
+        let error = parse(&with("cores = { core0 = [\"cortex-m0plus\"] }\ncores_share_memory = true"))
+            .unwrap_err();
+        assert!(error.contains("states one core socket"), "{error}");
+
+        let error = parse(&with(
+            "cores = { core0 = [\"cortex-m0plus\"], core1 = [\"m0+\"] }\ncores_share_memory = true",
+        ))
+        .unwrap_err();
+        assert!(error.contains("architecture 'm0+'"), "{error}");
+
+        let error = parse(&with("cores = { core0 = [], core1 = [\"cortex-m0plus\"] }\ncores_share_memory = true"))
+            .unwrap_err();
+        assert!(error.contains("lists no architecture"), "{error}");
+
+        let error = parse(&with("cores_share_memory = true")).unwrap_err();
+        assert!(error.contains("without stating `cores`"), "{error}");
+    }
+
+    /// A reservation naming a pin the part does not have: two statements that cannot both be true.
+    #[test]
+    fn a_reservation_outside_the_present_list_is_refused() {
+        let text = "\
+[table]
+kind = \"parts\"
+family = \"fam\"
+
+[[parts]]
+part = \"p\"
+package = \"QFN48\"
+flash = 0x40000
+ram = 0x8000
+pins = [\"PA10\"]
+reserved = { PB16 = \"the radio\" }
+source = \"a datasheet\"
+";
+        let error = parse(text).unwrap_err();
+        assert!(error.contains("reserves PB16"), "{error}");
+        assert!(error.contains("not in its pin list"), "{error}");
+
+        let empty = text.replace("PB16 = \"the radio\"", "PA10 = \"\"");
+        let error = parse(&empty).unwrap_err();
+        assert!(error.contains("empty owner"), "{error}");
+
+        let good = text.replace("PB16 = \"the radio\"", "PA10 = \"the radio\"");
+        assert!(parse(&good).is_ok(), "a reservation on a present pin, with an owner, is fine");
+    }
+
     #[test]
     fn rust_instances_mirror_the_csharp_names_and_spellings() {
         let table = InstancesTable {
@@ -7531,9 +8889,8 @@ base = 0x1000
                 InstanceRow {
                     name: "sercom3".into(),
                     block: "sercom".into(),
-                    values: vec![0x42001400, 0x17, 5, 12],
-                },
-                InstanceRow { name: "gclk".into(), block: "gclk".into(), values: vec![0x40000C00, -1, -1, -1] },
+                    values: vec![0x42001400, 0x17, 5, 12], port: String::new() },
+                InstanceRow { name: "gclk".into(), block: "gclk".into(), values: vec![0x40000C00, -1, -1, -1], port: String::new() },
             ],
         };
         let rust = emit_instances_rust(&table, "src.toml", "regen").expect("emits");
@@ -7562,9 +8919,8 @@ base = 0x1000
                 InstanceRow {
                     name: "sercom3".into(),
                     block: "sercom".into(),
-                    values: vec![0x42001400, 0x17, 5, 12],
-                },
-                InstanceRow { name: "gclk".into(), block: "gclk".into(), values: vec![0x40000C00, -1, -1, -1] },
+                    values: vec![0x42001400, 0x17, 5, 12], port: String::new() },
+                InstanceRow { name: "gclk".into(), block: "gclk".into(), values: vec![0x40000C00, -1, -1, -1], port: String::new() },
             ],
         };
         let swift = emit_instances_swift(&table, "src.toml", "regen").expect("emits");
@@ -7693,6 +9049,10 @@ kind = "device"
 family = "fam"
 part = "one"
 base = "fam"
+
+[sourcing]
+facts = "primary"
+validation = "none"
 
 [identity]
 reg = 0xD0
@@ -7829,6 +9189,10 @@ resolution_bits = "16..20, depending only on the oversampling setting"
     }
 
 
+    /// The least a part may say about its own sourcing, so a fixture testing something else can
+    /// satisfy the requirement without being about it.
+    const SOURCING: &str = "[sourcing]\nfacts = \"primary\"\nvalidation = \"none\"\n";
+
     fn flattened(member: &str) -> DeviceTable {
         let set = DeviceSet {
             family: "fam".into(),
@@ -7872,11 +9236,13 @@ resolution_bits = "16..20, depending only on the oversampling setting"
 
     #[test]
     fn an_inherited_encoding_is_replaced_whole_and_never_merged() {
-        let member = "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
-                      [identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x60]\n\
-                      [measurement]\nburst_length = 6\n\
-                      [enums.mode]\nsleep = 0\nforced = 2\n";
-        let part = flattened(member);
+        let member = format!(
+            "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n{SOURCING}\
+             [identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x60]\n\
+             [measurement]\nburst_length = 6\n\
+             [enums.mode]\nsleep = 0\nforced = 2\n"
+        );
+        let part = flattened(&member);
         let [csharp, ..] = emissions(&part);
         assert!(csharp.contains("public const uint MODE_FORCED = 2;"), "the member's code wins");
         assert!(
@@ -7943,7 +9309,7 @@ resolution_bits = "16..20, depending only on the oversampling setting"
     fn a_flattened_part_is_refused_when_a_reference_goes_nowhere() {
         let with = |body: &str| -> String {
             format!(
-                "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
+                "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n{SOURCING}\
                  [identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x60]\n[measurement]\nburst_length = 6\n{body}"
             )
         };
@@ -7967,11 +9333,170 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         let bad_depends = with("[calibration.humidity]\nform = \"h\"\ndepends_on = [\"nowhere\"]\n");
         assert!(emit(&bad_depends).expect_err("a dangling dependency is refused").contains("nowhere"));
 
-        let no_values = "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n";
-        assert!(emit(no_values).expect_err("an empty identity is refused").contains("accepts no value"));
+        let no_values =
+            format!("[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n{SOURCING}");
+        assert!(emit(&no_values).expect_err("an empty identity is refused").contains("accepts no value"));
 
-        let mismatch = "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
-                        [identity]\nreg = 0xF4\nwidth = 16\nvalues = [0x60]\n";
-        assert!(emit(mismatch).expect_err("a width disagreement is refused").contains("[registers.ctrl_meas]"));
+        let mismatch = format!(
+            "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n{SOURCING}\
+             [identity]\nreg = 0xF4\nwidth = 16\nvalues = [0x60]\n"
+        );
+        assert!(emit(&mismatch).expect_err("a width disagreement is refused").contains("[registers.ctrl_meas]"));
+    }
+
+
+    /// A member with an arbitrary `[sourcing]` body, everything else minimal and valid.
+    fn sourced(body: &str) -> String {
+        format!(
+            "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
+             [sourcing]\n{body}\
+             [identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x60]\n[measurement]\nburst_length = 6\n"
+        )
+    }
+
+    /// Resolves and emits one member against the shared base, so a refusal from either stage
+    /// surfaces the same way.
+    fn emit_one(text: &str) -> Result<String, String> {
+        let set = DeviceSet {
+            family: "fam".into(),
+            base: Some(device(DEVICE_BASE)),
+            parts: vec![device(text)],
+        };
+        let part = resolve_device(&set, &set.parts[0])?;
+        emit_part_csharp(&part, &["m.toml".to_string()], "regen")
+    }
+
+    #[test]
+    fn a_part_must_declare_how_well_it_is_known() {
+        let silent = "[table]\nkind = \"device\"\nfamily = \"fam\"\npart = \"one\"\nbase = \"fam\"\n\
+                      [identity]\nreg = 0xD0\nwidth = 8\nvalues = [0x60]\n[measurement]\nburst_length = 6\n";
+        let error = emit_one(silent).expect_err("a part that states no sourcing is refused");
+        assert!(error.contains("states no [sourcing]"), "{error}");
+
+        assert!(emit_one(&sourced("facts = \"primary\"\nvalidation = \"none\"\n")).is_ok());
+    }
+
+    #[test]
+    fn a_tier_outside_the_closed_set_is_refused() {
+        let facts = emit_one(&sourced("facts = \"datasheet\"\nvalidation = \"none\"\n"))
+            .expect_err("an unknown facts tier is refused");
+        assert!(facts.contains("primary, secondary"), "{facts}");
+
+        let validation = emit_one(&sourced("facts = \"primary\"\nvalidation = \"tested\"\n"))
+            .expect_err("an unknown validation tier is refused");
+        assert!(validation.contains("none, identified, exercised"), "{validation}");
+    }
+
+    #[test]
+    fn second_hand_facts_must_name_what_they_are_second_hand_to() {
+        let unnamed = emit_one(&sourced("facts = \"secondary\"\nvalidation = \"none\"\n"))
+            .expect_err("secondary sourcing with no derived_from is refused");
+        assert!(unnamed.contains("names no derived_from"), "{unnamed}");
+
+        let both = emit_one(&sourced(
+            "facts = \"primary\"\nderived_from = \"two\"\nvalidation = \"none\"\n",
+        ))
+        .expect_err("primary sourcing that also derives is refused");
+        assert!(both.contains("derives from nothing"), "{both}");
+    }
+
+    #[test]
+    fn a_derived_from_must_name_a_sibling_the_family_actually_has() {
+        let absent = emit_one(&sourced(
+            "facts = \"secondary\"\nderived_from = \"ghost\"\nvalidation = \"none\"\n",
+        ))
+        .expect_err("a derived_from naming no sibling is refused");
+        assert!(absent.contains("not a part of family 'fam'"), "{absent}");
+
+        let itself = emit_one(&sourced(
+            "facts = \"secondary\"\nderived_from = \"one\"\nvalidation = \"none\"\n",
+        ))
+        .expect_err("a self-referential derived_from is refused");
+        assert!(itself.contains("names the part itself"), "{itself}");
+    }
+
+    #[test]
+    fn a_validation_rank_must_say_what_earned_it() {
+        let bare = emit_one(&sourced("facts = \"primary\"\nvalidation = \"identified\"\n"))
+            .expect_err("a rank above none with no evidence is refused");
+        assert!(bare.contains("no evidence is stated"), "{bare}");
+
+        let unclaimed = emit_one(&sourced(
+            "facts = \"primary\"\nvalidation = \"none\"\nevidence = \"it answered once\"\n",
+        ))
+        .expect_err("evidence under a rank of none is refused");
+        assert!(unclaimed.contains("earns no rank"), "{unclaimed}");
+
+        let earned = emit_one(&sourced(
+            "facts = \"primary\"\nvalidation = \"identified\"\n\
+             evidence = \"the identity register answered the same value in every read, and a control that never selected the part read a different one\"\n",
+        ))
+        .expect("a rank with its evidence emits");
+        assert!(earned.contains("public const string SOURCING_VALIDATION = \"identified\";"), "{earned}");
+        assert!(earned.contains("SOURCING_EVIDENCE"), "{earned}");
+    }
+
+    #[test]
+    fn a_family_base_may_not_rank_itself() {
+        let ranked = format!("{DEVICE_BASE}\n[sourcing]\nfacts = \"primary\"\nvalidation = \"none\"\n");
+        let error = parse(&ranked).expect_err("a base that ranks itself is refused");
+        assert!(error.contains("sourced differently for each member"), "{error}");
+    }
+
+    #[test]
+    fn the_sourcing_tier_never_joins_the_family_invariant() {
+        let one = device(&sourced("facts = \"primary\"\nvalidation = \"none\"\n"));
+        let two = device(
+            &sourced("facts = \"secondary\"\nderived_from = \"one\"\nvalidation = \"none\"\n")
+                .replace("part = \"one\"", "part = \"two\""),
+        );
+        let set = DeviceSet { family: "fam".into(), base: Some(device(DEVICE_BASE)), parts: vec![one, two] };
+        let resolved: Vec<DeviceTable> =
+            set.parts.iter().map(|p| resolve_device(&set, p).expect("resolves")).collect();
+
+        for part in &resolved {
+            let rows = device_rows(part).expect("rows");
+            assert!(
+                rows.iter().any(|r| matches!(r, Row::Str(n, v) if n == "SOURCING_VALIDATION" && v == "none")),
+                "both members state validation = none"
+            );
+        }
+
+        let common = common_rows(&resolved).expect("the family intersects");
+        assert!(
+            !common.iter().any(|r| matches!(r, Row::Str(n, _) if n.starts_with("SOURCING_"))),
+            "no sourcing row may be a family invariant"
+        );
+        assert!(
+            common.iter().any(|r| matches!(r, Row::Uint(n, _) if n == "CTRL_MEAS_REG")),
+            "an ordinary shared fact still intersects"
+        );
+    }
+
+    #[test]
+    fn every_language_spells_the_tier() {
+        let second = device(
+            &sourced("facts = \"secondary\"\nderived_from = \"one\"\nvalidation = \"none\"\n")
+                .replace("part = \"one\"", "part = \"two\""),
+        );
+        let set = DeviceSet {
+            family: "fam".into(),
+            base: Some(device(DEVICE_BASE)),
+            parts: vec![device(&sourced("facts = \"primary\"\nvalidation = \"none\"\n")), second],
+        };
+        let part = resolve_device(&set, &set.parts[1]).expect("the second member resolves");
+        let [csharp, rust, swift, python] = emissions(&part);
+        for (rendered, spelling) in [
+            (&csharp, "public const string SOURCING_FACTS = \"secondary\";"),
+            (&rust, "pub const SOURCING_FACTS: &str = \"secondary\";"),
+            (&swift, "public static let SOURCING_FACTS: StaticString = \"secondary\""),
+            (&python, "SOURCING_FACTS = \"secondary\""),
+        ] {
+            assert!(rendered.contains(spelling), "missing: {spelling}\n{rendered}");
+        }
+        for rendered in [&csharp, &rust, &swift, &python] {
+            assert!(rendered.contains("SOURCING_DERIVED_FROM"), "{rendered}");
+            assert!(rendered.contains("SOURCING_VALIDATION"), "{rendered}");
+        }
     }
 }

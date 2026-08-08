@@ -228,6 +228,17 @@ pub struct Heap {
     top: u32,
     /// The type-descriptor table; an object's header word indexes it.
     type_descs: Vec<TypeDesc>,
+    /// Which payload slots hold a WEAK reference, per type-descriptor id -- see
+    /// [`Self::set_weak_offsets`]. Absent (the ordinary case) means the type has none, so a
+    /// heap whose embedder never declares one carries an empty map and one lookup per survivor.
+    ///
+    /// This lives beside the descriptor table rather than inside [`TypeDesc`] deliberately: the
+    /// backend's on-wire descriptor blob has no field for it (exactly as it has none for
+    /// [`TypeDesc::tagged_offsets`]), so a decoded descriptor could not populate it, and a fourth
+    /// literal field would have to be written at every construction site in four crates to say
+    /// "none" at all but one of them.
+    #[cfg(feature = "gc-collect")]
+    weak_offsets: alloc::collections::BTreeMap<u32, Vec<u32>>,
 }
 
 impl Heap {
@@ -243,7 +254,32 @@ impl Heap {
             bytes,
             top: ALIGN,
             type_descs,
+            #[cfg(feature = "gc-collect")]
+            weak_offsets: alloc::collections::BTreeMap::new(),
         }
+    }
+
+    /// Declares that an object of type `type_desc_id` holds a WEAK reference in each 4-byte
+    /// payload slot named by `offsets` (byte offsets within the payload, as in
+    /// [`TypeDesc::ref_offsets`]).
+    ///
+    /// **A weak slot is not traced.** MARK never follows it, so a target reachable only through
+    /// weak slots is reclaimed; RELOCATE forwards it if the target survived on its own account and
+    /// CLEARS it to null if it did not. That pair is the whole contract, and it is the one the C#
+    /// interpreter's heap already implements for `System.WeakReference`
+    /// (`lamella_cil_runtime::object::Object::Weak`) -- this is the same semantics in the flat-byte
+    /// heap, so one collector can serve every language that wants a weak reference.
+    #[cfg(feature = "gc-collect")]
+    pub fn set_weak_offsets(&mut self, type_desc_id: u32, offsets: Vec<u32>) {
+        debug_assert!(
+            self.type_descs
+                .get(type_desc_id as usize)
+                .is_none_or(|desc| offsets.iter().all(|weak| {
+                    !desc.ref_offsets.contains(weak) && !desc.tagged_offsets.contains(weak)
+                })),
+            "a weak offset is also declared strong, which would trace it and relocate it twice",
+        );
+        self.weak_offsets.insert(type_desc_id, offsets);
     }
 
     /// The bump pointer (the next free address). Equals [`ALIGN`] on an empty heap;
@@ -330,6 +366,10 @@ impl Heap {
     /// toward the heap base, rewriting every reference (roots and object fields) to
     /// the survivor's new address. Stop-the-world, non-generational, no finalizers.
     ///
+    /// "Unreachable from the roots" counts only STRONG references: a slot declared through
+    /// [`Self::set_weak_offsets`] is not followed here, so an object named only by weak slots is
+    /// reclaimed and each of those slots is cleared to null.
+    ///
     /// `enumerate_roots` mirrors the interpreter's collector signature
     /// (`lamella_cil_runtime::object::Heap::collect`): it visits each root slot mutably and
     /// is called **twice** -- once to seed the mark, once to relocate. The caller
@@ -376,9 +416,86 @@ impl Heap {
     {
         let resolver = TableResolver {
             type_descs: &self.type_descs,
+            weak_offsets: &self.weak_offsets,
         };
         let top = self.top;
-        self.top = mark_compact(&mut self.bytes, top, &resolver, enumerate_roots, pinned);
+        self.top =
+            mark_compact(&mut self.bytes, top, &resolver, enumerate_roots, &mut no_interior_refs, pinned);
+    }
+
+    /// [`Self::collect`], with a callback for the managed references its objects own OUTSIDE the heap --
+    /// a container's elements held in the caller's own side table, named by the object's header word and
+    /// first payload word. See [`InteriorRefs`], which is where the reason it is a callback rather than
+    /// another root list is written down: **a table reported as a root makes every reference cycle
+    /// through it immortal.**
+    ///
+    /// [`Self::collect`] and [`Self::collect_with_pins`] are this with an interior that supplies
+    /// nothing, so a caller that has no exterior references is unaffected and unchanged.
+    #[cfg(feature = "gc-collect")]
+    pub fn collect_with_interior<R>(&mut self, enumerate_roots: R, interior: InteriorRefs<'_>)
+    where
+        R: FnMut(&mut dyn FnMut(&mut Ref)),
+    {
+        let resolver = TableResolver {
+            type_descs: &self.type_descs,
+            weak_offsets: &self.weak_offsets,
+        };
+        let top = self.top;
+        self.top = mark_compact(&mut self.bytes, top, &resolver, enumerate_roots, interior, &[]);
+    }
+
+    /// [`Self::collect_with_interior`], with FINALIZATION: `registry` names the objects that must be
+    /// finalized before they may be reclaimed, and the returned list is the ones whose turn it is.
+    ///
+    /// The collector PARTITIONS `registry` in place. An entry the roots still reach stays (relocated
+    /// to where it moved). An entry they do not reach is this collection's candidate: it is MARKED --
+    /// so it, and everything it can reach, survives THIS collection and is safe for managed code to
+    /// touch -- then REMOVED from `registry` and returned, relocated.
+    ///
+    /// ## What that buys, and why a tracing collector needs no more than it
+    ///
+    /// This is PEP 442's model, which CPython adopted because a finalizable object inside a reference
+    /// CYCLE has no safe order to be torn down in. Each of its guarantees falls out of the partition:
+    ///
+    /// - **A finalizer runs at most once**, because an entry moves `registry` -> returned and never
+    ///   comes back. There is no separate "already finalized" bit to fall out of step with the list.
+    /// - **The object is intact inside its own finalizer**, because marking it dragged its whole
+    ///   closure through the compaction with it.
+    /// - **Resurrection needs no detection step.** If the finalizer stores the object somewhere the
+    ///   roots reach, the NEXT collection simply marks it and it lives; if it does not, the next
+    ///   collection reclaims it. CPython needs an explicit re-check here only because refcounting has
+    ///   already begun tearing the cycle down by this point.
+    /// - **A cycle of finalizable objects is collected**, every member queued in one pass.
+    ///
+    /// **The cost, stated rather than discovered: a finalizable object survives exactly one extra
+    /// collection.** That is bounded -- it cannot be queued twice -- so a bounded live set of
+    /// finalizable garbage still settles, which is what [`Self::collect`]'s callers are measured on.
+    #[cfg(feature = "gc-collect")]
+    pub fn collect_with_finalization<R>(
+        &mut self,
+        enumerate_roots: R,
+        interior: InteriorRefs<'_>,
+        registry: &mut Vec<Ref>,
+    ) -> Vec<Ref>
+    where
+        R: FnMut(&mut dyn FnMut(&mut Ref)),
+    {
+        let resolver = TableResolver {
+            type_descs: &self.type_descs,
+            weak_offsets: &self.weak_offsets,
+        };
+        let top = self.top;
+        let mut queued = Vec::new();
+        self.top = mark_compact_with_finalization(
+            &mut self.bytes,
+            top,
+            &resolver,
+            enumerate_roots,
+            interior,
+            &[],
+            Some((registry, &mut queued)),
+        );
+        queued
     }
 
     /// Collects with the roots taken from a single AOT frame, located through one
@@ -566,6 +683,33 @@ pub(crate) fn pinned_stack_roots(
 /// descriptor reads as the element count and a class descriptor ignores. The engine
 /// reads it defensively (0 when the object has no first word), so a zero-payload class
 /// never indexes past the region.
+/// The managed references an object owns OUTSIDE the heap, supplied by whoever owns them.
+///
+/// Called with an object's HEADER WORD and its FIRST PAYLOAD WORD -- the two values a mark-and-relocate
+/// pass already holds for every object it touches -- and expected to visit each such reference. A model
+/// that keeps its containers' elements in its own side tables names one of them by exactly those two
+/// words: the header says which kind of container, the payload head says which slot.
+///
+/// # Why this is a callback in the MARK phase and not another root list
+///
+/// **A side table walked as a ROOT makes every reference cycle through it immortal.** For `a -> b -> a`,
+/// `a`'s slot marks `b`'s header and `b`'s slot marks `a`'s, so neither header ever dies, whatever the
+/// program can or cannot reach -- and the acyclic case only appears to work, because a dead container's
+/// own header happens to be reachable from no slot. Reached from HERE, an object's exterior references
+/// are reached only from an object that is already marked, so a cycle with no live owner dies like any
+/// other garbage.
+///
+/// It is called a SECOND time during relocation, where liveness is settled and the survivors have moved,
+/// so the owner rewrites its own table in place. Nothing here consumes what it visits, and both passes
+/// ask the same question of the same object, so the two agree by construction.
+#[cfg(feature = "gc-collect")]
+pub type InteriorRefs<'a> = &'a mut dyn FnMut(u32, u32, &mut dyn FnMut(&mut Ref));
+
+/// An interior callback that supplies nothing -- for a heap whose objects own their whole payload, which
+/// is every caller that does not pass one of its own. See [`InteriorRefs`].
+#[cfg(feature = "gc-collect")]
+pub fn no_interior_refs(_header_word: u32, _payload_head: u32, _visit: &mut dyn FnMut(&mut Ref)) {}
+
 #[cfg(feature = "gc-collect")]
 pub(crate) trait TypeResolver {
     /// The payload size, in bytes, of the object whose header holds `header_word` and
@@ -583,6 +727,19 @@ pub(crate) trait TypeResolver {
     /// tagged layout (e.g. the device path until its wire format carries them) need not
     /// override it.
     fn for_each_tagged_offset(&self, _header_word: u32, _f: &mut dyn FnMut(u32)) {}
+
+    /// Invokes `f` with each byte offset (within the payload) of a WEAK reference slot of
+    /// the object whose header holds `header_word` -- a slot MARK never follows and RELOCATE
+    /// either forwards or clears. See [`Heap::set_weak_offsets`].
+    ///
+    /// **Required rather than defaulted, and the difference is not style.** A defaulted
+    /// no-op here would be the safe direction for [`Self::for_each_tagged_offset`] -- a slot
+    /// left out of that one is merely not traced -- but for a weak slot it is the unsafe one:
+    /// a resolver that stayed silent about a weak slot would leave that word holding a
+    /// pre-compaction address after the object it named has moved, which is a stale pointer
+    /// rather than a missed trace. So every resolver states its answer, and a new one cannot
+    /// acquire the wrong answer by saying nothing.
+    fn for_each_weak_offset(&self, header_word: u32, f: &mut dyn FnMut(u32));
 }
 
 /// The host resolver: an object's header word is an index into a [`TypeDesc`] table.
@@ -591,6 +748,8 @@ pub(crate) trait TypeResolver {
 #[cfg(feature = "gc-collect")]
 pub(crate) struct TableResolver<'a> {
     pub(crate) type_descs: &'a [TypeDesc],
+    /// The weak layout declared through [`Heap::set_weak_offsets`], keyed by type-descriptor id.
+    pub(crate) weak_offsets: &'a alloc::collections::BTreeMap<u32, Vec<u32>>,
 }
 
 #[cfg(feature = "gc-collect")]
@@ -613,6 +772,14 @@ impl TypeResolver for TableResolver<'_> {
             f(tagged_offset);
         }
     }
+
+    fn for_each_weak_offset(&self, header_word: u32, f: &mut dyn FnMut(u32)) {
+        if let Some(offsets) = self.weak_offsets.get(&header_word) {
+            for &weak_offset in offsets {
+                f(weak_offset);
+            }
+        }
+    }
 }
 
 /// The mark-compact algorithm itself, over a flat byte heap, shared verbatim by the
@@ -630,6 +797,9 @@ impl TypeResolver for TableResolver<'_> {
 /// which the packing cursor steps over. RELOCATE rewrites every root and every survivor
 /// field through the `old_payload -> new_payload` forwarding map; null stays null. The
 /// freed tail is zeroed so a later allocation never reads stale bytes.
+/// A WEAK slot (one the resolver reports through `for_each_weak_offset`) is visited by RELOCATE
+/// ALONE: MARK never follows it, and relocation forwards it if its target survived or clears it to
+/// null if it did not. That asymmetry is the whole of what makes a reference weak.
 /// NON-HEAP references are expected and are SKIPPED, not traced. An `ObjectRef` root or
 /// reference field may legitimately hold an address outside this region: a string literal
 /// lowers to a flash/rodata blob and a `Type` is never heap-allocated, so both are real
@@ -645,8 +815,29 @@ pub(crate) fn mark_compact<R>(
     bytes: &mut [u8],
     top: u32,
     resolver: &dyn TypeResolver,
-    mut enumerate_roots: R,
+    enumerate_roots: R,
+    interior: InteriorRefs<'_>,
     pinned: &[u32],
+) -> u32
+where
+    R: FnMut(&mut dyn FnMut(&mut Ref)),
+{
+    mark_compact_with_finalization(bytes, top, resolver, enumerate_roots, interior, pinned, None)
+}
+
+/// [`mark_compact`], with the optional finalization partition described on
+/// [`Heap::collect_with_finalization`]: `(registry, queue)` names the objects that must be finalized
+/// before reclamation and where to put the ones whose turn it is. `None` is the ordinary collection,
+/// and takes neither the extra mark pass nor the strong-liveness snapshot.
+#[cfg(feature = "gc-collect")]
+pub(crate) fn mark_compact_with_finalization<R>(
+    bytes: &mut [u8],
+    top: u32,
+    resolver: &dyn TypeResolver,
+    mut enumerate_roots: R,
+    interior: InteriorRefs<'_>,
+    pinned: &[u32],
+    finalization: Option<(&mut Vec<Ref>, &mut Vec<Ref>)>,
 ) -> u32
 where
     R: FnMut(&mut dyn FnMut(&mut Ref)),
@@ -670,21 +861,47 @@ where
             work.push(*reference);
         }
     };
+    let mut drain = |bytes: &[u8], live: &mut BTreeSet<u32>, work: &mut Vec<Ref>| {
+        while let Some(object) = work.pop() {
+            let header_word = read_word(bytes, object.header_addr());
+            let payload_head = read_head(bytes, object);
+            interior(header_word, payload_head, &mut |slot| mark(slot, live, work));
+            resolver.for_each_ref_offset(header_word, payload_head, &mut |ref_offset| {
+                let mut child = read_field(bytes, object, ref_offset);
+                mark(&mut child, live, work);
+            });
+            resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| {
+                let word = read_word(bytes, object.0 + tagged_offset);
+                if word != 0 && word & 0b11 == 0 {
+                    let mut child = Ref(word);
+                    mark(&mut child, live, work);
+                }
+            });
+        }
+    };
     enumerate_roots(&mut |slot| mark(slot, &mut live, &mut work));
-    while let Some(object) = work.pop() {
-        let header_word = read_word(bytes, object.header_addr());
-        let payload_head = read_head(bytes, object);
-        resolver.for_each_ref_offset(header_word, payload_head, &mut |ref_offset| {
-            let mut child = read_field(bytes, object, ref_offset);
-            mark(&mut child, &mut live, &mut work);
-        });
-        resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| {
-            let word = read_word(bytes, object.0 + tagged_offset);
-            if word != 0 && word & 0b11 == 0 {
-                let mut child = Ref(word);
-                mark(&mut child, &mut live, &mut work);
+    drain(bytes, &mut live, &mut work);
+
+    let mut strongly_live: Option<BTreeSet<u32>> = None;
+    let mut finalization = finalization;
+    if let Some((registry, queue)) = finalization.as_mut() {
+        let mut still_reachable = Vec::with_capacity(registry.len());
+        for &entry in registry.iter() {
+            if !entry.is_null() && is_heap(entry) && !live.contains(&entry.0) {
+                queue.push(entry);
+            } else {
+                still_reachable.push(entry);
             }
-        });
+        }
+        **registry = still_reachable;
+        if !queue.is_empty() {
+            strongly_live = Some(live.clone());
+            for &candidate in queue.iter() {
+                let mut reference = candidate;
+                mark(&mut reference, &mut live, &mut work);
+            }
+            drain(bytes, &mut live, &mut work);
+        }
     }
 
     let mut forward: BTreeMap<u32, u32> = BTreeMap::new();
@@ -719,12 +936,31 @@ where
             *reference = Ref(forward[&reference.0]);
         }
     };
+    let survived_strongly = |address: u32| match &strongly_live {
+        Some(snapshot) => snapshot.contains(&address),
+        None => forward.contains_key(&address),
+    };
+    let relocate_weak = |reference: &mut Ref| {
+        if !reference.is_null() && is_heap(*reference) {
+            *reference = if survived_strongly(reference.0) {
+                Ref(forward[&reference.0])
+            } else {
+                Ref::NULL
+            };
+        }
+    };
     enumerate_roots(&mut |slot| relocate(slot));
+    if let Some((registry, queue)) = finalization.as_mut() {
+        for entry in registry.iter_mut().chain(queue.iter_mut()) {
+            relocate(entry);
+        }
+    }
     for (&_old_payload, &new_payload) in forward.iter() {
         let new_ref = Ref(new_payload);
         let header_word = read_word(bytes, new_ref.header_addr());
         let mut offsets: Vec<u32> = Vec::new();
         let payload_head = read_head(bytes, new_ref);
+        interior(header_word, payload_head, &mut |slot| relocate(slot));
         resolver.for_each_ref_offset(header_word, payload_head, &mut |ref_offset| {
             offsets.push(ref_offset);
         });
@@ -732,6 +968,14 @@ where
             let mut child = read_field(bytes, new_ref, ref_offset);
             relocate(&mut child);
             let at = (new_ref.0 + ref_offset) as usize;
+            bytes[at..at + 4].copy_from_slice(&child.0.to_le_bytes());
+        }
+        let mut weak: Vec<u32> = Vec::new();
+        resolver.for_each_weak_offset(header_word, &mut |weak_offset| weak.push(weak_offset));
+        for weak_offset in weak {
+            let mut child = read_field(bytes, new_ref, weak_offset);
+            relocate_weak(&mut child);
+            let at = (new_ref.0 + weak_offset) as usize;
             bytes[at..at + 4].copy_from_slice(&child.0.to_le_bytes());
         }
         let mut tagged: Vec<u32> = Vec::new();
@@ -853,6 +1097,213 @@ mod tests {
         assert_ne!(a_new, b_new);
         assert_eq!(heap.read_ref_field(b_new, 0), a_new);
         assert_eq!(heap.top(), ALIGN + 2 * (HEADER_SIZE + 4));
+    }
+
+    /// The defect: a weak slot traced like a strong one keeps its target alive forever, so a
+    /// `weakref` is just a reference and nothing it names is ever reclaimed. Rooted through the
+    /// weak holder ALONE, so the target's only path to a root is the weak slot itself.
+    ///
+    /// The C# interpreter heap's `weak_cell_does_not_keep_its_target_alive_and_is_cleared`
+    /// (`lamella_cil_runtime::object`) asserts the same pair against the same contract; this is
+    /// that contract in the flat-byte heap.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_weak_slot_does_not_keep_its_target_alive_and_is_cleared() {
+        let mut heap = Heap::new(4096, vec![leaf(), leaf()]);
+        heap.set_weak_offsets(0, vec![0]);
+        let holder = heap.alloc(0).unwrap();
+        let target = heap.alloc(1).unwrap();
+        heap.write_ref_field(holder, 0, target);
+
+        let mut root = holder;
+        heap.collect(|visit| visit(&mut root));
+
+        assert_eq!(heap.top(), ALIGN + (HEADER_SIZE + 4));
+        assert_eq!(heap.read_ref_field(root, 0), Ref::NULL);
+    }
+
+    /// The other half, and the one a "clear it always" implementation would fail: a weak slot
+    /// whose target is kept alive by somebody else must be FORWARDED to where the compactor put
+    /// it, not cleared. Garbage is allocated first so every survivor's address actually changes.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_weak_slot_forwards_a_target_that_survives_via_a_strong_root() {
+        let mut heap = Heap::new(4096, vec![leaf(), one_ref(), leaf()]);
+        heap.set_weak_offsets(0, vec![0]);
+        let _garbage = heap.alloc(2).unwrap();
+        let target = heap.alloc(2).unwrap();
+        let weak_holder = heap.alloc(0).unwrap();
+        let strong_holder = heap.alloc(1).unwrap();
+        heap.write_ref_field(weak_holder, 0, target);
+        heap.write_ref_field(strong_holder, 0, target);
+
+        let mut roots = [weak_holder, strong_holder];
+        heap.collect(|visit| {
+            for root in &mut roots {
+                visit(root);
+            }
+        });
+
+        assert_eq!(heap.top(), ALIGN + 3 * (HEADER_SIZE + 4));
+        let weak_target = heap.read_ref_field(roots[0], 0);
+        let strong_target = heap.read_ref_field(roots[1], 0);
+        assert_ne!(weak_target, Ref::NULL, "a live target must not be cleared");
+        assert_ne!(weak_target, target, "the target moved, so the weak slot had to be rewritten");
+        assert_eq!(weak_target, strong_target, "both holders must name the same survivor");
+    }
+
+    /// A weak slot must not resurrect a CYCLE either -- the shape that made container arenas
+    /// immortal when they were traced as roots. Two objects referring to each other strongly,
+    /// named from outside only by a weak slot: the pair is garbage and must go.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_weak_slot_naming_a_cycle_does_not_keep_the_cycle_alive() {
+        let mut heap = Heap::new(4096, vec![leaf(), one_ref()]);
+        heap.set_weak_offsets(0, vec![0]);
+        let holder = heap.alloc(0).unwrap();
+        let a = heap.alloc(1).unwrap();
+        let b = heap.alloc(1).unwrap();
+        heap.write_ref_field(a, 0, b);
+        heap.write_ref_field(b, 0, a);
+        heap.write_ref_field(holder, 0, a);
+
+        let mut root = holder;
+        heap.collect(|visit| visit(&mut root));
+
+        assert_eq!(heap.top(), ALIGN + (HEADER_SIZE + 4), "the cycle survived a weak reference");
+        assert_eq!(heap.read_ref_field(root, 0), Ref::NULL);
+    }
+
+    /// The defect: with no finalization pass an unreachable object is simply reclaimed, so a
+    /// `__del__` or a `~T()` never runs and the surface that promises one is a lie. Here the object
+    /// must be QUEUED and must SURVIVE the collection, because a finalizer is about to touch it.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_finalizable_object_the_roots_cannot_reach_is_queued_and_survives_the_collection() {
+        let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
+        let doomed = heap.alloc(0).unwrap();
+        let owned = heap.alloc(1).unwrap();
+        heap.write_ref_field(doomed, 0, owned);
+        let mut registry = vec![doomed];
+
+        let queued = heap.collect_with_finalization(|_visit| {}, &mut no_interior_refs, &mut registry);
+
+        assert_eq!(queued.len(), 1, "the unreachable finalizable object was not queued");
+        assert!(registry.is_empty(), "a queued entry must leave the registry");
+        assert_eq!(heap.top(), ALIGN + 2 * (HEADER_SIZE + 4));
+        assert_eq!(heap.read_ref_field(queued[0], 0), Ref(ALIGN + HEADER_SIZE + HEADER_SIZE + 4));
+    }
+
+    /// **THE ONE THAT COSTS SOMETHING TO GET WRONG, AND THE REASON THIS IS NOT "CLEARED IFF ABSENT
+    /// FROM THE FORWARDING MAP".** A queued object survives the collection, so it IS in that map --
+    /// and every weak reference to it must nevertheless read null. Measured against CPython 3.14.6: a
+    /// `__del__` reading a weak reference to its own object reads `None`, and still does afterwards
+    /// even when the finalizer resurrected it.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_weak_reference_to_a_queued_object_is_cleared_although_the_object_survives() {
+        let mut heap = Heap::new(4096, vec![leaf(), leaf()]);
+        heap.set_weak_offsets(0, vec![0]);
+        let watcher = heap.alloc(0).unwrap();
+        let doomed = heap.alloc(1).unwrap();
+        heap.write_ref_field(watcher, 0, doomed);
+        let mut registry = vec![doomed];
+
+        let mut root = watcher;
+        let queued =
+            heap.collect_with_finalization(|visit| visit(&mut root), &mut no_interior_refs, &mut registry);
+
+        assert_eq!(queued.len(), 1, "the object was not queued for finalization");
+        assert_eq!(heap.top(), ALIGN + 2 * (HEADER_SIZE + 4));
+        assert_eq!(
+            heap.read_ref_field(root, 0),
+            Ref::NULL,
+            "a weak reference to an object kept alive only for its finalizer must read null",
+        );
+    }
+
+    /// PEP 442's whole reason for existing: a finalizable object inside a reference CYCLE. Before it,
+    /// CPython refused to collect such a cycle at all. Every member is queued in ONE pass, and the
+    /// pass after reclaims them.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_cycle_of_finalizable_objects_is_queued_together_then_reclaimed() {
+        let mut heap = Heap::new(4096, vec![one_ref()]);
+        let a = heap.alloc(0).unwrap();
+        let b = heap.alloc(0).unwrap();
+        heap.write_ref_field(a, 0, b);
+        heap.write_ref_field(b, 0, a);
+        let mut registry = vec![a, b];
+
+        let queued = heap.collect_with_finalization(|_visit| {}, &mut no_interior_refs, &mut registry);
+        assert_eq!(queued.len(), 2, "both members of the cycle are due");
+        assert!(registry.is_empty());
+        assert_eq!(heap.top(), ALIGN + 2 * (HEADER_SIZE + 4), "they must survive for their finalizers");
+
+        let mut empty: Vec<Ref> = Vec::new();
+        let again = heap.collect_with_finalization(|_visit| {}, &mut no_interior_refs, &mut empty);
+        assert!(again.is_empty(), "nothing is registered, so nothing is due");
+        assert_eq!(heap.top(), ALIGN, "the finalized cycle was not reclaimed");
+    }
+
+    /// **Exactly once.** The queued object is deliberately NOT rooted on the second collection either,
+    /// so the only thing stopping it being queued again is that it left the registry -- which is what
+    /// makes the once-only guarantee structural rather than a bit somebody has to remember to set.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_queued_object_is_never_queued_a_second_time() {
+        let mut heap = Heap::new(4096, vec![leaf()]);
+        let doomed = heap.alloc(0).unwrap();
+        let mut registry = vec![doomed];
+
+        let first = heap.collect_with_finalization(|_visit| {}, &mut no_interior_refs, &mut registry);
+        assert_eq!(first.len(), 1);
+        let second = heap.collect_with_finalization(|_visit| {}, &mut no_interior_refs, &mut registry);
+        assert!(second.is_empty(), "a finalizer must not run twice");
+        assert_eq!(heap.top(), ALIGN, "and the object is reclaimed on the pass after its finalizer");
+    }
+
+    /// RESURRECTION, which on a tracing collector needs no detection step at all: the caller reports
+    /// the object as a root on the next collection -- exactly what a finalizer storing `self`
+    /// somewhere reachable produces -- and it simply lives.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn an_object_its_finalizer_resurrected_lives_and_is_not_finalized_again() {
+        let mut heap = Heap::new(4096, vec![leaf()]);
+        let doomed = heap.alloc(0).unwrap();
+        let mut registry = vec![doomed];
+
+        let queued = heap.collect_with_finalization(|_visit| {}, &mut no_interior_refs, &mut registry);
+        assert_eq!(queued.len(), 1);
+
+        let mut resurrected = queued[0];
+        let again = heap.collect_with_finalization(
+            |visit| visit(&mut resurrected),
+            &mut no_interior_refs,
+            &mut registry,
+        );
+        assert!(again.is_empty(), "it left the registry, so it can never be due again");
+        assert_eq!(heap.top(), ALIGN + (HEADER_SIZE + 4), "the resurrected object was reclaimed");
+    }
+
+    /// The other side of the partition: an entry the roots STILL reach is not due, stays in the
+    /// registry, and is relocated to where the compaction put it -- so the registry does not go stale.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn a_finalizable_object_the_roots_still_reach_stays_registered_and_is_relocated() {
+        let mut heap = Heap::new(4096, vec![leaf(), leaf()]);
+        let _garbage = heap.alloc(1).unwrap();
+        let live_one = heap.alloc(0).unwrap();
+        let mut registry = vec![live_one];
+
+        let mut root = live_one;
+        let queued =
+            heap.collect_with_finalization(|visit| visit(&mut root), &mut no_interior_refs, &mut registry);
+
+        assert!(queued.is_empty(), "a reachable object's finalizer is not due");
+        assert_eq!(registry.len(), 1);
+        assert_ne!(registry[0], live_one, "the object moved, so the registry entry had to follow");
+        assert_eq!(registry[0], root, "and it must name the same survivor the root does");
     }
 
     #[cfg(feature = "gc-collect")]
@@ -1560,6 +2011,17 @@ mod tests {
             self.seen.borrow_mut().push((header_word, payload_head));
             self.inner.for_each_ref_offset(header_word, payload_head, f);
         }
+
+        fn for_each_weak_offset(&self, header_word: u32, f: &mut dyn FnMut(u32)) {
+            self.inner.for_each_weak_offset(header_word, f);
+        }
+    }
+
+    /// The weak layout of a heap that declares none -- what [`Heap::new`] starts with, for the
+    /// tests below that drive [`mark_compact`] through a hand-built [`TableResolver`].
+    #[cfg(feature = "gc-collect")]
+    fn no_weak_offsets() -> alloc::collections::BTreeMap<u32, Vec<u32>> {
+        alloc::collections::BTreeMap::new()
     }
 
     #[test]
@@ -1583,12 +2045,13 @@ mod tests {
         put(&mut bytes, b_payload, 0x2222);
         let top = b_payload + 8;
 
+        let weak_offsets = no_weak_offsets();
         let resolver = HeadRecordingResolver {
-            inner: TableResolver { type_descs: &descs },
+            inner: TableResolver { type_descs: &descs, weak_offsets: &weak_offsets },
             seen: core::cell::RefCell::new(Vec::new()),
         };
         let mut root = Ref(a_payload);
-        mark_compact(&mut bytes, top, &resolver, |visit| visit(&mut root), &[]);
+        mark_compact(&mut bytes, top, &resolver, |visit| visit(&mut root), &mut no_interior_refs, &[]);
 
         let seen = resolver.seen.borrow().clone();
         assert!(seen.len() >= 4, "both objects are visited at mark and at compact: {seen:?}");
@@ -1605,9 +2068,15 @@ mod tests {
         let top = ALIGN + HEADER_SIZE;
         let mut bytes = vec![0u8; top as usize];
         let mut root = Ref(top);
-        let new_top = mark_compact(&mut bytes, top, &TableResolver { type_descs: &descs }, |visit| {
-            visit(&mut root)
-        }, &[]);
+        let weak_offsets = no_weak_offsets();
+        let new_top = mark_compact(
+            &mut bytes,
+            top,
+            &TableResolver { type_descs: &descs, weak_offsets: &weak_offsets },
+            |visit| visit(&mut root),
+            &mut no_interior_refs,
+            &[],
+        );
         assert_eq!(new_top, ALIGN);
     }
 }

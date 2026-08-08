@@ -22,6 +22,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+use lamella_cil_runtime::reactor::ReactorEnv;
 use lamella_cil_runtime::{run, MethodId, Module, Value as CilValue, Vm};
 use lamella_load::load_with_corlib_and_libraries;
 use lamella_metadata::Assembly;
@@ -52,6 +53,18 @@ const EVT_SUBSCRIPTION: u32 = 1;
 const EVT_NO_SUCH_SOURCE: u32 = 0;
 /// `wait_ready` bounded out without an edge landing (the simulated world's same value).
 const EVT_TIMED_OUT: u32 = 1;
+/// How long a parked `wait_ready` yields between two reads of the readiness bit.
+///
+/// This BOUNDS the poll rate; it does not stop the world polling. Readiness arrives when the
+/// part's output data rate says it does -- for the accelerometer this grant serves, every 100 ms
+/// at the 10 Hz the subscribe step selects -- so asking faster than this cannot produce an
+/// earlier answer, and each ask is a real bus transaction driven through an interpreted driver.
+/// One millisecond is chosen rather than derived: this world is part-agnostic and cannot read an
+/// output data rate out of a device it is only given the address of, so it takes an interval
+/// short enough to be invisible against any such rate and long enough to stop the wait being a
+/// spin. A part whose readiness is wired to an interrupt line would not poll at all; the ones
+/// reached over a two-wire bus with no spare pin have no such edge to park on.
+const POLL_INTERVAL_MS: u64 = 1;
 
 /// Why the bridge could not open its interpreter session.
 #[derive(Debug)]
@@ -183,6 +196,26 @@ impl DriverSession {
 
     /// One interpreted static call returning an int. An escaping trap is a HOST failure
     /// -- the guest never sees it as a status.
+    /// The monotonic millisecond clock the embedder installed on the session's `Vm`
+    /// (`Vm::set_clock`), or `None` if it installed none.
+    ///
+    /// Deliberately the SAME clock the interpreter's own timed waits use rather than a second
+    /// one passed in beside it: an embedder that has already told the runtime how to read time
+    /// should not have to tell this world separately, and two clocks on one session is a fact
+    /// with two homes.
+    fn now_ms(&self) -> Option<u64> {
+        ReactorEnv::now_millis(&self.vm)
+    }
+
+    /// Yields the CPU for `millis` through that same seam -- on a host an OS sleep, on a device
+    /// whatever the firmware installed (a timer wait or a WFI).
+    ///
+    /// Only the trait method is public; `Vm`'s inherent `sleep_millis` is private, and the trait
+    /// impl delegates to it.
+    fn idle(&mut self, millis: u64) {
+        ReactorEnv::sleep_millis(&mut self.vm, millis);
+    }
+
     fn call_i32(&mut self, method: MethodId, args: Vec<CilValue>) -> Result<i32, Trap> {
         match run(&self.module, &mut self.vm, method, args) {
             Ok(Some(CilValue::Int32(v))) => Ok(v),
@@ -428,19 +461,18 @@ fn world_over(session: &Rc<RefCell<DriverSession>>) -> World {
 /// clears, so the hardware's status register IS the depth-1 coalescing slot rather
 /// than something the host has to simulate on top of it.
 ///
-/// `now_ms` supplies the caller's millisecond clock, because a bounded wait is mandatory and
-/// a bound needs a clock the host owns (the firmware passes its SysTick counter). `address`
-/// is the part's bus address.
+/// A bounded wait is mandatory, so this world needs a clock -- and it takes the one the
+/// embedder installed on the session's `Vm` (`Vm::set_clock`), which is also what bounds the
+/// interpreter's own timed waits. **Install a clock before granting this world**: without one
+/// the wait polls the part once and reports its bound as elapsed, because a deadline with no
+/// clock is treated as already due (the runtime's own convention for an absent clock) and
+/// spinning without one would burn the part forever. `address` is the part's bus address.
 ///
 /// # Panics
 /// If the session's harness carries no readiness half (`EnableDataReady` / `DataReady`) --
 /// callers with an i2c-only harness want [`world`] instead.
 #[must_use]
-pub fn eventful_world(
-    session: DriverSession,
-    address: u32,
-    now_ms: impl Fn() -> u64 + 'static,
-) -> World {
+pub fn eventful_world(session: DriverSession, address: u32) -> World {
     assert!(
         session.enable_data_ready.is_some() && session.data_ready.is_some(),
         "eventful_world needs a harness with the readiness half; use world() for i2c only"
@@ -474,7 +506,7 @@ pub fn eventful_world(
             return Ok(Some(WasmValue::I32(EVT_TIMED_OUT)));
         }
         let timeout_ms = u64::from(arg_i32(args, 1)?);
-        let deadline = now_ms().saturating_add(timeout_ms);
+        let deadline = s.borrow().now_ms().map(|now| now.saturating_add(timeout_ms));
         loop {
             let ready = {
                 let mut s = s.borrow_mut();
@@ -484,9 +516,15 @@ pub fn eventful_world(
             if ready == 1 {
                 return Ok(Some(WasmValue::I32(0)));
             }
-            if now_ms() >= deadline {
+            let Some(deadline) = deadline else {
+                return Ok(Some(WasmValue::I32(EVT_TIMED_OUT)));
+            };
+            let mut s = s.borrow_mut();
+            let remaining = deadline.saturating_sub(s.now_ms().unwrap_or(deadline));
+            if remaining == 0 {
                 return Ok(Some(WasmValue::I32(EVT_TIMED_OUT)));
             }
+            s.idle(remaining.min(POLL_INTERVAL_MS));
         }
     };
 

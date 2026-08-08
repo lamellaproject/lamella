@@ -6,7 +6,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_binder::{
-    BoundExpr, BoundExprKind, ConversionKind, FieldReference, MethodReference, SpecialType,
+    BoundExpr, BoundExprKind, BoundInitializer, BoundInitializerTarget, BoundMemberInitializer,
+    BoundMemberInitializerValue, ConversionKind, FieldReference, MethodReference, SpecialType,
     TypeSymbol,
 };
 use lamella_cil::{Instruction, Opcode, Operand};
@@ -99,6 +100,25 @@ pub(crate) fn vararg_lookup_params(
     let mut params = fixed.to_vec();
     params.push(arglist_marker_symbol());
     params.extend(extras.iter().map(vararg_extra_symbol));
+    params
+}
+
+/// The marker pseudo-parameter that separates a generic CALL SITE's key from its definition's,
+/// exactly as [`arglist_marker_symbol`] does for a vararg site. Not a spellable type: a C#
+/// identifier cannot contain `<`.
+fn method_instantiation_marker_symbol() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("<instantiation>")].into())
+}
+
+/// The token-table key for a generic CALL SITE: the definition's OPEN parameters, the marker,
+/// then the type arguments the site named.
+pub(crate) fn generic_site_lookup_params(
+    open_parameters: &[TypeSymbol],
+    type_arguments: &[TypeSymbol],
+) -> Vec<TypeSymbol> {
+    let mut params = open_parameters.to_vec();
+    params.push(method_instantiation_marker_symbol());
+    params.extend(type_arguments.iter().cloned());
     params
 }
 
@@ -256,7 +276,14 @@ pub fn emit_expression(
         BoundExprKind::ObjectCreation {
             arguments,
             constructor,
-        } => emit_new(constructor.as_ref(), arguments, frame, tokens, out),
+            initializer,
+        } => {
+            emit_new(constructor.as_ref(), arguments, frame, tokens, out)?;
+            match initializer {
+                Some(initializer) => emit_initializer(initializer, &expr.ty, frame, tokens, out),
+                None => Ok(()),
+            }
+        }
         BoundExprKind::DelegateCreation {
             delegate_type,
             target,
@@ -756,6 +783,7 @@ pub(crate) fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
         TypeSymbol::Named(_) | TypeSymbol::Array { .. } => Opcode::LdelemRef,
         TypeSymbol::Pointer(_) => return Err(EmitError::Unsupported("ldelem on a pointer")),
         TypeSymbol::ByRef(_) => return Err(EmitError::Unsupported("ldelem on a byref")),
+        TypeSymbol::Instantiation { .. } => Opcode::LdelemRef,
         TypeSymbol::Error => return Err(EmitError::Unsupported("element access of an error type")),
     })
 }
@@ -780,6 +808,7 @@ pub(crate) fn stelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
         TypeSymbol::Named(_) | TypeSymbol::Array { .. } => Opcode::StelemRef,
         TypeSymbol::Pointer(_) => return Err(EmitError::Unsupported("stelem on a pointer")),
         TypeSymbol::ByRef(_) => return Err(EmitError::Unsupported("stelem on a byref")),
+        TypeSymbol::Instantiation { .. } => Opcode::StelemRef,
         TypeSymbol::Error => return Err(EmitError::Unsupported("element store of an error type")),
     })
 }
@@ -958,22 +987,33 @@ fn emit_call(
             emit_argument(element, frame, tokens, out)?;
         }
     }
-    let lookup_params = match extras {
-        Some(extras) => vararg_lookup_params(&method.parameters, extras),
-        None => method.parameters.clone(),
+    let token = match method.instantiation.as_deref() {
+        Some(instantiation) => tokens
+            .method(
+                &method.declaring_type,
+                &method.name,
+                &generic_site_lookup_params(&instantiation.parameters, &instantiation.arguments),
+            )
+            .ok_or(EmitError::Unsupported(
+                "a generic call whose instantiation could not be minted",
+            ))?,
+        None => {
+            let lookup_params = match extras {
+                Some(extras) => vararg_lookup_params(&method.parameters, extras),
+                None => method.parameters.clone(),
+            };
+            tokens
+                .method(
+                    &method.declaring_type,
+                    &crate::tokens::conversion_key_name(&method.name, &method.return_type),
+                    &lookup_params,
+                )
+                .or_else(|| tokens.method(&method.declaring_type, &method.name, &lookup_params))
+                .ok_or(EmitError::Unsupported(
+                    "call to a method outside this module",
+                ))?
+        }
     };
-    let token = tokens
-        .method(
-            &method.declaring_type,
-            &crate::tokens::conversion_key_name(&method.name, &method.return_type),
-            &lookup_params,
-        )
-        .or_else(|| {
-            tokens.method(&method.declaring_type, &method.name, &lookup_params)
-        })
-        .ok_or(EmitError::Unsupported(
-            "call to a method outside this module",
-        ))?;
     let opcode = if inherited_value_call {
         Opcode::Callvirt
     } else if method.is_static || value_type_receiver.is_some() || is_base_call {
@@ -1236,6 +1276,123 @@ pub(crate) fn emit_indexer_store(
 }
 
 /// The `get_`/`set_` accessor method name for a property.
+/// Lowers an object or collection initializer, with the object it initializes ALREADY ON THE STACK,
+/// and leaves it there.
+///
+/// **Every member `dup`s the object rather than storing it to a local**, which is what csc emits and
+/// what makes the whole initializer one expression: the value of `new C { F = 1 }` is the
+/// initialized `C`, so it can be returned, passed or assigned without a temp.
+///
+/// ```text
+/// newobj C::.ctor
+/// dup ; <value> ; stfld C::F              a field
+/// dup ; <value> ; callvirt C::set_P       a property
+/// dup ; <value> ; callvirt C::Add         a collection element
+/// dup ; ldfld C::F ; <nested...> ; pop    a NESTED initializer
+/// ```
+fn emit_initializer(
+    initializer: &BoundInitializer,
+    target_ty: &TypeSymbol,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match initializer {
+        BoundInitializer::Collection(elements) => {
+            for element in elements {
+                out.push(Instruction::simple(Opcode::Dup));
+                emit_expression(element, frame, tokens, out)?;
+                let token = tokens
+                    .method(target_ty, "Add", core::slice::from_ref(&element.ty))
+                    .ok_or(EmitError::Unsupported("collection Add outside this module"))?;
+                out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
+            }
+            Ok(())
+        }
+        BoundInitializer::Object(members) => {
+            for member in members {
+                emit_member_initializer(member, frame, tokens, out)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Lowers one `name = value`, with the object on the stack, leaving it there.
+fn emit_member_initializer(
+    member: &BoundMemberInitializer,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match (&member.target, &member.value) {
+        (BoundInitializerTarget::Field(field), BoundMemberInitializerValue::Expression(value)) => {
+            let token = tokens
+                .field(&field.declaring_type, &field.name)
+                .ok_or(EmitError::Unsupported("initializer field outside this module"))?;
+            out.push(Instruction::simple(Opcode::Dup));
+            emit_expression(value, frame, tokens, out)?;
+            if field.is_volatile {
+                out.push(Instruction::simple(Opcode::Volatile));
+            }
+            out.push(Instruction::new(Opcode::Stfld, Operand::Token(token)));
+            Ok(())
+        }
+        (
+            BoundInitializerTarget::Property {
+                setter_declaring_type,
+                ty,
+            },
+            BoundMemberInitializerValue::Expression(value),
+        ) => {
+            let token = tokens
+                .method(
+                    setter_declaring_type,
+                    &accessor_name("set_", &member.name),
+                    core::slice::from_ref(ty),
+                )
+                .ok_or(EmitError::Unsupported(
+                    "initializer property setter outside this module",
+                ))?;
+            out.push(Instruction::simple(Opcode::Dup));
+            emit_expression(value, frame, tokens, out)?;
+            out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
+            Ok(())
+        }
+        (BoundInitializerTarget::Field(field), BoundMemberInitializerValue::Nested(nested)) => {
+            let token = tokens
+                .field(&field.declaring_type, &field.name)
+                .ok_or(EmitError::Unsupported("initializer field outside this module"))?;
+            out.push(Instruction::simple(Opcode::Dup));
+            out.push(Instruction::new(Opcode::Ldfld, Operand::Token(token)));
+            emit_initializer(nested, &field.ty, frame, tokens, out)?;
+            out.push(Instruction::simple(Opcode::Pop));
+            Ok(())
+        }
+        (
+            BoundInitializerTarget::Property {
+                setter_declaring_type,
+                ty,
+            },
+            BoundMemberInitializerValue::Nested(nested),
+        ) => {
+            let token = tokens
+                .method(setter_declaring_type, &accessor_name("get_", &member.name), &[])
+                .ok_or(EmitError::Unsupported(
+                    "initializer property getter outside this module",
+                ))?;
+            out.push(Instruction::simple(Opcode::Dup));
+            out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
+            emit_initializer(nested, ty, frame, tokens, out)?;
+            out.push(Instruction::simple(Opcode::Pop));
+            Ok(())
+        }
+        (BoundInitializerTarget::Unresolved, _) => Err(EmitError::Unsupported(
+            "an initializer member that did not resolve",
+        )),
+    }
+}
+
 pub(crate) fn accessor_name(prefix: &str, property: &str) -> String {
     let mut name = String::from(prefix);
     name.push_str(property);

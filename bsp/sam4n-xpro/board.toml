@@ -1,0 +1,60 @@
+# BOARD binding: the SAM4N Xplained Pro -- identity-first. No peripheral bindings yet, because the
+# SAM4N family has no generated driver; what this file states beyond identity is the board's two
+# control lines, which need no driver -- a control pin rides no alternate function.
+#
+# EVERY FACT BELOW IS THE BOARD'S USER GUIDE SAYING IT OUTRIGHT, which is worth noting because the
+# two boards onboarded before this one both needed a schematic to settle a polarity the manual left
+# to inference. This manual states the direction in prose for both the button and the LED.
+
+[table]
+kind = "board"
+board = "sam4n-xpro"
+vendor = "atmel"
+family = "sam4n"
+part = "atsam4n16c"
+board_model = 25            # lamella_wire::board_model::SAM4N_XPLAINED_PRO
+sources = [
+    "SAM4N Xplained Pro user guide (Atmel-42104): section 4.2.2 mechanical buttons and table 4-9, section 4.2.3 LED and table 4-10, section 4.3 embedded debugger implementation and table 4-12 virtual COM port connections, section 4.2.1 crystals and tables 4-7/4-8.",
+    "SAM4N Series datasheet (Atmel-11158) ordering information, for the package and memory sizes the part id resolves to.",
+]
+notes = [
+    "The board carries TWO crystals, a 12 MHz on PB9 (XIN) / PB8 (XOUT) and a 32.768 kHz, and the guide notes each has a cut-strap beside it for measuring the oscillator safety factor. Neither is stated as a [[plans]] row: a plan is verified against the oscillator registers a clock block carries, and this family has no block tables yet. The crystals are recorded here so the row that eventually states them does not have to re-derive which pins they are on.",
+    "The analog reference is brought out on a two-pin header for MEASURING only -- the guide is explicit that ADVREF must not be driven from an external source there. So it is not a board fact an adc binding could use as a reference rail.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+#
+# The same EDBG bridge the family's vendor puts on every Xplained Pro, and the same DTR caveat:
+# the EDBG holds its UART pins tristated until the host asserts DTR, so a board that says nothing
+# is a board whose terminal has not raised DTR rather than a board that has not booted.
+#
+# The guide names the target-side pins of that link -- PA10 is the target's TX and PA9 its RX --
+# and they are recorded in the sources above rather than as a binding, because a uart binding
+# needs pin-map rows and this family has none yet. They land together with the family's driver.
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG bridge's VCP.
+baud = 115200
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# BOTH ARE ACTIVE LOW AND THE GUIDE SAYS SO IN WORDS. Of the button: "When a button is pressed it
+# will drive the I/O line to GND." Of the LED: "The LED can be activated by driving the connected
+# I/O line to GND." Neither had to be read off a schematic, and both are the direction that is
+# wrong by default if a reader assumes a pin drives its load.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB14"
+active = "low"
+source = "SAM4N Xplained Pro user guide (Atmel-42104) section 4.2.3 and table 4-10: one yellow LED on PB14, activated by driving the connected I/O line to GND."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA30"
+active = "low"
+source = "SAM4N Xplained Pro user guide (Atmel-42104) section 4.2.2 and table 4-9: SW0 on PA30; a button drives the I/O line to GND when pressed. The other mechanical button is RESET, wired to NRST rather than to a port pin, so it is not a row here."

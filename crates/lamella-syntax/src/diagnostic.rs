@@ -121,6 +121,10 @@ pub enum DiagnosticKind {
     /// A namespace member was expected to begin a type declaration but the
     /// `class`/`struct`/`interface`/`enum`/`delegate` keyword was missing (16.4).
     TypeDeclarationExpected,
+    /// `CS1671`: a namespace declaration carried an attribute section or a modifier (16.2).
+    NamespaceCannotHaveModifiersOrAttributes,
+    /// `CS1730`: an `[assembly:]` or `[module:]` section appeared after a member (24.2).
+    GlobalAttributeMustPrecedeMembers,
     /// `operator` was not followed by an overloadable operator (17.9).
     OverloadableOperatorExpected,
     /// A `foreach` header was missing the `in` keyword (15.8.4).
@@ -132,9 +136,33 @@ pub enum DiagnosticKind {
     FeatureRequiresLaterVersion {
         /// The feature's noun phrase, e.g. "the null-coalescing operator '??'".
         feature: &'static str,
-        /// The version that introduced it, e.g. "C# 3.0".
+        /// The version that introduced it, as csc renders a REQUIRED version -- "2", "7.0".
         required: &'static str,
+        /// The version being COMPILED, which selects the code and the message''s "in C# N".
+        current: crate::version::LanguageVersion,
     },
+    /// A second file-scoped namespace declaration (`namespace N;`) appeared inside the first one's
+    /// body (csc CS8954).
+    ///
+    /// MEASURED, and the shape is not the one the message suggests: a file-scoped namespace's body
+    /// runs to the end of the file, so a second one is never a SIBLING -- it is always written
+    /// inside the first. csc reports it at the second declaration's NAME.
+    OnlyOneFileScopedNamespace,
+    /// A file-scoped namespace declaration and a brace-delimited one were nested inside one another
+    /// (csc CS8955), in either order.
+    ///
+    /// MEASURED: this is a rule about the immediate CONTAINER, not about the file as a whole. A
+    /// `namespace M { }` written after a file-scoped namespace is inside its body and draws this; a
+    /// `namespace M { }` written BEFORE one does not, because nothing is nested. csc reports it at
+    /// the inner declaration's NAME.
+    BothFileScopedAndNormalNamespaces,
+    /// A file-scoped namespace declaration was preceded by a type or namespace declaration (csc
+    /// CS8956).
+    ///
+    /// MEASURED: `using` directives, `extern alias` declarations and `[assembly:]` / `[module:]`
+    /// attribute sections may precede it; a type or a namespace may not. csc reports it at the
+    /// file-scoped declaration's NAME.
+    FileScopedNamespaceMustPrecedeMembers,
     /// An `__arglist` parameter marker appeared before other parameters; it must
     /// close the list (csc CS0257). Tokenized only under the typedref knob.
     ArglistMustBeLast,
@@ -182,9 +210,14 @@ impl DiagnosticKind {
             DiagnosticKind::OpenBraceExpected => 1514,
             DiagnosticKind::ExpectedCatchOrFinally => 1524,
             DiagnosticKind::TypeDeclarationExpected => 1518,
+            DiagnosticKind::NamespaceCannotHaveModifiersOrAttributes => 1671,
+            DiagnosticKind::GlobalAttributeMustPrecedeMembers => 1730,
             DiagnosticKind::OverloadableOperatorExpected => 1037,
             DiagnosticKind::InExpected => 1515,
-            DiagnosticKind::FeatureRequiresLaterVersion { .. } => 8022,
+            DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
+            DiagnosticKind::OnlyOneFileScopedNamespace => 8954,
+            DiagnosticKind::BothFileScopedAndNormalNamespaces => 8955,
+            DiagnosticKind::FileScopedNamespaceMustPrecedeMembers => 8956,
             DiagnosticKind::ArglistMustBeLast => 257,
             DiagnosticKind::ArglistNotValidInThisContext => 1669,
         }
@@ -268,12 +301,36 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::TypeDeclarationExpected => {
                 f.write_str("Expected class, delegate, enum, interface, or struct")
             }
+            DiagnosticKind::NamespaceCannotHaveModifiersOrAttributes => {
+                f.write_str("A namespace declaration cannot have modifiers or attributes")
+            }
+            DiagnosticKind::GlobalAttributeMustPrecedeMembers => f.write_str(
+                "Assembly and module attributes must precede all other elements defined in a \
+                 file except using clauses and extern alias declarations",
+            ),
             DiagnosticKind::OverloadableOperatorExpected => {
                 f.write_str("Overloadable operator expected")
             }
             DiagnosticKind::InExpected => f.write_str("'in' expected"),
-            DiagnosticKind::FeatureRequiresLaterVersion { feature, required } => {
-                write!(f, "Feature {feature} is not available in C# 1.0; it requires {required} or greater")
+            DiagnosticKind::FeatureRequiresLaterVersion {
+                feature,
+                required,
+                current,
+            } => {
+                write!(
+                    f,
+                    "Feature '{feature}' is not available in C# {}. Please use language version {required} or greater.",
+                    current.message_name()
+                )
+            }
+            DiagnosticKind::OnlyOneFileScopedNamespace => {
+                f.write_str("Source file can only contain one file-scoped namespace declaration.")
+            }
+            DiagnosticKind::BothFileScopedAndNormalNamespaces => f.write_str(
+                "Source file can not contain both file-scoped and normal namespace declarations.",
+            ),
+            DiagnosticKind::FileScopedNamespaceMustPrecedeMembers => {
+                f.write_str("File-scoped namespace must precede all other members in a file.")
             }
             DiagnosticKind::ArglistMustBeLast => {
                 write!(

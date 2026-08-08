@@ -1,0 +1,103 @@
+# BLOCK layout: the STM32F42x SPI, master use. Offsets are instance-base-relative; instance bases
+# and RCC enable routing live in ../instances.toml. Every register is 32-bit word-accessible and
+# every field of interest sits in the low half.
+#
+# Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
+# facts ride here.
+#
+# THIS PERIPHERAL IS AN SPI AND AN I2S IN ONE REGISTER MAP, and that is the first thing to know
+# about it rather than a footnote. I2SCFGR at 0x1C selects which of the two the block IS, and its
+# reset value selects SPI -- so a master that never touches I2SCFGR is correct, and a driver that
+# writes it without meaning to changes the peripheral's kind rather than a mode within it. The two
+# I2S registers are stated below because they are part of this map, not because an SPI driver
+# needs them.
+#
+# THE DATA REGISTER IS ONE ADDRESS SERVING TWO DIRECTIONS. DR at 0x0C is the transmit register when
+# written and the receive register when read, as this vendor's older USART is. On a full-duplex
+# master every byte clocked out clocks one in, so a transfer that writes without reading leaves a
+# byte in the receive path and OVR is set on the next one -- which is why a polled master reads DR
+# even when the value is discarded.
+#
+# BR IS A PRESCALER EXPONENT, NOT A DIVISOR. The three BR bits select the peripheral clock divided
+# by 2^(BR+1), so the slowest setting is /256 and there is no /1. A driver that wrote a divisor
+# there would run the bus 2^(divisor+1) times slow at best and above the part's maximum at worst.
+
+[table]
+kind = "block"
+family = "stm32f42x"
+block = "spi"
+sources = [
+    "RM0090 Rev 22 (STM32F405/415, F407/417, F427/437, F429/439) section 28.5.10 table 129 'SPI register map and reset values', page 920: SPI_CR1 0x00, SPI_CR2 0x04, SPI_SR 0x08, SPI_DR 0x0C, SPI_CRCPR 0x10, SPI_RXCRCR 0x14, SPI_TXCRCR 0x18, SPI_I2SCFGR 0x1C, SPI_I2SPR 0x20, each with its per-bit field positions and reset value",
+]
+notes = [
+    "TABLE 129 WAS READ FROM THE PAGE AS LAID OUT. Pulling its characters out in reading order interleaves the offset column with the register-name column, so the names drift out of step with their offsets by a row or more -- SPI_DR appears against 0x10 and SPI_CRCPR against no offset at all. Every offset and field position below came from the page as printed.",
+    "TWO RESET VALUES ARE NOT ZERO, and both matter to a driver that reads back what it wrote. SPI_SR resets with TXE set (0x0002), so an empty transmit buffer is the reset state rather than something a driver waits for; and SPI_CRCPR resets to 0x0007, which is the CRC polynomial and not a status.",
+    "The I2S registers are stated for map completeness and carry no derivation here. A driver that wants I2S needs the prescaler arithmetic and the standard selection, and neither is transcribed.",
+]
+
+[registers.CR1]
+offset = 0x00
+width = 32
+fields = { CPHA = [0, 1], CPOL = [1, 1], MSTR = [2, 1], BR = [3, 3], SPE = [6, 1], LSBFIRST = [7, 1], SSI = [8, 1], SSM = [9, 1], RXONLY = [10, 1], DFF = [11, 1], CRCNEXT = [12, 1], CRCEN = [13, 1], BIDIOE = [14, 1], BIDIMODE = [15, 1] }
+notes = "Control register 1; reset 0x0000. MSTR selects master, SPE enables the peripheral, and BR is the baud-rate prescaler EXPONENT (see the table note). SSM with SSI is the software-managed chip select a master drives from a plain GPIO instead: SSM takes the select off the pin and SSI supplies the level it would have had, and a master that sets SSM without SSI reads its own select as asserted-low and drops into mode fault. DFF selects 16-bit frames over 8."
+
+[registers.CR2]
+offset = 0x04
+width = 32
+fields = { RXDMAEN = [0, 1], TXDMAEN = [1, 1], SSOE = [2, 1], FRF = [4, 1], ERRIE = [5, 1], RXNEIE = [6, 1], TXEIE = [7, 1] }
+notes = "Control register 2; reset 0x0000. Bit 3 is reserved. FRF selects the TI frame format over Motorola; a polled master leaves this register alone entirely."
+
+[registers.SR]
+offset = 0x08
+width = 32
+fields = { RXNE = [0, 1], TXE = [1, 1], CHSIDE = [2, 1], UDR = [3, 1], CRCERR = [4, 1], MODF = [5, 1], OVR = [6, 1], BSY = [7, 1], FRE = [8, 1] }
+notes = "Status register; RESET 0x0002 -- TXE is SET at reset, because the transmit buffer starts empty. BSY is the flag a driver waits on before releasing chip select: TXE goes high when the buffer is free, which is before the last bit has left the shift register. Dropping select on TXE alone truncates the final frame."
+
+[registers.DR]
+offset = 0x0C
+width = 32
+fields = { DR = [0, 16] }
+notes = "Data register; reset 0x0000. ONE address, two directions: written it is the transmit register, read it is the receive register. Only the low 8 bits carry a frame unless CR1's DFF selects 16."
+
+[registers.CRCPR]
+offset = 0x10
+width = 32
+fields = { CRCPOLY = [0, 16] }
+notes = "CRC polynomial register; RESET 0x0007, which is a polynomial and not a status. Unused while CR1's CRCEN is clear."
+
+[registers.RXCRCR]
+offset = 0x14
+width = 32
+fields = { RXCRC = [0, 16] }
+notes = "Receive CRC register; reset 0x0000. Read-only."
+
+[registers.TXCRCR]
+offset = 0x18
+width = 32
+fields = { TXCRC = [0, 16] }
+notes = "Transmit CRC register; reset 0x0000. Read-only."
+
+[registers.I2SCFGR]
+offset = 0x1C
+width = 32
+fields = { CHLEN = [0, 1], DATLEN = [1, 2], CKPOL = [3, 1], I2SSTD = [4, 2], PCMSYNC = [7, 1], I2SCFG = [8, 2], I2SE = [10, 1], I2SMOD = [11, 1] }
+notes = "I2S configuration; reset 0x0000, and that reset value is what selects SPI -- I2SMOD clear means this block is an SPI. Bit 6 is reserved. Stated for map completeness; an SPI master does not write it."
+
+[registers.I2SPR]
+offset = 0x20
+width = 32
+fields = { I2SDIV = [0, 8], ODD = [8, 1], MCKOE = [9, 1] }
+notes = "I2S prescaler; RESET 0x0002. Stated for map completeness; the prescaler arithmetic is not transcribed."
+
+[constants]
+# The baud-rate prescaler is an EXPONENT: the peripheral clock is divided by 2^(BR+1). Stated as
+# the eight codes rather than as a formula so a driver selects one instead of computing it, and so
+# the absence of a divide-by-one is visible rather than inferred.
+BR_DIV_2 = 0x0
+BR_DIV_4 = 0x1
+BR_DIV_8 = 0x2
+BR_DIV_16 = 0x3
+BR_DIV_32 = 0x4
+BR_DIV_64 = 0x5
+BR_DIV_128 = 0x6
+BR_DIV_256 = 0x7

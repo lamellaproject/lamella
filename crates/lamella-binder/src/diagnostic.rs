@@ -4,6 +4,20 @@ use alloc::boxed::Box;
 use core::fmt;
 use lamella_syntax::diagnostic::Severity;
 use lamella_syntax::span::Span;
+use lamella_syntax::version::LanguageVersion;
+
+/// The language version this compilation is targeting -- **the one seam a selectable
+/// `/langversion` will be wired through**, and deliberately a single function rather than a
+/// literal repeated at each gate.
+///
+/// It answers [`LanguageVersion::DEFAULT`] today because ISO-1 is the only dialect lcsc implements,
+/// so every feature gate fires unconditionally and every gate code is `CS8022`. The value is
+/// nonetheless carried on the diagnostic rather than assumed where the message is formatted,
+/// because the code and the message's "in C# N" both derive from it: a second dialect changes five
+/// call sites through here, not thirty through a format string.
+pub(crate) fn compiling_version() -> LanguageVersion {
+    LanguageVersion::DEFAULT
+}
 
 /// Which of a C# compiler's two passes reported a diagnostic. A compilation is checked in the
 /// order the language is defined: DECLARATIONS first -- signatures, base clauses, interface
@@ -49,16 +63,119 @@ impl Diagnostic {
         }
     }
 
-    /// The `CSxxxx` numeric code.
+    /// The numeric part of the code. Pair it with [`Diagnostic::namespace`] to render it.
     #[must_use]
     pub fn code(&self) -> u16 {
         self.kind.code()
+    }
+
+    /// Which diagnostic namespace the code belongs to -- `CS` for anything csc also has a concept
+    /// of, `LAM` for the conditions it does not.
+    #[must_use]
+    pub fn namespace(&self) -> CodeNamespace {
+        self.kind.namespace()
     }
 
     /// The severity, from the diagnostic's kind.
     #[must_use]
     pub fn severity(&self) -> Severity {
         self.kind.severity()
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::{CodeNamespace, DiagnosticKind};
+    use alloc::format;
+    use lamella_syntax::version::LanguageVersion;
+
+    #[test]
+    fn the_lamella_namespace_is_for_conditions_csc_has_no_code_for() {
+        let kind = DiagnosticKind::FeatureNotInThisBuild {
+            feature: "generics".into(),
+            permitted_by: LanguageVersion::CSharp7,
+        };
+        assert_eq!(kind.namespace(), CodeNamespace::Lam);
+        assert_eq!(kind.code(), 1);
+        assert_eq!(CodeNamespace::Lam.prefix(), "LAM");
+
+        let rendered = format!("{kind}");
+        assert_eq!(
+            rendered,
+            "Feature 'generics' is permitted by C# 7.0 but is not provided by this build of Lamella."
+        );
+        assert!(
+            !rendered.contains("Please use language version"),
+            "this diagnostic exists BECAUSE that sentence would be wrong here"
+        );
+        assert!(!rendered.contains("yet"), "a knob is a configuration, not a gap");
+    }
+
+    #[test]
+    fn a_lamella_code_is_six_or_seven_characters_like_the_rest_of_the_ecosystem() {
+        let rendered = format!("{}{:04}", CodeNamespace::Lam.prefix(), 1u16);
+        assert_eq!(rendered, "LAM0001");
+        assert_eq!(rendered.len(), 7);
+        assert_eq!(format!("{}{:04}", CodeNamespace::Cs.prefix(), 649u16).len(), 6);
+    }
+}
+
+impl DiagnosticKind {
+    /// Which namespace this kind's code belongs to.
+    ///
+    /// `Cs` for everything csc also has a concept of, which is nearly all of it. A new arm here is
+    /// a claim that csc has NO code for the condition -- check before adding one.
+    #[must_use]
+    pub fn namespace(&self) -> CodeNamespace {
+        match self {
+            DiagnosticKind::FeatureNotInThisBuild { .. }
+            | DiagnosticKind::MemberSignatureNotSupported { .. } => CodeNamespace::Lam,
+            _ => CodeNamespace::Cs,
+        }
+    }
+}
+
+/// The namespace a diagnostic code belongs to.
+///
+/// **`CS` MEANS WHAT csc MEANS BY IT, ALWAYS.** A code is a search key: a developer who hits
+/// `CS0649` will look it up and land on
+/// csc's documentation, so lcsc may only spell a condition `CS` when csc has that same concept. It
+/// follows that a condition csc has NO concept of cannot borrow a `CS` number -- an unused one
+/// today is one a future Roslyn release may claim, and then the same key means two things
+/// depending on which compiler emitted it.
+///
+/// **`LAM` IS FOR EXACTLY THOSE CONDITIONS, AND IT IS A SMALL FAMILY.** Almost everything routes to
+/// csc's own codes: a BCL surface we do not ship reports as `CS0246`/`CS0234` (which is also how
+/// nanoFramework expresses a restricted platform, measured), a construct above the selected dialect
+/// reports as the `CS8022` family, and a language feature missing a compiler-required member reports
+/// as `CS0518`/`CS0656`. What is left is the condition none of those describe: the dialect permits
+/// the construct and THIS BUILD cannot produce it.
+///
+/// **The user-visible payoff is that the prefix says which kind of problem it is.** A `CS` code is a
+/// statement about the language; a `LAM` code is a statement about this build's coverage, and the
+/// second kind changes as the compiler grows where the first does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeNamespace {
+    /// csc's namespace, for conditions csc also has.
+    Cs,
+    /// Lamella's, for conditions csc has no concept of.
+    Lam,
+}
+
+impl CodeNamespace {
+    /// The literal prefix that precedes the digits: `CS` or `LAM`.
+    ///
+    /// Chosen against the widths a Problems pane already carries -- `CS0649` and `CA1822` at six
+    /// characters, `IDE0051` and `MSB3021` at seven -- so `LAM0001` costs nothing in a pane already
+    /// sized for the built-in analyzers, and one character in raw terminal output where the path
+    /// dominates the line anyway. Four digits rather than three because the extra character buys
+    /// ranges (compiler coverage, backend, linker, runtime) and three would not.
+    #[must_use]
+    pub fn prefix(self) -> &'static str {
+        match self {
+            CodeNamespace::Cs => "CS",
+            CodeNamespace::Lam => "LAM",
+        }
     }
 }
 
@@ -157,6 +274,28 @@ impl SignaturePosition {
     }
 }
 
+/// Which noun CS0305/CS0308 name, because csc's message templates are parameterized by it:
+/// *"Using the generic **{0}** '{1}' requires {2} type arguments"*. Both codes serve types and
+/// methods, and the two messages differ ONLY in this word -- so it is carried rather than baked in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenericMember {
+    /// A generic type: csc says "type" and quotes `Box<T>`.
+    Type,
+    /// A generic method: csc says "method" and quotes the full signature `C.Id<T>(T)`.
+    Method,
+}
+
+impl GenericMember {
+    /// The word csc puts in the message.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GenericMember::Type => "type",
+            GenericMember::Method => "method",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiagnosticKind {
@@ -169,6 +308,26 @@ pub enum DiagnosticKind {
     NameNotFound {
         /// The unresolved name.
         name: Box<str>,
+    },
+    /// `CS0305`: a generic TYPE or METHOD was used with the wrong number of type arguments. It IS
+    /// in scope -- at a different arity -- so this is what stands in place of a CS0246 the
+    /// programmer could not act on.
+    GenericArityMismatch {
+        /// The candidate as csc quotes it: the name with its declared parameters, `Box<T>` for a
+        /// type and the full signature `C.Id<T>(T)` for a method.
+        candidate: Box<str>,
+        /// How many type arguments that candidate requires.
+        required: usize,
+        /// Which noun csc puts in the message. See [`GenericMember`].
+        member: GenericMember,
+    },
+    /// `CS0308`: a NON-generic type or method was used with type arguments (`Plain<int>`). A
+    /// separate code from CS0305 in csc, measured because there is no arity to suggest.
+    NonGenericTypeWithTypeArguments {
+        /// The type or method named, as csc quotes it.
+        name: Box<str>,
+        /// Which noun csc puts in the message. See [`GenericMember`].
+        member: GenericMember,
     },
     /// `CS0031`: a constant value is outside the range of the type it is being converted to
     /// (the constant-expression conversion, 13.1.7), e.g. `byte b = 256;`.
@@ -355,6 +514,14 @@ pub enum DiagnosticKind {
         /// The type the member was looked for on.
         type_name: Box<str>,
         /// The member name that was not found.
+        member: Box<str>,
+    },
+    /// `LAM0002`: the member EXISTS on a referenced type and this build could not decode its
+    /// signature, so it could not be bound.
+    MemberSignatureNotSupported {
+        /// The type the member was looked for on.
+        type_name: Box<str>,
+        /// The member name, as the assembly spells it.
         member: Box<str>,
     },
     /// `CS1501`: no overload of the method takes the given number of arguments.
@@ -719,17 +886,42 @@ pub enum DiagnosticKind {
         /// The method's qualified signature (`C.M()`).
         method: Box<str>,
     },
-    /// `CS8022`: a language feature outside the strict C# 1.0 (ISO-1) dialect lcsc targets -- an
-    /// automatically-implemented property (C# 3.0), a `static` class (C# 2.0), and so on. csc
-    /// reports the same under `/langversion:ISO-1`; the message names the feature and the version it
-    /// needs. lcsc GATES every post-1.0 feature here (strict C# 1.0 now), even ones whose emit path
-    /// is already implemented -- see the `GATED FEATURE (ISO-N)` markers -- until a real
-    /// language-version mode lifts the gate.
+    /// A language feature outside the dialect being compiled -- an automatically-implemented
+    /// property (C# 3.0), a `static` class (C# 2.0), and so on. lcsc GATES every feature above the
+    /// selected version, even ones whose emit path is already implemented -- see the
+    /// `GATED FEATURE (ISO-N)` markers.
+    ///
+    /// **THE CODE IS NOT FIXED. It names the version being COMPILED**, not the one the feature
+    /// needs: `CS8022` at C# 1, `CS8023` at C# 2, and so on up to `CS8059` at C# 6 -- see
+    /// [`LanguageVersion::feature_gate_code`] for the measured table. The REQUIRED version appears
+    /// only in the message. A single hard-coded code was right while ISO-1 was the only selectable
+    /// dialect and becomes wrong the moment a second one exists, which is why `current` is carried
+    /// here rather than assumed at the format site.
     FeatureRequiresLaterVersion {
         /// The feature name (e.g. "automatically implemented properties").
         feature: Box<str>,
         /// The minimum C# version, as rendered (e.g. "C# 3.0").
         required: Box<str>,
+        /// The version being compiled, which selects both the code and the message's "in C# N".
+        current: LanguageVersion,
+    },
+    /// `LAM0001`: the selected dialect PERMITS this construct and this build cannot produce it.
+    ///
+    /// **Deliberately covers two causes with one message, because they are one fact to the person
+    /// reading it**: the feature is not implemented, or a capability knob turned it off. Either way
+    /// this build cannot compile the construct, and which of the two it is changes nothing they can
+    /// do about it in the source. That is also why the text must not say "yet" -- it would be wrong
+    /// for the knob case, and a knob is a supported configuration rather than a gap.
+    ///
+    /// **It exists because [`Self::FeatureRequiresLaterVersion`] would be a LIE here.** Telling
+    /// someone to "use language version 7 or greater" when they already passed exactly that sends
+    /// them looking for a switch that cannot help. The message names the permitting dialect
+    /// precisely so they stop suspecting the language version.
+    FeatureNotInThisBuild {
+        /// The feature name, spelled as csc spells it (e.g. "generics").
+        feature: Box<str>,
+        /// The dialect that permits the construct -- the one the user already selected.
+        permitted_by: LanguageVersion,
     },
     /// `CS8703`: an interface member declares an access modifier. Every interface member is
     /// implicitly public in C# 1.0 (13.2), so the modifier is not merely redundant -- it is a
@@ -813,6 +1005,80 @@ pub enum DiagnosticKind {
     ReadonlyAssignment {
         /// The field name.
         field: Box<str>,
+    },
+    /// `CS0200`: a property with no `set` accessor is assigned.
+    PropertyCannotBeAssigned {
+        /// The property, qualified as csc renders it (`C.P`).
+        property: Box<str>,
+    },
+    /// `CS1061`: a member is not found on the type of an EXPRESSION (as opposed to `CS0117`, which
+    /// is the same absence on a type named directly).
+    MemberNotFoundOnExpression {
+        /// The type the member was looked for on.
+        type_name: Box<str>,
+        /// The member name.
+        member: Box<str>,
+    },
+    /// `CS1922`: a collection initializer targets a type that does not implement `IEnumerable`.
+    ///
+    /// Separate from the missing-`Add` case (`CS1061`) because the two name different repairs --
+    /// implement the interface, or supply the method -- and csc reports them separately. Measured.
+    NotACollectionInitializerTarget {
+        /// The type being created.
+        type_name: Box<str>,
+    },
+    /// `CS1914`: a STATIC field or property is named in an object initializer.
+    ///
+    /// Its own code rather than the ordinary "cannot assign" family, because the mistake is
+    /// specific: an object initializer assigns members OF THE NEW OBJECT, and a static member does
+    /// not belong to one. MEASURED -- csc reports this even when the initializer is also refused by
+    /// the language-version gate, so it is not suppressed by that gate.
+    StaticMemberInObjectInitializer {
+        /// The member, qualified as csc renders it (`C.F`).
+        member: Box<str>,
+    },
+    /// `CS9034`: a `required` member cannot be assigned -- a `readonly` field, or a property with
+    /// no `set` accessor.
+    ///
+    /// The point of `required` is that every construction must assign the member, so a member
+    /// nothing can assign is a contradiction rather than a missing assignment. Distinct from
+    /// `CS0106`: `required` IS valid on a field or property, and it is this one that is not
+    /// settable.
+    RequiredMemberMustBeSettable {
+        /// The member, qualified as csc renders it (`C.F`).
+        member: Box<str>,
+    },
+    /// `CS9032`: a `required` member is less visible than the type that declares it.
+    ///
+    /// A caller that cannot see the member cannot satisfy it, so the type would be
+    /// unconstructible from where it is visible.
+    RequiredMemberLessVisible {
+        /// The member, qualified as csc renders it (`C.F`).
+        member: Box<str>,
+        /// The declaring type, as csc names it at the end of the sentence.
+        containing_type: Box<str>,
+    },
+    /// `CS9035`: an object creation leaves a `required` member unset.
+    RequiredMemberMustBeSet {
+        /// The member, qualified as csc renders it (`C.P`).
+        member: Box<str>,
+    },
+    /// `CS9036`: a `required` member is given a NESTED member or collection initializer rather
+    /// than a value.
+    RequiredMemberNeedsValue {
+        /// The member, qualified as csc renders it (`C.F`).
+        member: Box<str>,
+    },
+    /// `CS9030`: an `override` of a `required` member drops the `required`.
+    ///
+    /// `required` is part of the contract the base slot imposes on every construction, and an
+    /// override cannot narrow it -- otherwise constructing the derived type would escape a
+    /// requirement the base declared.
+    OverrideMustBeRequired {
+        /// The overriding member, qualified as csc renders it (`D.P`).
+        member: Box<str>,
+        /// The base member it overrides (`B.P`).
+        base_member: Box<str>,
     },
     /// `CS0535`: a class does not implement an inherited interface member.
     InterfaceMemberNotImplemented {
@@ -1059,8 +1325,11 @@ impl DiagnosticKind {
     #[must_use]
     pub fn code(&self) -> u16 {
         match self {
+            DiagnosticKind::FeatureNotInThisBuild { .. } => 1,
             DiagnosticKind::TypeNotFound { .. } => 246,
             DiagnosticKind::NameNotFound { .. } => 103,
+            DiagnosticKind::GenericArityMismatch { .. } => 305,
+            DiagnosticKind::NonGenericTypeWithTypeArguments { .. } => 308,
             DiagnosticKind::ConstantOutOfRange { .. } => 31,
             DiagnosticKind::NonConstantEnumMember { .. } => 133,
             DiagnosticKind::ConstantOverflowInCheckedContext => 220,
@@ -1090,6 +1359,7 @@ impl DiagnosticKind {
             DiagnosticKind::CannotAssignToMethodGroup { .. } => 1656,
             DiagnosticKind::CannotAssignToReadonlyLocal { .. } => 1656,
             DiagnosticKind::MemberNotFound { .. } => 117,
+            DiagnosticKind::MemberSignatureNotSupported { .. } => 2,
             DiagnosticKind::NoOverloadForArgumentCount { .. } => 1501,
             DiagnosticKind::PredefinedTypeMissing { .. } => 518,
             DiagnosticKind::ArglistOutsideVarargMethod => 190,
@@ -1152,7 +1422,7 @@ impl DiagnosticKind {
             DiagnosticKind::UnreferencedLabel => 164,
             DiagnosticKind::AbstractMethodWithBody { .. } => 500,
             DiagnosticKind::MethodMustHaveBody { .. } => 501,
-            DiagnosticKind::FeatureRequiresLaterVersion { .. } => 8022,
+            DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
             DiagnosticKind::InterfaceMemberModifier { .. } => 8703,
             DiagnosticKind::AbstractMemberInNonAbstractType { .. } => 513,
             DiagnosticKind::VirtualOrAbstractMemberIsPrivate { .. } => 621,
@@ -1171,6 +1441,15 @@ impl DiagnosticKind {
             DiagnosticKind::ConstFieldRequiresValue => 145,
             DiagnosticKind::InterfaceCannotContainInstanceField => 525,
             DiagnosticKind::ReadonlyAssignment { .. } => 191,
+            DiagnosticKind::PropertyCannotBeAssigned { .. } => 200,
+            DiagnosticKind::MemberNotFoundOnExpression { .. } => 1061,
+            DiagnosticKind::NotACollectionInitializerTarget { .. } => 1922,
+            DiagnosticKind::StaticMemberInObjectInitializer { .. } => 1914,
+            DiagnosticKind::RequiredMemberMustBeSettable { .. } => 9034,
+            DiagnosticKind::RequiredMemberLessVisible { .. } => 9032,
+            DiagnosticKind::RequiredMemberMustBeSet { .. } => 9035,
+            DiagnosticKind::RequiredMemberNeedsValue { .. } => 9036,
+            DiagnosticKind::OverrideMustBeRequired { .. } => 9030,
             DiagnosticKind::InterfaceMemberNotImplemented { .. } => 535,
             DiagnosticKind::NoMethodToOverride { .. } => 115,
             DiagnosticKind::CannotOverrideNonVirtual { .. } => 506,
@@ -1240,6 +1519,20 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NameNotFound { name } => {
                 write!(f, "The name '{name}' does not exist in the current context")
             }
+            DiagnosticKind::GenericArityMismatch {
+                candidate,
+                required,
+                member,
+            } => write!(
+                f,
+                "Using the generic {} '{candidate}' requires {required} type arguments",
+                member.as_str()
+            ),
+            DiagnosticKind::NonGenericTypeWithTypeArguments { name, member } => write!(
+                f,
+                "The non-generic {} '{name}' cannot be used with type arguments",
+                member.as_str()
+            ),
             DiagnosticKind::ConstantOverflowInCheckedContext => {
                 write!(f, "The operation overflows at compile time in checked mode")
             }
@@ -1352,6 +1645,11 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::MemberNotFound { type_name, member } => write!(
                 f,
                 "'{type_name}' does not contain a definition for '{member}'"
+            ),
+            DiagnosticKind::MemberSignatureNotSupported { type_name, member } => write!(
+                f,
+                "'{type_name}' defines '{member}', but its signature uses generics, \
+                 which this build of the compiler cannot read"
             ),
             DiagnosticKind::NoOverloadForArgumentCount { method, count } => write!(
                 f,
@@ -1615,9 +1913,22 @@ impl fmt::Display for DiagnosticKind {
                 "The modifier '{modifier}' is not valid for this item in C# 1.0; \
                  it requires C# 8.0 or greater"
             ),
-            DiagnosticKind::FeatureRequiresLaterVersion { feature, required } => write!(
+            DiagnosticKind::FeatureRequiresLaterVersion {
+                feature,
+                required,
+                current,
+            } => write!(
                 f,
-                "Feature '{feature}' is not available in C# 1.0; it requires {required} or greater"
+                "Feature '{feature}' is not available in C# {}. Please use language version {required} or greater.",
+                current.message_name()
+            ),
+            DiagnosticKind::FeatureNotInThisBuild {
+                feature,
+                permitted_by,
+            } => write!(
+                f,
+                "Feature '{feature}' is permitted by C# {} but is not provided by this build of Lamella.",
+                permitted_by.message_name()
             ),
             DiagnosticKind::AbstractMemberInNonAbstractType { member, type_name } => write!(
                 f,
@@ -1683,6 +1994,53 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::ReadonlyAssignment { field } => write!(
                 f,
                 "A readonly field '{field}' cannot be assigned to (except in a constructor)"
+            ),
+            DiagnosticKind::PropertyCannotBeAssigned { property } => write!(
+                f,
+                "Property or indexer '{property}' cannot be assigned to -- it is read only"
+            ),
+            DiagnosticKind::MemberNotFoundOnExpression { type_name, member } => write!(
+                f,
+                "'{type_name}' does not contain a definition for '{member}' and no accessible \
+                 extension method '{member}' accepting a first argument of type '{type_name}' \
+                 could be found (are you missing a using directive or an assembly reference?)"
+            ),
+            DiagnosticKind::NotACollectionInitializerTarget { type_name } => write!(
+                f,
+                "Cannot initialize type '{type_name}' with a collection initializer because it \
+                 does not implement 'System.Collections.IEnumerable'"
+            ),
+            DiagnosticKind::StaticMemberInObjectInitializer { member } => write!(
+                f,
+                "Static field or property '{member}' cannot be assigned in an object initializer"
+            ),
+            DiagnosticKind::RequiredMemberMustBeSettable { member } => {
+                write!(f, "Required member '{member}' must be settable.")
+            }
+            DiagnosticKind::RequiredMemberLessVisible {
+                member,
+                containing_type,
+            } => write!(
+                f,
+                "Required member '{member}' cannot be less visible or have a setter less visible \
+                 than the containing type '{containing_type}'."
+            ),
+            DiagnosticKind::RequiredMemberMustBeSet { member } => write!(
+                f,
+                "Required member '{member}' must be set in the object initializer or attribute \
+                 constructor."
+            ),
+            DiagnosticKind::RequiredMemberNeedsValue { member } => write!(
+                f,
+                "Required member '{member}' must be assigned a value, it cannot use a nested \
+                 member or collection initializer."
+            ),
+            DiagnosticKind::OverrideMustBeRequired {
+                member,
+                base_member,
+            } => write!(
+                f,
+                "'{member}' must be required because it overrides required member '{base_member}'"
             ),
             DiagnosticKind::InterfaceMemberNotImplemented { type_name, member } => write!(
                 f,
@@ -1890,6 +2248,14 @@ mod tests {
             666
         );
         assert_eq!(DiagnosticKind::ConstantOverflowInCheckedContext.code(), 220);
+        assert_eq!(
+            DiagnosticKind::TypeNotFound { name: "Foo".into() }.namespace(),
+            CodeNamespace::Cs
+        );
+        assert_eq!(
+            DiagnosticKind::ConstantOverflowInCheckedContext.namespace(),
+            CodeNamespace::Cs
+        );
         assert_eq!(
             DiagnosticKind::MemberNamedLikeType {
                 type_name: "C".into()

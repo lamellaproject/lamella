@@ -118,6 +118,30 @@ pub unsafe extern "C" fn lamella_py_bundle(ptr: *const u8, len: usize) -> *mut u
     result_buffer(crate::py::bundle_py_str(source))
 }
 
+/// Completions (IntelliSense) for the caret at byte `offset` in the Python at
+/// `ptr..ptr + len` (UTF-8), returning `[u32 length][UTF-8 JSON]`
+/// (`{items:[{label, kind, detail, insertText}]}`); free it with
+/// `lamella_dealloc(result, 4 + length)`. Behind the `py` feature.
+///
+/// The C# twin [`crate::compile::lamella_complete`] additionally takes a packed reference-assembly
+/// buffer; Python needs none, because the only modules a program here can import are the ones this
+/// blob already carries. **An empty item list is the normal answer for a caret with nothing to
+/// suggest, not an error** -- this call has no failure mode.
+///
+/// # Safety
+/// `ptr`/`len` must be the UTF-8 buffer the host filled via a prior [`lamella_alloc`].
+#[cfg(feature = "py")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_py_complete(
+    ptr: *const u8,
+    len: usize,
+    offset: usize,
+) -> *mut u8 {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let source = core::str::from_utf8(bytes).unwrap_or("");
+    result_buffer(crate::py::complete_py_str(source, offset).into_bytes())
+}
+
 /// Packages `bytes` into a freshly allocated `[u32 little-endian length][bytes]`
 /// buffer and returns a pointer to it; the host reads the length, then the bytes,
 /// then frees it with `lamella_dealloc(result, 4 + length)`. Shared by the run and

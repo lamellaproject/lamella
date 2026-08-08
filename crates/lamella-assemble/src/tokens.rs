@@ -1,5 +1,6 @@
 //! Resolving called methods and accessed fields to their metadata tokens.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -48,6 +49,23 @@ fn type_key(ty: &TypeSymbol) -> String {
     key
 }
 
+/// The type a PREDICATE about `ty` should be answered from: an instantiation defers to its generic
+/// definition (arity-mangled, ECMA-335 II.10.7.2), everything else is itself.
+fn definition_of(ty: &TypeSymbol) -> TypeSymbol {
+    let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = ty
+    else {
+        return ty.clone();
+    };
+    let mut parts: Vec<alloc::boxed::Box<str>> = definition.to_vec();
+    if let Some(last) = parts.last_mut() {
+        *last = lamella_binder::metadata_type_name(last, arguments.len()).into();
+    }
+    TypeSymbol::Named(parts.into())
+}
+
 /// The metadata tokens of the module's members and the strings it loads, keyed by
 /// identity (member references are minted into the same table for external calls).
 #[derive(Debug, Default)]
@@ -75,6 +93,10 @@ pub struct Tokens {
     /// object's runtime type (`ldvirtftn`, III.4.18), so an override is honored; a non-virtual
     /// method binds the exact method (`ldftn`).
     virtual_methods: BTreeSet<String>,
+    /// The type-parameter NAMES each declared generic type owns, in declaration order, by type key
+    /// -- `["TKey", "TValue"]` for `` Pair`2 ``. Empty (absent) for every non-generic type, which is
+    /// every C# 1.0 type.
+    type_parameters: BTreeMap<String, Vec<Box<str>>>,
     /// Canonicalizes single-part signature names to their qualified form before keying, so a
     /// parameter/field collected structurally as `StringBuilder` keys (and serializes) the same
     /// as the binder's `System.Text.StringBuilder` -- a forward call resolved against the model's
@@ -135,6 +157,24 @@ impl Tokens {
         self.types.get(&type_key(&self.canonical(ty))).copied()
     }
 
+    /// Records the type-parameter names a declared generic type owns, in declaration order.
+    /// A no-op for an empty list, so a non-generic type never gets an entry.
+    pub fn insert_type_parameters(&mut self, ty: &TypeSymbol, names: Vec<Box<str>>) {
+        if !names.is_empty() {
+            self.type_parameters.insert(type_key(&self.canonical(ty)), names);
+        }
+    }
+
+    /// The type-parameter names `ty` declares, in declaration order -- so a name's POSITION in this
+    /// slice is the `n` of the `!n` a signature encodes it as (II.23.1.16). Empty for a non-generic
+    /// type and for any type this module did not declare.
+    #[must_use]
+    pub(crate) fn type_parameters(&self, ty: &TypeSymbol) -> &[Box<str>] {
+        self.type_parameters
+            .get(&type_key(&self.canonical(ty)))
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// Records that this type is an enum (its signatures lower to the underlying type).
     pub fn insert_enum(&mut self, ty: &TypeSymbol) {
         self.enums.insert(type_key(&self.canonical(ty)));
@@ -170,7 +210,7 @@ impl Tokens {
     /// Whether this type is a struct (value type) declared in the module.
     #[must_use]
     pub fn is_struct(&self, ty: &TypeSymbol) -> bool {
-        self.structs.contains(&type_key(&self.canonical(ty)))
+        self.structs.contains(&type_key(&self.canonical(&definition_of(ty))))
     }
 
     /// Records that this type is an interface declared in the module.

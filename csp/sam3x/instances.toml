@@ -14,7 +14,7 @@ sources = [
 ]
 notes = [
     "pid drives PMC_PCER0 bit (id) for clock enable and the NVIC line; UART = 8, PIOA = 11, PMC = 5 (Table 9-1).",
-    "Bases confirmed on silicon: UART 0x400E0800, PMC 0x400E0600 (the System Controller order is SMC/SDRAMC/MATRIX/PMC/UART at 0x400E0000/0200/0400/0600/0800). PIOA 0x400E0E00 per the memory map.",
+    "The System Controller blocks sit in the order SMC/SDRAMC/MATRIX/PMC/UART at 0x400E0000/0200/0400/0600/0800, which is what puts UART at 0x400E0800 and PMC at 0x400E0600. PIOA is 0x400E0E00 per the memory map.",
 ]
 
 [[instances]]
@@ -32,5 +32,6 @@ pid = -1
 [[instances]]
 name = "pioa"
 block = "pio"
+port = "A"          # this instance IS the group pins named PA<n> resolve to
 base = 0x400E0E00
 pid = 11

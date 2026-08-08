@@ -4,18 +4,59 @@ use crate::ast::{
     Accessor, AssignmentOperator, Attribute, AttributeArgument, AttributeSection, BinaryOperator,
     CatchClause, CompilationUnit, ConstructorInitializer, ConstructorInitializerKind,
     ConversionDirection, DelegateDecl, EnumDecl, EnumMember, Expr, ExprKind, ForInitializer,
-    GotoTarget, Literal, Member, Modifier, NamespaceDecl, NamespaceMember, OverloadableOperator,
+    GotoTarget, Initializer, Literal, Member, MemberInitializer, MemberInitializerValue, Modifier,
+    NamespaceDecl, NamespaceMember, OverloadableOperator,
     Parameter, ParameterModifier, PostfixOperator, PredefinedType, QualifiedName, Stmt, StmtKind,
-    SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeRef, TypeRefKind, TypeTestOperation,
+    SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeParameter, TypeRef, TypeRefKind,
+    TypeTestOperation,
     UnaryOperator, UsingDirective, UsingKind, UsingResource, VariableDeclarator,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::lexer::{LexOptions, Tokenized, tokenize, tokenize_with};
 use crate::span::Span;
+use crate::version::{Feature, LanguageVersion};
 use crate::token::{Keyword, Punctuator, Token, TokenKind, TypedRefKeyword};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
+
+/// What a namespace member is being declared inside.
+///
+/// This exists for the three file-scoped-namespace placement rules (C# 10), each of which turns on
+/// the IMMEDIATE container and on nothing else -- see
+/// [`Parser::parse_file_scoped_namespace_body`] for the measured table. Threading it through
+/// [`Parser::parse_namespace_member`] is what lets those rules be decided where the mistake is,
+/// with the offending name in hand, rather than by a second walk over a finished tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamespaceContainer {
+    /// The compilation unit (or a REPL submission) itself -- the only place a file-scoped
+    /// namespace belongs, and only while nothing else has been declared.
+    CompilationUnit {
+        /// Whether a type or namespace has already been declared at file scope.
+        members_precede: bool,
+    },
+    /// A brace-delimited `namespace N { ... }` body.
+    Block,
+    /// A file-scoped `namespace N;` body, which runs to the end of ITS container.
+    FileScoped,
+}
+
+/// Right-angle brackets a nested type-argument list consumed as part of a `>>` token and owed to
+/// the lists enclosing it (25.5.1).
+///
+/// The lexer takes the longest match (9.4.5), so the two levels of `List<List<int>>` close on ONE
+/// [`Punctuator::GreaterThanGreaterThan`]. The inner list consumes that token whole and reports one
+/// close still owed; the enclosing list closes on the credit instead of on a token. See
+/// [`Parser::parse_type_argument_list`] for why the alternative -- narrowing the token in place --
+/// is a silent miscompile rather than a shortcut.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AngleCredit {
+    /// How many enclosing type-argument lists may close without consuming a token.
+    closes: u8,
+    /// The offset past the `>>` these closes came from, so an enclosing list still spans its
+    /// source text rather than ending before its own last character.
+    end: u32,
+}
 
 /// The result of parsing: the syntax tree and every diagnostic gathered, both
 /// the lexer's and the parser's, in source order.
@@ -88,7 +129,9 @@ pub fn parse_compilation_unit_with(
     source: &str,
     options: LexOptions,
 ) -> ParsedCompilationUnit {
+    let version = options.version;
     let mut parser = Parser::new(tokenize_with(source, options));
+    parser.version = version;
     let unit = parser.parse_compilation_unit();
     ParsedCompilationUnit {
         unit,
@@ -160,6 +203,10 @@ struct Parser {
     /// The `#define`d preprocessor symbols (9.5.3), carried onto the parsed
     /// [`CompilationUnit`] so the binder can resolve `[Conditional]` inclusion (24.4.2).
     defined_symbols: BTreeSet<Box<str>>,
+    /// The dialect being compiled. The parser gates several constructs on it, and the gate
+    /// DIAGNOSTIC needs it too -- its code and its "in C# N" both name the version being compiled,
+    /// not the one the feature wants.
+    version: LanguageVersion,
 }
 
 impl Parser {
@@ -176,6 +223,7 @@ impl Parser {
             position: 0,
             diagnostics: tokenized.diagnostics,
             defined_symbols: tokenized.defined_symbols,
+            version: LanguageVersion::DEFAULT,
         }
     }
 
@@ -344,7 +392,9 @@ impl Parser {
         let mut trailing = None;
         while !matches!(self.current().kind, TokenKind::EndOfFile) {
             if self.at_namespace_member() {
-                types.push(self.parse_namespace_member());
+                types.push(self.parse_namespace_member(NamespaceContainer::CompilationUnit {
+                    members_precede: !types.is_empty() || !statements.is_empty(),
+                }));
                 continue;
             }
             let saved_position = self.position;
@@ -960,10 +1010,17 @@ impl Parser {
             if self.current_punctuator() == Some(Punctuator::OpenBracket)
                 && self.is_global_attribute_target()
             {
+                if !members.is_empty() {
+                    let target = self.tokens.get(self.position + 1).map(|token| token.span);
+                    let span = target.unwrap_or_else(|| self.current().span);
+                    self.report(DiagnosticKind::GlobalAttributeMustPrecedeMembers, span);
+                }
                 global_attributes.push(self.parse_attribute_section());
                 continue;
             }
-            members.push(self.parse_namespace_member());
+            members.push(self.parse_namespace_member(NamespaceContainer::CompilationUnit {
+                members_precede: !members.is_empty(),
+            }));
             if self.position == before {
                 self.bump();
             }
@@ -1017,7 +1074,8 @@ impl Parser {
                     feature: crate::version::Feature::UsingStatic.description(),
                     required: crate::version::Feature::UsingStatic
                         .introduced_in()
-                        .display_name(),
+                        .required_name(),
+                            current: self.version,
                 },
                 Span::empty_at(self.current().span.start),
             );
@@ -1160,13 +1218,32 @@ impl Parser {
 
     /// Parses a namespace member (16.4): a nested namespace or a type declaration,
     /// with any leading attribute sections.
-    fn parse_namespace_member(&mut self) -> NamespaceMember {
+    ///
+    /// `container` says what this member is being declared inside, which is the entire input to
+    /// the file-scoped-namespace placement rules -- see [`NamespaceContainer`].
+    fn parse_namespace_member(&mut self, container: NamespaceContainer) -> NamespaceMember {
         let start = self.current().span.start;
         let attributes = self.parse_attribute_sections();
-        if self.current_keyword() == Some(Keyword::Namespace) {
-            return NamespaceMember::Namespace(self.parse_namespace_declaration());
-        }
+        let modifiers_from = self.position;
         let modifiers = self.parse_modifiers();
+        let modifiers_to = self.position;
+        if self.current_keyword() == Some(Keyword::Namespace) {
+            if matches!(container, NamespaceContainer::CompilationUnit { .. }) {
+                let modifier_spans: Vec<Span> = (modifiers_from..modifiers_to)
+                    .filter_map(|index| self.tokens.get(index).map(|token| token.span))
+                    .collect();
+                for section in &attributes {
+                    self.report(
+                        DiagnosticKind::NamespaceCannotHaveModifiersOrAttributes,
+                        section.span,
+                    );
+                }
+                for span in modifier_spans {
+                    self.report(DiagnosticKind::NamespaceCannotHaveModifiersOrAttributes, span);
+                }
+            }
+            return NamespaceMember::Namespace(self.parse_namespace_declaration(container));
+        }
         self.parse_type_kind_declaration(attributes, modifiers, start)
     }
 
@@ -1273,11 +1350,29 @@ impl Parser {
         }
     }
 
-    /// Parses a `namespace` declaration (16.2).
-    fn parse_namespace_declaration(&mut self) -> NamespaceDecl {
-        let start = self.current().span.start;
+    /// Parses a `namespace` declaration (16.2), in either the brace-delimited form or the
+    /// file-scoped form `namespace N;` (C# 10).
+    ///
+    /// The two forms are told apart by the token after the name -- `{` or `;` -- and produce the
+    /// same [`NamespaceDecl`] afterwards, because they declare the same namespace. All that
+    /// differs is where the body ends: a brace for one, the end of the enclosing container for the
+    /// other.
+    fn parse_namespace_declaration(&mut self, container: NamespaceContainer) -> NamespaceDecl {
+        let keyword = self.current().span;
+        let start = keyword.start;
         self.bump();
+        let diagnostics_before = self.diagnostics.len();
         let name = self.parse_qualified_name();
+        let named = self.diagnostics.len() == diagnostics_before;
+        if self.current_punctuator() == Some(Punctuator::Semicolon) {
+            return self.parse_file_scoped_namespace_body(container, keyword, name, start, named);
+        }
+        if named && container == NamespaceContainer::FileScoped {
+            self.report(
+                DiagnosticKind::BothFileScopedAndNormalNamespaces,
+                name.span,
+            );
+        }
         self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
         let usings = self.parse_using_directives();
         let mut members = Vec::new();
@@ -1285,7 +1380,7 @@ impl Parser {
             && !matches!(self.current().kind, TokenKind::EndOfFile)
         {
             let before = self.position;
-            members.push(self.parse_namespace_member());
+            members.push(self.parse_namespace_member(NamespaceContainer::Block));
             if self.position == before {
                 self.bump();
             }
@@ -1295,7 +1390,86 @@ impl Parser {
             name,
             usings,
             members,
+            file_scoped: false,
             span: Span::new(start, end),
+        }
+    }
+
+    /// Parses the rest of a file-scoped namespace declaration (C# 10), positioned on its `;`.
+    ///
+    /// **Its body is everything up to the end of its container**, so there is no closing brace to
+    /// expect and no second list to build: the members it collects are exactly the ones the
+    /// enclosing loop would otherwise have collected itself. That is what makes this feature pure
+    /// syntax -- the tree it produces is the tree the brace-delimited spelling produces, so the
+    /// binder, the metadata writer and the emitter see nothing new.
+    ///
+    /// Stopping at a `}` as well as at end-of-file is not defensive: it is what keeps a
+    /// MISPLACED file-scoped namespace (one written inside `namespace M { ... }`) from swallowing
+    /// the enclosing declaration's brace and turning one reportable mistake into a parse cascade.
+    ///
+    /// | container | diagnostic |
+    /// |---|---|
+    /// | the compilation unit, nothing declared yet | none -- this is the form the feature is for |
+    /// | the compilation unit, a type or namespace already declared | `CS8956` |
+    /// | a brace-delimited namespace | `CS8955` |
+    /// | another file-scoped namespace | `CS8954` |
+    ///
+    /// **`CS8954`'s message says "only one ... per file" and the rule is not that.** Because a
+    /// file-scoped body runs to end of file, a second file-scoped declaration is never a sibling of
+    /// the first -- it is always nested inside it, which is why the container answers this too.
+    ///
+    /// The version gate is reported separately and does not replace any of the three: csc emits
+    /// both, at every dialect, and so do we.
+    fn parse_file_scoped_namespace_body(
+        &mut self,
+        container: NamespaceContainer,
+        keyword: Span,
+        name: QualifiedName,
+        start: u32,
+        named: bool,
+    ) -> NamespaceDecl {
+        if named && !self.version.supports(Feature::FileScopedNamespaces) {
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: Feature::FileScopedNamespaces.description(),
+                    required: Feature::FileScopedNamespaces.introduced_in().required_name(),
+                    current: self.version,
+                },
+                keyword,
+            );
+        }
+        match container {
+            _ if !named => {}
+            NamespaceContainer::CompilationUnit { members_precede: true } => self.report(
+                DiagnosticKind::FileScopedNamespaceMustPrecedeMembers,
+                name.span,
+            ),
+            NamespaceContainer::Block => {
+                self.report(DiagnosticKind::BothFileScopedAndNormalNamespaces, name.span);
+            }
+            NamespaceContainer::FileScoped => {
+                self.report(DiagnosticKind::OnlyOneFileScopedNamespace, name.span);
+            }
+            NamespaceContainer::CompilationUnit { members_precede: false } => {}
+        }
+        self.bump();
+        let usings = self.parse_using_directives();
+        let mut members = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            members.push(self.parse_namespace_member(NamespaceContainer::FileScoped));
+            if self.position == before {
+                self.bump();
+            }
+        }
+        NamespaceDecl {
+            name,
+            usings,
+            members,
+            file_scoped: true,
+            span: Span::new(start, self.current().span.start),
         }
     }
 
@@ -1328,6 +1502,7 @@ impl Parser {
             }
         };
         let (name, _) = self.expect_identifier();
+        let type_parameters = self.parse_type_parameter_list();
         let bases = if self.eat(Punctuator::Colon) {
             let mut bases = Vec::new();
             bases.push(self.parse_type());
@@ -1355,6 +1530,7 @@ impl Parser {
             modifiers,
             kind,
             name,
+            type_parameters,
             bases,
             members,
             span: Span::new(start, end),
@@ -1363,9 +1539,66 @@ impl Parser {
 
     /// Parses a run of leading declaration modifiers (17.2 and elsewhere). The
     /// parser accepts any; binding checks which are valid where.
+    /// Whether the identifier `required` at the current position is the C# 11 MODIFIER rather than
+    /// an ordinary identifier naming the member's own type.
+    ///
+    /// **MEASURED against csc, and the rule is version-dependent in a way no amount of reading the
+    /// grammar would suggest:**
+    ///
+    /// | source | below C# 11 | C# 11 and up |
+    /// |---|---|---|
+    /// | `required int f;` | modifier (and gated) | modifier |
+    /// | `required Foo f;` | modifier (and gated) | modifier |
+    /// | `required f;` | **a field `f` of type `required`** | modifier, then `CS1519` |
+    ///
+    /// **csc does this lookahead only BELOW C# 11, to keep source that names a type `required`
+    /// compiling; at C# 11 it stops and the identifier becomes a real modifier unconditionally.**
+    /// That is a deliberate source-compatibility break in csc -- `class required { }` used as a
+    /// field type compiles at C# 10 and does not at C# 11 -- and matching it means accepting it.
+    ///
+    /// Recognizing it below C# 11 is what buys the clean `Feature 'required members' ... please use
+    /// language version 11.0` diagnostic instead of a parse cascade, which is the whole point of
+    /// having the gate.
+    fn required_is_a_modifier_here(&self) -> bool {
+        if !matches!(&self.current().kind, TokenKind::Identifier(text) if &**text == "required") {
+            return false;
+        }
+        if self.version >= LanguageVersion::CSharp11 {
+            return true;
+        }
+        let starts_a_type = matches!(
+            self.tokens.get(self.position + 1).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_)) | Some(TokenKind::Keyword(_))
+        );
+        let then_a_name = matches!(
+            self.tokens.get(self.position + 2).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_))
+        );
+        starts_a_type && then_a_name
+    }
+
     fn parse_modifiers(&mut self) -> Vec<Modifier> {
         let mut modifiers = Vec::new();
-        while let Some(modifier) = self.current_keyword().and_then(modifier_of) {
+        loop {
+            let modifier = match self.current_keyword().and_then(modifier_of) {
+                Some(modifier) => modifier,
+                None if self.required_is_a_modifier_here() => {
+                    if !self.version.supports(Feature::RequiredMembers) {
+                        self.report(
+                            DiagnosticKind::FeatureRequiresLaterVersion {
+                                feature: Feature::RequiredMembers.description(),
+                                required: Feature::RequiredMembers
+                                    .introduced_in()
+                                    .required_name(),
+                                current: self.version,
+                            },
+                            self.current().span,
+                        );
+                    }
+                    Modifier::Required
+                }
+                None => break,
+            };
             if modifiers.contains(&modifier) {
                 let span = self.current().span;
                 let keyword = token_spelling(&self.current().kind);
@@ -1458,9 +1691,10 @@ impl Parser {
             return self.parse_indexer(modifiers, ty, start);
         }
         if matches!(self.current().kind, TokenKind::Identifier(_))
-            && self.next_is(Punctuator::OpenParen)
+            && (self.next_is(Punctuator::OpenParen) || self.next_is(Punctuator::LessThan))
         {
             let (name, _) = self.expect_identifier();
+            let type_parameters = self.parse_type_parameter_list();
             let (parameters, arglist) = self.parse_parameter_list();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
@@ -1474,6 +1708,7 @@ impl Parser {
                 modifiers,
                 return_type: ty,
                 name,
+                type_parameters,
                 parameters,
                 is_vararg: arglist.is_some(),
                 body,
@@ -1503,6 +1738,7 @@ impl Parser {
             if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 return self.parse_property(modifiers, ty, member, Some(explicit_interface), start);
             }
+            let type_parameters = self.parse_type_parameter_list();
             let (parameters, arglist) = self.parse_parameter_list();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
@@ -1516,6 +1752,7 @@ impl Parser {
                 modifiers,
                 return_type: ty,
                 name: member,
+                type_parameters,
                 parameters,
                 is_vararg: arglist.is_some(),
                 body,
@@ -1600,7 +1837,8 @@ impl Parser {
                         feature: crate::version::Feature::AccessorAccessibility.description(),
                         required: crate::version::Feature::AccessorAccessibility
                             .introduced_in()
-                            .display_name(),
+                            .required_name(),
+                                current: self.version,
                     },
                     Span::empty_at(at),
                 );
@@ -2014,7 +2252,8 @@ impl Parser {
                         feature: crate::version::Feature::DefaultParameterValues.description(),
                         required: crate::version::Feature::DefaultParameterValues
                             .introduced_in()
-                            .display_name(),
+                            .required_name(),
+                                current: self.version,
                     },
                     Span::empty_at(at),
                 );
@@ -2264,6 +2503,28 @@ impl Parser {
                     expr = Expr::new(
                         ExprKind::Invocation {
                             receiver: Box::new(expr),
+                            type_arguments: Vec::new(),
+                            arguments,
+                        },
+                        span,
+                    );
+                }
+                Some(Punctuator::LessThan) if self.generic_call_ahead() => {
+                    let (type_arguments, _, _) = self.parse_type_argument_list(false);
+                    let open = self.current().span.start;
+                    self.expect(Punctuator::OpenParen, DiagnosticKind::TokenExpected {
+                        expected: "(",
+                    });
+                    let _ = open;
+                    let (arguments, end) = self.parse_arguments(
+                        Punctuator::CloseParen,
+                        DiagnosticKind::CloseParenExpected,
+                    );
+                    let span = Span::new(expr.span.start, end);
+                    expr = Expr::new(
+                        ExprKind::Invocation {
+                            receiver: Box::new(expr),
+                            type_arguments,
                             arguments,
                         },
                         span,
@@ -2505,7 +2766,8 @@ impl Parser {
                         feature: crate::version::Feature::AnonymousMethods.description(),
                         required: crate::version::Feature::AnonymousMethods
                             .introduced_in()
-                            .display_name(),
+                            .required_name(),
+                                current: self.version,
                     },
                     Span::empty_at(span.start),
                 );
@@ -2547,7 +2809,8 @@ impl Parser {
                         feature: crate::version::Feature::NamedArguments.description(),
                         required: crate::version::Feature::NamedArguments
                             .introduced_in()
-                            .display_name(),
+                            .required_name(),
+                                current: self.version,
                     },
                     Span::empty_at(at),
                 );
@@ -2664,7 +2927,20 @@ impl Parser {
     /// for ordinary type positions (declarations, casts, `typeof`) and OFF for the `is`/`as` target,
     /// where a trailing `?` is the conditional operator (`x is int ? a : b`) not a nullable type.
     fn parse_type_inner(&mut self, allow_nullable: bool) -> TypeRef {
-        let mut base = self.parse_non_array_type();
+        let base = self.parse_non_array_type();
+        self.parse_type_suffixes_inner(base, allow_nullable)
+    }
+
+    /// The pointer, nullable and array suffixes that follow an already-parsed base type, in an
+    /// ordinary type position (nullable permitted). Split out so a type ARGUMENT can take them
+    /// too without re-entering [`parse_non_array_type`](Self::parse_non_array_type), which would
+    /// re-read the name.
+    fn parse_type_suffixes(&mut self, base: TypeRef) -> TypeRef {
+        self.parse_type_suffixes_inner(base, true)
+    }
+
+    fn parse_type_suffixes_inner(&mut self, base: TypeRef, allow_nullable: bool) -> TypeRef {
+        let mut base = base;
         let start = base.span.start;
         while !matches!(base.kind, TypeRefKind::Error)
             && self.current_punctuator() == Some(Punctuator::Asterisk)
@@ -2683,7 +2959,8 @@ impl Parser {
                     feature: crate::version::Feature::NullableValueTypes.description(),
                     required: crate::version::Feature::NullableValueTypes
                         .introduced_in()
-                        .display_name(),
+                        .required_name(),
+                            current: self.version,
                 },
                 Span::empty_at(at),
             );
@@ -2720,7 +2997,8 @@ impl Parser {
                     feature: crate::version::Feature::AnonymousObjectCreation.description(),
                     required: crate::version::Feature::AnonymousObjectCreation
                         .introduced_in()
-                        .display_name(),
+                        .required_name(),
+                            current: self.version,
                 },
                 Span::empty_at(start),
             );
@@ -2733,24 +3011,31 @@ impl Parser {
                 self.bump();
                 let (arguments, mut end) = self
                     .parse_arguments(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                let mut initializer = None;
                 if self.current_punctuator() == Some(Punctuator::OpenBrace) {
-                    end = self.gate_object_initializer();
+                    self.gate_initializer_if_unsupported();
+                    let (parsed, parsed_end) = self.parse_initializer();
+                    initializer = Some(parsed);
+                    end = parsed_end;
                 }
                 Expr::new(
                     ExprKind::ObjectCreation {
                         target: element,
                         arguments,
+                        initializer,
                     },
                     Span::new(start, end),
                 )
             }
             Some(Punctuator::OpenBracket) => self.parse_array_creation(start, element),
             Some(Punctuator::OpenBrace) => {
-                let end = self.gate_object_initializer();
+                self.gate_initializer_if_unsupported();
+                let (initializer, end) = self.parse_initializer();
                 Expr::new(
                     ExprKind::ObjectCreation {
                         target: element,
                         arguments: Vec::new(),
+                        initializer: Some(initializer),
                     },
                     Span::new(start, end),
                 )
@@ -2764,6 +3049,7 @@ impl Parser {
                     ExprKind::ObjectCreation {
                         target: element,
                         arguments: Vec::new(),
+                        initializer: None,
                     },
                     Span::new(start, end),
                 )
@@ -2771,22 +3057,121 @@ impl Parser {
         }
     }
 
-    /// Reports the C# 3.0 object/collection-initializer gate (CS8022) at the current `{`, then
-    /// skips the balanced `{ ... }` and returns the offset past its `}`. Strict C# 1.0 has no
-    /// initializer, so a gated `new T { ... }` / `new T(args) { ... }` recovers to a plain object
-    /// creation instead of cascading. Shared by the parenless and argument-list `new` arms.
-    fn gate_object_initializer(&mut self) -> u32 {
-        let at = self.current().span.start;
+    /// Reports the C# 3.0 initializer gate at the current `{` when the dialect does not permit one.
+    ///
+    /// **Only that half of the two-bit rule lives here.** The other half -- a dialect that PERMITS
+    /// an initializer while this build cannot produce one -- is the binder's, because only it has
+    /// `LAM0001`. The two conditions are disjoint, so a program never draws both.
+    ///
+    /// **The two forms are the SAME version and DIFFERENT nouns**, so which one the message names
+    /// is decided here rather than by the feature table: csc reports `'object initializer'` for
+    /// `new C { F = 1 }` and `'collection initializer'` for `new ArrayList { 1, 2 }`. Both
+    /// measured, as is the tie-break -- **an EMPTY `new C { }` is an object initializer**.
+    fn gate_initializer_if_unsupported(&mut self) {
+        let feature = if self.initializer_assigns_a_member() {
+            Feature::ObjectInitializer
+        } else {
+            Feature::CollectionInitializer
+        };
+        if self.version.supports(feature) {
+            return;
+        }
         self.report(
             DiagnosticKind::FeatureRequiresLaterVersion {
-                feature: crate::version::Feature::ObjectAndCollectionInitializers.description(),
-                required: crate::version::Feature::ObjectAndCollectionInitializers
-                    .introduced_in()
-                    .display_name(),
+                feature: feature.description(),
+                required: feature.introduced_in().required_name(),
+                current: self.version,
             },
-            Span::empty_at(at),
+            Span::empty_at(self.current().span.start),
         );
-        self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace)
+    }
+
+    /// Parses an object or collection initializer `{ ... }`, positioned on the `{` (C# 3.0).
+    ///
+    /// **Which kind it is is decided by the first element and nothing else** -- `identifier =` opens
+    /// an object initializer, anything else a collection one, and an EMPTY `{ }` is an object
+    /// initializer because that is what csc calls it. Both spellings are the same version, so the
+    /// distinction exists for the MESSAGE and for what the binder must then check: a collection
+    /// initializer needs `IEnumerable` and an `Add` (csc CS1922 / CS1061), an object initializer
+    /// needs the named members to exist and be settable (CS0117 / CS0191 / CS0200 / CS1914).
+    ///
+    /// A TRAILING COMMA is legal in both, measured.
+    fn parse_initializer(&mut self) -> (Initializer, u32) {
+        let assigns_member = self.initializer_assigns_a_member();
+        self.bump();
+        let mut members = Vec::new();
+        let mut elements = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            if assigns_member {
+                members.push(self.parse_member_initializer());
+            } else {
+                elements.push(self.parse_expression());
+            }
+            if self.position == before {
+                self.bump();
+            }
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        let initializer = if assigns_member {
+            Initializer::Object(members)
+        } else {
+            Initializer::Collection(elements)
+        };
+        (initializer, end)
+    }
+
+    /// Parses one `name = value` of an object initializer.
+    ///
+    /// The value is itself an initializer when it is written `{ ... }` -- and that form assigns INTO
+    /// the member's existing object rather than constructing one, which is why it is a distinct
+    /// [`MemberInitializerValue`] rather than a synthesized `new`.
+    fn parse_member_initializer(&mut self) -> MemberInitializer {
+        let start = self.current().span.start;
+        let (name, mut end) = self.expect_identifier();
+        self.expect(Punctuator::Equals, DiagnosticKind::TokenExpected { expected: "=" });
+        let value = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+            let (nested, nested_end) = self.parse_initializer();
+            end = nested_end;
+            MemberInitializerValue::Nested(nested)
+        } else {
+            let expression = self.parse_expression();
+            end = expression.span.end;
+            MemberInitializerValue::Expression(expression)
+        };
+        MemberInitializer {
+            name,
+            value,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Whether the initializer starting at the current `{` assigns a member -- `{ F = ... }` -- as
+    /// opposed to listing elements. csc's own discriminator, and it needs only the two tokens after
+    /// the brace: an object initializer's first element is always `identifier =`.
+    ///
+    /// An empty `{ }` answers `true`, because that is what csc calls it. `{ F = { G = 1 } }` also
+    /// answers `true` from the outer brace and again from the inner one, matching csc's two
+    /// diagnostics for that program.
+    fn initializer_assigns_a_member(&self) -> bool {
+        if matches!(
+            self.tokens.get(self.position + 1).map(|token| &token.kind),
+            Some(TokenKind::Punctuator(Punctuator::CloseBrace))
+        ) {
+            return true;
+        }
+        matches!(
+            self.tokens.get(self.position + 1).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_))
+        ) && matches!(
+            self.tokens.get(self.position + 2).map(|token| &token.kind),
+            Some(TokenKind::Punctuator(Punctuator::Equals))
+        )
     }
 
     /// Parses the bracket part of an array creation, with the scanner at the
@@ -2856,8 +3241,16 @@ impl Parser {
         Expr::new(ExprKind::ArrayInitializer(elements), Span::new(start, end))
     }
 
-    /// Parses a type name (11.1): `identifier ('.' identifier)*`.
+    /// Parses a type name (11.1): `identifier ('.' identifier)*`, with a generic type-argument
+    /// list `<...>` where one follows and the dialect permits it (25.5).
     fn parse_type_name(&mut self) -> TypeRef {
+        self.parse_type_name_inner(false).0
+    }
+
+    /// [`parse_type_name`](Self::parse_type_name), also returning the right-angle brackets its own
+    /// argument list closed on and did not need -- see [`AngleCredit`]. `nested` says whether an
+    /// enclosing type-argument list is waiting for a `>`.
+    fn parse_type_name_inner(&mut self, nested: bool) -> (TypeRef, AngleCredit) {
         let start = self.current().span.start;
         let (first, mut end) = self.expect_identifier();
         let mut parts = Vec::new();
@@ -2868,20 +3261,149 @@ impl Parser {
             parts.push(part);
             end = part_end;
         }
-        if self.current_punctuator() == Some(Punctuator::LessThan) {
+        if self.current_punctuator() != Some(Punctuator::LessThan) {
+            return (
+                TypeRef::new(TypeRefKind::Name(parts), Span::new(start, end)),
+                AngleCredit::default(),
+            );
+        }
+        if !self.version.supports(Feature::Generics) {
             let at = self.current().span.start;
             self.report(
                 DiagnosticKind::FeatureRequiresLaterVersion {
                     feature: crate::version::Feature::Generics.description(),
                     required: crate::version::Feature::Generics
                         .introduced_in()
-                        .display_name(),
+                        .required_name(),
+                    current: self.version,
                 },
                 Span::empty_at(at),
             );
             end = self.skip_type_argument_list();
+            return (
+                TypeRef::new(TypeRefKind::Name(parts), Span::new(start, end)),
+                AngleCredit::default(),
+            );
         }
-        TypeRef::new(TypeRefKind::Name(parts), Span::new(start, end))
+        let (arguments, list_end, credit) = self.parse_type_argument_list(nested);
+        (
+            TypeRef::new(
+                TypeRefKind::Generic { parts, arguments },
+                Span::new(start, list_end),
+            ),
+            credit,
+        )
+    }
+
+    /// Parses a generic type-argument list from the current `<` (25.5): `< type (, type)* >`.
+    /// Returns the arguments, the offset past the closing `>`, and any [`AngleCredit`] left for an
+    /// enclosing list.
+    fn generic_call_ahead(&mut self) -> bool {
+        if !self.version.supports(Feature::Generics) {
+            return false;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let (arguments, _, credit) = self.parse_type_argument_list(false);
+        let clean = self.diagnostics.len() == saved_diagnostics;
+        let committed = clean
+            && credit.closes == 0
+            && !arguments.is_empty()
+            && self.current_punctuator() == Some(Punctuator::OpenParen);
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        committed
+    }
+
+    fn parse_type_argument_list(&mut self, nested: bool) -> (Vec<TypeRef>, u32, AngleCredit) {
+        self.bump();
+        let mut arguments = Vec::new();
+        let mut credit = AngleCredit::default();
+        loop {
+            let (argument, argument_credit) = self.parse_type_argument();
+            arguments.push(argument);
+            if argument_credit.closes > 0 {
+                credit = argument_credit;
+            }
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        if credit.closes > 0 {
+            credit.closes -= 1;
+            return (arguments, credit.end, credit);
+        }
+        match self.current_punctuator() {
+            Some(Punctuator::GreaterThanGreaterThan) if nested => {
+                let end = self.current().span.end;
+                self.bump();
+                (arguments, end, AngleCredit { closes: 1, end })
+            }
+            _ => {
+                let end = self.expect(
+                    Punctuator::GreaterThan,
+                    DiagnosticKind::TokenExpected { expected: ">" },
+                );
+                (arguments, end, AngleCredit::default())
+            }
+        }
+    }
+
+    /// Parses one type argument, propagating any [`AngleCredit`] its own nested argument list left.
+    ///
+    /// A type argument is a full type (25.5.1): `List<int[]>`, `List<int?>`, `List<C.D<int>>` are
+    /// all legal, so this is [`parse_type_inner`](Self::parse_type_inner)'s work with the credit
+    /// carried out. Array and pointer suffixes cannot themselves produce a credit -- only a
+    /// type-argument list can -- so it is only the base type's credit that travels.
+    fn parse_type_argument(&mut self) -> (TypeRef, AngleCredit) {
+        if !matches!(self.current().kind, TokenKind::Identifier(_)) {
+            return (self.parse_type(), AngleCredit::default());
+        }
+        let (base, credit) = self.parse_type_name_inner(true);
+        if credit.closes > 0 {
+            return (base, credit);
+        }
+        (self.parse_type_suffixes(base), AngleCredit::default())
+    }
+
+    /// A `<` where a DECLARATION's name has just been read begins a type-PARAMETER list
+    /// (`class C<T>`, `T M<T>(T)`). Parses it where the dialect permits generics; below C# 2
+    /// reports the feature diagnostic once and skips the balanced `<...>` so the rest of the
+    /// declaration still parses. Returns the declared parameters, empty in both other cases.
+    fn parse_type_parameter_list(&mut self) -> Vec<TypeParameter> {
+        if self.current_punctuator() != Some(Punctuator::LessThan) {
+            return Vec::new();
+        }
+        if !self.version.supports(Feature::Generics) {
+            let at = self.current().span.start;
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: crate::version::Feature::Generics.description(),
+                    required: crate::version::Feature::Generics
+                        .introduced_in()
+                        .required_name(),
+                    current: self.version,
+                },
+                Span::empty_at(at),
+            );
+            self.skip_type_argument_list();
+            return Vec::new();
+        }
+        self.bump();
+        let mut parameters = Vec::new();
+        loop {
+            let span = self.current().span;
+            let (name, end) = self.expect_identifier();
+            parameters.push(TypeParameter {
+                name,
+                span: Span::new(span.start, end),
+            });
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        self.expect(Punctuator::GreaterThan, DiagnosticKind::TokenExpected { expected: ">" });
+        parameters
     }
 
     /// Skips a generic type-argument list `< ... >` from the current `<`, balancing nested `<`/`>`
@@ -3153,8 +3675,25 @@ mod tests {
             }
             ExprKind::Invocation {
                 receiver,
+                type_arguments,
                 arguments,
-            } => format!("(call {}{})", dump(receiver), dump_args(arguments)),
+            } if type_arguments.is_empty() => {
+                format!("(call {}{})", dump(receiver), dump_args(arguments))
+            }
+            ExprKind::Invocation {
+                receiver,
+                type_arguments,
+                arguments,
+            } => format!(
+                "(call<{}> {}{})",
+                type_arguments
+                    .iter()
+                    .map(dump_type)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                dump(receiver),
+                dump_args(arguments)
+            ),
             ExprKind::ElementAccess {
                 receiver,
                 arguments,
@@ -3240,8 +3779,18 @@ mod tests {
             ExprKind::Cast { target, operand } => {
                 format!("(cast {} {})", dump_type(target), dump(operand))
             }
-            ExprKind::ObjectCreation { target, arguments } => {
-                format!("(new {}{})", dump_type(target), dump_args(arguments))
+            ExprKind::ObjectCreation {
+                target,
+                arguments,
+                initializer,
+            } => {
+                let mut text = format!("(new {}{}", dump_type(target), dump_args(arguments));
+                if let Some(initializer) = initializer {
+                    text.push(' ');
+                    text.push_str(&dump_initializer(initializer));
+                }
+                text.push(')');
+                text
             }
             ExprKind::ArrayCreation {
                 element,
@@ -3302,6 +3851,18 @@ mod tests {
                     }
                     text.push_str(part);
                 }
+                text
+            }
+            TypeRefKind::Generic { parts, arguments } => {
+                let mut text = parts.join(".");
+                text.push('<');
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        text.push(',');
+                    }
+                    text.push_str(&dump_type(argument));
+                }
+                text.push('>');
                 text
             }
             TypeRefKind::Array { element, rank } => {
@@ -3387,6 +3948,29 @@ mod tests {
             AssignmentOperator::LeftShift => "<<=",
             AssignmentOperator::RightShift => ">>=",
         }
+    }
+
+    /// Parses `source` under `version` with no diagnostics expected, returning the dumped tree.
+    ///
+    /// Needed for constructs the DEFAULT dialect refuses: `tree` asserts a clean parse, and a
+    /// C# 3 initializer under C# 1.0 draws the gate, so asserting its SHAPE means asking for it in
+    /// a dialect that admits it.
+    fn tree_at(source: &str, version: LanguageVersion) -> String {
+        let mut parser = Parser::new(tokenize_with(
+            source,
+            LexOptions {
+                version,
+                ..LexOptions::default()
+            },
+        ));
+        parser.version = version;
+        let expr = parser.parse_expression();
+        let diagnostics = without_gated_operator_cascades(parser.diagnostics);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics for {source:?}: {diagnostics:?}"
+        );
+        dump(&expr)
     }
 
     /// Parses `source` with no diagnostics expected, returning the dumped tree.
@@ -4110,6 +4694,7 @@ mod tests {
             Modifier::Extern => "extern",
             Modifier::Const => "const",
             Modifier::Unsafe => "unsafe",
+            Modifier::Required => "required",
         }
     }
 
@@ -4541,7 +5126,11 @@ mod tests {
                 prefix_attributes(&declaration.attributes, text)
             }
             NamespaceMember::Namespace(declaration) => {
-                let mut text = format!("(namespace {}", dump_qname(&declaration.name));
+                let mut text = format!(
+                    "(namespace{} {}",
+                    if declaration.file_scoped { ";" } else { "" },
+                    dump_qname(&declaration.name)
+                );
                 for using in &declaration.usings {
                     text.push_str(&format!(" {}", dump_using(using)));
                 }
@@ -4574,6 +5163,36 @@ mod tests {
         parts
     }
 
+    /// Renders an initializer so a test can see WHICH kind was chosen and how it nested -- the two
+    /// things about this feature that can go wrong without drawing a diagnostic.
+    fn dump_initializer(initializer: &Initializer) -> String {
+        match initializer {
+            Initializer::Object(members) => {
+                let mut text = String::from("{obj");
+                for member in members {
+                    text.push_str(&format!(" {}=", member.name));
+                    match &member.value {
+                        MemberInitializerValue::Expression(value) => text.push_str(&dump(value)),
+                        MemberInitializerValue::Nested(nested) => {
+                            text.push_str(&dump_initializer(nested));
+                        }
+                    }
+                }
+                text.push('}');
+                text
+            }
+            Initializer::Collection(elements) => {
+                let mut text = String::from("{coll");
+                for element in elements {
+                    text.push(' ');
+                    text.push_str(&dump(element));
+                }
+                text.push('}');
+                text
+            }
+        }
+    }
+
     fn unit_tree(source: &str) -> String {
         let parsed = parse_compilation_unit(source);
         assert!(
@@ -4592,6 +5211,189 @@ mod tests {
             .collect()
     }
 
+    /// Parses under `version` rather than the default dialect, and returns the tree dump.
+    fn unit_tree_at(source: &str, version: LanguageVersion) -> String {
+        let parsed = parse_compilation_unit_with(
+            source,
+            LexOptions {
+                version,
+                ..LexOptions::default()
+            },
+        );
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "unexpected diagnostics for {source:?}: {:?}",
+            parsed.diagnostics
+        );
+        dump_unit(&parsed.unit)
+    }
+
+    /// The diagnostic codes `source` draws under `version`.
+    fn unit_codes_at(source: &str, version: LanguageVersion) -> Vec<u16> {
+        parse_compilation_unit_with(
+            source,
+            LexOptions {
+                version,
+                ..LexOptions::default()
+            },
+        )
+        .diagnostics
+        .iter()
+        .map(Diagnostic::code)
+        .collect()
+    }
+
+    #[test]
+    fn an_initializer_parses_into_the_tree() {
+        let v3 = LanguageVersion::CSharp3;
+        assert_eq!(
+            tree_at("new C { F = 1, G = 2 }", v3),
+            "(new C {obj F=1 G=2})"
+        );
+        assert_eq!(tree_at("new C { 1, 2 }", v3), "(new C {coll 1 2})");
+        assert_eq!(tree_at("new C { }", v3), "(new C {obj})");
+        assert_eq!(tree_at("new C { F = 1, }", v3), "(new C {obj F=1})");
+        assert_eq!(tree_at("new C { 1, }", v3), "(new C {coll 1})");
+        assert_eq!(tree_at("new C(1) { F = 2 }", v3), "(new C 1 {obj F=2})");
+        assert_eq!(tree_at("new C(1)", v3), "(new C 1)");
+
+        assert_eq!(
+            tree_at("new C { F = { G = 1 } }", v3),
+            "(new C {obj F={obj G=1}})"
+        );
+    }
+
+    #[test]
+    fn required_is_a_modifier_or_an_identifier_depending_on_the_dialect() {
+        let v10 = LanguageVersion::CSharp10;
+        let v11 = LanguageVersion::CSharp11;
+
+        assert_eq!(unit_codes_at("class C { required int f; }", v10), [8936]);
+        assert_eq!(unit_codes_at("class C { required int f; }", v11), []);
+        assert_eq!(unit_codes_at("class C { required Foo f; }", v10), [8936]);
+
+        assert_eq!(unit_codes_at("class C { required f; }", v10), []);
+        assert_ne!(unit_codes_at("class C { required f; }", v11), []);
+
+        assert_eq!(unit_codes_at("class C { int required = 5; }", v10), []);
+        assert_eq!(unit_codes_at("class C { int required = 5; }", v11), []);
+        assert_eq!(unit_codes_at("class C { void M(int required) { } }", v11), []);
+
+        assert_eq!(unit_codes("class C { required int f; }"), [8022]);
+    }
+
+    #[test]
+    fn a_file_scoped_namespace_holds_everything_after_it() {
+        assert_eq!(
+            unit_tree_at("namespace N; class C { }", LanguageVersion::CSharp10),
+            "(namespace; N (class C))"
+        );
+        assert_eq!(
+            unit_tree_at("namespace A.B.C; class D { }", LanguageVersion::CSharp10),
+            "(namespace; A.B.C (class D))"
+        );
+        assert_eq!(
+            unit_tree_at(
+                "using System; namespace N; using System.Text; class C { }",
+                LanguageVersion::CSharp10
+            ),
+            "(using System) (namespace; N (using System.Text) (class C))"
+        );
+        assert_eq!(
+            unit_tree_at("namespace N;", LanguageVersion::CSharp10),
+            "(namespace; N)"
+        );
+        assert_eq!(
+            unit_tree_at("namespace N; class C { } class D { }", LanguageVersion::CSharp10),
+            "(namespace; N (class C) (class D))"
+        );
+        assert_eq!(
+            unit_tree_at("namespace N { class C { } }", LanguageVersion::CSharp10),
+            "(namespace N (class C))"
+        );
+    }
+
+    #[test]
+    fn a_file_scoped_namespace_is_gated_below_csharp_10() {
+        assert_eq!(
+            unit_codes_at("namespace N; class C { }", LanguageVersion::CSharp1),
+            [8022]
+        );
+        assert_eq!(
+            unit_codes_at("namespace N; class C { }", LanguageVersion::CSharp9),
+            [8773]
+        );
+        assert_eq!(
+            unit_codes_at("namespace N; class C { }", LanguageVersion::CSharp10),
+            []
+        );
+        assert_eq!(unit_codes("namespace N; class C { }"), [8022]);
+    }
+
+    #[test]
+    fn the_three_file_scoped_namespace_placement_rules() {
+        let at10 = LanguageVersion::CSharp10;
+
+        assert_eq!(unit_codes_at("class D { } namespace N;", at10), [8956]);
+        assert_eq!(unit_codes_at("namespace M { } namespace N;", at10), [8956]);
+        assert_eq!(unit_codes_at("delegate void D(); namespace N;", at10), [8956]);
+        assert_eq!(unit_codes_at("using System; namespace N;", at10), []);
+        assert_eq!(unit_codes_at("[assembly: A] namespace N;", at10), []);
+
+        assert_eq!(unit_codes_at("namespace N; namespace M { }", at10), [8955]);
+        assert_eq!(unit_codes_at("namespace M { namespace N; }", at10), [8955]);
+        assert_eq!(
+            unit_codes_at("namespace N; namespace M { } namespace O { }", at10),
+            [8955, 8955]
+        );
+        assert_eq!(
+            unit_codes_at("namespace N; class C { } namespace M { }", at10),
+            [8955]
+        );
+
+        assert_eq!(unit_codes_at("namespace N; namespace M;", at10), [8954]);
+        assert_eq!(
+            unit_codes_at("namespace N; namespace M; namespace O;", at10),
+            [8954, 8954]
+        );
+
+        assert_eq!(
+            unit_codes_at("namespace Z { } namespace N; namespace M;", at10),
+            [8956, 8954]
+        );
+
+        assert_eq!(
+            unit_codes_at("namespace M { namespace N; namespace O; }", at10),
+            [8955, 8954]
+        );
+        assert_eq!(
+            unit_codes_at("namespace N; namespace M { namespace O; }", at10),
+            [8955, 8955]
+        );
+
+        assert_eq!(
+            unit_codes_at("class D { } namespace N;", LanguageVersion::CSharp1),
+            [8022, 8956]
+        );
+    }
+
+    #[test]
+    fn a_namespace_whose_name_did_not_parse_is_not_classified() {
+        assert_eq!(unit_codes_at("namespace ;", LanguageVersion::CSharp1), [1001]);
+        assert_eq!(
+            unit_codes_at("class D { } namespace ;", LanguageVersion::CSharp10),
+            [1001]
+        );
+        assert_eq!(
+            unit_codes_at("namespace M { namespace ; }", LanguageVersion::CSharp10),
+            [1001]
+        );
+        assert_eq!(
+            unit_codes_at("class D { } namespace N;", LanguageVersion::CSharp10),
+            [8956]
+        );
+    }
+
     #[test]
     fn global_assembly_and_module_attributes_parse_and_collect() {
         assert_eq!(unit_codes("[assembly: Foo(\"x\")] class C {}"), []);
@@ -4604,6 +5406,214 @@ mod tests {
         let parsed = parse_compilation_unit("[Serializable] class C {}");
         assert!(parsed.unit.global_attributes.is_empty());
         assert_eq!(parsed.unit.members.len(), 1);
+    }
+
+    #[test]
+    fn a_global_attribute_after_a_member_reports_cs1730() {
+        assert_eq!(unit_codes("class C {} [assembly: A]"), [1730]);
+        assert_eq!(unit_codes("namespace N {} [assembly: A]"), [1730]);
+        assert_eq!(unit_codes("class C {} [module: B]"), [1730]);
+
+        assert_eq!(unit_codes("[assembly: A] class C {}"), []);
+        assert_eq!(unit_codes("using System; [assembly: A] class C {}"), []);
+    }
+
+    #[test]
+    fn a_namespace_with_modifiers_or_attributes_reports_cs1671() {
+        assert_eq!(unit_codes("[A] namespace N { }"), [1671]);
+        assert_eq!(unit_codes("public namespace N { }"), [1671]);
+        assert_eq!(unit_codes("[A] public namespace N { }"), [1671, 1671]);
+
+        assert_eq!(unit_codes("namespace N { }"), []);
+        assert_eq!(unit_codes("[A] class C { }"), []);
+        assert_eq!(unit_codes("public class C { }"), []);
+    }
+
+    #[test]
+    fn a_generic_declaration_reports_one_feature_code_not_a_parse_cascade() {
+        assert_eq!(unit_codes("public class C<T> { }"), [8022]);
+        assert_eq!(unit_codes("public class E { public T M<T>(T x) { return x; } }"), [8022]);
+        assert_eq!(unit_codes("class D { System.Collections.Generic.List<int> f; }"), [8022]);
+
+        assert_eq!(unit_codes("public class C<T> : B { void M() { } int F; }"), [8022]);
+        assert_eq!(unit_codes("public class C<T, U> { }"), [8022]);
+        assert_eq!(unit_codes("class D { System.Collections.Generic.List<System.Collections.Generic.List<int>> f; }"), [8022]);
+
+        assert_eq!(unit_codes("public class C : B { void M() { } int F; }"), []);
+        assert_eq!(unit_codes("public class C { public int M(int x) { return x; } }"), []);
+        assert_eq!(unit_codes("public class C { public int F = 1; }"), []);
+    }
+
+    #[test]
+    fn a_dialect_with_generics_parses_the_type_parameter_list_instead_of_skipping_it() {
+        assert_eq!(unit_codes_at("public class C<T> { }", LanguageVersion::CSharp2), []);
+        assert_eq!(
+            unit_codes_at(
+                "public class E { public int M<T>(int x) { return x; } }",
+                LanguageVersion::CSharp2
+            ),
+            []
+        );
+        assert_eq!(unit_codes_at("public class C<T, U> { }", LanguageVersion::CSharp2), []);
+
+        assert_eq!(unit_codes_at("public class C<T> { }", LanguageVersion::CSharp1), [8022]);
+        assert_eq!(unit_codes("public class C<T> { }"), [8022]);
+
+        let parsed = parse_compilation_unit_with(
+            "public class Box<T, U> { }",
+            LexOptions {
+                version: LanguageVersion::CSharp2,
+                ..LexOptions::default()
+            },
+        );
+        let NamespaceMember::Type(declaration) = &parsed.unit.members[0] else {
+            panic!("expected a type declaration");
+        };
+        let names: Vec<&str> = declaration
+            .type_parameters
+            .iter()
+            .map(|parameter| &*parameter.name)
+            .collect();
+        assert_eq!(names, ["T", "U"]);
+
+        let parsed = parse_compilation_unit_with(
+            "public class Box { }",
+            LexOptions {
+                version: LanguageVersion::CSharp2,
+                ..LexOptions::default()
+            },
+        );
+        let NamespaceMember::Type(declaration) = &parsed.unit.members[0] else {
+            panic!("expected a type declaration");
+        };
+        assert!(declaration.type_parameters.is_empty());
+    }
+
+    /// The declared type of the single field in `class C { ... }`, parsed under `version`.
+    fn field_type_at(source: &str, version: LanguageVersion) -> String {
+        let parsed = parse_compilation_unit_with(
+            source,
+            LexOptions {
+                version,
+                ..LexOptions::default()
+            },
+        );
+        let NamespaceMember::Type(declaration) = &parsed.unit.members[0] else {
+            panic!("expected a type declaration");
+        };
+        let Member::Field { ty, .. } = &declaration.members[0] else {
+            panic!("expected a field");
+        };
+        dump_type(ty)
+    }
+
+    #[test]
+    fn a_generic_call_site_is_told_from_two_comparisons_by_what_follows_the_angle() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(tree_at("Identity<int>(x)", v2), "(call<int> Identity x)");
+        assert_eq!(
+            tree_at("Map<int,string>(a,b)", v2),
+            "(call<int,string> Map a b)"
+        );
+        assert_eq!(
+            tree_at("c.Identity<int>(x)", v2),
+            "(call<int> (. c Identity) x)"
+        );
+
+        assert_eq!(tree_at("a < b > (c)", v2), "(call<b> a c)");
+
+        assert!(
+            !tree_at("F(G<A, B>7)", v2).contains("call<"),
+            "`>7` is not in the follower set, so G<A,B> is two comparisons"
+        );
+        assert!(
+            !tree_at("F<A> + y", v2).contains("call<"),
+            "9.2.3: `x = F<A> + y` is less-than, greater-than and unary-plus"
+        );
+        assert!(!tree_at("a < b", v2).contains("call<"));
+        assert!(!tree_at("a < b && c > d", v2).contains("call<"));
+
+        assert!(
+            !tree_at("a < (b >> c)", v2).contains("call<"),
+            "a failed type-argument parse must not be read as a call site"
+        );
+
+        let v1 = LanguageVersion::CSharp1;
+        assert!(!tree_at("a < b > (c)", v1).contains("call<"));
+    }
+
+    #[test]
+    fn a_failed_generic_call_speculation_leaves_no_diagnostics_behind() {
+        let v2 = LanguageVersion::CSharp2;
+        assert_eq!(unit_codes_at("class C { void M() { int x = a < b > (c); } }", v2), []);
+        assert_eq!(unit_codes_at("class C { void M() { bool y = p < q; } }", v2), []);
+    }
+
+    #[test]
+    fn a_dialect_with_generics_parses_a_use_site_into_a_constructed_type() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(unit_codes_at("class C { Box<int> f; }", v2), []);
+        assert_eq!(field_type_at("class C { Box<int> f; }", v2), "Box<int>");
+        assert_eq!(
+            field_type_at("class C { System.Collections.Generic.List<int> f; }", v2),
+            "System.Collections.Generic.List<int>"
+        );
+        assert_eq!(
+            field_type_at("class C { Dictionary<string,int> f; }", v2),
+            "Dictionary<string,int>"
+        );
+
+        assert_eq!(field_type_at("class C { Box<int[]> f; }", v2), "Box<int[]>");
+        assert_eq!(field_type_at("class C { Box<int>[] f; }", v2), "Box<int>[]");
+        assert_eq!(field_type_at("class C { Box<A.B> f; }", v2), "Box<A.B>");
+
+        assert_eq!(unit_codes("class C { Box<int> f; }"), [8022]);
+        assert_eq!(field_type_at("class C { Box<int> f; }", LanguageVersion::CSharp1), "Box");
+    }
+
+    #[test]
+    fn a_nested_type_argument_list_closes_on_the_right_shift_token() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(unit_codes_at("class C { Box<Box<int>> f; }", v2), []);
+        assert_eq!(
+            field_type_at("class C { Box<Box<int>> f; }", v2),
+            "Box<Box<int>>"
+        );
+        assert_eq!(
+            field_type_at("class C { Box<Box<Box<int>>> f; }", v2),
+            "Box<Box<Box<int>>>"
+        );
+        assert_eq!(
+            field_type_at("class C { Map<Box<int>,int> f; }", v2),
+            "Map<Box<int>,int>"
+        );
+        assert_eq!(
+            field_type_at("class C { Map<int,Box<int>> f; }", v2),
+            "Map<int,Box<int>>"
+        );
+        assert_eq!(
+            field_type_at("class C { Box<Box<int>>[] f; }", v2),
+            "Box<Box<int>>[]"
+        );
+    }
+
+    #[test]
+    fn a_right_shift_survives_the_local_declaration_speculation() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(
+            unit_tree_at("class C { void M() { a<b>>c; } }", v2),
+            "(class C (method void M () (block (expr (< a (>> b c))))))"
+        );
+        assert_eq!(unit_codes("class C { void M() { a<b>>c; } }"), [8022]);
+
+        assert_eq!(
+            unit_tree_at("class C { void M() { a<b<c>> d; } }", v2),
+            "(class C (method void M () (block (local a<b<c>> d))))"
+        );
     }
 
     #[test]

@@ -26,6 +26,14 @@ const HEADER_LEN: usize = 7;
 /// Trailing CRC-16 width.
 const CRC_LEN: usize = 2;
 
+/// The most payload bytes one frame can carry, which is what a `u16` `LEN` field can count.
+///
+/// Public because it is a fact a SENDER has to plan around rather than discover: a caller with more
+/// than this must chunk (as the deploy, bundle and module-firmware ops do), and the alternative to
+/// knowing the number is finding out from [`encode_frame`] returning `None` after the data already
+/// exists.
+pub const MAX_PAYLOAD: usize = u16::MAX as usize;
+
 /// Message type bytes. The Debug (`0x10+`) and REPL (`0x20+`) ranges are reserved.
 pub mod msg {
     /// Host -> target: a [`super::Hello`] (version range + capabilities).
@@ -52,7 +60,10 @@ pub mod msg {
 /// three explanations for silence are "I do not implement that", "I crashed", and "the cable is bad",
 /// and they are three different repairs.
 ///
-/// # The payload shape, and a note on its history
+/// So an unimplemented message type is REFUSED rather than ignored: a two-byte reply turns the worst
+/// observable into the most precise one.
+///
+/// # The payload shape
 ///
 /// Byte 0 is the reason. **What follows depends on the reason** rather than being free text: for
 /// [`error::UNKNOWN_MESSAGE_TYPE`] it is the one byte that was not understood, which is the whole of the
@@ -112,19 +123,27 @@ fn crc16(data: &[u8]) -> u16 {
 }
 
 /// Encode one frame: `SYNC | LEN | TYPE | SEQ | PAYLOAD | CRC`, the CRC covering `LEN..=PAYLOAD` (so a
-/// corrupted length is also caught). `payload` must fit in a `u16` length.
+/// corrupted length is also caught).
+///
+/// `None` when `payload` exceeds [`MAX_PAYLOAD`] -- such a payload has no representation on this
+/// wire, and there is nothing this function can return that would be one.
+///
+/// # Why this refuses instead of truncating, having truncated for the protocol's whole life
 #[must_use]
-pub fn encode_frame(msg_type: u8, seq: u16, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len().min(u16::MAX as usize);
+pub fn encode_frame(msg_type: u8, seq: u16, payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() > MAX_PAYLOAD {
+        return None;
+    }
+    let len = payload.len();
     let mut frame = Vec::with_capacity(HEADER_LEN + len + CRC_LEN);
     frame.extend_from_slice(&SYNC);
     frame.extend_from_slice(&(len as u16).to_le_bytes());
     frame.push(msg_type);
     frame.extend_from_slice(&seq.to_le_bytes());
-    frame.extend_from_slice(&payload[..len]);
+    frame.extend_from_slice(payload);
     let crc = crc16(&frame[2..]);
     frame.extend_from_slice(&crc.to_le_bytes());
-    frame
+    Some(frame)
 }
 
 /// Accumulates carrier bytes and yields whole frames, resynchronizing on the SYNC magic after garbage
@@ -318,11 +337,77 @@ impl Capabilities {
     /// A target that only sets [`DEBUG_BASIC`] can still be inspected; it just has to be stopped
     /// first, and the host has to say so.
     pub const LIVE_MEMORY: u32 = 1 << 14;
+    /// The target serves the interpreter a MONOTONIC CLOCK that was checked to be MOVING at boot,
+    /// so a program on it can measure elapsed time -- `DateTime`, `Environment.TickCount`,
+    /// `Thread.Sleep` and every timeout built on them.
+    ///
+    /// # Why a capability bit and not a silence
+    ///
+    /// This is the one seam whose failure has no error to report. A clock is a plain
+    /// `fn() -> u64`: a source that never advances returns a perfectly well-formed answer, and every
+    /// caller believes it. A self-timing benchmark on such a board reported **0 ms** for thousands
+    /// of iterations of real work while its checksum gate PASSED -- the computation right, the
+    /// duration nonsense, nothing anywhere in error. **A capability that is present but dead is
+    /// worse than one that is absent, because absent can be reported.** This bit is the reporting.
+    ///
+    /// It says nothing about ACCURACY. The scale is the board's own core-clock figure, so a
+    /// firmware on an untrimmed RC oscillator sets this bit and still delivers that oscillator's
+    /// tolerance. The promise is that time PASSES, which is the property a frozen counter breaks.
+    pub const MONOTONIC_CLOCK: u32 = 1 << 15;
+
+    /// Every named bit, with a short human label -- so a host tool can PRINT a capability set
+    /// instead of a hexadecimal number.
+    ///
+    /// It lives here rather than in each tool because a table of names kept next to its consumers
+    /// is a second spelling of this list, and a second spelling goes stale silently: the bit that
+    /// gets forgotten is always the newest one, which is the one someone is trying to see.
+    pub const NAMED: &'static [(u32, &'static str)] = &[
+        (Self::DEBUG_BASIC, "DEBUG_BASIC"),
+        (Self::BREAKPOINTS, "BREAKPOINTS"),
+        (Self::STEPPING, "STEPPING"),
+        (Self::MEM_WRITE, "MEM_WRITE"),
+        (Self::LOCALS, "LOCALS"),
+        (Self::REPL_RUN, "REPL_RUN"),
+        (Self::REPL_SOURCE, "REPL_SOURCE"),
+        (Self::AOT_ATTACH, "AOT_ATTACH"),
+        (Self::BAKED_IMAGE, "BAKED_IMAGE"),
+        (Self::DEBUG_ATTACH, "DEBUG_ATTACH"),
+        (Self::PROFILE_CHIPID, "PROFILE_CHIPID"),
+        (Self::TELEMETRY, "TELEMETRY"),
+        (Self::BUNDLE, "BUNDLE"),
+        (Self::RESIDENT_CORLIB, "RESIDENT_CORLIB"),
+        (Self::LIVE_MEMORY, "LIVE_MEMORY"),
+        (Self::MONOTONIC_CLOCK, "MONOTONIC_CLOCK"),
+    ];
 
     /// Whether this set includes `flag`.
     #[must_use]
     pub fn has(self, flag: u32) -> bool {
         self.0 & flag == flag
+    }
+
+    /// The set as labels, in bit order, with any bit [`NAMED`](Self::NAMED) does not cover reported
+    /// as `unknown bit N`. An empty set renders as `none`.
+    #[must_use]
+    pub fn describe(self) -> alloc::string::String {
+        use alloc::string::ToString;
+        let mut parts: Vec<alloc::string::String> = Vec::new();
+        let mut unnamed = self.0;
+        for (bit, name) in Self::NAMED {
+            if self.0 & bit != 0 {
+                parts.push((*name).to_string());
+                unnamed &= !bit;
+            }
+        }
+        for index in 0..u32::BITS {
+            if unnamed & (1 << index) != 0 {
+                parts.push(alloc::format!("unknown bit {index}"));
+            }
+        }
+        if parts.is_empty() {
+            return "none".to_string();
+        }
+        parts.join(" | ")
     }
 
     /// The capabilities present in BOTH sets (what a session can use).
@@ -572,6 +657,90 @@ pub mod board_model {
     /// ST STM32F429I-DISC1 (STM32F429ZI, Cortex-M4F).
     pub const STM32F429I_DISCO: u16 = 21;
 
+    /// Raspberry Pi Pico W / Pico WH (RP2040 + CYW43439 wireless). The same RP2040 image as the
+    /// plain Pico -- the radio takes no part in booting -- but a distinct board: GP23, GP24, GP25
+    /// and GP29 carry the radio here, and the user LED moves off the RP2040 entirely onto the
+    /// CYW43439's own WL_GPIO0.
+    pub const PICO_W: u16 = 22;
+
+    /// MuseLab nanoCH32V003 v1.0 (WCH CH32V003F4U6, QingKe V2A, RV32EC) -- the first RISC-V board
+    /// here that is not RV32I, and the smallest part: 16 KB of flash and 2 KB of SRAM, reached by
+    /// AOT-compiled images flashed through the single-wire debug pin rather than by a Link wire.
+    pub const NANO_CH32V003: u16 = 23;
+
+    /// SAM4S Xplained (ATSAM4S16C, LQFP100) -- the plain Xplained, NOT the Xplained Pro this
+    /// family's other board is. A different part on the same family (1 MB flash and 128 KB SRAM
+    /// against the Pro's 2 MB and 160 KB), a different on-board bridge, and an external SRAM on
+    /// the static memory bus that the Pro does not carry.
+    pub const SAM4S_XPLAINED: u16 = 24;
+
+    /// SAM4N Xplained Pro (ATSAM4N16C, QFP100) -- this vendor's SAM4 entry point: 1 MB of flash
+    /// like the SAM4S parts and 80 KB of SRAM against their 128 and 160, and no USB device port
+    /// at all, which is what makes it a separate family rather than another part row.
+    pub const SAM4N_XPLAINED_PRO: u16 = 25;
+
+    /// SAM4E Xplained Pro (ATSAM4E16E, LQFP144) -- this vendor's connectivity SAM4: an Ethernet
+    /// MAC and two CAN controllers its SAM4S and SAM4N siblings do not carry, and a core with a
+    /// floating point unit where theirs have none.
+    pub const SAM4E_XPLAINED_PRO: u16 = 26;
+
+    /// SAM4L8 Xplained Pro (ATSAM4LC8C, TQFP100) -- this vendor's low-power SAM4 and the one that
+    /// shares least with the rest of the line: 512 KB of flash and 64 KB of SRAM, no PMC at all,
+    /// and ONE GPIO controller whose ports are register banks rather than separate peripherals.
+    pub const SAM4L8_XPLAINED_PRO: u16 = 27;
+
+    /// NUCLEO-F429ZI (STM32F429ZI on ST's MB1137 Nucleo-144) -- the SAME PART as the F429
+    /// Discovery board on a different carrier, which is what makes the pair a controlled test of
+    /// the chip/board split: everything that differs between them is board truth by construction.
+    pub const NUCLEO_F429ZI: u16 = 28;
+
+    /// NUCLEO-F439ZI (STM32F439ZI on ST's MB1137 Nucleo-144) -- the SAME CARRIER as the
+    /// NUCLEO-F429ZI with a different part on it, which is the other half of that pair's test:
+    /// one varies the board and holds the part, this one varies the part and holds the board.
+    /// The two parts answer the same device id and the same JTAG id code, so this number is the
+    /// only thing that tells the two boards apart.
+    pub const NUCLEO_F439ZI: u16 = 29;
+
+    /// 32F769IDISCOVERY (STM32F769NI, Cortex-M7) -- the first `stm32f769`-family board, and this
+    /// vendor's counter-example on LED polarity: its user LEDs SINK where every other ST board
+    /// here sources, while its user button reads high when pressed like theirs do.
+    pub const STM32F769I_DISCO: u16 = 30;
+
+    /// STM32072B-EVAL (STM32F072VB, Cortex-M0) -- the first EVALUATION board here rather than a
+    /// Discovery or a Nucleo, and the first with no path from the target's serial to the host
+    /// through the board at all: its debugger is an ST-LINK/V2 rather than a V2-1, so the console
+    /// leaves over RS-232 to a D connector.
+    pub const STM32072B_EVAL: u16 = 31;
+
+    /// NUCLEO-H755ZI-Q (STM32H755ZI on ST's MB1363 Nucleo-144) -- the first board here whose part
+    /// carries TWO processors, a Cortex-M7 beside a Cortex-M4. This number stays one per BOARD and
+    /// does not split with them: the board is one physical thing whichever core is executing, so
+    /// which core an image was built for is a property of the image rather than of the carrier.
+    pub const NUCLEO_H755ZI_Q: u16 = 32;
+
+    /// Arduino GIGA R1 WiFi (STM32H747XIH6 on Arduino's ABX00063) -- the same silicon as the
+    /// NUCLEO-H755ZI-Q in a 240-ball package, and the pair's value is that their conventions are
+    /// opposite: this board's three user LEDs SINK where that one's source. It is also the first
+    /// ST-part board here with no on-board debugger and no serial bridge at all, so its console
+    /// path is the target's own USB device controller rather than a probe's virtual COM port.
+    pub const ARDUINO_GIGA_R1_WIFI: u16 = 33;
+
+    /// Arduino Portenta H7 (STM32H747XIH6 on Arduino's ABX00042) -- the same silicon as the
+    /// NUCLEO-H755ZI-Q and the GIGA, on a module whose debug signals leave through its
+    /// high-density connectors rather than any header of its own. 
+    pub const ARDUINO_PORTENTA_H7: u16 = 35;
+
+    /// Arduino UNO R4 Minima (Renesas R7FA4M1AB3CFM on Arduino's ABX00080) -- a vendor no other
+    /// board here uses, and the board whose LEDs disagree with each other: its built-in LED
+    /// SOURCES while the two serial-activity LEDs beside it SINK, so one board carries both
+    /// conventions. Its debug path is its own SWD connector with no probe fitted, which is a
+    /// per-board reading rather than a property shared with the WiFi variant of the same product.
+    pub const ARDUINO_UNO_R4_MINIMA: u16 = 34;
+
+    /// Arduino UNO Q (STM32U585AII6TR on Arduino's ABX00162/ABX00173) -- a microcontroller sharing
+    /// one board with a Qualcomm QRB2210 application processor running Linux.
+    pub const ARDUINO_UNO_Q: u16 = 36;
+
     /// The display name for a `board_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
@@ -601,6 +770,21 @@ pub mod board_model {
             FEATHER_M0_ADALOGGER => "Adafruit Feather M0 Adalogger",
             STM32F746G_DISCO => "STM32F746G Discovery",
             STM32F429I_DISCO => "STM32F429I Discovery",
+            PICO_W => "Raspberry Pi Pico W",
+            NANO_CH32V003 => "MuseLab nanoCH32V003",
+            SAM4S_XPLAINED => "SAM4S Xplained",
+            SAM4N_XPLAINED_PRO => "SAM4N Xplained Pro",
+            SAM4E_XPLAINED_PRO => "SAM4E Xplained Pro",
+            SAM4L8_XPLAINED_PRO => "SAM4L8 Xplained Pro",
+            NUCLEO_F429ZI => "NUCLEO-F429ZI",
+            NUCLEO_F439ZI => "NUCLEO-F439ZI",
+            STM32F769I_DISCO => "STM32F769I Discovery",
+            STM32072B_EVAL => "STM32072B-EVAL",
+            NUCLEO_H755ZI_Q => "NUCLEO-H755ZI-Q",
+            ARDUINO_GIGA_R1_WIFI => "Arduino GIGA R1 WiFi",
+            ARDUINO_UNO_R4_MINIMA => "Arduino UNO R4 Minima",
+            ARDUINO_PORTENTA_H7 => "Arduino Portenta H7",
+            ARDUINO_UNO_Q => "Arduino UNO Q",
             _ => return None,
         })
     }
@@ -692,8 +876,23 @@ pub fn negotiate(host: ProtocolRange, target: ProtocolRange) -> Option<u16> {
 pub struct Negotiated {
     /// The negotiated protocol version.
     pub version: u16,
-    /// The capabilities both sides offer.
+    /// The capabilities both sides offer -- what this SESSION can use. Ask this before using a
+    /// feature, because using one needs code at both ends.
     pub caps: Capabilities,
+    /// What the TARGET advertised about itself, before any intersection -- what this BOARD is.
+    ///
+    /// Two different questions were being answered by one field, and only one of them survives an
+    /// intersection. "Will a deploy work?" is genuinely two-sided: the host must implement it too,
+    /// so masking it against the host's own set is correct. "Does this board's clock move?" is a
+    /// property of the target alone, and intersecting it with the host's offer can only ever
+    /// subtract -- a host that does not claim [`Capabilities::MONOTONIC_CLOCK`] for itself reports
+    /// every board as having no clock, whatever the board said.
+    ///
+    /// That is invisible by construction rather than by oversight, which is why it needs a separate
+    /// field rather than a rule about which bits to be careful with: the masking happens before any
+    /// caller can look, so no amount of care at the call site can recover the answer. A tool asking
+    /// what a board IS reads this; a tool asking what it may DO reads [`Self::caps`].
+    pub target_caps: Capabilities,
     /// The target's resident-profile identity, when it advertised one.
     pub profile: Option<ProfileIdentity>,
 }
@@ -709,10 +908,20 @@ pub fn target_respond(host: &Hello, target_range: ProtocolRange, target_caps: Ca
 }
 
 /// The host's session parameters from the target's `HELLO_ACK`: the chosen version + the capability
-/// INTERSECTION (only what both sides offer) + the target's profile identity as advertised.
+/// INTERSECTION (only what both sides offer) + the target's RAW advertisement + the target's profile
+/// identity as advertised.
+///
+/// Both capability sets are kept because they answer different questions -- see
+/// [`Negotiated::target_caps`]. The intersection alone lost every target-only property, and lost it
+/// where no caller could notice.
 #[must_use]
 pub fn host_finish(ack: &HelloAck, host_caps: Capabilities) -> Negotiated {
-    Negotiated { version: ack.chosen, caps: host_caps.intersect(ack.caps), profile: ack.profile }
+    Negotiated {
+        version: ack.chosen,
+        caps: host_caps.intersect(ack.caps),
+        target_caps: ack.caps,
+        profile: ack.profile,
+    }
 }
 
 /// The full resident-profile MANIFEST a target returns for a `GET_PROFILE` request (the message
@@ -777,13 +986,56 @@ impl ProfileManifest {
     }
 }
 
-/// A carrier error.
+/// Why an exchange on this wire could not be completed -- the carrier failing, or an answer the
+/// caller cannot act on.
+///
+/// It opened life as a carrier error and outgrew that: the variants below divide by the REMEDY, and
+/// the last three are cases where the carrier worked perfectly. Reporting them as a carrier fault or
+/// (worse) as a timeout sends the reader to look at a cable that is fine.
+///
+/// `#[non_exhaustive]`: three variants beyond the original two have landed as the protocol's silent
+/// failures were found, and the supply is not obviously exhausted. Matching downstream therefore
+/// needs a wildcard arm, so the next variant is additive rather than a break at every call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransportError {
     /// The link is closed / disconnected.
     Closed,
     /// A carrier-level failure (I/O, USB).
     Carrier,
+    /// The payload cannot be framed: a frame's `LEN` is a `u16`, so a payload over 65,535 bytes has
+    /// no representation on this wire at all.
+    ///
+    /// It is a distinct answer from [`Carrier`](Self::Carrier) because the remedy is different and
+    /// the carrier is fine: the sender must CHUNK (the deploy and bundle ops already do) or send
+    /// less. Nothing was transmitted.
+    PayloadTooLarge,
+    /// The target REFUSED the request: it answered [`msg::ERROR`] rather than the expected reply.
+    ///
+    /// `reason` is the payload's reason byte (see the [`error`] module) and `msg_type` the message
+    /// type it names, or `0` when the refusal named none -- no message type is `0`, so the sentinel
+    /// cannot be mistaken for one.
+    ///
+    /// Distinct from [`Closed`](Self::Closed) for the [`PayloadTooLarge`](Self::PayloadTooLarge)
+    /// reason: the carrier is fine and the target answered promptly. The remedy is to STOP asking --
+    /// this target does not implement the op -- where a closed link says reconnect. A caller that
+    /// polls a refusal to its deadline reports a timeout, which is the one reading that sends the
+    /// reader to the cable.
+    Refused {
+        /// The refusal's reason byte.
+        reason: u8,
+        /// The message type refused, or `0` if the refusal named none.
+        msg_type: u8,
+    },
+    /// A reply arrived at the expected sequence and did NOT decode.
+    ///
+    /// The answer is IN HAND and unusable, which is not the same as "not in yet": a caller told
+    /// `None` polls on and reports a timeout for a target that already replied. `msg_type` is the
+    /// type that failed to decode, so the reader knows which decoder disagreed with the sender.
+    MalformedReply {
+        /// The message type whose payload would not decode.
+        msg_type: u8,
+    },
 }
 
 /// The carrier seam, at the FRAME level: a byte carrier (USB-CDC / UART) implements it over the
@@ -825,7 +1077,8 @@ impl MemTransport {
 
 impl Transport for MemTransport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
-        self.sent.extend_from_slice(&encode_frame(msg_type, seq, payload));
+        self.sent
+            .extend_from_slice(&encode_frame(msg_type, seq, payload).ok_or(TransportError::PayloadTooLarge)?);
         Ok(())
     }
 
@@ -839,9 +1092,47 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    /// A capability set renders as names, and -- the half that matters -- a bit nobody named is
+    /// REPORTED rather than dropped.
+    ///
+    /// The dropping version is the failure this guards: a host tool that silently omits an unnamed
+    /// bit shows a SHORTER capability list than the board actually sent, and the bit most likely to
+    /// be missing from the table is the newest one, which is the one someone is looking for.
+    #[test]
+    fn a_capability_set_names_what_it_knows_and_reports_what_it_does_not() {
+        assert_eq!(Capabilities(0).describe(), "none");
+        assert_eq!(Capabilities(Capabilities::BAKED_IMAGE).describe(), "BAKED_IMAGE");
+        assert_eq!(
+            Capabilities(Capabilities::MONOTONIC_CLOCK | Capabilities::BAKED_IMAGE).describe(),
+            "BAKED_IMAGE | MONOTONIC_CLOCK"
+        );
+        assert_eq!(
+            Capabilities(Capabilities::BAKED_IMAGE | (1 << 31)).describe(),
+            "BAKED_IMAGE | unknown bit 31"
+        );
+        assert_eq!(Capabilities(1 << 20).describe(), "unknown bit 20");
+    }
+
+    /// The table itself: one bit per entry, no duplicates, no zero rows. A duplicated bit would print
+    /// one capability under two names; a multi-bit entry would claim a set it does not have.
+    #[test]
+    fn the_capability_name_table_is_one_distinct_bit_per_row() {
+        let mut seen = 0u32;
+        for (bit, name) in Capabilities::NAMED {
+            assert_eq!(bit.count_ones(), 1, "{name} must be exactly one bit");
+            assert_eq!(seen & bit, 0, "{name} duplicates a bit already named");
+            seen |= bit;
+        }
+        assert_eq!(
+            seen.count_ones(),
+            32 - seen.leading_zeros(),
+            "the named bits should be contiguous from bit 0; a gap means a constant went unnamed"
+        );
+    }
+
     #[test]
     fn frame_round_trips() {
-        let bytes = encode_frame(msg::HELLO, 7, &[1, 2, 3, 4]);
+        let bytes = encode_frame(msg::HELLO, 7, &[1, 2, 3, 4]).expect("a 4-byte payload frames");
         let mut reader = FrameReader::new();
         reader.push(&bytes);
         let frame = reader.next_frame().expect("a complete frame");
@@ -851,9 +1142,32 @@ mod tests {
         assert!(reader.next_frame().is_none());
     }
 
+    /// The boundary, from both sides, because only one of them used to be wrong.
+    ///
+    /// A payload of exactly [`MAX_PAYLOAD`] is the largest this wire can carry and must still frame
+    /// and survive a round trip; one byte more has no representation and must be REFUSED.
+    #[test]
+    fn the_largest_payload_frames_and_one_byte_more_is_refused() {
+        let largest = alloc::vec![0xA5u8; MAX_PAYLOAD];
+        let bytes = encode_frame(msg::PING, 3, &largest).expect("MAX_PAYLOAD is carryable");
+        let mut reader = FrameReader::new();
+        reader.push(&bytes);
+        let frame = reader.next_frame().expect("the largest frame round-trips");
+        assert_eq!(frame.payload.len(), MAX_PAYLOAD, "the payload arrived whole");
+        assert_eq!(frame.payload, largest, "and unaltered");
+
+        let too_big = alloc::vec![0xA5u8; MAX_PAYLOAD + 1];
+        assert_eq!(
+            encode_frame(msg::PING, 4, &too_big),
+            None,
+            "a payload one byte over the length field must be refused, not truncated into a frame \
+             whose CRC then certifies the missing content as intact"
+        );
+    }
+
     #[test]
     fn reader_reassembles_across_chunks() {
-        let bytes = encode_frame(0x42, 0xBEEF, &[9, 9, 9]);
+        let bytes = encode_frame(0x42, 0xBEEF, &[9, 9, 9]).expect("a 3-byte payload frames");
         let mut reader = FrameReader::new();
         for (i, b) in bytes.iter().enumerate() {
             reader.push(&[*b]);
@@ -871,8 +1185,8 @@ mod tests {
 
     #[test]
     fn reader_resyncs_past_leading_garbage_and_a_corrupt_frame() {
-        let good = encode_frame(msg::PING, 1, &[0xAB]);
-        let mut corrupt = encode_frame(msg::PING, 2, &[0xCD]);
+        let good = encode_frame(msg::PING, 1, &[0xAB]).expect("a 1-byte payload frames");
+        let mut corrupt = encode_frame(msg::PING, 2, &[0xCD]).expect("a 1-byte payload frames");
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xFF;
 
@@ -1019,6 +1333,10 @@ mod tests {
         assert!(session.caps.has(Capabilities::DEBUG_BASIC));
         assert!(!session.caps.has(Capabilities::REPL_RUN));
         assert!(!session.caps.has(Capabilities::BREAKPOINTS));
+
+        assert!(session.target_caps.has(Capabilities::BREAKPOINTS));
+        assert!(session.target_caps.has(Capabilities::DEBUG_BASIC));
+        assert!(!session.target_caps.has(Capabilities::REPL_RUN));
     }
 
     #[test]

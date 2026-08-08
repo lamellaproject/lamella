@@ -1,6 +1,6 @@
 # The SAM3X parts table. Pin lists are PARTIAL present-lists: they carry the pins boards
-# bind today, so validation covers every current binding; completing each list is a
-# transcription task against the Atmel-11057 ch 4 pinouts, never a from-recall transcription.
+# bind today, so a consumer must not read one as the package. Validation covers every current
+# binding, and a pin-map row naming a pin outside every present-list is refused rather than assumed.
 
 [table]
 kind = "parts"

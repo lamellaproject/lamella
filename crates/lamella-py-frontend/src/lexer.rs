@@ -4,13 +4,14 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use lamella_py_bytecode::PyStr;
 
 /// One piece of an f-string: literal text (escapes already resolved), or a `{expression}`
 /// replacement field split into its parts (the parser re-parses the expression text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FStringPart {
     /// Literal text between replacement fields.
-    Literal(String),
+    Literal(PyStr),
     /// A `{expr[=][!conversion][:spec]}` replacement field.
     Expr {
         /// The raw source of the expression (before any `=`/`!`/`:`).
@@ -45,10 +46,12 @@ pub enum Tok {
     BigInt(String),
     /// A bytes literal `b"..."` -- its decoded bytes.
     Bytes(Vec<u8>),
-    /// A short string literal -- its decoded value, with escape sequences resolved.
-    /// Single-line `'...'` and `"..."` are handled; triple-quoted and `r`/`b`-prefixed
-    /// strings are outside this subset.
-    Str(String),
+    /// A string literal -- its decoded value, with escape sequences resolved.
+    ///
+    /// A [`PyStr`] rather than a `String` because a Python `str` is a sequence of CODE POINTS and a
+    /// Rust `String` is a sequence of SCALAR VALUES: the difference between those two sets is
+    /// exactly the surrogate block, which `'\ud800'` puts in a literal and which CPython accepts.
+    Str(PyStr),
     /// A single-line f-string `f"..."` split into literal text and raw replacement-field
     /// expressions; the parser re-parses the fields and desugars to `str()` + concatenation.
     FString(Vec<FStringPart>),
@@ -116,6 +119,11 @@ pub enum Tok {
     KwYield,
     /// `with`
     KwWith,
+    /// `async` -- the `async def` / `async for` / `async with` prefix. A hard keyword, as in
+    /// CPython 3.7 and later: `async` is never an identifier, not even as an attribute name.
+    KwAsync,
+    /// `await`
+    KwAwait,
 
     /// `+`
     Plus,
@@ -259,6 +267,41 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
     };
     lexer.run()?;
     Ok(lexer.tokens)
+}
+
+/// A string literal under construction, as the CODE POINTS it is made of.
+///
+/// The reason it is not a `String`: a Python `str` is a sequence of code points and a Rust `String`
+/// is a sequence of Unicode SCALAR VALUES. The two sets differ by exactly the surrogate block, so
+/// `'\ud800'` -- a legal Python literal of length 1 -- has no `String` to be built in, and no `char`
+/// to be built from either (`char::from_u32` answers `None` there by definition).
+///
+/// [`Self::push`] still takes a `char`, so every ordinary character in the lexer reads unchanged;
+/// only a value that is not a scalar has to go through [`Self::push_code`].
+#[derive(Default)]
+struct StrBuf(Vec<u32>);
+
+impl StrBuf {
+    /// Append an ordinary character.
+    fn push(&mut self, c: char) {
+        self.0.push(c as u32);
+    }
+
+    /// Append a code point that need not be a scalar value -- what the `\x`, `\u`, `\U` and octal
+    /// escapes produce, and the only door a lone surrogate can come through.
+    fn push_code(&mut self, code: u32) {
+        self.0.push(code);
+    }
+
+    /// Whether nothing has been appended yet.
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Encode to WTF-8, each code point independently.
+    fn finish(self) -> PyStr {
+        PyStr::from_code_points(self.0)
+    }
 }
 
 struct Lexer {
@@ -522,11 +565,11 @@ impl Lexer {
     fn lex_string(&mut self, raw: bool, triple: bool) -> Result<(), LexError> {
         let quote = self.peek().expect("lex_string called at a quote");
         self.pos += if triple { 3 } else { 1 };
-        let mut value = String::new();
+        let mut value = StrBuf::default();
         loop {
             if self.at_str_close(quote, triple) {
                 self.pos += if triple { 3 } else { 1 };
-                self.push(Tok::Str(value));
+                self.push(Tok::Str(value.finish()));
                 return Ok(());
             }
             match self.peek() {
@@ -555,7 +598,7 @@ impl Lexer {
     /// Append the source character at the cursor to `value`, advancing; a source line ending (`\n`,
     /// `\r`, or `\r\n`) becomes a single `\n` and bumps the line count. Reached only where a newline
     /// is permitted (triple-quoted content, or an ordinary non-newline character).
-    fn push_string_char(&mut self, value: &mut String) {
+    fn push_string_char(&mut self, value: &mut StrBuf) {
         match self.peek() {
             Some('\r') => {
                 value.push('\n');
@@ -706,7 +749,7 @@ impl Lexer {
     }
 
     /// Resolve one escape sequence (the leading backslash already consumed) into `out`.
-    fn lex_string_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+    fn lex_string_escape(&mut self, out: &mut StrBuf) -> Result<(), LexError> {
         let c = match self.peek() {
             Some(c) => c,
             None => return Err(self.err("unterminated string literal")),
@@ -746,7 +789,7 @@ impl Lexer {
     }
 
     /// `\xhh`: exactly two hex digits (the `x` already consumed), a character of that value.
-    fn lex_hex_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+    fn lex_hex_escape(&mut self, out: &mut StrBuf) -> Result<(), LexError> {
         let mut value: u32 = 0;
         for _ in 0..2 {
             match self.peek() {
@@ -757,14 +800,22 @@ impl Lexer {
                 _ => return Err(self.err("invalid '\\x' escape: two hex digits required")),
             }
         }
-        out.push(char::from_u32(value).expect("a byte value is a valid scalar"));
+        out.push_code(value);
         Ok(())
     }
 
     /// `\uXXXX` (4 hex digits) / `\UXXXXXXXX` (8 hex digits): the character at that code point. Unlike
-    /// `\x`, the value can exceed a byte and can be an invalid scalar (a surrogate, or above U+10FFFF),
-    /// which is an error, as in CPython.
-    fn lex_unicode_escape(&mut self, out: &mut String, digits: usize) -> Result<(), LexError> {
+    /// `\x`, the value can exceed a byte, and two kinds of value are outside what this produces --
+    /// for DIFFERENT reasons, which the two messages keep apart:
+    ///
+    /// - **Above U+10FFFF is not a code point at all**, and Python rejects it too (`'\U00110000'` is
+    ///   a SyntaxError). Refusing it agrees with CPython.
+    /// - **A lone surrogate, U+D800..U+DFFF, is a VALID Python string character** -- `len('\ud800')`
+    ///   is 1 and its `ord` is `0xd800` -- because a Python `str` is a sequence of code points, and
+    ///   one is ACCEPTED here. It is not a Unicode SCALAR VALUE, so it has no `char` and no
+    ///   `String`; it is carried as WTF-8 from here through the constant pool to the runtime's
+    ///   string object, each code point encoded independently.
+    fn lex_unicode_escape(&mut self, out: &mut StrBuf, digits: usize) -> Result<(), LexError> {
         let mut value: u32 = 0;
         for _ in 0..digits {
             match self.peek() {
@@ -775,16 +826,16 @@ impl Lexer {
                 _ => return Err(self.err("invalid unicode escape: too few hex digits")),
             }
         }
-        match char::from_u32(value) {
-            Some(ch) => out.push(ch),
-            None => return Err(self.err("invalid unicode escape: not a valid code point")),
+        if value > 0x10FFFF {
+            return Err(self.err("invalid unicode escape: above the maximum code point U+10FFFF"));
         }
+        out.push_code(value);
         Ok(())
     }
 
     /// `\N{NAME}`: the character with Unicode name NAME (a curated set of the common names; see
     /// [`crate::named_chars`]). The `N` is already consumed. An unrecognized name is a clear error.
-    fn lex_named_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+    fn lex_named_escape(&mut self, out: &mut StrBuf) -> Result<(), LexError> {
         if !matches!(self.peek(), Some('{')) {
             return Err(self.err("invalid '\\N' escape: expected '{' then a Unicode name"));
         }
@@ -818,7 +869,7 @@ impl Lexer {
     }
 
     /// `\ooo`: one to three octal digits, a character of that value.
-    fn lex_octal_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+    fn lex_octal_escape(&mut self, out: &mut StrBuf) -> Result<(), LexError> {
         let mut value: u32 = 0;
         let mut digits = 0;
         while digits < 3 {
@@ -831,7 +882,7 @@ impl Lexer {
                 _ => break,
             }
         }
-        out.push(char::from_u32(value).expect("an octal escape below 512 is a valid scalar"));
+        out.push_code(value);
         Ok(())
     }
 
@@ -845,12 +896,12 @@ impl Lexer {
         let quote = self.peek().expect("lex_fstring called at a quote");
         self.pos += if triple { 3 } else { 1 };
         let mut parts = Vec::new();
-        let mut literal = String::new();
+        let mut literal = StrBuf::default();
         loop {
             if self.at_str_close(quote, triple) {
                 self.pos += if triple { 3 } else { 1 };
                 if !literal.is_empty() {
-                    parts.push(FStringPart::Literal(literal));
+                    parts.push(FStringPart::Literal(literal.finish()));
                 }
                 self.push(Tok::FString(parts));
                 return Ok(());
@@ -868,7 +919,7 @@ impl Lexer {
                 }
                 Some('{') => {
                     if !literal.is_empty() {
-                        parts.push(FStringPart::Literal(core::mem::take(&mut literal)));
+                        parts.push(FStringPart::Literal(core::mem::take(&mut literal).finish()));
                     }
                     self.pos += 1;
                     let (text, conversion, spec, debug) = self.scan_fstring_expr(quote)?;
@@ -1181,11 +1232,11 @@ impl Lexer {
             "lambda" => Tok::KwLambda,
             "yield" => Tok::KwYield,
             "with" => Tok::KwWith,
+            "async" => Tok::KwAsync,
+            "await" => Tok::KwAwait,
             "del" => Tok::KwDel,
             "assert" => Tok::KwAssert,
-            "async" | "await" | "from" | "global" | "import" | "is" | "nonlocal" => {
-                Tok::Reserved(name)
-            }
+            "from" | "global" | "import" | "is" | "nonlocal" => Tok::Reserved(name),
             _ => Tok::Name(name),
         };
         self.push(kind);
@@ -1403,7 +1454,7 @@ mod tests {
         assert_eq!(kinds("'hello'\n")[0], Tok::Str("hello".into()));
         assert_eq!(kinds("\"hello\"\n")[0], Tok::Str("hello".into()));
         assert_eq!(kinds("'say \"hi\"'\n")[0], Tok::Str("say \"hi\"".into()));
-        assert_eq!(kinds("''\n")[0], Tok::Str(String::new()));
+        assert_eq!(kinds("''\n")[0], Tok::Str(PyStr::default()));
     }
 
     #[test]
@@ -1455,7 +1506,7 @@ mod tests {
                 },
             ])
         );
-        assert_eq!(kinds("\"\"\"\"\"\"\n")[0], Tok::Str(String::new()));
+        assert_eq!(kinds("\"\"\"\"\"\"\n")[0], Tok::Str(PyStr::default()));
         assert_eq!(kinds("\"\"\"a\"b\"\"\"\n")[0], Tok::Str("a\"b".into()));
     }
 
@@ -1573,7 +1624,7 @@ mod tests {
         );
         assert_eq!(kinds("'''abc'''\n")[0], Tok::Str("abc".into()));
         assert_eq!(kinds("\"\"\"a\"b\"\"\"\n")[0], Tok::Str("a\"b".into()));
-        assert_eq!(kinds("\"\"\"\"\"\"\n")[0], Tok::Str(String::new()));
+        assert_eq!(kinds("\"\"\"\"\"\"\n")[0], Tok::Str(PyStr::default()));
     }
 
     #[test]
@@ -1601,6 +1652,42 @@ mod tests {
         let src = "if x:\n    a = 1\n  b = 2\n";
         let err = tokenize(src).expect_err("should fail");
         assert!(err.message.contains("unindent"));
+    }
+
+    #[test]
+    fn a_lone_surrogate_is_a_character_and_only_a_non_code_point_is_refused() {
+        let cases: &[(&str, usize, &[u8])] = &[
+            ("\\ud800", 1, &[0xED, 0xA0, 0x80]),
+            ("\\udfff", 1, &[0xED, 0xBF, 0xBF]),
+            ("\\U0000d800", 1, &[0xED, 0xA0, 0x80]),
+            ("\\ud7ff", 1, &[0xED, 0x9F, 0xBF]),
+            ("\\ue000", 1, &[0xEE, 0x80, 0x80]),
+            ("\\U0010ffff", 1, &[0xF4, 0x8F, 0xBF, 0xBF]),
+            (
+                "\\ud800\\udc00",
+                2,
+                &[0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80],
+            ),
+        ];
+        for (escape, points, bytes) in cases {
+            let src = format!("x = \"{escape}\"\n");
+            let value = kinds(&src)
+                .into_iter()
+                .find_map(|t| match t {
+                    Tok::Str(s) => Some(s),
+                    _ => None,
+                })
+                .expect("a string token");
+            assert_eq!(value.as_bytes(), *bytes, "bytes for {escape}");
+            assert_eq!(value.code_points().count(), *points, "length of {escape}");
+        }
+
+        let over = tokenize("x = \"\\U00110000\"\n").expect_err("not a code point");
+        assert!(
+            over.message.contains("above the maximum code point"),
+            "got: {}",
+            over.message
+        );
     }
 
     #[test]

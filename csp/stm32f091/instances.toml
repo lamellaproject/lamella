@@ -11,6 +11,7 @@ family = "stm32f091"
 record = ["base", "rcc_en_off", "rcc_en_bit"]
 sources = [
     "STM32F0 reference manual RM0091 Rev 10: memory map (RCC 0x40021000, GPIOA 0x48000000, USART2 0x40004400); RCC AHBENR 6.4.6 (IOPAEN bit 17), APB1ENR 6.4.8 (USART2EN bit 17)",
+    "STM32F0 reference manual RM0091 Rev 10: memory map (GPIOC 0x48000800, GPIOD 0x48000C00, GPIOE 0x48001000, GPIOF 0x48001400); RCC AHBENR 6.4.6 per-bit descriptions (IOPCEN bit 19, IOPDEN bit 20, IOPEEN bit 21, IOPFEN bit 22). The four ports are placed together because one board reaches all of them -- its LEDs on D, its tamper key on C, its joystick across A, E and F.",
 ]
 
 [[instances]]
@@ -33,3 +34,31 @@ block = "rcc"
 base = 0x40021000
 rcc_en_off = -1
 rcc_en_bit = -1
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x48000800
+rcc_en_off = 0x14
+rcc_en_bit = 19     # IOPCEN
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x48000C00
+rcc_en_off = 0x14
+rcc_en_bit = 20     # IOPDEN
+
+[[instances]]
+name = "gpioe"
+block = "gpio"
+base = 0x48001000
+rcc_en_off = 0x14
+rcc_en_bit = 21     # IOPEEN
+
+[[instances]]
+name = "gpiof"
+block = "gpio"
+base = 0x48001400
+rcc_en_off = 0x14
+rcc_en_bit = 22     # IOPFEN

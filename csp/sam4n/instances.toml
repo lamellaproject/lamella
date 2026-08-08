@@ -1,0 +1,38 @@
+# INSTANCE map for the SAM4N family -- identity-first: ONLY the placed block copies a current
+# binding or control line references, with the SAM4-shaped record: the peripheral id is one number
+# serving as both the PMC clock-gate bit and the NVIC line. Block layouts arrive with the family's
+# first generated driver, and the rest of the instance map arrives with its first binding.
+#
+# THE PORT ROWS SAY WHICH GROUP THEY ARE, RATHER THAN LEAVING IT TO THEIR NAMES. A pin named PB14
+# has to resolve to the base address of the port group that backs it, and this vendor calls that
+# group PIOB where others call theirs PORTB, GPIOB or PORT0.
+#
+# THIS FAMILY'S ADDRESSES MATCH THE SAM4S's EXACTLY, AND THAT IS NOT A REASON TO SHARE ONE TABLE.
+# PIOA, PIOB and PIOC sit at the same three addresses on both series and carry the same three
+# peripheral ids. They are still two facts that happen to agree rather than one fact stated twice:
+# had this vendor moved a controller between the series, the two rows would legitimately differ,
+# and neither table would be wrong. What decides that they are separate families is the PIN MAP --
+# the SAM4N has no USB device port where the SAM4S has one, so the two series cannot assign the
+# same functions to the same pins, and a pin-function table is family-scoped.
+
+[table]
+kind = "instances"
+family = "sam4n"
+record = ["base", "pid"]
+sources = [
+    "SAM4N Series datasheet (Atmel-11158): peripheral identifiers table (PIOA 11, PIOB 12, PIOC 13), and the PIO register addresses given per controller as 0x400E0E00 (PIOA), 0x400E1000 (PIOB), 0x400E1200 (PIOC)",
+]
+
+[[instances]]
+name = "pioa"
+block = "pio"
+port = "A"          # this instance IS the group pins named PA<n> resolve to
+base = 0x400E0E00
+pid = 11
+
+[[instances]]
+name = "piob"
+block = "pio"
+port = "B"          # this instance IS the group pins named PB<n> resolve to
+base = 0x400E1000
+pid = 12

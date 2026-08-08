@@ -18,9 +18,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "uart0": {
         "kind": "uart",
+        "driver_family": "rp2040-uart",
         "instance": "uart0",
         "base": 0x40034000,
         "reset_mask": 0x400120,
@@ -33,6 +39,24 @@ FACTS = {
     },
 }
 
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "xosc": {"block": "xosc", "base": 0x40024000},
+    "clocks": {"block": "clocks", "base": 0x40008000},
+    "resets": {"block": "resets", "base": 0x4000C000},
+    "resets_clr": {"block": "resets", "base": 0x4000F000},
+    "io_bank0": {"block": "io-bank0", "base": 0x40014000, "reset_bit": 0x5},
+    "pads_bank0": {"block": "pads-bank0", "base": 0x4001C000, "reset_bit": 0x8},
+    "pll_sys": {"block": "pll", "base": 0x40028000, "reset_bit": 0xC},
+    "pll_usb": {"block": "pll", "base": 0x4002C000, "reset_bit": 0xD},
+    "uart0": {"block": "uart", "base": 0x40034000, "reset_bit": 0x16},
+    "sio": {"block": "sio", "base": 0xD0000000},
+}
+
 PLANS = {
     "xosc-12mhz": {"default": True, "source": "xosc", "xosc_hz": 12000000, "clk_peri_hz": 12000000},
     "pll-125-48": {"default": False, "source": "pll_sys + pll_usb", "xosc_hz": 12000000, "clk_sys_hz": 125000000, "pll_sys_fbdiv": 125, "pll_sys_postdiv1": 6, "pll_sys_postdiv2": 2, "clk_usb_hz": 48000000, "pll_usb_fbdiv": 100, "pll_usb_postdiv1": 5, "pll_usb_postdiv2": 5, "clk_peri_hz": 12000000},
@@ -42,6 +66,7 @@ PLANS = {
 # Emitted from this board's facts; each supported language states the same set in its
 # own idiom.
 DEVICES = {
+    "led": {"kind": "gpio-out", "port_base": 0xD0000000, "pin": 25, "mask": 0x2000000, "active_low": False},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until

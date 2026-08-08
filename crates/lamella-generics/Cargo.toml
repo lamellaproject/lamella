@@ -1,0 +1,21 @@
+[package]
+name = "lamella-generics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The closed generic instantiation set a program uses, and the canonical spelling that names each instantiation."
+
+# A LEAF, and deliberately so: both tiers monomorphize, so both need ONE spelling and ONE collector.
+# The alternative was a second implementation of a v1-frozen wire value in the other tier, which
+# would not fail loudly -- two spellings agreeing on `Pair`2[System.Int32,System.String]` and
+# diverging on the first NESTED or ARRAY argument is a type that exists twice.
+[dependencies]
+lamella-cil = { path = "../lamella-cil" }
+lamella-ir = { path = "../lamella-ir" }
+lamella-metadata = { path = "../lamella-metadata" }
+lamella-token = { path = "../lamella-token" }
+
+[lints]
+workspace = true

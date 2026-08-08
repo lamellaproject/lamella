@@ -6,8 +6,8 @@
 # therefore verifies this against the REAL (C-accelerated) module.
 #
 # SEED SUPPORT: an INT seed (or None) is reproducible. CPython also seeds from str/bytes (a SHA-512
-# digest, version 2) and from a float/other (its hash); both need primitives we do not have yet
-# (hashlib; the exact float hash), so a non-int, non-None seed raises a clear error rather than
+# digest, version 2) and from a float/other (its hash); both need primitives this runtime does not
+# provide (hashlib; the exact float hash), so a non-int, non-None seed raises a clear error rather than
 # diverging silently. None is deterministic here (fixed fallback) where CPython uses system entropy --
 # an unseeded generator is non-reproducible in CPython too, so this is unobservable to a differential.
 #

@@ -20,9 +20,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "uart0": {
         "kind": "uart",
+        "driver_family": "rp2350-uart",
         "instance": "uart0",
         "base": 0x40070000,
         "reset_mask": 0x4000240,
@@ -37,6 +43,7 @@ FACTS = {
     },
     "spi0": {
         "kind": "spi",
+        "driver_family": "rp2350-spi",
         "instance": "spi0",
         "base": 0x40080000,
         "reset_mask": 0x40240,
@@ -53,6 +60,7 @@ FACTS = {
     },
     "i2c0": {
         "kind": "i2c",
+        "driver_family": "rp2350-i2c",
         "instance": "i2c0",
         "base": 0x40090000,
         "reset_mask": 0x250,
@@ -65,11 +73,33 @@ FACTS = {
     },
     "adc": {
         "kind": "adc",
+        "driver_family": "rp2350-adc",
         "instance": "adc",
         "base": 0x400A0000,
         "reset_mask": 0x1,
         "reference_uv": 3300000,
     },
+}
+
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "xosc": {"block": "xosc", "base": 0x40048000},
+    "clocks": {"block": "clocks", "base": 0x40010000},
+    "resets": {"block": "resets", "base": 0x40020000},
+    "resets_clr": {"block": "resets", "base": 0x40023000},
+    "io_bank0": {"block": "io-bank0", "base": 0x40028000, "reset_bit": 0x6},
+    "pads_bank0": {"block": "pads-bank0", "base": 0x40038000, "reset_bit": 0x9},
+    "sio": {"block": "sio", "base": 0xD0000000},
+    "pll_sys": {"block": "pll", "base": 0x40050000, "reset_bit": 0xE},
+    "pll_usb": {"block": "pll", "base": 0x40058000, "reset_bit": 0xF},
+    "uart0": {"block": "uart", "base": 0x40070000, "reset_bit": 0x1A},
+    "spi0": {"block": "spi", "base": 0x40080000, "reset_bit": 0x12},
+    "i2c0": {"block": "i2c", "base": 0x40090000, "reset_bit": 0x4},
+    "adc": {"block": "adc", "base": 0x400A0000, "reset_bit": 0x0},
 }
 
 PLANS = {

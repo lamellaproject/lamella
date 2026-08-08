@@ -7,6 +7,9 @@
 #
 # Two behaviours worth knowing, both matching the standard module: equality compares VALUES and not
 # typecodes, so `array('h', [1, 2]) == array('i', [1, 2])`; and a slice of an array is an array.
+#
+# NOT PROVIDED, named rather than silently missing: the text typecodes 'u' and 'w', and the file
+# verbs (`fromfile`, `tofile`), which require a file object this runtime does not have.
 import struct
 
 _TYPECODES = "bBhHiIlLqQfd"

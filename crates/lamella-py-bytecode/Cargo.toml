@@ -7,5 +7,11 @@ license.workspace = true
 authors.workspace = true
 description = "Lamella's Python bytecode contract: opcodes, code objects, and the versioned encoding, shared by the Python front end and runtime."
 
+[dependencies]
+# The code-point byte codec, shared with the C# string tiers so the two cannot drift in the BYTES.
+# Only the byte form is shared; how code points group into characters differs per language and stays
+# with each caller.
+lamella-wtf8 = { path = "../lamella-wtf8" }
+
 [lints]
 workspace = true

@@ -1137,40 +1137,56 @@ impl<'a> Lexer<'a> {
     fn scan_numeric_literal(&mut self, start: usize) -> TokenKind {
         if self.peek() == Some('.') {
             self.bump();
-            self.consume_decimal_digits();
-            self.consume_exponent();
+            let mut run = self.consume_digit_run(10);
+            let (_, exponent_run) = self.consume_exponent();
+            run |= exponent_run;
+            self.gate_digit_run(run, start);
             let value_end = self.position;
             let suffix = self.try_consume_real_suffix().unwrap_or(RealSuffix::None);
             return self.numeric_real_token(&self.source[start..value_end], suffix, start);
         }
 
-        if self.peek() == Some('0') && matches!(self.peek_second(), Some('x' | 'X')) {
+        let prefixed = match (self.peek(), self.peek_second()) {
+            (Some('0'), Some('x' | 'X')) => Some((16, None)),
+            (Some('0'), Some('b' | 'B')) => Some((2, Some(Feature::BinaryLiterals))),
+            _ => None,
+        };
+        if let Some((radix, gated)) = prefixed {
             self.bump();
             self.bump();
+            if let Some(feature) = gated
+                && !self.options.version.supports(feature)
+            {
+                self.report_feature(feature, start);
+            }
             let digits_start = self.position;
-            self.consume_hex_digits();
-            if self.position == digits_start {
+            let run = self.consume_digit_run(radix);
+            if !run.digit {
                 self.report(DiagnosticKind::MalformedNumericLiteral, start);
             }
+            self.gate_digit_run(run, start);
             let digits = &self.source[digits_start..self.position];
             let suffix = self.consume_integer_suffix();
-            let value = self.parse_integer_value(digits, 16, start);
+            let value = self.parse_integer_value(digits, radix, start);
             return TokenKind::IntegerLiteral { value, suffix };
         }
 
         let digits_start = self.position;
-        self.consume_decimal_digits();
+        let mut run = self.consume_digit_run(10);
         let integer_digits_end = self.position;
 
         let mut is_real = false;
         if self.peek() == Some('.') && self.peek_second().is_some_and(|c| c.is_ascii_digit()) {
             is_real = true;
             self.bump();
-            self.consume_decimal_digits();
+            run |= self.consume_digit_run(10);
         }
-        if self.consume_exponent() {
+        let (has_exponent, exponent_run) = self.consume_exponent();
+        if has_exponent {
             is_real = true;
+            run |= exponent_run;
         }
+        self.gate_digit_run(run, start);
 
         if is_real {
             let value_end = self.position;
@@ -1201,6 +1217,13 @@ impl<'a> Lexer<'a> {
     /// Builds the token for a real-literal text (without its suffix). A `decimal` (`m`) literal
     /// keeps its EXACT 96-bit mantissa and scale; `float`/`double` narrow to `f64` bits.
     fn numeric_real_token(&mut self, text: &str, suffix: RealSuffix, start: usize) -> TokenKind {
+        let stripped;
+        let text = if text.contains('_') {
+            stripped = text.replace('_', "");
+            stripped.as_str()
+        } else {
+            text
+        };
         if suffix == RealSuffix::Decimal {
             if let Some((lo, mid, hi, scale)) = parse_decimal_literal(text) {
                 return TokenKind::DecimalLiteral { lo, mid, hi, scale };
@@ -1217,21 +1240,77 @@ impl<'a> Lexer<'a> {
         TokenKind::RealLiteral { bits, suffix }
     }
 
-    fn consume_decimal_digits(&mut self) {
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+    fn consume_decimal_digits(&mut self) -> DigitRun {
+        self.consume_digit_run(10)
+    }
+
+
+    /// Consumes a run of `radix` digits, taking `_` separators along with them, and reports the
+    /// shape back so the caller can gate it. Consuming first and judging after is deliberate: a
+    /// separator in the wrong place is still part of the literal, so scanning past it keeps one
+    /// mistake from cascading into the next token.
+    fn consume_digit_run(&mut self, radix: u32) -> DigitRun {
+        let mut run = DigitRun {
+            leading_separator: self.peek() == Some('_'),
+            ..DigitRun::default()
+        };
+        loop {
+            match self.peek() {
+                Some('_') => {
+                    run.separator = true;
+                    run.trailing_separator = true;
+                }
+                Some(c) if c.is_digit(radix) => {
+                    run.digit = true;
+                    run.trailing_separator = false;
+                }
+                _ => break,
+            }
             self.bump();
+        }
+        run
+    }
+
+    /// Reports whatever a digit run's separators require, MEASURED against csc rather than assumed
+    /// -- the obvious guesses are wrong in three places.
+    ///
+    /// * Separators between digits are C# 7.0.
+    /// * A separator immediately after a base prefix (`0x_FF`) is a SEPARATE feature at C# 7.2;
+    ///   csc rejects it at 7.0 by name, so accepting it there would be an accepts-invalid.
+    /// * A DOUBLED separator (`1__0`) is legal at every version that has separators at all.
+    /// * A TRAILING separator (`1_`) is not a feature gate: it is `CS1013 Invalid number`, at every
+    ///   version including the ones where separators are fully supported.
+    fn gate_digit_run(&mut self, run: DigitRun, start: usize) {
+        if run.trailing_separator {
+            self.report(DiagnosticKind::MalformedNumericLiteral, start);
+            return;
+        }
+        if run.separator && !self.options.version.supports(Feature::DigitSeparators) {
+            self.report_feature(Feature::DigitSeparators, start);
+        } else if run.leading_separator
+            && !self.options.version.supports(Feature::LeadingDigitSeparator)
+        {
+            self.report_feature(Feature::LeadingDigitSeparator, start);
         }
     }
 
-    fn consume_hex_digits(&mut self) {
-        while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-            self.bump();
-        }
+    /// Reports `feature` as unavailable in the dialect being compiled.
+    fn report_feature(&mut self, feature: Feature, start: usize) {
+        self.report(
+            DiagnosticKind::FeatureRequiresLaterVersion {
+                feature: feature.description(),
+                required: feature.introduced_in().required_name(),
+                current: self.options.version,
+            },
+            start,
+        );
     }
 
-    fn consume_exponent(&mut self) -> bool {
+    /// Consumes an `e`/`E` exponent if one is present, returning whether it was and the shape of
+    /// its digit run -- separators are legal there too (`1e1_0`), measured.
+    fn consume_exponent(&mut self) -> (bool, DigitRun) {
         if !matches!(self.peek(), Some('e' | 'E')) {
-            return false;
+            return (false, DigitRun::default());
         }
         let exponent_start = self.position;
         self.bump();
@@ -1239,11 +1318,11 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         let digits_start = self.position;
-        self.consume_decimal_digits();
+        let run = self.consume_digit_run(10);
         if self.position == digits_start {
             self.report(DiagnosticKind::MalformedNumericLiteral, exponent_start);
         }
-        true
+        (true, run)
     }
 
     fn try_consume_real_suffix(&mut self) -> Option<RealSuffix> {
@@ -1278,7 +1357,7 @@ impl<'a> Lexer<'a> {
 
     fn parse_integer_value(&mut self, digits: &str, radix: u32, start: usize) -> u64 {
         let mut value: u64 = 0;
-        for c in digits.chars() {
+        for c in digits.chars().filter(|&c| c != '_') {
             let digit = c
                 .to_digit(radix)
                 .expect("the scanner validated these digits");
@@ -1306,7 +1385,7 @@ impl<'a> Lexer<'a> {
     /// cascade is dropped downstream (`without_gated_operator_cascades`) so only this CS8022 stands.
     fn try_gate_post_1_0_operator(&mut self, start: usize) -> Option<TokenKind> {
         const GATED: &[(&str, Feature)] = &[
-            ("=>", Feature::LambdaArrow),
+            ("=>", Feature::LambdaExpression),
             ("??", Feature::NullCoalescing),
             ("?[", Feature::NullConditional),
             ("?.", Feature::NullConditional),
@@ -1324,7 +1403,8 @@ impl<'a> Lexer<'a> {
             self.report(
                 DiagnosticKind::FeatureRequiresLaterVersion {
                     feature: feature.description(),
-                    required: feature.introduced_in().display_name(),
+                    required: feature.introduced_in().required_name(),
+                    current: self.options.version,
                 },
                 start,
             );
@@ -1518,6 +1598,32 @@ fn is_format_char(c: char) -> bool {
     )
 }
 
+/// The shape of a scanned digit run, so the caller can gate its separators once per literal rather
+/// than at each digit.
+///
+/// `BitOrAssign` merges the runs of one literal -- integer part, fraction, exponent -- because csc
+/// reports a separator problem once for the literal, not once per run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DigitRun {
+    /// At least one actual digit was consumed.
+    digit: bool,
+    /// At least one `_` appeared anywhere in the run.
+    separator: bool,
+    /// The run began with `_` -- after a base prefix that is C# 7.2''s `leading digit separator`.
+    leading_separator: bool,
+    /// The run ENDED on `_`, which is `CS1013 Invalid number` at every version.
+    trailing_separator: bool,
+}
+
+impl core::ops::BitOrAssign for DigitRun {
+    fn bitor_assign(&mut self, other: DigitRun) {
+        self.digit |= other.digit;
+        self.separator |= other.separator;
+        self.leading_separator |= other.leading_separator;
+        self.trailing_separator |= other.trailing_separator;
+    }
+}
+
 /// The Unicode replacement character (U+FFFD), stood in for one ill-formed
 /// escape so the rest of the literal still scans and a character literal with a
 /// single bad escape counts as one character rather than as empty.
@@ -1544,6 +1650,71 @@ mod tests {
             .into_iter()
             .map(|token| token.kind)
             .collect()
+    }
+
+    /// Tokenizes under `version` and returns the diagnostic codes, so a dialect-sensitive literal
+    /// can be checked at more than one rung.
+    fn codes_at(source: &str, version: crate::version::LanguageVersion) -> Vec<u16> {
+        let options = LexOptions {
+            version,
+            ..LexOptions::default()
+        };
+        tokenize_with(source, options)
+            .diagnostics
+            .iter()
+            .map(|d| d.kind.code())
+            .collect()
+    }
+
+    #[test]
+    fn binary_literals_and_digit_separators_follow_cscs_rules_exactly() {
+        use crate::version::LanguageVersion::{CSharp1, CSharp7, CSharp7_2};
+
+
+        assert_eq!(codes_at("0b1010_0101", CSharp1), [8022, 8022]);
+        assert_eq!(codes_at("0b1010", CSharp1), [8022]);
+        assert_eq!(codes_at("0b1010_0101", CSharp7), []);
+        assert_eq!(codes_at("1_000_000", CSharp7), []);
+        assert_eq!(codes_at("0xFF_FF", CSharp7), []);
+        assert_eq!(int_value("0b1010_0101"), 0xA5);
+        assert_eq!(int_value("1_000_000"), 1_000_000);
+
+        assert_eq!(codes_at("1__0", CSharp7), []);
+        assert_eq!(int_value("1__0"), 10);
+
+        assert_eq!(codes_at("0x_FF", CSharp7), [8107]);
+        assert_eq!(codes_at("0b_1010", CSharp7), [8107]);
+        assert_eq!(codes_at("0x_FF", CSharp7_2), []);
+        assert_eq!(codes_at("0b_1010", CSharp7_2), []);
+
+        assert_eq!(codes_at("1_", CSharp1), [1013]);
+        assert_eq!(codes_at("1_", CSharp7_2), [1013]);
+
+        assert_eq!(codes_at("1_0.0_1", CSharp7), []);
+        assert_eq!(codes_at("1e1_0", CSharp7), []);
+
+        assert_eq!(codes_at("0b2", CSharp7), [1013]);
+        assert_eq!(codes_at("0b2", CSharp1), [8022, 1013]);
+    }
+
+    /// The value of a source text that scans to a single integer literal.
+    fn int_value(source: &str) -> u64 {
+        match tokenize_with(
+            source,
+            LexOptions {
+                version: crate::version::LanguageVersion::CSharp7_2,
+                ..LexOptions::default()
+            },
+        )
+        .tokens
+        .into_iter()
+        .find_map(|token| match token.kind {
+            TokenKind::IntegerLiteral { value, .. } => Some(value),
+            _ => None,
+        }) {
+            Some(value) => value,
+            None => panic!("{source} did not scan to an integer literal"),
+        }
     }
 
     #[test]

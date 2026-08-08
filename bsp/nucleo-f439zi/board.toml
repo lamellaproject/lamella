@@ -1,0 +1,91 @@
+# BOARD binding: the NUCLEO-F439ZI -- the SAME CARRIER as this family's Nucleo, carrying a
+# DIFFERENT PART.
+#
+# THIS IS THE OTHER HALF OF A CONTROLLED TEST, and the two halves vary opposite things. The
+# NUCLEO-F429ZI put one part on a second carrier, so everything that differed between it and the
+# Discovery board was board truth by construction. This board puts a second part on THAT carrier,
+# so everything that differs between it and the NUCLEO-F429ZI is part truth by construction -- and
+# the manual says as much itself: UM1974 gives ONE pin-assignment table for the pair, titled for
+# both boards, and its LED, button and bridge sections name no variant at all. What separates the
+# two is a single line in the product history, where one entry reads STM32F429ZIT6 on board
+# MB1137-F429ZI-B01 and the other STM32F439ZIT6 on MB1137-F439ZI-B01.
+#
+# WHAT THE PART BRINGS THAT THE OTHER DOES NOT is a cryptographic processor and a hash processor,
+# which RM0090 scopes to the STM32F43xxx line by name. Nothing here reaches them yet. What matters
+# to a board file is that the two parts answer the SAME DEV_ID and the SAME JTAG ID code, so this
+# board and its sibling cannot be told apart by asking the silicon -- only by the number below.
+#
+# No peripheral bindings yet, for the same reason as the sibling: the virtual COM port rides
+# USART3 on PD8/PD9, and this family places no usart3 instance and has no pin-map rows for those
+# two cells. The carrier states the wire it is; the binding lands with those rows.
+
+[table]
+kind = "board"
+board = "nucleo-f439zi"
+vendor = "st"
+family = "stm32f42x"
+part = "stm32f439zi"
+board_model = 29            # lamella_wire::board_model::NUCLEO_F439ZI
+sources = [
+    "UM1974 Rev 11 (STM32 Nucleo-144 boards, MB1137): user LD1 is a green LED connected to the STM32 I/O PB0 with SB120 ON and SB119 OFF, LD2 a blue LED on PB7, LD3 a red LED on PB14, and the section states outright that these user LEDs are on when the I/O is HIGH and off when it is LOW; B1 USER is connected to PC13 by default with SB173 ON and SB180 OFF; the USART3 interface on PD8 and PD9 carries the virtual COM port. Its product summary and product history name this board's part STM32F439ZIT6 on board MB1137-F439ZI-B01.",
+    "MB1137 schematic revision B-01, from ST's Nucleo-144 CAD pack. Sheet 2 (MCU): PB7 through SB139 and R31 680R into LD2's anode with its cathode at ground; PB14 through SB118 and R30 1K into LD3; PC13 through SB173 and R59 330R to the B1 USER switch, whose far side is VDD, with R58 220K to ground. Sheet 6 (extension connectors): PB0 through SB120 into R34 10K, with R33 200K to ground, feeding the non-inverting input of U7, a TSV631AILT amplifier powered from +3V3_PER and wired as a unity-gain follower -- its inverting input is tied to its own output, and that output drives R32 510R into LD1's anode with the cathode at ground.",
+]
+notes = [
+    "EVERY FACT BELOW IS GATED BY A SOLDER BRIDGE, and the manual gives the default for each: SB120 ON / SB119 OFF puts LD1 on PB0 rather than on the Arduino D13 pin PA5, SB139 and SB118 connect LD2 and LD3, and SB173 ON / SB180 OFF puts the user button on PC13 rather than on the wakeup pin PA0. The board file states the defaults; a unit reworked away from them is not what this file describes, and its bridges would have to be read off the unit.",
+    "LD1 IS NOT WIRED LIKE LD2 AND LD3 AND THE MANUAL DOES NOT SAY SO -- only the schematic does, and on a different sheet from the other two. LD2 and LD3 are driven straight from their pins through a series resistor into the anode. LD1 is driven through an amplifier: PB0 sees a 10K series resistor into a 200K to ground, roughly 210K to the pin, and the LED's current comes from the +3V3_PER rail through the follower's output rather than from the port. The POLARITY is the same either way, because a follower does not invert, which is why one sentence in the manual covers all three. What is not the same is the load: PB0 sources microamps where PB7 and PB14 source milliamps, and LD1 depends on a rail that the other two do not.",
+    "The virtual COM port reaches the target on PD8 (USART3 TX) and PD9 (USART3 RX), by solder-bridge default -- SB5 and SB6 closed on the schematic's ST-LINK side. Recorded here rather than bound, because a uart binding needs a usart3 instance row and pin-map cells this family does not have yet.",
+    "The schematic is drawn for the whole Nucleo-144 range and its title block says NUCLEO-XXXXZX, so it carries variant notes rather than one board's truth -- 'R73 only fitted on F2 & F4 Series' is one, and this part is an F4. Every fact taken from it was checked against UM1974's prose before being written here, and the one fact the manual does not carry at all is the LD1 amplifier above.",
+    "The MB1137 MCU sheet numbers the pins of its own LQFP144 footprint, and those numbers agree with this part's package on all four cells used here -- PC13 at 7, PB0 at 46, PB14 at 75, PB7 at 137. A carrier drawn for a range and a part drawn for a line agreeing pin by pin is what makes the swap below a part swap and nothing else.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge's VCP.
+baud = 115200
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# ALL THREE LEDS ARE ACTIVE HIGH and UM1974 states it in words for all three at once: they are on
+# when the I/O is HIGH and off when it is LOW. The schematic shows two different reasons for the
+# one behavior -- LD2 and LD3 are driven from their pins into the anode, LD1 through a unity-gain
+# follower that does not invert -- which is why the manual's single sentence is right and a reader
+# who assumes one wiring behind it would be wrong about the third. This vendor's Xplained-style
+# boards do the opposite, feeding the anode from the supply and SINKING through the pin, so
+# polarity is a per-board reading rather than a per-vendor one.
+#
+# THE USER BUTTON IS ACTIVE HIGH TOO, AND THAT IS THE MIRROR OF WHAT A READER ASSUMES. R58, a
+# 220K, holds PC13 DOWN, and the switch ties it UP to VDD through R59 -- so the pin reads LOW at
+# rest and HIGH while pressed, and a driver that enables a pull-up and waits for a low edge waits
+# forever. Both boards of this family are wired that way, so it is the vendor's habit here rather
+# than one board's quirk.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB0"
+active = "high"
+source = "UM1974 Rev 11: user LD1, a green LED, is connected to the STM32 I/O PB0 with SB120 ON and SB119 OFF -- the alternative bridge setting puts it on the Arduino D13 signal PA5 instead, so the pin is a board configuration rather than a fixed wiring. MB1137 rev B-01 sheet 6: PB0 reaches U7's non-inverting input through R34 10K with R33 200K to ground, and U7's output drives R32 510R into LD1's anode with the cathode at ground -- a unity-gain follower, so HIGH lights it."
+
+[[devices]]
+name = "led1"
+kind = "gpio-out"
+pin = "PB7"
+active = "high"
+source = "UM1974 Rev 11: user LD2, a blue LED, is connected to PB7. MB1137 rev B-01 sheet 2: PB7 through SB139 (closed) and R31 680R into LD2's anode, cathode at ground -- so HIGH lights it."
+
+[[devices]]
+name = "led2"
+kind = "gpio-out"
+pin = "PB14"
+active = "high"
+source = "UM1974 Rev 11: user LD3, a red LED, is connected to PB14. MB1137 rev B-01 sheet 2: PB14 through SB118 (closed) and R30 1K into LD3's anode, cathode at ground -- so HIGH lights it."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PC13"
+active = "high"
+source = "UM1974 Rev 11: B1 USER is connected to the I/O PC13 by default, with SB173 ON and SB180 OFF -- the alternative puts it on PA0 for wakeup instead. MB1137 rev B-01 sheet 2: the switch's far side is VDD and R58, a 220K, pulls PC13 to ground through R59 330R -- so the pin rests LOW and reads HIGH while the button is held, which is the opposite of the usual arrangement."

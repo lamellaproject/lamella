@@ -34,7 +34,29 @@ namespace System.Threading
 
         public virtual bool WaitOne(int millisecondsTimeout, bool exitContext)
         {
-            return WaitOne();
+            lock (coordinator)
+            {
+                int start = Environment.TickCount;
+                while (!signaled)
+                {
+                    int remaining = Remaining(start, millisecondsTimeout);
+                    if (remaining == 0) return false;
+                    if (!Monitor.Wait(coordinator, remaining)) return false;
+                }
+                if (autoReset)
+                {
+                    signaled = false;
+                }
+                return true;
+            }
+        }
+
+        private static int Remaining(int start, int total)
+        {
+            if (total < 0) return total;
+            int elapsed = Environment.TickCount - start;
+            if (elapsed >= total) return 0;
+            return total - elapsed;
         }
 
         public virtual void Close()
@@ -79,7 +101,36 @@ namespace System.Threading
 
         public static bool WaitAll(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext)
         {
-            return WaitAll(waitHandles);
+            lock (coordinator)
+            {
+                int start = Environment.TickCount;
+                while (true)
+                {
+                    bool all = true;
+                    for (int i = 0; i < waitHandles.Length; i++)
+                    {
+                        if (!waitHandles[i].signaled)
+                        {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if (all)
+                    {
+                        for (int i = 0; i < waitHandles.Length; i++)
+                        {
+                            if (waitHandles[i].autoReset)
+                            {
+                                waitHandles[i].signaled = false;
+                            }
+                        }
+                        return true;
+                    }
+                    int remaining = Remaining(start, millisecondsTimeout);
+                    if (remaining == 0) return false;
+                    if (!Monitor.Wait(coordinator, remaining)) return false;
+                }
+            }
         }
 
         public static int WaitAny(WaitHandle[] waitHandles)
@@ -106,7 +157,27 @@ namespace System.Threading
 
         public static int WaitAny(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext)
         {
-            return WaitAny(waitHandles);
+            lock (coordinator)
+            {
+                int start = Environment.TickCount;
+                while (true)
+                {
+                    for (int i = 0; i < waitHandles.Length; i++)
+                    {
+                        if (waitHandles[i].signaled)
+                        {
+                            if (waitHandles[i].autoReset)
+                            {
+                                waitHandles[i].signaled = false;
+                            }
+                            return i;
+                        }
+                    }
+                    int remaining = Remaining(start, millisecondsTimeout);
+                    if (remaining == 0) return WaitTimeout;
+                    if (!Monitor.Wait(coordinator, remaining)) return WaitTimeout;
+                }
+            }
         }
 
         internal void SetSignal()

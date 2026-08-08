@@ -17,9 +17,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "uart0": {
         "kind": "uart",
+        "driver_family": "esp32c6-uart",
         "instance": "uart0",
         "base": 0x60000000,
         "pcr_conf": 0x60096000,
@@ -29,6 +35,17 @@ FACTS = {
         "mcu_sel": 0,
         "sclk_hz": 40000000,
     },
+}
+
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "uart0": {"block": "uart", "base": 0x60000000},
+    "pcr": {"block": "pcr", "base": 0x60096000},
+    "io_mux": {"block": "io-mux", "base": 0x60090000},
 }
 
 PLANS = {

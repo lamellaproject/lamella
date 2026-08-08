@@ -19,3 +19,5 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 [dev-dependencies]
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util", "usbbulk"] }
 lamella-usbbulk = { path = "../lamella-usbbulk" }
+# Probe SELECTION: every RPi Debug Probe is `2e8a:000c`, so an example must say WHICH one.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }

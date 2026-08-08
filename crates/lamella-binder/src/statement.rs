@@ -5,6 +5,7 @@ use crate::bound::{
     Binder, BoundExpr, BoundExprKind, MethodReference, constant_int_value, constant_literal_value,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use lamella_syntax::version::Feature;
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
@@ -413,13 +414,7 @@ impl Binder {
                 let expression = self.bind_expression(expression);
                 let expression = self.coerce_switch_governing(expression);
                 if matches!(expression.ty, TypeSymbol::Special(SpecialType::Boolean)) {
-                    self.report(Diagnostic::new(
-                        DiagnosticKind::FeatureRequiresLaterVersion {
-                            feature: "switch on boolean type".into(),
-                            required: "C# 2.0".into(),
-                        },
-                        switch_span,
-                    ));
+                    self.gate_feature(Feature::SwitchOnBool, switch_span);
                 } else if !expression.ty.is_error()
                     && !self.is_switch_governing_type(&expression.ty)
                 {
@@ -940,6 +935,7 @@ impl Binder {
                         return_type: void_ty.clone(),
                         is_static: true,
                         is_vararg: false,
+                        instantiation: None,
                     }),
                 },
                 ty: void_ty.clone(),

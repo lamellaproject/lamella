@@ -100,6 +100,7 @@ impl BigInt {
     /// The nearest `f64` (for mixing with floats and float comparison). Exact within 53 bits; a
     /// larger magnitude rounds (or overflows to infinity), as CPython's int->float does.
     #[must_use]
+    #[cfg(feature = "float")]
     pub fn to_f64(&self) -> f64 {
         let mut value = 0.0f64;
         for &limb in self.mag.iter().rev() {

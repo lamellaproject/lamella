@@ -4,6 +4,7 @@ use lamella_assemble::{Diagnostic, LineMap, compile_source_with, compile_sources
 use lamella_metadata::Assembly;
 use lamella_syntax::decode::decode_source;
 use lamella_syntax::lexer::{LexOptions, Normalization};
+use lamella_syntax::version::{LanguageVersion, LanguageVersionError};
 use std::process::ExitCode;
 
 /// The parsed command line.
@@ -96,11 +97,18 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         } else if matches!(arg.as_str(), "/native-interop" | "--native-interop") {
             lex.native_interop = true;
         } else if let Some(version) = strip_option(arg, &["/langversion:", "--langversion="]) {
-            if !version.eq_ignore_ascii_case("ISO-1") && version != "1" {
-                return Err(format!(
-                    "lcsc implements only C# 1.0 (ECMA-334 first edition); \
-                     /langversion:{version} is not supported (use ISO-1)"
-                ));
+            match LanguageVersion::parse_flag(version) {
+                Ok(selected) => lex.version = selected,
+                Err(LanguageVersionError::Unsupported) => {
+                    return Err(format!(
+                        "/langversion:{version} names a C# version this compiler cannot gate \
+                         against yet; the newest it can is {}",
+                        LanguageVersion::SELECTABLE_MAX.flag_value()
+                    ));
+                }
+                Err(LanguageVersionError::Invalid) => {
+                    return Err(format!("/langversion:{version} is not a C# language version"));
+                }
             }
         } else if arg.starts_with("/target:") || arg == "/nologo" {
         } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
@@ -281,8 +289,10 @@ fn print_diagnostics(path: &str, text: &str, diagnostics: &[Diagnostic]) {
             "warning"
         };
         println!(
-            "{path}({line},{column}): {severity} CS{:04}: {}",
-            diagnostic.code, diagnostic.message
+            "{path}({line},{column}): {severity} {}{:04}: {}",
+            diagnostic.namespace.prefix(),
+            diagnostic.code,
+            diagnostic.message
         );
     }
 }
@@ -380,14 +390,32 @@ mod tests {
     }
 
     #[test]
-    fn langversion_accepts_csharp_1_0_and_refuses_later() {
-        for v in ["/langversion:ISO-1", "/langversion:iso-1", "/langversion:1"] {
+    fn langversion_selects_a_dialect_and_refuses_only_what_it_cannot_gate() {
+        let selected = |v: &str| -> LanguageVersion {
+            let args = [String::from("App.cs"), format!("/langversion:{v}")];
+            parse_args(&args).unwrap_or_else(|e| panic!("{v} should parse: {e}")).lex.version
+        };
+        assert_eq!(selected("ISO-1"), LanguageVersion::CSharp1);
+        assert_eq!(selected("iso-1"), LanguageVersion::CSharp1);
+        assert_eq!(selected("ISO-2"), LanguageVersion::CSharp2);
+        assert_eq!(selected("7"), LanguageVersion::CSharp7);
+        assert_eq!(selected("9"), LanguageVersion::CSharp9);
+        assert_eq!(selected("11"), LanguageVersion::CSharp11);
+        assert_eq!(selected("latest"), LanguageVersion::SELECTABLE_MAX);
+
+        let bare = [String::from("App.cs")];
+        assert_eq!(parse_args(&bare).expect("bare parse").lex.version, LanguageVersion::DEFAULT);
+        assert_eq!(LanguageVersion::DEFAULT, LanguageVersion::CSharp1);
+
+        for v in ["/langversion:12", "/langversion:14", "/langversion:preview"] {
             let args = [String::from("App.cs"), String::from(v)];
-            assert!(parse_args(&args).is_ok(), "{v} should be accepted");
+            let message = parse_args(&args).err().unwrap_or_else(|| panic!("{v} should be refused"));
+            assert!(message.contains("cannot gate"), "{v} should say why: {message}");
         }
-        for v in ["/langversion:2", "/langversion:ISO-2", "/langversion:latest"] {
+        for v in ["/langversion:banana", "/langversion:1.5"] {
             let args = [String::from("App.cs"), String::from(v)];
-            assert!(parse_args(&args).is_err(), "{v} should be refused");
+            let message = parse_args(&args).err().unwrap_or_else(|| panic!("{v} should be refused"));
+            assert!(message.contains("not a C# language version"), "{v}: {message}");
         }
     }
 

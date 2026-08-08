@@ -8,6 +8,17 @@ namespace Lamella.Generated
         public const int BOARD_MODEL = 20;
         public const string BOARD_VENDOR = "St";
 
+        /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+        /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+        /// peripherals of the same kind can share no register at all, so a consumer that selects a
+        /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+        /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+        /// name a driver; and a uart is a different register map on every family, so the kind does
+        /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+        public const string VCP_DRIVER_FAMILY = "stm32f7-usart";
+        public const string CODEC_I2C_DRIVER_FAMILY = "stm32f7-i2c";
+        public const string HEADER_I2C_DRIVER_FAMILY = "stm32f7-i2c";
+
         public const uint VCP_BASE = 0x40011000;
         public const uint VCP_RCC_EN_REG = 0x40023844;
         public const uint VCP_RCC_EN_MASK = 0x10;
@@ -55,6 +66,32 @@ namespace Lamella.Generated
         public const uint CODEC_I2C_KERNEL_HZ = 16000000;
         public const uint CODEC_I2C_TIMINGR_100K_HSI_16MHZ = 0x30420F13;
         public const uint CODEC_I2C_TIMINGR_400K_HSI_16MHZ = 0x10320309;
+
+        public const uint HEADER_I2C_BASE = 0x40005400;
+        public const uint HEADER_I2C_RCC_EN_REG = 0x40023840;
+        public const uint HEADER_I2C_RCC_EN_MASK = 0x200000;
+        public const uint HEADER_I2C_SCL_PORT_RCC_EN_REG = 0x40023830;
+        public const uint HEADER_I2C_SCL_PORT_RCC_EN_MASK = 0x2;
+        public const uint HEADER_I2C_SCL_MODER_REG = 0x40020400;
+        public const uint HEADER_I2C_SCL_MODER_MASK = 0x30000;
+        public const uint HEADER_I2C_SCL_MODER_VALUE = 0x20000;
+        public const uint HEADER_I2C_SCL_AFR_REG = 0x40020424;
+        public const uint HEADER_I2C_SCL_AFR_MASK = 0xF;
+        public const uint HEADER_I2C_SCL_AFR_VALUE = 0x4;
+        public const uint HEADER_I2C_SDA_PORT_RCC_EN_REG = 0x40023830;
+        public const uint HEADER_I2C_SDA_PORT_RCC_EN_MASK = 0x2;
+        public const uint HEADER_I2C_SDA_MODER_REG = 0x40020400;
+        public const uint HEADER_I2C_SDA_MODER_MASK = 0xC0000;
+        public const uint HEADER_I2C_SDA_MODER_VALUE = 0x80000;
+        public const uint HEADER_I2C_SDA_AFR_REG = 0x40020424;
+        public const uint HEADER_I2C_SDA_AFR_MASK = 0xF0;
+        public const uint HEADER_I2C_SDA_AFR_VALUE = 0x40;
+        public const uint HEADER_I2C_OTYPER_REG = 0x40020404;
+        public const uint HEADER_I2C_OTYPER_SCL_MASK = 0x100;
+        public const uint HEADER_I2C_OTYPER_SDA_MASK = 0x200;
+        public const uint HEADER_I2C_KERNEL_HZ = 16000000;
+        public const uint HEADER_I2C_TIMINGR_100K_HSI_16MHZ = 0x30420F13;
+        public const uint HEADER_I2C_TIMINGR_400K_HSI_16MHZ = 0x10320309;
 
         public const uint WM8994_ADDRESS = 0x1A;
 

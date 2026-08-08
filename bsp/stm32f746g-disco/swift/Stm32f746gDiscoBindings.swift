@@ -10,6 +10,17 @@ public enum Stm32f746gDiscoBindings {
     public static let BOARD_MODEL: UInt16 = 20
     public static let BOARD_VENDOR: String = "St"
 
+    /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+    /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+    /// peripherals of the same kind can share no register at all, so a consumer that selects a
+    /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+    /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+    /// name a driver; and a uart is a different register map on every family, so the kind does
+    /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+    public static let VCP_DRIVER_FAMILY: String = "stm32f7-usart"
+    public static let CODEC_I2C_DRIVER_FAMILY: String = "stm32f7-i2c"
+    public static let HEADER_I2C_DRIVER_FAMILY: String = "stm32f7-i2c"
+
     // -- VCP: an st-usart binding descriptor --
     public static let VCP_BASE: UInt32 = 0x40011000
     public static let VCP_RCC_EN_REG: UInt32 = 0x40023844
@@ -63,6 +74,37 @@ public enum Stm32f746gDiscoBindings {
     public static let CODEC_I2C_KERNEL_HZ: UInt32 = 16000000
     public static let CODEC_I2C_TIMINGR_100K_HSI_16MHZ: UInt32 = 0x30420F13
     public static let CODEC_I2C_TIMINGR_400K_HSI_16MHZ: UInt32 = 0x10320309
+
+    // -- HEADER_I2C: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --
+    // a push-pull output cannot be pulled low by the device at the other end, so an
+    // acknowledge is fought instead of seen and nothing ever answers, with the mux
+    // perfectly correct. The timing words are the manual's own compliant points at
+    // this plan's kernel rate, composed here: five counts, not a divisor --
+    public static let HEADER_I2C_BASE: UInt32 = 0x40005400
+    public static let HEADER_I2C_RCC_EN_REG: UInt32 = 0x40023840
+    public static let HEADER_I2C_RCC_EN_MASK: UInt32 = 0x200000
+    public static let HEADER_I2C_SCL_PORT_RCC_EN_REG: UInt32 = 0x40023830
+    public static let HEADER_I2C_SCL_PORT_RCC_EN_MASK: UInt32 = 0x2
+    public static let HEADER_I2C_SCL_MODER_REG: UInt32 = 0x40020400
+    public static let HEADER_I2C_SCL_MODER_MASK: UInt32 = 0x30000
+    public static let HEADER_I2C_SCL_MODER_VALUE: UInt32 = 0x20000
+    public static let HEADER_I2C_SCL_AFR_REG: UInt32 = 0x40020424
+    public static let HEADER_I2C_SCL_AFR_MASK: UInt32 = 0xF
+    public static let HEADER_I2C_SCL_AFR_VALUE: UInt32 = 0x4
+    public static let HEADER_I2C_SDA_PORT_RCC_EN_REG: UInt32 = 0x40023830
+    public static let HEADER_I2C_SDA_PORT_RCC_EN_MASK: UInt32 = 0x2
+    public static let HEADER_I2C_SDA_MODER_REG: UInt32 = 0x40020400
+    public static let HEADER_I2C_SDA_MODER_MASK: UInt32 = 0xC0000
+    public static let HEADER_I2C_SDA_MODER_VALUE: UInt32 = 0x80000
+    public static let HEADER_I2C_SDA_AFR_REG: UInt32 = 0x40020424
+    public static let HEADER_I2C_SDA_AFR_MASK: UInt32 = 0xF0
+    public static let HEADER_I2C_SDA_AFR_VALUE: UInt32 = 0x40
+    public static let HEADER_I2C_OTYPER_REG: UInt32 = 0x40020404
+    public static let HEADER_I2C_OTYPER_SCL_MASK: UInt32 = 0x100
+    public static let HEADER_I2C_OTYPER_SDA_MASK: UInt32 = 0x200
+    public static let HEADER_I2C_KERNEL_HZ: UInt32 = 16000000
+    public static let HEADER_I2C_TIMINGR_100K_HSI_16MHZ: UInt32 = 0x30420F13
+    public static let HEADER_I2C_TIMINGR_400K_HSI_16MHZ: UInt32 = 0x10320309
 
     // -- on-board devices: PORT group base + pin index + mask --
     public static let WM8994_ADDRESS: UInt32 = 0x1A

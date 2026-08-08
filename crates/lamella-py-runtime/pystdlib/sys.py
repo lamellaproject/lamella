@@ -8,6 +8,10 @@
 # `implementation.name` is "lamella"; `version_info` is the CPython language level this runtime tracks,
 # which is the established convention for an alternative implementation and is a statement about which
 # specification is being followed, not a claim of complete coverage.
+#
+# NOT PROVIDED -- absent rather than stubbed, so a missing attribute is visible at the call site:
+# `stdout` / `stderr` / `stdin` (they want file objects), `modules` and `path` (the import machinery's
+# own state), `getsizeof`, `settrace`, and the frame accessors.
 import _platform
 
 # --- the machine ---

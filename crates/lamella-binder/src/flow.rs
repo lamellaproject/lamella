@@ -1,6 +1,9 @@
 //! Flow analysis (ECMA-334 1st ed, clause 12).
 
-use crate::bound::{constant_int_value, constant_literal_value, BoundExpr, BoundExprKind};
+use crate::bound::{
+    constant_int_value, constant_literal_value, BoundExpr, BoundExprKind, BoundInitializer,
+    BoundInitializerTarget, BoundMemberInitializerValue,
+};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::statement::{BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection};
 use crate::symbols::{Model, TypeKind};
@@ -622,6 +625,48 @@ pub(crate) fn collect_field_accesses(stmt: &BoundStmt, reads: &mut FieldSet, wri
 
 /// Records the field reads and writes in `expr` (see [`collect_field_accesses`]). Also the
 /// entry point for a field initializer's own expression.
+/// Records an initializer's field reads and writes.
+///
+/// **A member initializer is an ASSIGNMENT**, so a resolved field is a WRITE -- that is the whole
+/// reason [`BoundMemberInitializer`] carries its `field`. A nested initializer both READS the
+/// member (to reach the object it already refers to) and writes into that object's members, so it
+/// recurses with the outer member recorded as read rather than written.
+fn collect_initializer_uses(
+    initializer: &BoundInitializer,
+    reads: &mut FieldSet,
+    writes: &mut FieldSet,
+) {
+    match initializer {
+        BoundInitializer::Collection(elements) => {
+            for element in elements {
+                collect_field_uses(element, reads, writes);
+            }
+        }
+        BoundInitializer::Object(members) => {
+            for member in members {
+                match &member.value {
+                    BoundMemberInitializerValue::Expression(value) => {
+                        if let BoundInitializerTarget::Field(field) = &member.target {
+                            if let Some(key) = field_type_key(&field.declaring_type) {
+                                writes.insert((key, field.name.clone()));
+                            }
+                        }
+                        collect_field_uses(value, reads, writes);
+                    }
+                    BoundMemberInitializerValue::Nested(nested) => {
+                        if let BoundInitializerTarget::Field(field) = &member.target {
+                            if let Some(key) = field_type_key(&field.declaring_type) {
+                                reads.insert((key, field.name.clone()));
+                            }
+                        }
+                        collect_initializer_uses(nested, reads, writes);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Marks a field-access expression's field as WRITTEN. Used for the in-place assignment forms --
 /// a compound `+=`, a `ref`/`out` argument, an address-of, and `++`/`--` -- so a field mutated only
 /// that way is not mistaken for read-never-written (which CS0649 would otherwise flag on valid code).
@@ -761,9 +806,16 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
                 collect_field_uses(element, reads, writes);
             }
         }
-        BoundExprKind::ObjectCreation { arguments, .. } => {
+        BoundExprKind::ObjectCreation {
+            arguments,
+            initializer,
+            ..
+        } => {
             for argument in arguments {
                 collect_field_uses(argument, reads, writes);
+            }
+            if let Some(initializer) = initializer {
+                collect_initializer_uses(initializer, reads, writes);
             }
         }
         BoundExprKind::DelegateCreation { receiver, .. } => {

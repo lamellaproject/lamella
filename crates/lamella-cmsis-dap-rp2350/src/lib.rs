@@ -3,7 +3,7 @@
 //! the chip's own bootrom flash API on the halted core -- no flash controller driver on the host.
 
 use lamella_cmsis_dap::{Dap, Transport};
-use lamella_probe_core::{ArmDap, CallFrame, ProbeError, TargetAccess};
+use lamella_probe_core::{ArmDap, CallFrame, ProbeError, TargetAccess, TargetAccessExt};
 
 /// The XIP flash window base -- where a firmware image boots from.
 pub const XIP_BASE: u32 = 0x1000_0000;

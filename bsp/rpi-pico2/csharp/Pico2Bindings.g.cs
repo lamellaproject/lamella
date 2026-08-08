@@ -8,6 +8,18 @@ namespace Lamella.Generated
         public const int BOARD_MODEL = 2;
         public const string BOARD_VENDOR = "RaspberryPi";
 
+        /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+        /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+        /// peripherals of the same kind can share no register at all, so a consumer that selects a
+        /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+        /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+        /// name a driver; and a uart is a different register map on every family, so the kind does
+        /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+        public const string UART0_DRIVER_FAMILY = "rp2350-uart";
+        public const string SPI0_DRIVER_FAMILY = "rp2350-spi";
+        public const string I2C0_DRIVER_FAMILY = "rp2350-i2c";
+        public const string ADC_DRIVER_FAMILY = "rp2350-adc";
+
         public const uint UART0_BASE = 0x40070000;
         public const uint UART0_RESET_MASK = 0x4000240;
         public const uint UART0_IO_TX_CTRL = 0x40028004;
@@ -53,6 +65,11 @@ namespace Lamella.Generated
         public const uint PLL_SYS_PRIM_PLL_150_48 = 0x52000;
         public const uint PLL_USB_FBDIV_PLL_150_48 = 100;
         public const uint PLL_USB_PRIM_PLL_150_48 = 0x55000;
+
+        public const uint LED_PORT_BASE = 0xD0000000;
+        public const uint LED_PIN = 25;
+        public const uint LED_MASK = 0x2000000;
+        public const uint LED_ACTIVE_LOW = 0;
 
         /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
         /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought

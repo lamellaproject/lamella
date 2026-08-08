@@ -16,6 +16,13 @@ use lamella_metadata::flags::{
 use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, ConstantValue, SigType, TypeName};
 use lamella_syntax::ast::Literal;
+
+/// The attribute that carries `required` (C# 11) across an assembly boundary. There is no
+/// FieldAttributes or PropertyAttributes bit for `required` -- this attribute IS the encoding, so a
+/// reader that does not decode it answers "not required" for every imported member, which is an
+/// answer that looks exactly like a correct one.
+const REQUIRED_MEMBER_ATTRIBUTE_NAMESPACE: &str = "System.Runtime.CompilerServices";
+const REQUIRED_MEMBER_ATTRIBUTE_NAME: &str = "RequiredMemberAttribute";
 use lamella_syntax::token::RealSuffix;
 use lamella_token::Token;
 
@@ -23,8 +30,20 @@ use lamella_token::Token;
 pub fn load_assembly(model: &mut Model, assembly: &Assembly) {
     let param_array = assembly.param_array_params();
     let conditional = assembly.conditional_symbols();
+    let type_parameters = assembly.type_parameter_names();
+    let method_type_parameters = assembly.method_type_parameter_names();
     for type_def in assembly.type_defs() {
-        if let Some(info) = type_info(assembly, &type_def, &param_array, &conditional) {
+        if let Some(info) = type_info(
+            assembly,
+            &type_def,
+            &param_array,
+            &conditional,
+            &method_type_parameters,
+        ) {
+            let mut info = info;
+            if let Some(names) = type_parameters.get(&type_def.token().row()) {
+                info.type_parameters = names.iter().map(|&name| Box::from(name)).collect();
+            }
             model.insert(info);
         }
     }
@@ -48,6 +67,7 @@ fn type_info(
     type_def: &lamella_metadata::TypeDef,
     param_array: &BTreeSet<u32>,
     conditional: &BTreeMap<u32, Vec<Box<str>>>,
+    method_type_parameters: &BTreeMap<u32, Vec<&str>>,
 ) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
     if name == "<Module>" {
@@ -97,27 +117,50 @@ fn type_info(
             let constant = field.constant().and_then(constant_to_literal);
             info.fields.push(FieldSymbol {
                 name: field_name.into(),
-                ty: sigtype_to_symbol(assembly, &signature),
+                ty: sigtype_to_symbol(assembly, &signature, &[]),
                 is_static: field.flags() & 0x0010 != 0
                     && (field.flags() & 0x0040 == 0 || constant.is_some()),
                 is_readonly: field.flags() & 0x0020 != 0,
                 is_volatile: false,
                 accessibility: member_accessibility(field.flags()),
                 constant,
+                is_required: assembly.has_attribute(
+                    field.token(),
+                    REQUIRED_MEMBER_ATTRIBUTE_NAMESPACE,
+                    REQUIRED_MEMBER_ATTRIBUTE_NAME,
+                ),
             });
         }
     }
+    let required_properties: Vec<&str> = type_def
+        .properties()
+        .filter(|property| {
+            assembly.has_attribute(
+                property.token(),
+                REQUIRED_MEMBER_ATTRIBUTE_NAMESPACE,
+                REQUIRED_MEMBER_ATTRIBUTE_NAME,
+            )
+        })
+        .filter_map(|property| property.name())
+        .collect();
     for method in type_def.methods() {
-        let (Some(method_name), Some(signature)) = (method.name(), method.signature()) else {
+        let Some(method_name) = method.name() else {
             continue;
         };
+        let Some(signature) = method.signature() else {
+            info.undecodable_members.push(method_name.into());
+            continue;
+        };
+        let own_parameters: &[&str] = method_type_parameters
+            .get(&method.rid())
+            .map_or(&[], Vec::as_slice);
         let symbol = MethodSymbol {
             name: method_name.into(),
-            return_type: sigtype_to_symbol(assembly, &signature.return_type),
+            return_type: sigtype_to_symbol(assembly, &signature.return_type, own_parameters),
             parameters: signature
                 .parameters
                 .iter()
-                .map(|parameter| sigtype_to_symbol(assembly, parameter))
+                .map(|parameter| sigtype_to_symbol(assembly, parameter, own_parameters))
                 .collect(),
             parameter_info: imported_parameter_info(&method, signature.parameters.len()),
             is_static: !signature.has_this,
@@ -130,7 +173,16 @@ fn type_info(
             is_override: method_is_virtual(method.flags()) && !method_is_newslot(method.flags()),
             is_sealed: method_is_final(method.flags()),
             accessibility: member_accessibility(method.flags()),
+            type_parameters: method_type_parameters
+                .get(&method.rid())
+                .map(|names| names.iter().map(|&name| Box::from(name)).collect())
+                .unwrap_or_default(),
             conditional: conditional.get(&method.rid()).cloned().unwrap_or_default(),
+            sets_required_members: assembly.has_attribute(
+                method.token(),
+                "System.Diagnostics.CodeAnalysis",
+                "SetsRequiredMembersAttribute",
+            ),
         };
         let property = method_name
             .strip_prefix("get_")
@@ -155,6 +207,7 @@ fn type_info(
                     is_sealed: symbol.is_sealed,
                     has_getter: method_name.starts_with("get_"),
                     has_setter: method_name.starts_with("set_"),
+                    is_required: required_properties.contains(&property_name),
                 });
             }
         }
@@ -275,7 +328,7 @@ fn constant_to_literal(value: ConstantValue) -> Option<Literal> {
 }
 
 /// Maps a metadata signature element to a [`TypeSymbol`].
-fn sigtype_to_symbol(assembly: &Assembly, sig: &SigType) -> TypeSymbol {
+fn sigtype_to_symbol(assembly: &Assembly, sig: &SigType, method_parameters: &[&str]) -> TypeSymbol {
     if let Some(special) = primitive_symbol(sig) {
         return special;
     }
@@ -284,16 +337,20 @@ fn sigtype_to_symbol(assembly: &Assembly, sig: &SigType) -> TypeSymbol {
         SigType::UIntPtr => named_symbol("System", "UIntPtr"),
         SigType::TypedByRef => named_symbol("System", "TypedReference"),
         SigType::Class(token) | SigType::ValueType(token) => token_type_symbol(assembly, *token),
-        SigType::SzArray(element) => sigtype_to_symbol(assembly, element).into_array(1),
+        SigType::SzArray(element) => sigtype_to_symbol(assembly, element, method_parameters).into_array(1),
         SigType::Array { element, rank } => {
-            sigtype_to_symbol(assembly, element).into_array(*rank as u8)
+            sigtype_to_symbol(assembly, element, method_parameters).into_array(*rank as u8)
         }
         SigType::ByRef(referent) => {
-            TypeSymbol::ByRef(Box::new(sigtype_to_symbol(assembly, referent)))
+            TypeSymbol::ByRef(Box::new(sigtype_to_symbol(assembly, referent, method_parameters)))
         }
         SigType::Pointer(referent) => {
-            TypeSymbol::Pointer(Box::new(sigtype_to_symbol(assembly, referent)))
+            TypeSymbol::Pointer(Box::new(sigtype_to_symbol(assembly, referent, method_parameters)))
         }
+        SigType::MVar(index) => match method_parameters.get(*index as usize) {
+            Some(name) => TypeSymbol::Named([Box::from(*name)].into()),
+            None => TypeSymbol::Error,
+        },
         _ => TypeSymbol::Error,
     }
 }

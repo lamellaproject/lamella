@@ -1,7 +1,7 @@
 # The SAMD21 parts table. Pin lists are PARTIAL present-lists: they carry the pins the
-# boards bind today, so validation covers every current binding; completing each list is a
-# transcription task from the datasheet (DS40001882 ch 5 pinouts), never a
-# from-recall transcription.
+# boards bind today, so a consumer must not read one as the package. Validation covers every
+# current binding, and a pin-map row naming a pin outside every present-list is refused rather
+# than assumed.
 
 [table]
 kind = "parts"

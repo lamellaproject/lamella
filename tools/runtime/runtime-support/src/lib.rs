@@ -49,8 +49,8 @@ const HEAP_PTR: *mut u32 = 0x2000_0100 as *mut u32;
 ///
 /// **A zero end is not "unbounded", it is "no heap": every allocation fails.** That direction is
 /// deliberate. The opposite reading -- treat 0 as no limit -- would make an un-seeded stub silently
-/// keep the old unbounded behaviour, which is precisely the invisible-default shape that has cost
-/// this project repeatedly. A stub that forgets to seed this instead fails at its FIRST allocation,
+/// keep an unbounded heap -- the invisible-default shape, where the safe-looking reading of a
+/// missing value is the dangerous one. A stub that forgets to seed this instead fails at its FIRST allocation,
 /// loudly and immediately, where the cause is unmistakable.
 const HEAP_END: *mut u32 = 0x2000_0104 as *mut u32;
 
@@ -60,12 +60,11 @@ const HEAP_END: *mut u32 = 0x2000_0104 as *mut u32;
 ///
 /// **Returns NULL when the request does not fit below [`HEAP_END`]** -- the AOT already emits a
 /// null test after every allocation call, so a null is what turns exhaustion into a defined event
-/// at the allocation that could not be served. Before this bound existed the cursor simply ran past
-/// the end of the heap forever and overwrote whatever sat above it, which is not a failure a
-/// program can observe: it is a program that keeps running on corrupted memory. The differential
-/// harness has paid for that twice -- a heap that reached the statics presented as 68 rows
-/// "faulting in the backend", and one that reached the stack presented as a codegen defect in
-/// `char-classification` for as long as anyone looked at it.
+/// at the allocation that could not be served. Without the bound the cursor runs past the end of
+/// the heap and overwrites whatever sits above it, which is not a failure a program can observe:
+/// it is a program that keeps running on corrupted memory, and it presents as whatever happens to
+/// occupy that address -- a statics window looks like a backend fault, a stack looks like a codegen
+/// defect.
 ///
 /// Every arithmetic step is checked. `payload_size` reaches this seam from a managed `newarr`
 /// count, so a hostile or merely wrong length must not wrap the rounding (or the sum) into a
@@ -128,12 +127,23 @@ pub extern "C" fn lamella_rint(x: f64) -> f64 {
 ///
 /// The new backing inherits the old one's TypeDesc (the word at `backing - 4`, per the GC ABI) rather
 /// than a null or a fresh one, so a grown list stays exactly the kind of object the frontend allocated.
+///
+/// # Returns
+///
+/// **1** when the list has room for `needed_cap` -- whether it already did or was grown to fit.
+/// **0** when the heap is exhausted, in which case NOTHING WAS CHANGED: the old backing, the old
+/// capacity and `len` are exactly as they were, so a caller that reports the failure leaves a
+/// coherent list behind rather than a half-grown one.
+///
+/// A caller may ignore the value and behave exactly as it did while this returned `()` -- which is
+/// what lets the two halves of the fix land independently. But ignoring it re-opens the defect
+/// below, so a caller that appends MUST branch on it.
 #[no_mangle]
-pub extern "C" fn py_list_grow(header: *mut u32, needed_cap: u32, element_size: u32) {
+pub extern "C" fn py_list_grow(header: *mut u32, needed_cap: u32, element_size: u32) -> u32 {
     unsafe {
         let cap = core::ptr::read(header.add(1));
         if cap >= needed_cap {
-            return;
+            return 1;
         }
         let new_cap = needed_cap.max(cap.saturating_mul(2));
         let len = core::ptr::read(header);
@@ -142,7 +152,7 @@ pub extern "C" fn py_list_grow(header: *mut u32, needed_cap: u32, element_size: 
         let new_backing =
             lamella_gc_alloc_impl(4 + new_cap.saturating_mul(element_size), type_desc) as *mut u32;
         if new_backing.is_null() {
-            return;
+            return 0;
         }
         core::ptr::write(new_backing, new_cap);
         core::ptr::copy_nonoverlapping(
@@ -152,6 +162,7 @@ pub extern "C" fn py_list_grow(header: *mut u32, needed_cap: u32, element_size: 
         );
         core::ptr::write(header.add(2), new_backing as u32);
         core::ptr::write(header.add(1), new_cap);
+        1
     }
 }
 

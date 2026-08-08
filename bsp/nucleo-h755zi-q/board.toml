@@ -1,0 +1,80 @@
+# BOARD binding: the NUCLEO-H755ZI-Q, an STM32H755ZIT6 on ST's MB1363 Nucleo-144 reference board.
+
+[table]
+kind = "board"
+board = "nucleo-h755zi-q"
+vendor = "st"
+family = "stm32h7"
+part = "stm32h755zi"
+board_model = 32            # lamella_wire::board_model::NUCLEO_H755ZI_Q
+sources = [
+    "UM2408 Rev 6 (STM32H7 Nucleo-144 boards, MB1363) Table 1: the NUCLEO-H755ZI-Q's board reference is MB1363 and its target STM32 is the STM32H755ZIT6, with Ethernet and cryptography as its differentiating features. Its codification section reads the -Q suffix as the STM32 having an internal SMPS function.",
+    "UM2408 Rev 6 section 7.6 (LEDs): user LD1 is a green LED connected to PB0 with SB65 OFF and SB54 ON, or to PA5 with SB65 ON and SB54 OFF, corresponding to the ST Zio D13; user LD2 is a yellow LED connected to PE1; user LD3 is a red LED connected to PB14; and the section states outright that these user LEDs are on when the I/O is HIGH value and off when the I/O is LOW. Caution: LD3 cannot be used if Zio D65 is used, in which case R75 must be removed.",
+    "UM2408 Rev 6 section 7.10 and Table 12 (USART3 pins): the USART3 interface, available on PD8 and PD9, can be connected either to ST-LINK or to the ST morpho connector, and by default the USART3 communication between the target STM32H7 and the STLINK is enabled to support the virtual COM port, with SB16 and SB17 ON. Table 12's virtual-COM-port column gives PD8 the function USART3 TX with SB103 OFF, SB16 ON and SB15 OFF, and PD9 the function USART3 RX with SB104 OFF, SB17 ON and SB94 OFF.",
+    "UM2408 Rev 6 section 7.7 (push-buttons): B1 user, the blue button, is connected to the I/O PC13 by default with tamper support, SB82 ON and SB81 OFF; if not, it is connected to PA0 with wake-up support, SB81 ON and SB82 OFF. B2 reset, the black button, is connected to NRST.",
+]
+notes = [
+    "LD2 and LD3 are gated by fitted resistors rather than by solder bridges -- R74 and R75 -- and Table 16's only alternative for each is 'not connected', so there is no second wiring for them to be in. R75 is the one with a consequence: the Caution in section 7.6 says LD3 cannot be used if Zio D65 is used, because PB14 is Zio D65, so a shield claiming that pin and this LED row cannot both be right.",
+    "The debugger is an STLINK-V3E rather than the ST-LINK/V2-1 the vendor's earlier Nucleo and Discovery boards carry, and it re-enumerates as a virtual COM port, a mass storage device and a debug port. The carrier below is still the `stlink-vcp` kind, because what that kind records is the PATH the console takes through the board, and the path is the same.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board STLINK-V3E's VCP, over the CN1 Micro-B connector.
+role = "vcp"
+baud = 115200
+plan = "hsi-64mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart3"
+function = "AF7"
+tx = { pin = "PD8" }
+rx = { pin = "PD9" }
+
+# --- the operating point ----------------------------------------------------------------------
+#
+# THE PART'S OWN RESET STATE, deliberately -- and on this part that is a FASTER clock than the
+# families beside it, not a slower one. The Cortex-M7 reaches 480 MHz through the PLLs and every
+# route there is a configuration a program performs, so a plan naming the internal oscillator
+# holds on every unit whatever the board's two crystals are populated with.
+
+[[plans]]
+name = "hsi-64mhz"
+default = true
+source = "hsi"
+hsi_hz = 64000000           # RCC_CR HSIDIV resets to 00: hsi(_ker)_ck = 64 MHz.
+pclk_hz = 64000000          # rcc_pclk1, where USART3 sits. Equal to the HSI under reset
+                            # prescalers, which the generator verifies rather than assumes.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# ALL THREE USER LEDS ARE ACTIVE HIGH and UM2408 says so for all three at once, in words rather
+# than leaving it to a schematic: they are on when the I/O is HIGH and off when it is LOW. That
+# agrees with this vendor's other Nucleo-144 boards and is the OPPOSITE of its own F769 Discovery,
+# whose manual says a zero low-logic state must be written to light a LED -- same vendor, same
+# range of years, opposite habit. Polarity is a per-BOARD reading, never a per-vendor one.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB0"
+active = "high"
+source = "UM2408 Rev 6 section 7.6: user LD1, a green user LED, is connected to the STM32H7 I/O PB0 with SB65 OFF and SB54 ON. The same section: these user LEDs are on when the I/O is HIGH value, and are off when the I/O is LOW."
+
+[[devices]]
+name = "led1"
+kind = "gpio-out"
+pin = "PE1"
+active = "high"
+source = "UM2408 Rev 6 section 7.6: user LD2, a yellow user LED, is connected to PE1, and Table 16 gives R74 as the resistor that connects it. The same section: these user LEDs are on when the I/O is HIGH value, and are off when the I/O is LOW."
+
+[[devices]]
+name = "led2"
+kind = "gpio-out"
+pin = "PB14"
+active = "high"
+source = "UM2408 Rev 6 section 7.6: user LD3, a red user LED, is connected to PB14, and Table 16 gives R75 as the resistor that connects it. The same section carries a Caution that LD3 cannot be used if Zio D65 is used, in which case R75 must be removed -- PB14 is Zio D65 on this board's connector table. The polarity is that section's own sentence: these user LEDs are on when the I/O is HIGH value, and are off when the I/O is LOW."

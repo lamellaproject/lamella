@@ -59,14 +59,93 @@ fn trace_received(bytes: &[u8]) {
     eprint!("{rendered}");
 }
 
+/// Why a `serial:<id>` target could not be turned into a port name.
+///
+/// Two states with different remedies, so they are two variants rather than one failure: "plug the
+/// board in / check the serial" against "say which of these you meant". It lives HERE, in the host
+/// crate, and deliberately not in [`TransportError`] -- that type is shared with `no_std` firmware.
+#[cfg(feature = "serial")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// No attached USB-backed port reports a serial containing the requested text.
+    NoSuchSerial(String),
+    /// More than one does. Carries every match, because the useful message names the alternatives.
+    Ambiguous(String, Vec<String>),
+}
+
+#[cfg(feature = "serial")]
+impl core::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoSuchSerial(wanted) => write!(
+                f,
+                "no attached port carries a USB serial containing {wanted:?} -- run `wire-boards` to list them"
+            ),
+            Self::Ambiguous(wanted, ports) => write!(
+                f,
+                "{:?} matches {} attached boards ({}) -- give more of the serial",
+                wanted,
+                ports.len(),
+                ports.join(", ")
+            ),
+        }
+    }
+}
+
+/// Turn a target string into a port name: `serial:<id>` resolves through the attached boards' USB
+/// serial numbers, anything else is already a port name and is returned unchanged.
+///
+/// # Why a serial is the addressable form and a port name is not
+///
+/// **A COM number is an assignment, not an identity.** The OS hands it out, it changes when a board
+/// moves to a different hub port, and on a shared bench two people can be handed each other's. Every
+/// other carrier in this tree already refuses to work that way -- `st-enumerate` lists probes by
+/// descriptor serial, `wire-list` lists native-USB boards by serial, and `stlink-flash` REQUIRES one
+/// because a flash tool that picks its own probe can erase somebody else's board. The serial carrier
+/// was the last one that could only be named as `COM64`, and it is the one most boards use: every
+/// micro:bit, every ST board reached through its on-board debugger's virtual COM port.
+///
+/// # Errors
+/// [`ResolveError`] if nothing matches or if more than one does.
+#[cfg(feature = "serial")]
+pub fn resolve_target(target: &str) -> Result<String, ResolveError> {
+    let Some(wanted) = target.strip_prefix("serial:") else {
+        return Ok(target.to_string());
+    };
+    let needle = wanted.to_ascii_lowercase();
+    let matches: Vec<String> = serialport::available_ports()
+        .into_iter()
+        .flatten()
+        .filter(|port| match &port.port_type {
+            serialport::SerialPortType::UsbPort(info) => info
+                .serial_number
+                .as_deref()
+                .is_some_and(|actual| actual.to_ascii_lowercase().contains(&needle)),
+            _ => false,
+        })
+        .map(|port| port.port_name)
+        .collect();
+    match matches.len() {
+        0 => Err(ResolveError::NoSuchSerial(wanted.to_string())),
+        1 => Ok(matches.into_iter().next().expect("length checked")),
+        _ => Err(ResolveError::Ambiguous(wanted.to_string(), matches)),
+    }
+}
+
 #[cfg(feature = "serial")]
 impl SerialTransport {
-    /// Open the serial port at `path` (e.g. `"COM5"` / `"/dev/ttyACM0"`) at `baud`. The baud is moot
-    /// for native USB-CDC but honored for a real UART.
+    /// Open the serial carrier at `path` -- either a port name (`"COM5"` / `"/dev/ttyACM0"`) or
+    /// `serial:<id>`, which selects the board by its USB serial number (see [`resolve_target`]).
+    /// The baud is moot for native USB-CDC but honored for a real UART.
     ///
     /// # Errors
-    /// [`TransportError::Carrier`] if the port cannot be opened.
-    pub fn open(path: &str, baud: u32) -> Result<Self, TransportError> {
+    /// [`TransportError::Carrier`] if the port cannot be opened, or if a `serial:` target names no
+    /// board or more than one. Call [`resolve_target`] first when the caller wants to tell a user
+    /// WHICH of those happened -- this signature is shared with the carrier-neutral driver and
+    /// cannot widen without reaching the `no_std` side.
+    pub fn open(target: &str, baud: u32) -> Result<Self, TransportError> {
+        let resolved = resolve_target(target).map_err(|_| TransportError::Carrier)?;
+        let path = resolved.as_str();
         let resets_on_dtr = serialport::available_ports()
             .into_iter()
             .flatten()
@@ -98,7 +177,7 @@ impl SerialTransport {
 #[cfg(feature = "serial")]
 impl Transport for SerialTransport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
-        let frame = encode_frame(msg_type, seq, payload);
+        let frame = encode_frame(msg_type, seq, payload).ok_or(TransportError::PayloadTooLarge)?;
         let wire_ms = 100 + (frame.len() as u64 * 10 * 1000) / u64::from(self.baud.max(1));
         self.port.set_timeout(Duration::from_millis(wire_ms)).ok();
         let written = self
@@ -260,7 +339,7 @@ pub fn parse_usb_target(target: &str) -> (u16, u16, Option<String>) {
 #[cfg(feature = "usb")]
 impl Transport for UsbTransport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
-        let frame = encode_frame(msg_type, seq, payload);
+        let frame = encode_frame(msg_type, seq, payload).ok_or(TransportError::PayloadTooLarge)?;
         self.device.write_packet(&frame).map_err(|_| TransportError::Carrier)
     }
 
@@ -383,9 +462,9 @@ pub fn deploy_blocking(
 /// 8-byte `(offset, total)` header this payload puts ahead of the bytes, rounded DOWN to the 512-byte
 /// flash page a chunk must start on.
 ///
-/// **This is a bound on silent corruption, not on throughput.** [`lamella_wire::encode_frame`] answers
-/// an over-long payload by DROPPING THE TAIL and CRCing what is left, so the frame stays well formed
-/// and the target cannot tell it received a short chunk.
+/// **This is a bound on what the wire can carry, not on throughput.** A frame's `LEN` is a `u16`
+/// ([`lamella_wire::MAX_PAYLOAD`]), and a `DEPLOY_CHUNK` spends 8 of those bytes on
+/// `(offset, total)` before any image byte.
 ///
 /// Not gated behind the carrier features the deploy driver needs, so the arithmetic stays testable
 /// without one.
@@ -594,29 +673,22 @@ mod tests {
         assert_eq!(result.stdout, "hi\n");
     }
 
-    /// THE DEFECT [`CHUNK_DATA_CAP`] EXISTS FOR, stated so it cannot come back quietly.
-    ///
-    /// `encode_frame` answers an over-long payload by dropping the tail and CRCing what is left, so
-    /// what reaches the target is INDISTINGUISHABLE FROM A GOOD FRAME -- there is no short read to
-    /// notice and no CRC failure to resynchronize on. A `DEPLOY_CHUNK` payload carries 8 bytes of
-    /// `(offset, total)` ahead of the image bytes, and those 8 bytes are what make 65536 -- round, and
-    /// a legal multiple of the 512-byte flash page the doc asks for -- the value that corrupts.
     #[test]
-    fn an_oversized_chunk_loses_its_tail_and_still_verifies() {
-        let round_trip = |data_len: usize| {
-            let payload = vec![0xA5u8; 8 + data_len];
-            let mut reader = lamella_wire::FrameReader::new();
-            reader.push(&lamella_wire::encode_frame(0x20, 1, &payload));
-            let frame = reader.next_frame().expect("well formed either way -- that is the problem");
-            (payload.len(), frame.payload.len())
-        };
+    fn an_oversized_chunk_is_refused_rather_than_silently_truncated() {
+        let over = vec![0xA5u8; 8 + 65536];
+        assert_eq!(
+            lamella_wire::encode_frame(0x20, 1, &over),
+            None,
+            "an over-long DEPLOY_CHUNK must be refused; truncating it produced a frame the target \
+             could not tell from a good one"
+        );
 
-        let (sent, received) = round_trip(65536);
-        assert!(received < sent, "encode_frame no longer truncates -- re-derive CHUNK_DATA_CAP");
-        assert_eq!(received, u16::MAX as usize, "it truncates to the LEN cap and says nothing");
-
-        let (sent, received) = round_trip(CHUNK_DATA_CAP);
-        assert_eq!(sent, received, "a capped chunk must cross whole");
+        let capped = vec![0xA5u8; 8 + CHUNK_DATA_CAP];
+        let bytes = lamella_wire::encode_frame(0x20, 1, &capped).expect("a capped chunk frames");
+        let mut reader = lamella_wire::FrameReader::new();
+        reader.push(&bytes);
+        let frame = reader.next_frame().expect("a capped chunk is a well-formed frame");
+        assert_eq!(frame.payload.len(), capped.len(), "a capped chunk must cross whole");
         assert_eq!(CHUNK_DATA_CAP % 512, 0, "a chunk must still start on a 512-byte flash page");
     }
 
@@ -631,7 +703,7 @@ mod tests {
         let image: Vec<u8> = (0..(2 * 65536 + 777)).map(|i| (i % 251) as u8).collect();
         let mut transport = MemTransport::new();
         for _ in 0..8 {
-            transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 3, &[1]));
+            transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 3, &[1]).expect("a 1-byte ack frames"));
         }
 
         let ok = deploy_chunked_blocking(&mut transport, 3, &image, 65536, Duration::from_secs(5))

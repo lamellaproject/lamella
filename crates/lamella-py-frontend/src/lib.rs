@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod ast;
 pub mod boardfacts;
 pub mod compile;
+pub mod complete;
 pub mod exc;
 pub mod lexer;
 pub mod lower;
@@ -31,6 +32,20 @@ pub enum FrontendError {
     Compile(compile::CompileError),
     /// A board fact the program names and the board does not state.
     BoardFact(boardfacts::BoardFactError),
+    /// A failure in a module reached through the import graph, naming the module it came from.
+    ///
+    /// The name has to travel with the error because the inner one's line number is a line in THAT
+    /// module's source, not in the source the caller handed over -- so without the name a bundle
+    /// build reports a position in a file it never names, and the reader looks for it in the wrong
+    /// place. A consumer that maps an error onto the caller's buffer must therefore NOT use the
+    /// inner line as its own; the module's name and the inner line both survive in the `Display`
+    /// text, which is where they belong until a diagnostic can carry a file.
+    InModule {
+        /// The module whose source failed to compile.
+        module: alloc::string::String,
+        /// What went wrong inside it.
+        error: alloc::boxed::Box<FrontendError>,
+    },
 }
 
 impl core::fmt::Display for FrontendError {
@@ -40,6 +55,7 @@ impl core::fmt::Display for FrontendError {
             FrontendError::Parse(e) => write!(f, "syntax error: {e}"),
             FrontendError::Compile(e) => write!(f, "compile error: {e}"),
             FrontendError::BoardFact(e) => write!(f, "board fact error: {e}"),
+            FrontendError::InModule { module, error } => write!(f, "in module '{module}': {error}"),
         }
     }
 }
@@ -81,7 +97,7 @@ pub fn compile_str(
 }
 
 /// Compile Python `source` against ONE BOARD's generated facts: `import board` plus every
-/// `board.` the program reads are resolved to constants before compilation, and the import is
+/// `board.*` the program reads are resolved to constants before compilation, and the import is
 /// dropped. `board_source` is a generated `bsp/<board>/python/board.py`.
 ///
 /// This is how a tier with no filesystem and no import machinery reads the same facts the
@@ -137,13 +153,18 @@ pub fn compile_bundle(
         let Some(source) = resolve(&name) else {
             continue;
         };
-        let ast = parser::parse(lexer::tokenize(&source)?)?;
+        let in_module = |e: FrontendError| FrontendError::InModule {
+            module: name.clone(),
+            error: alloc::boxed::Box::new(e),
+        };
+        let ast = parser::parse(lexer::tokenize(&source).map_err(|e| in_module(e.into()))?)
+            .map_err(|e| in_module(e.into()))?;
         for imported in top_level_imports(&ast) {
             if !seen.contains(&imported) {
                 queue.push_back(imported);
             }
         }
-        modules.push(compile::compile_module(&name, &ast)?);
+        modules.push(compile::compile_module(&name, &ast).map_err(|e| in_module(e.into()))?);
     }
     Ok(bytecode::Bundle { entry, modules })
 }
@@ -172,6 +193,26 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use bytecode::{FeatureFlags, Module, Op, StaticType};
+
+    #[test]
+    fn a_bundled_module_that_fails_to_compile_is_named_in_the_error() {
+        let resolve = |name: &str| -> Option<String> {
+            match name {
+                "broken" => Some(String::from("def f(:\n")),
+                _ => None,
+            }
+        };
+        let err = compile_bundle("main", "import broken\n", &resolve)
+            .expect_err("the imported module does not parse");
+        assert!(
+            matches!(&err, FrontendError::InModule { module, .. } if module == "broken"),
+            "the failing module is named: {err}"
+        );
+        let text = alloc::format!("{err}");
+        assert!(text.contains("in module 'broken'"), "{text}");
+        assert!(text.contains("line 1"), "the inner position survives too: {text}");
+        assert!(compile_bundle("main", "import math\n", &resolve).is_ok());
+    }
 
     /// A typed iterative `fib` plus one dynamic attribute access. Exercises the
     /// whole pipeline end to end and round-trips through the versioned container.

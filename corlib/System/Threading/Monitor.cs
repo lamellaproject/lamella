@@ -14,11 +14,27 @@ namespace System.Threading
 
         public static bool TryEnter(object obj) { return TryEnterLock(obj); }
 
-        public static bool TryEnter(object obj, int millisecondsTimeout) { return TryEnterLock(obj); }
+        public static bool TryEnter(object obj, int millisecondsTimeout)
+        {
+            if (millisecondsTimeout < 0) { EnterLock(obj); return true; }
+            if (TryEnterLock(obj)) return true;
+            if (millisecondsTimeout == 0) return false;
+            TryEnterLockTimeout(obj, millisecondsTimeout);
+            return !WaitTimedOut();
+        }
 
         public static bool Wait(object obj) { WaitLock(obj); return true; }
 
-        public static bool Wait(object obj, int millisecondsTimeout) { WaitLock(obj); return true; }
+        public static bool Wait(object obj, int millisecondsTimeout)
+        {
+            if (millisecondsTimeout < 0)
+            {
+                WaitLock(obj);
+                return true;
+            }
+            WaitLockTimeout(obj, millisecondsTimeout);
+            return !WaitTimedOut();
+        }
 
         public static void Pulse(object obj) { PulseLock(obj); }
 
@@ -28,6 +44,9 @@ namespace System.Threading
         [Lamella.Runtime.RuntimeProvided] private static void ExitLock(object obj) { }
         [Lamella.Runtime.RuntimeProvided] private static bool TryEnterLock(object obj) { return false; }
         [Lamella.Runtime.RuntimeProvided] private static void WaitLock(object obj) { }
+        [Lamella.Runtime.RuntimeProvided] private static void WaitLockTimeout(object obj, int millisecondsTimeout) { }
+        [Lamella.Runtime.RuntimeProvided] private static void TryEnterLockTimeout(object obj, int millisecondsTimeout) { }
+        [Lamella.Runtime.RuntimeProvided] private static bool WaitTimedOut() { return false; }
         [Lamella.Runtime.RuntimeProvided] private static void PulseLock(object obj) { }
         [Lamella.Runtime.RuntimeProvided] private static void PulseAllLock(object obj) { }
     }

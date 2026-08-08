@@ -17,9 +17,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "i2c": {
         "kind": "i2c",
+        "driver_family": "nrf51-twi",
         "instance": "twi0",
         "twi_base": 0x40003000,
         "psel_scl": 0x0,
@@ -27,6 +33,19 @@ FACTS = {
         "pin_cnf_scl_reg": 0x50000700,
         "pin_cnf_sda_reg": 0x50000778,
     },
+}
+
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "port0": {"block": "gpio", "base": 0x50000000},
+    "twi0": {"block": "twi", "base": 0x40003000},
+    "uart0": {"block": "uart", "base": 0x40002000},
+    "timer0": {"block": "timer", "base": 0x40008000},
+    "nvmc": {"block": "nvmc", "base": 0x4001E000},
 }
 
 PLANS = {

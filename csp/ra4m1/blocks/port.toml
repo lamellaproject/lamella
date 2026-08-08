@@ -1,0 +1,52 @@
+# BLOCK layout: the RA4M1 I/O port block -- the registers a control line is driven through.
+# PARTIAL: per-pin fields are stated for the pins the boards claim and grow as more do. Offsets are
+# instance-base-relative; port instance bases live in ../instances.toml.
+#
+# THE BLOCK IS FOUR 32-BIT REGISTERS AND EACH PACKS TWO 16-BIT HALVES, one bit per pin in each half.
+# A port's direction and its output data therefore live in ONE register: PCNTR1 holds the direction
+# bits in [15:0] and the output data bits in [31:16], so pin n's direction is bit n and its output
+# level is bit n + 16 of the same word.
+
+[table]
+kind = "block"
+family = "ra4m1"
+block = "port"
+sources = [
+    "Renesas RA4M1 Group User's Manual: Hardware R01UH0887EJ0110 Rev.1.10 (Sep 29, 2023): section 19.2.1 Port Control Register 1 (PCNTR1/PODR/PDR) at offset 0x00, PDRn in b15 to b0 (0: Input, 1: Output) and PODRn in b31 to b16 (0: Low output, 1: High output), reset value 0 for every bit, accessed in 32-bit units with PODRn and PDRn accessed in 16-bit units",
+    "Renesas RA4M1 Group User's Manual: Hardware R01UH0887EJ0110 Rev.1.10: section 19.2.2 Port Control Register 2 (PCNTR2/EIDR/PIDR) at offset 0x04, PIDRn in b15 to b0 (0: Low level, 1: High level, read-only) and EIDRn in b31 to b16; section 19.2.3 Port Control Register 3 (PCNTR3/PORR/POSR) at offset 0x08, POSRn in b15 to b0 (1: High output, write-only) and PORRn in b31 to b16 (1: Low output, write-only); section 19.2.4 Port Control Register 4 (PCNTR4/EORR/EOSR) at offset 0x0C, listed for PORT1 to PORT4 only",
+]
+notes = [
+    "PCNTR3 is the single-write alternative to a read-modify-write on PCNTR1's output half: writing 1 to POSRn drives pin n high and writing 1 to PORRn drives it low, and the manual says each changes the corresponding PODR bit. Its two halves are 16 bits apart and a mask written to the wrong one drives the pin the wrong way rather than failing, which is the same shape as the alias ordering above and a separate instance of it.",
+    "PORRn and POSRn must not be set at the same time, and the manual states that outright rather than leaving the collision to a consumer. Nothing in this table can check a word a driver composes.",
+    "A bit of any of these registers that belongs to a pin the package does not carry is reserved: reserved bits read as 0 and the write value should be 0. So a driver writing a whole-port mask is writing to bits it does not own, and which pins exist is a per-package fact held on the parts table rather than here.",
+    "The per-pin field rows below are PARTIAL and stay that way. A pin's bit follows from its index by rule -- direction at [n], output data at [n + 16], and the same pairing in PCNTR3 -- and that rule is what composes a control line's words at generation time, so a row per pin would restate the arithmetic rather than add a fact.",
+    "Three pins are stated. P200, P214 and P215 are input only, so their direction and output-data bits are reserved even though the pins exist; none of the three is among the pins below, and a later row on port 2 must check that list before assuming a pin can be driven.",
+]
+
+[registers.PCNTR1]
+offset = 0x0
+width = 32
+fields = { PDR11 = [11, 1], PDR12 = [12, 1], PDR13 = [13, 1], PODR11 = [27, 1], PODR12 = [28, 1], PODR13 = [29, 1] }
+notes = "Port control 1: direction in [15:0] at one bit per pin (0 = input, 1 = output) and output data in [31:16] at one bit per pin (0 = low, 1 = high). Reset is 0 throughout, so every pin starts as an input holding a low output value. PARTIAL: pins 11, 12 and 13 stated."
+
+[registers.PCNTR2]
+offset = 0x4
+width = 32
+fields = { }
+notes = "Port control 2: pin state in [15:0], one bit per pin, read-only (0 = low level, 1 = high level). Event input data occupies [31:16] and exists on ports 1 to 4 only. This is the register a button row would be read through; no board here drives an input pin, so no field is stated."
+
+[registers.PCNTR3]
+offset = 0x8
+width = 32
+fields = { POSR11 = [11, 1], POSR12 = [12, 1], POSR13 = [13, 1], PORR11 = [27, 1], PORR12 = [28, 1], PORR13 = [29, 1] }
+notes = "Port control 3, write-only: output SET in [15:0] and output RESET in [31:16], one bit per pin. Writing 1 to a set bit drives the pin high and writing 1 to a reset bit drives it low, each changing the pin's PCNTR1 output-data bit; writing 0 to either has no effect, so a pin is driven without reading the port first. PARTIAL: pins 11, 12 and 13 stated."
+
+[registers.PCNTR4]
+offset = 0xC
+width = 32
+fields = { }
+notes = "Port control 4: event output set in [15:0] and event output reset in [31:16], acting when the port's event-link input occurs. Listed for ports 1 to 4 only, so a port outside that range does not carry this register at its block offset."
+
+[constants]
+PDR_OUTPUT = 1
+PODR_HIGH = 1

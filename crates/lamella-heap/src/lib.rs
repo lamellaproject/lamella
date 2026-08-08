@@ -7,7 +7,9 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_has_atomic = "8")]
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering;
 
 /// The number of size classes. The class table spans the interpreter's whole allocation
 /// range with a fit tight enough that internal fragmentation stays small even for the
@@ -23,7 +25,7 @@ const MIN_BLOCK: usize = 16;
 /// ~2 KiB of its class:
 ///   0..16   : 16, 32, ..., 256        (16-byte steps)   -- the tiny-churn range
 ///   16..28  : 320, 384, ..., 1024     (64-byte steps)
-///   28..40  : 1536, 2048, ..., 8192   (512-byte steps... widening)
+///   28..40  : 1536, 2048, ..., 7168   (512-byte steps)
 ///   40..44  : 10240, 12288, 16384, 20480
 const fn class_size(index: usize) -> usize {
     if index < 16 {
@@ -44,15 +46,68 @@ const fn class_size(index: usize) -> usize {
 
 /// The smallest class that fits `size` (already rounded to at least [`MIN_BLOCK`]), or
 /// `None` when `size` exceeds every class.
+///
+/// Inverted in CLOSED FORM rather than by scanning [`class_size`], and the reason is interrupt
+/// latency rather than throughput.
 const fn class_for(size: usize) -> Option<usize> {
-    let mut index = 0;
-    while index < CLASS_COUNT {
-        if class_size(index) >= size {
-            return Some(index);
-        }
-        index += 1;
+    if size <= MIN_BLOCK {
+        Some(0)
+    } else if size <= 256 {
+        Some(size.div_ceil(16) - 1)
+    } else if size <= 1024 {
+        Some(15 + (size - 256).div_ceil(64))
+    } else if size <= 7168 {
+        Some(27 + (size - 1024).div_ceil(512))
+    } else if size <= 10240 {
+        Some(40)
+    } else if size <= 12288 {
+        Some(41)
+    } else if size <= 16384 {
+        Some(42)
+    } else if size <= 20480 {
+        Some(43)
+    } else {
+        None
     }
-    None
+}
+
+/// Everything an allocation or a free needs that is derivable from its [`Layout`] ALONE.
+///
+/// It exists to be computed OUTSIDE the lock. On ARMv6-M the lock is interrupts-off, so every
+/// instruction inside it is interrupt latency paid by every peripheral on the part -- and the class
+/// arithmetic needs no heap state at all, so there is no reason for it to be in there. Splitting it
+/// out is what leaves the critical section holding only the pointer moves it exists to serialize.
+struct Request {
+    /// The class whose free list may satisfy this request, and to which its block returns.
+    ///
+    /// `None` covers BOTH cases the allocator serves by an unreclaimed carve: a request beyond
+    /// every class, and an over-aligned one. Class blocks are only [`MIN_BLOCK`]-aligned, so for an
+    /// over-aligned request neither the pop nor the push is sound -- and collapsing the two into one
+    /// field is what makes `alloc` and `dealloc` agree about which blocks recycle by construction
+    /// rather than by two predicates that must be kept in step.
+    class: Option<usize>,
+    /// The bytes to carve when the free list cannot serve it: the class's fixed size, or the
+    /// request's own size when it is beyond every class.
+    carve_size: usize,
+    /// The alignment the carve must honor.
+    align: usize,
+}
+
+impl Request {
+    /// Reads `layout` into the class arithmetic. Pure -- no heap state, nothing to lock.
+    fn of(layout: Layout) -> Request {
+        let need = layout.size().max(MIN_BLOCK).max(layout.align());
+        let align = layout.align().max(MIN_BLOCK);
+        let sized = class_for(need);
+        Request {
+            class: if align <= MIN_BLOCK { sized } else { None },
+            carve_size: match sized {
+                Some(class) => class_size(class),
+                None => need,
+            },
+            align,
+        }
+    }
 }
 
 /// A free block's intrusive header: the next free block in its class (null at the tail).
@@ -98,32 +153,22 @@ impl Heap {
         self.classes = [core::ptr::null_mut(); CLASS_COUNT];
     }
 
-    /// The block size a request of `layout` takes: rounded to the class granularity, and to
-    /// the alignment when it exceeds [`MIN_BLOCK`] (an over-aligned request bump-carves
-    /// aligned, so its class rounding also honors the alignment).
-    fn block_size(layout: Layout) -> usize {
-        layout.size().max(MIN_BLOCK).max(layout.align())
-    }
-
-    /// Allocates for `layout`, or null on exhaustion. O(1): a class hit pops its free list,
-    /// a miss carves the class's fixed size from the bump frontier (aligned when the
+    /// Allocates for a prepared `request`, or null on exhaustion. A class hit pops its free
+    /// list, a miss carves the class's fixed size from the bump frontier (aligned when the
     /// request over-aligns).
-    fn alloc(&mut self, layout: Layout) -> *mut u8 {
-        let need = Self::block_size(layout);
-        let align = layout.align().max(MIN_BLOCK);
-        match class_for(need) {
-            Some(class) => {
-                if align <= MIN_BLOCK {
-                    let head = self.classes[class];
-                    if !head.is_null() {
-                        self.classes[class] = unsafe { (*head).next };
-                        return head.cast();
-                    }
-                }
-                self.carve(class_size(class), align)
+    ///
+    /// Takes a [`Request`] rather than a `Layout` so the class arithmetic happens before the
+    /// caller takes the lock: this body is what runs with interrupts off on ARMv6-M, and it is
+    /// a few loads and stores with no loop and no call.
+    fn alloc(&mut self, request: &Request) -> *mut u8 {
+        if let Some(class) = request.class {
+            let head = self.classes[class];
+            if !head.is_null() {
+                self.classes[class] = unsafe { (*head).next };
+                return head.cast();
             }
-            None => self.carve(need, align),
         }
+        self.carve(request.carve_size, request.align)
     }
 
     /// Carves `size` bytes from the bump frontier, advanced to `align`, or null if it would
@@ -139,20 +184,18 @@ impl Heap {
         aligned as *mut u8
     }
 
-    /// Returns a block to its size class's free list (O(1)). A block beyond every class
-    /// (an unreclaimed large carve) is dropped -- it is never reused, matching the bump
-    /// behavior for that rare case.
+    /// Returns a block to its size class's free list (O(1)). A block with no class -- one
+    /// beyond every class, or an over-aligned carve -- is dropped: it is never reused,
+    /// matching the bump behavior for those rare cases.
+    ///
+    /// Takes a [`Request`] for the same reason [`Heap::alloc`] does: the class arithmetic is
+    /// the caller's, computed before the lock.
     ///
     /// # Safety
-    /// `ptr` must be a block this heap returned for a `layout`-compatible request, not yet
-    /// freed.
-    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        let need = Self::block_size(layout);
-        let align = layout.align().max(MIN_BLOCK);
-        if align > MIN_BLOCK {
-            return;
-        }
-        if let Some(class) = class_for(need) {
+    /// `ptr` must be a block this heap returned for a request prepared from the same
+    /// `Layout`, not yet freed.
+    unsafe fn dealloc(&mut self, ptr: *mut u8, request: &Request) {
+        if let Some(class) = request.class {
             let node = ptr.cast::<FreeNode>();
             unsafe { (*node).next = self.classes[class] };
             self.classes[class] = node;
@@ -207,9 +250,23 @@ impl Heap {
 
 unsafe impl Send for Heap {}
 
-/// A spin-locked [`Heap`] usable as a `#[global_allocator]`. The lock is a plain spin
-/// (uncontended on the single-core serve; no allocation happens in interrupt context).
+/// A locked [`Heap`] usable as a `#[global_allocator]`.
+///
+/// # Two locks, chosen by what the target's atomics can do
+///
+/// Where the target has atomic compare-and-swap the lock is a plain spin (uncontended on the
+/// single-core serve). **ARMv6-M -- Cortex-M0 and M0+ -- has atomic load/store but NO CAS**, so
+/// `compare_exchange_weak` does not exist there and this crate did not compile for `thumbv6m` at
+/// all.
+///
+/// On a CAS-less target the lock is therefore an interrupt-disable critical section instead. On a
+/// single-core MCU that is not a workaround, it is the stronger primitive: a spin lock on one core
+/// DEADLOCKS outright if an interrupt handler allocates while the lock is held, where disabling
+/// interrupts makes that case impossible rather than unlikely.
 pub struct LockedHeap {
+    /// The spin flag -- present only on targets whose atomics can CAS; the critical-section arm
+    /// needs no flag, because interrupts-off IS the exclusion.
+    #[cfg(target_has_atomic = "8")]
     locked: AtomicBool,
     heap: UnsafeCell<Heap>,
     /// A lock-free mirror of the heap's carved high-water (see [`Heap::carved`]), refreshed
@@ -224,6 +281,7 @@ impl LockedHeap {
     #[must_use]
     pub const fn empty() -> LockedHeap {
         LockedHeap {
+            #[cfg(target_has_atomic = "8")]
             locked: AtomicBool::new(false),
             heap: UnsafeCell::new(Heap::empty()),
             carved: core::sync::atomic::AtomicUsize::new(0),
@@ -238,7 +296,8 @@ impl LockedHeap {
         self.with(|heap| unsafe { heap.init(base, size) });
     }
 
-    /// Runs `body` holding the lock.
+    /// Runs `body` holding the lock (the spin arm -- targets with atomic CAS).
+    #[cfg(target_has_atomic = "8")]
     fn with<T>(&self, body: impl FnOnce(&mut Heap) -> T) -> T {
         while self
             .locked
@@ -250,6 +309,14 @@ impl LockedHeap {
         let result = body(unsafe { &mut *self.heap.get() });
         self.locked.store(false, Ordering::Release);
         result
+    }
+
+    /// Runs `body` holding the lock (the critical-section arm -- ARMv6-M, which has no CAS).
+    ///
+    /// Interrupts off IS the exclusion, so there is no flag to set and nothing to spin on.
+    #[cfg(not(target_has_atomic = "8"))]
+    fn with<T>(&self, body: impl FnOnce(&mut Heap) -> T) -> T {
+        critical_section(|| body(unsafe { &mut *self.heap.get() }))
     }
 
     /// Bytes never yet carved from the region (takes the lock).
@@ -275,16 +342,47 @@ impl LockedHeap {
 
 unsafe impl Sync for LockedHeap {}
 
+/// Runs `body` with interrupts disabled on a Cortex-M target, restoring the prior interrupt state
+/// afterwards. Same shape as `lamella-alloc`'s, deliberately: the two crates guard different
+/// structures for the same reason, and a second spelling of one primitive is a place for them to
+/// drift.
+///
+/// The restore is CONDITIONAL on the entry state rather than an unconditional `cpsie i`, so a call
+/// made with interrupts already off -- from a fault handler, or nested inside another section --
+/// leaves them off instead of silently re-enabling them under its caller.
+#[cfg(all(not(target_has_atomic = "8"), target_arch = "arm"))]
+fn critical_section<R>(body: impl FnOnce() -> R) -> R {
+    use core::arch::asm;
+    let primask: u32;
+    unsafe {
+        asm!("mrs {}, PRIMASK", out(reg) primask, options(nomem, nostack, preserves_flags));
+        asm!("cpsid i", options(nomem, nostack, preserves_flags));
+    }
+    let result = body();
+    if primask & 1 == 0 {
+        unsafe { asm!("cpsie i", options(nomem, nostack, preserves_flags)) };
+    }
+    result
+}
+
+#[cfg(all(not(target_has_atomic = "8"), not(target_arch = "arm")))]
+compile_error!(
+    "lamella-heap needs either atomic CAS or a critical section for this target, and has neither: \
+     add an interrupt-disable `critical_section` for this architecture beside the ARMv6-M one"
+);
+
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let (ptr, carved) = self.with(|heap| (heap.alloc(layout), heap.carved()));
+        let request = Request::of(layout);
+        let (ptr, carved) = self.with(|heap| (heap.alloc(&request), heap.carved()));
         self.carved.store(carved, Ordering::Relaxed);
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if let Some(ptr) = NonNull::new(ptr) {
-            self.with(|heap| unsafe { heap.dealloc(ptr.as_ptr(), layout) });
+            let request = Request::of(layout);
+            self.with(|heap| unsafe { heap.dealloc(ptr.as_ptr(), &request) });
         }
     }
 }
@@ -397,6 +495,26 @@ mod tests {
         assert_eq!(h.frontier_free(), stable, "mixed churn does not grow the frontier");
         unsafe { h.dealloc(held, hold) };
         free_region(region, layout);
+    }
+
+    /// The schedule search `class_for` REPLACED: the smallest class whose size fits, found by
+    /// walking [`class_size`] itself. Kept here as the reference the closed form is checked
+    /// against -- it restates nothing, so it cannot drift from the table the way a second copy
+    /// of the arithmetic would.
+    fn class_for_by_scan(size: usize) -> Option<usize> {
+        (0..CLASS_COUNT).find(|&index| class_size(index) >= size)
+    }
+
+    #[test]
+    fn the_closed_form_agrees_with_the_schedule_over_the_whole_range() {
+        let top = class_size(CLASS_COUNT - 1);
+        for size in 0..=(top + 64) {
+            assert_eq!(
+                class_for(size),
+                class_for_by_scan(size),
+                "the closed form and the schedule disagree at size {size}"
+            );
+        }
     }
 
     #[test]

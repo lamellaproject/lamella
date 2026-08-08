@@ -4,6 +4,17 @@
 pub const BOARD_MODEL: u16 = 20;
 pub const BOARD_VENDOR: &str = "St";
 
+/// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+/// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+/// peripherals of the same kind can share no register at all, so a consumer that selects a
+/// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+/// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+/// name a driver; and a uart is a different register map on every family, so the kind does
+/// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+pub const VCP_DRIVER_FAMILY: &str = "stm32f7-usart";
+pub const CODEC_I2C_DRIVER_FAMILY: &str = "stm32f7-i2c";
+pub const HEADER_I2C_DRIVER_FAMILY: &str = "stm32f7-i2c";
+
 pub const VCP_BASE: u32 = 0x40011000;
 pub const VCP_RCC_EN_REG: u32 = 0x40023844;
 pub const VCP_RCC_EN_MASK: u32 = 0x10;
@@ -51,6 +62,32 @@ pub const CODEC_I2C_OTYPER_SDA_MASK: u32 = 0x100;
 pub const CODEC_I2C_KERNEL_HZ: u32 = 16000000;
 pub const CODEC_I2C_TIMINGR_100K_HSI_16MHZ: u32 = 0x30420F13;
 pub const CODEC_I2C_TIMINGR_400K_HSI_16MHZ: u32 = 0x10320309;
+
+pub const HEADER_I2C_BASE: u32 = 0x40005400;
+pub const HEADER_I2C_RCC_EN_REG: u32 = 0x40023840;
+pub const HEADER_I2C_RCC_EN_MASK: u32 = 0x200000;
+pub const HEADER_I2C_SCL_PORT_RCC_EN_REG: u32 = 0x40023830;
+pub const HEADER_I2C_SCL_PORT_RCC_EN_MASK: u32 = 0x2;
+pub const HEADER_I2C_SCL_MODER_REG: u32 = 0x40020400;
+pub const HEADER_I2C_SCL_MODER_MASK: u32 = 0x30000;
+pub const HEADER_I2C_SCL_MODER_VALUE: u32 = 0x20000;
+pub const HEADER_I2C_SCL_AFR_REG: u32 = 0x40020424;
+pub const HEADER_I2C_SCL_AFR_MASK: u32 = 0xF;
+pub const HEADER_I2C_SCL_AFR_VALUE: u32 = 0x4;
+pub const HEADER_I2C_SDA_PORT_RCC_EN_REG: u32 = 0x40023830;
+pub const HEADER_I2C_SDA_PORT_RCC_EN_MASK: u32 = 0x2;
+pub const HEADER_I2C_SDA_MODER_REG: u32 = 0x40020400;
+pub const HEADER_I2C_SDA_MODER_MASK: u32 = 0xC0000;
+pub const HEADER_I2C_SDA_MODER_VALUE: u32 = 0x80000;
+pub const HEADER_I2C_SDA_AFR_REG: u32 = 0x40020424;
+pub const HEADER_I2C_SDA_AFR_MASK: u32 = 0xF0;
+pub const HEADER_I2C_SDA_AFR_VALUE: u32 = 0x40;
+pub const HEADER_I2C_OTYPER_REG: u32 = 0x40020404;
+pub const HEADER_I2C_OTYPER_SCL_MASK: u32 = 0x100;
+pub const HEADER_I2C_OTYPER_SDA_MASK: u32 = 0x200;
+pub const HEADER_I2C_KERNEL_HZ: u32 = 16000000;
+pub const HEADER_I2C_TIMINGR_100K_HSI_16MHZ: u32 = 0x30420F13;
+pub const HEADER_I2C_TIMINGR_400K_HSI_16MHZ: u32 = 0x10320309;
 
 pub const WM8994_ADDRESS: u32 = 0x1A;
 

@@ -1,0 +1,22 @@
+# PARTS table for the SAM4N family: the entry point of this vendor's SAM4 line. The pin
+# present-list is PARTIAL and evidence-only -- a pin-map row or a binding pin outside it is
+# refused -- and it grows as bindings and control lines place pins.
+
+[table]
+kind = "parts"
+family = "sam4n"
+sources = [
+    "SAM4N Series datasheet (Atmel-11158) ordering information: ATSAM4N16CA-AU is 1024 KB flash, 80 KB SRAM, QFP100",
+]
+notes = [
+    "SINGLE-PLANE FLASH, unlike the SAM4S family's dual-plane member. One flash controller covers the whole 1024 KB, so nothing here needs the plane arithmetic that family's parts row carries.",
+    "The SRAM is what most separates this series from the SAM4S at the same flash size: 80 KB here against 128 KB on an ATSAM4S16C and 160 KB on an ATSAM4SD32C. Three parts across two series share 1024 KB of flash and no two of them share a RAM size.",
+]
+
+[[parts]]
+part = "atsam4n16c"
+package = "QFP100"
+flash = 0x100000
+ram = 0x14000
+pins = ["PA30", "PB14"]
+source = "SAM4N Series datasheet (Atmel-11158) ordering information: ATSAM4N16CA-AU / ATSAM4N16CA-AUR, 1024 KB flash, 80 KB SRAM, QFP100. The pin list is PARTIAL: PA30 and PB14 are here because a board's control lines place them, each cited on its own row in that board file."

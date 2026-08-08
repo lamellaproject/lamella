@@ -923,8 +923,9 @@ fn lower_function(
             meta.end
         };
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+        let mut grown = meta.grow_done;
         for op in &co.ops[meta.start..body_end] {
-            lower_op(co, funcs, constants, &local_ty, &mut values, &mut insts, &mut locals, &mut stack, &mut arrays, op)?;
+            lower_op(co, funcs, constants, &local_ty, &mut values, &mut insts, &mut locals, &mut stack, &mut arrays, &mut grown, op)?;
         }
 
         let terminator = if meta.call_exc_handler.is_some() {
@@ -1062,6 +1063,61 @@ fn lower_function(
                             jump_to(&is_merge, &live_in, meta.succs[0], &locals, &stack)?
                 }
             }
+        } else if let Some(slot) = meta.grow_check {
+            let header = locals[slot as usize];
+            match arrays.get(&header).copied() {
+                Some(info) => {
+                    let element_size = elem_size(info.elem);
+                    let len = emit(&mut values, &mut insts, Inst::FieldLoad { base: header, offset: GROWLIST_LEN_OFFSET }, MirType::I32);
+                    let one = emit(&mut values, &mut insts, Inst::ConstInt { ty: MirType::I32, value: 1 }, MirType::I32);
+                    let needed = emit(&mut values, &mut insts, Inst::Binary { op: MBinOp::Add, lhs: len, rhs: one }, MirType::I32);
+                    let width = emit(&mut values, &mut insts, Inst::ConstInt { ty: MirType::I32, value: i64::from(element_size) }, MirType::I32);
+                    let grew = emit(
+                        &mut values,
+                        &mut insts,
+                        Inst::PInvoke { import: PY_LIST_GROW_SYMBOL.into(), args: vec![header, needed, width] },
+                        MirType::I32,
+                    );
+                    let if_true =
+                        branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &stack, tramp_base, &mut tramps)?;
+                    let raise_id = BlockId((tramp_base + tramps.len()) as u32);
+                    let mut raise_insts: Vec<(ValueId, Inst)> = Vec::new();
+                    let tagv = emit(
+                        &mut values,
+                        &mut raise_insts,
+                        Inst::ConstInt { ty: MirType::I32, value: i64::from(bc::exception_tag("MemoryError")) },
+                        MirType::I32,
+                    );
+                    let _stored = emit(
+                        &mut values,
+                        &mut raise_insts,
+                        Inst::StaticStore { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET, value: tagv },
+                        MirType::I32,
+                    );
+                    let raise_term = raise_route(
+                        handler_of(meta.end - 1),
+                        &is_merge,
+                        &live_in,
+                        ret_ty,
+                        &locals,
+                        &mut values,
+                        &mut raise_insts,
+                    )?;
+                    tramps.push(BasicBlock {
+                        params: Vec::new(),
+                        insts: raise_insts,
+                        terminator: Some(raise_term),
+                    });
+                    Terminator::Branch {
+                        cond: grew,
+                        if_true,
+                        true_args: Vec::new(),
+                        if_false: raise_id,
+                        false_args: Vec::new(),
+                    }
+                }
+                None => jump_to(&is_merge, &live_in, meta.succs[0], &locals, &stack)?,
+            }
         } else if !meta.ends_in_terminator {
             jump_to(&is_merge, &live_in, meta.succs[0], &locals, &stack)?
         } else {
@@ -1194,9 +1250,10 @@ fn stack_exit(stack: &[StackEntry]) -> Result<Vec<(ValueId, MirType)>, LowerErro
         .map(|e| match e {
             StackEntry::Value(v, t) => Ok((*v, *t)),
             StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
-            StackEntry::Tuple(_) | StackEntry::EmptyList | StackEntry::ListAppend(_) => {
-                Err(LowerError::DynamicOperation)
-            }
+            StackEntry::Tuple(_)
+            | StackEntry::EmptyList
+            | StackEntry::ListAppend(_)
+            | StackEntry::ListPop(_) => Err(LowerError::DynamicOperation),
             StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) | StackEntry::ConstStr => {
                 Err(LowerError::DynamicOperation)
             }
@@ -1292,6 +1349,18 @@ struct BlockMeta {
     /// `[access, handler]`; when it is a dynamic container the check is skipped (a plain fall-through --
     /// that access stays the interpreter's), the handler edge unused.
     subscript_check: Option<usize>,
+    /// Set when the block's LAST op is [`bc::Op::ListGrow`]: the local slot of the list about to be
+    /// appended to. The block ends in a grow-and-check (a `Branch` on whether the runtime found room)
+    /// BEFORE the store that follows, because a store past the capacity a failed grow left behind is
+    /// a memory-safety defect rather than a wrong answer. `succs` are `[store]`, plus the handler when
+    /// a `try` guards the append -- and unlike the division and subscript checks this one is emitted
+    /// GUARDED OR NOT, since an unguarded heap exhaustion must still raise rather than fault.
+    grow_check: Option<u32>,
+    /// Set when the PREVIOUS block ended in [`bc::Op::ListGrow`], so this block's first append has
+    /// already had its capacity ensured and must NOT ask again. Without it the grow would be called
+    /// twice per append -- harmless, since the second call returns at once, and a wasted call on the
+    /// hot path all the same.
+    grow_done: bool,
 }
 
 /// Whether `op` is a division that raises `ZeroDivisionError` on a zero divisor: floor-division
@@ -1354,6 +1423,7 @@ fn block_layout(ops: &[bc::Op], exc_table: &[bc::ExcEntry]) -> Result<Vec<BlockM
             _ if is_subscript_op(op) && enclosing_handler(exc_table, i).is_some() => {
                 leaders.push(i);
             }
+            bc::Op::ListGrow { .. } if i + 1 < ops.len() => leaders.push(i + 1),
             _ => {}
         }
     }
@@ -1396,6 +1466,14 @@ fn block_layout(ops: &[bc::Op], exc_table: &[bc::ExcEntry]) -> Result<Vec<BlockM
             }
             _ => None,
         };
+        let grow_done = start
+            .checked_sub(1)
+            .and_then(|i| ops.get(i))
+            .is_some_and(|op| matches!(op, bc::Op::ListGrow { .. }));
+        let grow_check = match last {
+            bc::Op::ListGrow { list } if end < ops.len() => Some(*list),
+            _ => None,
+        };
         let (succs, ends_in_terminator) = match last {
             bc::Op::Jump(t) => (vec![block_id(*t as usize)?], true),
             bc::Op::PopJumpIfFalse(t) => (vec![block_id(*t as usize)?, block_id(end)?], true),
@@ -1416,6 +1494,13 @@ fn block_layout(ops: &[bc::Op], exc_table: &[bc::ExcEntry]) -> Result<Vec<BlockM
             _ if subscript_check.is_some() => {
                 (vec![block_id(end)?, block_id(subscript_check.unwrap())?], false)
             }
+            _ if grow_check.is_some() => {
+                let mut succs = vec![block_id(end)?];
+                if let Some(handler) = enclosing_handler(exc_table, end - 1) {
+                    succs.push(block_id(handler)?);
+                }
+                (succs, false)
+            }
             _ => (vec![block_id(end)?], false),
         };
         metas.push(BlockMeta {
@@ -1426,6 +1511,8 @@ fn block_layout(ops: &[bc::Op], exc_table: &[bc::ExcEntry]) -> Result<Vec<BlockM
             call_exc_handler,
             div_check_handler,
             subscript_check,
+            grow_check,
+            grow_done,
         });
     }
     Ok(metas)
@@ -1586,6 +1673,9 @@ enum StackEntry {
     /// that immediately consumes it lowers it; anywhere else (a stored or passed bound method) it is
     /// dynamic.
     ListAppend(ValueId),
+    /// A growable list's bound `pop` method, carrying the HEADER it was read off. Like
+    /// [`Self::ListAppend`], only the `Call` that immediately consumes it lowers it.
+    ListPop(ValueId),
     /// A built-in exception TYPE pushed by `LoadGlobal` (`raise IndexError`, `except IndexError:`).
     /// It is not a plain value: only `Raise` (which stores its tag) and `MatchExc` (which tests the
     /// in-flight tag against its subtype closure) consume it; anywhere else falls to the dynamic path.
@@ -1612,9 +1702,10 @@ fn pop_value(stack: &mut Vec<StackEntry>) -> Result<(ValueId, MirType), LowerErr
     match pop(stack)? {
         StackEntry::Value(v, t) => Ok((v, t)),
         StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
-        StackEntry::Tuple(_) | StackEntry::EmptyList | StackEntry::ListAppend(_) => {
-            Err(LowerError::DynamicOperation)
-        }
+        StackEntry::Tuple(_)
+        | StackEntry::EmptyList
+        | StackEntry::ListAppend(_)
+        | StackEntry::ListPop(_) => Err(LowerError::DynamicOperation),
         StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) | StackEntry::ConstStr => {
             Err(LowerError::DynamicOperation)
         }
@@ -1632,6 +1723,7 @@ fn lower_op(
     locals: &mut [ValueId],
     stack: &mut Vec<StackEntry>,
     arrays: &mut BTreeMap<ValueId, ArrayInfo>,
+    grown: &mut bool,
     op: &bc::Op,
 ) -> Result<(), LowerError> {
     match op {
@@ -1883,6 +1975,15 @@ fn lower_op(
                 stack.push(StackEntry::ListAppend(obj));
                 return Ok(());
             }
+            if matches!(arrays.get(&obj).map(|info| info.kind), Some(SeqKind::GrowList))
+                && co.names.get(*name as usize).is_some_and(|n| n == "pop")
+            {
+                if !co.exc_table.is_empty() {
+                    return Err(LowerError::DynamicOperation);
+                }
+                stack.push(StackEntry::ListPop(obj));
+                return Ok(());
+            }
             let id = values.fresh(MirType::PyValue);
             insts.push((id, Inst::PyIntrinsic {
                 op: PyOp::Getattr { name: *name },
@@ -2099,9 +2200,11 @@ fn lower_op(
         | bc::Op::DeleteFast(_) => {
             return Err(LowerError::DynamicOperation);
         }
+        bc::Op::ListGrow { .. } => {}
         bc::Op::MakeFunction { .. }
         | bc::Op::Yield
         | bc::Op::YieldFrom
+        | bc::Op::Await
         | bc::Op::CallEx { .. }
         | bc::Op::BuildClass
         | bc::Op::BuildClassKw { .. }
@@ -2148,9 +2251,9 @@ fn lower_op(
                 );
                 stack.push(StackEntry::Value(id, MirType::I32));
             } else if crate::exc::is_builtin_exception(name) {
-                stack.push(StackEntry::ExcType(name.clone()));
+                stack.push(StackEntry::ExcType(String::from(name)));
             } else {
-                return Err(LowerError::UnresolvedGlobal(name.clone()));
+                return Err(LowerError::UnresolvedGlobal(String::from(name)));
             }
         }
         bc::Op::Call(argc) => {
@@ -2384,6 +2487,36 @@ fn lower_op(
                     let (id, ty) = inline_builtin(builtin, values, insts, &args)?;
                     stack.push(StackEntry::Value(id, ty));
                 }
+                StackEntry::ListPop(header) => {
+                    if argc != 0 {
+                        return Err(LowerError::DynamicOperation);
+                    }
+                    let Some(&info) = arrays.get(&header) else {
+                        return Err(LowerError::DynamicOperation);
+                    };
+                    let element_size = elem_size(info.elem);
+                    let len = emit(values, insts, Inst::FieldLoad { base: header, offset: GROWLIST_LEN_OFFSET }, MirType::I32);
+                    let one = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 1 }, MirType::I32);
+                    let idx = emit(values, insts, Inst::Binary { op: MBinOp::Sub, lhs: len, rhs: one }, MirType::I32);
+                    let empty = emit(values, insts, Inst::Compare { op: MCmpOp::UnsignedGe, lhs: idx, rhs: len }, MirType::I32);
+                    let zero = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 0 }, MirType::I32);
+                    let mask = emit(values, insts, Inst::Binary { op: MBinOp::Sub, lhs: zero, rhs: empty }, MirType::I32);
+                    let narrowed = emit(values, insts, Inst::Binary { op: MBinOp::Or, lhs: idx, rhs: mask }, MirType::I32);
+                    let backing = emit(values, insts, Inst::FieldLoad { base: header, offset: GROWLIST_BACKING_OFFSET }, MirType::ObjectRef);
+                    let value = emit(
+                        values,
+                        insts,
+                        Inst::ArrayLoad { array: backing, index: narrowed, element_size, signed: false },
+                        info.elem,
+                    );
+                    emit(
+                        values,
+                        insts,
+                        Inst::FieldStore { base: header, offset: GROWLIST_LEN_OFFSET, value: idx },
+                        MirType::I32,
+                    );
+                    stack.push(StackEntry::Value(value, info.elem));
+                }
                 StackEntry::ListAppend(header) => {
                     if argc != 1 {
                         return Err(LowerError::ArityMismatch { expected: 1, found: argc });
@@ -2399,13 +2532,16 @@ fn lower_op(
                     let len = emit(values, insts, Inst::FieldLoad { base: header, offset: GROWLIST_LEN_OFFSET }, MirType::I32);
                     let one = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 1 }, MirType::I32);
                     let needed = emit(values, insts, Inst::Binary { op: MBinOp::Add, lhs: len, rhs: one }, MirType::I32);
-                    let width = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: i64::from(element_size) }, MirType::I32);
-                    emit(
-                        values,
-                        insts,
-                        Inst::PInvoke { import: PY_LIST_GROW_SYMBOL.into(), args: vec![header, needed, width] },
-                        MirType::I32,
-                    );
+                    if !*grown {
+                        let width = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: i64::from(element_size) }, MirType::I32);
+                        emit(
+                            values,
+                            insts,
+                            Inst::PInvoke { import: PY_LIST_GROW_SYMBOL.into(), args: vec![header, needed, width] },
+                            MirType::I32,
+                        );
+                    }
+                    *grown = false;
                     let backing = emit(values, insts, Inst::FieldLoad { base: header, offset: GROWLIST_BACKING_OFFSET }, MirType::ObjectRef);
                     emit(values, insts, Inst::ArrayStore { array: backing, index: len, value, element_size }, MirType::I32);
                     emit(
@@ -2456,7 +2592,8 @@ fn lower_op(
                 | StackEntry::Value(..)
                 | StackEntry::Tuple(_)
                 | StackEntry::EmptyList
-                | StackEntry::ListAppend(_) => {
+                | StackEntry::ListAppend(_)
+                | StackEntry::ListPop(_) => {
                     return Err(LowerError::CallTargetNotCallable);
                 }
                 StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) | StackEntry::ConstStr => {
@@ -2539,7 +2676,7 @@ fn module_constants(body: &bc::CodeObject) -> BTreeMap<String, i32> {
                 },
             };
             if let Some(name) = body.local_names.get(slot) {
-                constants.insert(name.clone(), bits);
+                constants.insert(String::from(name), bits);
             }
         }
     }

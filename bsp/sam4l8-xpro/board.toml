@@ -1,0 +1,60 @@
+# BOARD binding: the SAM4L8 Xplained Pro -- identity-first. No peripheral bindings yet, because the
+# SAM4L family has no generated driver; what this file states beyond identity is the board's two
+# control lines, which need no driver -- a control pin rides no alternate function.
+#
+# BOTH CONTROL LINES ARE ON THE SAME PORT, which is a first here and worth knowing before reading
+# the rows: PC07 and PC24 are both port 2 of the one GPIO controller this part has, so both resolve
+# to the same bank base and differ only in bit position.
+
+[table]
+kind = "board"
+board = "sam4l8-xpro"
+vendor = "atmel"
+family = "sam4l"
+part = "atsam4lc8c"
+board_model = 27            # lamella_wire::board_model::SAM4L8_XPLAINED_PRO
+sources = [
+    "SAM4L8 Xplained Pro user guide (Atmel-42103): the mechanical buttons section and its pin table (SW0 on PC24; a button drives the I/O line to GND), and the LED section and its pin table (one yellow LED0 on PC07, activated by driving the connected I/O line to GND).",
+    "SAM4L8 Xplained Pro design documentation (the vendor's published CAD package for this board), which names the fitted part ATSAM4LC8CA.",
+    "ATSAM4L8/L4/L2 datasheet (Atmel-42023) table 44-1 ordering information, for the package and memory sizes the part id resolves to.",
+]
+notes = [
+    "THE FITTED PART CAME FROM THE BOARD'S OWN DESIGN DOCUMENTATION rather than from a product page: ATSAM4LC8CA. The user guide names the series and the design package names the device, which is the same two-document shape the rest of this vendor's boards needed.",
+    "This part answers a chip id of 0xAB0B0AE0 / 0x1400000F, which is chip truth and is recorded on the family parts table rather than here.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+#
+# The same EDBG bridge as this vendor's other Xplained Pro boards, and the same DTR caveat: the
+# EDBG holds its UART pins tristated until the host asserts DTR, so a board that says nothing is a
+# board whose terminal has not raised DTR rather than one that has not booted.
+
+[[carriers]]
+kind = "edbg-vcp"           # the on-board EDBG bridge's VCP.
+baud = 115200
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# BOTH ARE ACTIVE LOW AND THE GUIDE SAYS SO IN WORDS, the same as this vendor's SAM4N and SAM4E
+# boards: a button "will drive the I/O line to GND", and the LED "can be activated by driving the
+# connected I/O line to GND".
+#
+# THE PIN NAMES CARRY THE DATASHEET'S LEADING ZERO. PC07 is how the document spells it, and the
+# part's present-list spells it the same way, so the two are one string. PC7 would name the same
+# physical pin and match nothing.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PC07"
+active = "low"
+source = "SAM4L8 Xplained Pro user guide (Atmel-42103), LED connections: one yellow LED0 on PC07, activated by driving the connected I/O line to GND."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PC24"
+active = "low"
+source = "SAM4L8 Xplained Pro user guide (Atmel-42103), mechanical buttons: SW0 on PC24; a button drives the I/O line to GND when pressed. The other mechanical button is RESET, wired to the reset line rather than to a port pin, so it is not a row here."

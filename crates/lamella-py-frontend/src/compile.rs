@@ -246,7 +246,7 @@ fn build_extremum_reducer_def(builtin: &str) -> Stmt {
                 body: vec![Stmt::Raise {
                     exc: Some(Expr::Call {
                         func: Box::new(name("ValueError")),
-                        args: vec![Expr::Str(String::from(message))],
+                        args: vec![Expr::Str(message.into())],
                         keywords: Vec::new(),
                     }),
                     cause: None,
@@ -285,6 +285,7 @@ fn build_extremum_reducer_def(builtin: &str) -> Stmt {
             },
             Stmt::Return(Some(name("m"))),
         ],
+        is_async: false,
     })
 }
 
@@ -369,6 +370,7 @@ fn build_sum_reducer_def() -> Stmt {
             },
             Stmt::Return(Some(name("s"))),
         ],
+        is_async: false,
     })
 }
 
@@ -376,8 +378,33 @@ fn build_sum_reducer_def() -> Stmt {
 /// top-level body. A `return` is only valid in a function.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
+    /// A `def` body.
     Function,
+    /// An `async def` body -- a coroutine function. Separate from `Function` so the body compiler
+    /// knows what it is compiling: `Op::Await` may be emitted only here, and the synthesized bodies
+    /// (a lambda, a comprehension's hidden function) compile as `Function`, which is what makes an
+    /// `await` that ended up in one a compile error rather than a malformed code object.
+    Coroutine,
+    /// The module's top-level body.
     Module,
+}
+
+impl Scope {
+    /// Whether this is a function body of either kind -- where `return` is legal and whose locals
+    /// can be captured as cells -- as opposed to the module's top-level body.
+    fn is_function(self) -> bool {
+        !matches!(self, Scope::Module)
+    }
+}
+
+/// The body scope a `def` compiles in: an `async def` is a coroutine, everything else a plain
+/// function. Synthesized bodies (lambdas, comprehension functions) never route through here.
+fn scope_of(func: &FuncDef) -> Scope {
+    if func.is_async {
+        Scope::Coroutine
+    } else {
+        Scope::Function
+    }
 }
 
 fn compile_function(
@@ -385,7 +412,7 @@ fn compile_function(
     func_rets: &BTreeMap<String, bc::StaticType>,
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let body: Vec<&Stmt> = func.body.iter().collect();
-    compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body, None, Outer { enclosing: &[], func_rets })
+    compile_code_object(scope_of(func), &func.name, &func.params, &func.ret, &body, None, Outer { enclosing: &[], func_rets })
 }
 
 /// The simple method name of a class-body member (a `def` or a decorated `def`), else `None`.
@@ -435,7 +462,7 @@ fn compile_method(
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let body: Vec<&Stmt> = method.body.iter().collect();
     compile_code_object(
-        Scope::Function,
+        scope_of(method),
         qualified,
         &method.params,
         &method.ret,
@@ -555,10 +582,28 @@ fn class_body_bound_names(body: &[Stmt]) -> BTreeSet<String> {
 /// Python's rule is positional -- the FIRST statement, and only if it is a plain string literal.
 /// A string anywhere else is an expression whose value is discarded, and a body that opens with
 /// anything else has no docstring however many strings follow.
-fn docstring_of(first: Option<&Stmt>) -> Option<&str> {
+///
+/// A docstring carrying a SURROGATE is refused, and that is CPython's own answer rather than a
+/// narrowing of it: a docstring must be encodable as UTF-8, so CPython raises `UnicodeEncodeError`
+/// while COMPILING one -- in every docstring position (module, class, function, nested function,
+/// parenthesized, implicitly concatenated), and for a surrogate pair as readily as a lone one. The
+/// identical text in any other string literal is accepted by both.
+///
+/// So a code object's `doc` being plain UTF-8 text is the CORRECT width for what a Python program can
+/// express there, and what is owed is a refusal that names the reason rather than a silent drop. A
+/// string in this position that is not a docstring at all -- an f-string, say -- is untouched, exactly
+/// as it is untouched in CPython.
+fn docstring_of(first: Option<&Stmt>) -> Result<Option<&str>, CompileError> {
     match first {
-        Some(Stmt::Expr(Expr::Str(text))) => Some(text),
-        _ => None,
+        Some(Stmt::Expr(Expr::Str(text))) => match text.as_str() {
+            Some(text) => Ok(Some(text)),
+            None => Err(error(
+                "a docstring cannot contain a surrogate character (U+D800 to U+DFFF), because a \
+                 docstring is stored as UTF-8 text; the same text is accepted in any other string \
+                 literal",
+            )),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -673,7 +718,7 @@ fn compile_code_object(
         (cellvars, freevars)
     };
     let mut child_scopes: Vec<BTreeSet<String>> = enclosing.to_vec();
-    if scope == Scope::Function {
+    if scope.is_function() {
         child_scopes.push(bound);
     }
 
@@ -681,7 +726,7 @@ fn compile_code_object(
         scope,
         asm: Assembler::new(),
         consts: Vec::new(),
-        names: Vec::new(),
+        names: Default::default(),
         local_names,
         local_types,
         cellvars: cellvars.clone(),
@@ -707,9 +752,9 @@ fn compile_code_object(
         func_rets: visible_rets.clone(),
     };
     if scope == Scope::Module {
-        let doc = docstring_of(body.first().copied());
+        let doc = docstring_of(body.first().copied())?;
         let doc_const = match doc {
-            Some(text) => compiler.const_index(bc::Const::Str(String::from(text))),
+            Some(text) => compiler.const_index(bc::Const::Str(text.into())),
             None => compiler.const_index(bc::Const::None),
         };
         compiler.asm.emit(bc::Op::LoadConst(doc_const));
@@ -737,20 +782,23 @@ fn compile_code_object(
         posonly_count: params.iter().filter(|p| p.positional_only).count() as u32,
         kwonly_count: params.iter().filter(|p| p.keyword_only).count() as u32,
         is_generator: compiler.has_yield,
+        is_coroutine: scope == Scope::Coroutine,
         doc: match scope {
-            Scope::Function => docstring_of(body.first().copied()).map(String::from),
+            Scope::Function | Scope::Coroutine => {
+                docstring_of(body.first().copied())?.map(String::from)
+            }
             Scope::Module => None,
         },
         has_varargs: params.iter().any(|p| p.is_vararg),
         has_varkwargs: params.iter().any(|p| p.is_varkwarg),
         ret_ty: resolve_type(ret),
         n_locals: compiler.local_names.len(),
-        local_names: compiler.local_names,
-        cellvars,
-        freevars,
+        local_names: compiler.local_names.iter().collect(),
+        cellvars: cellvars.iter().collect(),
+        freevars: freevars.iter().collect(),
         local_types: compiler.local_types,
         consts: compiler.consts,
-        names: compiler.names,
+        names: compiler.names.iter().collect(),
         ops,
         cache_count,
         exc_table,
@@ -804,8 +852,8 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
             }
         }
         Stmt::Import { modules } => {
-            for (_, bound) in modules {
-                add_dynamic_local(bound, names, types);
+            for (module, alias) in modules {
+                add_dynamic_local(ast::import_bound_name(module, alias), names, types);
             }
         }
         Stmt::ImportFrom { names: imports, .. } => {
@@ -846,6 +894,12 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
             body,
             orelse,
             ..
+        }
+        | Stmt::AsyncFor {
+            target,
+            body,
+            orelse,
+            ..
         } => {
             if !names.iter().any(|n| n == target) {
                 names.push(target.clone());
@@ -879,6 +933,11 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
             }
         }
         Stmt::With {
+            optional_name,
+            body,
+            ..
+        }
+        | Stmt::AsyncWith {
             optional_name,
             body,
             ..
@@ -1006,6 +1065,9 @@ fn collect_comp_targets_stmt(
         }
         Stmt::ForIter {
             iterable, body, orelse, ..
+        }
+        | Stmt::AsyncFor {
+            iterable, body, orelse, ..
         } => {
             collect_comp_targets_expr(iterable, names, types);
             for s in body.iter().chain(orelse) {
@@ -1024,7 +1086,7 @@ fn collect_comp_targets_stmt(
                 }
             }
         }
-        Stmt::With { context, body, .. } => {
+        Stmt::With { context, body, .. } | Stmt::AsyncWith { context, body, .. } => {
             collect_comp_targets_expr(context, names, types);
             for s in body {
                 collect_comp_targets_stmt(s, names, types);
@@ -1322,7 +1384,9 @@ fn collect_comp_targets_expr(
                 collect_comp_targets_expr(v, names, types);
             }
         }
-        Expr::YieldFrom(value) => collect_comp_targets_expr(value, names, types),
+        Expr::YieldFrom(value) | Expr::Await(value) => {
+            collect_comp_targets_expr(value, names, types);
+        }
     }
 }
 
@@ -1378,7 +1442,9 @@ fn collect_nonlocals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 collect_nonlocals_stmt(s, out);
             }
         }
-        Stmt::For { body, orelse, .. } | Stmt::ForIter { body, orelse, .. } => {
+        Stmt::For { body, orelse, .. }
+        | Stmt::ForIter { body, orelse, .. }
+        | Stmt::AsyncFor { body, orelse, .. } => {
             for s in body.iter().chain(orelse.iter()) {
                 collect_nonlocals_stmt(s, out);
             }
@@ -1393,7 +1459,7 @@ fn collect_nonlocals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Stmt::With { body, .. } => {
+        Stmt::With { body, .. } | Stmt::AsyncWith { body, .. } => {
             for s in body {
                 collect_nonlocals_stmt(s, out);
             }
@@ -1422,7 +1488,9 @@ fn collect_globals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 collect_globals_stmt(s, out);
             }
         }
-        Stmt::For { body, orelse, .. } | Stmt::ForIter { body, orelse, .. } => {
+        Stmt::For { body, orelse, .. }
+        | Stmt::ForIter { body, orelse, .. }
+        | Stmt::AsyncFor { body, orelse, .. } => {
             for s in body.iter().chain(orelse.iter()) {
                 collect_globals_stmt(s, out);
             }
@@ -1437,7 +1505,7 @@ fn collect_globals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Stmt::With { body, .. } => {
+        Stmt::With { body, .. } | Stmt::AsyncWith { body, .. } => {
             for s in body {
                 collect_globals_stmt(s, out);
             }
@@ -1534,7 +1602,8 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
             walk_body_uses(body, u);
             walk_body_uses(orelse, u);
         }
-        Stmt::ForIter { iterable, body, orelse, .. } => {
+        Stmt::ForIter { iterable, body, orelse, .. }
+        | Stmt::AsyncFor { iterable, body, orelse, .. } => {
             walk_expr_uses(iterable, u);
             walk_body_uses(body, u);
             walk_body_uses(orelse, u);
@@ -1558,7 +1627,7 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
             walk_body_uses(orelse, u);
             walk_body_uses(finalbody, u);
         }
-        Stmt::With { context, body, .. } => {
+        Stmt::With { context, body, .. } | Stmt::AsyncWith { context, body, .. } => {
             walk_expr_uses(context, u);
             walk_body_uses(body, u);
         }
@@ -1726,7 +1795,7 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
                 walk_expr_uses(v, u);
             }
         }
-        Expr::YieldFrom(value) => walk_expr_uses(value, u),
+        Expr::YieldFrom(value) | Expr::Await(value) => walk_expr_uses(value, u),
     }
 }
 
@@ -1878,12 +1947,14 @@ fn gather_appends_stmt(stmt: &Stmt, names: &[String], appends: &mut [Vec<Expr>])
                 gather_appends_stmt(s, names, appends);
             }
         }
-        Stmt::For { body, orelse, .. } | Stmt::ForIter { body, orelse, .. } => {
+        Stmt::For { body, orelse, .. }
+        | Stmt::ForIter { body, orelse, .. }
+        | Stmt::AsyncFor { body, orelse, .. } => {
             for s in body.iter().chain(orelse) {
                 gather_appends_stmt(s, names, appends);
             }
         }
-        Stmt::With { body, .. } => {
+        Stmt::With { body, .. } | Stmt::AsyncWith { body, .. } => {
             for s in body {
                 gather_appends_stmt(s, names, appends);
             }
@@ -2098,6 +2169,13 @@ fn gather_assignments_stmt(
             body,
             orelse,
             ..
+        }
+        | Stmt::AsyncFor {
+            target,
+            iterable,
+            body,
+            orelse,
+            ..
         } => {
             if let Some(slot) = names.iter().position(|n| n == target) {
                 rhss[slot].push(Expr::Subscript {
@@ -2132,6 +2210,11 @@ fn gather_assignments_stmt(
             }
         }
         Stmt::With {
+            optional_name,
+            body,
+            ..
+        }
+        | Stmt::AsyncWith {
             optional_name,
             body,
             ..
@@ -2552,7 +2635,8 @@ impl Compiler {
     /// Emit one `LoadClosure` per free variable of a nested function (in that function's freevar
     /// order), pushing the matching cell from this frame's deref array. Returns the `CLOSURE` flag
     /// bit for `MakeFunction` (0 when the nested function captures nothing).
-    fn emit_captured_cells(&mut self, freevars: &[String]) -> u8 {
+    fn emit_captured_cells<'n>(&mut self, freevars: impl IntoIterator<Item = &'n str>) -> u8 {
+        let freevars: Vec<&str> = freevars.into_iter().collect();
         if freevars.is_empty() {
             return 0;
         }
@@ -2572,7 +2656,7 @@ impl Compiler {
         self.decorating_a_def = false;
         match stmt {
             Stmt::FuncDef(func) => {
-                if self.scope == Scope::Function {
+                if self.scope.is_function() {
                     self.compile_nested_def(func)
                 } else if direct && self.owns_module_def_name(&func.name) && !decorated {
                     self.compile_module_def(func)
@@ -2609,7 +2693,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Return(value) => {
-                if self.scope != Scope::Function {
+                if !self.scope.is_function() {
                     return Err(error("'return' outside a function"));
                 }
                 match value {
@@ -2676,6 +2760,12 @@ impl Compiler {
                 body,
                 orelse,
             } => self.compile_for_iter(target, iterable, body, orelse),
+            Stmt::AsyncFor {
+                target,
+                iterable,
+                body,
+                orelse,
+            } => self.compile_async_for(target, iterable, body, orelse),
             Stmt::Raise { exc, cause } => {
                 match (exc, cause) {
                     (Some(e), Some(c)) => {
@@ -2707,7 +2797,12 @@ impl Compiler {
                 context,
                 optional_name,
                 body,
-            } => self.compile_with(context, optional_name, body),
+            } => self.compile_with(context, optional_name, body, false),
+            Stmt::AsyncWith {
+                context,
+                optional_name,
+                body,
+            } => self.compile_with(context, optional_name, body, true),
             Stmt::Break => {
                 let (_, target, fin_depth, handler_depth) = self
                     .loops
@@ -2731,10 +2826,16 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Import { modules } => {
-                for (module, bound) in modules {
+                for (module, alias) in modules {
                     let midx = self.name_index(module);
                     self.asm.emit(bc::Op::ImportName(midx));
-                    self.emit_store_name(bound);
+                    let root = module.split('.').next().unwrap_or(module);
+                    if alias.is_none() && root != module {
+                        self.asm.emit(bc::Op::PopTop);
+                        let ridx = self.name_index(root);
+                        self.asm.emit(bc::Op::ImportName(ridx));
+                    }
+                    self.emit_store_name(ast::import_bound_name(module, alias));
                 }
                 Ok(())
             }
@@ -3079,7 +3180,13 @@ impl Compiler {
         context: &Expr,
         optional_name: &Option<String>,
         body: &[Stmt],
+        is_async: bool,
     ) -> Result<(), CompileError> {
+        let (enter_name, exit_name) = if is_async {
+            ("__aenter__", "__aexit__")
+        } else {
+            ("__enter__", "__exit__")
+        };
         let mgr = self.alloc_temp();
         let mgr_name = format!(".t{mgr}");
         self.compile_expr(context)?;
@@ -3087,10 +3194,15 @@ impl Compiler {
         let enter = Expr::Call {
             func: Box::new(Expr::Attribute {
                 value: Box::new(Expr::Name(mgr_name.clone())),
-                attr: String::from("__enter__"),
+                attr: String::from(enter_name),
             }),
             args: Vec::new(),
             keywords: Vec::new(),
+        };
+        let enter = if is_async {
+            Expr::Await(Box::new(enter))
+        } else {
+            enter
         };
         self.compile_expr(&enter)?;
         match optional_name {
@@ -3104,13 +3216,20 @@ impl Compiler {
         self.compile_expr(&Expr::Bool(false))?;
         self.asm.emit(bc::Op::StoreFast(hit));
 
-        let exit_call = |args: Vec<Expr>| Expr::Call {
-            func: Box::new(Expr::Attribute {
-                value: Box::new(Expr::Name(mgr_name.clone())),
-                attr: String::from("__exit__"),
-            }),
-            args,
-            keywords: Vec::new(),
+        let exit_call = |args: Vec<Expr>| {
+            let call = Expr::Call {
+                func: Box::new(Expr::Attribute {
+                    value: Box::new(Expr::Name(mgr_name.clone())),
+                    attr: String::from(exit_name),
+                }),
+                args,
+                keywords: Vec::new(),
+            };
+            if is_async {
+                Expr::Await(Box::new(call))
+            } else {
+                call
+            }
         };
         let type_of_exc = Expr::Call {
             func: Box::new(Expr::Name(String::from("type"))),
@@ -3181,7 +3300,7 @@ impl Compiler {
             compile_class_method_bodies(&qualified, body, &mut self.hoisted, &enclosing, &self.func_rets.clone())?;
             qualified
         };
-        let name_const = self.const_index(bc::Const::Str(String::from(name)));
+        let name_const = self.const_index(bc::Const::Str(name.into()));
         self.asm.emit(bc::Op::LoadConst(name_const));
         match bases {
             [] => {
@@ -3201,9 +3320,9 @@ impl Compiler {
         }
         self.asm.emit(bc::Op::SetupClassNamespace);
         self.in_class_body = true;
-        let doc = docstring_of(body.first());
+        let doc = docstring_of(body.first())?;
         let doc_const = match doc {
-            Some(text) => self.const_index(bc::Const::Str(String::from(text))),
+            Some(text) => self.const_index(bc::Const::Str(text.into())),
             None => self.const_index(bc::Const::None),
         };
         self.asm.emit(bc::Op::LoadConst(doc_const));
@@ -3217,7 +3336,7 @@ impl Compiler {
                     let freevars = self.method_freevars(qualified);
                     let f = self.name_index(qualified);
                     let mut flags = self.emit_param_defaults(&method.params)?;
-                    flags |= self.emit_captured_cells(&freevars);
+                    flags |= self.emit_captured_cells(freevars.iter().map(String::as_str));
                     self.asm.emit(bc::Op::MakeFunction { func: f, flags });
                     self.emit_store_member(&method.name);
                 }
@@ -3233,7 +3352,7 @@ impl Compiler {
                     let freevars = self.method_freevars(qualified);
                     let f = self.name_index(qualified);
                     let mut flags = self.emit_param_defaults(&method.params)?;
-                    flags |= self.emit_captured_cells(&freevars);
+                    flags |= self.emit_captured_cells(freevars.iter().map(String::as_str));
                     self.asm.emit(bc::Op::MakeFunction { func: f, flags });
                     for _ in decorators {
                         self.asm.emit(bc::Op::Call(1));
@@ -3277,7 +3396,7 @@ impl Compiler {
         self.hoisted
             .iter()
             .find(|c| c.name == qualified)
-            .map(|c| c.freevars.clone())
+            .map(|c| c.freevars.iter().map(String::from).collect())
             .unwrap_or_default()
     }
 
@@ -3326,6 +3445,120 @@ impl Compiler {
         }
         self.asm.place(after);
         Ok(())
+    }
+
+    /// The local slot of `xs` in `xs.append(v)` when `xs` is a local this scope settled as a
+    /// growable list, else `None` -- the sites that get a [`bc::Op::ListGrow`].
+    ///
+    /// Deliberately narrow: a bare-name receiver, the attribute `append`, exactly one argument, and
+    /// a local slot whose settled type is a growable list. Anything else keeps today's emission,
+    /// because a `ListGrow` buys nothing where the typed lowering was never going to recognize the
+    /// append anyway.
+    fn growable_append_slot(&self, func: &Expr, args: &[Expr]) -> Option<u32> {
+        if args.len() != 1 {
+            return None;
+        }
+        let Expr::Attribute { value, attr } = func else {
+            return None;
+        };
+        if attr != "append" {
+            return None;
+        }
+        let Expr::Name(name) = &**value else {
+            return None;
+        };
+        let slot = self.local_names.iter().position(|n| n == name)?;
+        matches!(
+            self.local_types.get(slot),
+            Some(bc::StaticType::GrowListInt | bc::StaticType::GrowListFloat)
+        )
+        .then_some(slot as u32)
+    }
+
+    /// `async for target in aiterable:` -- the ASYNC iterator protocol, desugared over the existing
+    /// `while` / `try` emitters:
+    /// ```text
+    /// _it = aiterable.__aiter__()
+    /// _done = False
+    /// while not _done:
+    ///     try:
+    ///         target = await _it.__anext__()
+    ///     except StopAsyncIteration:
+    ///         _done = True
+    ///     if not _done:
+    ///         body
+    /// else:
+    ///     orelse
+    /// ```
+    /// The `_done` flag is what makes the `else` clause come out right, and it is the whole reason
+    /// this is not the obvious `while True: ... except: break` shape. Exhausting the iterator is
+    /// NORMAL completion, so `orelse` must run -- but a `break` in the user's body must SKIP it.
+    /// Ending the loop by falsifying its condition gets both from one `while ... else`: the flag
+    /// path falls out of the loop into `orelse`, a `break` leaves past it. The flag also guards the
+    /// body, so the iteration that discovered exhaustion does not run it with a stale target.
+    ///
+    /// `__aiter__` is NOT awaited (it returns the async iterator directly); `__anext__` is.
+    fn compile_async_for(
+        &mut self,
+        target: &str,
+        iterable: &Expr,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), CompileError> {
+        let it = self.alloc_temp();
+        let it_name = format!(".t{it}");
+        let done = self.alloc_temp();
+        let done_name = format!(".t{done}");
+        self.compile_expr(&Expr::Call {
+            func: Box::new(Expr::Attribute {
+                value: Box::new(iterable.clone()),
+                attr: String::from("__aiter__"),
+            }),
+            args: Vec::new(),
+            keywords: Vec::new(),
+        })?;
+        self.asm.emit(bc::Op::StoreFast(it));
+        self.compile_expr(&Expr::Bool(false))?;
+        self.asm.emit(bc::Op::StoreFast(done));
+
+        let not_done = || Expr::Not {
+            operand: Box::new(Expr::Name(done_name.clone())),
+        };
+        let step = Stmt::Try {
+            body: vec![Stmt::Assign(Assign {
+                target: String::from(target),
+                annotation: None,
+                value: Some(Expr::Await(Box::new(Expr::Call {
+                    func: Box::new(Expr::Attribute {
+                        value: Box::new(Expr::Name(it_name)),
+                        attr: String::from("__anext__"),
+                    }),
+                    args: Vec::new(),
+                    keywords: Vec::new(),
+                }))),
+            })],
+            handlers: vec![ExceptHandler {
+                typ: Some(Expr::Name(String::from("StopAsyncIteration"))),
+                name: None,
+                body: vec![Stmt::Assign(Assign {
+                    target: done_name.clone(),
+                    annotation: None,
+                    value: Some(Expr::Bool(true)),
+                })],
+            }],
+            orelse: Vec::new(),
+            finalbody: Vec::new(),
+        };
+        let guarded_body = Stmt::If {
+            test: not_done(),
+            body: body.to_vec(),
+            orelse: Vec::new(),
+        };
+        self.compile_stmt(&Stmt::While {
+            test: not_done(),
+            body: vec![step, guarded_body],
+            orelse: orelse.to_vec(),
+        })
     }
 
     /// `for target in <typed list/tuple>: body` -- desugared to a counted loop `while i < len(it):
@@ -3646,6 +3879,9 @@ impl Compiler {
                     for arg in args {
                         self.compile_expr(arg)?;
                     }
+                    if let Some(slot) = self.growable_append_slot(func, args) {
+                        self.asm.emit(bc::Op::ListGrow { list: slot });
+                    }
                     self.asm.emit(bc::Op::Call(args.len() as u32));
                 }
             }
@@ -3677,7 +3913,6 @@ impl Compiler {
                 let kinds_idx = self.const_index(bc::Const::ArgKinds(kinds));
                 let kwnames_idx = self.const_index(bc::Const::KwNames(kwnames));
                 self.asm.emit(bc::Op::CallEx {
-                    argc: args.len() as u32,
                     kinds: kinds_idx,
                     kwnames: kwnames_idx,
                 });
@@ -3699,6 +3934,16 @@ impl Compiler {
                 self.asm.emit(bc::Op::GetIter);
                 self.asm.emit(bc::Op::YieldFrom);
                 self.has_yield = true;
+            }
+            Expr::Await(value) => {
+                if self.scope != Scope::Coroutine {
+                    return Err(error(
+                        "'await' inside a comprehension is not supported in this subset (the \
+                         comprehension compiles to a function of its own, which is not a coroutine)",
+                    ));
+                }
+                self.compile_expr(value)?;
+                self.asm.emit(bc::Op::Await);
             }
         }
         Ok(())
@@ -3752,7 +3997,7 @@ impl Compiler {
         let qualified = format!("{}.${seq}.{}", self.name, func.name);
         let body: Vec<&Stmt> = func.body.iter().collect();
         let (co, hoisted) = compile_code_object(
-            Scope::Function,
+            scope_of(func),
             &qualified,
             &func.params,
             &func.ret,
@@ -3799,7 +4044,7 @@ impl Compiler {
             for p in params {
                 if p.keyword_only {
                     if let Some(default) = &p.default {
-                        let key = self.const_index(bc::Const::Str(p.name.clone()));
+                        let key = self.const_index(bc::Const::Str(p.name.as_str().into()));
                         self.asm.emit(bc::Op::LoadConst(key));
                         self.compile_expr(default)?;
                     }
@@ -3833,7 +4078,7 @@ impl Compiler {
         };
         let body: Vec<&Stmt> = func.body.iter().collect();
         let (co, hoisted) = compile_code_object(
-            Scope::Function,
+            scope_of(func),
             &qualified,
             &func.params,
             &func.ret,
@@ -3845,7 +4090,7 @@ impl Compiler {
         self.hoisted.push(co);
         self.hoisted.extend(hoisted);
         let mut flags = self.emit_param_defaults(&func.params)?;
-        flags |= self.emit_captured_cells(&freevars);
+        flags |= self.emit_captured_cells(freevars.iter());
         let func_idx = self.name_index(&qualified);
         self.asm.emit(bc::Op::MakeFunction { func: func_idx, flags });
         self.emit_store_name(&func.name);
@@ -3879,7 +4124,7 @@ impl Compiler {
         self.hoisted.push(lambda_co);
         self.hoisted.extend(nested);
         let mut flags = self.emit_param_defaults(params)?;
-        flags |= self.emit_captured_cells(&freevars);
+        flags |= self.emit_captured_cells(freevars.iter());
         let idx = self.name_index(&lambda_name);
         self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
         Ok(())
@@ -3924,7 +4169,7 @@ impl Compiler {
         let freevars = co.freevars.clone();
         self.hoisted.push(co);
         self.hoisted.extend(nested);
-        let flags = self.emit_captured_cells(&freevars);
+        let flags = self.emit_captured_cells(freevars.iter());
         let idx = self.name_index(&name);
         self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
         self.compile_expr(first_iterable)?;
@@ -4618,6 +4863,271 @@ mod tests {
         assert!(gi < yf, "GetIter (obtain the sub-iterator) precedes YieldFrom (delegate)");
     }
 
+    /// Parse + compile, returning the error message for a program that must be refused.
+    fn compile_err(source: &str) -> String {
+        match tokenize(source) {
+            Err(e) => e.message,
+            Ok(tokens) => match parse(tokens) {
+                Err(e) => e.message,
+                Ok(ast) => compile_module("test", &ast)
+                    .expect_err("expected a refusal")
+                    .message,
+            },
+        }
+    }
+
+    #[test]
+    fn a_growable_append_is_preceded_by_the_capacity_op() {
+        let module = compile_src("xs = []
+xs.append(1)
+").unwrap();
+        let grows: Vec<&Op> = module
+            .body
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::ListGrow { .. }))
+            .collect();
+        assert_eq!(grows.len(), 1, "one per append: {:?}", module.body.ops);
+        let at = module.body.ops.iter().position(|op| matches!(op, Op::ListGrow { .. })).unwrap();
+        assert!(matches!(module.body.ops[at + 1], Op::Call(1)), "directly before the append call");
+
+        let fixed = compile_src("xs: list[int] = []
+xs.append(1)
+").unwrap();
+        assert!(!fixed.body.ops.iter().any(|op| matches!(op, Op::ListGrow { .. })));
+        let dynamic = compile_src("xs = make()
+xs.append(1)
+").unwrap();
+        assert!(!dynamic.body.ops.iter().any(|op| matches!(op, Op::ListGrow { .. })));
+        let arity = compile_src("xs = []
+xs.append(1, 2)
+").unwrap();
+        assert!(!arity.body.ops.iter().any(|op| matches!(op, Op::ListGrow { .. })));
+    }
+
+    #[test]
+    fn a_dotted_import_binds_the_root_and_an_aliased_one_binds_the_leaf() {
+        let module = compile_src("import a.b
+").unwrap();
+        assert!(module.body.names.iter().any(|n| n == "a.b"), "the chain is imported");
+        assert!(module.body.names.iter().any(|n| n == "a"), "and the root is what binds");
+        let imports: Vec<&Op> = module
+            .body
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::ImportName(_) | Op::PopTop))
+            .collect();
+        assert_eq!(imports.len(), 3, "leaf import, discard, root import: {imports:?}");
+        assert!(matches!(imports[1], Op::PopTop), "the pushed leaf is discarded");
+
+        let aliased = compile_src("import a.b as x
+").unwrap();
+        assert_eq!(
+            aliased.body.ops.iter().filter(|op| matches!(op, Op::ImportName(_))).count(),
+            1,
+            "an aliased dotted import needs only the leaf"
+        );
+        assert!(!aliased.body.ops.iter().any(|op| matches!(op, Op::PopTop)));
+
+        let plain = compile_src("import a
+").unwrap();
+        assert_eq!(
+            plain.body.ops.iter().filter(|op| matches!(op, Op::ImportName(_))).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_alias_equal_to_the_root_still_binds_the_leaf() {
+        let module = compile_src("import a.b as a
+").unwrap();
+        assert_eq!(
+            module.body.ops.iter().filter(|op| matches!(op, Op::ImportName(_))).count(),
+            1,
+            "the leaf is imported once and bound directly"
+        );
+        assert!(
+            !module.body.ops.iter().any(|op| matches!(op, Op::PopTop)),
+            "nothing is discarded, because the pushed leaf IS what binds"
+        );
+    }
+
+    #[test]
+    fn a_dotted_from_import_reads_members_off_the_leaf() {
+        let module = compile_src("from a.b import c
+").unwrap();
+        assert!(module.body.names.iter().any(|n| n == "a.b"), "the leaf is the source");
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::ImportFrom(_))));
+        assert_eq!(
+            module.body.ops.iter().filter(|op| matches!(op, Op::ImportName(_))).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_package_relative_import_is_refused_by_name() {
+        for src in ["from . import x
+", "from .a import b
+", "from .. import y
+"] {
+            assert!(
+                compile_err(src).contains("package-relative import"),
+                "{src}: {}",
+                compile_err(src)
+            );
+        }
+    }
+
+    #[test]
+    fn an_async_def_is_a_coroutine_and_not_a_generator() {
+        let module = compile_src("async def f():\n    pass\n").unwrap();
+        let f = func(&module, "f");
+        assert!(f.is_coroutine, "an async def is a coroutine");
+        assert!(!f.is_generator, "and is not a generator");
+        let plain = compile_src("def h():\n    return 5\n").unwrap();
+        assert!(!func(&plain, "h").is_coroutine);
+        let generator = compile_src("def g():\n    yield 1\n").unwrap();
+        let g = func(&generator, "g");
+        assert!(g.is_generator && !g.is_coroutine);
+    }
+
+    #[test]
+    fn await_emits_the_await_op_with_no_getiter() {
+        let module = compile_src("async def f():\n    return await g()\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.ops.iter().filter(|op| matches!(op, Op::Await)).count(), 1);
+        assert!(
+            !f.ops.iter().any(|op| matches!(op, Op::GetIter)),
+            "await does not iterate its operand"
+        );
+        let call = f.ops.iter().position(|op| matches!(op, Op::Call(_))).unwrap();
+        let await_at = f.ops.iter().position(|op| matches!(op, Op::Await)).unwrap();
+        assert!(call < await_at, "the operand is pushed, then awaited");
+    }
+
+    #[test]
+    fn await_binds_as_a_primary_not_a_unary_expression() {
+        let module = compile_src("async def f():\n    return await a ** b\n").unwrap();
+        let f = func(&module, "f");
+        let await_at = f.ops.iter().position(|op| matches!(op, Op::Await)).unwrap();
+        let pow_at = f
+            .ops
+            .iter()
+            .position(|op| matches!(op, Op::Binary(bc::BinOp::Pow)))
+            .unwrap();
+        assert!(await_at < pow_at, "await binds tighter than **");
+        assert!(compile_err("async def f():\n    return await -a\n").contains("expected an expression"));
+    }
+
+    #[test]
+    fn async_for_desugars_to_the_async_iterator_protocol() {
+        let module =
+            compile_src("async def f():\n    async for x in it:\n        print(x)\n").unwrap();
+        let f = func(&module, "f");
+        assert!(f.names.iter().any(|n| n == "__aiter__"));
+        assert!(f.names.iter().any(|n| n == "__anext__"));
+        assert!(
+            f.names.iter().any(|n| n == "StopAsyncIteration"),
+            "exhaustion is caught by name"
+        );
+        assert!(f.ops.iter().any(|op| matches!(op, Op::Await)), "__anext__ is awaited");
+        assert!(
+            !f.ops.iter().any(|op| matches!(op, Op::ForIter { .. } | Op::GetIter)),
+            "it does not fall back to the sync iterator protocol"
+        );
+    }
+
+    #[test]
+    fn async_for_over_a_range_call_does_not_take_the_counted_fast_path() {
+        let module = compile_src("async def f():\n    async for i in range(3):\n        print(i)\n")
+            .unwrap();
+        let f = func(&module, "f");
+        assert!(
+            f.names.iter().any(|n| n == "__aiter__"),
+            "the async protocol is used even for a range header"
+        );
+    }
+
+    #[test]
+    fn async_with_reuses_the_pep343_protocol_with_awaited_async_dunders() {
+        let module =
+            compile_src("async def f():\n    async with mgr() as x:\n        print(x)\n").unwrap();
+        let f = func(&module, "f");
+        assert!(f.names.iter().any(|n| n == "__aenter__"));
+        assert!(f.names.iter().any(|n| n == "__aexit__"));
+        assert!(!f.names.iter().any(|n| n == "__enter__"), "not the sync dunder");
+        assert!(f.ops.iter().any(|op| matches!(op, Op::Reraise)), "the exception path survives");
+        assert_eq!(
+            f.ops.iter().filter(|op| matches!(op, Op::Await)).count(),
+            4,
+            "__aenter__ plus the handler's and both finally copies' __aexit__ calls"
+        );
+    }
+
+    #[test]
+    fn async_constructs_outside_a_coroutine_are_refused_with_cpythons_messages() {
+        assert_eq!(compile_err("await x\n"), "'await' outside function");
+        assert_eq!(compile_err("def f():\n    await x\n"), "'await' outside async function");
+        assert_eq!(
+            compile_err("async def f():\n    def g():\n        await x\n"),
+            "'await' outside async function"
+        );
+        assert_eq!(
+            compile_err("async def f():\n    return lambda: await x\n"),
+            "'await' outside async function"
+        );
+        assert_eq!(
+            compile_err("def f():\n    async for x in y:\n        pass\n"),
+            "'async for' outside async function"
+        );
+        assert_eq!(
+            compile_err("def f():\n    async with y:\n        pass\n"),
+            "'async with' outside async function"
+        );
+        assert_eq!(compile_err("async def f():\n    pass\nawait x\n"), "'await' outside function");
+    }
+
+    #[test]
+    fn the_async_surface_this_subset_does_not_have_is_refused_by_name() {
+        assert!(compile_err("async def f():\n    yield 1\n").contains("async generator"));
+        assert_eq!(
+            compile_err("async def f():\n    yield from g()\n"),
+            "'yield from' inside async function"
+        );
+        assert!(
+            compile_err("async def f():\n    return [x async for x in y]\n")
+                .contains("asynchronous comprehension")
+        );
+        assert!(
+            compile_err("async def f():\n    return [await x for x in y]\n")
+                .contains("comprehension"),
+            "an await moved into a hidden comprehension function is refused, not emitted"
+        );
+        assert!(compile_err("x = o.async\n").contains("is a keyword in Python 3.7 and later"));
+        assert!(compile_err("def await():\n    pass\n").contains("is a keyword in Python 3.7 and later"));
+        assert_eq!(compile_err("async = 1\n"), "expected 'def', 'for' or 'with' after 'async'");
+    }
+
+    #[test]
+    fn the_coroutine_flag_survives_every_route_a_def_can_take() {
+        let decorated = compile_src("@dec\nasync def f():\n    pass\n").unwrap();
+        assert!(
+            decorated.functions.iter().any(|f| f.is_coroutine),
+            "decoration does not lose the coroutine flag"
+        );
+        let method = compile_src("class C:\n    async def m(self):\n        return await g()\n")
+            .unwrap();
+        let m = func(&method, "C.m");
+        assert!(m.is_coroutine, "an async method is a coroutine");
+        assert!(m.ops.iter().any(|op| matches!(op, Op::Await)));
+        let nested = compile_src("def outer():\n    async def inner():\n        pass\n").unwrap();
+        assert!(
+            nested.functions.iter().any(|f| f.name.ends_with("inner") && f.is_coroutine),
+            "a nested async def is a coroutine"
+        );
+        assert!(!func(&nested, "outer").is_coroutine);
+    }
+
     #[test]
     fn genexpr_compiles_to_a_lazy_generator_function() {
         let module = compile_src("g = (x * x for x in xs)\n").unwrap();
@@ -4679,7 +5189,7 @@ mod tests {
             compile_src("def f():\n    n = 5\n    g = lambda: n\n    return g\n").unwrap();
         let f = module.functions.iter().find(|c| c.name == "f").expect("f present");
         assert_eq!(f.cellvars.len(), 1);
-        assert_eq!(f.cellvars[0], "n");
+        assert_eq!(&f.cellvars[0], "n");
         assert!(f.ops.iter().any(|op| matches!(op, Op::StoreDeref(0))));
         assert!(f.ops.iter().any(|op| matches!(op, Op::LoadClosure(0))));
         assert!(f
@@ -4692,7 +5202,7 @@ mod tests {
             .find(|c| c.name.contains("<lambda."))
             .expect("lambda present");
         assert_eq!(lam.freevars.len(), 1);
-        assert_eq!(lam.freevars[0], "n");
+        assert_eq!(&lam.freevars[0], "n");
         assert!(lam.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
     }
 
@@ -4701,7 +5211,7 @@ mod tests {
         let src = "def make_adder(k):\n    def add(n):\n        return n + k\n    return add\n";
         let module = compile_src(src).unwrap();
         let outer = func(&module, "make_adder");
-        assert_eq!(outer.cellvars, [String::from("k")]);
+        assert_eq!(outer.cellvars.iter().collect::<Vec<_>>(), ["k"]);
         assert!(outer.freevars.is_empty());
         assert!(outer.ops.iter().any(|op| matches!(op, Op::LoadClosure(0))));
         assert!(outer
@@ -4710,7 +5220,7 @@ mod tests {
             .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x04 != 0)));
         let inner = func(&module, "make_adder.add");
         assert!(inner.cellvars.is_empty());
-        assert_eq!(inner.freevars, [String::from("k")]);
+        assert_eq!(inner.freevars.iter().collect::<Vec<_>>(), ["k"]);
         assert_eq!(
             &inner.ops[..4],
             &[Op::LoadFast(0), Op::LoadDeref(0), Op::Binary(BinOp::Add), Op::Return]
@@ -4723,7 +5233,7 @@ mod tests {
                    return x + n\n    return Adder()\n";
         let module = compile_src(src).unwrap();
         let outer = func(&module, "make_adder");
-        assert_eq!(outer.cellvars, [String::from("n")]);
+        assert_eq!(outer.cellvars.iter().collect::<Vec<_>>(), ["n"]);
         assert!(outer.freevars.is_empty());
         assert!(outer.ops.iter().any(|op| matches!(op, Op::LoadClosure(0))));
         assert!(outer
@@ -4732,7 +5242,7 @@ mod tests {
             .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x04 != 0)));
         let method = func(&module, "make_adder.Adder.add");
         assert!(method.cellvars.is_empty());
-        assert_eq!(method.freevars, [String::from("n")]);
+        assert_eq!(method.freevars.iter().collect::<Vec<_>>(), ["n"]);
         assert_eq!(
             &method.ops[..4],
             &[Op::LoadFast(1), Op::LoadDeref(0), Op::Binary(BinOp::Add), Op::Return]
@@ -4774,12 +5284,12 @@ mod tests {
         let module = compile_src(src).unwrap();
 
         let repeat = func(&module, "repeat");
-        assert_eq!(repeat.cellvars, [String::from("times")]);
+        assert_eq!(repeat.cellvars.iter().collect::<Vec<_>>(), ["times"]);
         assert!(repeat.freevars.is_empty());
 
         let deco = func(&module, "repeat.deco");
-        assert_eq!(deco.cellvars, [String::from("fn")]);
-        assert_eq!(deco.freevars, [String::from("times")]);
+        assert_eq!(deco.cellvars.iter().collect::<Vec<_>>(), ["fn"]);
+        assert_eq!(deco.freevars.iter().collect::<Vec<_>>(), ["times"]);
         let closures: Vec<u32> = deco
             .ops
             .iter()
@@ -4792,7 +5302,7 @@ mod tests {
 
         let wrapper = func(&module, "repeat.deco.wrapper");
         assert!(wrapper.cellvars.is_empty());
-        assert_eq!(wrapper.freevars, [String::from("fn"), String::from("times")]);
+        assert_eq!(wrapper.freevars.iter().collect::<Vec<_>>(), ["fn", "times"]);
         assert!(wrapper.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
         assert!(wrapper.ops.iter().any(|op| matches!(op, Op::LoadDeref(1))));
     }
@@ -4812,9 +5322,9 @@ mod tests {
         let src = "def make_counter():\n    box = [0]\n    def step():\n        \
                    box[0] = box[0] + 1\n        return box[0]\n    return step\n";
         let module = compile_src(src).unwrap();
-        assert_eq!(func(&module, "make_counter").cellvars, [String::from("box")]);
+        assert_eq!(func(&module, "make_counter").cellvars.iter().collect::<Vec<_>>(), ["box"]);
         let step = func(&module, "make_counter.step");
-        assert_eq!(step.freevars, [String::from("box")]);
+        assert_eq!(step.freevars.iter().collect::<Vec<_>>(), ["box"]);
         assert!(step.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
         assert!(step.ops.iter().any(|op| matches!(op, Op::Setitem)));
         assert!(!step.ops.iter().any(|op| matches!(op, Op::StoreDeref(_))));
@@ -4826,11 +5336,11 @@ mod tests {
                    n = n + 1\n        return n\n    return step\n";
         let module = compile_src(src).unwrap();
         let outer = func(&module, "make_counter");
-        assert_eq!(outer.cellvars, [String::from("n")]);
+        assert_eq!(outer.cellvars.iter().collect::<Vec<_>>(), ["n"]);
         assert!(outer.ops.iter().any(|op| matches!(op, Op::StoreDeref(0))), "n = 0 writes the cell");
         let step = func(&module, "make_counter.step");
         assert!(step.cellvars.is_empty());
-        assert_eq!(step.freevars, [String::from("n")]);
+        assert_eq!(step.freevars.iter().collect::<Vec<_>>(), ["n"]);
         assert!(step.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
         assert!(step.ops.iter().any(|op| matches!(op, Op::StoreDeref(0))), "n is written through");
         assert!(!step.local_names.iter().any(|n| n == "n"));
@@ -5301,7 +5811,7 @@ mod tests {
     fn loads_global(co: &bc::CodeObject, name: &str) -> bool {
         co.ops.iter().any(|op| {
             matches!(op, Op::LoadGlobal(i)
-                if co.names.get(*i as usize).map(String::as_str) == Some(name))
+                if co.names.get(*i as usize) == Some(name))
         })
     }
 
@@ -5358,7 +5868,7 @@ mod tests {
         assert!(documented
             .body
             .consts
-            .contains(&bc::Const::Str(String::from("the doc."))));
+            .contains(&bc::Const::Str("the doc.".into())));
         for m in [documented, compile_src("x = 1\n").unwrap()] {
             assert!(
                 m.body.local_names.iter().any(|n| n == "__doc__"),
@@ -5368,13 +5878,32 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_surrogate_reaches_the_constant_pool_intact() {
+        let m = compile_src("x = \"\\ud800\"\n").unwrap();
+        let found = m.body.consts.iter().any(|c| {
+            matches!(c, bc::Const::Str(s) if s.as_bytes() == [0xED, 0xA0, 0x80])
+        });
+        assert!(found, "the surrogate must reach the pool as WTF-8, got: {:?}", m.body.consts);
+
+        let joined = compile_src("x = \"\\ud800\" \"\\udc00\"\n").unwrap();
+        let pair = joined.body.consts.iter().any(|c| {
+            matches!(c, bc::Const::Str(s)
+                if s.as_bytes() == [0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80] && s.code_points().count() == 2)
+        });
+        assert!(pair, "concatenation must not combine a pair, got: {:?}", joined.body.consts);
+
+        let plain = compile_src("x = \"ab\"\n").unwrap();
+        assert!(plain.body.consts.contains(&bc::Const::Str("ab".into())));
+    }
+
+    #[test]
     fn a_class_binds_its_docstring_into_its_own_namespace() {
         let m = compile_src("class C:\n    \"class doc.\"\n    def me(self):\n        return 1\n")
             .unwrap();
         assert!(m
             .body
             .consts
-            .contains(&bc::Const::Str(String::from("class doc."))));
+            .contains(&bc::Const::Str("class doc.".into())));
         assert!(
             m.body.names.iter().any(|n| n == "__doc__"),
             "the class body stores __doc__ as a member"
@@ -5401,6 +5930,68 @@ mod tests {
         assert_eq!(func(&bare, "g").doc, None);
         let later = compile_src("def h():\n    x = 1\n    \"not a doc\"\n    return x\n").unwrap();
         assert_eq!(func(&later, "h").doc, None);
+    }
+
+    /// A docstring carrying a surrogate is REFUSED, in every position a docstring can occupy.
+    ///
+    /// Each row is CPython 3.14.6's own answer, measured rather than reasoned about: it raises
+    /// `UnicodeEncodeError` while COMPILING each of these, because a docstring must be encodable as
+    /// UTF-8. Accepting them would have made this front end compile programs the oracle rejects, and
+    /// that is the direction a portability trap runs -- the program is written here and breaks there.
+    ///
+    /// The source rows are written as the six ASCII characters `\ud800`, which is what a Python file
+    /// holding this actually contains. A file holding a REAL surrogate cannot be encoded to UTF-8 and
+    /// so cannot be a Python source file at all.
+    #[test]
+    fn a_docstring_carrying_a_surrogate_is_refused_in_every_docstring_position() {
+        let refused = [
+            ("module", "\"\\ud800doc\"\nx = 1\n"),
+            ("function", "def f():\n    \"\\ud800doc\"\n    return 1\n"),
+            ("class", "class C:\n    \"\\ud800doc\"\n"),
+            (
+                "nested function",
+                "def o():\n    def i():\n        \"\\ud800doc\"\n        return 1\n    return i\n",
+            ),
+            ("surrogate pair", "def f():\n    \"\\ud800\\udc00\"\n    return 1\n"),
+            (
+                "implicit concatenation",
+                "def f():\n    \"ok\" \"\\ud800\"\n    return 1\n",
+            ),
+        ];
+        for (position, source) in refused {
+            let err = compile_src(source)
+                .expect_err(&format!("a {position} docstring with a surrogate must be refused"));
+            assert!(
+                err.message.contains("docstring") && err.message.contains("surrogate"),
+                "the {position} refusal must name the reason, got: {}",
+                err.message
+            );
+        }
+    }
+
+    /// The other half of the rule, and the half that says the refusal is NARROW: the identical text
+    /// is accepted everywhere that is not a docstring, exactly as CPython accepts it. Without these
+    /// rows a refusal that rejected every surrogate string would pass the test above.
+    #[test]
+    fn a_surrogate_outside_a_docstring_position_still_compiles() {
+        for (what, source) in [
+            ("a local", "def f():\n    y = \"\\ud800\"\n    return y\n"),
+            (
+                "a string after the docstring",
+                "def f():\n    \"doc\"\n    z = \"\\ud800\"\n    return z\n",
+            ),
+            ("a module-level assignment", "x = \"\\ud800\"\n"),
+            ("a returned literal", "def f():\n    return \"\\ud800\"\n"),
+            ("a pair", "x = \"\\ud800\\udc00\"\n"),
+            ("adjacent literals", "x = \"ok\" \"\\ud800\"\n"),
+        ] {
+            assert!(
+                compile_src(source).is_ok(),
+                "{what} holding a surrogate must still compile"
+            );
+        }
+        let m = compile_src("def f():\n    \"plain\"\n    return 1\n").unwrap();
+        assert_eq!(func(&m, "f").doc.as_deref(), Some("plain"));
     }
 
     /// `class C(Base, tag="x")`: the keyword VALUES are pushed between the base and the namespace,
@@ -5851,7 +6442,7 @@ mod tests {
         let get_x = func(&module, "get_x");
         assert_eq!(get_x.local_types, vec![StaticType::Dynamic]);
         assert_eq!(get_x.cache_count, 1);
-        assert_eq!(get_x.names, vec![String::from("x")]);
+        assert_eq!(get_x.names.iter().collect::<Vec<_>>(), ["x"]);
         assert_eq!(
             get_x.ops,
             vec![

@@ -1,0 +1,19 @@
+# INSTANCE map for the SAM4L family -- identity-first: ONLY the placed block copies a current
+# binding or control line references.
+
+[table]
+kind = "instances"
+family = "sam4l"
+record = ["base"]
+sources = [
+    "ATSAM4L8/L4/L2 datasheet (Atmel-42023) peripheral memory map: GPIO at 0x400E1000",
+    "ATSAM4L8/L4/L2 datasheet (Atmel-42023) section 23.6.1.1 and figure 23-6 (port configuration registers): the GPIO user interface is organized into ports of 32 pins, port n's configuration registers at n * 0x200 from the block base",
+    "ATSAM4L8/L4/L2 datasheet (Atmel-42023) GPIO function multiplexing table: the pin index column runs PA00 = 0, PB00 = 32, PC00 = 64, so a pin's port number is its index divided by 32 and the PC pins are port 2",
+]
+
+[[instances]]
+name = "gpio_port2"
+block = "gpio"
+port = "C"          # this bank IS the group pins named PC<n> resolve to: PC00 is index 64, and
+                    # 64 / 32 = port 2.
+base = 0x400E1400   # the GPIO block base 0x400E1000 plus port 2's 2 * 0x200.

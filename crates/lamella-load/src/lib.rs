@@ -71,7 +71,9 @@ use lamella_cil_runtime::intrinsics::{
     string_create_from_chars, string_not_equals, string_substring, string_substring_len,
     type_from_handle, type_get_name,
     thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
-    monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
+    monitor_try_enter, monitor_try_enter_timeout, monitor_wait, monitor_wait_timeout,
+    monitor_wait_timed_out, monitor_pulse,
+    monitor_pulse_all,
     socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
     socket_send, socket_recv, socket_set_recv_timeout, socket_local_port, socket_close,
     socket_udp_bind, socket_udp_send_to, socket_udp_recv_from, dns_resolve_host,
@@ -161,6 +163,8 @@ use lamella_cil_runtime::{
     CastElem, CastPrim, IntrinsicFn, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget,
     PrimKind, TypeId, Value,
 };
+
+pub mod monomorphize;
 
 const TYPE_REF: u8 = 0x01;
 const TYPE_DEF: u8 = 0x02;
@@ -1322,6 +1326,7 @@ pub fn load_program_lazy_corlib<'c, 'p>(
     let mut module = Module::new();
     let mut resolution = CorlibResolution::new();
     materialize_corlib_refs(&mut module, &mut resolution, program, corlib);
+    let program_type_offset = module.type_count();
     let entry = load_assembly(
         &mut module,
         program,
@@ -1332,6 +1337,25 @@ pub fn load_program_lazy_corlib<'c, 'p>(
         &mut resolution.field_index,
         true,
     );
+    #[cfg(feature = "generics")]
+    {
+        let instantiations = monomorphize::collect_instantiations(
+            program,
+            core::slice::from_ref(&corlib.clone()),
+        );
+        monomorphize::monomorphize(
+            &mut module,
+            program,
+            LAZY_PROGRAM_ASM,
+            program_type_offset,
+            &resolution.type_index,
+            &resolution.field_index,
+            flash_cil,
+            &instantiations,
+        );
+    }
+    #[cfg(not(feature = "generics"))]
+    let _ = program_type_offset;
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     if let Some(name) = first_unresolved_call(&module, program, LAZY_PROGRAM_ASM, corlib) {
         return Err(LazyLoadError::UnresolvedMember(name));
@@ -1397,6 +1421,8 @@ fn first_unresolved_call(
                     continue;
                 }
                 if module.resolve(asm, *token).is_some()
+                    || module.is_delegate_ctor(asm, *token)
+                    || module.delegate_invoke(asm, *token).is_some()
                     || module.pinvoke_target(asm, token.0).is_some()
                     || corlib_declares_abstract(corlib, assembly, *token)
                 {
@@ -1863,6 +1889,15 @@ fn materialize_corlib_method_row<'c>(
                 declaring,
                 walk,
             );
+
+            if is_delegate_type(corlib, type_def.extends()) {
+                if name == ".ctor" {
+                    module.mark_delegate_ctor(LAZY_CORLIB_ASM, token);
+                } else if name == "Invoke" {
+                    let count = u16::try_from(params.len()).unwrap_or(u16::MAX);
+                    module.mark_delegate_invoke(LAZY_CORLIB_ASM, token, count);
+                }
+            }
 
             let string_ctor =
                 name == ".ctor" && declaring.namespace == "System" && declaring.name == "String";
@@ -2524,6 +2559,44 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
     libraries: &[SourceAssembly<'l>],
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LoadError> {
+    #[cfg(feature = "generics")]
+    let instantiations = {
+        let mut references: Vec<Assembly<'_>> = Vec::with_capacity(1 + libraries.len());
+        references.push(corlib.clone());
+        references.extend(libraries.iter().cloned());
+        monomorphize::collect_instantiations(program, &references)
+    };
+    #[cfg(not(feature = "generics"))]
+    let instantiations: Vec<monomorphize::Instantiation> = Vec::new();
+    load_with_corlib_and_libraries_lowered(corlib, libraries, program, &instantiations)
+        .map(|(program, _)| program)
+}
+
+/// [`load_with_corlib_unfrozen`] with the program's closed generic instantiations MONOMORPHIZED:
+/// each one becomes its own type identity, and the call sites that reach it bind to members of that
+/// identity instead of leaving the `UnloweredGeneric` mark the bake refuses on.
+pub fn load_with_corlib_monomorphized<'c, 'p>(
+    corlib: &SourceAssembly<'c>,
+    program: &SourceAssembly<'p>,
+    instantiations: &[monomorphize::Instantiation],
+) -> Result<(Program, monomorphize::Lowering), LoadError> {
+    load_with_corlib_and_libraries_lowered(corlib, &[], program, instantiations)
+}
+
+/// The one loading core. `instantiations` are the PROGRAM's closed generic instantiations; an empty
+/// slice is the ordinary (non-monomorphizing) load.
+///
+/// # Errors
+/// As [`load_with_corlib_and_libraries`].
+///
+/// # Panics
+/// As [`load_with_corlib_and_libraries`].
+fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
+    corlib: &SourceAssembly<'c>,
+    libraries: &[SourceAssembly<'l>],
+    program: &SourceAssembly<'p>,
+    instantiations: &[monomorphize::Instantiation],
+) -> Result<(Program, monomorphize::Lowering), LoadError> {
     assert!(
         libraries.len() <= usize::from(u8::MAX) - 2,
         "assembly ids are 8-bit: corlib + at most {} libraries + the program",
@@ -2558,18 +2631,30 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
             true,
         );
     }
+    let program_asm = 1 + libraries.len() as u8;
+    let program_type_offset = module.type_count();
     let entry = load_assembly(
         &mut module,
         program,
         flash_cil,
-        1 + libraries.len() as u8,
+        program_asm,
         &mut index,
         &mut type_index,
         &mut field_index,
         true,
     );
+    let lowering = monomorphize::monomorphize(
+        &mut module,
+        program,
+        program_asm,
+        program_type_offset,
+        &type_index,
+        &field_index,
+        flash_cil,
+        instantiations,
+    );
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
-    Ok(Program { module, entry })
+    Ok((Program { module, entry }, lowering))
 }
 
 /// [`load_with_corlib`] WITHOUT the final freeze -- see [`load_unfrozen`].
@@ -3172,6 +3257,13 @@ fn bind_bcl_calls(
         }
 
         let function = if parent.table() == TYPE_SPEC {
+            if matches!(
+                assembly.type_spec_signature(parent),
+                Some(lamella_metadata::SigType::GenericInst { .. })
+            ) {
+                module.mark_unlowered_generic(asm, *token);
+                continue;
+            }
             match method_name {
                 ".ctor" => {
                     let rank = signature.as_ref().map_or(0, |sig| sig.parameters.len());
@@ -3313,19 +3405,34 @@ fn list_ctor(
     None
 }
 
-/// Whether a type declared in THIS assembly is a `System.Collections` list type, so a
-/// same-assembly (corlib-internal) `newobj` of its `.ctor` allocates an empty list. Mirrors the
-/// type recognition in [`list_ctor`]; the caller supplies the `.ctor` arity. `false` without the
-/// surface.
-#[cfg(feature = "NETMFv4_4")]
-fn same_assembly_list_ctor(namespace: &str, type_name: &str) -> bool {
-    namespace == "System.Collections"
-        && matches!(type_name, "ArrayList" | "Hashtable" | "Stack" | "Queue")
-}
-
-#[cfg(not(feature = "NETMFv4_4"))]
+/// Whether a same-assembly (corlib-internal) `newobj` of this type's `.ctor` should allocate a
+/// NATIVE list instead of running the type's managed constructor. **Nothing does any more.**
+///
+/// All four types are complete from-scratch managed implementations with zero `[RuntimeProvided]`,
+/// and `ArrayList`'s own module comment says it *"overrides the native intrinsic ArrayList because
+/// the corlib resolves ahead of it"*. So the managed body is the intended implementation and the
+/// native list is the legacy path it supersedes. **StringBuilder is the precedent: it was de-marked
+/// here when it became fully managed, and these four simply never were.**
+///
+/// Kept as a named predicate rather than deleted, because the marking mechanism it fed is still
+/// live for anything that genuinely IS native-constructed, and a future half-conversion should have
+/// this doc to read.
 fn same_assembly_list_ctor(_namespace: &str, _type_name: &str) -> bool {
     false
+}
+
+#[cfg(test)]
+mod same_assembly_list_ctor_tests {
+    /// The four collection types are NOT marked for native same-assembly construction.
+    #[test]
+    fn the_managed_collections_are_not_marked_for_native_construction() {
+        for type_name in ["ArrayList", "Hashtable", "Stack", "Queue"] {
+            assert!(
+                !super::same_assembly_list_ctor("System.Collections", type_name),
+                "{type_name} is marked for native same-assembly construction again. Its corlib                  implementation is fully managed, so a corlib-internal `new` would allocate an                  instance with no managed fields while a corlib-internal call ran the managed body                  that reads them. If it is genuinely native-constructed now, its methods must bind                  to the intrinsics on the SAME-ASSEMBLY path too, not only the cross-assembly one."
+            );
+        }
+    }
 }
 
 /// Maps a recognized BCL member -- by declaring type, method name, and signature --
@@ -3500,7 +3607,10 @@ fn bcl_intrinsic(
             "EnterLock" => return Some(intrinsic!(monitor_enter)),
             "ExitLock" => return Some(intrinsic!(monitor_exit)),
             "TryEnterLock" => return Some(intrinsic!(monitor_try_enter)),
+            "TryEnterLockTimeout" => return Some(intrinsic!(monitor_try_enter_timeout)),
             "WaitLock" => return Some(intrinsic!(monitor_wait)),
+            "WaitLockTimeout" => return Some(intrinsic!(monitor_wait_timeout)),
+            "WaitTimedOut" => return Some(intrinsic!(monitor_wait_timed_out)),
             "PulseLock" => return Some(intrinsic!(monitor_pulse)),
             "PulseAllLock" => return Some(intrinsic!(monitor_pulse_all)),
             _ => {}
@@ -5201,6 +5311,12 @@ pub struct UnboundSeam {
     pub type_name: String,
     /// The method's name.
     pub method: String,
+    /// The parameter types, encoded by [`encode_sig_type`].
+    pub params: Vec<String>,
+    /// The return type, same encoding. It is not part of overload identity in C#, but it IS what
+    /// says whether a silent seam hands back a zero, a null, or nothing at all -- which is the
+    /// difference between a wrong answer and a no-op.
+    pub returns: String,
     /// What the absence means -- see [`SeamDisposition`].
     pub disposition: SeamDisposition,
 }
@@ -5209,8 +5325,12 @@ impl fmt::Display for UnboundSeam {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}.{}::{}",
-            self.namespace, self.type_name, self.method
+            "{}.{}::{}({}) -> {}",
+            self.namespace,
+            self.type_name,
+            self.method,
+            self.params.join(", "),
+            self.returns
         )
     }
 }
@@ -5267,6 +5387,18 @@ pub fn unbound_seams(assembly: &Assembly) -> Vec<UnboundSeam> {
                 namespace: declaring.namespace.into(),
                 type_name: declaring.name.into(),
                 method: name.into(),
+                params: signature
+                    .as_ref()
+                    .map(|sig| {
+                        sig.parameters
+                            .iter()
+                            .map(|param| encode_sig_type(assembly, param))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                returns: signature
+                    .as_ref()
+                    .map_or_else(String::new, |sig| encode_sig_type(assembly, &sig.return_type)),
                 disposition: if assembly.is_intended_default(token) {
                     SeamDisposition::Intended
                 } else {
@@ -5325,6 +5457,18 @@ pub fn seam_legality(assembly: &Assembly, available: &BTreeSet<u32>) -> SeamLega
                 namespace: declaring.namespace.into(),
                 type_name: declaring.name.into(),
                 method: name.into(),
+                params: signature
+                    .as_ref()
+                    .map(|sig| {
+                        sig.parameters
+                            .iter()
+                            .map(|param| encode_sig_type(assembly, param))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                returns: signature
+                    .as_ref()
+                    .map_or_else(String::new, |sig| encode_sig_type(assembly, &sig.return_type)),
                 disposition: if assembly.is_intended_default(token) {
                     SeamDisposition::Intended
                 } else {

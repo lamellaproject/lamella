@@ -1,0 +1,52 @@
+# BOARD binding: the Arduino UNO R4 Minima, an R7FA4M1AB3CFM on Arduino's ABX00080 in the UNO form
+# factor.
+
+[table]
+kind = "board"
+board = "arduino-uno-r4-minima"
+vendor = "arduino"
+family = "ra4m1"
+part = "r7fa4m1ab3cfm"
+board_model = 34            # lamella_wire::board_model::ARDUINO_UNO_R4_MINIMA
+sources = [
+    "Arduino UNO R4 Minima user manual (SKU ABX00080), description: the board features a RA4M1 series microcontroller from Renesas (R7FA4M1AB3CFM#AA0), which embeds a 48 MHz Arm Cortex-M4 microprocessor, with 256 kB flash, 32 kB SRAM and 8 kB data memory (EEPROM); the operating voltage is 5 V",
+    "Arduino UNO R4 Minima user manual (SKU ABX00080) section 4.1, the front-view component table: U1 is the R7FA4M1AB3CFM#AA0 microcontroller, U2 an ISL854102FRZ-T buck converter, PB1 the RESET button, J1 the ICSP header (SPI), J2 the SWD/JTAG connector, J3 a CX90B-16P USB-C connector, J4 the DC jack, DL1 the TX LED (serial transmit), DL2 the RX LED (serial receive), DL3 the power LED and DL4 the SCK LED (serial clock). Section 10.4 gives the SWD/JTAG connector's pinout as 1 +5V, 2 SWDIO, 3 GND, 4 SWCLK, 5 GND, 6 NC, 7 RX, 8 TX, 9 GND, 10 NC",
+    "Arduino UNO R4 Minima full pinout (ABX00080, page 1 of 4, last update 27 Nov 2023): the microcontroller is drawn as an R7FA4M1AB3CFM; a table of LEDs gives P013 as the RX LED, P012 as the TX LED and P111 as LED_BUILTIN; the digital header column gives D13 as P111 with SPI function RSPCKB, and D0/RX and D1/TX as P301 and P302 with UART functions SCI_RXD2 and SCI_TXD2",
+    "Arduino UNO R4 Minima schematics (ABX00080 V1.2, 23/08/2023), sheet TOP.SchDoc: U1 is designated R7FA4M1AB3CFM#AA0; DL1 and DL2 are KPT-1608YC yellow LEDs whose anodes are on a shared +5V rail and whose cathodes run through R14 and R15, each 330 ohm, to the nets P012 and P013; DL3 is an HSMG-C190 green LED from the same +5V rail through R16, 330 ohm, to ground; DL4 is a KPT-1608YC yellow LED whose anode is on the net P111_GPT3_A and whose cathode runs through R17, 330 ohm, to ground. Push-button PB1 connects to the RESET net. USB_D_N and USB_D_P reach the microcontroller at pin 18, P915/USB_DM, and pin 19, P914/USB_DP",
+]
+notes = [
+    "The part's pin names are written here with a separator the vendor's own spelling omits -- P111 as P1.11, P012 as P0.12, P013 as P0.13 -- because a pin name in this model is a port and an index and the undelimited form has no boundary to split on. The documents cited above all use the undelimited spelling.",
+]
+
+# --- the carrier ------------------------------------------------------------------------------
+#
+# THE MICROCONTROLLER'S OWN USB DEVICE CONTROLLER, over the USB-C connector J3. There is no bridge
+# between it and the host, which is why the row carries no vendor identity: a bridge has a USB
+# identity of its own to state and this path has only the device the target itself presents.
+
+[[carriers]]
+kind = "native-usb"
+default = true
+
+# --- control lines ----------------------------------------------------------------------------
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "P1.11"
+active = "high"
+source = "The full pinout's LED table gives P111 as LED_BUILTIN, and its digital header column gives the same pin as D13. The schematics sheet TOP.SchDoc puts the net P111_GPT3_A on the ANODE of DL4, a KPT-1608YC yellow LED, and runs its cathode through R17, 330 ohm, to ground. The pin is therefore the driven end above the diode and the LED lights when the pin is driven high. The user manual's component table names the same part DL4, the SCK LED, because D13 is also the SPI clock."
+
+[[devices]]
+name = "led_tx"
+kind = "gpio-out"
+pin = "P0.12"
+active = "low"
+source = "The full pinout's LED table gives P012 as the TX LED. The schematics sheet TOP.SchDoc puts the ANODE of DL1, a KPT-1608YC yellow LED, on a +5V rail shared with DL2 and DL3, and runs its cathode through R14, 330 ohm, to the net P012. The pin is therefore below the diode and the LED lights when the pin is driven low, which is the opposite of led0 on the same board. The user manual's component table names DL1 the LED TX (serial transmit)."
+
+[[devices]]
+name = "led_rx"
+kind = "gpio-out"
+pin = "P0.13"
+active = "low"
+source = "The full pinout's LED table gives P013 as the RX LED. The schematics sheet TOP.SchDoc puts the ANODE of DL2, a KPT-1608YC yellow LED, on the same +5V rail as DL1, and runs its cathode through R15, 330 ohm, to the net P013. The pin sinks and the LED lights when it is driven low. This row is read from the schematic in its own right rather than by analogy with led_tx: the sheet draws both cathodes."

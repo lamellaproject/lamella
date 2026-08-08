@@ -30,3 +30,9 @@ test-util = []
 lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-usbhid = { path = "../lamella-usbhid", optional = true }
 lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
+
+[dev-dependencies]
+# Probe SELECTION: these examples reach a `2e8a:000c` or an EDBG, both of which every board of
+# their kind shares, so an example must resolve WHICH one. A dev-dependency back onto a crate that
+# depends on this one is allowed and is not a cycle in the build graph.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }

@@ -124,13 +124,13 @@ impl BoardFacts {
 fn literal(expr: &Expr) -> Option<FactValue> {
     match expr {
         Expr::Int(v) => Some(FactValue::Int(*v)),
-        Expr::Str(s) => Some(FactValue::Str(s.clone())),
+        Expr::Str(s) => Some(FactValue::Str(String::from(s.as_str()?))),
         Expr::Bool(b) => Some(FactValue::Int(i64::from(*b))),
         Expr::Dict(entries) => {
             let mut out = BTreeMap::new();
             for (key, value) in entries {
                 let Expr::Str(key) = key else { return None };
-                out.insert(key.clone(), literal(value)?);
+                out.insert(String::from(key.as_str()?), literal(value)?);
             }
             Some(FactValue::Dict(out))
         }
@@ -138,7 +138,7 @@ fn literal(expr: &Expr) -> Option<FactValue> {
     }
 }
 
-/// Resolve every `board.` expression in `ast` to the constant the board states, and drop the
+/// Resolve every `board.*` expression in `ast` to the constant the board states, and drop the
 /// `import board` that introduced it. Returns how many facts were bound.
 ///
 /// A program that does not import the board module is returned untouched, and this reports 0.
@@ -163,9 +163,9 @@ pub fn fold_module(ast: &mut ModuleAst, facts: &BoardFacts) -> Result<usize, Boa
 fn imported_board_name(body: &[Stmt]) -> Option<String> {
     for stmt in body {
         if let Stmt::Import { modules } = stmt {
-            for (module, bound) in modules {
+            for (module, alias) in modules {
                 if module == "board" {
-                    return Some(bound.clone());
+                    return Some(String::from(crate::ast::import_bound_name(module, alias)));
                 }
             }
         }
@@ -208,7 +208,7 @@ impl Folder<'_> {
         };
         match value {
             FactValue::Int(v) => Ok(Some(Expr::Int(v))),
-            FactValue::Str(s) => Ok(Some(Expr::Str(s))),
+            FactValue::Str(s) => Ok(Some(Expr::Str(s.into()))),
             other => Err(BoardFactError::NotAValue {
                 path,
                 found: other.kind(),
@@ -257,6 +257,9 @@ impl Folder<'_> {
                     });
                 };
                 let Expr::Str(key) = &**index else {
+                    return Err(BoardFactError::NonLiteralIndex { path });
+                };
+                let Some(key) = key.as_str() else {
                     return Err(BoardFactError::NonLiteralIndex { path });
                 };
                 let path = format!("{path}[{key:?}]");
@@ -392,14 +395,14 @@ impl Folder<'_> {
                 }
                 Ok(())
             }
-            Expr::YieldFrom(value) => self.expr(value),
+            Expr::YieldFrom(value) | Expr::Await(value) => self.expr(value),
             Expr::Walrus { value, .. } => self.expr(value),
         }
     }
 
     /// Recurse into every expression a statement contains. EXHAUSTIVE for the same reason
     /// `children` is: a new `Stmt` variant should stop this build, not silently become a place
-    /// where `board.…` survives compilation.
+    /// where `board.*` survives compilation.
     fn stmt(&mut self, stmt: &mut Stmt) -> Result<(), BoardFactError> {
         match stmt {
             Stmt::FuncDef(func) => {
@@ -467,6 +470,12 @@ impl Folder<'_> {
                 body,
                 orelse,
                 ..
+            }
+            | Stmt::AsyncFor {
+                iterable,
+                body,
+                orelse,
+                ..
             } => {
                 self.expr(iterable)?;
                 self.body(body)?;
@@ -494,7 +503,7 @@ impl Folder<'_> {
                 self.body(orelse)?;
                 self.body(finalbody)
             }
-            Stmt::With { context, body, .. } => {
+            Stmt::With { context, body, .. } | Stmt::AsyncWith { context, body, .. } => {
                 self.expr(context)?;
                 self.body(body)
             }
@@ -626,7 +635,7 @@ DEVICES = {
         assert_eq!(folded_value("import board\nx = board.BOARD_MODEL\n"), Expr::Int(1));
         assert_eq!(
             folded_value("import board\nx = board.BOARD\n"),
-            Expr::Str("microbit-v1".to_string())
+            Expr::Str("microbit-v1".into())
         );
     }
 

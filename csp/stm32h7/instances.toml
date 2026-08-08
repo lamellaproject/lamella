@@ -1,0 +1,82 @@
+# INSTANCE map: where each STM32H7 block copy sits, plus its RCC clock-enable routing.
+# The record carries the enable REGISTER OFFSET as data because ST spreads the gates across banked
+# enable registers, so [base, rcc_en_off, rcc_en_bit] states each gate in full. `-1` = the row
+# gates nothing (the RCC itself).
+
+[table]
+kind = "instances"
+family = "stm32h7"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4: Table 7 register boundary addresses -- RCC 0x58024400 and GPIOA through GPIOK from 0x58020000 in 0x400 steps on AHB4 (D3), with GPIOK occupying 0x58022800-0x58022BFF, USART3 0x40004800 on APB1 (D2)",
+    "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4: RCC_AHB4ENR 9.7.42 (address offset 0x0E0, GPIOBEN bit 1, GPIOCEN bit 2, GPIODEN bit 3, GPIOEEN bit 4, GPIOIEN bit 8, GPIOJEN bit 9, GPIOKEN bit 10); RCC_APB1LENR 9.7.44 (address offset 0x0E8, USART3EN bit 18)",
+]
+notes = [
+    "Every bit position here is taken from the reference manual's per-bit descriptions rather than from its register bit-map diagram: the diagram is a wide table whose columns do not survive a text conversion, and the per-bit prose states the same fact unambiguously.",
+    "The GPIO ports sit in the D3 power domain and the USART in D2, which is a fact with a consequence nothing here models yet: RM0399 warns that enabling a peripheral in a domain that is in DStop or DStandby makes the power controller raise that domain first, so the clock-enable write can take far longer than the two clock cycles it takes within a running domain.",
+    "This family places six GPIO ports rather than the eleven the part carries, and one USART of the many it carries, because a present-list and an instance map here are evidence-only: a row is added when a board reaches the block.",
+    "Every base below was read off RM0399 Table 7 rather than stepped from GPIOA, and the table repays that: it prints its rows in DESCENDING address order, GPIOK first and GPIOA last, so an eye running down the page and an index counting up the alphabet move in opposite directions. The arithmetic happens to agree here -- 0x400 per port with no gap -- and a boundary table exists to be read, not to be predicted.",
+]
+
+[[instances]]
+name = "usart3"
+block = "usart"
+base = 0x40004800
+rcc_en_off = 0xE8   # RCC_APB1LENR (the shared form; C1 is 0x148 and C2 0x1A8)
+rcc_en_bit = 18     # USART3EN
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x58020400
+rcc_en_off = 0xE0   # RCC_AHB4ENR (the shared form; C1 is 0x140 and C2 0x1A0)
+rcc_en_bit = 1      # GPIOBEN
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x58020800
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 2      # GPIOCEN
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x58020C00
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 3      # GPIODEN
+
+[[instances]]
+name = "gpioe"
+block = "gpio"
+base = 0x58021000
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 4      # GPIOEEN
+
+[[instances]]
+name = "gpioi"
+block = "gpio"
+base = 0x58022000
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 8      # GPIOIEN
+
+[[instances]]
+name = "gpioj"
+block = "gpio"
+base = 0x58022400
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 9      # GPIOJEN
+
+[[instances]]
+name = "gpiok"
+block = "gpio"
+base = 0x58022800
+rcc_en_off = 0xE0   # RCC_AHB4ENR
+rcc_en_bit = 10     # GPIOKEN
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x58024400
+rcc_en_off = -1
+rcc_en_bit = -1

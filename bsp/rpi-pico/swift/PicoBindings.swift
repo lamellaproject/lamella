@@ -10,6 +10,15 @@ public enum PicoBindings {
     public static let BOARD_MODEL: UInt16 = 13
     public static let BOARD_VENDOR: String = "RaspberryPi"
 
+    /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+    /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+    /// peripherals of the same kind can share no register at all, so a consumer that selects a
+    /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+    /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+    /// name a driver; and a uart is a different register map on every family, so the kind does
+    /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+    public static let UART0_DRIVER_FAMILY: String = "rp2040-uart"
+
     // -- UART0: a pl011 uart binding descriptor --
     public static let UART0_BASE: UInt32 = 0x40034000
     public static let UART0_RESET_MASK: UInt32 = 0x400120
@@ -32,6 +41,12 @@ public enum PicoBindings {
     public static let PLL_SYS_PRIM_PLL_125_48: UInt32 = 0x62000
     public static let PLL_USB_FBDIV_PLL_125_48: UInt32 = 100
     public static let PLL_USB_PRIM_PLL_125_48: UInt32 = 0x55000
+
+    // -- on-board devices: PORT group base + pin index + mask --
+    public static let LED_PORT_BASE: UInt32 = 0xD0000000
+    public static let LED_PIN: UInt32 = 25
+    public static let LED_MASK: UInt32 = 0x2000000
+    public static let LED_ACTIVE_LOW: UInt32 = 0
 
     // -- memory regions the board fits: SIZE is what a program may reach, which a device's own
     // size may exceed; a region with a CONTROLLER does not exist until that instance is brought

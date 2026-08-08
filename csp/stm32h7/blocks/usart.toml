@@ -1,0 +1,81 @@
+# BLOCK layout: the STM32H7 USART. PARTIAL -- the registers and fields a byte-at-a-time channel
+# needs, plus the ones that decide the frame. Offsets are instance-base-relative.
+#
+# THIS IS THE SAME IP GENERATION AS THE VENDOR'S F0, F7 AND L4 LINES and not the F4's: CR1 sits at
+# 0x00, the receive and transmit data registers are separate, status lives at 0x1C, and the baud
+# register is a plain divisor with no mantissa-and-fraction split. A driver carried across from an
+# F4 writes its first byte into the control register, which disables the peripheral it was
+# configuring rather than transmitting anything.
+
+[table]
+kind = "block"
+family = "stm32h7"
+block = "usart"
+sources = [
+    "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4: USART_CR1 51.8.2 (address offset 0x00, FIFO mode disabled), USART_CR2 51.8.3 (0x04), USART_CR3 51.8.4 (0x08), USART_BRR 51.8.5 (0x0C), USART_ISR 51.8.10 (0x1C, FIFO mode disabled), USART_ICR 51.8.11 (0x20), USART_RDR 51.8.12 (0x24), USART_TDR 51.8.13 (0x28), USART_PRESC 51.8.14 (0x2C)",
+    "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4, per-bit descriptions: CR1 UE bit 0, UESM bit 1, RE bit 2, TE bit 3, PS bit 9, PCE bit 10, M0 bit 12, OVER8 bit 15, M1 bit 28, FIFOEN bit 29; CR2 STOP bits 13:12; ISR RXNE bit 5, TC bit 6, TXE bit 7, BUSY bit 16; PRESC PRESCALER bits 3:0",
+]
+notes = [
+    "8N1 = CR1.M[1:0] = 00 (8 data bits), CR2.STOP = 00 (1 stop bit), CR1.PCE = 0 (no parity), CR1.OVER8 = 0 (16x oversampling). All are reset values, so CR1 = UE | TE | RE is a complete 8N1 config.",
+    "The word length is TWO BITS IN TWO PLACES -- M0 at bit 12 and M1 at bit 28 -- so a driver that treated word length as one field would set half of it and read back a value it never wrote.",
+    "TX: poll ISR.TXE (transmit data register empty), write the byte to TDR. RX: poll ISR.RXNE, read RDR. ISR.TC = transmission complete, the shift register drained -- which is the flag to wait on before cutting power or changing the baud rate, and not the one to wait on between bytes.",
+    "ISR's reset value is 0x0000 00C0 with the FIFO disabled: TXE and TC are already set out of reset, because an idle transmitter has room and has nothing outstanding. A driver that waits for TXE before its first byte therefore does not block, and one that waits for it to CLEAR waits forever.",
+    "The registers are accessed as words. The manual says so of the whole peripheral rather than of any one register, which is why no 16-bit view of BRR appears here.",
+    "Every bit position is from the per-bit descriptions rather than the register bit-map diagram, whose columns do not survive a text conversion.",
+]
+
+[registers.CR1]
+offset = 0x0
+width = 32
+fields = { UE = [0, 1], UESM = [1, 1], RE = [2, 1], TE = [3, 1], IDLEIE = [4, 1], RXNEIE = [5, 1], TCIE = [6, 1], TXEIE = [7, 1], PEIE = [8, 1], PS = [9, 1], PCE = [10, 1], M0 = [12, 1], OVER8 = [15, 1], M1 = [28, 1], FIFOEN = [29, 1] }
+notes = "UE = USART enable, TE/RE = transmitter/receiver enable. Word length M[1:0] = {M1(28), M0(12)}: 00 = 8 data bits. OVER8 0 = 16x oversampling. PCE 0 = no parity. FIFOEN 0 = the layout stated here; setting it renames RXNEIE and TXEIE to RXFNEIE and TXFNFIE at the same positions."
+
+[registers.CR2]
+offset = 0x4
+width = 32
+fields = { STOP = [12, 2] }
+notes = "STOP = 00 gives one stop bit, which is the reset value. 01 is half a stop bit and 11 is one and a half, so the four codes are not an ordering a driver can compute from a count."
+
+[registers.CR3]
+offset = 0x8
+width = 32
+fields = { }
+
+[registers.BRR]
+offset = 0xC
+width = 32
+fields = { BRR = [0, 16] }
+notes = "Baud rate. With OVER8 = 0, BRR = USARTDIV = round(f_ck / baud), where f_ck is the kernel clock AFTER USART_PRESC. The kernel clock is SELECTED rather than fixed -- RCC_D2CCIP2R's USART234578SEL picks it for USART2/3 and the APB1 UARTs, and its reset selection is rcc_pclk1 -- and the APB an instance sits on differs by instance, USART1 and USART6 being on APB2. So the rate is a plan fact established per board; this block states the arithmetic only. Writable only while UE = 0."
+
+[registers.ISR]
+offset = 0x1C
+width = 32
+fields = { PE = [0, 1], FE = [1, 1], NE = [2, 1], ORE = [3, 1], IDLE = [4, 1], RXNE = [5, 1], TC = [6, 1], TXE = [7, 1], BUSY = [16, 1] }
+notes = "Status, in the FIFO-disabled layout that CR1.FIFOEN = 0 selects. TXE = TDR empty (room to write), TC = transmission complete, RXNE = RDR holds a received byte. With the FIFO enabled the same two positions read TXFNF and RXFNE."
+
+[registers.ICR]
+offset = 0x20
+width = 32
+fields = { }
+notes = "Interrupt flag clear. A status flag on this IP is cleared by writing here rather than by a read-then-read-data dance."
+
+[registers.RDR]
+offset = 0x24
+width = 32
+fields = { RDR = [0, 9] }
+notes = "Receive data (read once RXNE = 1). Low 8 bits at 8-bit word length."
+
+[registers.TDR]
+offset = 0x28
+width = 32
+fields = { TDR = [0, 9] }
+notes = "Transmit data (write once TXE = 1). Low 8 bits at 8-bit word length."
+
+[registers.PRESC]
+offset = 0x2C
+width = 32
+fields = { PRESCALER = [0, 4] }
+notes = "Kernel clock prescaler, ahead of BRR. 0000 = not divided (reset), then 2, 4, 6, 8, 10, 12, 16, 32, 64, 128, 256 -- so the codes are not powers of two and a value outside the list is treated as 1011, divide by 256, rather than refused. Writable only while UE = 0."
+
+[parameters]
+baud = "16x oversampling (OVER8 = 0) with PRESC at its reset value: BRR = round(f_ck / baud). The rate comes from the board plan; the divisor is generated."

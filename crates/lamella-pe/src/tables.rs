@@ -279,4 +279,46 @@ mod tests {
             1u64 << table::METHOD_SEMANTICS
         );
     }
+
+    #[test]
+    fn generic_param_sorts_by_owner_and_keeps_number_order_within_one_owner() {
+        let param = |number: u16, owner: Token| {
+            alloc::vec![
+                Column::U16(number),
+                Column::U16(0),
+                Column::Coded(CodedIndex::TypeOrMethodDef, owner),
+                Column::StringRef(0),
+            ]
+        };
+        let ty = Token::new(table::TYPE_DEF, 1);
+        let method = Token::new(table::METHOD_DEF, 1);
+
+        let mut descending = TableStream::new();
+        descending.add_row(table::GENERIC_PARAM, param(0, method));
+        descending.add_row(table::GENERIC_PARAM, param(0, ty));
+        descending.add_row(table::GENERIC_PARAM, param(1, ty));
+        descending.sort_by_coded_column(table::GENERIC_PARAM, 2);
+
+        let mut ascending = TableStream::new();
+        ascending.add_row(table::GENERIC_PARAM, param(0, ty));
+        ascending.add_row(table::GENERIC_PARAM, param(1, ty));
+        ascending.add_row(table::GENERIC_PARAM, param(0, method));
+        ascending.sort_by_coded_column(table::GENERIC_PARAM, 2);
+
+        let sorted = descending.serialize(HeapSizes::default());
+        assert_eq!(sorted, ascending.serialize(HeapSizes::default()));
+        assert_eq!(
+            u64_at(&sorted, 16) & (1u64 << table::GENERIC_PARAM),
+            1u64 << table::GENERIC_PARAM
+        );
+
+        let mut one_owner = TableStream::new();
+        one_owner.add_row(table::GENERIC_PARAM, param(0, ty));
+        one_owner.add_row(table::GENERIC_PARAM, param(1, ty));
+        one_owner.add_row(table::GENERIC_PARAM, param(2, ty));
+        let before = one_owner.serialize(HeapSizes::default());
+        one_owner.sort_by_coded_column(table::GENERIC_PARAM, 2);
+        let after = one_owner.serialize(HeapSizes::default());
+        assert_eq!(before[24..], after[24..]);
+    }
 }

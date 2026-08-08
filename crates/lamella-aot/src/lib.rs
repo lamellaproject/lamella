@@ -8,6 +8,8 @@ extern crate alloc;
 pub mod cil;
 pub mod debugmap;
 pub mod dwarf;
+/// The closed generic instantiation set and the canonical spelling that names each instantiation.
+pub use lamella_generics as generics;
 pub mod resolver;
 pub mod target;
 

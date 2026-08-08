@@ -4,12 +4,12 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use lamella_cil::Operand;
+use lamella_cil::{Opcode, Operand};
 use lamella_ir::{Function, MirType, StaticOwner, TypeHandle};
 use lamella_metadata::tables::table;
 use lamella_metadata::{
-    Assembly, CharSet, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef,
-    TypeName, exception_tag_for_name, fnv1a32,
+    Assembly, CharSet, Method, MethodKind, MethodSig, ResolvedMethod, SigType, TargetLayout,
+    TypeDef, TypeLayout, TypeName, exception_tag_for_name, fnv1a32, layout_value_type,
 };
 use lamella_token::Token;
 
@@ -88,6 +88,8 @@ pub(crate) fn descriptor_symbol(handle: u32, qualifiers: &DescQualifiers) -> Str
             .get(ordinal)
             .unwrap_or_else(|| panic!("reference ordinal {ordinal} has no descriptor qualifier"));
         alloc::format!("{}{}_{}", lamella_elf::TYPE_DESC_PREFIX, hash, owner_token)
+    } else if handle >> 24 == crate::generics::INSTANTIATION_HANDLE_TABLE {
+        alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle)
     } else if let Some(own) = &qualifiers.own {
         alloc::format!("{}{}_{}", lamella_elf::TYPE_DESC_PREFIX, own, handle)
     } else {
@@ -108,6 +110,10 @@ pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::boxed::
 }
 
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
+///
+/// `Clone` so one monomorphized body can be lowered under its own instantiation without rebuilding
+/// the references, the rid map and the box-target set -- see [`Self::with_type_arguments`].
+#[derive(Clone)]
 pub struct MetadataResolver<'a> {
     assembly: &'a Assembly<'a>,
     /// The REFERENCED assemblies, in reference order, for cross-assembly vtable-slot agreement:
@@ -122,6 +128,38 @@ pub struct MetadataResolver<'a> {
     /// the module. Empty for single-method lowering, where a call keeps its rid (a one-
     /// function lowering does not dispatch internal calls anyway).
     rid_to_index: Vec<(u32, u32)>,
+    /// The type arguments in force while lowering ONE monomorphized body -- `[I4]` while lowering
+    /// `Box<int>`'s copy of `Box`1`'s methods. Empty for every ordinary body, which is what keeps
+    /// the non-generic path byte-identical.
+    type_arguments: Vec<SigType>,
+    /// The monomorphized bodies this module emits, keyed by `(instantiation, method, parameters)`.
+    mono: crate::generics::MonoPlan,
+    /// Every type token this assembly's own code takes a `box` of, deduplicated -- the bound on
+    /// [`Self::unbox_accepted_handles`].
+    box_target_tokens: Vec<Token>,
+}
+
+/// Every distinct type token `assembly`'s method bodies take a `box` of. A boxed value cannot exist
+/// unless some `box` created it, so this is the population an `unbox` in the same image can meet.
+fn box_target_tokens(assembly: &Assembly) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    for type_def in assembly.type_defs() {
+        for method in type_def.methods() {
+            let Some(body) = method.body() else {
+                continue;
+            };
+            for inst in body.code.iter() {
+                if inst.opcode == Opcode::Box {
+                    if let Operand::Token(token) = inst.operand {
+                        tokens.push(token);
+                    }
+                }
+            }
+        }
+    }
+    tokens.sort_unstable_by_key(|t| t.0);
+    tokens.dedup_by_key(|t| t.0);
+    tokens
 }
 
 impl<'a> MetadataResolver<'a> {
@@ -132,6 +170,9 @@ impl<'a> MetadataResolver<'a> {
             assembly,
             references: Vec::new(),
             rid_to_index: Vec::new(),
+            type_arguments: Vec::new(),
+            mono: crate::generics::MonoPlan::default(),
+            box_target_tokens: box_target_tokens(assembly),
         }
     }
 
@@ -144,6 +185,61 @@ impl<'a> MetadataResolver<'a> {
     pub fn with_reference(mut self, reference: &'a Assembly<'a>) -> MetadataResolver<'a> {
         self.references.push(reference);
         self
+    }
+
+    /// The type arguments in force while lowering one monomorphized body.
+    #[must_use]
+    pub fn with_type_arguments(mut self, arguments: Vec<SigType>) -> MetadataResolver<'a> {
+        self.type_arguments = arguments;
+        self
+    }
+
+    /// Attaches the module's [`MonoPlan`](crate::generics::MonoPlan), so a call on a generic
+    /// instantiation binds to the monomorphized body's function index.
+    #[must_use]
+    pub fn with_monomorphized(mut self, plan: crate::generics::MonoPlan) -> MetadataResolver<'a> {
+        self.mono = plan;
+        self
+    }
+
+    /// A call on a generic INSTANTIATION resolved to the monomorphized body's function index, or
+    /// `None` when this is not such a call or the plan does not carry that body.
+    fn monomorphized_call(&self, token: Token, signature: &MethodSig) -> Option<CallInfo> {
+        if self.mono.is_empty() || token.table() != table::MEMBER_REF {
+            return None;
+        }
+        let member = self.assembly.member_ref(token.row())?;
+        let spec = member.parent();
+        if spec.table() != table::TYPE_SPEC {
+            return None;
+        }
+        let spec_signature = self.closed_spec_signature(spec)?;
+        let name = crate::generics::spell_sig(self.assembly, &spec_signature)?;
+        let index = self
+            .mono
+            .index_of(&name, member.name()?, &signature.parameters)?;
+        let has_result = !matches!(signature.return_type, SigType::Void);
+        let result_type = if has_result {
+            let (_, _, arguments) = self.instantiated_parent(spec)?;
+            let closed = crate::generics::substitute_sig(&signature.return_type, &arguments)?;
+            Some(mir_type(&closed, self.assembly, &TargetLayout::ilp32())?)
+        } else {
+            None
+        };
+        Some(CallInfo {
+            args: signature.parameters.len() + usize::from(signature.has_this),
+            has_result,
+            result_type,
+            target: CallTarget::Internal(index),
+        })
+    }
+
+    /// `ty` with this resolver's instantiation applied, or `ty` unchanged when none is in force.
+    fn apply_instantiation(&self, ty: &SigType) -> Option<SigType> {
+        if self.type_arguments.is_empty() {
+            return Some(ty.clone());
+        }
+        crate::generics::substitute_sig(ty, &self.type_arguments)
     }
 
     /// [`with_reference`](Self::with_reference) for a whole reference list at once (the
@@ -215,6 +311,9 @@ impl<'a> MetadataResolver<'a> {
             assembly,
             references: Vec::new(),
             rid_to_index,
+            type_arguments: Vec::new(),
+            mono: crate::generics::MonoPlan::default(),
+            box_target_tokens: box_target_tokens(assembly),
         }
     }
 
@@ -495,6 +594,35 @@ impl<'a> MetadataResolver<'a> {
                         .find(|(h, _)| *h == handle)
                         .map(|(_, n)| n.clone()),
                 }
+            })
+            .collect()
+    }
+
+    /// A [`TypeMeta`] per INSTANTIATION the attached [`MonoPlan`](crate::generics::MonoPlan) covers.
+    #[must_use]
+    pub fn instantiation_descriptors(&self) -> Vec<TypeMeta> {
+        self.mono
+            .instantiations()
+            .into_iter()
+            .filter_map(|(name, spec)| {
+                let layout = self.instantiated_reference_layout(spec)?;
+                let mut words = alloc::vec![
+                    layout.size,
+                    layout.reference_offsets.len() as u32,
+                    exception_tag_for_name("", name),
+                    0,
+                ];
+                words.extend(layout.reference_offsets.iter().copied());
+                Some(TypeMeta {
+                    handle: layout.handle,
+                    type_tag: exception_tag_for_name("", name),
+                    vtable: Vec::new(),
+                    itable: Vec::new(),
+                    base: None,
+                    words: Some(words.into_boxed_slice()),
+                    exported: false,
+                    full_name: Some(alloc::boxed::Box::from(name)),
+                })
             })
             .collect()
     }
@@ -888,6 +1016,15 @@ enum SlotImpl {
     Extern(String),
 }
 
+/// A method's decoded parameter list, or `None` when its signature CANNOT BE DECODED -- today that
+/// means a generic one. [`lamella_metadata::parse_method`] refuses those deliberately, because a
+/// generic signature carries an extra leading `GenParamCount` and reading past it would yield a
+/// plausible and WRONG `MethodSig` with no error at all.
+#[must_use]
+pub fn decodable_params(method: &lamella_metadata::Method<'_>) -> Option<Vec<SigType>> {
+    method.signature().map(|sig| sig.parameters)
+}
+
 /// The assembly-independent identity of a parameter list: each parameter's extern-symbol encoding
 /// (a primitive one char, a class/value type its FULL NAME), so a referenced base's signature and a
 /// this-assembly override's compare equal even though their `SigType` tokens index different
@@ -929,7 +1066,7 @@ fn assembly_base_chain<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) ->
 /// referenced corlib's for a cross-assembly `new ThreadStart(...)`): its `extends` chain reaches
 /// `System.MulticastDelegate`/`System.Delegate`. The walk is bounded so a malformed cyclic base
 /// cannot loop.
-fn is_delegate_type_of<'x>(assembly: &'x Assembly<'x>, type_def: &TypeDef<'x>) -> bool {
+pub(crate) fn is_delegate_type_of<'x>(assembly: &'x Assembly<'x>, type_def: &TypeDef<'x>) -> bool {
     let mut current = type_def.extends();
     for _ in 0..64 {
         if current.row() == 0 {
@@ -1297,6 +1434,130 @@ impl<'a> MetadataResolver<'a> {
         chain
     }
 
+    /// Type arguments read off a `TypeSpec`, with the instantiation IN FORCE applied to each.
+    ///
+    /// With no instantiation in force this is the identity, which is what keeps every ordinary
+    /// program on exactly the bytes it was on. Under one it turns `` Box`1<!0> `` into
+    /// `` Box`1<System.Int32> `` while lowering `Box<int>`'s copy of the body -- the composition
+    /// that makes a definition able to talk about itself.
+    fn close_arguments(&self, arguments: Vec<SigType>) -> Option<Vec<SigType>> {
+        if self.type_arguments.is_empty() {
+            return Some(arguments);
+        }
+        arguments
+            .iter()
+            .map(|argument| crate::generics::substitute_sig(argument, &self.type_arguments))
+            .collect()
+    }
+
+    /// A `TypeSpec`'s own signature with the instantiation in force applied -- the form to SPELL,
+    /// because a spelling is an IDENTITY and `` Box`1[!0] `` is not one.
+    ///
+    /// It is [`Self::close_arguments`] one level out: that one closes the arguments a consumer
+    /// substitutes WITH, this one closes the whole constructed type a consumer NAMES.
+    fn closed_spec_signature(&self, spec: Token) -> Option<SigType> {
+        let signature = self.assembly.type_spec_signature(spec)?;
+        if self.type_arguments.is_empty() {
+            return Some(signature);
+        }
+        crate::generics::substitute_sig(&signature, &self.type_arguments)
+    }
+
+    /// A `TypeSpec` parent resolved to the generic definition it instantiates and the arguments to
+    /// substitute: `(owning assembly, the definition's TypeDef, the type arguments)`.
+    ///
+    /// The definition is found BY NAME, through the same [`Self::find_reference_type`] every other
+    /// cross-assembly lookup uses -- a `TypeSpec`'s definition token may be a `TypeRef` into corlib,
+    /// and a token is meaningless outside its own assembly.
+    fn instantiated_parent(
+        &self,
+        token: Token,
+    ) -> Option<(&'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> {
+        let SigType::GenericInst {
+            definition,
+            arguments,
+        } = self.assembly.type_spec_signature(token)?
+        else {
+            return None;
+        };
+        let arguments = self.close_arguments(arguments)?;
+        let definition = match definition.as_ref() {
+            SigType::Class(token) | SigType::ValueType(token) => *token,
+            _ => return None,
+        };
+        let name = self.assembly.type_token_name(definition)?;
+        match definition.table() {
+            table::TYPE_DEF => Some((
+                self.assembly,
+                self.assembly.type_def(definition.row())?,
+                arguments,
+            )),
+            _ => {
+                let (_, owner, type_def) = self.find_reference_type(name.namespace, name.name)?;
+                Some((owner, type_def, arguments))
+            }
+        }
+    }
+
+    /// The layout of one INSTANTIATION of a generic definition: the definition's own instance
+    /// fields with `!n` replaced by the instantiation's arguments, then laid out.
+    fn instantiated_layout(
+        &self,
+        owner: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+        arguments: &[SigType],
+    ) -> Option<TypeLayout> {
+        let mut fields = Vec::new();
+        for field in type_def.fields().filter(|field| !field.is_static()) {
+            fields.push(crate::generics::substitute_sig(
+                &field.signature()?,
+                arguments,
+            )?);
+        }
+        layout_value_type(&fields, &TargetLayout::ilp32(), &|token| {
+            owner.value_type_layout(token, &TargetLayout::ilp32()).ok()
+        })
+        .ok()
+    }
+
+    /// The heap layout of ONE INSTANTIATION, named by the `TypeSpec` token that spells it: the
+    /// base chain's blocks as usual, then the definition's own block SUBSTITUTED, under a handle
+    /// minted from the canonical name.
+    fn instantiated_reference_layout(&self, spec: Token) -> Option<ReferenceLayout> {
+        let (owner, type_def, arguments) = self.instantiated_parent(spec)?;
+        if type_def.is_value_type() {
+            return None;
+        }
+        if type_def.methods().any(|method| method.is_virtual())
+            || type_def.interfaces().next().is_some()
+        {
+            return None;
+        }
+        let chain = self.cross_class_chain(owner, type_def);
+        let mut size = 0u32;
+        let mut reference_offsets = Vec::new();
+        for (index, (link_assembly, link)) in chain.iter().enumerate() {
+            let layout = if index + 1 == chain.len() {
+                self.instantiated_layout(owner, *link, &arguments)?
+            } else {
+                link_assembly
+                    .value_type_layout(link.token(), &TargetLayout::ilp32())
+                    .ok()?
+            };
+            for offset in &layout.reference_offsets {
+                reference_offsets.push(size + offset);
+            }
+            size = (size + layout.size).next_multiple_of(4);
+        }
+        let spec_type = self.closed_spec_signature(spec)?;
+        let name = crate::generics::spell_sig(self.assembly, &spec_type)?;
+        Some(ReferenceLayout {
+            handle: crate::generics::instantiation_handle(&name),
+            size,
+            reference_offsets,
+        })
+    }
+
     /// The payload offset where `type_def`'s OWN field block starts: the word-aligned sum of
     /// every base block before it -- [`Self::reference_layout_of`]'s accumulation, stopped
     /// before `type_def` (the chain's LAST entry by construction).
@@ -1316,8 +1577,20 @@ impl<'a> MetadataResolver<'a> {
 /// The AOT's interface-method identity tag: FNV-1a32 of the interface's full name, the method name, and
 /// a byte per parameter type, with the high bit set (the shared type/exception tag space). A
 /// `callvirt IFoo::Bar(args)` and every implementing type's itable entry for it derive the SAME tag, so
-/// dispatch needs no shared registry; the interpreter computes it identically to make its signature-key
-/// interface dispatch tag-equivalent.
+/// dispatch needs no shared registry.
+///
+/// SCOPE, corrected: this is the AOT's tag and nothing else computes it. An earlier revision of this
+/// note said the interpreter computes it identically; it does not -- `lamella-cil-runtime` reproduces
+/// the EXCEPTION tag (`exception.rs`) and dispatches interfaces by signature key, never by this hash.
+/// What the tag IS, is cross-ASSEMBLY ABI: it is baked into emitted code and into itable entries in
+/// type descriptors, so a program object and a library object built at different times must agree
+/// about every byte of it. That is the reason it freezes at v1, and the reason is narrower than the
+/// cross-tier one previously recorded.
+///
+/// [`element::VAR`]: lamella_metadata::signature::element::VAR
+/// [`element::GENERICINST`]: lamella_metadata::signature::element::GENERICINST
+/// [`element::MVAR`]: lamella_metadata::signature::element::MVAR
+/// [`element::CLASS`]: lamella_metadata::signature::element::CLASS
 #[must_use]
 pub fn interface_method_tag(interface: &TypeName, method: &str, params: &[SigType]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
@@ -1329,41 +1602,41 @@ pub fn interface_method_tag(interface: &TypeName, method: &str, params: &[SigTyp
     hash = fnv1a32(hash, b".");
     hash = fnv1a32(hash, method.as_bytes());
     for param in params {
-        hash = fnv1a32(hash, &[sig_element_byte(param)]);
+        hash = fold_tag_element(hash, param);
     }
     hash | 0x8000_0000
 }
 
-/// The ECMA-335 element-type byte for a parameter type, folded into an interface-method tag to
-/// distinguish overloads. Reference/value types contribute their kind byte, not their name, so
-/// overloads differing only by user-defined parameter type are not distinguished.
-fn sig_element_byte(ty: &SigType) -> u8 {
+/// One parameter's contribution to an interface-method tag: its element byte, plus -- for the three
+/// GENERIC element types only -- the payload that byte cannot carry.
+fn fold_tag_element(hash: u32, ty: &SigType) -> u32 {
     match ty {
-        SigType::Void => 0x01,
-        SigType::Boolean => 0x02,
-        SigType::Char => 0x03,
-        SigType::I1 => 0x04,
-        SigType::U1 => 0x05,
-        SigType::I2 => 0x06,
-        SigType::U2 => 0x07,
-        SigType::I4 => 0x08,
-        SigType::U4 => 0x09,
-        SigType::I8 => 0x0a,
-        SigType::U8 => 0x0b,
-        SigType::R4 => 0x0c,
-        SigType::R8 => 0x0d,
-        SigType::String => 0x0e,
-        SigType::ValueType(_) => 0x11,
-        SigType::Class(_) => 0x12,
-        SigType::Array { .. } => 0x14,
-        SigType::TypedByRef => 0x16,
-        SigType::IntPtr => 0x18,
-        SigType::UIntPtr => 0x19,
-        SigType::Object => 0x1c,
-        SigType::SzArray(_) => 0x1d,
-        _ => 0x00,
+        SigType::Var(number) => {
+            let hash = fnv1a32(hash, &[sig_element_byte(ty)]);
+            fnv1a32(hash, &number.to_le_bytes())
+        }
+        SigType::MVar(number) => {
+            let hash = fnv1a32(hash, &[sig_element_byte(ty)]);
+            fnv1a32(hash, &number.to_le_bytes())
+        }
+        SigType::GenericInst {
+            definition,
+            arguments,
+        } => {
+            let mut hash = fnv1a32(hash, &[sig_element_byte(ty)]);
+            hash = fold_tag_element(hash, definition);
+            for argument in arguments {
+                hash = fold_tag_element(hash, argument);
+            }
+            hash
+        }
+        other => fnv1a32(hash, &[sig_element_byte(other)]),
     }
 }
+
+/// The ECMA-335 element-type byte a `SigType` is spelled with, folded into an interface-method tag
+/// to distinguish overloads.
+pub(crate) use lamella_metadata::signature::element_byte as sig_element_byte;
 
 impl CallResolver for MetadataResolver<'_> {
     fn resolve(&self, operand: &Operand) -> Option<CallInfo> {
@@ -1372,6 +1645,9 @@ impl CallResolver for MetadataResolver<'_> {
         };
         let method = self.assembly.resolve_method(*token)?;
         let signature = method.signature.as_ref()?;
+        if let Some(info) = self.monomorphized_call(*token, signature) {
+            return Some(info);
+        }
         let args = signature.parameters.len() + usize::from(signature.has_this);
         let has_result = !matches!(signature.return_type, SigType::Void);
         let result_type = has_result
@@ -1409,11 +1685,12 @@ impl CallResolver for MetadataResolver<'_> {
                 CallTarget::Intrinsic(Intrinsic::ArrayGetLength)
             }
             MethodKind::Reference => {
-                let (namespace, type_name) = method
-                    .declaring_type
-                    .as_ref()
-                    .map_or(("", ""), |t| (t.namespace, t.name));
-                let name = method.name.unwrap_or("");
+                let declaring = method.declaring_type.as_ref()?;
+                if declaring.name.is_empty() {
+                    return None;
+                }
+                let (namespace, type_name) = (declaring.namespace, declaring.name);
+                let name = method.name?;
                 CallTarget::External(
                     extern_method_symbol(
                         namespace,
@@ -1452,6 +1729,19 @@ impl CallResolver for MetadataResolver<'_> {
                 if !member.is_field() {
                     return None;
                 }
+                if member.parent().table() == table::TYPE_SPEC {
+                    let (owner, type_def, arguments) = self.instantiated_parent(member.parent())?;
+                    let name = member.name()?;
+                    let index = type_def
+                        .fields()
+                        .filter(|field| !field.is_static())
+                        .position(|field| field.name() == Some(name))?;
+                    let layout = self.instantiated_layout(owner, type_def, &arguments)?;
+                    return Some(
+                        self.class_block_start(owner, type_def)?
+                            + *layout.field_offsets.get(index)?,
+                    );
+                }
                 let parent = self.assembly.type_token_name(member.parent())?;
                 let field_name = member.name()?;
                 let (_, owner, type_def) =
@@ -1464,11 +1754,26 @@ impl CallResolver for MetadataResolver<'_> {
                 Some(self.class_block_start(owner, type_def)? + block)
             }
             _ => {
-                let block = self.assembly.field_offset(*token, &TargetLayout::ilp32())?;
                 let declaring = self
                     .assembly
                     .type_defs()
                     .find(|type_def| type_def.fields().any(|field| field.token() == *token))?;
+                let block = match self.assembly.field_offset(*token, &TargetLayout::ilp32()) {
+                    Some(block) => block,
+                    None if !self.type_arguments.is_empty() => {
+                        let index = declaring
+                            .fields()
+                            .filter(|field| !field.is_static())
+                            .position(|field| field.token() == *token)?;
+                        let layout = self.instantiated_layout(
+                            self.assembly,
+                            declaring,
+                            &self.type_arguments,
+                        )?;
+                        *layout.field_offsets.get(index)?
+                    }
+                    None => return None,
+                };
                 Some(self.class_block_start(self.assembly, declaring)? + block)
             }
         }
@@ -1479,8 +1784,18 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         let signature = match token.table() {
-            table::MEMBER_REF => self.assembly.member_ref(token.row())?.field_type()?,
-            _ => self.assembly.field_signature(*token)?,
+            table::MEMBER_REF => {
+                let member = self.assembly.member_ref(token.row())?;
+                let declared = member.field_type()?;
+                if member.parent().table() == table::TYPE_SPEC {
+                    let (_, _, arguments) = self.instantiated_parent(member.parent())?;
+                    crate::generics::substitute_sig(&declared, &arguments)?
+                } else {
+                    declared
+                }
+            }
+            _ => self
+                .apply_instantiation(&self.assembly.field_signature(*token)?)?,
         };
         mir_type(&signature, self.assembly, &TargetLayout::ilp32())
     }
@@ -1564,6 +1879,12 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
+        if token.table() == table::MEMBER_REF
+            && let Some(member) = self.assembly.member_ref(token.row())
+            && member.parent().table() == table::TYPE_SPEC
+        {
+            return self.instantiated_reference_layout(member.parent());
+        }
         let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
         if let Some(type_def) = self.assembly.find_type(declaring.namespace, declaring.name) {
             return self.reference_layout_of(self.assembly, type_def);
@@ -2001,6 +2322,27 @@ impl CallResolver for MetadataResolver<'_> {
         reference_handle_parts(qualified).is_some().then_some(qualified)
     }
 
+    fn unbox_accepted_handles(&self, operand: &Operand) -> Vec<TypeHandle> {
+        let Operand::Token(token) = operand else {
+            return Vec::new();
+        };
+        let own = self.qualified_type_handle(*token);
+        let Some(form) = unbox_normal_form(self.assembly, *token, self.references()) else {
+            return alloc::vec![own];
+        };
+        let mut handles = alloc::vec![own];
+        for candidate in &self.box_target_tokens {
+            if *candidate != *token
+                && unbox_normal_form(self.assembly, *candidate, self.references()) == Some(form)
+            {
+                handles.push(self.qualified_type_handle(*candidate));
+            }
+        }
+        handles.sort_unstable_by_key(|h| h.0);
+        handles.dedup_by_key(|h| h.0);
+        handles
+    }
+
     fn boxed_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
         let Operand::Token(token) = operand else {
             return None;
@@ -2183,10 +2525,7 @@ impl CallResolver for MetadataResolver<'_> {
         let own = type_def.methods().find(|m| {
             m.is_virtual()
                 && m.name() == Some(name)
-                && param_key(
-                    self.assembly,
-                    &m.signature().map(|sig| sig.parameters).unwrap_or_default(),
-                ) == key
+                && decodable_params(m).is_some_and(|p| param_key(self.assembly, &p) == key)
         })?;
         let has_result = !matches!(signature.return_type, SigType::Void);
         Some(CallInfo {
@@ -2242,6 +2581,9 @@ fn mir_type(sig: &SigType, assembly: &Assembly, target: &TargetLayout) -> Option
         SigType::Pointer(_) => MirType::NativeInt,
         SigType::Class(_) | SigType::Object | SigType::String => MirType::ObjectRef,
         SigType::SzArray(_) | SigType::Array { .. } => MirType::ObjectRef,
+        SigType::GenericInst { definition, .. } if matches!(**definition, SigType::Class(_)) => {
+            MirType::ObjectRef
+        }
         SigType::ValueType(token) => match enum_underlying(assembly, *token, &[], target) {
             Some(underlying) => underlying,
             None => MirType::ValueType {
@@ -2454,6 +2796,68 @@ pub(crate) fn enum_underlying<'x>(
     mir_type(&underlying, owner, target)
 }
 
+/// The ECMA-335 element byte a value type NORMALIZES to for UNBOX compatibility -- a primitive is
+/// itself, an enum is its underlying primitive, and anything else (a real struct) is `None`, meaning
+/// only its own exact identity will do.
+///
+/// This is III.4.32/III.4.33's rule, and it is deliberately the SAME normalization the interpreter
+/// applies (`interp.rs`'s `ElemRule::Unbox`: *"the exact type, with an enum standing for its exact
+/// underlying primitive"*). The two tiers have to agree about which unbox throws, so the rule is
+/// taken from the tier that already implements it rather than re-derived here.
+pub(crate) fn unbox_normal_form<'x>(
+    assembly: &'x Assembly<'x>,
+    token: Token,
+    references: &[&'x Assembly<'x>],
+) -> Option<u8> {
+    if let Some(name) = assembly.type_token_name(token) {
+        if let Some(sig) = primitive_sig_type(name.namespace, name.name) {
+            return Some(sig_element_byte(&sig));
+        }
+    }
+    let (owner, type_def) = resolve_value_type_def(assembly, token, references)?;
+    let base = owner.type_token_name(type_def.extends())?;
+    if base.namespace != "System" || base.name != "Enum" {
+        return None;
+    }
+    let underlying = type_def
+        .fields()
+        .find(|field| !field.is_static())?
+        .signature()?;
+    if matches!(
+        underlying,
+        SigType::Var(_) | SigType::MVar(_) | SigType::GenericInst { .. }
+    ) {
+        return None;
+    }
+    Some(sig_element_byte(&underlying))
+}
+
+/// The `SigType` a `System` primitive's NAME denotes, so a boxed primitive can be normalized by the
+/// same element-byte encoding a signature parameter uses. `None` for anything that is not one of
+/// them (including `System.Enum` itself, which is abstract and never boxed as such).
+fn primitive_sig_type(namespace: &str, name: &str) -> Option<SigType> {
+    if namespace != "System" {
+        return None;
+    }
+    Some(match name {
+        "Boolean" => SigType::Boolean,
+        "Char" => SigType::Char,
+        "SByte" => SigType::I1,
+        "Byte" => SigType::U1,
+        "Int16" => SigType::I2,
+        "UInt16" => SigType::U2,
+        "Int32" => SigType::I4,
+        "UInt32" => SigType::U4,
+        "Int64" => SigType::I8,
+        "UInt64" => SigType::U8,
+        "Single" => SigType::R4,
+        "Double" => SigType::R8,
+        "IntPtr" => SigType::IntPtr,
+        "UIntPtr" => SigType::UIntPtr,
+        _ => return None,
+    })
+}
+
 /// Lowers the given methods of an `assembly` to MIR as one module: a call from one of them
 /// to another resolves to the callee's index in `methods` (so pass them in the order you
 /// will give a module lowering such as [`crate::arm32::lower_module`], the entry first), and
@@ -2514,7 +2918,11 @@ pub fn lower_methods_debug(
 
 /// A method's argument and local MIR types, from its signature and local-variable
 /// signature; a type the backend does not lower yet falls back to `int32`.
-fn slot_types(
+///
+/// Public so a DIAGNOSTIC types a method exactly as [`lower_methods_with_references`] does. A tool
+/// that computed its own slot types would be reporting a different program from the one the build
+/// lowers, which is the failure `dump-mir` already paid for once by lowering without references.
+pub fn slot_types(
     assembly: &Assembly,
     method: &Method,
     target: &TargetLayout,
@@ -2638,9 +3046,9 @@ fn is_int32_tostring(method: &ResolvedMethod) -> bool {
 
 /// Decodes a `#US` entry (UTF-16 code units plus a trailing flag byte) to its CODE UNITS.
 ///
-/// Units, not a [`String`], and that is the whole point of this function's shape. It used to end in
-/// `String::from_utf16_lossy` and hand back text, which the `ldstr` lowering then re-encoded to UTF-16
-/// -- a round trip through a type that CANNOT HOLD a lone surrogate. So `"a\u{D800}b"` reached every
+/// Units, not a [`String`], and that is the whole point of this function's shape. Ending in
+/// `String::from_utf16_lossy` and handing back text, which the `ldstr` lowering then re-encodes to
+/// UTF-16, is a round trip through a type that CANNOT HOLD a lone surrogate: `"a\u{D800}b"` reached every
 /// backend as `"a\u{FFFD}b"`, in EVERY tier including the default one whose storage is UTF-16 and can
 /// hold it perfectly well.
 ///
@@ -2657,6 +3065,43 @@ fn decode_user_string(raw: &[u8]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_instantiations_interface_tag_takes_the_canonical_spelling() {
+        use lamella_generics::TypeArg;
+        let of = |argument: TypeArg| {
+            TypeArg::Instance {
+                definition: "System.Collections.Generic.IList`1"
+                    .to_string()
+                    .into_boxed_str(),
+                value_type: false,
+                arguments: alloc::vec![argument],
+            }
+            .name()
+        };
+        let string_name = of(TypeArg::Primitive(
+            lamella_metadata::signature::element::STRING,
+        ));
+        let foo_name = of(TypeArg::Named {
+            name: "Sample.Foo".to_string().into_boxed_str(),
+            value_type: false,
+        });
+        let tag_of = |name: &str| {
+            interface_method_tag(
+                &TypeName {
+                    namespace: "System.Collections.Generic",
+                    name: name.strip_prefix("System.Collections.Generic.").unwrap(),
+                },
+                "Add",
+                &[],
+            )
+        };
+        assert_ne!(
+            tag_of(&string_name),
+            tag_of(&foo_name),
+            "IList<string> and IList<Foo> must not share an interface tag"
+        );
+    }
 
     #[test]
     fn decodes_a_user_string() {
@@ -2852,5 +3297,210 @@ mod tests {
             Some(ELEMENT_KIND_UTF16_UNIT),
             "Char and UInt16 share one frozen code"
         );
+    }
+
+    /// THE DEFECT, STATED: `Pointer` and `ByRef` had no arm in `sig_element_byte` and fell to a
+    /// `_ => 0x00` fallback, so three overloads that differ only in those parameter types produced
+    /// ONE tag -- and a tag IS the dispatch key, so two of the three would have dispatched to the
+    /// third's implementation. The `assert_ne!`s below are the defect: every one of them held as
+    /// `assert_eq!` before the fallback was removed.
+    #[test]
+    fn pointer_and_byref_parameters_no_longer_collapse_to_one_tag() {
+        let iface = TypeName {
+            namespace: "Probe",
+            name: "IOverloads",
+        };
+        let tag = |p: SigType| interface_method_tag(&iface, "Bar", &[p]);
+        let int_ptr = tag(SigType::Pointer(Box::new(SigType::I4)));
+        let byte_ptr = tag(SigType::Pointer(Box::new(SigType::U1)));
+        let by_ref = tag(SigType::ByRef(Box::new(SigType::I4)));
+        let plain = tag(SigType::I4);
+        assert_ne!(int_ptr, by_ref, "T* and ref T are different signatures");
+        assert_ne!(int_ptr, plain, "T* and T are different signatures");
+        assert_ne!(by_ref, plain, "ref T and T are different signatures");
+        assert_eq!(
+            int_ptr, byte_ptr,
+            "int* and byte* still share the PTR kind byte -- a known, stated limit, not a fix"
+        );
+    }
+
+    #[test]
+    fn the_interface_tag_spelling_is_pinned_to_literal_values() {
+        let foo = TypeName {
+            namespace: "",
+            name: "IFoo",
+        };
+        let list = TypeName {
+            namespace: "System.Collections",
+            name: "IList",
+        };
+        for (label, tag, expected) in [
+            ("IFoo.Bar()", interface_method_tag(&foo, "Bar", &[]), 0xaca5_33df),
+            (
+                "IFoo.Bar(int)",
+                interface_method_tag(&foo, "Bar", &[SigType::I4]),
+                0x9f10_9b75,
+            ),
+            (
+                "IFoo.Bar(int*)",
+                interface_method_tag(&foo, "Bar", &[SigType::Pointer(Box::new(SigType::I4))]),
+                0x9810_9070,
+            ),
+            (
+                "IFoo.Bar(ref int)",
+                interface_method_tag(&foo, "Bar", &[SigType::ByRef(Box::new(SigType::I4))]),
+                0x9710_8edd,
+            ),
+            (
+                "IFoo.Bar(int, string)",
+                interface_method_tag(&foo, "Bar", &[SigType::I4, SigType::String]),
+                0xe224_c2a1,
+            ),
+            (
+                "System.Collections.IList.Add(object)",
+                interface_method_tag(&list, "Add", &[SigType::Object]),
+                0xe64e_7989,
+            ),
+        ] {
+            assert_eq!(
+                tag, expected,
+                "{label}: the interface-method tag's spelling changed -- this is cross-assembly ABI"
+            );
+        }
+    }
+
+    /// A GENERIC parameter contributes more than its element byte -- **and exactly how much more is
+    /// the point of this test, because I got it wrong first and the test is what said so.**
+    #[test]
+    fn a_generic_parameter_separates_arguments_but_not_definitions() {
+        use lamella_metadata::signature::element;
+        let foo = TypeName {
+            namespace: "",
+            name: "IFoo",
+        };
+        let list = SigType::Class(Token::new(0x01, 7));
+        let set = SigType::Class(Token::new(0x01, 9));
+        let instance = |definition: &SigType, argument: SigType| SigType::GenericInst {
+            definition: Box::new(definition.clone()),
+            arguments: alloc::vec![argument],
+        };
+        let tag = |p: SigType| interface_method_tag(&foo, "Bar", &[p]);
+
+        assert_ne!(
+            tag(instance(&list, SigType::I4)),
+            tag(instance(&list, SigType::String)),
+            "List<int> and List<string> must not share a tag"
+        );
+        assert_ne!(tag(instance(&list, SigType::I4)), tag(list.clone()));
+        assert_ne!(tag(instance(&list, SigType::I4)), tag(SigType::I4));
+        assert_ne!(tag(SigType::Var(0)), tag(SigType::Var(1)));
+        assert_ne!(tag(SigType::Var(0)), tag(SigType::MVar(0)));
+        assert_ne!(element::VAR, element::MVAR);
+
+        assert_eq!(
+            tag(instance(&list, SigType::I4)),
+            tag(instance(&set, SigType::I4)),
+            "List<int> and HashSet<int> collide -- the parameter position's existing imprecision"
+        );
+        assert_eq!(
+            tag(instance(&list, SigType::Class(Token::new(0x02, 3)))),
+            tag(instance(&list, SigType::Class(Token::new(0x02, 4)))),
+            "List<Foo> and List<Bar> collide, exactly as bare Foo and Bar already do"
+        );
+    }
+
+    #[test]
+    fn a_non_generic_parameter_folds_exactly_its_element_byte() {
+        let foo = TypeName {
+            namespace: "",
+            name: "IFoo",
+        };
+        for ty in [
+            SigType::Void,
+            SigType::Boolean,
+            SigType::Char,
+            SigType::I1,
+            SigType::U1,
+            SigType::I2,
+            SigType::U2,
+            SigType::I4,
+            SigType::U4,
+            SigType::I8,
+            SigType::U8,
+            SigType::R4,
+            SigType::R8,
+            SigType::String,
+            SigType::Object,
+            SigType::IntPtr,
+            SigType::UIntPtr,
+            SigType::TypedByRef,
+            SigType::Class(Token::new(0x02, 1)),
+            SigType::ValueType(Token::new(0x02, 1)),
+            SigType::Pointer(Box::new(SigType::I4)),
+            SigType::ByRef(Box::new(SigType::I4)),
+            SigType::SzArray(Box::new(SigType::I4)),
+            SigType::Array {
+                element: Box::new(SigType::I4),
+                rank: 2,
+            },
+        ] {
+            let folded = fold_tag_element(0x811c_9dc5, &ty);
+            let raw = fnv1a32(0x811c_9dc5, &[sig_element_byte(&ty)]);
+            assert_eq!(folded, raw, "{ty:?} must fold exactly one byte");
+            assert_eq!(
+                interface_method_tag(&foo, "Bar", &[ty.clone()]),
+                (fnv1a32(
+                    fnv1a32(fnv1a32(fnv1a32(0x811c_9dc5, b"IFoo"), b"."), b"Bar"),
+                    &[sig_element_byte(&ty)]
+                ) | 0x8000_0000)
+            );
+        }
+    }
+
+    /// The three codes reserved for generics must not alias a byte the tag already emits, or the
+    /// first generic signature would be indistinguishable from an existing overload.
+    #[test]
+    fn the_reserved_generic_element_codes_alias_nothing_the_tag_emits() {
+        use lamella_metadata::signature::element;
+        let emitted = [
+            SigType::Void,
+            SigType::Boolean,
+            SigType::Char,
+            SigType::I1,
+            SigType::U1,
+            SigType::I2,
+            SigType::U2,
+            SigType::I4,
+            SigType::U4,
+            SigType::I8,
+            SigType::U8,
+            SigType::R4,
+            SigType::R8,
+            SigType::String,
+            SigType::Pointer(Box::new(SigType::I4)),
+            SigType::ByRef(Box::new(SigType::I4)),
+            SigType::ValueType(lamella_token::Token::new(2, 1)),
+            SigType::Class(lamella_token::Token::new(2, 1)),
+            SigType::Array {
+                element: Box::new(SigType::I4),
+                rank: 2,
+            },
+            SigType::TypedByRef,
+            SigType::IntPtr,
+            SigType::UIntPtr,
+            SigType::Object,
+            SigType::SzArray(Box::new(SigType::I4)),
+        ];
+        let used: Vec<u8> = emitted.iter().map(sig_element_byte).collect();
+        for reserved in [element::VAR, element::GENERICINST, element::MVAR] {
+            assert!(
+                !used.contains(&reserved),
+                "reserved generic code {reserved:#04x} already names an emitted parameter kind"
+            );
+        }
+        let mut sorted = used.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), used.len(), "two parameter kinds share one byte");
     }
 }

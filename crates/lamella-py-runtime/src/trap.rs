@@ -35,6 +35,9 @@ pub enum Trap {
     /// implemented set (e.g. a string constant outside the supported forms). Distinct
     /// from malformed input.
     Unsupported,
+    /// A float was needed and this build has none -- the `float` capability is compiled out
+    /// (the no-float tier, for parts too small to carry soft float at all).
+    FloatUnavailable,
     /// An integer result overflowed the fixnum range. Python's `int` has an unlimited
     /// range (data model, Numbers); the interpreter traps the overflow rather than
     /// wrapping silently.

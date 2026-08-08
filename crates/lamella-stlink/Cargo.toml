@@ -17,3 +17,9 @@ workspace = true
 lamella-probe-core = { path = "../lamella-probe-core" }
 # The USB bulk transport. An ST-Link's debug interface is a vendor-specific bulk endpoint pair.
 lamella-usbbulk = { path = "../lamella-usbbulk" }
+
+[dev-dependencies]
+# The STM32 flash sequence. Its crate is NAMED for CMSIS-DAP but its `Stm32F4Flash` is a BLANKET
+# impl over any `TargetAccess`, and `StLink` implements that -- so the two compose with no lifting.
+# The dependency is here rather than the reverse because the ST-Link is the transport, not the part.
+lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32" }

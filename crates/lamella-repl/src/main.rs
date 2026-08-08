@@ -53,7 +53,7 @@ fn main() -> ExitCode {
 }
 
 fn session_oneshot(lines: &[String]) -> ExitCode {
-    let mut session = match lamella_repl::ReplSession::new() {
+    let mut session = match lamella_repl::IncrementalSession::open_compiler_discovered() {
         Ok(session) => session,
         Err(message) => {
             eprintln!("{message}");
@@ -61,8 +61,13 @@ fn session_oneshot(lines: &[String]) -> ExitCode {
         }
     };
     for line in lines {
-        match session.submit(line) {
-            Ok(output) => print!("{output}"),
+        match session.submit_source(line) {
+            Ok(display) => {
+                print!("{}", session.take_console_output());
+                if !display.is_empty() {
+                    println!("{display}");
+                }
+            }
             Err(message) => {
                 eprintln!("{message}");
                 return ExitCode::FAILURE;
@@ -74,7 +79,7 @@ fn session_oneshot(lines: &[String]) -> ExitCode {
 }
 
 fn session_repl() -> ExitCode {
-    let mut session = match lamella_repl::ReplSession::new() {
+    let mut session = match lamella_repl::IncrementalSession::open_compiler_discovered() {
         Ok(session) => session,
         Err(message) => {
             eprintln!("lamella-repl: {message}");
@@ -122,7 +127,7 @@ fn session_repl() -> ExitCode {
             if let Some(command) = line.trim().strip_prefix(':') {
                 match handle_meta(command, &history) {
                     Meta::Continue => continue,
-                    Meta::Reset => match lamella_repl::ReplSession::new() {
+                    Meta::Reset => match lamella_repl::IncrementalSession::open_compiler_discovered() {
                         Ok(fresh) => {
                             session = fresh;
                             history.clear();
@@ -152,13 +157,18 @@ fn session_repl() -> ExitCode {
 }
 
 fn run_submission(
-    session: &mut lamella_repl::ReplSession,
+    session: &mut lamella_repl::IncrementalSession,
     history: &mut Vec<String>,
     submission: &str,
 ) {
     history.push(submission.to_owned());
-    match session.submit(submission) {
-        Ok(output) => print!("{output}"),
+    match session.submit_source(submission) {
+        Ok(display) => {
+            print!("{}", session.take_console_output());
+            if !display.is_empty() {
+                println!("{display}");
+            }
+        }
         Err(message) => println!("{message}"),
     }
     let _ = io::stdout().flush();

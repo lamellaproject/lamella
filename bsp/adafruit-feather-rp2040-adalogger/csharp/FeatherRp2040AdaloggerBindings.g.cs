@@ -8,6 +8,15 @@ namespace Lamella.Generated
         public const int BOARD_MODEL = 18;
         public const string BOARD_VENDOR = "Adafruit";
 
+        /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+        /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+        /// peripherals of the same kind can share no register at all, so a consumer that selects a
+        /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+        /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+        /// name a driver; and a uart is a different register map on every family, so the kind does
+        /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+        public const string UART0_DRIVER_FAMILY = "rp2040-uart";
+
         public const uint UART0_BASE = 0x40034000;
         public const uint UART0_RESET_MASK = 0x400120;
         public const uint UART0_IO_TX_CTRL = 0x40014004;

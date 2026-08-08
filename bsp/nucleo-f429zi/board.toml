@@ -1,0 +1,85 @@
+# BOARD binding: the NUCLEO-F429ZI -- and its point is that it carries THE SAME PART as this
+# family's other board on a completely different carrier.
+#
+# THE PAIR IS A CONTROLLED TEST OF THE CHIP/BOARD SPLIT, which is why this board is worth having
+# beyond a second F429. The Discovery board and this one are the same silicon: same part id, same
+# memory sizes, same peripheral set, same pin map -- so EVERYTHING that differs between the two
+# files is board truth by construction, and nothing in `csp/stm32f42x` needed to change to admit
+# it. If a family's chip package had board truth hiding in it, a second carrier on one part is
+# where that shows.
+#
+# No peripheral bindings yet: the virtual COM port rides USART3 on PD8/PD9, and this family places
+# no usart3 instance and has no pin-map rows for those two cells. The carrier states the wire it
+# is; the binding lands with those rows.
+
+[table]
+kind = "board"
+board = "nucleo-f429zi"
+vendor = "st"
+family = "stm32f42x"
+part = "stm32f429zi"
+board_model = 28            # lamella_wire::board_model::NUCLEO_F429ZI
+sources = [
+    "UM1974 (STM32 Nucleo-144 boards, MB1137): user LD1 is a green LED on PB0, LD2 a blue LED on PB7, LD3 a red LED on PB14; B1 USER is connected to PC13 by default; the USART3 interface on PD8 and PD9 carries the virtual COM port with SB5/SB6 ON and SB7/SB4 OFF.",
+    "MB1137 schematic revision B-01, from ST's Nucleo-144 CAD pack. Sheet 2 (MCU): PB7 through SB139 and R31 680R to LD2's anode with its cathode at ground; PB14 through SB118 and R30 1K to LD3; PC13 through SB173 to the B1 USER switch, whose other side is VDD, with R58 220K to ground. Sheet 6 (extension connectors): PB0 through SB120 into R34 10K with R33 200K to ground, feeding the non-inverting input of U7, a TSV631AILT off +3V3_PER wired as a unity-gain follower, whose output drives R32 510R into LD1's anode with the cathode at ground.",
+]
+notes = [
+    "EVERY FACT BELOW IS GATED BY A SOLDER BRIDGE, and the manual gives the default for each: SB120 ON / SB119 OFF puts LD1 on PB0 rather than on the Arduino D13 pin PA5, SB139 and SB118 connect LD2 and LD3, and SB173 connects the user button. The board file states the defaults; a unit reworked away from them is not what this file describes, and its bridges would have to be read off the unit.",
+    "The virtual COM port reaches the target on PD8 (USART3 TX) and PD9 (USART3 RX), also by solder-bridge default -- SB5 and SB6 ON. Recorded here rather than bound, because a uart binding needs a usart3 instance row and pin-map cells this family does not have yet.",
+    "The schematic is drawn for the whole Nucleo-144 range and its title block says NUCLEO-XXXXZX, so it carries variant notes rather than one board's truth -- 'R73 only fitted on F2 & F4 Series' is one, and this part is an F4. Where a fact could be read from either document, the manual's variant-specific prose and the schematic's own wiring were checked to agree before it was written here.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge's VCP.
+baud = 115200
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# ALL THREE LEDS ARE ACTIVE HIGH and UM1974 states it in words for all three at once: they are on
+# when the I/O is HIGH and off when it is LOW. THE SCHEMATIC SHOWS TWO DIFFERENT REASONS FOR THAT
+# ONE BEHAVIOR, on two different sheets. LD2 and LD3 are driven from their pins through a series
+# resistor into the LED's ANODE, with the cathode at ground. LD1 IS NOT: PB0 reaches a 10K series
+# resistor into a 200K to ground, feeding a unity-gain follower (U7, a TSV631AILT off +3V3_PER)
+# whose output drives R32 510R into the anode -- so the polarity is the same because a follower
+# does not invert, while the LOAD is not: PB0 sources microamps where PB7 and PB14 source
+# milliamps. Both arrangements are the opposite of this vendor's Xplained-style boards, where the
+# supply feeds the anode and the pin sinks -- so the same vendor's two board families disagree,
+# and the polarity has to be read per board rather than per vendor.
+#
+# THE USER BUTTON IS ACTIVE HIGH TOO, AND THAT IS THE MIRROR OF WHAT A READER ASSUMES. R58, a
+# 220K, holds PC13 DOWN, and the switch ties it UP to VDD -- so the pin reads LOW at rest and HIGH
+# while pressed, and a driver that enables a pull-up and waits for a low edge waits forever. The
+# F429 Discovery board's own user button is wired the same way, which is worth knowing because it
+# means this is the vendor's habit here rather than one board's quirk.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PB0"
+active = "high"
+source = "UM1974: user LD1, a green LED, is connected to the STM32 I/O PB0 with SB120 ON and SB119 OFF -- the alternative bridge setting puts it on the Arduino D13 signal PA5 instead, so the pin is a board configuration rather than a fixed wiring. MB1137 rev B-01 sheet 6: PB0 reaches U7's non-inverting input through R34 10K with R33 200K to ground, and U7's output drives R32 510R into LD1's anode with the cathode at ground -- a unity-gain follower, so HIGH lights it."
+
+[[devices]]
+name = "led1"
+kind = "gpio-out"
+pin = "PB7"
+active = "high"
+source = "UM1974: user LD2, a blue LED, is connected to PB7. MB1137 rev B-01 sheet 2: PB7 through SB139 (closed) and R31 680R into LD2's anode, cathode at ground -- so HIGH lights it."
+
+[[devices]]
+name = "led2"
+kind = "gpio-out"
+pin = "PB14"
+active = "high"
+source = "UM1974: user LD3, a red LED, is connected to PB14. MB1137 rev B-01 sheet 2: PB14 through SB118 (closed) and R30 1K into LD3's anode, cathode at ground -- so HIGH lights it."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PC13"
+active = "high"
+source = "UM1974: B1 USER is connected to the I/O PC13 by default (SB173). MB1137 rev B-01 sheet 2: the switch's far side is VDD and R58, a 220K, pulls PC13 to ground -- so the pin rests LOW and reads HIGH while the button is held, which is the opposite of the usual arrangement."

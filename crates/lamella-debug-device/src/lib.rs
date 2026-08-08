@@ -5,16 +5,16 @@
 
 use core::cell::RefCell;
 
-use lamella_cmsis_dap::{Dap, Transport};
+use lamella_probe_core::TargetAccess;
 use lamella_debug_backend::{
     DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
 };
 
-/// Drives a Cortex-M target over a CMSIS-DAP probe as a [`DebugBackend`]. The trait's
-/// inspection methods take `&self` (suited to the interpreter's in-memory state), so the
-/// probe sits behind a `RefCell` for the I/O those methods must perform.
-pub struct DeviceBackend<T: Transport> {
-    dap: RefCell<Dap<T>>,
+/// Drives a Cortex-M target over ANY probe as a [`DebugBackend`]. The trait's inspection methods
+/// take `&self` (suited to the interpreter's in-memory state), so the probe sits behind a
+/// `RefCell` for the I/O those methods must perform.
+pub struct DeviceBackend<A: TargetAccess> {
+    probe: RefCell<A>,
     /// `(native offset, source line)` for the loaded method, ascending by offset.
     lines: Vec<(u32, u32)>,
     /// The loaded method's flash base, subtracted from a PC to index `lines`.
@@ -34,12 +34,12 @@ pub struct DeviceBackend<T: Transport> {
     entry: String,
 }
 
-impl<T: Transport> DeviceBackend<T> {
+impl<A: TargetAccess> DeviceBackend<A> {
     /// Wraps a probe with the loaded method's line table (native offset -> source line),
     /// its flash `base`, per-method `names`, the source `file` it came from, and the `entry`
     /// method's name (stepping out of which continues, having no in-program caller).
     pub fn new(
-        dap: Dap<T>,
+        probe: A,
         lines: Vec<(u32, u32)>,
         base: u32,
         names: Vec<(u32, String)>,
@@ -47,7 +47,7 @@ impl<T: Transport> DeviceBackend<T> {
         entry: String,
     ) -> Self {
         DeviceBackend {
-            dap: RefCell::new(dap),
+            probe: RefCell::new(probe),
             lines,
             base,
             names,
@@ -83,9 +83,9 @@ impl<T: Transport> DeviceBackend<T> {
     /// stop); a probe error is `None`.
     fn service_semihosting(&mut self) -> Option<bool> {
         let string_bytes = {
-            let dap = self.dap.get_mut();
-            let pc = dap.read_core_reg(15).ok()?;
-            let word = dap.read_word(pc & !3).ok()?;
+            let probe = self.probe.get_mut();
+            let pc = probe.read_core_reg(15).ok()?;
+            let word = probe.read_word(pc & !3).ok()?;
             let halfword = if pc & 2 != 0 {
                 (word >> 16) as u16
             } else {
@@ -94,11 +94,11 @@ impl<T: Transport> DeviceBackend<T> {
             if halfword != 0xBEAB {
                 return Some(false);
             }
-            let bytes = if dap.read_core_reg(0).ok()? == 0x04 {
-                let mut addr = dap.read_core_reg(1).ok()?;
+            let bytes = if probe.read_core_reg(0).ok()? == 0x04 {
+                let mut addr = probe.read_core_reg(1).ok()?;
                 let mut collected = Vec::new();
                 while collected.len() < 4096 {
-                    let w = dap.read_word(addr & !3).ok()?;
+                    let w = probe.read_word(addr & !3).ok()?;
                     let byte = (w >> ((addr & 3) * 8)) as u8;
                     if byte == 0 {
                         break;
@@ -110,8 +110,8 @@ impl<T: Transport> DeviceBackend<T> {
             } else {
                 None
             };
-            dap.write_core_reg(15, pc.wrapping_add(2)).ok()?;
-            dap.resume().ok()?;
+            probe.write_core_reg(15, pc.wrapping_add(2)).ok()?;
+            probe.resume().ok()?;
             bytes
         };
         if let Some(bytes) = string_bytes {
@@ -121,7 +121,7 @@ impl<T: Transport> DeviceBackend<T> {
     }
 }
 
-impl<T: Transport> DeviceBackend<T> {
+impl<A: TargetAccess> DeviceBackend<A> {
     /// Runs the target at full speed to `target` -- a return address -- arming it as a temporary
     /// breakpoint; reports `Step` on arrival or `Breakpoint` if a user breakpoint intervened. Used
     /// by step-over (run a callee to the live LR) and step-out (run the frame to its saved return).
@@ -156,16 +156,16 @@ impl<T: Transport> DeviceBackend<T> {
             };
 
         if let Some(armed) = armed {
-            let dap = self.dap.get_mut();
-            if dap.set_breakpoints(&armed).is_err() {
+            let probe = self.probe.get_mut();
+            if probe.set_breakpoints(&armed).is_err() {
                 return Stop::Fault("arm return breakpoint".into());
             }
-            if dap.resume().is_err() {
+            if probe.resume().is_err() {
                 return Stop::Fault("resume into call".into());
             }
             let mut halted = false;
             for _ in 0..1_000_000u32 {
-                match dap.is_halted() {
+                match probe.is_halted() {
                     Ok(true) => {
                         halted = true;
                         break;
@@ -174,12 +174,12 @@ impl<T: Transport> DeviceBackend<T> {
                     Err(_) => return Stop::Fault("poll halt".into()),
                 }
             }
-            let _ = dap.set_breakpoints(&self.breakpoints);
+            let _ = probe.set_breakpoints(&self.breakpoints);
             if !halted {
-                let _ = dap.halt();
+                let _ = probe.halt();
                 return Stop::Fault("call did not return".into());
             }
-            let pc = dap.read_core_reg(15).unwrap_or(0) & !1;
+            let pc = probe.read_core_reg(15).unwrap_or(0) & !1;
             return if self.breakpoints.contains(&pc) {
                 Stop::Breakpoint
             } else {
@@ -189,10 +189,10 @@ impl<T: Transport> DeviceBackend<T> {
 
         const FALLBACK_STEP_LIMIT: u32 = 2048;
         for _ in 0..FALLBACK_STEP_LIMIT {
-            if self.dap.get_mut().step().is_err() {
+            if self.probe.get_mut().step().is_err() {
                 return Stop::Fault("step in call".into());
             }
-            let pc = self.dap.get_mut().read_core_reg(15).unwrap_or(0) & !1;
+            let pc = self.probe.get_mut().read_core_reg(15).unwrap_or(0) & !1;
             if pc == target {
                 return Stop::Step;
             }
@@ -224,8 +224,8 @@ impl<T: Transport> DeviceBackend<T> {
             .find(|&&(start, _)| start <= off)
             .map(|&(start, _)| start)?;
         let method_start = self.base + method_off;
-        let dap = self.dap.get_mut();
-        let w0 = dap.read_word(method_start & !3).ok()?;
+        let probe = self.probe.get_mut();
+        let w0 = probe.read_word(method_start & !3).ok()?;
         let push = if method_start & 2 != 0 {
             (w0 >> 16) as u16
         } else {
@@ -236,7 +236,7 @@ impl<T: Transport> DeviceBackend<T> {
         }
         let saved_count = u32::from(push & 0x00FF).count_ones();
         let after = method_start + 2;
-        let w1 = dap.read_word(after & !3).ok()?;
+        let w1 = probe.read_word(after & !3).ok()?;
         let next = if after & 2 != 0 {
             (w1 >> 16) as u16
         } else {
@@ -247,42 +247,42 @@ impl<T: Transport> DeviceBackend<T> {
         } else {
             0
         };
-        let sp = dap.read_core_reg(13).ok()?;
-        let saved_lr = dap.read_word((sp + frame + 4 * saved_count) & !3).ok()?;
+        let sp = probe.read_core_reg(13).ok()?;
+        let saved_lr = probe.read_word((sp + frame + 4 * saved_count) & !3).ok()?;
         Some(saved_lr & !1)
     }
 }
 
-impl<T: Transport> DebugBackend for DeviceBackend<T> {
+impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     fn launch(&mut self) -> bool {
-        let dap = self.dap.get_mut();
-        dap.connect_swd().is_ok()
-            && dap.read_idcode().is_ok()
-            && dap.init_mem().is_ok()
-            && dap.halt().is_ok()
+        let probe = self.probe.get_mut();
+        probe.connect().is_ok()
+            && probe.read_idcode().is_ok()
+            && probe.init_mem().is_ok()
+            && probe.halt().is_ok()
     }
 
     fn resume(&mut self) -> Stop {
         let bps = self.breakpoints.clone();
-        let dap = self.dap.get_mut();
-        let _ = dap.set_breakpoints(&bps);
-        if let Ok(pc) = dap.read_core_reg(15) {
+        let probe = self.probe.get_mut();
+        let _ = probe.set_breakpoints(&bps);
+        if let Ok(pc) = probe.read_core_reg(15) {
             if bps.contains(&(pc & !1)) {
-                let _ = dap.step();
+                let _ = probe.step();
             }
         }
-        match dap.resume() {
+        match probe.resume() {
             Ok(()) => Stop::Running,
             Err(_) => Stop::Fault("resume failed".into()),
         }
     }
 
     fn pause(&mut self) -> bool {
-        self.dap.get_mut().halt().is_ok()
+        self.probe.get_mut().halt().is_ok()
     }
 
     fn run_to_return(&mut self) -> Stop {
-        let lr = match self.dap.get_mut().read_core_reg(14) {
+        let lr = match self.probe.get_mut().read_core_reg(14) {
             Ok(lr) => lr & !1,
             Err(_) => return Stop::Fault("read LR".into()),
         };
@@ -291,10 +291,10 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
 
     fn step_out(&mut self) -> Option<Stop> {
         let (pc, lr) = {
-            let dap = self.dap.get_mut();
+            let probe = self.probe.get_mut();
             (
-                dap.read_core_reg(15).unwrap_or(0) & !1,
-                dap.read_core_reg(14).unwrap_or(0) & !1,
+                probe.read_core_reg(15).unwrap_or(0) & !1,
+                probe.read_core_reg(14).unwrap_or(0) & !1,
             )
         };
         let here = self.method_name_at(pc.saturating_sub(self.base));
@@ -311,7 +311,7 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn poll(&mut self) -> Stop {
-        match self.dap.get_mut().is_halted() {
+        match self.probe.get_mut().is_halted() {
             Ok(false) => Stop::Running,
             Ok(true) => match self.service_semihosting() {
                 Some(true) => Stop::Running,
@@ -323,14 +323,14 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn step(&mut self) -> Stop {
-        match self.dap.get_mut().step() {
+        match self.probe.get_mut().step() {
             Ok(()) => Stop::Step,
             Err(_) => Stop::Fault("step failed".into()),
         }
     }
 
     fn depth(&self) -> usize {
-        self.dap
+        self.probe
             .borrow_mut()
             .read_core_reg(13)
             .map_or(0, |sp| sp.wrapping_neg() as usize)
@@ -339,7 +339,7 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     fn set_breakpoints(&mut self, addresses: &[u64]) {
         let words: Vec<u32> = addresses.iter().take(4).map(|&a| a as u32).collect();
         self.breakpoints = words.clone();
-        let _ = self.dap.get_mut().set_breakpoints(&words);
+        let _ = self.probe.get_mut().set_breakpoints(&words);
     }
 
     fn max_breakpoints(&self) -> Option<usize> {
@@ -347,7 +347,7 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn stack(&self) -> Vec<Frame> {
-        let pc = self.dap.borrow_mut().read_core_reg(15).unwrap_or(0);
+        let pc = self.probe.borrow_mut().read_core_reg(15).unwrap_or(0);
         let line = self.source_line_at(pc.saturating_sub(self.base));
         vec![Frame {
             address: u64::from(pc),
@@ -385,7 +385,7 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn at_source_boundary(&self) -> bool {
-        let pc = self.dap.borrow_mut().read_core_reg(15).unwrap_or(0);
+        let pc = self.probe.borrow_mut().read_core_reg(15).unwrap_or(0);
         let offset = pc.saturating_sub(self.base);
         match self.lines.iter().position(|&(native, _)| native == offset) {
             Some(0) => true,
@@ -399,11 +399,11 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn read_memory(&self, address: u64, len: usize) -> Vec<u8> {
-        let mut dap = self.dap.borrow_mut();
+        let mut probe = self.probe.borrow_mut();
         let mut out = Vec::with_capacity(len);
         let mut addr = address as u32;
         while out.len() < len {
-            match dap.read_word(addr) {
+            match probe.read_word(addr) {
                 Ok(word) => out.extend_from_slice(&word.to_le_bytes()),
                 Err(_) => break,
             }
@@ -418,12 +418,12 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
             "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp",
             "lr", "pc", "xpsr",
         ];
-        let mut dap = self.dap.borrow_mut();
+        let mut probe = self.probe.borrow_mut();
         NAMES
             .iter()
             .enumerate()
             .filter_map(|(sel, name)| {
-                dap.read_core_reg(sel as u8).ok().map(|value| Register {
+                probe.read_core_reg(sel as u8).ok().map(|value| Register {
                     name: (*name).into(),
                     value: u64::from(value),
                 })
@@ -432,12 +432,12 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn disassemble(&self, address: u64, offset: i64, count: usize) -> Vec<Disassembled> {
-        let mut dap = self.dap.borrow_mut();
+        let mut probe = self.probe.borrow_mut();
         let start = (address as i64).wrapping_add(offset * 2) as u32;
         (0..count)
             .map(|i| {
                 let addr = start.wrapping_add((i as u32) * 2);
-                let text = match dap.read_word(addr & !3) {
+                let text = match probe.read_word(addr & !3) {
                     Ok(word) => {
                         let half = if addr & 2 != 0 {
                             word >> 16

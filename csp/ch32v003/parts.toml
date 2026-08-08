@@ -1,0 +1,86 @@
+# PARTS table for the CH32V003 family: WCH's QingKe V2A RISC-V microcontrollers. The pin
+# present-list is PARTIAL and evidence-only -- a pin-map row or a binding pin outside it is
+# refused.
+#
+# THIS PART'S INSTRUCTION SET IS STATED BECAUSE THE COMMON RISC-V ASSUMPTION IS FALSE HERE. The
+# usual 32-bit RISC-V profile is RV32I with hardware multiply; this core is neither, and code
+# generated on that assumption assembles and then executes an illegal instruction or names a
+# register the silicon does not have. The profile is given as a NAME plus the three consequences a
+# code generator has to respect -- how many integer registers there are, how multiply and divide
+# are reached, and how wide the hardware floating point is -- and generation derives all three from
+# the name and refuses a row where they disagree, the same state-and-verify shape a clock plan uses
+# when it states both its divisors and the rates they produce. A name alone could not be checked;
+# consequences alone would not say which silicon they came from.
+
+[table]
+kind = "parts"
+family = "ch32v003"
+sources = [
+    "CH32V003 Datasheet V1.8 (WCH): chapter 1 features, Table 2-1 pin definitions, chapter 4 package and ordering information",
+    "CH32V003 Reference Manual V1.9 (WCH): section 1.2 (16KB CodeFlash, 2KB SRAM at 0x20000000)",
+]
+notes = [
+    "PROVENANCE, because it is not the ordinary case: wch-ic.com serves its download pages as a client-side application with no static file URL, so neither document could be fetched from the vendor's own host. Both were read from a mirror and accepted only after checking that each SELF-IDENTIFIES on its title page -- 'CH32V003 Reference Manual V1.9' and 'CH32V003 Datasheet V1.8', the former printing https://wch-ic.com on the page itself. The host is a mirror; the documents are WCH's. This is the same standard the nRF51 blocks were accepted under. If a fact here is ever disputed, re-read the vendor's own copy first.",
+    "All four order codes are the same die: 16 KB flash, 2 KB SRAM, and the same QingKe V2A core. They differ only in package and therefore in how many pins are brought out, which is why the flash/ram/isa columns repeat and the pin lists are what will diverge as rows are grown.",
+    "THE FAMILY ABOVE IS WHY `isa_float` EXISTS AT ALL. This core has no floating-point extension, so every float operation on it is a library call. WCH's QingKe V4F, in the CH32V307, is rv32imac plus F -- a hardware single-precision FPU. A part table that recorded only the register count and the multiply path would describe those two cores identically on the one axis where they differ most in generated code.",
+    "THE SIBLING CORE IS WHY `isa_muldiv` HAS THREE VALUES RATHER THAN TWO. The V2A here reaches multiply and divide through neither instruction, so both are runtime routines. WCH's next core up, the V2C, is the same RV32EC base plus Zmmul -- the M extension's multiply half without its divide. A part on that core is neither 'hardware' nor 'soft', and calling it either would cost a `mul` it has or emit a `div` that traps.",
+]
+
+# The core profile every row below repeats, stated once here so the repetition is readable rather
+# than four unexplained copies: the QingKe V2A implements RV32EC. The E is not a detail -- it
+# halves the integer register file to x0-x15, so a register allocator carrying the usual RV32I
+# pool of saved registers x18-x27 names registers this silicon does not have. And there is no M
+# extension, so multiply and divide are library calls; emitting `mul` here is an illegal
+# instruction, not a slow one.
+
+[[parts]]
+part = "ch32v003f4u6"
+package = "QFN20"
+flash = 0x4000
+ram = 0x800
+isa = "rv32ec"
+isa_registers = 16
+isa_muldiv = "soft"
+isa_float = "soft"
+isa_source = "CH32V003 Datasheet V1.8 chapter 1: 'QingKe 32-bit RISC-V core, RV32EC instruction set'. CH32V003 Reference Manual V1.9 overview states the same: 'It adopts QingKe V2A core, RV32EC instruction set'. RV32E gives 16 integer registers and the profile carries no M extension, so multiply and divide are soft."
+pins = ["PD6"]
+source = "CH32V003 Datasheet V1.8 chapter 1 (16KB flash, 2KB SRAM) and chapter 4 ordering information (QFN20, 3.0*3.0mm body, 0.4mm pitch, order model CH32V003F4U6). The pin list is PARTIAL rather than the package's full set: PD6 is here because a board binds it, and Table 2-1 gives it as QFN20 pin 20, type I/O/A, whose main function after reset is plain PD6."
+
+[[parts]]
+part = "ch32v003f4p6"
+package = "TSSOP20"
+flash = 0x4000
+ram = 0x800
+isa = "rv32ec"
+isa_registers = 16
+isa_muldiv = "soft"
+isa_float = "soft"
+isa_source = "As ch32v003f4u6: the same core and the same statement in both documents."
+pins = ["PD6"]
+source = "CH32V003 Datasheet V1.8 chapter 4 ordering information (TSSOP20, 4.4*6.5mm body, 0.65mm pitch, order model CH32V003F4P6). Table 2-1 gives PD6 as TSSOP20 pin 3."
+
+[[parts]]
+part = "ch32v003a4m6"
+package = "SOP16"
+flash = 0x4000
+ram = 0x800
+isa = "rv32ec"
+isa_registers = 16
+isa_muldiv = "soft"
+isa_float = "soft"
+isa_source = "As ch32v003f4u6: the same core and the same statement in both documents."
+pins = ["PD6"]
+source = "CH32V003 Datasheet V1.8 chapter 4 ordering information (SOP16, 3.9*10.0mm body, 1.27mm pitch, order model CH32V003A4M6). Table 2-1 gives PD6 as SOP16 pin 10."
+
+[[parts]]
+part = "ch32v003j4m6"
+package = "SOP8"
+flash = 0x4000
+ram = 0x800
+isa = "rv32ec"
+isa_registers = 16
+isa_muldiv = "soft"
+isa_float = "soft"
+isa_source = "As ch32v003f4u6: the same core and the same statement in both documents."
+pins = ["PD6"]
+source = "CH32V003 Datasheet V1.8 chapter 4 ordering information (SOP8, 3.9*5.0mm body, 1.27mm pitch, order model CH32V003J4M6). Table 2-1 gives PD6 as SOP8 pin 1 -- and on this package that pin is SHARED: the pinout diagram brings PD6 and PA1 out together on pin 1, which is a property of the 8-pin package rather than of the die."

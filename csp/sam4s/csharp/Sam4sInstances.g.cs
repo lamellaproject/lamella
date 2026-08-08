@@ -8,6 +8,8 @@ namespace Lamella.Generated
         public const uint UART1_BASE = 0x400E0800;
         public const uint UART1_PID = 9;
         public const uint PMC_BASE = 0x400E0400;
+        public const uint PIOA_BASE = 0x400E0E00;
+        public const uint PIOA_PID = 11;
         public const uint PIOB_BASE = 0x400E1000;
         public const uint PIOB_PID = 12;
         public const uint PIOC_BASE = 0x400E1200;

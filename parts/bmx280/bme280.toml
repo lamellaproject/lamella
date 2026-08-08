@@ -16,6 +16,19 @@ notes = [
     "Register and readout compatible with the BMP280 for pressure and temperature; the differences are the humidity channel, the standby encoding, and the identity value.",
 ]
 
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
+#
+# Unvalidated, stated plainly: no physical BME280 has been made to answer any of it. The
+# compensation arithmetic has been cross-checked against the vendor's own reference calculation,
+# which is a DIFFERENT claim and does not raise this rank -- it establishes that these numbers
+# agree with the document, not that a part agrees with these numbers.
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
 [identity]
 reg = 0xD0
 width = 8

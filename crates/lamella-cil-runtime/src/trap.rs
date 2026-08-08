@@ -47,8 +47,22 @@ pub enum Trap {
     /// A checked arithmetic operation or conversion overflowed (the `OverflowException`
     /// site) -- `add.ovf` / `sub.ovf` / `mul.ovf` and `conv.ovf.*`.
     Overflow,
-    /// A field token (`ldfld`/`stfld`) resolved to no field slot in the module.
+    /// A field token (`ldfld`/`stfld`) resolved to no field slot in the module -- the field is not
+    /// REGISTERED. A loading or binding question: the token names a field this module does not know.
     UnresolvedField(Token),
+    /// The field resolved fine, and the STORAGE does not have that slot -- an instance, a struct
+    /// value, or the static area, depending on the instruction.
+    ///
+    /// A different defect from [`UnresolvedField`](Self::UnresolvedField) with a different remedy,
+    /// which is why it is a different trap: the field IS registered, so nothing about loading or
+    /// binding is wrong -- the storage was allocated with a layout that does not match the type
+    /// whose field is being read. **Look at how it was ALLOCATED, not at the field.**
+    FieldSlotMissing {
+        /// The field token the instruction named.
+        field: Token,
+        /// The slot it resolved to, which the storage does not have.
+        slot: u32,
+    },
     /// Integer division or remainder by zero (`div`, `rem`, and unsigned forms).
     DivideByZero,
     /// A `call` token resolved to no method in the module.
@@ -121,6 +135,12 @@ impl fmt::Display for Trap {
             Trap::UnresolvedField(token) => {
                 write!(f, "field token 0x{:08X} resolved to no field", token.0)
             }
+            Trap::FieldSlotMissing { field, slot } => write!(
+                f,
+                "field token 0x{:08X} resolved to slot {slot}, which this instance does not have \
+                 (the field is fine; the object was allocated with a different layout)",
+                field.0
+            ),
             Trap::DivideByZero => f.write_str("integer divide by zero"),
             Trap::UnresolvedCall(token) => {
                 write!(f, "call token 0x{:08X} resolved to no method", token.0)

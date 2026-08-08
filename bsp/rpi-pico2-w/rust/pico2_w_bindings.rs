@@ -4,6 +4,18 @@
 pub const BOARD_MODEL: u16 = 10;
 pub const BOARD_VENDOR: &str = "RaspberryPi";
 
+/// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+/// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+/// peripherals of the same kind can share no register at all, so a consumer that selects a
+/// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+/// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+/// name a driver; and a uart is a different register map on every family, so the kind does
+/// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+pub const UART0_DRIVER_FAMILY: &str = "rp2350-uart";
+pub const SPI0_DRIVER_FAMILY: &str = "rp2350-spi";
+pub const I2C0_DRIVER_FAMILY: &str = "rp2350-i2c";
+pub const ADC_DRIVER_FAMILY: &str = "rp2350-adc";
+
 pub const UART0_BASE: u32 = 0x40070000;
 pub const UART0_RESET_MASK: u32 = 0x4000240;
 pub const UART0_IO_TX_CTRL: u32 = 0x40028004;

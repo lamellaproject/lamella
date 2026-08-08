@@ -135,6 +135,13 @@ pub use lamella_elf::{
     STACKMAP_END_SYMBOL, STACKMAP_RECORD_PREFIX, STACKMAP_START_SYMBOL, STACKMAP_STATICS_PREFIX,
 };
 
+/// Re-exported return-address stack-map names (see [`lamella_elf`]): the backend contributes
+/// per-function fragments in [`STACKMAP_GCMAP_SECTION`]; this linker synthesizes
+/// [`STACKMAP_BLOB_SYMBOL`] from the fragments whose function survived, and defines
+/// [`TEXT_BASE_SYMBOL`] at the image's `.text` start so a collector can turn a runtime return
+/// address into a lookup key.
+pub use lamella_elf::{STACKMAP_BLOB_SYMBOL, STACKMAP_GCMAP_SECTION, TEXT_BASE_SYMBOL};
+
 /// Re-exported statics-layout names (see [`lamella_elf`]): the backend references regions and the
 /// EH word by them; this linker lays the regions out in a RAM window, defines every symbol, and
 /// brackets the span for a boot stub's zero loop.
@@ -374,12 +381,176 @@ fn link_with_base_ram(
     residents: &[(&str, u32)],
     ram: Option<(u32, u32)>,
 ) -> Result<LinkedImage, LinkError> {
-    if let Some(table) = stackmap_table_object(objects) {
-        let mut with_table: Vec<Object> = objects.to_vec();
-        with_table.push(table);
-        return link_with_base_inner(&with_table, entry, text_base, residents, ram);
+    let synthetic: Vec<Object> = stackmap_table_object(objects)
+        .into_iter()
+        .chain(gcmap_blob_object(objects))
+        .collect();
+    if !synthetic.is_empty() {
+        let mut with_synthetic: Vec<Object> = objects.to_vec();
+        with_synthetic.extend(synthetic);
+        return link_with_base_inner(&with_synthetic, entry, text_base, residents, ram);
     }
     link_with_base_inner(objects, entry, text_base, residents, ram)
+}
+
+/// One function's contribution to the return-address stack map, as the backend's `.lamella_gcmap`
+/// fragment carries it: the owning function's symbol name, and each safepoint as its return address
+/// RELATIVE TO that function plus the entry's opaque tail.
+#[derive(Debug, Clone)]
+struct GcMapFragment {
+    function: String,
+    entries: Vec<(u32, Vec<u8>)>,
+}
+
+/// Reads a `u32` at `at`, or `None` past the end.
+fn rd32(data: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Every `.lamella_gcmap` fragment in `objects`, in object order. A malformed or truncated fragment
+/// ENDS that section's parse rather than being skipped: the format is self-delimiting, so a bad
+/// length means every following offset is meaningless, and silently resyncing would emit a map with
+/// plausible entries at wrong addresses.
+fn gcmap_fragments(objects: &[Object]) -> Vec<GcMapFragment> {
+    let mut out = Vec::new();
+    for obj in objects {
+        for sec in obj
+            .sections
+            .iter()
+            .filter(|s| s.name == STACKMAP_GCMAP_SECTION)
+        {
+            let data = &sec.data;
+            let mut at = 0usize;
+            while at < data.len() {
+                let Some(name_len) = rd32(data, at) else { break };
+                let name_at = at + 4;
+                let Some(name) = data
+                    .get(name_at..name_at + name_len as usize)
+                    .and_then(|b| core::str::from_utf8(b).ok())
+                else {
+                    break;
+                };
+                at = (name_at + name_len as usize).next_multiple_of(4);
+                let Some(count) = rd32(data, at) else { break };
+                at += 4;
+                let mut entries = Vec::with_capacity(count as usize);
+                let mut truncated = false;
+                for _ in 0..count {
+                    let (Some(rel_pc), Some(tail_len)) = (rd32(data, at), rd32(data, at + 4)) else {
+                        truncated = true;
+                        break;
+                    };
+                    let tail_at = at + 8;
+                    let Some(tail) = data.get(tail_at..tail_at + tail_len as usize) else {
+                        truncated = true;
+                        break;
+                    };
+                    entries.push((rel_pc, tail.to_vec()));
+                    at = (tail_at + tail_len as usize).next_multiple_of(4);
+                }
+                out.push(GcMapFragment {
+                    function: String::from(name),
+                    entries,
+                });
+                if truncated {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The set of function names a fragment can still resolve against -- every non-local symbol DEFINED
+/// somewhere in `objects`. A dead-stripped function leaves no definition, which is exactly how a
+/// fragment for it is dropped: no keep-rule, no name convention, just the absence of a symbol.
+fn defined_names(objects: &[Object]) -> BTreeSet<String> {
+    objects
+        .iter()
+        .flat_map(|o| &o.symbols)
+        .filter(|s| s.defined && !s.name.is_empty() && s.binding != Binding::Local)
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// The synthetic object RESERVING the return-address stack map, or `None` when no object carries
+/// fragments. The bytes are zero here and written by `fill_gcmap_blob` once layout has fixed every
+/// address; only the SIZE has to be right this early, and it is knowable because which functions
+/// survive is a question about symbol existence rather than about addresses.
+fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
+    let machine = objects.first()?.machine;
+    let fragments = gcmap_fragments(objects);
+    if fragments.is_empty() {
+        return None;
+    }
+    let live = defined_names(objects);
+    let size: usize = 4 + fragments
+        .iter()
+        .filter(|f| live.contains(&f.function))
+        .flat_map(|f| &f.entries)
+        .map(|(_, tail)| 4 + tail.len())
+        .sum::<usize>();
+    Some(Object {
+        machine,
+        text: alloc::vec![0u8; size],
+        text_align: 4,
+        symbols: alloc::vec![
+            lamella_elf::ParsedSymbol {
+                name: String::new(),
+                value: 0,
+                size: 0,
+                binding: Binding::Local,
+                kind: SymbolType::NoType,
+                defined: false,
+                section: None,
+            },
+            lamella_elf::ParsedSymbol {
+                name: String::from(STACKMAP_BLOB_SYMBOL),
+                value: 0,
+                size: size as u32,
+                binding: Binding::Global,
+                kind: SymbolType::NoType,
+                defined: true,
+                section: None,
+            },
+        ],
+        relocations: Vec::new(),
+        sections: Vec::new(),
+    })
+}
+
+/// Writes the return-address stack map into the space [`gcmap_blob_object`] reserved: each surviving
+/// safepoint as `u32 key` (the function's linked image offset plus the fragment's relative pc, which
+/// is exactly `runtime_return_addr - __lamella_text_base`) followed by its tail verbatim, sorted by
+/// key for the collector's binary search, behind a `u32 count`.
+fn fill_gcmap_blob(text: &mut [u8], objects: &[Object], defined: &[Defined]) {
+    let Some((blob_at, _)) = resolve_sym(defined, STACKMAP_BLOB_SYMBOL) else {
+        return;
+    };
+    let live = defined_names(objects);
+    let mut rows: Vec<(u32, Vec<u8>)> = Vec::new();
+    for fragment in gcmap_fragments(objects) {
+        if !live.contains(&fragment.function) {
+            continue;
+        }
+        let Some((func_at, _)) = resolve_sym(defined, &fragment.function) else {
+            continue;
+        };
+        for (rel_pc, tail) in fragment.entries {
+            rows.push((func_at + rel_pc, tail));
+        }
+    }
+    rows.sort_by_key(|(key, _)| *key);
+    let mut out = Vec::with_capacity(4 + rows.iter().map(|(_, t)| 4 + t.len()).sum::<usize>());
+    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for (key, tail) in &rows {
+        out.extend_from_slice(&key.to_le_bytes());
+        out.extend_from_slice(tail);
+    }
+    let at = blob_at as usize;
+    if let Some(slot) = text.get_mut(at..at + out.len()) {
+        slot.copy_from_slice(&out);
+    }
 }
 
 /// The stack-map pointer-table object over every record symbol in `objects` (see
@@ -512,6 +683,14 @@ fn link_with_base_inner(
         }
     }
 
+    if objects
+        .iter()
+        .any(|o| o.sections.iter().any(|s| s.name == STACKMAP_GCMAP_SECTION))
+        && !defined.iter().any(|(n, _, _)| n == TEXT_BASE_SYMBOL)
+    {
+        defined.push((String::from(TEXT_BASE_SYMBOL), 0, false));
+    }
+
     if let Some(base) = text_base {
         for &(name, addr) in residents {
             if defined.iter().any(|(n, _, _)| n == name) {
@@ -639,6 +818,8 @@ fn link_with_base_inner(
         }
     }
 
+    fill_gcmap_blob(&mut text, objects, &defined);
+
     let debug_sections = link_carried_sections(objects, &bases, machine, text_base, &defined)?;
 
     let entry_offset =
@@ -678,6 +859,9 @@ fn link_carried_sections(
     let mut placed: BTreeMap<(usize, usize), (usize, u32)> = BTreeMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
+            if sec.name == STACKMAP_GCMAP_SECTION {
+                continue;
+            }
             let out_i = match out.iter().position(|(n, _)| *n == sec.name) {
                 Some(i) => i,
                 None => {
@@ -694,6 +878,9 @@ fn link_carried_sections(
 
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
+            if sec.name == STACKMAP_GCMAP_SECTION {
+                continue;
+            }
             let (out_i, contrib) = placed[&(oi, si)];
             for r in &sec.relocations {
                 let abs32 = match machine {
@@ -1020,6 +1207,31 @@ pub fn link_icf(
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
     link_gc_inner(objects, entry, true, text_base)
+}
+
+/// As [`link_gc`], but pulling archive members on demand first, exactly as [`link_with_archives`]
+/// does -- so a program that reaches the runtime-support archive can be measured against its
+/// [`link_icf_with_archives`] twin on the SAME input.
+pub fn link_gc_with_archives(
+    objects: &[Object],
+    archives: &[Archive],
+    entry: &str,
+    text_base: Option<u32>,
+) -> Result<LinkedImage, LinkError> {
+    link_gc_inner(&include_on_demand(objects, archives), entry, false, text_base)
+}
+
+/// As [`link_icf`], but pulling archive members on demand first (see [`link_gc_with_archives`]).
+/// The pair exists because the only honest measure of what ICF recovers is the same object set
+/// linked both ways: folding measured on a program object alone omits every archive body, and the
+/// archive is where a duplicated helper is most likely to appear twice.
+pub fn link_icf_with_archives(
+    objects: &[Object],
+    archives: &[Archive],
+    entry: &str,
+    text_base: Option<u32>,
+) -> Result<LinkedImage, LinkError> {
+    link_gc_inner(&include_on_demand(objects, archives), entry, true, text_base)
 }
 
 fn link_gc_inner(
@@ -1624,6 +1836,185 @@ mod tests {
             kind: SymbolType::NoType,
             section: SymbolSection::Text,
         }
+    }
+
+    /// An object carrying a `.lamella_gcmap` section beside its `.text`, which is how the ARM
+    /// backend hands the linker its per-function safepoint fragments.
+    fn obj_arm_gcmap(
+        text: &[u8],
+        syms: &[Symbol],
+        relocs: &[Relocation],
+        gcmap: &[u8],
+    ) -> Object {
+        read_object(&lamella_elf::write_relocatable_object_with_sections(
+            Machine::Arm,
+            text,
+            syms,
+            relocs,
+            &[lamella_elf::Section {
+                name: STACKMAP_GCMAP_SECTION,
+                flags: 0,
+                addralign: 4,
+                data: gcmap,
+                relocations: &[],
+            }],
+        ))
+        .unwrap()
+    }
+
+    /// One `.lamella_gcmap` fragment for `name`: each `(rel_pc, nrefs)` becomes an entry whose tail
+    /// is `[frame_size=8][saved_bytes=8][nrefs][ref_offsets..][ntagged=0]`. An ODD `nrefs` makes the
+    /// tail 10 bytes rather than 8, which is what exercises the fragment's 4-byte entry padding.
+    fn gcmap_fragment(name: &str, entries: &[(u32, u16)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for &(rel_pc, nrefs) in entries {
+            let mut tail = Vec::new();
+            tail.extend_from_slice(&8u16.to_le_bytes());
+            tail.extend_from_slice(&8u16.to_le_bytes());
+            tail.extend_from_slice(&nrefs.to_le_bytes());
+            for r in 0..nrefs {
+                tail.extend_from_slice(&(r * 4).to_le_bytes());
+            }
+            tail.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&rel_pc.to_le_bytes());
+            out.extend_from_slice(&(tail.len() as u32).to_le_bytes());
+            out.extend_from_slice(&tail);
+            while out.len() % 4 != 0 {
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    /// The synthesized map as `(key, tail)` rows, read back out of a linked image.
+    fn decode_gcmap(img: &LinkedImage) -> Vec<(u32, Vec<u8>)> {
+        let (_, at) = img
+            .symbols
+            .iter()
+            .find(|(n, _)| n == STACKMAP_BLOB_SYMBOL)
+            .expect("the linker defines the stack-map blob")
+            .clone();
+        let blob = &img.text[at as usize..];
+        let count = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+        let mut rows = Vec::new();
+        let mut off = 4;
+        for _ in 0..count {
+            let key = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap());
+            let nrefs = u16::from_le_bytes(blob[off + 8..off + 10].try_into().unwrap()) as usize;
+            let ntag_at = off + 10 + nrefs * 2;
+            let ntagged = u16::from_le_bytes(blob[ntag_at..ntag_at + 2].try_into().unwrap()) as usize;
+            let end = ntag_at + 2 + ntagged * 2;
+            rows.push((key, blob[off + 4..end].to_vec()));
+            off = end;
+        }
+        rows
+    }
+
+    #[test]
+    fn every_stack_map_key_lands_inside_a_surviving_function() {
+        let text = alloc::vec![0u8; 16];
+        let prog = obj_arm_gcmap(
+            &text,
+            &[func("f0", 1, 8), func("f1", 9, 8)],
+            &[],
+            &[
+                gcmap_fragment("f0", &[(4, 1)]),
+                gcmap_fragment("f1", &[(0, 0), (4, 2)]),
+            ]
+            .concat(),
+        );
+        let img = link_at_base(&[prog], "f0", 0x1000).unwrap();
+        let extents: Vec<(u32, u32)> = alloc::vec![(0, 8), (8, 16)];
+        let rows = decode_gcmap(&img);
+        assert_eq!(rows.len(), 3, "three safepoints across two functions");
+        for (key, _) in &rows {
+            assert!(
+                extents.iter().any(|&(lo, hi)| *key >= lo && *key < hi),
+                "key {key} is not inside any function extent {extents:?}"
+            );
+        }
+        assert!(
+            rows.windows(2).all(|w| w[0].0 <= w[1].0),
+            "the map is sorted for the collector's binary search"
+        );
+        assert_eq!(
+            rows.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            alloc::vec![4, 8, 12],
+            "f0+4, f1+0, f1+4 against f1 laid at 8"
+        );
+    }
+
+    /// The recovery this move exists for: a function that does NOT survive dead-stripping pays
+    /// nothing for the safepoints the compiler saw in it. Under the old emission the map was built
+    /// from every DECLARED method before the linker had dropped anything.
+    #[test]
+    fn a_dead_functions_safepoints_are_not_in_the_map() {
+        let text = alloc::vec![0u8; 16];
+        let live = obj_arm_gcmap(
+            &text,
+            &[func("f0", 1, 8), func("dead0", 9, 8)],
+            &[],
+            &[
+                gcmap_fragment("f0", &[(4, 1)]),
+                gcmap_fragment("dead0", &[(0, 3), (4, 1)]),
+            ]
+            .concat(),
+        );
+        let with_dead = decode_gcmap(&link_at_base(&[live.clone()], "f0", 0x1000).unwrap());
+        assert_eq!(with_dead.len(), 3, "nothing stripped yet: all three entries");
+
+        let trimmed = garbage_collect(&[live], "f0");
+        assert!(
+            !trimmed[0].symbols.iter().any(|s| s.name == "dead0"),
+            "dead0 is unreachable from f0 and should be stripped"
+        );
+        let rows = decode_gcmap(&link_at_base(&trimmed, "f0", 0x1000).unwrap());
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the surviving function's safepoint is in the map"
+        );
+        assert_eq!(rows[0].0, 4, "and it is keyed at f0+4");
+    }
+
+    /// The fragments are an INPUT: they are not `SHF_ALLOC`, they are not carried out as a debug
+    /// section, and the only thing the image gets from them is the synthesized map.
+    #[test]
+    fn gcmap_fragments_do_not_reach_the_image() {
+        let text = alloc::vec![0u8; 8];
+        let prog = obj_arm_gcmap(
+            &text,
+            &[func("f0", 1, 8)],
+            &[],
+            &gcmap_fragment("f0", &[(4, 1)]),
+        );
+        let img = link_at_base(&[prog], "f0", 0x1000).unwrap();
+        assert!(
+            !img.debug_sections
+                .iter()
+                .any(|(n, _)| n == STACKMAP_GCMAP_SECTION),
+            "fragments are consumed by synthesis, not carried through"
+        );
+        assert_eq!(img.text.len(), 8 + 4 + 14);
+        assert!(
+            img.symbols.iter().any(|(n, _)| n == TEXT_BASE_SYMBOL),
+            "the linker defines the base a collector subtracts"
+        );
+        assert_eq!(
+            img.symbols
+                .iter()
+                .find(|(n, _)| n == TEXT_BASE_SYMBOL)
+                .unwrap()
+                .1,
+            0,
+            "and it is the image's .text start"
+        );
     }
 
     /// A minimal 16-byte METHOD_SLOTS stack-map record: `[func_addr=0][code_size][mode=1]`
@@ -2645,6 +3036,82 @@ mod tests {
             addr("g"),
             "address-taken functions must keep distinct identities"
         );
+    }
+
+    /// THE DEFECT, STATED: the `--gc-sections`/ICF path is FUNCTION-ONLY, so it cannot link any
+    /// object that references a defined DATA symbol -- and every AOT program does (its type
+    /// descriptors, its stack-map table, its statics region). `link_gc_inner` gathers only
+    /// `SymbolType::Func` symbols, lays out only those, and defines only those, so a reference to a
+    /// data symbol that IS defined in the input comes back `UndefinedSymbol`.
+    ///
+    /// This is asserted rather than merely noted because the consequence is easy to miss and
+    /// expensive to assume away: ICF is the lever the generics code-model audit prices
+    /// monomorphization against, and it has never met a real image. The `link` control in the same
+    /// test is what makes the claim about the PATH rather than about the fixture.
+    ///
+    /// When the fold path learns about data symbols, this test fails -- that is intended. Replace
+    /// it then with the positive assertion (the image links AND the duplicate folds).
+    #[test]
+    fn the_gc_and_icf_path_cannot_link_a_reference_to_a_data_symbol() {
+        let text = [0x15, 0x20, 0x70, 0x47, 0, 0, 0, 0];
+        let main = obj_arm(
+            &text,
+            &[func("main", 1, 4), data("desc", 8, 4)],
+            &[Relocation {
+                offset: 4,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+        );
+        let plain = link_at_base(core::slice::from_ref(&main), "main", 0x8000);
+        assert!(
+            plain.is_ok(),
+            "the control must link -- otherwise the fixture is what is wrong, not the path"
+        );
+        for refused in [
+            link_gc_with_archives(core::slice::from_ref(&main), &[], "main", Some(0x8000)),
+            link_icf_with_archives(core::slice::from_ref(&main), &[], "main", Some(0x8000)),
+        ] {
+            assert!(
+                matches!(&refused, Err(LinkError::UndefinedSymbol(n)) if n == "desc"),
+                "the fold path must still refuse a defined data symbol; got {refused:?}"
+            );
+        }
+    }
+
+    /// The archive-pulling twins resolve an undefined symbol from a member exactly as
+    /// [`link_with_archives`] does, so a fold measurement and a production measurement can be taken
+    /// on the SAME input set.
+    #[test]
+    fn the_fold_path_pulls_archive_members_on_demand() {
+        let body = &[0x15, 0x20, 0x70, 0x47];
+        let archive = Archive {
+            members: alloc::vec![
+                ArchiveMember {
+                    name: String::from("f.o"),
+                    object: obj_arm(body, &[func("f", 1, 4)], &[]),
+                },
+                ArchiveMember {
+                    name: String::from("g.o"),
+                    object: obj_arm(body, &[func("g", 1, 4)], &[]),
+                },
+            ],
+        };
+        let main = icf_main(&[]);
+        assert!(
+            link_gc(core::slice::from_ref(&main), "main").is_err(),
+            "without the archive there is no `f` -- the control for the two below"
+        );
+        let objects = core::slice::from_ref(&main);
+        let archives = core::slice::from_ref(&archive);
+        for pulled in [
+            link_gc_with_archives(objects, archives, "main", None),
+            link_icf_with_archives(objects, archives, "main", Some(0x8000)),
+        ] {
+            let image = pulled.expect("the archive member resolves `f`");
+            assert!(image.symbols.iter().any(|(n, _)| n == "f"));
+        }
     }
 
 

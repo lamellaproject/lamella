@@ -14,7 +14,12 @@ namespace System.Threading
 
         internal Thread() { }
 
-        public void Start() { _id = StartThread(_start, _isBackground); }
+        public void Start()
+        {
+            int id = StartThread(_start, _isBackground);
+            if (id < 0) throw new OutOfMemoryException("Cannot start another thread.");
+            _id = id;
+        }
 
         public bool IsBackground
         {

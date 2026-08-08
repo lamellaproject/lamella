@@ -25,15 +25,17 @@ pub use complete::{
     Completion, CompletionKind, Hover, SignatureHelp, complete, hover, signature_help,
 };
 pub use bound::{
-    Binder, BoundExpr, BoundExprKind, ConversionKind, DeclaredField, FieldReference,
-    ConvertingStep, MethodReference, SubmissionBinding, bind_expression, literal_int_value,
+    Binder, BoundExpr, BoundExprKind, BoundInitializer, BoundInitializerTarget,
+    BoundMemberInitializer, BoundMemberInitializerValue, ConversionKind, DeclaredField,
+    FieldReference, ConvertingStep, MethodInstantiation, MethodReference, SubmissionBinding,
+    bind_expression, literal_int_value,
 };
 pub use conversion::has_implicit_conversion;
 pub use declaration::{collect_into, collect_model, collect_types, resolve_constants};
-pub use diagnostic::{Diagnostic, DiagnosticKind};
+pub use diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment, switch_section_reachability};
 pub use program::{
-    bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references, bind_compilation_unit_with_references_and_options,
+    bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references, bind_compilation_unit_with_dialect, bind_compilation_unit_with_references_and_options,
     bind_compilation_units_with_references, bind_compilation_units_with_references_and_options,
 };
 pub use reference::load_assembly;
@@ -44,6 +46,6 @@ pub use statement::{
 };
 pub use symbols::{
     Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, SignatureCanon,
-    TypeInfo, TypeKind,
+    TypeInfo, TypeKind, metadata_type_name,
 };
 pub use types::TypeSymbol;

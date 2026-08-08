@@ -107,7 +107,9 @@ name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-reactor",
  "lamella-token",
+ "lamella-wtf8",
 ]
 
 [[package]]
@@ -117,6 +119,10 @@ dependencies = [
  "lamella-cil-runtime",
  "smoltcp",
 ]
+
+[[package]]
+name = "lamella-reactor"
+version = "0.0.0"
 
 [[package]]
 name = "lamella-runtime-support"
@@ -145,6 +151,10 @@ dependencies = [
 
 [[package]]
 name = "lamella-token"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-wtf8"
 version = "0.0.0"
 
 [[package]]

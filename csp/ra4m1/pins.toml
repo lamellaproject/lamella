@@ -1,0 +1,13 @@
+# PIN map: pin x function -> (instance, signal) for the RA4M1.
+# PARTIAL, evidence-only.
+
+[table]
+kind = "pins"
+family = "ra4m1"
+sources = [
+    "Renesas RA4M1 Group User's Manual: Hardware R01UH0887EJ0110 Rev.1.10 (Sep 29, 2023): section 19.2.5 Port mn Pin Function Select Register (PmnPFS/PmnPFS_HA/PmnPFS_BY), m = 0 to 9 and n = 00 to 15, whose PSEL[4:0] field selects the peripheral function of one pin and whose PMR bit selects between general I/O and that peripheral function",
+]
+notes = [
+    "A general-purpose output needs no row here. The manual states that the PDR bit in PORTm.PCNTR1 serves the same function as the PDR bit in PFS.PmnPFS, and a pin comes out of reset as general I/O, so direction and output data are reachable through the port block without touching the pin-function register at all.",
+    "The PmnPFS registers are write-protected: a write-protect register must be opened before any of them accepts a value, and closed after. A future row's consumer needs that sequence, and it is a property of the register file rather than of any one pin.",
+]

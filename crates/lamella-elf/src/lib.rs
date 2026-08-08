@@ -130,6 +130,29 @@ pub const TYPE_DESC_PREFIX: &str = "__lamella_typedesc_";
 /// reachability-keep would drop every record). Shared here so backend and linker agree on one string.
 pub const STACKMAP_RECORD_PREFIX: &str = "__lamella_smrec_";
 
+/// The CARRIED section holding per-function RETURN-ADDRESS stack-map fragments, from which
+/// `lamella-link` synthesizes the whole-program [`STACKMAP_BLOB_SYMBOL`] map.
+pub const STACKMAP_GCMAP_SECTION: &str = ".lamella_gcmap";
+
+/// The whole-program return-address stack map a collector binary-searches (`__lamella_gc_stackmaps`),
+/// synthesized by `lamella-link` from [`STACKMAP_GCMAP_SECTION`] over the functions that SURVIVED
+/// dead-stripping. Its wire format is the GC ABI's and is unchanged by where it is
+/// built.
+pub const STACKMAP_BLOB_SYMBOL: &str = "__lamella_gc_stackmaps";
+
+/// The image's `.text` start (`__lamella_text_base`), the base a collector subtracts from a runtime
+/// return address to get a [`STACKMAP_BLOB_SYMBOL`] lookup key. Defined by `lamella-link` at image
+/// offset 0 whenever it synthesizes the map.
+pub const TEXT_BASE_SYMBOL: &str = "__lamella_text_base";
+
+/// Whether a PROGBITS, non-`SHF_ALLOC` section is one the linker CARRIES through the link as itself
+/// -- the DWARF [`DEBUG_SECTION_PREFIX`] family, plus [`STACKMAP_GCMAP_SECTION`]. Anything else
+/// non-allocated is dropped, as it was before carrying existed.
+#[must_use]
+pub fn is_carried_section(name: &str) -> bool {
+    name.starts_with(DEBUG_SECTION_PREFIX) || name == STACKMAP_GCMAP_SECTION
+}
+
 /// The prefix on a GLOBAL-roots stack-map record's data symbol (`__lamella_smstat_<asmhash>`) -- the
 /// mode-2 STATICS record naming one assembly's static region's ref-bearing words. Its `func_addr`
 /// word carries an `R_ARM_ABS32` relocation against the assembly's region symbol
@@ -1105,7 +1128,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         let name = sec_name(i)?;
         if sh(i, SH_TYPE)? != 1
             || sh(i, SH_FLAGS)? & SHF_ALLOC != 0
-            || !name.starts_with(DEBUG_SECTION_PREFIX)
+            || !is_carried_section(name)
         {
             continue;
         }

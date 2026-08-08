@@ -13,6 +13,10 @@
 # The float codes f (single) and d (double) go through a tiny native seam, because seeing a float's
 # actual bits is the one thing pure Python cannot do. Packing a double as 'f' rounds to single
 # precision exactly as a C cast would, including overflow to infinity, which is not an error.
+#
+# NOT PROVIDED (each raises a clear error rather than diverging):
+#   - the half-precision code 'e', which needs its own 16-bit conversion, and 'p' (the Pascal string).
+#   - pack_into / unpack_from, which write through a caller's buffer.
 import _platform
 import _struct
 

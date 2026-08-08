@@ -1,0 +1,21 @@
+# PIN map for the SAM4N family: pin x function -> (instance, signal), or -> nothing. PARTIAL and
+# evidence-only -- a row joins when a binding needs it, and a row naming a pin outside every part's
+# present-list is refused.
+#
+# EMPTY OF ROWS, AND THAT IS A PROPERTY OF WHAT THIS FAMILY HAS BOUND SO FAR. The only pins placed
+# are a board's LED and user button, and a control pin rides no alternate function -- it is driven
+# as a plain output or read as a plain input, so it needs no cell here. Rows arrive with the
+# family's first bus binding.
+#
+# THIS MAP IS WHY THIS FAMILY IS NOT THE SAM4S's. The two series place their controllers at
+# identical addresses and carry identical peripheral ids, so an instance map could have been
+# shared. Their pin functions cannot be: this series has no USB device port where the SAM4S has
+# one, so the pins that carry the USB data lines there carry something else here. A shared
+# pin-function table would state rows true of one series and false of the other.
+
+[table]
+kind = "pins"
+family = "sam4n"
+sources = [
+    "SAM4N Series datasheet (Atmel-11158): the I/O line peripheral multiplexing tables, for rows when a binding needs them",
+]

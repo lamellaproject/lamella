@@ -26,8 +26,8 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 /// `from m import a` bind their names.
 ///
 /// Version 18 added `StoreGlobal` (a `global x` assignment inside a function stores to the module
-/// namespace). 17 is [`BUNDLE_FORMAT_VERSION`], so the bare-module version skips it -- the two share
-/// one u16 dispatch space (a reader tells a bare module from a bundle by the version).
+/// namespace). 17 is skipped: it was once a bundle container's version, back when the two numbers
+/// were independent and shared one dispatch space. See [`BUNDLE_FORMAT_VERSION`].
 ///
 /// Version 19 added `YieldFrom` (`yield from iterable` -- a generator delegates to a sub-iterator).
 ///
@@ -38,7 +38,30 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 ///
 /// Version 22 added a code object's `doc` (a function's docstring, which `__doc__` reads) and
 /// `BuildClassKw` (keyword arguments in a class header).
-pub const FORMAT_VERSION: u16 = 22;
+///
+/// Version 23 added a code object's `is_coroutine` (an `async def` body) and [`Op::Await`]. The
+/// coroutine bit is INDEPENDENT of `is_generator` rather than a refinement of it -- CPython's
+/// `CO_COROUTINE` and `CO_GENERATOR` are separate flags, and an `async def` with no `yield` has
+/// only the former set.
+///
+/// Version 24 packed a code object's four boolean properties into ONE [`CodeFlags`] byte, where
+/// each had cost a whole byte. Done while 23 was hours old and nothing persisted had been built
+/// against it -- and done as a BUMP rather than by redefining 23, because a version identifies a
+/// layout, and the check below compares for EQUALITY: a silently-changed 23 would have decoded as
+/// garbage where a bumped one is refused. The four spare bits are the point, not the three bytes;
+/// see [`CodeFlags`].
+///
+/// Version 25 added [`Op::ListGrow`], which separates a growable list's CAPACITY step from its
+/// STORE so a heap exhaustion can be caught between them.
+///
+/// Version 26 dropped [`Op::CallEx`]'s `argc`, which restated the length of the argument-tag list it
+/// already points at. The four wire bytes are incidental; what it buys is in memory, where an enum
+/// is as wide as its widest variant and this was the only one carrying three payload words.
+///
+/// Version 27 gave a module a trailing length-prefixed DEBUG SECTION, empty in every artifact this
+/// build writes. It costs four bytes a module and buys the ability to add source positions later
+/// without moving this number -- see [`RESERVED_DEBUG_SECTION_LEN`], where the reasoning lives.
+pub const FORMAT_VERSION: u16 = 27;
 
 /// The feature-flag bits a module's header carries, declaring which language
 /// surface its bytecode assumes. A reader lacking a required feature rejects the
@@ -54,6 +77,163 @@ impl FeatureFlags {
     /// Whether every bit in `other` is also set here.
     #[must_use]
     pub fn contains(self, other: FeatureFlags) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// A Python string constant's value: a sequence of CODE POINTS, held as WTF-8 bytes.
+///
+/// # Why not `String`
+///
+/// A Python `str` is a sequence of code points, U+0000..=U+10FFFF, and that range INCLUDES the
+/// surrogates U+D800..=U+DFFF -- `len('\ud800')` is 1 and its `ord` is `0xd800`. A Rust `String` is
+/// UTF-8, whose value space is the Unicode SCALAR VALUES: every code point EXCEPT those. The
+/// difference is exactly the surrogate block, so a `String` cannot hold what a Python `str` can, and
+/// no choice of Rust string type fixes that.
+///
+/// The bytes are WTF-8, written by [`lamella_wtf8`] so this and the C# string tiers cannot drift in
+/// the byte form.
+#[derive(Debug, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
+pub struct PyStr(Vec<u8>);
+
+impl PyStr {
+    /// The WTF-8 bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Take ownership of the WTF-8 bytes as they stand.
+    ///
+    /// The caller is responsible for their shape: they must be what [`lamella_wtf8::push_code_point`]
+    /// would have written, or a reader gets [`lamella_wtf8::REPLACEMENT`] where it expected a
+    /// character. Used by the decoder, which reads bytes this type wrote.
+    #[must_use]
+    pub fn from_wtf8(bytes: Vec<u8>) -> PyStr {
+        PyStr(bytes)
+    }
+
+    /// Build from code points, encoding each one independently.
+    pub fn from_code_points(codes: impl IntoIterator<Item = u32>) -> PyStr {
+        let mut bytes = Vec::new();
+        for code in codes {
+            lamella_wtf8::push_code_point(code, &mut bytes);
+        }
+        PyStr(bytes)
+    }
+
+    /// Append another string's code points -- adjacent-literal concatenation, `"ab" "cd"`.
+    pub fn append(&mut self, other: &PyStr) {
+        self.0.extend_from_slice(&other.0);
+    }
+
+    /// The value as a `&str`, or `None` when it holds a surrogate and therefore has no UTF-8 form.
+    ///
+    /// `None` is not an error path a consumer can skip: it is the case this type exists for. A
+    /// consumer that can only handle UTF-8 must decide what to do about a Python string it cannot
+    /// represent, and that decision is the consumer's rather than this type's.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(&self.0).ok()
+    }
+
+    /// The code points, in order -- the sequence a Python `str` actually is, so `count()` is `len()`
+    /// and the nth item is what `ord(s[n])` answers.
+    pub fn code_points(&self) -> impl Iterator<Item = u32> + '_ {
+        let mut at = 0;
+        core::iter::from_fn(move || {
+            let (code, width) = lamella_wtf8::next_code_point(&self.0, at)?;
+            at += width;
+            Some(code)
+        })
+    }
+
+    /// Whether any code point is a surrogate -- i.e. whether this string is one the UTF-8 world
+    /// cannot represent.
+    #[must_use]
+    pub fn has_surrogate(&self) -> bool {
+        self.code_points().any(|c| (0xD800..=0xDFFF).contains(&c))
+    }
+}
+
+impl From<&str> for PyStr {
+    fn from(s: &str) -> PyStr {
+        PyStr(s.as_bytes().to_vec())
+    }
+}
+
+/// Compare against Rust text directly.
+///
+/// Byte equality IS code-point equality here: surrogate-free WTF-8 is byte-identical to UTF-8, and a
+/// `str` can never hold a surrogate, so a surrogate-bearing value correctly compares unequal to
+/// every `str` rather than to some lossy rendering of itself.
+impl PartialEq<str> for PyStr {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for PyStr {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+
+impl From<String> for PyStr {
+    fn from(s: String) -> PyStr {
+        PyStr(s.into_bytes())
+    }
+}
+
+/// A code object's boolean properties, packed into ONE wire byte -- the same shape as
+/// [`FeatureFlags`] one level up, rather than a second convention.
+///
+/// It replaced four adjacent `bool`s that each cost a whole byte. The three bytes saved per code
+/// object, in every bundle on every device, are the smaller half of the reason. **The larger half is
+/// the four SPARE BITS**: a reader checks the format version for STRICT EQUALITY (see
+/// [`FORMAT_VERSION`]), so once a version ships on a device, bumping it is a device-compatibility
+/// event and not merely a code change -- every board in the field would need reflashing to load a
+/// bundle a newer toolchain built. A flag that fits in a spare bit needs no bump at all, which is
+/// what turns "settle every flag before the freeze" back into a decision that can wait for its
+/// feature.
+///
+/// The [`CodeObject`] itself keeps its four NAMED fields; this type exists only at the wire
+/// boundary, so nothing that reads `co.is_generator` had to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CodeFlags(pub u8);
+
+impl CodeFlags {
+    /// The body contains `yield` -- calling it returns a generator object.
+    pub const GENERATOR: CodeFlags = CodeFlags(0x01);
+    /// An `async def` -- calling it returns a coroutine object. Independent of [`Self::GENERATOR`]
+    /// (see [`CodeObject::is_coroutine`]); a body setting BOTH would be an async generator, which
+    /// nothing emits.
+    pub const COROUTINE: CodeFlags = CodeFlags(0x02);
+    /// The parameter list has a `*args` slot.
+    pub const VARARGS: CodeFlags = CodeFlags(0x04);
+    /// The parameter list has a `**kwargs` slot.
+    pub const VARKWARGS: CodeFlags = CodeFlags(0x08);
+
+    /// The flags of `co`, for encoding.
+    #[must_use]
+    pub fn of(co: &CodeObject) -> CodeFlags {
+        let mut bits = 0;
+        for (set, flag) in [
+            (co.is_generator, Self::GENERATOR),
+            (co.is_coroutine, Self::COROUTINE),
+            (co.has_varargs, Self::VARARGS),
+            (co.has_varkwargs, Self::VARKWARGS),
+        ] {
+            if set {
+                bits |= flag.0;
+            }
+        }
+        CodeFlags(bits)
+    }
+
+    /// Whether every bit in `other` is also set here.
+    #[must_use]
+    pub fn contains(self, other: CodeFlags) -> bool {
         self.0 & other.0 == other.0
     }
 }
@@ -100,6 +280,9 @@ pub const EXCEPTION_HIERARCHY: &[(&str, &str)] = &[
     ("NotADirectoryError", "OSError"),
     ("PermissionError", "OSError"),
     ("MemoryError", "Exception"),
+    ("StopAsyncIteration", "Exception"),
+    ("UnicodeError", "ValueError"),
+    ("UnicodeEncodeError", "UnicodeError"),
 ];
 
 /// The AOT exception TAG of a Python exception `name`: FNV-1a-32 over `"python." + name`, the high
@@ -280,6 +463,8 @@ impl UnaryOp {
 /// |     55 | ImportStar | imports |
 /// |     56 | InplaceBinOp | augmented assignment |
 /// |     57 | BuildClassKw | class keyword arguments |
+/// |     58 | Await | async |
+/// |     59 | ListGrow | growable lists |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -472,14 +657,45 @@ pub enum Op {
     /// `yield from` expression's result. Stack: pops the iterator, pushes the result. Appears only in
     /// a generator function. The operand is produced by a preceding [`Op::GetIter`].
     YieldFrom,
-    /// A call with `*args` / `**kwargs` unpacking. The stack holds `[callee, arg0 .. arg{argc-1}]`;
-    /// `consts[kinds]` (a [`Const::ArgKinds`]) tags each of the `argc` values (positional / `*` /
-    /// keyword / `**`), and `consts[kwnames]` (a [`Const::KwNames`]) names the keyword-tagged slots
-    /// in order. The runtime flattens the `*`/`**` operands and binds the result; pushes the result.
+    /// Ensure the growable list in local slot `list` has room for one more element -- the CAPACITY
+    /// half of `xs.append(v)`, emitted immediately before the `append` call itself.
+    ///
+    /// It exists to be a place a block can END. A typed lowering grows the backing by calling out to
+    /// the runtime, and that call can FAIL (a full heap); the store that follows must then not
+    /// happen, and skipping it needs a branch, and a branch needs a block boundary. Grow and store
+    /// inside one op leave nowhere to put it -- so they are two ops, and this is the first.
+    ListGrow {
+        /// The local slot holding the list, which the following call appends to.
+        list: u32,
+    },
+    /// Await the awaitable on top of the stack (`await expr`). Pop it, suspend this coroutine until
+    /// it completes, and push its result. Appears only in a code object whose
+    /// [`CodeObject::is_coroutine`] is set.
+    ///
+    /// A DISTINCT op rather than a [`Op::YieldFrom`] on the same operand, because `await` enforces
+    /// rules `yield from` does not: the operand must be AWAITABLE (a coroutine, or an object with
+    /// `__await__` returning an iterator) and a plain iterable is a `TypeError` -- so the
+    /// awaitable-or-not decision belongs to the op rather than to whatever produced the operand.
+    /// Unlike `yield from`, no [`Op::GetIter`] precedes it: the operand is pushed as it stands and
+    /// the op does its own `__await__` resolution.
+    ///
+    /// Two consequences of that split are worth stating, because they are what an implementer would
+    /// otherwise have to infer: a coroutine driven to completion here delivers its RETURN value (not
+    /// a yielded one), and an exception thrown in from the driving loop propagates into the awaited
+    /// operand first, so a `try` inside the awaited coroutine sees it before this frame does.
+    Await,
+    /// A call with `*args` / `**kwargs` unpacking. `consts[kinds]` (a [`Const::ArgKinds`]) tags each
+    /// argument slot (positional / `*` / keyword / `**`), and `consts[kwnames]` (a
+    /// [`Const::KwNames`]) names the keyword-tagged slots in order. The stack holds
+    /// `[callee, arg0 .. arg{n-1}]` for the `n` slots that tag names. The runtime flattens the
+    /// `*`/`**` operands and binds the result; pushes the result.
+    ///
+    /// The argument COUNT is that tag list's length rather than a field of its own. It was once
+    /// both, and the two could disagree -- a reader had to compare them and refuse a mismatch. Two
+    /// spellings of one number is a state that can be malformed; one spelling cannot be.
     CallEx {
-        /// The number of argument values on the stack (each tagged by `kinds`).
-        argc: u32,
-        /// The index into `consts` of the [`Const::ArgKinds`] tagging each argument slot.
+        /// The index into `consts` of the [`Const::ArgKinds`] tagging each argument slot. Its length
+        /// is the number of argument values on the stack.
         kinds: u32,
         /// The index into `consts` of the [`Const::KwNames`] naming the keyword-tagged slots.
         kwnames: u32,
@@ -521,8 +737,17 @@ pub enum Op {
     /// Import the module named `names[idx]` and push the module object: resolve it (a cached
     /// `sys.modules` entry, else a native stdlib module, else `ModuleNotFoundError`), running its
     /// body once. Emitted for BOTH `import m` (the pushed module is then stored) and the lead-in of
-    /// `from m import ...` (the module is the source for the following [`Op::ImportFrom`]s). A dotted
-    /// name (`a.b`) is a single string here; package submodules are a later addition.
+    /// `from m import ...` (the module is the source for the following [`Op::ImportFrom`]s).
+    ///
+    /// A DOTTED name (`a.b`) is a single string here, and the module pushed is the one the string
+    /// NAMES -- the leaf. Resolving it must import each ancestor first, so `a` is in the module
+    /// table by the time `a.b` is. **`import a.b` therefore does NOT bind what this pushes**: it
+    /// binds the ROOT, which the emitter gets by discarding the leaf and importing `a` again (a
+    /// cache hit), because CPython binds the root and reaches `a.b` as an attribute of it.
+    /// `import a.b as x` binds the leaf, so there the pushed module is used directly.
+    ///
+    /// Package machinery beyond that -- `__init__.py` bodies, package-relative imports -- is a
+    /// later addition; a name that resolves to nothing is a `ModuleNotFoundError`, as in CPython.
     ImportName(u32),
     /// Read `names[idx]` off the module on top of the stack (WITHOUT popping it) and push the value
     /// -- `getattr(module, name)`, an `ImportError` if the module has no such member. For each name in
@@ -554,7 +779,10 @@ pub enum Const {
     /// tagged 31-bit fixnum, widening to a heap `long` (and arbitrary-precision bignum) as needed.
     Int(i64),
     /// A string literal (its decoded value); the interpreter materializes it as a heap `str`.
-    Str(String),
+    ///
+    /// A [`PyStr`] rather than a `String`, because a Python string's value space includes the
+    /// surrogate code points and a `String`'s does not.
+    Str(PyStr),
     /// A per-argument tag list for [`Op::CallEx`]: one byte per argument slot -- 0 positional,
     /// 1 `*` unpack, 2 keyword, 3 `**` unpack. Compile-time metadata, never a runtime value.
     ArgKinds(Vec<u8>),
@@ -647,6 +875,138 @@ pub struct Param {
     pub ty: StaticType,
 }
 
+/// A code object's identifiers, held as ONE text buffer plus a span per name rather than as a
+/// `Vec<String>` of separately allocated strings.
+///
+/// The shape is chosen for the device rather than the host. A decoded bundle's names are numerous
+/// and short -- for a program importing `asyncio` there are 383 of them averaging under nine
+/// characters -- and the device allocator hands out SIZE CLASSES whose smallest is 16 bytes. So every
+/// one of those names cost a 16-byte block plus a 12-byte `String` header on a 32-bit target, for a
+/// mean of nine bytes of text. Interning them collapses that to one block for the text and one for
+/// the spans.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct NamePool {
+    /// Every name's bytes, concatenated in index order.
+    text: String,
+    /// `(offset, length)` into `text`, one per name.
+    spans: Vec<(u32, u32)>,
+}
+
+impl NamePool {
+    /// An empty pool, allocating nothing.
+    #[must_use]
+    pub fn new() -> NamePool {
+        NamePool {
+            text: String::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    /// The number of names.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Whether the pool holds no names.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// The name at `index`, or `None` when it is out of range.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&str> {
+        let &(offset, length) = self.spans.get(index)?;
+        self.text
+            .get(offset as usize..offset as usize + length as usize)
+    }
+
+    /// A pool sized for `names` names, so filling it does not grow the span table.
+    #[must_use]
+    pub fn with_capacity(names: usize) -> NamePool {
+        NamePool {
+            text: String::new(),
+            spans: Vec::with_capacity(names),
+        }
+    }
+
+    /// Append `name`, returning its index.
+    pub fn push(&mut self, name: &str) -> usize {
+        let offset = self.text.len() as u32;
+        self.text.push_str(name);
+        self.spans.push((offset, name.len() as u32));
+        self.spans.len() - 1
+    }
+
+    /// Release any capacity beyond what the names actually occupy.
+    pub fn shrink_to_fit(&mut self) {
+        self.text.shrink_to_fit();
+        self.spans.shrink_to_fit();
+    }
+
+    /// The names in index order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        (0..self.spans.len()).map(|i| self.index_or_empty(i))
+    }
+
+    /// The index of the first name equal to `name`, or `None`.
+    #[must_use]
+    pub fn position(&self, name: &str) -> Option<usize> {
+        self.iter().position(|n| n == name)
+    }
+
+    /// Whether the pool holds `name`.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.position(name).is_some()
+    }
+
+    /// The spans are written by `push` alone, so every one of them is in range and on a character
+    /// boundary; a missing span would mean the pool's own invariant had been broken rather than that
+    /// the caller asked for something reasonable.
+    fn index_or_empty(&self, index: usize) -> &str {
+        self.get(index).unwrap_or("")
+    }
+}
+
+impl core::ops::Index<usize> for NamePool {
+    type Output = str;
+
+    fn index(&self, index: usize) -> &str {
+        self.index_or_empty(index)
+    }
+}
+
+impl core::fmt::Debug for NamePool {
+    /// Prints as the list of names it stands for, so a failing assertion reads like the `Vec<String>`
+    /// this replaced rather than exposing offsets nobody wrote by hand.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<S: AsRef<str>> FromIterator<S> for NamePool {
+    fn from_iter<I: IntoIterator<Item = S>>(names: I) -> NamePool {
+        let names = names.into_iter();
+        let mut pool = NamePool::with_capacity(names.size_hint().0);
+        for name in names {
+            pool.push(name.as_ref());
+        }
+        pool.shrink_to_fit();
+        pool
+    }
+}
+
+impl<'a> IntoIterator for &'a NamePool {
+    type Item = &'a str;
+    type IntoIter = alloc::boxed::Box<dyn Iterator<Item = &'a str> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        alloc::boxed::Box::new(self.iter())
+    }
+}
+
 /// A compiled code object: the bytecode and tables for one function (or the module's
 /// top-level body). It is what the interpreter executes and what the typed lowering
 /// consumes. The interpreter ignores the typing fields (`params`/`ret_ty`/
@@ -667,6 +1027,15 @@ pub struct CodeObject {
     /// Whether this is a generator function (its body contains `yield`). A CALL of a generator
     /// function does not run the body -- it returns a generator object; the body runs on `next`.
     pub is_generator: bool,
+    /// Whether this is a coroutine function (an `async def`). A CALL does not run the body -- it
+    /// returns a coroutine object, which runs when it is awaited or scheduled.
+    ///
+    /// INDEPENDENT of `is_generator`, not a refinement of it: an `async def` with no `yield` sets
+    /// this alone, matching CPython, where `CO_COROUTINE` and `CO_GENERATOR` are separate flags. A
+    /// body that sets BOTH would be an async generator (CPython gives that its own third flag);
+    /// nothing emits that pair today, because `yield` inside an `async def` is refused at compile
+    /// time rather than compiled as something else.
+    pub is_coroutine: bool,
     /// Whether the parameter list has a `*args` slot -- the param at index
     /// `params.len() - kwonly_count - (has_varkwargs as usize) - 1`, which collects surplus
     /// positional arguments into a tuple. When set, extra positionals are NOT a TypeError.
@@ -682,18 +1051,18 @@ pub struct CodeObject {
     pub n_locals: usize,
     /// The name of each local slot, indexed by slot number; `local_names.len() ==
     /// n_locals`. Kept for diagnostics and for the typed lowering.
-    pub local_names: Vec<String>,
+    pub local_names: NamePool,
     /// The locals of this function that a nested function captures, so they must live in heap
     /// cells rather than plain slots. Their order defines the low half of the deref index space
     /// (`0 .. cellvars.len()`), which [`Op::LoadDeref`] / [`Op::StoreDeref`] / [`Op::LoadClosure`]
     /// index. Empty for a function that no nested function reads. A cellvar that is also a
     /// parameter has its bound argument copied into its fresh cell at frame setup.
-    pub cellvars: Vec<String>,
+    pub cellvars: NamePool,
     /// The names this function uses that are cellvars of an enclosing function -- reached through
     /// captured cells, not this frame's own locals. Their order continues the deref index space
     /// after `cellvars` (`cellvars.len() .. cellvars.len() + freevars.len()`). A closure built with
     /// [`Op::MakeFunction`]'s `CLOSURE` flag receives exactly `freevars.len()` cells in this order.
-    pub freevars: Vec<String>,
+    pub freevars: NamePool,
     /// The annotated/inferred type of each local slot, indexed by slot number;
     /// `local_types.len() == n_locals`. Drives the typed fast path.
     pub local_types: Vec<StaticType>,
@@ -701,7 +1070,7 @@ pub struct CodeObject {
     pub consts: Vec<Const>,
     /// The attribute/global name pool, indexed by [`Op::LoadAttr`] and
     /// [`Op::LoadGlobal`].
-    pub names: Vec<String>,
+    pub names: NamePool,
     /// The instructions, in order.
     pub ops: Vec<Op>,
     /// The body's docstring: a leading bare-string statement, else `None`. It rides the code
@@ -805,7 +1174,8 @@ fn put_const(buf: &mut Vec<u8>, c: &Const) {
         }
         Const::Str(s) => {
             buf.push(3);
-            put_str(buf, s);
+            put_len(buf, s.as_bytes().len());
+            buf.extend_from_slice(s.as_bytes());
         }
         Const::KwNames(names) => {
             buf.push(4);
@@ -973,14 +1343,14 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
         }
         Op::Yield => buf.push(41),
         Op::YieldFrom => buf.push(54),
+        Op::Await => buf.push(58),
+        Op::ListGrow { list } => {
+            buf.push(59);
+            put_u32(buf, *list);
+        }
         Op::ImportStar => buf.push(55),
-        Op::CallEx {
-            argc,
-            kinds,
-            kwnames,
-        } => {
+        Op::CallEx { kinds, kwnames } => {
             buf.push(42);
-            put_u32(buf, *argc);
             put_u32(buf, *kinds);
             put_u32(buf, *kwnames);
         }
@@ -1034,9 +1404,7 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
     }
     put_u32(buf, co.posonly_count);
     put_u32(buf, co.kwonly_count);
-    buf.push(u8::from(co.is_generator));
-    buf.push(u8::from(co.has_varargs));
-    buf.push(u8::from(co.has_varkwargs));
+    buf.push(CodeFlags::of(co).0);
     buf.push(co.ret_ty as u8);
     put_len(buf, co.n_locals);
     put_len(buf, co.local_names.len());
@@ -1093,7 +1461,24 @@ fn put_module_content(buf: &mut Vec<u8>, module: &Module) {
         put_code_object(buf, f);
     }
     put_code_object(buf, &module.body);
+    put_len(buf, RESERVED_DEBUG_SECTION_LEN as usize);
 }
+
+/// The length this build writes for a module's trailing debug section: none. The section is EMPTY
+/// today, and reserving it now is the point rather than an accident of layout.
+///
+/// A reader compares the format version for strict equality, so a format change after a version has
+/// shipped on a device means reflashing every board that holds one. Source positions are the change
+/// most likely to be wanted later -- there is no line table, so no traceback can name a line -- and
+/// they are the kind of thing that gets deferred precisely because it is not needed to run a program.
+///
+/// A reader that skips this section BY ITS DECLARED LENGTH skips a longer one it has never seen. So
+/// the bytes that would carry a line table can be added later without moving the version: an old
+/// reader steps over them and loses only the diagnostics it never had, and a new reader given an old
+/// artifact reads a length of zero and behaves as it always did. Both directions degrade to what the
+/// reader can actually do, which is what makes the later change a compiler change rather than a
+/// fleet-wide reflash.
+const RESERVED_DEBUG_SECTION_LEN: u32 = 0;
 
 impl Module {
     /// Serialize this module to the versioned binary container.
@@ -1124,10 +1509,25 @@ impl Module {
     }
 }
 
+/// Set in a container's version word when the payload is a [`Bundle`] rather than a bare [`Module`],
+/// leaving the low 15 bits to carry [`FORMAT_VERSION`]. One word still says both things, so a reader
+/// tells the two containers apart exactly as before.
+const BUNDLE_KIND_BIT: u16 = 0x8000;
+
 /// The binary format version of a [`Bundle`] container -- a program's entry module plus its
-/// importable managed (Python-authored) modules. Distinct from [`FORMAT_VERSION`] (a bare single
-/// module) so a reader dispatches on the version: [`FORMAT_VERSION`] -> a `Module`, this -> a `Bundle`.
-pub const BUNDLE_FORMAT_VERSION: u16 = 17;
+/// importable managed (Python-authored) modules.
+///
+/// It is DERIVED from [`FORMAT_VERSION`] rather than chosen, and that is the whole point. A bundle's
+/// entry and modules are written by the same writer a bare module uses, so [`FORMAT_VERSION`] is what
+/// identifies the layout of a bundle's payload. While the two numbers were independent, nothing made
+/// anyone move this one when that one moved -- and nothing did: the module layout advanced through
+/// several byte-level changes while this stayed put, so a bundle declared a version that described
+/// its container and said nothing about its contents. A reader compares for strict equality precisely
+/// to refuse a stale payload, and on the bundle path there was no number for it to refuse.
+///
+/// Deriving it closes that by construction rather than by remembering: a bump to [`FORMAT_VERSION`]
+/// moves this in the same edit, and the two cannot drift apart again.
+pub const BUNDLE_FORMAT_VERSION: u16 = FORMAT_VERSION | BUNDLE_KIND_BIT;
 
 /// A compiled multi-module program: the `entry` module (run at startup) plus the importable managed
 /// modules an `import` resolves to (by `name`). The Python analog of a corlib bundle.
@@ -1211,11 +1611,31 @@ impl<'a> Reader<'a> {
     }
 
     fn string(&mut self) -> Result<String, DecodeError> {
+        self.str_slice().map(String::from)
+    }
+
+    /// A length-prefixed name, borrowed out of the artifact rather than copied.
+    fn str_slice(&mut self) -> Result<&'a str, DecodeError> {
         let len = self.u32()? as usize;
         let bytes = self.bytes(len)?;
-        core::str::from_utf8(bytes)
-            .map(String::from)
-            .map_err(|_| DecodeError::BadUtf8)
+        core::str::from_utf8(bytes).map_err(|_| DecodeError::BadUtf8)
+    }
+
+    /// A count-prefixed run of names, read straight into one [`NamePool`].
+    ///
+    /// This is where the device saving is taken rather than merely represented: the names never
+    /// exist as separate `String`s even briefly, so decoding a bundle does not allocate one heap
+    /// block per name -- which on a segregated allocator costs a 16-byte class for a name averaging
+    /// nine characters, and costs it again in the fragmentation the freed blocks leave behind.
+    fn name_pool(&mut self) -> Result<NamePool, DecodeError> {
+        let count = self.u32()? as usize;
+        let mut pool = NamePool::new();
+        for _ in 0..count {
+            let name = self.str_slice()?;
+            pool.push(name);
+        }
+        pool.shrink_to_fit();
+        Ok(pool)
     }
 
     /// Read a module's CONTENT (name + functions + body) -- the header-less body of a bare module or
@@ -1228,6 +1648,8 @@ impl<'a> Reader<'a> {
             functions.push(self.code_object()?);
         }
         let body = self.code_object()?;
+        let debug_len = self.u32()? as usize;
+        let _debug = self.bytes(debug_len)?;
         Ok(Module {
             name,
             functions,
@@ -1246,7 +1668,10 @@ impl<'a> Reader<'a> {
             0 => Const::None,
             1 => Const::Bool(self.u8()? != 0),
             2 => Const::Int(self.i64()?),
-            3 => Const::Str(self.string()?),
+            3 => {
+                let len = self.u32()? as usize;
+                Const::Str(PyStr::from_wtf8(self.bytes(len)?.to_vec()))
+            }
             4 => {
                 let n = self.u32()? as usize;
                 let mut names = Vec::with_capacity(n);
@@ -1343,7 +1768,6 @@ impl<'a> Reader<'a> {
             },
             41 => Op::Yield,
             42 => Op::CallEx {
-                argc: self.u32()?,
                 kinds: self.u32()?,
                 kwnames: self.u32()?,
             },
@@ -1360,6 +1784,8 @@ impl<'a> Reader<'a> {
             53 => Op::StoreGlobal(self.u32()?),
             54 => Op::YieldFrom,
             55 => Op::ImportStar,
+            58 => Op::Await,
+            59 => Op::ListGrow { list: self.u32()? },
             57 => Op::BuildClassKw { kwnames: self.u32()? },
             56 => {
                 let b = self.u8()?;
@@ -1381,26 +1807,16 @@ impl<'a> Reader<'a> {
         }
         let posonly_count = self.u32()?;
         let kwonly_count = self.u32()?;
-        let is_generator = self.u8()? != 0;
-        let has_varargs = self.u8()? != 0;
-        let has_varkwargs = self.u8()? != 0;
+        let flags = CodeFlags(self.u8()?);
+        let is_generator = flags.contains(CodeFlags::GENERATOR);
+        let is_coroutine = flags.contains(CodeFlags::COROUTINE);
+        let has_varargs = flags.contains(CodeFlags::VARARGS);
+        let has_varkwargs = flags.contains(CodeFlags::VARKWARGS);
         let ret_ty = self.py_type()?;
         let n_locals = self.u32()? as usize;
-        let n_local_names = self.u32()? as usize;
-        let mut local_names = Vec::with_capacity(n_local_names);
-        for _ in 0..n_local_names {
-            local_names.push(self.string()?);
-        }
-        let n_cellvars = self.u32()? as usize;
-        let mut cellvars = Vec::with_capacity(n_cellvars);
-        for _ in 0..n_cellvars {
-            cellvars.push(self.string()?);
-        }
-        let n_freevars = self.u32()? as usize;
-        let mut freevars = Vec::with_capacity(n_freevars);
-        for _ in 0..n_freevars {
-            freevars.push(self.string()?);
-        }
+        let local_names = self.name_pool()?;
+        let cellvars = self.name_pool()?;
+        let freevars = self.name_pool()?;
         let n_local_types = self.u32()? as usize;
         let mut local_types = Vec::with_capacity(n_local_types);
         for _ in 0..n_local_types {
@@ -1411,11 +1827,7 @@ impl<'a> Reader<'a> {
         for _ in 0..n_consts {
             consts.push(self.const_value()?);
         }
-        let n_names = self.u32()? as usize;
-        let mut names = Vec::with_capacity(n_names);
-        for _ in 0..n_names {
-            names.push(self.string()?);
-        }
+        let names = self.name_pool()?;
         let doc = match self.u8()? {
             0 => None,
             _ => Some(self.string()?),
@@ -1442,6 +1854,7 @@ impl<'a> Reader<'a> {
             posonly_count,
             kwonly_count,
             is_generator,
+            is_coroutine,
             has_varargs,
             has_varkwargs,
             ret_ty,
@@ -1477,6 +1890,181 @@ mod tests {
         assert_eq!(tags.len(), count, "exception tags must be collision-free");
     }
 
+    #[test]
+    fn a_bundle_embeds_the_bare_module_payload_verbatim() {
+        let m = sample_module();
+        let features = FeatureFlags::FIRST_LIGHT;
+        let bare = m.encode(features);
+        let bundle = Bundle {
+            entry: m,
+            modules: Vec::new(),
+        }
+        .encode(features);
+
+        assert_eq!(&bare[..4], &bundle[..4], "the same magic");
+        assert_eq!(u16::from_le_bytes([bare[4], bare[5]]), FORMAT_VERSION);
+        assert_eq!(
+            u16::from_le_bytes([bundle[4], bundle[5]]),
+            BUNDLE_FORMAT_VERSION
+        );
+        assert_eq!(
+            &bare[8..],
+            &bundle[8..bare.len()],
+            "a bundle's entry payload is the bare module's payload, byte for byte"
+        );
+    }
+
+    /// A pool reads like the `Vec<String>` it replaced: same order, same names, indexable.
+    #[test]
+    fn a_name_pool_reads_like_the_vec_it_replaced() {
+        let pool: NamePool = ["alpha", "b", "", "gamma"].into_iter().collect();
+        assert_eq!(pool.len(), 4);
+        assert!(!pool.is_empty());
+        assert_eq!(&pool[0], "alpha");
+        assert_eq!(&pool[1], "b");
+        assert_eq!(&pool[2], "", "an empty name keeps its slot rather than vanishing");
+        assert_eq!(&pool[3], "gamma");
+        assert_eq!(pool.get(4), None);
+        assert_eq!(pool.iter().collect::<Vec<_>>(), ["alpha", "b", "", "gamma"]);
+        assert_eq!(pool.position("gamma"), Some(3));
+        assert_eq!(pool.position("delta"), None);
+        assert!(pool.contains("b"));
+        assert!(NamePool::new().is_empty());
+    }
+
+    #[test]
+    fn a_built_pool_holds_no_slack() {
+        let names: Vec<String> = (0..40).map(|i| alloc::format!("identifier_{i}")).collect();
+        let pool: NamePool = names.iter().collect();
+
+        let text = pool.text.len();
+        assert!(
+            pool.text.capacity() <= text + 16,
+            "the text buffer holds {} bytes of slack over {text}",
+            pool.text.capacity() - text
+        );
+        assert!(
+            pool.spans.capacity() <= pool.spans.len() + 4,
+            "the span table holds {} entries of slack over {}",
+            pool.spans.capacity() - pool.spans.len(),
+            pool.spans.len()
+        );
+    }
+
+    /// Every artifact this build writes declares an EMPTY debug section, and it round-trips. This is
+    /// the half that ordinary use exercises, and on its own it proves nothing about the reservation.
+    #[test]
+    fn a_module_declares_an_empty_debug_section_and_round_trips() {
+        let m = sample_module();
+        let bytes = m.encode(FeatureFlags::FIRST_LIGHT);
+        assert_eq!(
+            &bytes[bytes.len() - 4..],
+            &0u32.to_le_bytes(),
+            "module content must end with the reserved section's length, and this build writes none"
+        );
+        let (back, _) = Module::decode(&bytes).expect("an empty section must decode");
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn a_reader_steps_over_a_debug_section_longer_than_it_can_write() {
+        let m = sample_module();
+        let features = FeatureFlags::FIRST_LIGHT;
+
+        let bare = m.encode(features);
+        let content = &bare[8..];
+        assert_eq!(&content[content.len() - 4..], &0u32.to_le_bytes());
+        let without_section = &content[..content.len() - 4];
+
+        let payload: Vec<u8> = (0..37u8).collect();
+        let mut fat = without_section.to_vec();
+        put_len(&mut fat, payload.len());
+        fat.extend_from_slice(&payload);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        put_u16(&mut bytes, BUNDLE_FORMAT_VERSION);
+        put_u16(&mut bytes, features.0);
+        bytes.extend_from_slice(&fat);
+        put_len(&mut bytes, 1);
+        bytes.extend_from_slice(content);
+
+        let (decoded, back_features) =
+            Bundle::decode(&bytes).expect("a longer debug section must be stepped over, not refused");
+        assert_eq!(back_features, features);
+        assert_eq!(decoded.entry, m, "the module carrying the section still reads");
+        assert_eq!(
+            decoded.modules,
+            vec![m],
+            "and so does everything AFTER it -- which is the property being reserved"
+        );
+    }
+
+    /// An enum is as wide as its widest variant, so ONE op's payload sets the size of every op in
+    /// every array a device decodes. That is a cost with no local cause: the variant that pays it is
+    /// not the variant that spends it, and the ops that get wider are the common ones. This pins the
+    /// width so adding a fat variant is a decision someone makes on purpose.
+    ///
+    /// Every payload here is a `u32`, a `u8` or a C-like enum, so the layout does not depend on
+    /// pointer width and this measurement holds for a 32-bit target as well as the host it runs on.
+    /// A `usize` or a reference in a variant would break that, and would break this test first.
+    #[test]
+    fn no_op_variant_is_wider_than_two_payload_words() {
+        assert_eq!(
+            core::mem::align_of::<Op>(),
+            4,
+            "a payload wider than 4-byte alignment would pad every op"
+        );
+        assert!(
+            core::mem::size_of::<Op>() <= 12,
+            "size_of::<Op>() is {}; a variant carrying three payload words widens EVERY op, and at \
+             roughly 1,300 ops in a real bundle each byte is another 1.3 KiB of device RAM",
+            core::mem::size_of::<Op>()
+        );
+    }
+
+    /// The payload of both containers is written by one function, so a bundle has to declare the
+    /// layout version of what it embeds. This asserts the DERIVATION rather than a literal, because a
+    /// literal is what let the two drift in the first place: a test naming today's number passes
+    /// forever while `FORMAT_VERSION` walks away from it.
+    #[test]
+    fn a_bundle_version_carries_the_module_layout_version_it_embeds() {
+        assert_eq!(
+            BUNDLE_FORMAT_VERSION & !BUNDLE_KIND_BIT,
+            FORMAT_VERSION,
+            "a bundle must declare the layout version of the module content it carries"
+        );
+        assert_ne!(
+            BUNDLE_FORMAT_VERSION, FORMAT_VERSION,
+            "the two containers must still be distinguishable by their version word alone"
+        );
+        assert_eq!(
+            FORMAT_VERSION & BUNDLE_KIND_BIT,
+            0,
+            "the kind bit must stay outside the range the layout version can reach"
+        );
+    }
+
+    /// A bundle written before the version carried its payload's layout is REFUSED rather than
+    /// decoded with today's field expectations. 17 is that artifact's version, and it is the case the
+    /// strict-equality check exists for: the same bytes it used to accept.
+    #[test]
+    fn a_bundle_declaring_the_old_container_version_is_refused() {
+        let m = sample_module();
+        let mut bytes = Bundle {
+            entry: m,
+            modules: Vec::new(),
+        }
+        .encode(FeatureFlags::FIRST_LIGHT);
+        bytes[4..6].copy_from_slice(&17u16.to_le_bytes());
+
+        assert_eq!(
+            Bundle::decode(&bytes),
+            Err(DecodeError::UnsupportedVersion(17)),
+            "a bundle whose header predates the derived version must be refused, not decoded"
+        );
+    }
+
     fn sample_module() -> Module {
         let func = CodeObject {
             name: String::from("inc"),
@@ -1488,16 +2076,17 @@ mod tests {
             posonly_count: 0,
             kwonly_count: 0,
             is_generator: false,
+            is_coroutine: false,
             has_varargs: false,
             has_varkwargs: false,
             ret_ty: StaticType::Int,
             n_locals: 1,
-            local_names: vec![String::from("n")],
-            cellvars: Vec::new(),
-            freevars: Vec::new(),
+            local_names: ["n"].into_iter().collect(),
+            cellvars: NamePool::new(),
+            freevars: NamePool::new(),
             local_types: vec![StaticType::Int],
             consts: vec![Const::Int(1), Const::None, Const::KwNames(vec![String::from("x")])],
-            names: vec![String::from("x")],
+            names: ["x"].into_iter().collect(),
             ops: vec![
                 Op::LoadFast(0),
                 Op::LoadConst(0),
@@ -1524,16 +2113,17 @@ mod tests {
                 posonly_count: 0,
                 kwonly_count: 0,
                 is_generator: false,
+                is_coroutine: false,
                 has_varargs: false,
                 has_varkwargs: false,
                 ret_ty: StaticType::Dynamic,
                 n_locals: 0,
-                local_names: Vec::new(),
-                cellvars: Vec::new(),
-                freevars: Vec::new(),
+                local_names: NamePool::new(),
+                cellvars: NamePool::new(),
+                freevars: NamePool::new(),
                 local_types: Vec::new(),
                 consts: vec![Const::None],
-                names: Vec::new(),
+                names: NamePool::new(),
                 ops: vec![Op::LoadConst(0), Op::Return],
                 cache_count: 0,
                 exc_table: Vec::new(),
@@ -1623,7 +2213,7 @@ mod tests {
             Op::UnpackEx { before: 1, after: 1 },
             Op::CallKw { argc: 2, kwnames: 1 },
             Op::Yield,
-            Op::CallEx { argc: 3, kinds: 2, kwnames: 1 },
+            Op::CallEx { kinds: 2, kwnames: 1 },
             Op::DeleteItem,
             Op::DeleteAttr { name: 4 },
             Op::LoadDeref(2),
@@ -1638,6 +2228,8 @@ mod tests {
             Op::YieldFrom,
             Op::ImportStar,
             Op::InplaceBinOp(BinOp::Add),
+            Op::Await,
+            Op::ListGrow { list: 2 },
             Op::Return,
         ];
         let mut buf = Vec::new();
@@ -1662,16 +2254,17 @@ mod tests {
             posonly_count: 0,
             kwonly_count: 0,
             is_generator: false,
+            is_coroutine: false,
             has_varargs: false,
             has_varkwargs: false,
             ret_ty: StaticType::Dynamic,
             n_locals: 1,
-            local_names: vec![String::from("n")],
-            cellvars: vec![String::from("n")],
-            freevars: vec![String::from("outer_x")],
+            local_names: ["n"].into_iter().collect(),
+            cellvars: ["n"].into_iter().collect(),
+            freevars: ["outer_x"].into_iter().collect(),
             local_types: vec![StaticType::Dynamic],
             consts: vec![Const::Int(1)],
-            names: Vec::new(),
+            names: NamePool::new(),
             ops: vec![
                 Op::LoadDeref(1),
                 Op::LoadConst(0),
@@ -1688,6 +2281,146 @@ mod tests {
         put_code_object(&mut buf, &co);
         let mut r = Reader { data: &buf, pos: 0 };
         assert_eq!(r.code_object().unwrap(), co);
+    }
+
+    #[test]
+    fn coroutine_bit_round_trips_independently_of_the_generator_bit() {
+        for (generator, coroutine) in [(false, false), (true, false), (false, true), (true, true)] {
+            let co = CodeObject {
+                name: String::from("f"),
+                doc: None,
+                params: Vec::new(),
+                posonly_count: 0,
+                kwonly_count: 0,
+                is_generator: generator,
+                is_coroutine: coroutine,
+                has_varargs: false,
+                has_varkwargs: false,
+                ret_ty: StaticType::Dynamic,
+                n_locals: 0,
+                local_names: NamePool::new(),
+                cellvars: NamePool::new(),
+                freevars: NamePool::new(),
+                local_types: Vec::new(),
+                consts: Vec::new(),
+                names: NamePool::new(),
+                ops: vec![Op::Await, Op::Return],
+                cache_count: 0,
+                exc_table: Vec::new(),
+            };
+            let mut buf = Vec::new();
+            put_code_object(&mut buf, &co);
+            let mut r = Reader { data: &buf, pos: 0 };
+            let back = r.code_object().unwrap();
+            assert_eq!(back, co);
+            assert_eq!(back.is_generator, generator);
+            assert_eq!(back.is_coroutine, coroutine);
+        }
+    }
+
+    #[test]
+    fn all_sixteen_flag_combinations_survive_one_packed_byte() {
+        for bits in 0u8..16 {
+            let mut co = CodeObject {
+                name: String::from("f"),
+                doc: None,
+                params: Vec::new(),
+                posonly_count: 0,
+                kwonly_count: 0,
+                is_generator: bits & 1 != 0,
+                is_coroutine: bits & 2 != 0,
+                has_varargs: bits & 4 != 0,
+                has_varkwargs: bits & 8 != 0,
+                ret_ty: StaticType::Dynamic,
+                n_locals: 0,
+                local_names: NamePool::new(),
+                cellvars: NamePool::new(),
+                freevars: NamePool::new(),
+                local_types: Vec::new(),
+                consts: Vec::new(),
+                names: NamePool::new(),
+                ops: vec![Op::Return],
+                cache_count: 0,
+                exc_table: Vec::new(),
+            };
+            let mut buf = Vec::new();
+            put_code_object(&mut buf, &co);
+            let mut r = Reader { data: &buf, pos: 0 };
+            assert_eq!(r.code_object().unwrap(), co, "flags {bits:#06b} round trip");
+            assert_eq!(CodeFlags::of(&co).0, bits, "packed bit values");
+            assert_eq!(CodeFlags::of(&co).0 & 0xF0, 0, "bits 4-7 stay spare");
+            co.is_coroutine = true;
+            assert!(CodeFlags::of(&co).contains(CodeFlags::COROUTINE));
+        }
+    }
+
+    #[test]
+    fn a_string_constant_carries_code_points_cpython_can_hold_and_utf8_cannot() {
+        let rows: &[(&[u32], &[u8], usize)] = &[
+            (&[0xD800], &[0xED, 0xA0, 0x80], 1),
+            (&[0xD800, 0xDC00], &[0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80], 2),
+            (&[0x10000], &[0xF0, 0x90, 0x80, 0x80], 1),
+            (&[0x20AC], &[0xE2, 0x82, 0xAC], 1),
+            (&[0x61, 0xDFFF, 0x62], &[0x61, 0xED, 0xBF, 0xBF, 0x62], 3),
+        ];
+        for (codes, bytes, length) in rows {
+            let s = PyStr::from_code_points(codes.iter().copied());
+            assert_eq!(s.as_bytes(), *bytes, "byte form for {codes:04X?}");
+            assert_eq!(s.code_points().count(), *length, "len for {codes:04X?}");
+            assert_eq!(s.code_points().collect::<Vec<_>>(), *codes, "round trip");
+
+            let module = Module {
+                name: String::from("m"),
+                functions: Vec::new(),
+                body: CodeObject {
+                    name: String::from("<module>"),
+                    doc: None,
+                    params: Vec::new(),
+                    posonly_count: 0,
+                    kwonly_count: 0,
+                    is_generator: false,
+                    is_coroutine: false,
+                    has_varargs: false,
+                    has_varkwargs: false,
+                    ret_ty: StaticType::Dynamic,
+                    n_locals: 0,
+                    local_names: NamePool::new(),
+                    cellvars: NamePool::new(),
+                    freevars: NamePool::new(),
+                    local_types: Vec::new(),
+                    consts: vec![Const::Str(s.clone())],
+                    names: NamePool::new(),
+                    ops: vec![Op::LoadConst(0), Op::Return],
+                    cache_count: 0,
+                    exc_table: Vec::new(),
+                },
+            };
+            let (back, _) =
+                Module::decode(&module.encode(FeatureFlags::default())).expect("decodes");
+            assert_eq!(back.body.consts, vec![Const::Str(s.clone())], "survives the container");
+        }
+    }
+
+    #[test]
+    fn a_surrogate_free_string_is_byte_identical_to_what_utf8_would_have_written() {
+        for text in ["", "hi", "caf\u{e9}", "\u{20AC}\u{1F600}", "line\nbreak"] {
+            let s = PyStr::from(text);
+            assert_eq!(s.as_bytes(), text.as_bytes(), "identical bytes for {text:?}");
+            assert_eq!(s.as_str(), Some(text), "and it still reads as a &str");
+            assert!(!s.has_surrogate());
+        }
+        let lone = PyStr::from_code_points([0xD800]);
+        assert_eq!(lone.as_str(), None);
+        assert!(lone.has_surrogate());
+    }
+
+    #[test]
+    fn stop_async_iteration_is_in_the_hierarchy_under_exception() {
+        let base = EXCEPTION_HIERARCHY
+            .iter()
+            .find(|(name, _)| *name == "StopAsyncIteration")
+            .map(|(_, base)| *base);
+        assert_eq!(base, Some("Exception"));
     }
 
     #[test]

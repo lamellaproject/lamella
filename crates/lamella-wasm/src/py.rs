@@ -71,7 +71,15 @@ pub fn run_py_str(source: &str) -> RunResult {
     match run(main_co, &entry_functions, &[], &mut model) {
         Ok(value) => {
             let mut stdout = model.take_stdout();
-            stdout.push_str(&model.display(value));
+            match model.display(value) {
+                Ok(rendered) => stdout.push_str(&rendered),
+                Err(trap) => {
+                    let mut result = trap_result(&mut model, trap);
+                    stdout.push_str(&result.stdout);
+                    result.stdout = stdout;
+                    return result;
+                }
+            }
             stdout.push('\n');
             RunResult {
                 stdout,
@@ -137,6 +145,49 @@ pub fn bundle_py_str(source: &str) -> Vec<u8> {
     }
 }
 
+/// Completions (IntelliSense) for the caret at byte `offset` in `source`, as
+/// `{"items":[{"label","kind","detail","insertText"}]}` -- the SAME envelope
+/// `lamella_complete` returns for C#, so one editor seam drives both languages and a client does
+/// not branch on which one it asked.
+///
+/// # It takes no references, and that is a property of the language rather than an omission
+///
+/// The C# engine needs a `Model` built from reference assemblies before it can say anything about
+/// a member. Python has no reference assemblies here: the stdlib a program can reach is the set
+/// [`lamella_py_runtime::pystdlib`] carries INSIDE this blob, so the engine has everything it needs
+/// from the source and the offset alone. That is why this signature is shorter than the C# one, and
+/// why a caller has nothing to fetch before the first keystroke can be answered.
+///
+/// # It cannot fail, because the caret is normally in broken source
+///
+/// A caret sits mid-identifier by definition and `x = math.` is not a parseable statement, so an
+/// engine that needed a clean parse would answer nothing exactly when asked. [`lamella_py_frontend::complete`]
+/// repairs the source before parsing and falls back to a token scan; **no input produces an error and
+/// the worst outcome is an empty list**. There is deliberately no failure envelope to interpret.
+#[must_use]
+pub fn complete_py_str(source: &str, offset: usize) -> String {
+    let mut json = String::from("{\"items\":[");
+    for (index, item) in lamella_py_frontend::complete::complete(source, offset)
+        .iter()
+        .enumerate()
+    {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str("{\"label\":");
+        crate::push_json_string(&mut json, &item.label);
+        json.push_str(",\"kind\":");
+        crate::push_json_string(&mut json, item.kind.as_str());
+        json.push_str(",\"detail\":");
+        crate::push_json_string(&mut json, &item.detail);
+        json.push_str(",\"insertText\":");
+        crate::push_json_string(&mut json, &item.insert_text);
+        json.push('}');
+    }
+    json.push_str("]}");
+    json
+}
+
 /// A `PY-TRAP` diagnostic that keeps whatever the program printed BEFORE the fault -- discarding
 /// it would hide the half of the run that worked -- and names an uncaught Python exception by its
 /// type, the way CPython's traceback does, rather than by an internal trap kind.
@@ -168,6 +219,7 @@ fn compile_error_result(error: &FrontendError) -> RunResult {
         FrontendError::Parse(e) => e.line,
         FrontendError::Compile(_) => 0,
         FrontendError::BoardFact(_) => 0,
+        FrontendError::InModule { .. } => 0,
     };
     RunResult {
         stdout: String::new(),
@@ -331,5 +383,41 @@ mod tests {
         assert!(check_py_str("import json\nprint(json.dumps(1))\n")
             .diagnostics
             .is_empty());
+    }
+
+    #[test]
+    fn completion_answers_a_caret_in_source_that_does_not_parse() {
+        let source = "def main():\n    total = 1\n    tot\n";
+        let offset = source.find("tot\n").expect("the partial identifier") + 3;
+        let json = complete_py_str(source, offset);
+
+        assert!(
+            json.contains("\"label\":\"total\""),
+            "the local in scope is offered: {json}"
+        );
+        assert!(
+            json.contains("\"kind\":\"local\""),
+            "and it is spelled as the engine spells it: {json}"
+        );
+        assert!(json.starts_with("{\"items\":["), "{json}");
+        assert!(json.ends_with("]}"), "{json}");
+    }
+
+    #[test]
+    fn completion_filters_by_the_prefix_the_caret_sits_in() {
+        let source = "def main():\n    total = 1\n    zzq\n";
+        let offset = source.find("zzq\n").expect("the partial identifier") + 3;
+        let json = complete_py_str(source, offset);
+        assert!(
+            !json.contains("\"label\":\"total\""),
+            "a prefix that matches nothing must not offer everything: {json}"
+        );
+    }
+
+    #[test]
+    fn a_caret_with_nothing_to_suggest_yields_an_empty_list_not_a_failure() {
+        let source = "import json\njson.\n";
+        let offset = source.find("json.\n").expect("the member access") + 5;
+        assert_eq!(complete_py_str(source, offset), "{\"items\":[]}");
     }
 }

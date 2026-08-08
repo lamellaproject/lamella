@@ -5,15 +5,6 @@
 # what it genuinely differs by. Drawn the other way, this file would have had to switch features
 # back OFF -- which is the check a family of one member cannot run.
 #
-# SOURCING, AND IT IS SECONDARY. Every fact below comes from the BME280 datasheet's own
-# BMP280-compatibility section: a primary vendor statement about this part, but not this part's
-# own datasheet. Nothing here is written from memory or inferred from a third-party driver, and
-# nothing the family base states about pressure or temperature is contradicted by that section.
-#
-# WHAT THIS PART THEREFORE DOES NOT STATE, because the compatibility section does not cover it:
-# power figures, timing, and the measurement-duration table a non-blocking driver would need.
-# Treat those as absent rather than defaulted.
-
 [table]
 kind = "device"
 family = "bmx280"
@@ -25,6 +16,25 @@ sources = [
 notes = [
     "The vendor states the BME280 is downward register compatible with this part: pressure and temperature control and readout are identical. Four registers are documented as differing, and all four are stated here or in the base.",
 ]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Secondary, and `derived_from` names what it is secondary TO: every fact below comes from the
+# BME280 datasheet's own BMP280-compatibility section, which is a primary vendor statement about
+# this part but is not this part's own datasheet. Nothing here is written from memory or inferred
+# from a third-party driver, and nothing the family base states about pressure or temperature is
+# contradicted by that section.
+#
+# WHAT THIS PART THEREFORE DOES NOT STATE, because the compatibility section does not cover it:
+# power figures, timing, and the measurement-duration table a non-blocking driver would need.
+# Treat those as absent rather than defaulted.
+#
+# Unvalidated: no physical BMP280 has been made to answer any of it.
+
+[sourcing]
+facts = "secondary"
+derived_from = "bme280"
+validation = "none"
 
 # --- identity: THREE accepted values, not one ----------------------------------------------------
 #

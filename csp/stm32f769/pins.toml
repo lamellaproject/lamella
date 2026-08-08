@@ -1,0 +1,32 @@
+# PIN map: pin x function -> (instance, signal) for the STM32F769.
+# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers (AF0..AF15) that the
+# AFRL/AFRH nibbles select.
+#
+# THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
+# its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
+
+[table]
+kind = "pins"
+family = "stm32f769"
+sources = [
+    "STM32F765xx/STM32F767xx/STM32F768Ax/STM32F769xx datasheet DS11532 Rev 9, Table 13 'alternate function mapping' (page 89), whose sixteen function columns are headed by AF number: the AF7 column is headed SPI2/I2S2/SPI3/I2S3/USART1/2/3/UART5/DFSDM1/SPDIF, and PA9's AF7 cell is USART1_TX while PA10's is USART1_RX",
+]
+notes = [
+    "Only the two cells the board's virtual COM port claims are stated. The user LEDs and the user button are plain GPIO rather than muxed functions, so they carry no row here -- a pin driven by the port itself has no alternate function to select, and a row asserting one would be a claim the board does not make.",
+]
+
+# --- USART1: the virtual COM port ------------------------------------------------------------
+
+[[pins]]
+pin = "PA9"
+function = "AF7"
+instance = "usart1"
+signal = "tx"
+source = "DS11532 Rev 9 Table 13: PA9's AF7 cell is USART1_TX. UM2033 Rev 5 corroborates the direction from the board's side -- its pin table gives PA9 the signal name USART1_TX against the label VCP_TX."
+
+[[pins]]
+pin = "PA10"
+function = "AF7"
+instance = "usart1"
+signal = "rx"
+source = "DS11532 Rev 9 Table 13: PA10's AF7 cell is USART1_RX. UM2033 Rev 5 gives PA10 the signal name USART1_RX against the label VCP_RX, so the board and the part agree on the pair without either being read from the other."

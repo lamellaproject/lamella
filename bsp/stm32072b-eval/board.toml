@@ -1,0 +1,106 @@
+# BOARD binding: the STM32072B-EVAL -- an EVALUATION board rather than a Discovery or a Nucleo,
+# which is a different KIND of product: it exists to demonstrate every peripheral of the part at
+# once. Most of what this file has to say is in what it DOES NOT contain.
+
+[table]
+kind = "board"
+board = "stm32072b-eval"
+vendor = "st"
+family = "stm32f091"
+part = "stm32f072vb"
+board_model = 31            # lamella_wire::board_model::STM32072B_EVAL
+sources = [
+    "UM1714 Rev 1 (DocID025744), Evaluation board for STM32 F0 series with STM32F072VB MCU. Introduction: the board carries an STM32F072VBT6 with internal 16KB SRAM and 128KB flash, and an ST-LINK/V2 is integrated for program loading and debugging over SWD. Section 2.20: four general purpose colour LEDs LD1-LD4 are available as display devices, two push buttons (B1 Reset, B2 tamper) and one joystick, whose selection key is connected to PA0.",
+    "UM1714 Rev 1 Table 34 'STM32072B-EVAL IO assignment': PD8 LED1, PD9 LED2, PD10 LED3, PD11 LED4, PC13 TAMPER_KEY, PA0 JOY_SEL, PE2 JOY_LEFT, PE3 JOY_RIGHT, PF9 JOY_UP, PF10 JOY_DOWN.",
+    "UM1714 Rev 1 Figure 26 (schematic sheet 8): each of LD1-LD4 has its ANODE at +3V3 and its cathode returning through a series resistor to the MCU pin, so the pin sinks; the tamper key B2 sits on a node held up by R195, a 4K7 to VDD, and shorted to ground through R196 when pressed; the joystick's five lines are annotated 'Input pins with pull-down'.",
+]
+notes = [
+    "The joystick is FIVE SEPARATE GPIO INPUTS rather than one device -- a select and four directions, each on its own pin with its own pull-down. It is stated as five rows because that is what the board wires; a reader wanting one logical control assembles it, and nothing here decides how.",
+    "B1 is the RESET button and carries no row: it drives NRST rather than a port pin, so it is not a line a program can read. B2, labelled 'tamper', is the one general-purpose button.",
+    "NOT MODELLED AND EACH FOR THE SAME REASON: the TFT LCD (SPI1, chip select PE6), the microSD card (chip select PF2, card-detect PB15), the smart card, the audio DAC and microphone, the RF EEPROM and temperature sensor on I2C2, the touch-sensing buttons, CAN, IrDA, the IR LED and receiver, the potentiometer on PC0 and the light-dependent resistor on PA1. Every one of them is a device whose shape is neither a GPIO line nor a bus address.",
+]
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# ALL FOUR LEDS ARE ACTIVE LOW, and the schematic shows why in one direction: the LED's anode sits
+# at +3V3 and its cathode returns through a series resistor to the MCU pin, so the pin SINKS the
+# current. Read backwards, a board's LEDs are lit from reset until a program drives them high.
+# That is the opposite of the two Nucleo-144 boards and the F429 Discovery and the same as the
+# F769 Discovery -- four ST boards, two habits, so polarity stays a per-board reading.
+#
+# THE TAMPER KEY IS ACTIVE LOW TOO, and for once that is the arrangement a reader expects: R195, a
+# 4K7, holds the pin up to VDD and the switch shorts it to ground.
+#
+# THE JOYSTICK IS THE OTHER WAY: its five lines are annotated on the schematic as "input pins with
+# pull-down", so each rests LOW and reads HIGH while its direction is held. One board, both
+# conventions again.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PD8"
+active = "low"
+source = "UM1714 Rev 1 Table 34: PD8 is LED1. Figure 26 sheet 8: LD1 (green) has its anode at +3V3 and its cathode through R193, 510R, to the pin -- so the pin sinks and LOW lights it."
+
+[[devices]]
+name = "led1"
+kind = "gpio-out"
+pin = "PD9"
+active = "low"
+source = "UM1714 Rev 1 Table 34: PD9 is LED2. Figure 26 sheet 8: LD2 (orange) has its anode at +3V3 and its cathode through R192, 680R, to the pin."
+
+[[devices]]
+name = "led2"
+kind = "gpio-out"
+pin = "PD10"
+active = "low"
+source = "UM1714 Rev 1 Table 34: PD10 is LED3. Figure 26 sheet 8: LD3 (red) has its anode at +3V3 and its cathode through R191, 680R, to the pin."
+
+[[devices]]
+name = "led3"
+kind = "gpio-out"
+pin = "PD11"
+active = "low"
+source = "UM1714 Rev 1 Table 34: PD11 is LED4. Figure 26 sheet 8: LD4 (blue) has its anode at +3V3 and its cathode through R190, 680R, to the pin."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PC13"
+active = "low"
+source = "UM1714 Rev 1 Table 34: PC13 is TAMPER_KEY, the B2 push-button. Figure 26 sheet 8: the node is held up by R195, a 4K7 to VDD, and the switch shorts it to ground through R196 -- so the pin rests HIGH and reads LOW while B2 is held."
+
+[[devices]]
+name = "joystick-select"
+kind = "gpio-in"
+pin = "PA0"
+active = "high"
+source = "UM1714 Rev 1 section 2.20: the selection key of the joystick is connected to PA0, which supports the wake-up feature. Table 34 gives PA0 as JOY_SEL. Figure 26 sheet 8 annotates the joystick's lines as input pins with pull-down, so the pin rests LOW and reads HIGH while pressed."
+
+[[devices]]
+name = "joystick-up"
+kind = "gpio-in"
+pin = "PF9"
+active = "high"
+source = "UM1714 Rev 1 Table 34: PF9 is JOY_UP. Figure 26 sheet 8: input pins with pull-down."
+
+[[devices]]
+name = "joystick-down"
+kind = "gpio-in"
+pin = "PF10"
+active = "high"
+source = "UM1714 Rev 1 Table 34: PF10 is JOY_DOWN. Figure 26 sheet 8: input pins with pull-down."
+
+[[devices]]
+name = "joystick-left"
+kind = "gpio-in"
+pin = "PE2"
+active = "high"
+source = "UM1714 Rev 1 Table 34: PE2 is JOY_LEFT. Figure 26 sheet 8: input pins with pull-down."
+
+[[devices]]
+name = "joystick-right"
+kind = "gpio-in"
+pin = "PE3"
+active = "high"
+source = "UM1714 Rev 1 Table 34: PE3 is JOY_RIGHT. Figure 26 sheet 8: input pins with pull-down."

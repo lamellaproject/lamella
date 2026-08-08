@@ -1,0 +1,86 @@
+# BLOCK layout: the STM32F769 GPIO port block -- the registers a uart binding muxes through.
+# PARTIAL: MODER/AFRH fields are stated for the pins bindings claim and grow as more do.
+# Offsets are instance-base-relative; port instance bases live in ../instances.toml.
+#
+# A pin's alternate function is selected in TWO registers, which is the thing to get right: MODER
+# puts the pin in alternate-function MODE (2 bits per pin), and an AFR register selects WHICH
+# function (4 bits per pin). Setting one without the other leaves the pin either driving nothing or
+# driving the wrong peripheral.
+
+[table]
+kind = "block"
+family = "stm32f769"
+block = "gpio"
+sources = [
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5: GPIOx_MODER 6.4.1 (address offset 0x00), GPIOx_OTYPER 6.4.2 (0x04), GPIOx_OSPEEDR 6.4.3 (0x08), GPIOx_PUPDR 6.4.4 (0x0C), GPIOx_IDR 6.4.5 (0x10), GPIOx_ODR 6.4.6 (0x14), GPIOx_BSRR 6.4.7 (0x18), GPIOx_AFRL 6.4.9 (0x20), GPIOx_AFRH 6.4.10 (0x24)",
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5, GPIOx_MODER bit description: 00 input (reset state), 01 general purpose output, 10 alternate function, 11 analog",
+]
+notes = [
+    "GPIO config is read-modify-write: MODER holds 2 bits per pin and an AFR nibble 4, so a pin's field span is cleared before the set value is OR-ed in.",
+    "WHICH AFR register a pin uses is decided by the pin number, not by the function: AFRL covers pins 0..7 and AFRH covers pins 8..15, each with 4 bits per pin counted from its own base. So pin 9's nibble is at bit 4 of AFRH, not at bit 36 of anything. Both pins this family muxes are in the high half, so nothing here exercises AFRL -- which is worth knowing before the first row that does.",
+    "The alternate-function MODE value is 10 binary (2), the same on every port and pin.",
+    "OTYPER is the one register here with ONE bit per pin rather than two, so its shift is the pin index itself and not twice it. A rule applied uniformly across these registers is wrong for exactly this one.",
+    "BSRR's low half SETS a pin and its high half CLEARS one, so either can be done with a single write and no read-modify-write. The two halves are 16 bits apart and a mask written to the wrong one drives the pin the wrong way rather than failing.",
+    "The per-pin field rows below are PARTIAL and deliberately stay that way. A pin's span follows from its index by rule -- 2 bits at [2n], a nibble at [4n] within its own AFR half, one bit at [n] -- and that rule is what composes a binding's words at generation time, so a row per pin would be a second statement of the same arithmetic rather than a new fact.",
+]
+
+[registers.MODER]
+offset = 0x0
+width = 32
+fields = { MODER9 = [18, 2], MODER10 = [20, 2] }
+notes = "Port mode, 2 bits per pin at [2n, 2] (PARTIAL: pins 9 and 10 stated). 00 = input (reset), 01 = general purpose output, 10 = alternate function, 11 = analog."
+
+[registers.OTYPER]
+offset = 0x4
+width = 32
+fields = { }
+notes = "Output type, ONE bit per pin at [n]: 0 = push-pull (reset), 1 = open drain."
+
+[registers.OSPEEDR]
+offset = 0x8
+width = 32
+fields = { }
+notes = "Output speed, 2 bits per pin at [2n]: 00 low (reset), 01 medium, 10 high, 11 very high. A slew-rate setting, not a clock -- it does not make a bus faster, it stops a fast bus from being smeared."
+
+[registers.PUPDR]
+offset = 0xC
+width = 32
+fields = { }
+notes = "Pull-up/pull-down, 2 bits per pin at [2n]: 00 none (reset), 01 pull-up, 10 pull-down. Whether an external pull is present is a board fact, never this table's."
+
+[registers.IDR]
+offset = 0x10
+width = 32
+fields = { }
+notes = "Input data, ONE bit per pin at [n], read-only. What a button row is read through."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { }
+notes = "Output data, ONE bit per pin at [n]. Read-modify-write; BSRR is the single-write alternative."
+
+[registers.BSRR]
+offset = 0x18
+width = 32
+fields = { }
+notes = "Bit set/reset, write-only: bit [n] SETS pin n and bit [n+16] CLEARS it."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { }
+notes = "Alternate function for pins 0..7, 4 bits per pin at [4n, 4]. No pin this family muxes falls in this half yet."
+
+[registers.AFRH]
+offset = 0x24
+width = 32
+fields = { AFSEL9 = [4, 4], AFSEL10 = [8, 4] }
+notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4] (PARTIAL: pins 9 and 10 stated)."
+
+[constants]
+MODER_MODE_OUTPUT = 1
+MODER_MODE_AF = 2
+OTYPER_OPEN_DRAIN = 1
+OSPEEDR_VERY_HIGH = 3
+PUPDR_PULL_UP = 1

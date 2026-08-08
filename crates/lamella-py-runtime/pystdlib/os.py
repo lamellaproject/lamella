@@ -11,6 +11,10 @@ them is true.
 `sep` is `/` and `linesep` is `\\n`, on every target. These are DELIBERATELY not the host's: this
 runtime's targets are devices, `/` is accepted by every desktop platform as well, and a program that
 writes `os.linesep` into a file should get the same bytes wherever it runs.
+
+NOT PROVIDED, each raising by name rather than approximated: `stat` (a stat_result needs a whole
+record of fields the seam does not carry), `getcwd`/`chdir` (a working directory is process state
+this runtime does not own), `walk`, `environ`, and the process and permission surfaces.
 """
 import _fs
 

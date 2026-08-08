@@ -30,6 +30,9 @@ pub mod calling {
     pub const SENTINEL: u8 = 0x41;
     /// The leading byte of a local-variable signature (II.23.2.6).
     pub const LOCAL_SIG: u8 = 0x07;
+    /// The leading byte of a `MethodSpec` instantiation signature (II.23.2.15):
+    /// `IMAGE_CEE_CS_CALLCONV_GENERICINST`.
+    pub const GENERICINST: u8 = 0x0A;
 }
 
 /// The element-type bytes a signature begins with (II.23.1.16).
@@ -70,8 +73,17 @@ pub mod element {
     pub const VALUETYPE: u8 = 0x11;
     /// A reference type; followed by a `TypeDefOrRef` token.
     pub const CLASS: u8 = 0x12;
+    /// A generic TYPE parameter in a generic type definition (`!0`), II.23.1.16: "represented as
+    /// number (compressed unsigned integer)".
+    ///
+    /// DECODED into [`super::SigType::Var`].
+    pub const VAR: u8 = 0x13;
     /// A general (multi-dimensional) array; followed by element type and shape.
     pub const ARRAY: u8 = 0x14;
+    /// A generic type INSTANTIATION (`List<int>`), II.23.1.16: "Followed by type type-arg-count
+    /// type-1 ... type-n". Decoded into [`super::SigType::GenericInst`] -- see [`VAR`] for the tag
+    /// question that decoding does NOT answer.
+    pub const GENERICINST: u8 = 0x15;
     /// `System.TypedReference`.
     pub const TYPEDBYREF: u8 = 0x16;
     /// `native int`.
@@ -84,12 +96,59 @@ pub mod element {
     pub const OBJECT: u8 = 0x1C;
     /// A single-dimensional zero-based array; followed by element type.
     pub const SZARRAY: u8 = 0x1D;
+    /// A generic METHOD parameter in a generic method definition (`!!0`), II.23.1.16: also
+    /// "represented as number (compressed unsigned integer)". Decoded into [`super::SigType::MVar`].
+    pub const MVAR: u8 = 0x1E;
     /// A required custom modifier; followed by a `TypeDefOrRef` token.
     pub const CMOD_REQD: u8 = 0x1F;
     /// An optional custom modifier; followed by a `TypeDefOrRef` token.
     pub const CMOD_OPT: u8 = 0x20;
     /// A pinned local-variable constraint, preceding the local's type (II.23.2.6).
     pub const PINNED: u8 = 0x45;
+}
+
+/// The ECMA-335 element-type byte a [`SigType`](super::SigType) is spelled with -- the ENCODE
+/// direction of the table [`element`] declares and [`parse_type`](super::parse_type) decodes.
+///
+/// # Why it lives here and not in a consumer
+///
+/// It maps a `lamella-metadata` type onto `lamella-metadata` constants, so a copy anywhere else is a
+/// SECOND table over one byte space -- the drift shape this tree has already paid for once, when the
+/// AOT's interface tag kept its own version and `Pointer`/`ByRef` had no arm in it: `IFoo.Bar(int*)`,
+/// `IFoo.Bar(byte*)` and `IFoo.Bar(ref int)` all tagged alike. One table, beside the decoder it must
+/// agree with.
+#[must_use]
+pub fn element_byte(ty: &super::SigType) -> u8 {
+    use super::SigType;
+    match ty {
+        SigType::Void => element::VOID,
+        SigType::Boolean => element::BOOLEAN,
+        SigType::Char => element::CHAR,
+        SigType::I1 => element::I1,
+        SigType::U1 => element::U1,
+        SigType::I2 => element::I2,
+        SigType::U2 => element::U2,
+        SigType::I4 => element::I4,
+        SigType::U4 => element::U4,
+        SigType::I8 => element::I8,
+        SigType::U8 => element::U8,
+        SigType::R4 => element::R4,
+        SigType::R8 => element::R8,
+        SigType::String => element::STRING,
+        SigType::Pointer(_) => element::PTR,
+        SigType::ByRef(_) => element::BYREF,
+        SigType::ValueType(_) => element::VALUETYPE,
+        SigType::Class(_) => element::CLASS,
+        SigType::Array { .. } => element::ARRAY,
+        SigType::TypedByRef => element::TYPEDBYREF,
+        SigType::IntPtr => element::I,
+        SigType::UIntPtr => element::U,
+        SigType::Object => element::OBJECT,
+        SigType::SzArray(_) => element::SZARRAY,
+        SigType::Var(_) => element::VAR,
+        SigType::MVar(_) => element::MVAR,
+        SigType::GenericInst { .. } => element::GENERICINST,
+    }
 }
 
 /// An error decoding a signature.
@@ -101,12 +160,7 @@ pub enum SigError {
     BadElementType(u8),
     /// A field signature did not begin with the FIELD calling convention.
     BadCallingConvention(u8),
-    /// A method signature declares type parameters (the GENERIC convention, II.23.2.1). This
-    /// reader does not decode generics, and REFUSING is the whole point: the layout differs by an
-    /// extra leading `GenParamCount`, so decoding it as an ordinary signature silently yields the
-    /// wrong arity and the wrong types rather than failing. A caller that maps this to `None`
-    /// omits the member, which a consumer sees as "no such method" instead of as a mysterious
-    /// mismatch.
+    /// A method signature declares type parameters (the GENERIC convention, II.23.2.1).
     GenericSignature,
 }
 
@@ -127,6 +181,8 @@ pub struct MethodSig {
     /// vararg call-site `MemberRef` carries the fixed parameters, then a sentinel, then the
     /// variable-argument types.
     pub is_vararg: bool,
+    /// How many type parameters the method itself declares (the `1` of `T Identity<T>(T)`), or 0.
+    pub generic_param_count: u32,
     /// For a vararg call-site signature, the index in `parameters` at which the sentinel appeared --
     /// the count of FIXED parameters (the remainder are the variable arguments). `None` if no
     /// sentinel was present (a vararg `MethodDef`, or any non-vararg signature).
@@ -195,6 +251,19 @@ pub enum SigType {
     Pointer(Box<SigType>),
     /// A managed reference to the referent type.
     ByRef(Box<SigType>),
+    /// A generic parameter of the enclosing TYPE, by its zero-based number: the `T` of `Box<T>`
+    /// seen from inside it (`ELEMENT_TYPE_VAR`, II.23.1.16).
+    Var(u32),
+    /// A generic parameter of the METHOD itself (`ELEMENT_TYPE_MVAR`).
+    MVar(u32),
+    /// An instantiation of a generic type: `List<int>`, or `Box<!0>` inside another generic
+    /// (`ELEMENT_TYPE_GENERICINST`).
+    GenericInst {
+        /// The generic definition, a [`SigType::Class`] or [`SigType::ValueType`] naming `C\`n`.
+        definition: Box<SigType>,
+        /// The type arguments, in order.
+        arguments: Vec<SigType>,
+    },
 }
 
 /// Reads a `TypeDefOrRef` token compressed into a signature (II.23.2.8): a
@@ -258,6 +327,20 @@ pub fn read_type(reader: &mut Reader) -> Result<SigType, SigError> {
                 read_type_def_or_ref(reader)?;
                 continue;
             }
+            element::VAR => SigType::Var(reader.read_compressed_u32()?),
+            element::MVAR => SigType::MVar(reader.read_compressed_u32()?),
+            element::GENERICINST => {
+                let definition = Box::new(read_type(reader)?);
+                let count = reader.read_compressed_u32()?;
+                let mut arguments = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    arguments.push(read_type(reader)?);
+                }
+                SigType::GenericInst {
+                    definition,
+                    arguments,
+                }
+            }
             other => return Err(SigError::BadElementType(other)),
         });
     }
@@ -287,9 +370,11 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
     let has_this = convention & calling::HAS_THIS != 0;
     let explicit_this = convention & calling::EXPLICIT_THIS != 0;
     let is_vararg = convention & calling::CONVENTION_MASK == calling::VARARG;
-    if convention & calling::GENERIC != 0 {
-        return Err(SigError::GenericSignature);
-    }
+    let generic_param_count = if convention & calling::GENERIC != 0 {
+        reader.read_compressed_u32()?
+    } else {
+        0
+    };
     let param_count = reader.read_compressed_u32()?;
     let return_type = read_type(&mut reader)?;
     let mut parameters = Vec::new();
@@ -308,7 +393,29 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
         parameters,
         is_vararg,
         sentinel_index,
+        generic_param_count,
     })
+}
+
+/// Decodes a `MethodSpec` instantiation blob (II.23.2.15): the `GENERICINST` calling convention,
+/// the argument count, then that many type signatures -- the type arguments of one generic-method
+/// call site, in declaration order.
+///
+/// This is the last signature shape in the format that had no decoder here, which left its only
+/// consumer walking the blob itself and finding each argument's boundary by the shortest prefix
+/// that parses. That works and is a workaround; one decoder per format is the rule.
+pub fn parse_method_spec(blob: &[u8]) -> Result<Vec<SigType>, SigError> {
+    let mut reader = Reader::new(blob);
+    let convention = reader.read_u8()?;
+    if convention != calling::GENERICINST {
+        return Err(SigError::BadCallingConvention(convention));
+    }
+    let count = reader.read_compressed_u32()?;
+    let mut arguments = Vec::with_capacity(count as usize);
+    while (arguments.len() as u32) < count {
+        arguments.push(read_type(&mut reader)?);
+    }
+    Ok(arguments)
 }
 
 /// One local-variable slot as its signature declares it (II.23.2.6): the slot's type, and
@@ -521,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_method_signature_is_refused_not_misread() {
+    fn a_generic_method_signature_is_decoded_not_misread() {
         let generic = [
             calling::GENERIC | calling::HAS_THIS,
             0x01,
@@ -530,7 +637,11 @@ mod tests {
             element::I4,
             element::I4,
         ];
-        assert_eq!(parse_method(&generic), Err(SigError::GenericSignature));
+        let decoded = parse_method(&generic).expect("a generic signature decodes");
+        assert_eq!(decoded.generic_param_count, 1);
+        assert_eq!(decoded.parameters.len(), 2, "GenParamCount must not be read as ParamCount");
+        assert_eq!(decoded.return_type, SigType::I4);
+        assert!(decoded.has_this);
 
         let mut as_default = generic;
         as_default[0] &= !calling::GENERIC;
@@ -538,11 +649,53 @@ mod tests {
         assert_eq!(misread.parameters.len(), 1, "truth is 2");
         assert_ne!(misread.return_type, SigType::I4, "truth is I4");
 
-        assert_eq!(
-            parse_method(&[calling::GENERIC, 0x01, 0x00, element::I4]),
-            Err(SigError::GenericSignature)
-        );
+        let nibble_default =
+            parse_method(&[calling::GENERIC, 0x01, 0x00, element::I4]).expect("decodes");
+        assert_eq!(nibble_default.generic_param_count, 1);
+        assert_eq!(nibble_default.parameters.len(), 0);
+        assert_eq!(nibble_default.return_type, SigType::I4);
+
+        let ordinary = parse_method(&[calling::HAS_THIS, 0x00, element::VOID]).expect("decodes");
+        assert_eq!(ordinary.generic_param_count, 0);
         assert!(parse_method(&[calling::HAS_THIS, 0x00, element::VOID]).is_ok());
+    }
+
+    #[test]
+    fn a_method_spec_instantiation_decodes_its_arguments() {
+        assert_eq!(
+            parse_method_spec(&[calling::GENERICINST, 0x02, element::I4, element::STRING]),
+            Ok(alloc::vec![SigType::I4, SigType::String])
+        );
+
+        let decoded = parse_method_spec(&[
+            calling::GENERICINST,
+            0x01,
+            element::GENERICINST,
+            element::CLASS,
+            0x0D,
+            0x01,
+            element::U1,
+        ])
+        .expect("a nested instantiation decodes");
+        let [SigType::GenericInst {
+            definition,
+            arguments,
+        }] = &decoded[..]
+        else {
+            panic!("expected one instantiation argument, got {decoded:?}");
+        };
+        assert_eq!(**definition, SigType::Class(Token::new(table::TYPE_REF, 3)));
+        assert_eq!(arguments[..], [SigType::U1]);
+
+        assert_eq!(
+            parse_method_spec(&[element::GENERICINST, 0x01, element::I4]),
+            Err(SigError::BadCallingConvention(element::GENERICINST))
+        );
+        assert_eq!(
+            parse_method_spec(&[element::I4, 0x01, element::I4]),
+            Err(SigError::BadCallingConvention(element::I4))
+        );
+        assert_eq!(parse_method_spec(&[]), Err(SigError::Truncated));
     }
 
     #[test]

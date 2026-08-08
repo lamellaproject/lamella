@@ -20,7 +20,13 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 # Real ST-Link access for the examples -- the probe most STM32 boards ship with.
 lamella-stlink = { path = "../lamella-stlink" }
 # Probe discovery, so the same example can also run over CMSIS-DAP and prove the flash path is
-# probe-portable rather than merely claimed to be.
-lamella-probe = { path = "../lamella-probe" }
-# Real-probe HID access for the examples (native USB-HID; e.g. an MCU-Link Pro or Atmel-ICE).
+# probe-portable rather than merely claimed to be. `usbbulk` because a probe's TRANSPORT is not a
+# property of the probe MODEL: an MCU-Link Pro presents CMSIS-DAP over USB-HID on its V2.x firmware
+# and over USB BULK on its V3.x firmware, so the same physical probe needs both paths available and
+# the tool has to pick at run time.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["usbbulk"] }
+# Real-probe HID access for the examples (native USB-HID; e.g. an Atmel-ICE, or an MCU-Link Pro on
+# firmware older than V3).
 lamella-usbhid = { path = "../lamella-usbhid" }
+lamella-usbbulk = { path = "../lamella-usbbulk" }

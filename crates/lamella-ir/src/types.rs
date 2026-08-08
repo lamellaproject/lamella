@@ -11,9 +11,19 @@ pub struct TypeHandle(pub u32);
 /// The table byte reserved for arrays a FRONT END synthesizes, which have no metadata token of
 /// their own -- a string blob, a delegate's entry list, a Python list's backing store. A handle
 /// otherwise carries a metadata type token (TypeRef `0x01` / TypeDef `0x02`) or the backend's
-/// reference-owned encoding (`0x03`), so `0x04` can never alias a real type. It stays under bit 27,
-/// where the backends' symbol flags begin.
+/// reference-owned encoding (`0x03`), so `0x04` can never alias a real type.
 pub const SYNTHETIC_ARRAY_HANDLE_TABLE: u32 = 0x04;
+
+/// The table byte reserved for a GENERIC INSTANTIATION, whose handle carries a hash of its
+/// canonical spelling rather than a metadata row.
+///
+/// An instantiation has no metadata row of its own, so like a synthesized array it takes a byte no
+/// type table occupies. It needs one of its OWN rather than sharing `0x04`: a descriptor is
+/// deduplicated BY HANDLE, so an instantiation whose spelling hash equaled a synthesized array's
+/// element kind would share one `__lamella_typedesc_*` with it -- and word 0 of an array descriptor
+/// is `MARK | rank` where word 0 of a class descriptor is a PAYLOAD SIZE, so whichever was laid
+/// first would describe the other.
+pub const INSTANTIATION_HANDLE_TABLE: u32 = 0x09;
 
 /// The reserved handle for a synthesized array whose elements are `element_kind` -- the identity a
 /// front end stamps on an [`Inst::AllocArray`](crate::Inst::AllocArray) it invents.
@@ -32,10 +42,9 @@ pub const fn synthetic_array_handle(element_kind: u32) -> TypeHandle {
     TypeHandle((SYNTHETIC_ARRAY_HANDLE_TABLE << 24) | element_kind)
 }
 
-/// How far [`array_handle`] lifts a class-identity table byte to reach the array's own: `0x01` ->
-/// `0x05`, `0x02` -> `0x06`, `0x03` -> `0x07`. Those three bytes are RESERVED for array identities
-/// and are the last the encoding has -- everything must stay under bit 27, where the backends'
-/// symbol flags begin (a handle rides the low bits of a descriptor reference word).
+/// How far [`array_handle`] lifts an element's table byte to reach the array's own: `0x01` ->
+/// `0x05`, `0x02` -> `0x06`, `0x03` -> `0x07`, and [`INSTANTIATION_HANDLE_TABLE`] `0x09` -> `0x0D`.
+/// Those four bytes are RESERVED for array identities.
 pub const ARRAY_HANDLE_TABLE_OFFSET: u32 = 0x04;
 
 /// The handle identifying the rank-1 ARRAY whose elements are `element` -- `T[]`, given `T`.
@@ -51,12 +60,14 @@ pub const ARRAY_HANDLE_TABLE_OFFSET: u32 = 0x04;
 /// same array handle from the same element identity.
 ///
 /// A handle that is ALREADY an array identity (a synthetic `0x04`) or that names no class
-/// descriptor at all (a TypeSpec -- a nested array or a generic instantiation) is its own array
-/// handle: there is no class descriptor for it to collide with.
+/// descriptor at all (a bare TypeSpec, which is what an element the reader cannot name resolves to)
+/// is its own array handle: there is no class descriptor for it to collide with.
 #[must_use]
 pub const fn array_handle(element: TypeHandle) -> TypeHandle {
     match element.0 >> 24 {
-        0x01..=0x03 => TypeHandle(element.0 + (ARRAY_HANDLE_TABLE_OFFSET << 24)),
+        0x01..=0x03 | INSTANTIATION_HANDLE_TABLE => {
+            TypeHandle(element.0 + (ARRAY_HANDLE_TABLE_OFFSET << 24))
+        }
         _ => element,
     }
 }
@@ -174,6 +185,100 @@ mod tests {
         assert!(!MirType::ObjectRef.is_tagged_value());
         assert!(!MirType::ManagedPtr.is_tagged_value());
         assert_eq!(MirType::PyValue.stack_slot_bytes(), 4);
+    }
+
+    /// WHAT BOUNDS THE HANDLE SPACE, AS A PROPERTY RATHER THAN A SENTENCE IN A DOC COMMENT.
+    ///
+    /// A handle rides the low bits of a descriptor reference word alongside five flags in bits
+    /// 31..27, and for years the rule written down here was "every table byte must stay under
+    /// `0x08`, where the flags begin".
+    #[test]
+    fn the_handle_space_is_bounded_by_the_bit_tested_flags() {
+        const EXTERN_SYMBOL_FLAG: u32 = 0x8000_0000;
+        const DESC_SYMBOL_FLAG: u32 = 0x4000_0000;
+        const STRING_SYMBOL_FLAG: u32 = 0x2000_0000;
+        const STATICS_BASE_SYMBOL_FLAG: u32 = 0x1000_0000;
+        const EH_TAG_SYMBOL_FLAG: u32 = 0x0800_0000;
+
+        let allocated = [
+            0x01,
+            0x02,
+            0x03,
+            SYNTHETIC_ARRAY_HANDLE_TABLE,
+            0x05,
+            0x06,
+            0x07,
+            INSTANTIATION_HANDLE_TABLE,
+            INSTANTIATION_HANDLE_TABLE + ARRAY_HANDLE_TABLE_OFFSET,
+            0x1B,
+        ];
+        for table in allocated {
+            let handle = (table << 24) | 0x00ff_ffff;
+            for word in [handle, DESC_SYMBOL_FLAG | handle] {
+                assert_eq!(
+                    word & EXTERN_SYMBOL_FLAG,
+                    0,
+                    "table byte {table:#04x} reaches bit 31, which is BIT TESTED as an extern call"
+                );
+                assert_eq!(
+                    word & STRING_SYMBOL_FLAG,
+                    0,
+                    "table byte {table:#04x} reaches bit 29, which is BIT TESTED as a string blob"
+                );
+                assert_ne!(
+                    word >> 24,
+                    STATICS_BASE_SYMBOL_FLAG >> 24,
+                    "table byte {table:#04x} shares its TOP BYTE with a statics base, which is the \
+                     only test that separates the two"
+                );
+                assert_ne!(
+                    word, EH_TAG_SYMBOL_FLAG,
+                    "table byte {table:#04x} can spell the EH word, matched by EXACT EQUALITY"
+                );
+            }
+        }
+
+        let mut seen = allocated;
+        seen.sort_unstable();
+        let mut deduped = seen;
+        let unique = {
+            let mut n = 0;
+            for i in 0..deduped.len() {
+                if i == 0 || deduped[i] != deduped[i - 1] {
+                    deduped[n] = deduped[i];
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert_eq!(
+            unique,
+            allocated.len(),
+            "two identity kinds were given one table byte; a descriptor is deduplicated BY HANDLE, \
+             so whichever the backend lays first decides the other's shape"
+        );
+
+        for table in [0x01u32, 0x02, 0x03, INSTANTIATION_HANDLE_TABLE] {
+            let element = TypeHandle((table << 24) | 0x0000_ffff);
+            assert_eq!(
+                array_handle(element).0 >> 24,
+                table + ARRAY_HANDLE_TABLE_OFFSET,
+                "a class identity's array lift must land on its reserved byte"
+            );
+        }
+        let synthetic = synthetic_array_handle(7);
+        assert_eq!(synthetic.0 >> 24, SYNTHETIC_ARRAY_HANDLE_TABLE);
+        assert_eq!(
+            array_handle(synthetic),
+            synthetic,
+            "an array identity is its own array handle -- there is nothing for it to collide with"
+        );
+        let type_spec = TypeHandle((0x1B << 24) | 0x0000_ffff);
+        assert_eq!(
+            array_handle(type_spec),
+            type_spec,
+            "a bare TypeSpec owns no class descriptor, so its array needs no separate identity"
+        );
     }
 
     #[test]

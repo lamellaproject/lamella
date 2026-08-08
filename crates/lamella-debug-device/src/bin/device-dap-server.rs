@@ -14,12 +14,94 @@ use lamella_usbhid::Device;
 /// build_debug's line-table offsets are image-relative (the code sits at image offset 8, after the
 /// [SP][reset] vector table, and the image flashes at address 0), so a raw PC indexes the tables
 /// directly -- no base to subtract.
-const FLASH_BASE: u32 = 0;
+/// Which probe family to open. Selected explicitly rather than by trying ids in order: on a bench
+/// with several probes attached, a server that opens whichever answers first can flash a board
+/// another lane is using.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+    CmsisDap,
+    #[cfg(feature = "st")]
+    StLink,
+}
 
-const USAGE: &str = "usage: device-dap-server <program.dll> [<Type> <Method>] [probe-serial]";
+/// Which part's flash to program, and therefore where the image lands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Nrf51,
+    #[cfg(feature = "st")]
+    Stm32F0,
+    #[cfg(feature = "st")]
+    Stm32F4,
+    #[cfg(feature = "st")]
+    Stm32F7,
+    #[cfg(feature = "st")]
+    Stm32H7,
+}
+
+impl Part {
+    /// Where this part's flash is mapped for execution -- and therefore what `DeviceBackend` must
+    /// subtract from a PC before indexing the image-relative line tables.
+    fn flash_base(self) -> u32 {
+        match self {
+            Part::Nrf51 => 0,
+            #[cfg(feature = "st")]
+            _ => 0x0800_0000,
+        }
+    }
+}
+
+const USAGE: &str = "usage: device-dap-server [--probe cmsis|stlink] [--part nrf51|f0|f4|f7|h7] \
+                     [--pid 0xNNNN] <program.dll> [<Type> <Method>] [probe-serial]";
 
 fn main() -> std::io::Result<()> {
-    let mut args = std::env::args().skip(1);
+    let mut probe = ProbeKind::CmsisDap;
+    let mut part = Part::Nrf51;
+    #[cfg(feature = "st")]
+    let mut stlink_pid = lamella_stlink::product_id::V2_1;
+    let mut positional: Vec<String> = Vec::new();
+    let mut raw = std::env::args().skip(1);
+    while let Some(arg) = raw.next() {
+        match arg.as_str() {
+            "--probe" => {
+                probe = match raw.next().as_deref() {
+                    Some("cmsis") => ProbeKind::CmsisDap,
+                    #[cfg(feature = "st")]
+                    Some("stlink") => ProbeKind::StLink,
+                    #[cfg(not(feature = "st"))]
+                    Some("stlink") => panic!("--probe stlink needs this crate built with --features st"),
+                    other => panic!("--probe takes cmsis or stlink, not {other:?}"),
+                };
+            }
+            "--part" => {
+                part = match raw.next().as_deref() {
+                    Some("nrf51") => Part::Nrf51,
+                    #[cfg(feature = "st")]
+                    Some("f0") => Part::Stm32F0,
+                    #[cfg(feature = "st")]
+                    Some("f4") => Part::Stm32F4,
+                    #[cfg(feature = "st")]
+                    Some("f7") => Part::Stm32F7,
+                    #[cfg(feature = "st")]
+                    Some("h7") => Part::Stm32H7,
+                    other => panic!("--part does not accept {other:?} in this build"),
+                };
+            }
+            "--pid" => {
+                let value = raw.next();
+                #[cfg(feature = "st")]
+                {
+                    stlink_pid = value
+                        .as_deref()
+                        .and_then(|t| u16::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or(stlink_pid);
+                }
+                #[cfg(not(feature = "st"))]
+                let _ = value;
+            }
+            _ => positional.push(arg),
+        }
+    }
+    let mut args = positional.into_iter();
     let program = args.next().expect(USAGE);
     let rest: Vec<String> = args.collect();
     let (target, serial): (Option<(String, String)>, Option<String>) = match rest.len() {
@@ -32,11 +114,38 @@ fn main() -> std::io::Result<()> {
 
     let (lines, names, image, file, entry) = source_lines(&program, target.as_ref());
 
-    let device = Device::open(0x0d28, 0x0204, serial.as_deref())
-        .expect("open the DAPLink (CMSIS-DAP) probe");
-    let mut probe = ArmDap::new(Dap::new(device));
-    flash(&mut probe, &image);
-    let backend = DeviceBackend::new(probe.into_inner(), lines, FLASH_BASE, names, file, entry);
+    match probe {
+        #[cfg(feature = "st")]
+        ProbeKind::StLink => {
+            let stlink = lamella_stlink::StLink::open(
+                stlink_pid,
+                serial.as_deref(),
+            )
+            .expect("open the ST-Link");
+            serve(stlink, part, &image, lines, names, file, entry)
+        }
+        ProbeKind::CmsisDap => {
+            let device = Device::open(0x0d28, 0x0204, serial.as_deref())
+                .expect("open the DAPLink (CMSIS-DAP) probe");
+            serve(ArmDap::new(Dap::new(device)), part, &image, lines, names, file, entry)
+        }
+    }
+}
+
+/// Flashes the image, then serves DAP over stdio against the freshly flashed program.
+///
+/// Generic over the probe, so an ST-Link and a CMSIS-DAP probe run the identical code path.
+fn serve<A: TargetAccess + 'static>(
+    mut probe: A,
+    part: Part,
+    image: &[u8],
+    lines: Vec<(u32, u32)>,
+    names: Vec<(u32, String)>,
+    file: String,
+    entry: String,
+) -> std::io::Result<()> {
+    flash(&mut probe, part, image);
+    let backend = DeviceBackend::new(probe, lines, part.flash_base(), names, file, entry);
 
     let mut debugger = lamella_dap::Debugger::with_backend(Box::new(backend));
     lamella_dap::serve_polled(
@@ -46,8 +155,12 @@ fn main() -> std::io::Result<()> {
     )
 }
 
-/// Flashes a raw image to nRF51 flash at address 0 and resets the target to run it.
-fn flash<A: TargetAccess>(target: &mut A, image: &[u8]) {
+/// Flashes a raw image to the selected part and resets the target to run it.
+///
+/// Every algorithm reached here is a blanket impl over [`TargetAccess`], so this is genuinely one
+/// function over two probe families and five parts -- the seam doing its job rather than a
+/// coincidence. Only the erase geometry and the base address are per-part.
+fn flash<A: TargetAccess>(target: &mut A, part: Part, image: &[u8]) {
     let words: Vec<u32> = image
         .chunks(4)
         .map(|c| {
@@ -60,11 +173,54 @@ fn flash<A: TargetAccess>(target: &mut A, image: &[u8]) {
     target.read_idcode().expect("read IDCODE");
     target.init_mem().expect("init MEM-AP");
     target.halt().expect("halt");
-    let pages = (words.len() * 4).div_ceil(0x400);
-    for page in 0..pages as u32 {
-        target.erase_flash_page(page * 0x400).expect("erase page");
+    let base = part.flash_base();
+
+    match part {
+        Part::Nrf51 => {
+            let pages = (words.len() * 4).div_ceil(0x400);
+            for page in 0..pages as u32 {
+                target.erase_flash_page(page * 0x400).expect("erase page");
+            }
+            target.write_flash(base, &words).expect("write flash");
+        }
+        #[cfg(feature = "st")]
+        Part::Stm32F0 => {
+            use lamella_cmsis_dap_stm32::{STM32F0_PAGE, Stm32F0Flash};
+            target.f0_unlock_flash().expect("unlock flash");
+            for page in 0..(image.len() as u32).div_ceil(STM32F0_PAGE) {
+                target.f0_erase_page(base + page * STM32F0_PAGE).expect("erase page");
+            }
+            target.f0_program(base, image).expect("program");
+            target.f0_lock_flash().expect("lock flash");
+        }
+        #[cfg(feature = "st")]
+        Part::Stm32F4 | Part::Stm32F7 => {
+            use lamella_cmsis_dap_stm32::{
+                STM32F4_SECTOR_SIZES, STM32F7_SECTOR_SIZES, Stm32F4Flash, sectors_covering,
+            };
+            let sizes: &[usize] = if part == Part::Stm32F7 {
+                &STM32F7_SECTOR_SIZES
+            } else {
+                &STM32F4_SECTOR_SIZES
+            };
+            target.unlock_flash().expect("unlock flash");
+            for sector in 0..sectors_covering(image.len(), sizes) {
+                target.erase_sector(sector).expect("erase sector");
+            }
+            target.program_words(base, &words).expect("program");
+            target.lock_flash().expect("lock flash");
+        }
+        #[cfg(feature = "st")]
+        Part::Stm32H7 => {
+            use lamella_cmsis_dap_stm32::{STM32H7_SECTOR, Stm32H7Flash};
+            target.h7_unlock_flash(base).expect("unlock flash");
+            for sector in 0..(image.len() as u32).div_ceil(STM32H7_SECTOR) {
+                target.h7_erase_sector(base + sector * STM32H7_SECTOR).expect("erase sector");
+            }
+            target.h7_program(base, image).expect("program");
+            target.h7_lock_flash(base).expect("lock flash");
+        }
     }
-    target.write_flash(0x0, &words).expect("write flash");
     target.reset_and_run().expect("reset and run");
 }
 

@@ -1,0 +1,16 @@
+[package]
+name = "lamella-wtf8"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The shared code-point byte codec: one definition of the UTF-8/WTF-8 bytes every language runtime stores."
+
+# A leaf, on the `lamella-gc` / `lamella-reactor` pattern: the BYTE form both language runtimes
+# write, depending on nothing so either can depend on it. What differs between them is how code
+# points are grouped into their own notion of a character, and that stays in each caller.
+[dependencies]
+
+[lints]
+workspace = true

@@ -15,6 +15,82 @@ pub mod cmd {
     pub const SWJ_CLOCK: u8 = 0x11;
     pub const SWJ_SEQUENCE: u8 = 0x12;
     pub const SWD_CONFIGURE: u8 = 0x13;
+    pub const SWD_SEQUENCE: u8 = 0x1D;
+}
+
+/// The reply's first byte when the probe does NOT implement the command it was sent: "commands
+/// that are not implemented reply with `0xFF` instead of repeating the command byte".
+///
+/// It is the only refusal a probe can express before it has looked at the arguments, and it is
+/// why [`has_status_byte`] is not the whole story -- an unimplemented command never gets as far
+/// as producing a status.
+pub const INVALID_COMMAND: u8 = 0xFF;
+
+/// A [`has_status_byte`] command succeeded.
+pub const DAP_OK: u8 = 0x00;
+
+/// A [`has_status_byte`] command failed.
+pub const DAP_ERROR: u8 = 0xFF;
+
+/// The `DAP_Connect` reply's port field when the probe could not initialize the mode asked for:
+/// "0 = initialization failed; no mode pre-configured". `DAP_Connect` answers with the port it
+/// actually selected rather than a status, so this value is its failure report.
+pub const CONNECT_FAILED: u8 = 0x00;
+
+/// Whether the byte AFTER the echoed command id is a status byte ([`DAP_OK`] / [`DAP_ERROR`]).
+pub fn has_status_byte(command: u8) -> bool {
+    matches!(
+        command,
+        cmd::DISCONNECT
+            | cmd::TRANSFER_CONFIGURE
+            | cmd::RESET_TARGET
+            | cmd::SWJ_CLOCK
+            | cmd::SWJ_SEQUENCE
+            | cmd::SWD_CONFIGURE
+            | cmd::SWD_SEQUENCE
+    )
+}
+
+/// One phase of a [`swd_sequence`]: a run of SWCLK cycles during which the host either DRIVES
+/// SWDIO or RELEASES it.
+///
+/// The distinction is the whole reason this command exists next to `DAP_SWJ_Sequence`, which can
+/// only ever drive. A SWD transaction hands the line over to the target for the turnaround and
+/// acknowledge cycles, and a host that keeps driving through them is contending with the target --
+/// or, where the target drives nothing (the multi-drop `TARGETSEL` write), is still leaving the
+/// DP's state machine to sample a line the protocol says should be released.
+pub enum SwdPhase<'a> {
+    /// Host drives `cycles` bits from `data`, least-significant bit first.
+    Out {
+        /// How many SWCLK cycles to drive: 1-64, encoded as 6 bits where 0 means 64.
+        cycles: u8,
+        /// The bits to shift out, least-significant bit of the first byte first.
+        data: &'a [u8],
+    },
+    /// Host releases SWDIO for `cycles` clocks; the probe captures and returns what it saw.
+    In {
+        /// How many SWCLK cycles to release for: 1-64, encoded as 6 bits where 0 means 64.
+        cycles: u8,
+    },
+}
+
+/// Encodes `DAP_SWD_Sequence`: a list of drive/release phases clocked back to back.
+///
+/// `cycles` is 1-64 per phase, encoded as 6 bits where 0 means 64. Bit 7 of the info byte marks a
+/// release (input) phase.
+pub fn swd_sequence(phases: &[SwdPhase]) -> Vec<u8> {
+    let mut out = vec![cmd::SWD_SEQUENCE, phases.len() as u8];
+    for phase in phases {
+        match phase {
+            SwdPhase::Out { cycles, data } => {
+                out.push(cycles & 0x3f);
+                let bytes = (usize::from(if *cycles == 0 { 64 } else { *cycles }) + 7) / 8;
+                out.extend_from_slice(&data[..bytes.min(data.len())]);
+            }
+            SwdPhase::In { cycles } => out.push(0x80 | (cycles & 0x3f)),
+        }
+    }
+    out
 }
 
 /// The wire protocol selected by `DAP_Connect`.
@@ -178,16 +254,21 @@ pub fn transfer_block_read(request: u8, count: u16) -> [u8; 5] {
     [cmd::TRANSFER_BLOCK, 0x00, c[0], c[1], request]
 }
 
-/// Parses the reply to a read `DAP_TransferBlock` into `out`, returning the completed count and
-/// the last acknowledge; values are appended for however many transfers completed.
-pub fn parse_block_read(reply: &[u8], out: &mut Vec<u32>) -> Result<(u16, Ack), ProtoError> {
+/// Parses the reply to a read `DAP_TransferBlock` into the caller's `out`, returning the completed
+/// count and the last acknowledge; the first `count` slots are filled.
+///
+/// A reply carrying more words than `out` holds is [`ProtoError::Truncated`] rather than a partial
+/// fill: the caller sized the buffer from the count it asked for, so a longer reply means the probe
+/// and the caller disagree about the transfer, and silently keeping the prefix would hand back a
+/// buffer that looks complete.
+pub fn parse_block_read(reply: &[u8], out: &mut [u32]) -> Result<(u16, Ack), ProtoError> {
     let (count, ack) = parse_block_write(reply)?;
     let expected = 4 + count as usize * 4;
-    if reply.len() < expected {
+    if reply.len() < expected || out.len() < count as usize {
         return Err(ProtoError::Truncated);
     }
-    for word in reply[4..expected].chunks_exact(4) {
-        out.push(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+    for (slot, word) in out.iter_mut().zip(reply[4..expected].chunks_exact(4)) {
+        *slot = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
     }
     Ok((count, ack))
 }

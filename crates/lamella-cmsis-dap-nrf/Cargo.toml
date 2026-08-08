@@ -16,14 +16,23 @@ workspace = true
 lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 lamella-usbhid = { path = "../lamella-usbhid", optional = true }
+# Probe SELECTION, which is a policy rather than a transport: every micro:bit is `0d28:0204`, so
+# choosing one is the ladder `lamella-probe` already owns (explicit serial > LAMELLA_PROBE_SERIAL >
+# the sole attached probe > refuse). Re-deriving it here would be a second copy of a rule whose
+# whole value is being the only one.
+lamella-probe = { path = "../lamella-probe", optional = true }
 
 [features]
 # `microbit` adds the one-call flash_microbit() helper, opening the micro:bit's on-board HID probe.
-microbit = ["dep:lamella-usbhid"]
+# It pulls `lamella-probe` because that helper WRITES FLASH and must therefore resolve which board
+# it means rather than take the first `0d28:0204` the OS offers.
+microbit = ["dep:lamella-usbhid", "dep:lamella-probe"]
 
 [dev-dependencies]
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
 lamella-usbhid = { path = "../lamella-usbhid" }
+# Probe SELECTION for the examples: they all reach a `0d28:0204` and must say WHICH one.
+lamella-probe = { path = "../lamella-probe" }
 lamella-aot = { path = "../lamella-aot", features = ["arm32"] }
 lamella-py-frontend = { path = "../lamella-py-frontend" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32" }

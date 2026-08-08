@@ -183,7 +183,10 @@ fn is_reference_type(model: &Model, ty: &TypeSymbol) -> bool {
                 TypeKind::Class | TypeKind::Interface | TypeKind::Delegate
             )
         }),
-        TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => false,
+        TypeSymbol::Instantiation { .. }
+        | TypeSymbol::Pointer(_)
+        | TypeSymbol::ByRef(_)
+        | TypeSymbol::Error => false,
     }
 }
 

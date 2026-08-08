@@ -208,6 +208,15 @@ impl TypeResolver for PtrResolver {
             f(unsafe { DeviceTypeDesc::ref_offset(desc, i) });
         }
     }
+
+    /// NONE, and stated rather than defaulted (see [`TypeResolver::for_each_weak_offset`]).
+    ///
+    /// [`DeviceTypeDesc`] IS the backend's emitted bytes, and its layout --
+    /// `[payload_size][nrefs][type_tag][base_ptr][ref_offsets...]` -- has no field naming a weak
+    /// slot, so there is nothing here to answer with. That is a true answer today rather than a
+    /// placeholder: no emitted type declares one, because the only weak reference the C# tier has
+    /// is the interpreter heap's `Object::Weak`, which is a different heap.
+    fn for_each_weak_offset(&self, _header_word: u32, _f: &mut dyn FnMut(u32)) {}
 }
 
 /// A garbage-collected heap over a fixed raw memory region, with the on-device object and
@@ -321,7 +330,14 @@ impl DeviceHeap {
         R: FnMut(&mut dyn FnMut(&mut Ref)),
     {
         let top = self.top;
-        self.top = mark_compact(self.region, top, &PtrResolver, enumerate_roots, pinned);
+        self.top = mark_compact(
+            self.region,
+            top,
+            &PtrResolver,
+            enumerate_roots,
+            &mut crate::heap::no_interior_refs,
+            pinned,
+        );
     }
 
     /// Collects using the live AOT call stack, for the safepoint-collect path: walks the

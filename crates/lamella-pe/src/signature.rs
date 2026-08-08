@@ -76,6 +76,22 @@ pub enum TypeSig {
         /// The number of dimensions (>= 2 for a rectangular array).
         rank: u32,
     },
+    /// A generic parameter of the enclosing TYPE, by its zero-based number: `!0` is the `T` of
+    /// `Box<T>` (ECMA-335 4th ed, II.23.1.16 `ELEMENT_TYPE_VAR`).
+    Var(u32),
+    /// A generic parameter of the METHOD itself, by its zero-based number: `!!0` is the `T` of
+    /// `T Identity<T>(T)` (`ELEMENT_TYPE_MVAR`).
+    MVar(u32),
+    /// An instantiation of a generic type: `Box<int>`, or `Box<!0>` inside another generic
+    /// (`ELEMENT_TYPE_GENERICINST`).
+    GenericInst {
+        /// The generic type definition being instantiated -- a [`TypeSig::Class`] or
+        /// [`TypeSig::ValueType`] naming the `C\`n` TypeDef/TypeRef.
+        definition: Box<TypeSig>,
+        /// The type arguments, in order. Its length must equal the definition's arity: the count is
+        /// written into the blob, and a consumer reads that many types back.
+        arguments: Vec<TypeSig>,
+    },
 }
 
 fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
@@ -129,6 +145,25 @@ fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
             compress_u32(0, out);
             compress_u32(0, out);
         }
+        TypeSig::Var(number) => {
+            out.push(element::VAR);
+            compress_u32(*number, out);
+        }
+        TypeSig::MVar(number) => {
+            out.push(element::MVAR);
+            compress_u32(*number, out);
+        }
+        TypeSig::GenericInst {
+            definition,
+            arguments,
+        } => {
+            out.push(element::GENERICINST);
+            encode_type(definition, out);
+            compress_u32(arguments.len() as u32, out);
+            for argument in arguments {
+                encode_type(argument, out);
+            }
+        }
     }
 }
 
@@ -153,6 +188,44 @@ pub fn method_signature(has_this: bool, parameters: &[TypeSig], return_type: &Ty
     encode_type(return_type, &mut out);
     for parameter in parameters {
         encode_type(parameter, &mut out);
+    }
+    out
+}
+
+/// Encodes a GENERIC method DEF signature (II.23.2.1): the `GENERIC` convention bit, then
+/// `GenParamCount` BEFORE `ParamCount`, then the return and parameter types.
+///
+/// `generic_parameters` is how many type parameters the METHOD declares -- the `1` of
+/// `T Identity<T>(T)`. Its types are referred to as [`TypeSig::MVar`], numbered from zero.
+#[must_use]
+pub fn generic_method_signature(
+    has_this: bool,
+    generic_parameters: u32,
+    parameters: &[TypeSig],
+    return_type: &TypeSig,
+) -> Vec<u8> {
+    let mut out = vec![if has_this {
+        DEFAULT | calling::GENERIC | calling::HAS_THIS
+    } else {
+        DEFAULT | calling::GENERIC
+    }];
+    compress_u32(generic_parameters, &mut out);
+    compress_u32(parameters.len() as u32, &mut out);
+    encode_type(return_type, &mut out);
+    for parameter in parameters {
+        encode_type(parameter, &mut out);
+    }
+    out
+}
+
+/// Encodes a `MethodSpec` instantiation blob (II.23.2.15): the generic ARGUMENTS at one call site
+/// to a generic method, as `GENERICINST GenArgCount Type*`.
+#[must_use]
+pub fn method_spec_signature(arguments: &[TypeSig]) -> Vec<u8> {
+    let mut out = vec![calling::GENERICINST];
+    compress_u32(arguments.len() as u32, &mut out);
+    for argument in arguments {
+        encode_type(argument, &mut out);
     }
     out
 }

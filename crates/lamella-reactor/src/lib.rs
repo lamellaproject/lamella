@@ -1,25 +1,29 @@
-//! The scheduler's reactor: the single OS-thread block point, extracted Session-free so the
-//! interpreter's green-thread scheduler and the AOT native scheduler drive ONE implementation.
-//! A parked thread waits on a timer deadline or a
-//! socket; when nothing is runnable, [`block_point`] performs the ONE blocking wait -- a net poll
-//! that honors the nearest timer, or a tickless sleep -- and returns the threads to wake.
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
+
+//! The scheduler's reactor: the single OS-thread block point, as a leaf crate every runtime can
+//! depend on. A parked thread waits on a timer deadline or a socket; when nothing is runnable,
+//! [`block_point`] performs the ONE blocking wait -- a net poll that honors the nearest timer, or a
+//! tickless sleep -- and returns the threads to wake.
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 
 /// Why a thread is parked. The reactor acts on `Sleep`/`Io` (timer + socket waits); a `Join` or
-/// `Monitor`-lock park is woken by thread-completion / lock-handoff, NOT here -- such a thread is
+/// lock park is woken by thread-completion / lock-handoff, NOT here -- such a thread is
 /// simply absent from the park set the reactor sees. Its presence WITHOUT any `Sleep`/`Io` park is
 /// the deadlock [`block_point`] reports by returning `None`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WaitReason {
-    /// Sleeping until this monotonic-millisecond deadline (`Thread.Sleep`, or a `Monitor.Wait` timeout).
+    /// Sleeping until this monotonic-millisecond deadline (a thread sleep, or a timed lock wait).
     Sleep(u64),
     /// Parked until this socket handle is ready (a socket op returned WouldBlock).
     Io(u32),
 }
 
-/// The clock + network seam the reactor blocks on. The interpreter's `Vm` implements it; the AOT
-/// runtime-support provides the same over its C-ABI net backend, so both schedulers share the
+/// The clock + network seam the reactor blocks on. A runtime's VM implements it; the AOT
+/// runtime-support provides the same over its C-ABI net backend, so every scheduler shares the
 /// block-point algorithm below.
 pub trait ReactorEnv {
     /// The monotonic millisecond clock, or `None` if none is installed (a timer is then treated as
@@ -33,7 +37,7 @@ pub trait ReactorEnv {
     fn net_poll(&mut self, timeout_ms: Option<u64>) -> Vec<u32>;
     /// The allocation-free form of [`net_poll`](ReactorEnv::net_poll): the ready handles are written
     /// into `ready` (up to its length) and the count returned. The default delegates to `net_poll`
-    /// and copies -- correct for an alloc-capable env (the interpreter). A `no_std`/no-alloc env (the
+    /// and copies -- correct for an alloc-capable env (an interpreter). A `no_std`/no-alloc env (the
     /// AOT staticlib scheduler) OVERRIDES this to poll straight into the caller buffer, and can then
     /// leave `net_poll` a `Vec::new()` stub, since [`block_point_into`] only ever calls this form.
     fn net_poll_into(&mut self, timeout_ms: Option<u64>, ready: &mut [u32]) -> usize {
@@ -55,11 +59,11 @@ pub trait ReactorEnv {
 /// `parks` is the parked threads as `(thread_id, reason)`; a thread parked on a lock/join is simply
 /// not included. The returned ids are a subset of `parks`' ids.
 ///
-/// A thread may appear TWICE in `parks` -- an `Io` park bounded by a `Sleep` deadline (the
-/// interpreter's timed receive, `Socket.ReceiveTimeout`): the deadline then shapes the poll
-/// timeout, the thread wakes when EITHER entry fires, and it may appear in the woken ids once per
-/// fired entry -- callers treat the woken ids as a SET. On a deadline (non-ready) wake the socket
-/// stays registered; the CALLER deregisters it when it applies the wake.
+/// A thread may appear TWICE in `parks` -- an `Io` park bounded by a `Sleep` deadline (a socket
+/// receive timeout): the deadline then shapes the poll timeout, the thread wakes when EITHER entry
+/// fires, and it may appear in the woken ids once per fired entry -- callers treat the woken ids as
+/// a SET. On a deadline (non-ready) wake the socket stays registered; the CALLER deregisters it when
+/// it applies the wake.
 #[must_use]
 pub fn block_point(parks: &[(u32, WaitReason)], env: &mut dyn ReactorEnv) -> Option<Vec<u32>> {
     let mut woken = alloc::vec![0u32; parks.len()];
@@ -73,10 +77,12 @@ pub fn block_point(parks: &[(u32, WaitReason)], env: &mut dyn ReactorEnv) -> Opt
 /// staticlib scheduler, whose `no_std`/no-alloc target has no allocator for a return `Vec` -- the
 /// caller passes a fixed stack buffer (sized to its thread count) and this touches no heap.
 ///
-/// This is the CANONICAL reference for the algorithm. The AOT native scheduler keeps a byte-faithful
-/// no-alloc twin (`sched_block_point`) rather than depend on this crate (its device image must not
-/// pull the interpreter crate in); a change here must be mirrored there, and the two agree by the
-/// shared protocol plus this module's unit tests and the AOT scheduler's on-target e2e.
+/// This is the CANONICAL reference for the algorithm. The AOT native scheduler keeps a
+/// byte-faithful no-alloc twin (`sched_block_point`); a change here must be mirrored there, and the
+/// two agree by the shared protocol plus this crate's unit tests and the AOT scheduler's on-target
+/// e2e. That twin predates this crate, when the algorithm lived inside the C# interpreter and a
+/// device image could not pull an interpreter in to reach it -- a leaf crate removes that reason,
+/// so the mirror is now a duplication to retire rather than one to maintain.
 ///
 /// A block point drains at most [`READY_BATCH`] ready sockets per call; any beyond it stay
 /// registered and re-ready on the next block point, so no wake is lost -- the loop makes progress.
@@ -140,8 +146,8 @@ pub fn block_point_into(
 pub const READY_BATCH: usize = 64;
 
 /// A stateful park store over [`block_point`], for a scheduler (e.g. the AOT native scheduler) that
-/// would rather `park`/`unpark` than rebuild the park slice each idle. The interpreter derives its
-/// slice from its own thread table and calls [`block_point`] directly, so it does not use this.
+/// would rather `park`/`unpark` than rebuild the park slice each idle. The C# interpreter derives
+/// its slice from its own thread table and calls [`block_point`] directly, so it does not use this.
 #[derive(Default)]
 pub struct Reactor {
     parks: Vec<(u32, WaitReason)>,
@@ -277,6 +283,52 @@ mod tests {
 
         let mut dead = NoAllocEnv { now: Some(0), ready: vec![], deregistered: vec![] };
         assert_eq!(block_point_into(&[], &mut dead, &mut woken), None);
+    }
+
+    /// A runtime with NO SOCKETS AT ALL -- a language runtime whose async surface is timers and its
+    /// own queues. Both network methods PANIC, so what would otherwise be a claim in a comment is
+    /// enforced: if the block point ever reaches them, this test dies rather than passing quietly.
+    struct TimerOnlyEnv {
+        now: u64,
+        slept: u64,
+    }
+    impl ReactorEnv for TimerOnlyEnv {
+        fn now_millis(&self) -> Option<u64> {
+            Some(self.now)
+        }
+        fn sleep_millis(&mut self, millis: u64) {
+            self.slept += millis;
+            self.now += millis;
+        }
+        fn net_poll(&mut self, _timeout_ms: Option<u64>) -> Vec<u32> {
+            panic!("a timer-only runtime must never be asked to poll a socket")
+        }
+        fn net_deregister(&mut self, _socket: u32) {
+            panic!("a timer-only runtime must never be asked to deregister a socket")
+        }
+    }
+
+    /// A runtime with no network can drive the reactor, implementing only the CLOCK half for real.
+    ///
+    /// This is the edge a second language runtime binds to: it depends on this leaf crate, supplies
+    /// `now_millis`/`sleep_millis`, parks its own waiters by OPAQUE ID, and gets back the ids to
+    /// resume. The two network methods still have to be spelled -- the trait is one seam, not two --
+    /// but they are never CALLED without an `Io` park, and stubbing them cannot go wrong silently
+    /// because nothing consults them.
+    #[test]
+    fn a_runtime_with_no_sockets_can_drive_the_block_point() {
+        let mut env = TimerOnlyEnv { now: 0, slept: 0 };
+        let mut reactor = Reactor::new();
+        reactor.park(10, WaitReason::Sleep(50));
+        reactor.park(20, WaitReason::Sleep(500));
+
+        assert_eq!(reactor.block_point(&mut env), Some(vec![10]));
+        assert_eq!(env.slept, 50, "the block point must sleep to the NEAREST deadline, not past it");
+
+        assert_eq!(reactor.block_point(&mut env), Some(vec![20]));
+        assert_eq!(env.slept, 500);
+
+        assert_eq!(reactor.block_point(&mut env), None);
     }
 
     #[test]

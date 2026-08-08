@@ -237,8 +237,8 @@ struct Scheduler {
     runnable: u32,
     /// The managed-frame ANCHOR the GC stack walk starts from (design sec 2.3 refinement 1; the
     /// ARM crate documents the full contract): SP at the thread's last managed->runtime seam call,
-    /// written by the seam entry shims below. RISC-V records/walker land as the follow-on; the
-    /// anchors are written NOW so the Scheduler stays the ARM struct's twin.
+    /// written by the seam entry shims below. RISC-V records and its walker are not built here yet;
+    /// the anchors are written regardless, so the Scheduler stays the ARM struct's twin.
     anchor_sp: [u32; MAX_THREADS],
     /// The anchor's PC twin (the seam call's `ra`); 0 = never crossed a seam.
     anchor_pc: [u32; MAX_THREADS],

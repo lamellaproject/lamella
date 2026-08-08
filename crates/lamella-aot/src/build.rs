@@ -71,20 +71,218 @@ pub enum BuildError {
         /// How many such edges the build found; the named pair is the first.
         total: usize,
     },
+    /// TWO BODIES WERE WRITTEN FOR ONE MethodDef ROW. A program is a `Vec<Function>` indexed by rid
+    /// and every emitted symbol is `f<rid>`, so a second body does not collide -- it REPLACES the
+    /// first, and the image is built around whichever won with no diagnostic anywhere. Refused
+    /// rather than shipped, for the same reason [`Self::SilentSeamCallEdge`] is: the failure mode is
+    /// a confident wrong answer, not a crash.
+    DuplicateMethodBody {
+        /// The MethodDef row a second body was written to; the first is the one that was lost.
+        rid: u32,
+        /// How many rows this build found; `rid` is the first.
+        total: usize,
+    },
+    /// A MONOMORPHIZED BODY the plan named could not be produced: its definition method, its
+    /// `TypeSpec`'s arguments, or one of its substituted slot types did not resolve.
+    ///
+    /// It is an error rather than a skipped body for the reason the whole emission path is shaped
+    /// around: a planned index whose slot is never written stays a `stub()` on the RISC-V object
+    /// path, and a stub RETURNS. A call to it would answer zero and keep going, which is the silent
+    /// wrong answer this tier refuses to ship. A build that cannot emit a body it promised must
+    /// stop.
+    MonomorphizedBody {
+        /// The function index the plan assigned the body.
+        index: u32,
+        /// The instantiation's canonical spelling.
+        instantiation: alloc::string::String,
+        /// The method's name.
+        method: alloc::string::String,
+        /// What could not be resolved.
+        reason: MonoGap,
+    },
+    /// THE INSTANTIATION SET COULD NOT BE PLANNED: a method signature did not decode, so a body
+    /// could not be keyed for its call sites.
+    ///
+    /// Refused rather than planned partially. A missing body is not an absent feature -- the call
+    /// to it lands on a `stub()` that returns, which is a wrong answer the program cannot see. The
+    /// collector's own refusals (growth on a cycle, a handle collision) arrive here too.
+    Instantiations(crate::generics::Refusal),
+}
+
+/// Which part of a monomorphized body did not resolve, for a [`BuildError::MonomorphizedBody`] that
+/// names a defect rather than reporting a count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonoGap {
+    /// The plan's `MethodDef` rid names no method, or one with no CIL body.
+    NoDefinitionBody,
+    /// The plan's `TypeSpec` did not decode to a generic instantiation, so there are no arguments
+    /// to substitute.
+    NoArguments,
+    /// A parameter, local or return type still mentioned a type parameter after substitution, or
+    /// did not resolve to a MIR type.
+    UnsubstitutedSlot,
+    /// The definition's CIL did not lower under this instantiation.
+    LowerCil(cil::CilError),
 }
 
 /// Compiles a CIL assembly to native bytes for `target`. `target = "wasm"` emits a WebAssembly module
 /// with the embedding ABI (per-method exports + `alloc`/`dealloc` + memory) -- the C# -> `.wasm`
-/// widget. A chip `target` ("microbit" for the nRF51 Cortex-M0, "rp2350" for the Pico 2 / Pico 2 W
-/// Cortex-M33) emits a flashable bare-metal image -- the flat, linker-free fast path.
+/// widget. A chip `target` ("microbit" for the nRF51 Cortex-M0, "rp2040" for the Pico / Pico H
+/// Cortex-M0+, "rp2350" for the Pico 2 / Pico 2 W Cortex-M33) emits a flashable bare-metal image --
+/// the flat, linker-free fast path. `"qemu-riscv32"` emits the RV32IM twin of that image for QEMU's
+/// `virt` machine, and `"ch32v003"` the RV32EC twin for the CH32V003's 16 KB flash at `0x0000_0000`.
 pub fn build(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     match target {
         #[cfg(feature = "wasm")]
         "wasm" => build_wasm(cil),
         #[cfg(feature = "arm32")]
-        "microbit" | "rp2350" => build_cortex_m(cil, target),
+        t if CORTEX_M_TARGETS.contains(&t) => build_cortex_m(cil, t),
+        #[cfg(feature = "riscv32")]
+        "qemu-riscv32" => build_riscv32(cil, target),
+        #[cfg(feature = "riscv32")]
+        "ch32v003" => build_ch32v003(cil),
         _ => Err(BuildError::UnsupportedTarget),
     }
+}
+
+/// QEMU `virt` RAM base. `-bios`/`-kernel` loads the image here and the hart begins at the FIRST
+/// INSTRUCTION -- there is no vector table to place, which is why this image has no [SP][reset]
+/// prologue like the Cortex-M ones. RISC-V has no hardware SP init either, so the stub sets `sp`
+/// before it calls anything that opens a frame.
+#[cfg(feature = "riscv32")]
+pub const RISCV_VIRT_LOAD_ADDR: u32 = 0x8000_0000;
+/// The stack descends from 2 MiB into RAM -- clear of the image at the base of RAM. The same value
+/// the `qemu-riscv` harness has used since the backend's first RISC-V program.
+#[cfg(feature = "riscv32")]
+const RISCV_VIRT_SP_TOP: u32 = 0x8020_0000;
+/// The `virt` board's SiFive test finisher: a word written here terminates QEMU. `0x5555` exits 0;
+/// `(code << 16) | 0x3333` exits with `code`. This is how the image reports the entry's result --
+/// the RISC-V analogue of the RP2350 mailbox, and cheaper, because the machine can simply exit.
+#[cfg(feature = "riscv32")]
+const RISCV_VIRT_FINISHER: u32 = 0x0010_0000;
+
+/// Compiles a CIL assembly to a runnable bare-metal RV32IM image for QEMU's `virt` machine: the same
+/// front end the Cortex-M path uses, laid out by [`riscv32::lower_module`], behind a boot stub that
+/// sets `sp`, calls the entry, and EXITS QEMU WITH THE ENTRY'S RETURN VALUE through the SiFive test
+/// finisher. So `qemu-system-riscv32 -machine virt -bios <out.bin> -nographic` exits 42 for a `Main`
+/// returning 42, with no probe, mailbox read or semihosting.
+///
+/// This is the flat, linker-free fast path, exactly as [`build_cortex_m`] is: no external calls, so
+/// no soft-float helpers, no GC seam, no P/Invoke. The linked object pipeline for this backend is
+/// [`riscv32::lower_object`] plus `lamella-link`, which is what the differential harness drives.
+///
+/// **It is QEMU, not silicon.** The RV32IM code it emits is the same code the 519-row differential
+/// runs, but a real RISC-V part boots its own way (an ESP32-C6 wants an ESP image header and its
+/// bootloader; a CH32V003 wants the RV32EC profile and flash at 0). Wiring those is a per-part boot
+/// image beside this one, not a change to the lowering.
+#[cfg(feature = "riscv32")]
+pub fn build_riscv32(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
+    if target != "qemu-riscv32" {
+        return Err(BuildError::UnsupportedTarget);
+    }
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let entry = find_main(&assembly);
+    let funcs = lower_assembly(&assembly, entry, &[])?;
+    let code = riscv32::lower_module(&funcs).map_err(BuildError::LowerRiscv)?;
+    Ok(riscv_virt_boot_image(&code))
+}
+
+/// Wraps RV32IM code whose function 0 is the entry in a QEMU `virt` boot image. Single-sourced here
+/// so [`build_riscv32`] and any harness that wants the same shape agree by construction, the way
+/// [`rp2350_boot_image`] serves both the browser export and the object-path flasher.
+#[cfg(feature = "riscv32")]
+pub fn riscv_virt_boot_image(code: &[u8]) -> Vec<u8> {
+    use lamella_asm_riscv32::{BranchCond, Encoder, Reg};
+    let mut enc = Encoder::new();
+    let entry = enc.new_label();
+    let pass = enc.new_label();
+    let write = enc.new_label();
+    let halt = enc.new_label();
+    enc.li(Reg::SP, RISCV_VIRT_SP_TOP as i32);
+    enc.jal(Reg::RA, entry);
+    enc.branch(BranchCond::Eq, Reg::A0, Reg::ZERO, pass);
+    enc.slli(Reg::T2, Reg::A0, 16);
+    enc.li(Reg::T0, 0x3333);
+    enc.or(Reg::T2, Reg::T2, Reg::T0);
+    enc.j(write);
+    enc.bind_label(pass);
+    enc.li(Reg::T2, 0x5555);
+    enc.bind_label(write);
+    enc.lui(Reg::T1, RISCV_VIRT_FINISHER >> 12);
+    enc.sw(Reg::T2, Reg::T1, 0);
+    enc.bind_label(halt);
+    enc.j(halt);
+    enc.bind_label(entry);
+    let stub = enc.finish().expect("the riscv virt boot stub assembles").bytes;
+    let mut image = Vec::with_capacity(stub.len() + code.len());
+    image.extend_from_slice(&stub);
+    image.extend_from_slice(code);
+    image
+}
+
+/// CH32V003 reset vector. The 16 KB flash executes from `0x0000_0000` on reset -- the boot alias of
+/// the `0x0800_0000`-native flash (CH32V003RM) -- so the image is linked to run from zero and the
+/// reset stub must lay out first.
+#[cfg(feature = "riscv32")]
+pub const CH32V003_FLASH_BASE: u32 = 0x0000_0000;
+/// Top of the CH32V003's 2 KB SRAM at `0x2000_0000`; the stack grows down from it. RISC-V has no
+/// hardware SP init, so the boot stub sets `sp` before it calls anything that opens a frame.
+///
+/// Public alongside [`CH32V003_FLASH_BASE`] so the LINKED pipeline (`examples/ch32v003-blink`) and
+/// this flat one cannot disagree about the part's memory map. The two emit different images by
+/// design; the chip they describe is the same one, and it should be written down once.
+#[cfg(feature = "riscv32")]
+pub const CH32V003_SRAM_TOP: u32 = 0x2000_0800;
+
+/// Compiles a CIL assembly to a flashable bare-metal image for the CH32V003 (QingKe RV32EC): the
+/// same front end every other target uses, laid out by [`riscv32::lower_module_profile`] under
+/// [`riscv32::RiscvProfile::Rv32ec`] (x0-x15 only, no M-extension), behind a reset stub that sets
+/// `sp` and calls the entry. Flash the result to `0x0000_0000` with a WCH-LinkE and reset.
+///
+/// **This is the flat, linker-free fast path**, exactly as [`build_riscv32`] and [`build_cortex_m`]
+/// are: a whole program with no external calls. On RV32EC that bound is TIGHTER than on the other
+/// targets, and it is worth stating rather than discovering: the profile lowers scalar `mul`/`div`/
+/// `rem` to `__mulsi3`/`__divsi3`-style soft-routine CALLS, and a flat image has nothing to resolve
+/// them against, so a program that multiplies or divides is REFUSED with
+/// [`riscv32::LowerError::ControlFlowUnsupported`] rather than mislinked. Array access is
+/// unaffected, by two different mechanisms: a single-dimension index scales by a power-of-two
+/// element size, which is a shift, and the multi-dimensional index/alloc arithmetic goes through an
+/// INLINE shift-and-add multiply instead of the routine. The linked pipeline that DOES resolve those
+/// routines is [`build_object_riscv_profile`] plus `lamella-link`, which is the path
+/// `examples/ch32v003-blink` drives and the one that has been on silicon.
+#[cfg(feature = "riscv32")]
+pub fn build_ch32v003(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let entry = find_main(&assembly);
+    let funcs = lower_assembly(&assembly, entry, &[])?;
+    let code = riscv32::lower_module_profile(&funcs, riscv32::RiscvProfile::Rv32ec)
+        .map_err(BuildError::LowerRiscv)?;
+    Ok(ch32v003_boot_image(&code))
+}
+
+/// Wraps RV32EC code whose function 0 is the entry in a CH32V003 boot image. Single-sourced here so
+/// [`build_ch32v003`] and any harness wanting the same shape agree by construction, the way
+/// [`rp2350_boot_image`] and [`riscv_virt_boot_image`] already do.
+///
+/// The stub sets `sp` to the top of SRAM and calls the entry trampoline; a `Main` that returns lands
+/// in the spin below it. A real chip has no SiFive finisher to write a pass/fail word to, so unlike
+/// [`riscv_virt_boot_image`] there is nowhere to report a result -- the image parks instead.
+#[cfg(feature = "riscv32")]
+pub fn ch32v003_boot_image(code: &[u8]) -> Vec<u8> {
+    use lamella_asm_riscv32::{Encoder, Reg};
+    let mut enc = Encoder::new();
+    let entry = enc.new_label();
+    let spin = enc.new_label();
+    enc.li(Reg::SP, CH32V003_SRAM_TOP as i32);
+    enc.jal(Reg::RA, entry);
+    enc.bind_label(spin);
+    enc.j(spin);
+    enc.bind_label(entry);
+    let stub = enc.finish().expect("the ch32v003 boot stub assembles").bytes;
+    let mut image = Vec::with_capacity(stub.len() + code.len());
+    image.extend_from_slice(&stub);
+    image.extend_from_slice(code);
+    image
 }
 
 /// Compiles a CIL assembly to a WebAssembly module: every method lowered through the same
@@ -113,24 +311,65 @@ pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 /// the device image through `lamella-firmware`'s `build_cortex_m_image` (object lowering + link).
 #[cfg(feature = "arm32")]
 pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
-    if !matches!(target, "microbit" | "rp2350") {
+    if !CORTEX_M_TARGETS.contains(&target) {
         return Err(BuildError::UnsupportedTarget);
     }
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
     let funcs = lower_assembly(&assembly, entry, &[])?;
     let code = arm32::lower_module(&funcs).map_err(BuildError::LowerArm)?;
+    cortex_m_boot_image(target, &code)
+}
+
+/// The Cortex-M chips this crate can shape a boot image for. Both the up-front validation in
+/// [`build_cortex_m`]/[`build_py`] and [`cortex_m_boot_image`]'s arms are driven from this one list,
+/// so a chip cannot be accepted by the guard and then fall through unhandled -- the test below walks
+/// it and requires an image from every entry.
+#[cfg(feature = "arm32")]
+pub const CORTEX_M_TARGETS: [&str; 4] = ["microbit", "nrf52833", "rp2040", "rp2350"];
+
+/// Wraps Cortex-M `code` whose function 0 is the entry in `target`'s boot image. Single-sourced here
+/// so every front end reaching this backend -- CIL through [`build_cortex_m`], Python through
+/// [`build_py`] -- gets the SAME bytes in front of the same code, the way [`rp2350_boot_image`],
+/// [`riscv_virt_boot_image`] and [`ch32v003_boot_image`] already serve their own callers.
+#[cfg(feature = "arm32")]
+fn cortex_m_boot_image(target: &str, code: &[u8]) -> Result<Vec<u8>, BuildError> {
     Ok(match target {
-        "rp2350" => rp2350_boot_image(0, &code),
-        _ => {
-            let initial_sp: u32 = 0x2000_4000;
+        "rp2350" => rp2350_boot_image(0, code),
+        "rp2040" => rp2040_boot_image(0, code),
+        "microbit" | "nrf52833" => {
+            let initial_sp: u32 = match target {
+                "nrf52833" => 0x2002_0000,
+                _ => 0x2000_4000,
+            };
             let mut image = Vec::with_capacity(8 + code.len());
             image.extend_from_slice(&initial_sp.to_le_bytes());
             image.extend_from_slice(&0x0000_0009u32.to_le_bytes());
-            image.extend_from_slice(&code);
+            image.extend_from_slice(code);
             image
         }
+        _ => return Err(BuildError::UnsupportedTarget),
     })
+}
+
+/// Compiles an already-lowered PYTHON module to a flashable bare-metal image for a Cortex-M chip,
+/// the twin of [`build_cortex_m`] for the other front end: `funcs` is what
+/// `lamella_py_frontend::lower::lower_module` produces, **`funcs[0]` is the entry** (the same
+/// function-0-is-the-entry contract [`riscv_virt_boot_image`] and [`ch32v003_boot_image`] state), and
+/// the entry should loop forever because a reset handler never returns.
+///
+/// It takes MIR rather than bytes because that is where the two front ends meet: `build()` and
+/// [`build_cortex_m`] start from a CIL assembly, and Python has no CIL to hand them. This crate
+/// cannot depend on the Python front end (that crate depends on THIS one), so the seam is
+/// [`lamella_ir::Function`], which both already speak.
+#[cfg(feature = "arm32")]
+pub fn build_py(funcs: &[Function], target: &str) -> Result<Vec<u8>, BuildError> {
+    if !CORTEX_M_TARGETS.contains(&target) {
+        return Err(BuildError::UnsupportedTarget);
+    }
+    let (code, _maps) = arm32::lower_module_py(funcs, None, arm32::PySupport::default())
+        .map_err(BuildError::LowerArm)?;
+    cortex_m_boot_image(target, &code)
 }
 
 /// The per-method debug info [`build_debug`] returns: `(MethodDef rid, the function's image offset, its
@@ -152,7 +391,8 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
     };
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let (funcs, maps, fails) = lower_assembly_debug(&assembly, entry, &[]);
+    let (funcs, maps, fails, duplicates) = lower_assembly_debug(&assembly, entry, &[]);
+    refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(BuildError::LowerCil { rid, error });
     }
@@ -179,6 +419,24 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
         .collect();
     Ok((image, debug))
 }
+
+/// The ARMv6-M/v7-M vector-table offset register, shared by the RP2040 and RP2350 boot paths: each
+/// points it at its own vector table so a fault vectors through the image's table rather than
+/// whatever the mask ROM left behind.
+#[cfg(feature = "arm32")]
+const SCB_VTOR: u32 = 0xE000_ED08;
+
+/// The RP2040 mask ROM reads exactly this many bytes from flash offset 0 (datasheet 2.8.1): 252
+/// bytes of stage 2 followed by its 4-byte checksum.
+#[cfg(feature = "arm32")]
+pub const RP2040_BOOT2_BYTES: usize = 256;
+/// The checksummed part of those 256 bytes -- the stage 2 itself.
+#[cfg(feature = "arm32")]
+pub const RP2040_BOOT2_PAYLOAD: usize = 252;
+/// Where the RP2040 image's own vector table sits: directly after the stage 2, at XIP flash base +
+/// 0x100. The serve firmware for this part splits its memory the same way.
+#[cfg(feature = "arm32")]
+pub const RP2040_VECTOR_BASE: u32 = 0x1000_0100;
 
 /// RP2350 (Pico 2 / Pico 2 W) result mailbox: the `rp2350` boot stub stamps `[magic][return value]`
 /// near the top of SRAM, read over SWD WITHOUT halting the core (the flasher's `rp2350-peek`, or the
@@ -227,9 +485,6 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     /// guarantees that. Handing out memory this stub never cleared would seed live objects from
     /// power-on garbage -- which on a mark-compact heap is a wrong ROOT, not merely a wrong value.
     const HEAP_LIMIT: u32 = ZERO_END;
-    /// The M33 vector-table offset register: the stub points it at the flash base so a fault vectors
-    /// through THIS table (the bootrom leaves VTOR on its own).
-    const SCB_VTOR: u32 = 0xE000_ED08;
     /// The PICOBIN IMAGE_DEF block the bootrom validates: a self-looping Arm RP2350 EXE, no signing.
     const IMAGE_DEF: [u32; 5] = [0xffff_ded3, 0x1021_0142, 0x0000_01ff, 0x0000_0000, 0xab12_3579];
 
@@ -325,6 +580,258 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     enc.finish().unwrap().bytes
 }
 
+/// RP2040 (Pico / Pico H) result mailbox -- the RP2350 mailbox's twin, one bank lower because this
+/// part has 264 KB of SRAM rather than 520. Read over SWD without halting the core to confirm the
+/// image ran and recover the entry's return value.
+#[cfg(feature = "arm32")]
+pub const RP2040_RESULT_ADDR: u32 = 0x2003_F000;
+/// Stamped at [`RP2040_RESULT_ADDR`] before the entry runs ("booted, in managed code").
+#[cfg(feature = "arm32")]
+pub const RP2040_BOOT_MAGIC: u32 = 0xB007_1A6D;
+/// Stamped over [`RP2040_BOOT_MAGIC`] once the entry returns; `RESULT_ADDR + 4` then holds the result.
+#[cfg(feature = "arm32")]
+pub const RP2040_DONE_MAGIC: u32 = 0x4C41_4D44;
+
+/// The 256 bytes the RP2040 mask ROM reads from flash offset 0: OUR stage 2, generated here rather
+/// than vendored.
+///
+/// RP2040 datasheet 2.8.1 gives the boot sequence, and the fact that makes this correct is that the
+/// mask ROM has ALREADY set up the QSPI pad/IO muxing and the SSI, and already issued the XIP exit
+/// sequence, before it copies these 256 bytes into SRAM and jumps to them. **So a stage 2 does not
+/// have to know the fitted flash part to be CORRECT -- only to be FAST.** The vendored stage 2 this
+/// replaces (`boot2_w25q080.padded.bin`) is named for a Winbond W25Q080 and configures a quad-read
+/// XIP mode specific to it; a board with a different QSPI part needs a different blob.
+///
+/// So this one asks the ROM for the universal path instead. Datasheet 2.8.3 publishes the ROM's own
+/// functions through a lookup helper -- the table pointer at `0x14`, the helper at `0x18`, a code
+/// being two ASCII bytes packed `(c2 << 8) | c1` -- and among them (2.8.3.1.3):
+///
+/// > `'C','X'  void _flash_enter_cmd_xip(void)` -- Configure the SSI to generate a standard 03h
+/// > serial read command, with 24 address bits, upon each XIP access. This is a very slow XIP
+/// > configuration, but is very widely supported.
+///
+/// **NAMED TRADEOFF, because it should not be discovered with a benchmark: this boots and executes
+/// SLOWER than a part-specific stage 2**, since 03h single-lane reads are slower than a quad-read
+/// XIP mode, and on an XIP part that is every instruction fetch, not just the boot. The future
+/// optimization is a per-flash fast path selected from board facts -- the shape this tree already
+/// uses everywhere else. Correct and part-agnostic first.
+///
+/// `_flash_flush_cache` ('F','C') is called first because that is the order the datasheet's own
+/// documented sequence uses (2.8.3.1.3): it enables the XIP cache and clears any IO forcing left on
+/// QSPI CSn. It is a no-op on a cache that is already clean, so it costs 4 instructions to not
+/// depend on what the mask ROM happened to leave behind.
+///
+/// The result is position-independent (PC-relative literals only, no self-referencing words), which
+/// it must be: the ROM copies it to SRAM and runs it there, not at the address it was linked for.
+#[cfg(feature = "arm32")]
+pub fn rp2040_boot2() -> [u8; RP2040_BOOT2_BYTES] {
+    use lamella_asm_arm32::{Encoder, Reg};
+    /// Datasheet 2.8.3, table 178: the ROM's well-known low-memory layout. Both are 16-bit
+    /// pointers -- the whole bootrom lives in the low 16 KB.
+    const ROM_FUNC_TABLE_PTR: u8 = 0x14;
+    const ROM_TABLE_LOOKUP_PTR: u8 = 0x18;
+    /// `rom_table_code(c1, c2) = (c2 << 8) | c1` (datasheet 2.8.3.1).
+    const fn rom_code(c1: u8, c2: u8) -> u32 {
+        ((c2 as u32) << 8) | c1 as u32
+    }
+
+    let mut enc = Encoder::new();
+    let flush_code_word = enc.new_label();
+    let xip_code_word = enc.new_label();
+    let vectors_word = enc.new_label();
+    let vtor_word = enc.new_label();
+
+    enc.movs_imm(Reg::R0, ROM_FUNC_TABLE_PTR).unwrap();
+    enc.ldrh_imm(Reg::R4, Reg::R0, 0).unwrap();
+    enc.movs_imm(Reg::R0, ROM_TABLE_LOOKUP_PTR).unwrap();
+    enc.ldrh_imm(Reg::R5, Reg::R0, 0).unwrap();
+
+    for code_word in [flush_code_word, xip_code_word] {
+        enc.mov_reg(Reg::R0, Reg::R4);
+        enc.ldr_literal(Reg::R1, code_word).unwrap();
+        enc.blx(Reg::R5);
+        enc.movs_imm(Reg::R1, 1).unwrap();
+        enc.orrs(Reg::R0, Reg::R1).unwrap();
+        enc.blx(Reg::R0);
+    }
+
+    enc.ldr_literal(Reg::R0, vectors_word).unwrap();
+    enc.ldr_literal(Reg::R1, vtor_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_imm(Reg::R1, Reg::R0, 4).unwrap();
+    enc.ldr_imm(Reg::R0, Reg::R0, 0).unwrap();
+    enc.mov_reg(Reg::SP, Reg::R0);
+    enc.bx(Reg::R1);
+
+    enc.align_to_word();
+    enc.bind_label(flush_code_word);
+    enc.emit_word(rom_code(b'F', b'C'));
+    enc.bind_label(xip_code_word);
+    enc.emit_word(rom_code(b'C', b'X'));
+    enc.bind_label(vectors_word);
+    enc.emit_word(RP2040_VECTOR_BASE);
+    enc.bind_label(vtor_word);
+    enc.emit_word(SCB_VTOR);
+    let stub = enc.finish().expect("the rp2040 boot2 stub assembles").bytes;
+
+    assert!(
+        stub.len() <= RP2040_BOOT2_PAYLOAD,
+        "the rp2040 stage 2 must fit the mask ROM's 252-byte payload"
+    );
+    let mut boot2 = [0u8; RP2040_BOOT2_BYTES];
+    boot2[..stub.len()].copy_from_slice(&stub);
+    let checksum = boot2_checksum(&boot2[..RP2040_BOOT2_PAYLOAD]);
+    boot2[RP2040_BOOT2_PAYLOAD..].copy_from_slice(&checksum.to_le_bytes());
+    boot2
+}
+
+/// The checksum the RP2040 mask ROM validates before it will run a stage 2, over the first 252
+/// bytes, stored little-endian in the last 4. Datasheet 2.8.1.3.1 states it as five parameters and
+/// this is written from those, not from the name they add up to (which is CRC-32/MPEG-2 -- a
+/// mnemonic, where the parameters are the specification):
+///
+/// > Polynomial: `0x04c11db7` / Input reflection: no / Output reflection: no /
+/// > Initial value: `0xffffffff` / Final XOR: `0x00000000`
+#[cfg(feature = "arm32")]
+fn boot2_checksum(payload: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in payload {
+        crc ^= (byte as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Wraps AOT-lowered Cortex-M code in a flashable RP2040 image: [`rp2040_boot2`] at flash offset 0,
+/// then the vector table at [`RP2040_VECTOR_BASE`] and a reset stub that seeds and zeroes RAM,
+/// stamps [`RP2040_BOOT_MAGIC`], calls the entry, stores `[RP2040_DONE_MAGIC, return value]` in the
+/// mailbox at [`RP2040_RESULT_ADDR`], and parks.
+///
+/// The shape past the boot2 is [`rp2350_boot_image`]'s, deliberately, and the differences are the
+/// two parts' own: the RP2040 has no PICOBIN `IMAGE_DEF` (its mask ROM checksums a stage 2 instead
+/// of scanning the image), and its RAM is 264 KB rather than 520.
+#[cfg(feature = "arm32")]
+pub fn rp2040_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
+    use lamella_asm_arm32::{Cond, Encoder, Reg};
+    /// Link base for the program text, past the vector table + reset stub region.
+    const CODE_BASE: u32 = RP2040_VECTOR_BASE + 0x100;
+    /// Top of the 264 KB SRAM window (SRAM0-3 256 KB + SRAM4/5 2x4 KB, contiguous); the stack
+    /// descends from here. The serve firmware for this part uses the
+    /// serve firmware -- one part, one stack top.
+    const SP_TOP: u32 = 0x2004_2000;
+    /// The bump allocator's high-water pointer word -- the fixed address runtime-support uses.
+    const HEAP_PTR: u32 = 0x2000_0100;
+    /// The bump heap grows up from here -- above the statics window + the archive's static band.
+    const HEAP_BASE: u32 = 0x2001_0000;
+    /// The stub ZEROES [ZERO_START, ZERO_END) before managed code runs: power-on RAM is garbage on
+    /// real silicon (the statics window's word 0 is the EH tag; garbage there HardFaults startup).
+    const ZERO_START: u32 = 0x2000_0100;
+    const ZERO_END: u32 = HEAP_BASE + 0x1_0000;
+    /// One past the last byte the bump allocator may hand out; a zero here means "no heap", so
+    /// seeding it is not optional. The ceiling is the band this stub actually PREPARED -- handing
+    /// out memory it never cleared would seed live objects from power-on garbage, which on a
+    /// mark-compact heap is a wrong ROOT and not merely a wrong value.
+    const HEAP_LIMIT: u32 = ZERO_END;
+
+    let entry_addr = (CODE_BASE + entry_offset) | 1;
+    const FAULT_OFF: u32 = 16 * 4;
+    const STUB_OFF: u32 = FAULT_OFF + 2;
+    let mut enc = Encoder::new();
+    enc.emit_word(SP_TOP);
+    enc.emit_word((RP2040_VECTOR_BASE + STUB_OFF) | 1);
+    for _ in 2..16 {
+        enc.emit_word((RP2040_VECTOR_BASE + FAULT_OFF) | 1);
+    }
+    debug_assert_eq!(enc.position(), FAULT_OFF);
+    let fault = enc.new_label();
+    enc.bind_label(fault);
+    enc.b(fault);
+    debug_assert_eq!(enc.position(), STUB_OFF);
+
+    let vtor_word = enc.new_label();
+    let vectors_word = enc.new_label();
+    let zero_start_word = enc.new_label();
+    let zero_end_word = enc.new_label();
+    let heap_ptr_word = enc.new_label();
+    let heap_base_word = enc.new_label();
+    let heap_limit_word = enc.new_label();
+    let boot_magic_word = enc.new_label();
+    let done_magic_word = enc.new_label();
+    let result_word = enc.new_label();
+    let result_hi_word = enc.new_label();
+    let entry_word = enc.new_label();
+    enc.ldr_literal(Reg::R0, vectors_word).unwrap();
+    enc.ldr_literal(Reg::R1, vtor_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.movs_imm(Reg::R0, 0).unwrap();
+    enc.ldr_literal(Reg::R1, zero_start_word).unwrap();
+    enc.ldr_literal(Reg::R2, zero_end_word).unwrap();
+    let zero_loop = enc.new_label();
+    enc.bind_label(zero_loop);
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.adds_imm8(Reg::R1, 4).unwrap();
+    enc.cmp_reg(Reg::R1, Reg::R2).unwrap();
+    enc.b_cond(Cond::CarryClear, zero_loop);
+    enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
+    enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, heap_limit_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    enc.ldr_literal(Reg::R0, boot_magic_word).unwrap();
+    enc.ldr_literal(Reg::R1, result_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, entry_word).unwrap();
+    enc.blx(Reg::R0);
+    enc.ldr_literal(Reg::R1, result_hi_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, done_magic_word).unwrap();
+    enc.ldr_literal(Reg::R1, result_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    let park = enc.new_label();
+    enc.bind_label(park);
+    enc.b(park);
+    enc.align_to_word();
+    enc.bind_label(vtor_word);
+    enc.emit_word(SCB_VTOR);
+    enc.bind_label(vectors_word);
+    enc.emit_word(RP2040_VECTOR_BASE);
+    enc.bind_label(zero_start_word);
+    enc.emit_word(ZERO_START);
+    enc.bind_label(zero_end_word);
+    enc.emit_word(ZERO_END);
+    enc.bind_label(heap_ptr_word);
+    enc.emit_word(HEAP_PTR);
+    enc.bind_label(heap_base_word);
+    enc.emit_word(HEAP_BASE);
+    enc.bind_label(heap_limit_word);
+    enc.emit_word(HEAP_LIMIT);
+    enc.bind_label(boot_magic_word);
+    enc.emit_word(RP2040_BOOT_MAGIC);
+    enc.bind_label(done_magic_word);
+    enc.emit_word(RP2040_DONE_MAGIC);
+    enc.bind_label(result_word);
+    enc.emit_word(RP2040_RESULT_ADDR);
+    enc.bind_label(result_hi_word);
+    enc.emit_word(RP2040_RESULT_ADDR + 4);
+    enc.bind_label(entry_word);
+    enc.emit_word(entry_addr);
+    let pad = ((CODE_BASE - RP2040_VECTOR_BASE) - enc.position()) as usize;
+    enc.emit_bytes(&vec![0u8; pad]);
+    enc.emit_bytes(code);
+    let body = enc.finish().unwrap().bytes;
+
+    let mut image = Vec::with_capacity(RP2040_BOOT2_BYTES + body.len());
+    image.extend_from_slice(&rp2040_boot2());
+    image.extend_from_slice(&body);
+    image
+}
+
 /// Compiles a CIL assembly to ONE ARM/Thumb relocatable ELF object through the RELOCATING path
 /// ([`arm32::lower_object`]): every method becomes a `STT_FUNC` symbol named `f<rid>` (so `f0` is the
 /// startup -> `.cctor`s -> `Main`), cross-method calls become `R_ARM_THM_CALL` relocations, and any
@@ -367,7 +874,8 @@ pub fn build_object_with_corlib_debug(
     let references = alloc::vec![&corlib_assembly];
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let (mut funcs, maps, fails) = lower_assembly_debug(&assembly, entry, &references);
+    let (mut funcs, maps, fails, duplicates) = lower_assembly_debug(&assembly, entry, &references);
+    refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(BuildError::LowerCil { rid, error });
     }
@@ -521,7 +1029,9 @@ fn build_object_core(
             .map(|bytes| alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, bytes)))
             .collect(),
     };
-    let (mut funcs, _maps, cil_fails, seams) = lower_assembly_seams(&assembly, entry, &references);
+    let (mut funcs, _maps, cil_fails, seams, duplicates) =
+        lower_assembly_seams(&assembly, entry, &references);
+    refuse_duplicate_bodies(&duplicates)?;
     let cil_fail_rows: Vec<(u32, cil::CilError)> = if defer {
         for (rid, _) in &cil_fails {
             funcs[*rid as usize] = deferred_trap_body();
@@ -1349,8 +1859,10 @@ fn build_object_riscv_inner(
         reference_cctors
             .extend(find_cctors(reference).into_iter().map(|rid| alloc::format!("{prefix}f{rid}")));
     }
-    let mut funcs =
+    let (mut funcs, plan) =
         lower_reachable(&assembly, entry, &descriptors, &references, &reference_cctors)?;
+    let resolver = resolver.with_monomorphized(plan);
+    descriptors.extend(resolver.instantiation_descriptors());
     let mut names: Vec<alloc::string::String> =
         (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
     names.extend(append_enum_to_string(
@@ -1411,6 +1923,68 @@ fn build_object_riscv_inner(
     .map_err(BuildError::LowerRiscv)
 }
 
+/// Lowers ONE monomorphized body: the generic definition's own CIL, lowered under the type
+/// arguments of the instantiation the plan assigned it.
+pub fn lower_monomorphized_body<'a>(
+    assembly: &'a Assembly<'a>,
+    resolver: &MetadataResolver<'a>,
+    body: &crate::generics::MonoBody,
+) -> Result<Function, BuildError> {
+    let gap = |reason: MonoGap| BuildError::MonomorphizedBody {
+        index: body.index,
+        instantiation: alloc::string::String::from(&*body.instantiation),
+        method: alloc::string::String::from(&*body.name),
+        reason,
+    };
+    let method = assembly
+        .method(body.rid)
+        .ok_or_else(|| gap(MonoGap::NoDefinitionBody))?;
+    let cil_body = method.body().ok_or_else(|| gap(MonoGap::NoDefinitionBody))?;
+    let (_, arguments) =
+        crate::generics::instantiation_of(assembly, body.spec).ok_or_else(|| gap(MonoGap::NoArguments))?;
+    let mut arg_types = Vec::new();
+    if let Some(signature) = method.signature() {
+        if signature.has_this {
+            arg_types.push(MirType::ObjectRef);
+        }
+        for parameter in &signature.parameters {
+            arg_types.push(
+                substituted_mir_type(parameter, &arguments, assembly, resolver.references())
+                    .ok_or_else(|| gap(MonoGap::UnsubstitutedSlot))?,
+            );
+        }
+    }
+    let mut local_types = Vec::new();
+    for local in &method.local_variables() {
+        local_types.push(
+            substituted_mir_type(local, &arguments, assembly, resolver.references())
+                .ok_or_else(|| gap(MonoGap::UnsubstitutedSlot))?,
+        );
+    }
+    let instantiated = resolver.clone().with_type_arguments(arguments);
+    cil::lower_method_typed(&cil_body, &instantiated, &arg_types, &local_types)
+        .map(|(func, _map)| func)
+        .map_err(|error| gap(MonoGap::LowerCil(error)))
+}
+
+/// A slot's MIR type with the instantiation applied FIRST, or `None` when it does not close.
+fn substituted_mir_type<'x>(
+    sig: &SigType,
+    arguments: &[SigType],
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+) -> Option<MirType> {
+    let closed = crate::generics::substitute_sig(sig, arguments)?;
+    match &closed {
+        SigType::Var(_) | SigType::MVar(_) => None,
+        SigType::GenericInst { definition, .. } => match definition.as_ref() {
+            SigType::Class(_) => Some(MirType::ObjectRef),
+            _ => None,
+        },
+        other => Some(mir_type(other, assembly, references)),
+    }
+}
+
 /// Lowers the methods of a self-contained assembly REACHABLE from `entry`, rid-indexed, into a dense
 /// module for [`riscv32::lower_object`]. Index 0 is the entry [`startup`] (board-init hook, then each
 /// `.cctor`, then `Main`); each reachable method sits at its `MethodDef` rid; every unreached rid is a
@@ -1425,18 +1999,22 @@ fn lower_reachable<'a>(
     descriptors: &[crate::resolver::TypeMeta],
     references: &[&'a Assembly<'a>],
     reference_cctors: &[alloc::string::String],
-) -> Result<Vec<Function>, BuildError> {
+) -> Result<(Vec<Function>, crate::generics::MonoPlan), BuildError> {
     let mut max_rid = entry;
     for type_def in assembly.type_defs() {
         for method in type_def.methods() {
             max_rid = max_rid.max(method.rid());
         }
     }
-    let mut funcs: Vec<Function> = (0..=max_rid).map(|_| stub()).collect();
+    let plan = crate::generics::MonoPlan::for_assembly(assembly, max_rid + 1)
+        .map_err(BuildError::Instantiations)?;
+    let mut funcs: Vec<Function> = (0..=max_rid + plan.len() as u32).map(|_| stub()).collect();
     let mut lowered = vec![false; funcs.len()];
     let cctors = find_cctors(assembly);
     let init = find_native_export(assembly, "lamella_time_init");
-    let resolver = MetadataResolver::new(assembly).with_references(references);
+    let resolver = MetadataResolver::new(assembly)
+        .with_references(references)
+        .with_monomorphized(plan.clone());
     let mut worklist: Vec<u32> = core::iter::once(entry)
         .chain(cctors.iter().copied())
         .chain(init)
@@ -1461,8 +2039,12 @@ fn lower_reachable<'a>(
             continue;
         }
         *seen = true;
-        let Some(func) = lower_one_reachable(assembly, &resolver, rid)? else {
-            continue;
+        let func = match plan.bodies().iter().find(|body| body.index == rid) {
+            Some(body) => lower_monomorphized_body(assembly, &resolver, body)?,
+            None => match lower_one_reachable(assembly, &resolver, rid)? {
+                Some(func) => func,
+                None => continue,
+            },
         };
         for block in &func.blocks {
             for (_, inst) in &block.insts {
@@ -1481,7 +2063,7 @@ fn lower_reachable<'a>(
         funcs[rid as usize] = func;
     }
     funcs[0] = startup_with_references(init, reference_cctors, &cctors, entry);
-    Ok(funcs)
+    Ok((funcs, plan))
 }
 
 /// Lowers the method at `MethodDef` rid `rid` to MIR (its plain managed body -- the same path
@@ -1563,7 +2145,9 @@ fn build_library_object_riscv_inner(
         .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
-    let (mut funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &references);
+    let (mut funcs, _maps, fails, seams, duplicates) =
+        lower_assembly_seams(&assembly, None, &references);
+    refuse_duplicate_bodies(&duplicates)?;
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
     let resolver = MetadataResolver::new(&assembly).with_references(&references);
     let mut descriptors = resolver.type_descriptors();
@@ -1635,8 +2219,8 @@ fn build_library_object_riscv_inner(
 }
 
 /// As [`build_library_object_riscv`], but ALSO returning the [`LibraryBuildReport`] -- the RISC-V
-/// twin of [`build_library_object_report`]. The object bytes are identical; the report is the
-/// observation that RISC-V previously had no way to make.
+/// twin of [`build_library_object_report`]. The object bytes are identical; the report is
+/// observation only.
 #[cfg(feature = "riscv32")]
 pub fn build_library_object_riscv_report(
     cil: &[u8],
@@ -1771,7 +2355,7 @@ pub struct UnsynthesizedSeam {
 }
 
 /// What [`build_library_object_report`] observed while building: the THREE distinct silent-demotion
-/// layers a library method can fall through, each previously invisible (finding 4b).
+/// layers a library method can fall through, none of which a plain build surfaces.
 #[derive(Debug, Default)]
 pub struct LibraryBuildReport {
     /// Methods whose CIL BODY failed to lower to MIR -- they kept the placeholder body, so calling
@@ -1793,8 +2377,8 @@ pub struct LibraryBuildReport {
 }
 
 /// As [`build_library_object`], but also returning the [`LibraryBuildReport`] -- the CIL->MIR fail
-/// list `lower_assembly_debug` computes (previously discarded) and the object-emit stub set
-/// (previously internal to the emit fixpoint). The object bytes are IDENTICAL to
+/// list `lower_assembly_debug` computes and the object-emit stub set the emit fixpoint tracks
+/// internally. The object bytes are IDENTICAL to
 /// [`build_library_object`]'s; the report is observation only. A caller diagnosing a silently
 /// wrong library call reads this to separate "the method is a stub" from "dispatch reached the
 /// wrong slot" in one run.
@@ -1835,7 +2419,9 @@ fn build_library_object_inner(
         .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
         .collect::<Result<_, _>>()?;
     let reference_list: Vec<&Assembly> = reference_assemblies.iter().collect();
-    let (mut funcs, _maps, fails, seams) = lower_assembly_seams(&assembly, None, &reference_list);
+    let (mut funcs, _maps, fails, seams, duplicates) =
+        lower_assembly_seams(&assembly, None, &reference_list);
+    refuse_duplicate_bodies(&duplicates)?;
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
     let mut names = library_symbol_names(&assembly, &reference_list, funcs.len(), &prefix);
     let qualifiers = arm32::DescQualifiers {
@@ -2061,7 +2647,9 @@ fn imported_silent_seams<'a>(
             let Some(method_name) = method.name() else {
                 continue;
             };
-            let params = method.signature().map(|s| s.parameters).unwrap_or_default();
+            let Some(params) = crate::resolver::decodable_params(&method) else {
+                continue;
+            };
             let symbol = crate::resolver::extern_method_symbol(
                 type_name.namespace,
                 type_name.name,
@@ -2198,8 +2786,9 @@ fn library_symbol_names<'a>(
             if (method.is_static() || method.is_virtual() || is_synth_seam || is_plain_instance)
                 && matches!(method.flags() & 0x7, 0x4..=0x6)
             {
-                if let Some(method_name) = method.name() {
-                    let params = method.signature().map(|s| s.parameters).unwrap_or_default();
+                if let (Some(method_name), Some(params)) =
+                    (method.name(), crate::resolver::decodable_params(&method))
+                {
                     names[rid] = crate::resolver::extern_method_symbol(
                         type_name.namespace,
                         type_name.name,
@@ -2292,6 +2881,9 @@ fn mir_type<'x>(sig: &SigType, assembly: &'x Assembly<'x>, references: &[&'x Ass
         | SigType::Class(_)
         | SigType::SzArray(_)
         | SigType::Array { .. } => MirType::ObjectRef,
+        SigType::GenericInst { definition, .. } if matches!(**definition, SigType::Class(_)) => {
+            MirType::ObjectRef
+        }
         SigType::Pointer(_) => MirType::NativeInt,
         SigType::ValueType(token) => {
             if let Some(underlying) =
@@ -3219,7 +3811,8 @@ fn lower_assembly<'a>(
     entry: Option<u32>,
     references: &[&'a Assembly<'a>],
 ) -> Result<Vec<Function>, BuildError> {
-    let (funcs, _maps, fails) = lower_assembly_debug(assembly, entry, references);
+    let (funcs, _maps, fails, duplicates) = lower_assembly_debug(assembly, entry, references);
+    refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(BuildError::LowerCil { rid, error });
     }
@@ -3233,22 +3826,87 @@ fn lower_assembly_debug<'a>(
     assembly: &'a Assembly<'a>,
     entry: Option<u32>,
     references: &[&'a Assembly<'a>],
-) -> (
+) -> LoweredAssemblyDebug {
+    let (funcs, maps, fails, _seams, duplicates) =
+        lower_assembly_seams(assembly, entry, references);
+    (funcs, maps, fails, duplicates)
+}
+
+/// What [`lower_assembly_debug`] returns: [`LoweredAssembly`] without the seam census, which its
+/// callers do not read.
+type LoweredAssemblyDebug = (
     Vec<Function>,
     Vec<cil::CilSourceMap>,
     Vec<(u32, cil::CilError)>,
-) {
-    let (funcs, maps, fails, _seams) = lower_assembly_seams(assembly, entry, references);
-    (funcs, maps, fails)
+    Vec<u32>,
+);
+
+/// The rid-indexed function table, with the 1:1 invariant MADE OBSERVABLE.
+///
+/// A program is a `Vec<Function>` indexed by MethodDef rid and every emitted symbol is `f<rid>`, so
+/// writing a body is an index assignment: a SECOND body for one row does not collide, it REPLACES
+/// the first, and the image is built around whichever won with no diagnostic anywhere. This type
+/// exists so that write cannot happen without being recorded. It does not refuse -- the caller
+/// does, through [`refuse_duplicate_bodies`] -- because the lowering has a lenient path and the
+/// decision about what is tolerable belongs at the build entry point, not here.
+struct BodySlots {
+    /// The bodies, indexed by MethodDef rid.
+    funcs: Vec<Function>,
+    /// Which rids [`Self::write`] has already filled. Not derivable from `funcs` -- every slot
+    /// starts as a `stub()` and a legitimately-stubbed body is indistinguishable from an empty one.
+    written: Vec<bool>,
+    /// The rids a second body was written to, in the order the collisions happened.
+    duplicates: Vec<u32>,
+}
+
+impl BodySlots {
+    fn new(len: usize) -> Self {
+        Self {
+            funcs: (0..len).map(|_| stub()).collect(),
+            written: alloc::vec![false; len],
+            duplicates: Vec::new(),
+        }
+    }
+
+    /// Writes `func` as the body of MethodDef row `rid`, recording the rid if it already had one.
+    /// The FIRST body is the one that is lost, matching the existing assignment's behavior exactly
+    /// -- this changes what is observable, not what is emitted.
+    fn write(&mut self, rid: u32, func: Function) {
+        let slot = rid as usize;
+        if self.written[slot] {
+            self.duplicates.push(rid);
+        }
+        self.written[slot] = true;
+        self.funcs[slot] = func;
+    }
+}
+
+/// Turns the rows [`lower_assembly_seams`] saw a second body written to into a refusal.
+///
+/// One call per build entry point rather than one check inside the lowering, because the lowering
+/// has a LENIENT path that tolerates CIL failures (`build_object_with_libraries_report` collects
+/// them into a report instead of refusing), and a duplicate body must not be tolerable there: a
+/// method that failed to lower is a known hole a caller can read, while a method that lowered TWICE
+/// is a wrong answer nothing downstream can see.
+fn refuse_duplicate_bodies(duplicates: &[u32]) -> Result<(), BuildError> {
+    match duplicates.first() {
+        Some(&rid) => Err(BuildError::DuplicateMethodBody {
+            rid,
+            total: duplicates.len(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// What [`lower_assembly_seams`] observed: the rid-indexed functions and source maps, the methods
-/// whose CIL did not lower, and the `[RuntimeProvided]` seams nothing synthesized.
+/// whose CIL did not lower, the `[RuntimeProvided]` seams nothing synthesized, and any MethodDef row
+/// a SECOND body was written to (see [`BuildError::DuplicateMethodBody`]).
 type LoweredAssembly = (
     Vec<Function>,
     Vec<cil::CilSourceMap>,
     Vec<(u32, cil::CilError)>,
     Vec<SeamRow>,
+    Vec<u32>,
 );
 
 /// One census row as the lowering decided it: the seam's rid, what was emitted in its place, and
@@ -3271,18 +3929,19 @@ fn lower_assembly_seams<'a>(
     let mut max_rid = entry.unwrap_or(0);
     for type_def in assembly.type_defs() {
         let type_name = type_def.name();
+        let delegate = crate::resolver::is_delegate_type_of(assembly, &type_def);
         for method in type_def.methods() {
             let rid = method.rid();
             max_rid = max_rid.max(rid);
-            methods.push((rid, method, type_name));
+            methods.push((rid, method, type_name, delegate));
         }
     }
-    let mut funcs: Vec<Function> = (0..=max_rid).map(|_| stub()).collect();
+    let mut bodies = BodySlots::new(max_rid as usize + 1);
     let mut maps: Vec<cil::CilSourceMap> = (0..=max_rid)
         .map(|_| cil::CilSourceMap(Vec::new()))
         .collect();
     if let Some(entry_rid) = entry {
-        funcs[0] = startup(
+        bodies.funcs[0] = startup(
             find_native_export(assembly, "lamella_time_init"),
             &find_cctors(assembly),
             entry_rid,
@@ -3291,9 +3950,25 @@ fn lower_assembly_seams<'a>(
     let resolver = MetadataResolver::new(assembly).with_references(references);
     let mut fails: Vec<(u32, cil::CilError)> = Vec::new();
     let mut seams: Vec<SeamRow> = Vec::new();
-    for (rid, method, type_name) in &methods {
-        let Some(body) = method.body() else { continue };
+    for (rid, method, type_name, is_delegate) in &methods {
         let signature = method.signature();
+        let Some(body) = method.body() else {
+            if *is_delegate && method.name() == Some("Invoke") {
+                if let Some(sig) = &signature {
+                    let mut params = alloc::vec![MirType::ObjectRef];
+                    for parameter in &sig.parameters {
+                        params.push(mir_type(parameter, assembly, resolver.references()));
+                    }
+                    let ret = if sig.return_type == SigType::Void {
+                        None
+                    } else {
+                        Some(mir_type(&sig.return_type, assembly, resolver.references()))
+                    };
+                    bodies.write(*rid, delegate_invoke_body(&params, ret));
+                }
+            }
+            continue;
+        };
         let folded = type_name.as_ref().is_some_and(|name| {
             crate::resolver::folded_intrinsic(
                 name.namespace,
@@ -3311,11 +3986,11 @@ fn lower_assembly_seams<'a>(
             });
             match emission {
                 SeamEmission::Synthesized(func) => {
-                    funcs[*rid as usize] = func;
+                    bodies.write(*rid, func);
                     continue;
                 }
                 SeamEmission::Trap(func) => {
-                    funcs[*rid as usize] = func;
+                    bodies.write(*rid, func);
                     seams.push((*rid, SeamDisposition::Trap, folded));
                     continue;
                 }
@@ -3340,13 +4015,13 @@ fn lower_assembly_seams<'a>(
             .collect();
         match cil::lower_method_typed(&body, &resolver, &arg_types, &local_types) {
             Ok((func, map)) => {
-                funcs[*rid as usize] = func;
+                bodies.write(*rid, func);
                 maps[*rid as usize] = map;
             }
             Err(error) => fails.push((*rid, error)),
         }
     }
-    (funcs, maps, fails, seams)
+    (bodies.funcs, maps, fails, seams, bodies.duplicates)
 }
 
 /// The embedding ABI's export list: `main` (the entry trampoline at index 0, if there is an entry)
@@ -3371,8 +4046,10 @@ fn method_exports(assembly: &Assembly, has_main: bool) -> Vec<(String, u32)> {
             };
             let mut name = format!("{type_name}_{method_name}");
             if taken.contains(&name) {
-                let arity = method.signature().map_or(0, |s| s.parameters.len());
-                name = format!("{type_name}_{method_name}_{arity}");
+                name = match crate::resolver::decodable_params(&method) {
+                    Some(params) => format!("{type_name}_{method_name}_{}", params.len()),
+                    None => format!("{type_name}_{method_name}_{}", method.rid()),
+                };
                 if taken.contains(&name) {
                     name = format!("{type_name}_{method_name}_{}", method.rid());
                 }
@@ -3495,6 +4172,29 @@ impl MirBuilder {
             blocks: self.blocks,
         }
     }
+}
+
+/// A synthesized MIR body for a delegate type's `Invoke` -- the thunk form of the dispatch a
+/// `callvirt` of it already lowers to inline. `params[0]` is the delegate receiver; the rest are
+/// `Invoke`'s own signature parameters.
+fn delegate_invoke_body(params: &[MirType], ret: Option<MirType>) -> Function {
+    let (mut mb, ids) = MirBuilder::new(params);
+    let invoke = Inst::InvokeDelegate {
+        delegate: ids[0],
+        args: ids[1..].to_vec(),
+        returns_value: ret.is_some(),
+    };
+    match ret {
+        Some(ty) => {
+            let result = mb.emit(ty, invoke);
+            mb.ret(result);
+        }
+        None => {
+            mb.side(invoke);
+            mb.ret_void();
+        }
+    }
+    mb.finish(ret)
 }
 
 /// A synthesized MIR body for `[RuntimeProvided] System.Delegate.Combine(a, b)` -- the immutable multicast
@@ -5836,6 +6536,33 @@ mod tests {
         crate::wasm::lower(&f).expect("wasm lowers Combine");
     }
 
+    #[test]
+    fn a_delegate_invoke_thunk_dispatches_instead_of_returning() {
+        for ret in [Some(MirType::I32), None] {
+            let returns = ret.is_some();
+            let f = delegate_invoke_body(&[MirType::ObjectRef, MirType::I32], ret);
+            lamella_ir::verify(&f).expect("the Invoke thunk verifies");
+            let dispatches = f.blocks.iter().flat_map(|b| &b.insts).any(|(_, inst)| {
+                matches!(
+                    inst,
+                    Inst::InvokeDelegate { delegate, args, returns_value }
+                        if *delegate == ValueId(0) && args == &[ValueId(1)] && *returns_value == returns
+                )
+            });
+            assert!(
+                dispatches,
+                "the synthesized Invoke must dispatch through its receiver, not answer a constant"
+            );
+            #[cfg(feature = "arm32")]
+            crate::arm32::lower_object(&[f.clone()], &["invoke"], &[]).expect("arm lowers Invoke");
+            #[cfg(feature = "riscv32")]
+            crate::riscv32::lower_object(&[f.clone()], &["invoke"], &[], &[])
+                .expect("riscv lowers Invoke");
+            #[cfg(feature = "wasm")]
+            crate::wasm::lower(&f).expect("wasm lowers Invoke");
+        }
+    }
+
     #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
     #[test]
     fn delegate_remove_body_verifies_and_lowers() {
@@ -6157,6 +6884,198 @@ mod tests {
         ));
     }
 
+    /// A one-block Python function that returns its argument: no allocation, no `PyIntrinsic`, no
+    /// float -- the shape the flat path is FOR, and the shape that has been on nRF51 silicon.
+    fn py_identity() -> Function {
+        Function {
+            params: vec![MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![MirType::PyValue],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        }
+    }
+
+    /// EVERY chip the guard admits must reach an arm that produces an image. The guard and the
+    /// boot-image match are two lists that could drift apart silently -- a chip accepted by the
+    /// guard and unhandled by the match would fall to `UnsupportedTarget` AFTER lowering, reporting
+    /// "unsupported" about a target that is supported. Walking the constant is what makes the two
+    /// one list rather than two that happen to agree today.
+    #[test]
+    fn build_py_reaches_every_cortex_m_target_the_guard_admits() {
+        for target in CORTEX_M_TARGETS {
+            let image = build_py(&[py_identity()], target)
+                .unwrap_or_else(|e| panic!("{target} must produce an image, got {e:?}"));
+            assert!(
+                image.len() > 8,
+                "{target}: an image is more than a bare vector table"
+            );
+        }
+    }
+
+    /// The Python front end and the CIL front end get the SAME boot image, because there is only one
+    /// that builds it. Checked on the Nordic shape, whose stack top is spelled out from the parts
+    /// rather than imported from the implementation ([`CORTEX_M_TARGETS`]'s two Nordic entries are
+    /// the nRF51's 16 KiB and the nRF52833's 128 KiB at `0x2000_0000`), so this is an answer key
+    /// rather than a mirror.
+    #[test]
+    fn build_py_lays_the_same_nordic_vector_table_the_cil_path_does() {
+        for (target, sp) in [("microbit", 0x2000_4000u32), ("nrf52833", 0x2002_0000)] {
+            let image = build_py(&[py_identity()], target).expect("builds");
+            assert_eq!(
+                &image[0..4],
+                &sp.to_le_bytes(),
+                "{target}: word 0 is the initial stack pointer"
+            );
+            assert_eq!(
+                &image[4..8],
+                &0x0000_0009u32.to_le_bytes(),
+                "{target}: word 1 is the reset vector -> offset 8, Thumb bit set"
+            );
+        }
+    }
+
+    /// `build_py` REACHES the Python backend rather than falling through: a `PyIntrinsic` with no
+    /// `PySupport` address must report `CallUnsupported` FROM THE LOWERING, not `UnsupportedTarget`.
+    /// An unwired entry point never lowers at all, so only a real arm can produce this error --
+    /// the same separation `build_routes_ch32v003_to_the_rv32ec_backend` makes with `Parse`.
+    ///
+    /// It also pins the flat path's limit as a REFUSAL rather than a silent miscompile: the
+    /// addresses `PySupport` carries cannot be resolved without a linker, and the backend says so.
+    #[test]
+    fn build_py_refuses_a_dynamic_op_the_flat_path_cannot_resolve() {
+        let dynamic = Function {
+            params: vec![MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![MirType::PyValue, MirType::PyValue],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::PyIntrinsic {
+                        op: lamella_ir::PyOp::Getattr { name: 5 },
+                        args: vec![ValueId(0)],
+                        cache: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(matches!(
+            build_py(&[dynamic], "microbit"),
+            Err(BuildError::LowerArm(arm32::LowerError::CallUnsupported))
+        ));
+    }
+
+    /// The PUBLIC refusal. `"ch32v003"` is a real target of this crate's OTHER backend, so it is the
+    /// case that would actually be tried: a RISC-V chip must not reach an ARM lowering.
+    #[test]
+    fn build_py_refuses_a_chip_outside_the_supported_list() {
+        assert!(matches!(
+            build_py(&[py_identity()], "ch32v003"),
+            Err(BuildError::UnsupportedTarget)
+        ));
+    }
+
+    /// The guard refuses BEFORE lowering, which is the only thing it contributes that the boot-image
+    /// arm does not -- and it is invisible to a return value unless the lowering would ALSO fail.
+    /// So: an unsupported chip AND a function the lowering cannot compile. Guarded, the answer is
+    /// `UnsupportedTarget`; unguarded, lowering runs first and answers `LowerArm(CallUnsupported)`,
+    /// reporting a dynamic-op problem about a build whose real problem is the chip.
+    ///
+    /// The assertion above cannot do this job: it scores both candidates identically, so it stays
+    /// green with the guard deleted. A control has to tell the two apart to be evidence about either.
+    #[test]
+    fn build_py_checks_the_chip_before_it_spends_the_lowering() {
+        let dynamic = Function {
+            params: vec![MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![MirType::PyValue, MirType::PyValue],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::PyIntrinsic {
+                        op: lamella_ir::PyOp::Getattr { name: 5 },
+                        args: vec![ValueId(0)],
+                        cache: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(
+            matches!(
+                build_py(&[dynamic], "ch32v003"),
+                Err(BuildError::UnsupportedTarget)
+            ),
+            "the chip is reported, not the dynamic op the lowering would have tripped on"
+        );
+    }
+
+    /// [`cortex_m_boot_image`]'s own refusal, which the public entry points can never reach because
+    /// they filter first. It is tested directly rather than left to inspection: the arm is what keeps
+    /// the function TOTAL, and without it an unlisted chip would fall through to the Nordic arm and
+    /// silently receive a micro:bit vector table -- which is what the code did before this was split
+    /// out, safely, because one guarded caller stood in front of it. A second caller now exists.
+    #[test]
+    fn the_boot_image_builder_refuses_a_chip_rather_than_defaulting_to_nordic() {
+        assert!(matches!(
+            cortex_m_boot_image("ch32v003", &[0x70, 0x47]),
+            Err(BuildError::UnsupportedTarget)
+        ));
+    }
+
+    /// `build()` REACHES the RV32EC backend for `"ch32v003"`. Malformed CIL landing on `Parse`
+    /// rather than `UnsupportedTarget` is what separates "the target string is wired" from "the
+    /// string fell through to the catch-all": an unwired target never gets as far as reading the
+    /// assembly, so `Parse` can only be reported by an arm that exists.
+    #[test]
+    #[cfg(feature = "riscv32")]
+    fn build_routes_ch32v003_to_the_rv32ec_backend() {
+        assert!(matches!(
+            build(b"not a managed assembly", "ch32v003"),
+            Err(BuildError::Parse)
+        ));
+    }
+
+    /// The reset stub is PREPENDED and sets `sp` before anything opens a frame -- the CH32V003
+    /// resets into flash `0x0000_0000` with no hardware SP init, so code placed first would run
+    /// managed code on a garbage stack.
+    ///
+    /// The stack top is spelled out from the CH32V003RM here (2 KB SRAM at `0x2000_0000`) instead
+    /// of importing [`CH32V003_SRAM_TOP`]: a test that imports the value it is checking agrees with
+    /// the implementation by construction and cannot report a wrong constant.
+    #[test]
+    #[cfg(feature = "riscv32")]
+    fn the_ch32v003_boot_stub_precedes_the_code_and_sets_sp() {
+        use lamella_asm_riscv32::{Encoder, Reg};
+        let code = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let image = ch32v003_boot_image(&code);
+
+        assert!(image.len() > code.len(), "a stub is prepended to the code");
+        assert_eq!(
+            &image[image.len() - code.len()..],
+            &code,
+            "the lowered code follows the stub verbatim, so function 0 is what the stub calls"
+        );
+
+        let mut expect = Encoder::new();
+        expect.li(Reg::SP, 0x2000_0800u32 as i32);
+        let sp_init = expect.finish().expect("li sp assembles").bytes;
+        assert_eq!(
+            &image[..sp_init.len()],
+            &sp_init[..],
+            "the image opens by loading the top of the CH32V003's 2 KB SRAM into sp"
+        );
+    }
+
     #[test]
     fn startup_runs_cctors_before_main() {
         let f = startup(None, &[5, 7], 3);
@@ -6210,6 +7129,66 @@ mod tests {
             Some(Terminator::Return(Some(v))) if v.0 as usize == f.blocks[0].insts.len() - 1
         ));
         assert!(lamella_ir::verify(&f).is_ok());
+    }
+
+    /// THE DEFECT, STATED: a second body for one MethodDef row REPLACES the first rather than
+    /// colliding, because `funcs` is indexed by rid. The assertion that matters is the middle one
+    /// -- the surviving body is the SECOND, which is exactly the silent-overwrite behavior; the
+    /// change is that the collision is now recorded instead of leaving no trace at all.
+    #[test]
+    fn a_second_body_for_one_rid_overwrites_and_is_recorded() {
+        let body = |value: i64| Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let mut slots = BodySlots::new(4);
+        slots.write(1, body(21));
+        slots.write(2, body(7));
+        assert!(
+            slots.duplicates.is_empty(),
+            "distinct rids are not a collision"
+        );
+
+        slots.write(1, body(99));
+        assert_eq!(slots.duplicates, vec![1], "the second write to rid 1 is recorded");
+        assert!(
+            matches!(
+                slots.funcs[1].blocks[0].insts[0].1,
+                Inst::ConstInt { value: 99, .. }
+            ),
+            "the second body still wins; only its silence is gone"
+        );
+        assert!(
+            matches!(
+                slots.funcs[2].blocks[0].insts[0].1,
+                Inst::ConstInt { value: 7, .. }
+            ),
+            "an untouched slot is unaffected"
+        );
+    }
+
+    /// The recorded collision becomes a refusal, and it names the row. A build that tolerated it
+    /// would ship an image built around whichever body won, with no diagnostic anywhere.
+    #[test]
+    fn a_recorded_duplicate_refuses_the_build() {
+        assert!(refuse_duplicate_bodies(&[]).is_ok());
+        assert!(matches!(
+            refuse_duplicate_bodies(&[7, 9]),
+            Err(BuildError::DuplicateMethodBody { rid: 7, total: 2 })
+        ));
     }
 
 }

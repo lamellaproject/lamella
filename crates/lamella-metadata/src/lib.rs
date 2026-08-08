@@ -38,6 +38,7 @@ pub use reader::{
 };
 pub use rows::{Col, Row, Tables, columns};
 pub use signature::{
-    LocalVar, MethodSig, SigError, SigType, parse_field, parse_local_vars, parse_method, parse_type,
+    LocalVar, MethodSig, SigError, SigType, parse_field, parse_local_vars, parse_method,
+    parse_method_spec, parse_type,
 };
 pub use tables::{TableError, TablesHeader};

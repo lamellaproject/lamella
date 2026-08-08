@@ -8,6 +8,16 @@ namespace Lamella.Generated
         public const int BOARD_MODEL = 21;
         public const string BOARD_VENDOR = "St";
 
+        /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+        /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+        /// peripherals of the same kind can share no register at all, so a consumer that selects a
+        /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+        /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+        /// name a driver; and a uart is a different register map on every family, so the kind does
+        /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+        public const string VCP_DRIVER_FAMILY = "stm32f42x-usart";
+        public const string MEMS_SPI_DRIVER_FAMILY = "stm32f42x-spi";
+
         public const uint VCP_BASE = 0x40011000;
         public const uint VCP_RCC_EN_REG = 0x40023844;
         public const uint VCP_RCC_EN_MASK = 0x10;
@@ -29,6 +39,43 @@ namespace Lamella.Generated
         public const uint VCP_RX_AFR_VALUE = 0x700;
         public const uint VCP_PCLK_HZ = 16000000;
         public const uint VCP_BRR_115200_HSI_16MHZ = 0x8B;
+
+        public const uint MEMS_SPI_BASE = 0x40015000;
+        public const uint MEMS_SPI_RCC_EN_REG = 0x40023844;
+        public const uint MEMS_SPI_RCC_EN_MASK = 0x100000;
+        public const uint MEMS_SPI_SCK_PORT_RCC_EN_REG = 0x40023830;
+        public const uint MEMS_SPI_SCK_PORT_RCC_EN_MASK = 0x20;
+        public const uint MEMS_SPI_SCK_MODER_REG = 0x40021400;
+        public const uint MEMS_SPI_SCK_MODER_MASK = 0xC000;
+        public const uint MEMS_SPI_SCK_MODER_VALUE = 0x8000;
+        public const uint MEMS_SPI_SCK_AFR_REG = 0x40021420;
+        public const uint MEMS_SPI_SCK_AFR_MASK = 0xF0000000;
+        public const uint MEMS_SPI_SCK_AFR_VALUE = 0x50000000;
+        public const uint MEMS_SPI_MISO_PORT_RCC_EN_REG = 0x40023830;
+        public const uint MEMS_SPI_MISO_PORT_RCC_EN_MASK = 0x20;
+        public const uint MEMS_SPI_MISO_MODER_REG = 0x40021400;
+        public const uint MEMS_SPI_MISO_MODER_MASK = 0x30000;
+        public const uint MEMS_SPI_MISO_MODER_VALUE = 0x20000;
+        public const uint MEMS_SPI_MISO_AFR_REG = 0x40021424;
+        public const uint MEMS_SPI_MISO_AFR_MASK = 0xF;
+        public const uint MEMS_SPI_MISO_AFR_VALUE = 0x5;
+        public const uint MEMS_SPI_MOSI_PORT_RCC_EN_REG = 0x40023830;
+        public const uint MEMS_SPI_MOSI_PORT_RCC_EN_MASK = 0x20;
+        public const uint MEMS_SPI_MOSI_MODER_REG = 0x40021400;
+        public const uint MEMS_SPI_MOSI_MODER_MASK = 0xC0000;
+        public const uint MEMS_SPI_MOSI_MODER_VALUE = 0x80000;
+        public const uint MEMS_SPI_MOSI_AFR_REG = 0x40021424;
+        public const uint MEMS_SPI_MOSI_AFR_MASK = 0xF0;
+        public const uint MEMS_SPI_MOSI_AFR_VALUE = 0x50;
+        public const uint MEMS_SPI_CS_PORT_RCC_EN_REG = 0x40023830;
+        public const uint MEMS_SPI_CS_PORT_RCC_EN_MASK = 0x4;
+        public const uint MEMS_SPI_CS_MODER_REG = 0x40020800;
+        public const uint MEMS_SPI_CS_MODER_MASK = 0xC;
+        public const uint MEMS_SPI_CS_MODER_VALUE = 0x4;
+        public const uint MEMS_SPI_CS_BSRR_REG = 0x40020818;
+        public const uint MEMS_SPI_CS_BSRR_SET = 0x2;
+        public const uint MEMS_SPI_CS_BSRR_CLEAR = 0x20000;
+        public const uint MEMS_SPI_PCLK_HZ = 16000000;
 
         public const uint LED_GREEN_PORT_BASE = 0x40021800;
         public const uint LED_GREEN_PIN = 13;

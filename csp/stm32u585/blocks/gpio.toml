@@ -1,0 +1,106 @@
+# BLOCK layout: the STM32U585 GPIO port block -- the registers a control line drives and a binding
+# muxes through. PARTIAL: MODER fields are stated for the pins the boards claim and grow as more do.
+# Offsets are instance-base-relative; port instance bases live in ../instances.toml.
+
+[table]
+kind = "block"
+family = "stm32u585"
+block = "gpio"
+sources = [
+    "STM32U575xx/585xx reference manual RM0456 Rev 7: GPIOx_MODER 13.4.1 (address offset 0x00), GPIOx_OTYPER 13.4.2 (0x04), GPIOx_OSPEEDR 13.4.3 (0x08), GPIOx_PUPDR 13.4.4 (0x0C), GPIOx_IDR 13.4.5 (0x10), GPIOx_ODR 13.4.6 (0x14), GPIOx_BSRR 13.4.7 (0x18), GPIOx_LCKR 13.4.8 (0x1C), GPIOx_AFRL 13.4.9 (0x20), GPIOx_AFRH 13.4.10 (0x24), GPIOx_BRR 13.4.11 (0x28), GPIOx_HSLVR 13.4.12 (0x2C), GPIOx_SECCFGR 13.4.13 (0x30), each section headed (x = A to J)",
+    "STM32U575xx/585xx reference manual RM0456 Rev 7, GPIOx_MODER bit description: bits 31:0 MODEy[1:0], 00 input mode, 01 general purpose output mode, 10 alternate function mode, 11 analog mode (reset state); reset value 0xFFFF FFFF for port G and for port H on STM32U575/585/59x/5Ax/5Fx/5Gx",
+]
+notes = [
+    "GPIO config is read-modify-write: MODER holds 2 bits per pin and an AFR nibble 4, so a pin's field span is cleared before the set value is OR-ed in.",
+    "WHICH AFR register a pin uses is decided by the pin number, not by the function: AFRL covers pins 0..7 and AFRH covers pins 8..15, each with 4 bits per pin counted from its OWN base. So pin 10's nibble is at bit 8 of AFRH, not at bit 40 of anything.",
+    "OTYPER, IDR, ODR, BSRR and BRR carry ONE bit per pin rather than two, so their shift is the pin index itself and not twice it. A rule applied uniformly across these registers is wrong for exactly those.",
+    "BSRR's low half SETS a pin and its high half CLEARS one, so either can be done with a single write and no read-modify-write. BRR at 0x28 is a second way to clear: its low half alone does what BSRR's high half does. Two registers reaching the same effect is worth knowing before someone reads a driver that uses one and a manual passage describing the other.",
+    "The per-pin field rows below are PARTIAL and deliberately stay that way. A pin's span follows from its index by rule -- 2 bits at [2n], a nibble at [4n] within its own AFR half, one bit at [n] -- and that rule is what composes a binding's words at generation time, so a row per pin would be a second statement of the same arithmetic rather than a new fact.",
+]
+
+[registers.MODER]
+offset = 0x0
+width = 32
+fields = { MODE10 = [20, 2], MODE11 = [22, 2], MODE12 = [24, 2], MODE13 = [26, 2], MODE14 = [28, 2], MODE15 = [30, 2] }
+notes = "Port mode, 2 bits per pin at [2n, 2] (PARTIAL: pins 10 to 15 stated, the six the board drives). 00 = input, 01 = general purpose output, 10 = alternate function, 11 = analog -- and 11 is the RESET state, so a pin nobody configures has its input buffer off. RM0456 names the fields MODEy, not MODERy as the H7 manual does."
+
+[registers.OTYPER]
+offset = 0x4
+width = 32
+fields = { }
+notes = "Output type, ONE bit per pin at [n]: 0 = push-pull (reset), 1 = open drain. Bits 31:16 are reserved."
+
+[registers.OSPEEDR]
+offset = 0x8
+width = 32
+fields = { }
+notes = "Output speed, 2 bits per pin at [2n]: 00 low, 01 medium, 10 high, 11 very high. A slew-rate setting, not a clock -- it does not make a bus faster, it stops a fast bus from being smeared."
+
+[registers.PUPDR]
+offset = 0xC
+width = 32
+fields = { }
+notes = "Pull-up/pull-down, 2 bits per pin at [2n]: 00 none, 01 pull-up, 10 pull-down. Whether an external pull is present is a board fact, never this table's."
+
+[registers.IDR]
+offset = 0x10
+width = 32
+fields = { }
+notes = "Input data, ONE bit per pin at [n], read-only. On this part it reads zero until MODER takes the pin out of analog mode."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { }
+notes = "Output data, ONE bit per pin at [n]. Read-modify-write; BSRR and BRR are the single-write alternatives."
+
+[registers.BSRR]
+offset = 0x18
+width = 32
+fields = { }
+notes = "Bit set/reset, write-only: bit [n] SETS pin n and bit [n+16] CLEARS it."
+
+[registers.LCKR]
+offset = 0x1C
+width = 32
+fields = { }
+notes = "Configuration lock. Freezes a pin's control and alternate-function registers until the next reset, through a write sequence rather than a plain write -- word access only."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { }
+notes = "Alternate function for pins 0..7, 4 bits per pin at [4n, 4]."
+
+[registers.AFRH]
+offset = 0x24
+width = 32
+fields = { }
+notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4]. The nibble's value IS the AF number. Reset 0x0000 0000."
+
+[registers.BRR]
+offset = 0x28
+width = 32
+fields = { }
+notes = "Bit reset, write-only: bit [n] CLEARS pin n. Does with one half-register what BSRR's high half does. Not present on csp/stm32h7."
+
+[registers.HSLVR]
+offset = 0x2C
+width = 32
+fields = { }
+notes = "High-speed low-voltage. Per-port counterpart of FLASH_OPTR's IO_VDDIO2_HSLV, which may be set only with VDDIO2 below 2.7 V. Reset 0x0000 0000."
+
+[registers.SECCFGR]
+offset = 0x30
+width = 32
+fields = { }
+notes = "Secure configuration, one bit per pin. Reset 0x0000 FFFF for ports A to E -- every pin secure out of reset. Governs nothing unless TZEN is set. Not present on csp/stm32h7."
+
+[constants]
+MODE_INPUT = 0
+MODE_OUTPUT = 1
+MODE_AF = 2
+MODE_ANALOG = 3
+OTYPER_OPEN_DRAIN = 1
+OSPEEDR_VERY_HIGH = 3
+PUPDR_PULL_UP = 1

@@ -166,7 +166,7 @@ fn error(code: &'static str, message: String) -> Diagnostic {
 }
 
 /// Appends `text` to `json` as a quoted, escaped JSON string.
-fn push_json_string(json: &mut String, text: &str) {
+pub(crate) fn push_json_string(json: &mut String, text: &str) {
     json.push('"');
     for character in text.chars() {
         match character {

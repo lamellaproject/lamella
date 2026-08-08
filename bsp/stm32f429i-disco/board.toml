@@ -180,3 +180,28 @@ pclk_hz = 16000000          # the APB clock feeding this board's bound USART. US
                             # so this is PCLK2 -- which is exactly why the key is not named for a bus
                             # number. Its prescaler also resets to no division, verified rather than
                             # taken.
+
+# --- the MEMS gyroscope's bus ------------------------------------------------------------------
+#
+# The board's motion sensor sits on its own SPI, and it is the one binding here that a HEADER does
+# not reach: the three data lines go nowhere else on the board, so this is the whole of that bus.
+#
+# THE CHIP SELECT IS A PLAIN GPIO AND THAT IS THE BOARD'S CHOICE, NOT A DRIVER'S. This controller
+# has an NSS of its own on PF6, and the board did not use it -- the select is wired to PC1 instead,
+# on a different port from all three data lines. So the pin is board truth, the driver owns the
+# level, and a binding that claimed the hardware select would describe a wiring that is not there.
+#
+# NO RATE IS STATED, DELIBERATELY. An SPI master's clock is bounded by what is on the other end,
+# and this binding names a bus rather than a part. The APB rate emits and the family's spi block
+# states the eight prescaler codes; a driver that knows which sensor answered picks one.
+
+[[bindings]]
+role = "mems-spi"
+kind = "spi"
+instance = "spi5"
+function = "AF5"            # DS9405 Rev 13 Table 12: the AF5 column is headed SPI1/2/3/4/5/6, and
+                            # all three of these cells are SPI5's.
+sck = { pin = "PF7" }
+miso = { pin = "PF8" }
+mosi = { pin = "PF9" }
+cs = { pin = "PC1", soft = true }

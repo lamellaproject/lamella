@@ -174,6 +174,26 @@ pub mod debug {
     /// `(name_len(u8), name(UTF-8), <val>)` -- the names here are runtime TYPE metadata
     /// (`fieldN` by slot, `[i]`, a box's `value`), not source local names.
     pub const DBG_CHILDREN: u8 = 0x1E;
+    /// Target -> host: console output produced SO FAR, while the program is still running.
+    /// Payload = `bytes(UTF-8)`, no header. UNSOLICITED and sequence-independent -- it arrives
+    /// during a [`DBG_RESUME`] that has not answered yet, so it carries the resume's `seq` but is
+    /// distinguished by its message TYPE. A host must not mistake it for the resume's reply.
+    ///
+    /// WHY IT EXISTS: every terminal frame ([`EVT_STOPPED`], `RUN_RESULT`) carries the WHOLE
+    /// stdout, and by construction none of them exists until the program has finished. A program
+    /// that prints, sleeps five seconds, then prints, therefore said nothing for five seconds and
+    /// then said everything -- correct output, delivered in the one shape that makes a running
+    /// program look hung.
+    ///
+    /// ADDITIVE ON PURPOSE, so there is no flag day: the terminal frames STILL carry the complete
+    /// stdout. A host that ignores this type behaves exactly as it did before, and an old firmware
+    /// that never sends one leaves a new host rendering the terminal buffer as it always has.
+    ///
+    /// A CHUNK NEVER SPLITS A CHARACTER. The target holds back a trailing high surrogate rather
+    /// than encoding half a pair, so the host can decode each frame independently and never has to
+    /// join across frames to find a code point. That decision is the target's because it is nearly
+    /// free here and would be a buffering rule on every host otherwise.
+    pub const EVT_OUTPUT: u8 = 0x1F;
 
     /// The `<val>` encoding [`DBG_VARS`]/[`DBG_CHILDREN`] carry: one tag byte, then the
     /// payload the tag implies (all little-endian). [`NULL`] is bare; [`INT32`] carries an
@@ -472,7 +492,7 @@ pub mod live {
 /// `thumbv7em-none-eabi` a `max-atomic-width` of 32 and `core::sync::atomic::AtomicU64` DOES
 /// NOT EXIST on it. The type resolves on a host and on wasm and nowhere else -- so it compiles for
 /// every target that is not a microcontroller, and fails for **every device the identity was added
-/// for**.
+/// for** -- a failure a host-only build cannot surface at all.
 ///
 /// # Why a source read rather than a build
 ///
@@ -836,14 +856,18 @@ fn failure(reason: &str) -> RunResult {
 /// -- this build's identity always carries the structured board/chip fields, even when a
 /// firmware left them `0` = unknown.
 fn serve_caps() -> lamella_wire::Capabilities {
-    serve_caps_with(RESIDENT_CORLIB_PRESENT.load(core::sync::atomic::Ordering::Relaxed))
+    use core::sync::atomic::Ordering;
+    serve_caps_with(
+        RESIDENT_CORLIB_PRESENT.load(Ordering::Relaxed),
+        MONOTONIC_CLOCK_LIVE.load(Ordering::Relaxed),
+    )
 }
 
-/// [`serve_caps`] with the resident-corlib answer supplied rather than read from the static, so the
-/// advertisement rule is checkable without a test having to reach into process-wide state -- which
-/// would make every other test in the process depend on whether that one had run yet.
+/// [`serve_caps`] with the resident-corlib and clock answers supplied rather than read from the
+/// statics, so the advertisement rule is checkable without a test having to reach into process-wide
+/// state -- which would make every other test in the process depend on whether that one had run yet.
 #[cfg(feature = "baked-image")]
-fn serve_caps_with(resident_corlib: bool) -> lamella_wire::Capabilities {
+fn serve_caps_with(resident_corlib: bool, monotonic_clock: bool) -> lamella_wire::Capabilities {
     use lamella_wire::Capabilities;
     Capabilities(
         Capabilities::BAKED_IMAGE
@@ -852,8 +876,33 @@ fn serve_caps_with(resident_corlib: bool) -> lamella_wire::Capabilities {
             | Capabilities::STEPPING
             | Capabilities::LOCALS
             | Capabilities::PROFILE_CHIPID
-            | if resident_corlib { Capabilities::RESIDENT_CORLIB } else { 0 },
+            | if resident_corlib { Capabilities::RESIDENT_CORLIB } else { 0 }
+            | if monotonic_clock { Capabilities::MONOTONIC_CLOCK } else { 0 },
     )
+}
+
+/// Whether this firmware installed a monotonic clock it CHECKED to be moving -- the source of
+/// [`lamella_wire::Capabilities::MONOTONIC_CLOCK`], recorded by [`note_monotonic_clock`].
+///
+/// A static for the same reason the resident-corlib answer is one: it is a property of the running
+/// FIRMWARE rather than of a request, settled once at boot and true for the board's whole life.
+/// It starts FALSE, so a firmware that installs no clock, or installs one without checking it,
+/// advertises nothing -- the bit has to be earned by a positive observation.
+#[cfg(feature = "baked-image")]
+static MONOTONIC_CLOCK_LIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Record that this firmware's monotonic clock was OBSERVED ADVANCING at boot, so a `HELLO_ACK`
+/// advertises [`lamella_wire::Capabilities::MONOTONIC_CLOCK`] and a host knows a timing number from
+/// this board means something.
+///
+/// The board's clock module calls this from `install`, which is the only place that has both the
+/// counter and the reason to look at it. Pass `false` to state the opposite explicitly -- a clock
+/// that was installed and found DEAD -- which keeps the bit clear without relying on nobody having
+/// set it.
+#[cfg(feature = "baked-image")]
+pub fn note_monotonic_clock(live: bool) {
+    MONOTONIC_CLOCK_LIVE.store(live, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether this firmware holds a resident corlib, and that corlib's content hash.
@@ -1509,12 +1558,50 @@ fn expand_reply(
 #[cfg(feature = "baked-image")]
 const RUN_SERVICE_STEPS: u32 = 256;
 
+/// Sends whatever console output the program has produced since `sent`, as a [`debug::EVT_OUTPUT`]
+/// frame, and advances `sent` past what went out.
+///
+/// The delta is taken from the VM's own output buffer rather than a tap, because the buffer IS the
+/// record and a cursor over it cannot lose a write or double-send one -- whereas a tap is a
+/// `fn` pointer that cannot capture this transport, and a side buffer for it would be a second
+/// copy of the same bytes with its own overflow question.
+///
+/// A TRAILING HIGH SURROGATE IS HELD BACK, so a frame never carries half of a pair: the host can
+/// then decode each frame on its own. It costs one comparison here and saves every host a
+/// cross-frame joining rule.
+///
+/// Nothing is sent when there is nothing new, so an idle or silent program adds no wire traffic.
+#[cfg(feature = "baked-image")]
+fn stream_output(
+    transport: &mut impl Transport,
+    vm: &Vm,
+    sent: &mut usize,
+) -> Result<(), TransportError> {
+    let output = vm.output();
+    let mut end = output.len();
+    if end <= *sent {
+        return Ok(());
+    }
+    if matches!(output[end - 1], 0xD800..=0xDBFF) {
+        end -= 1;
+        if end <= *sent {
+            return Ok(());
+        }
+    }
+    let text = String::from_utf16_lossy(&output[*sent..end]);
+    *sent = end;
+    transport.send(debug::EVT_OUTPUT, 0, text.as_bytes())
+}
+
 /// Run until a breakpoint, completion, a trap, or a [`debug::DBG_PAUSE`]: bounded bursts
 /// of steps with a wire poll between bursts, so a running target stays pause-able.
 /// A mid-run `HELLO` is answered with `caps` and ends the run ([`RunStop::Reclaimed`]);
 /// a mid-run detach is acked and ends it ([`RunStop::Detached`]) -- without these, a
 /// resume over a non-terminating program would leave the Lamella Link permanently deaf
 /// on every carrier.
+///
+/// Console output is streamed as it appears ([`debug::EVT_OUTPUT`]) rather than only in the
+/// terminal frame, so a long-running program is visible while it runs.
 #[cfg(feature = "baked-image")]
 fn run_until_stop(
     transport: &mut impl Transport,
@@ -1524,6 +1611,7 @@ fn run_until_stop(
     caps: lamella_wire::Capabilities,
 ) -> Result<RunStop, TransportError> {
     use lamella_cil_runtime::{PendingOp, Status};
+    let mut sent = vm.output().len();
     loop {
         for _ in 0..RUN_SERVICE_STEPS {
             match session.step(module, vm) {
@@ -1547,6 +1635,7 @@ fn run_until_stop(
             match lamella_cil_runtime::take_pending_op(vm) {
                 PendingOp::None | PendingOp::Yield => {}
                 PendingOp::SleepUntil(deadline) => {
+                    stream_output(transport, vm, &mut sent)?;
                     if let Some(stop) = wait_until(transport, vm, session, deadline, caps)? {
                         return Ok(stop);
                     }
@@ -1563,6 +1652,7 @@ fn run_until_stop(
                 }
             }
         }
+        stream_output(transport, vm, &mut sent)?;
         if let Some(stop) = service_wire(transport, session, caps)? {
             return Ok(stop);
         }
@@ -2252,13 +2342,16 @@ pub fn run_deployed_with(
     let entry = match lamella_cil_runtime::boot_baked(module, &mut vm, entry) {
         Ok(entry) => entry,
         Err(trap) => {
-            return Ok(Deployed::Completed(RunResult {
-                exit: 70,
-                stdout: format!(
-                    "{}BOOT TRAP (static constructor): {trap:?}",
-                    String::from_utf16_lossy(vm.output())
-                ),
-            }));
+            return Ok(completed(
+                transport,
+                RunResult {
+                    exit: 70,
+                    stdout: format!(
+                        "{}BOOT TRAP (static constructor): {trap:?}",
+                        String::from_utf16_lossy(vm.output())
+                    ),
+                },
+            ));
         }
     };
     let mut carrier: Result<(), TransportError> = Ok(());
@@ -2287,14 +2380,44 @@ pub fn run_deployed_with(
     carrier?;
     match outcome {
         Ok(lamella_cil_runtime::Ran::Finished(value)) => {
-            Ok(Deployed::Completed(run_result_of(&vm, &value)))
+            Ok(completed(transport, run_result_of(&vm, &value)))
         }
         Ok(lamella_cil_runtime::Ran::Interrupted) => Ok(Deployed::Interrupted),
-        Err(trap) => Ok(Deployed::Completed(RunResult {
-            exit: 70,
-            stdout: format!("{}TRAP: {trap:?}", String::from_utf16_lossy(vm.output())),
-        })),
+        Err(trap) => Ok(completed(
+            transport,
+            RunResult {
+                exit: 70,
+                stdout: format!("{}TRAP: {trap:?}", String::from_utf16_lossy(vm.output())),
+            },
+        )),
     }
+}
+
+/// Announce a finished deployed run on the wire, and hand the same result back to the firmware.
+///
+/// # Why the boot path reports at all, and why from HERE
+///
+/// A deployed run answers no request -- the board RESET into it, so there is no seq to reply to and
+/// nothing to return a value to. That is exactly why the result has to be SENT: a host that issued
+/// `DEPLOY_RUN` and is listening has no other way to learn the app's exit value or its output, and
+/// **discarding it is the difference between a deploy you can verify and one you can only assume.**
+/// Sent unsolicited at seq 0; a host that is not listening simply reads a frame it did not ask for,
+/// which the framing already tolerates.
+///
+/// It lives in the runner rather than in each firmware because it was written in each firmware and
+/// **nine of the ten got it wrong.** One board sent the frame; the rest either printed the app's
+/// output to their raw UART as human text -- which is not a wire frame and reaches no host driver --
+/// or dropped the result on the floor. `DEPLOY_RUN` therefore never delivered a `RUN_RESULT` on
+/// almost every board in the tree, and the one place a host had to wait was a 120-second timeout.
+/// A firmware cannot forget a step it does not perform.
+///
+/// A carrier fault here is deliberately DROPPED rather than propagated. The run's outcome is the
+/// return value, and it already happened; failing to announce it must not turn a completed run into
+/// an error, nor lose the exit code the caller is about to act on.
+#[cfg(feature = "baked-image")]
+fn completed(transport: &mut impl Transport, result: RunResult) -> Deployed {
+    let _ = transport.send(repl::RUN_RESULT, 0, &result.encode());
+    Deployed::Completed(result)
 }
 
 
@@ -2850,12 +2973,28 @@ pub fn send_image(transport: &mut impl Transport, seq: u16, image: &[u8]) -> Res
 
 /// Host driver: poll for the [`repl::RUN_RESULT`] matching `seq` (non-blocking; `None` if not in yet).
 ///
+/// `Ok(None)` means ONE thing -- no answer has arrived yet -- and the two other outcomes that used to
+/// share it now have their own. Both were indistinguishable from "keep waiting", so a caller polled
+/// each to its deadline and reported a timeout: the most expensive reading, because it points at the
+/// link when the link is fine.
+///
 /// # Errors
-/// Propagates a [`TransportError`] from the carrier.
+/// Propagates a [`TransportError`] from the carrier; [`TransportError::Refused`] when the target
+/// answered [`lamella_wire::msg::ERROR`] for this sequence; [`TransportError::MalformedReply`] when
+/// the result arrived at this sequence and did not decode.
 pub fn try_recv_result(transport: &mut impl Transport, seq: u16) -> Result<Option<RunResult>, TransportError> {
     while let Some(frame) = transport.poll()? {
         if frame.msg_type == repl::RUN_RESULT && frame.seq == seq {
-            return Ok(RunResult::decode(&frame.payload));
+            return match RunResult::decode(&frame.payload) {
+                Some(result) => Ok(Some(result)),
+                None => Err(TransportError::MalformedReply { msg_type: frame.msg_type }),
+            };
+        }
+        if frame.msg_type == lamella_wire::msg::ERROR && frame.seq == seq {
+            return Err(TransportError::Refused {
+                reason: frame.payload.first().copied().unwrap_or(0),
+                msg_type: lamella_wire::error::refused_message_type(&frame.payload).unwrap_or(0),
+            });
         }
     }
     Ok(None)
@@ -3147,6 +3286,91 @@ mod tests {
         assert_eq!(result.stdout, "hi\n");
     }
 
+    /// Console output streams as a DELTA, never re-sent, and never split mid-character.
+    ///
+    /// The three ways this can be quietly wrong are a missed delta (output that never arrives), a
+    /// re-sent one (the console repeats itself), and a chunk cut through a surrogate pair (the host
+    /// decodes a replacement character for text the program did write). Each gets a row.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn console_output_streams_as_a_delta_and_never_splits_a_surrogate_pair() {
+        use lamella_wire::{MemTransport, Transport};
+
+        let mut vm = Vm::new();
+        let mut host = MemTransport::new();
+        let mut sent = 0usize;
+
+        stream_output(&mut host, &vm, &mut sent).unwrap();
+        assert!(host.take_sent().is_empty(), "an empty delta must send nothing at all");
+
+        vm.write(&"first\n".encode_utf16().collect::<Vec<u16>>());
+        stream_output(&mut host, &vm, &mut sent).unwrap();
+        let mut peer = MemTransport::new();
+        peer.feed(&host.take_sent());
+        let frame = peer.poll().unwrap().expect("an EVT_OUTPUT frame");
+        assert_eq!(frame.msg_type, debug::EVT_OUTPUT);
+        assert_eq!(String::from_utf8_lossy(&frame.payload), "first\n");
+
+        stream_output(&mut host, &vm, &mut sent).unwrap();
+        assert!(host.take_sent().is_empty(), "an unchanged buffer must not be re-sent");
+
+        vm.write(&"second\n".encode_utf16().collect::<Vec<u16>>());
+        stream_output(&mut host, &vm, &mut sent).unwrap();
+        let mut peer = MemTransport::new();
+        peer.feed(&host.take_sent());
+        let frame = peer.poll().unwrap().expect("a second EVT_OUTPUT frame");
+        assert_eq!(String::from_utf8_lossy(&frame.payload), "second\n", "the delta, not the buffer");
+
+        vm.write(&[0xD83D]);
+        stream_output(&mut host, &vm, &mut sent).unwrap();
+        assert!(host.take_sent().is_empty(), "a trailing lead surrogate must wait for its trail");
+
+        vm.write(&[0xDE00]);
+        stream_output(&mut host, &vm, &mut sent).unwrap();
+        let mut peer = MemTransport::new();
+        peer.feed(&host.take_sent());
+        let frame = peer.poll().unwrap().expect("the completed pair");
+        assert_eq!(frame.payload, vec![0xF0, 0x9F, 0x98, 0x80], "the pair must arrive as one character");
+    }
+
+    /// The THREE states `try_recv_result` used to collapse into `Ok(None)`, each fed as the frame a
+    /// target really sends. Only the first may still be `Ok(None)`; the other two were polled to the
+    /// caller's deadline and reported as timeouts, which points the reader at a link that is fine.
+    #[test]
+    fn try_recv_result_separates_nothing_yet_from_a_refusal_and_from_a_malformed_reply() {
+        use lamella_wire::{MemTransport, error, msg};
+
+        let mut quiet = MemTransport::new();
+        assert_eq!(try_recv_result(&mut quiet, 4).unwrap(), None);
+
+        let mut driver = MemTransport::new();
+        let mut target = MemTransport::new();
+        target.send(msg::ERROR, 4, &error::unknown_message_type(repl::RUN_IMAGE)).unwrap();
+        driver.feed(&target.take_sent());
+        assert_eq!(
+            try_recv_result(&mut driver, 4),
+            Err(TransportError::Refused {
+                reason: error::UNKNOWN_MESSAGE_TYPE,
+                msg_type: repl::RUN_IMAGE,
+            })
+        );
+
+        let mut driver = MemTransport::new();
+        let mut target = MemTransport::new();
+        target.send(repl::RUN_RESULT, 4, &[1, 2, 3]).unwrap();
+        driver.feed(&target.take_sent());
+        assert_eq!(
+            try_recv_result(&mut driver, 4),
+            Err(TransportError::MalformedReply { msg_type: repl::RUN_RESULT })
+        );
+
+        let mut driver = MemTransport::new();
+        let mut target = MemTransport::new();
+        target.send(msg::ERROR, 5, &error::unknown_message_type(repl::RUN_IMAGE)).unwrap();
+        driver.feed(&target.take_sent());
+        assert_eq!(try_recv_result(&mut driver, 4).unwrap(), None);
+    }
+
     #[cfg(feature = "baked-image")]
     #[test]
     fn serve_one_baked_negotiates_then_runs_an_image() {
@@ -3249,12 +3473,31 @@ mod tests {
     #[test]
     fn a_resident_corlib_is_advertised_and_only_when_there_is_one() {
         use lamella_wire::Capabilities;
-        assert!(serve_caps_with(true).has(Capabilities::RESIDENT_CORLIB));
-        assert!(!serve_caps_with(false).has(Capabilities::RESIDENT_CORLIB));
+        assert!(serve_caps_with(true, false).has(Capabilities::RESIDENT_CORLIB));
+        assert!(!serve_caps_with(false, false).has(Capabilities::RESIDENT_CORLIB));
         for resident in [true, false] {
-            assert!(serve_caps_with(resident).has(Capabilities::BAKED_IMAGE));
-            assert!(serve_caps_with(resident).has(Capabilities::PROFILE_CHIPID));
+            assert!(serve_caps_with(resident, false).has(Capabilities::BAKED_IMAGE));
+            assert!(serve_caps_with(resident, false).has(Capabilities::PROFILE_CHIPID));
         }
+    }
+
+    /// The clock bit is advertised only on a board that OBSERVED its counter moving, and the two
+    /// answers are independent of the resident-corlib one -- a board can have either, both or
+    /// neither, and folding two facts into one advertisement must not let one imply the other.
+    ///
+    /// The bit exists because this seam cannot report its own failure: a dead clock is a
+    /// `fn() -> u64` returning a well-formed constant, which is why a self-timing benchmark on a
+    /// frozen board reported 0 ms with its checksum gate passing.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_moving_clock_is_advertised_and_only_when_it_was_seen_to_move() {
+        use lamella_wire::Capabilities;
+        assert!(serve_caps_with(false, true).has(Capabilities::MONOTONIC_CLOCK));
+        assert!(!serve_caps_with(false, false).has(Capabilities::MONOTONIC_CLOCK));
+        assert!(!serve_caps_with(true, false).has(Capabilities::MONOTONIC_CLOCK));
+        assert!(!serve_caps_with(false, true).has(Capabilities::RESIDENT_CORLIB));
+        assert!(serve_caps_with(true, true).has(Capabilities::RESIDENT_CORLIB));
+        assert!(serve_caps_with(true, true).has(Capabilities::MONOTONIC_CLOCK));
     }
 
     /// A type the target DOES implement still gets its own reply -- so the refusal above was added at the

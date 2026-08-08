@@ -4,6 +4,18 @@
 pub const BOARD_MODEL: u16 = 2;
 pub const BOARD_VENDOR: &str = "RaspberryPi";
 
+/// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+/// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+/// peripherals of the same kind can share no register at all, so a consumer that selects a
+/// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+/// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+/// name a driver; and a uart is a different register map on every family, so the kind does
+/// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+pub const UART0_DRIVER_FAMILY: &str = "rp2350-uart";
+pub const SPI0_DRIVER_FAMILY: &str = "rp2350-spi";
+pub const I2C0_DRIVER_FAMILY: &str = "rp2350-i2c";
+pub const ADC_DRIVER_FAMILY: &str = "rp2350-adc";
+
 pub const UART0_BASE: u32 = 0x40070000;
 pub const UART0_RESET_MASK: u32 = 0x4000240;
 pub const UART0_IO_TX_CTRL: u32 = 0x40028004;
@@ -49,6 +61,11 @@ pub const PLL_SYS_FBDIV_PLL_150_48: u32 = 125;
 pub const PLL_SYS_PRIM_PLL_150_48: u32 = 0x52000;
 pub const PLL_USB_FBDIV_PLL_150_48: u32 = 100;
 pub const PLL_USB_PRIM_PLL_150_48: u32 = 0x55000;
+
+pub const LED_PORT_BASE: u32 = 0xD0000000;
+pub const LED_PIN: u32 = 25;
+pub const LED_MASK: u32 = 0x2000000;
+pub const LED_ACTIVE_LOW: u32 = 0;
 
 /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
 /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought

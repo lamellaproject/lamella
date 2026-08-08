@@ -1,0 +1,42 @@
+# PARTS table for the stm32f769 family. Pin lists are PARTIAL present-lists: they carry the pins
+# the boards reach, so a consumer must not read one as the package.
+#
+# WHY THIS IS A FAMILY OF ITS OWN AND NOT A ROW ON `stm32f7`, since the two are one letter apart in
+# a marketing name. A family here owns ONE reference manual and one pin-function table, and these
+# two parts do not share either. RM0410's introduction says it "provides complete information on
+# how to use the STM32F76xxx and STM32F77xxx microcontroller memory and peripherals"; RM0385's says
+# the same sentence about the STM32F75xxx and STM32F74xxx. Two manuals, each claiming completeness
+# for a set the other does not mention. That test is what admitted the STM32F439 into the family
+# its F429 sibling already had -- RM0090 names both lines by name -- and it is the same test giving
+# the opposite answer here.
+#
+# WHERE THIS FAMILY AND `stm32f7` AGREE ON A NUMBER, THAT IS TWO FACTS AGREEING RATHER THAN ONE
+# FACT COPIED. Both manuals place USART1 at 0x40011000, the GPIO ports from 0x40020000, and the RCC
+# at 0x40023800; each was read from RM0410 here and each was already read from RM0385 there. Had
+# the vendor moved a peripheral the two rows would legitimately differ and neither would be wrong.
+#
+# ram: SRAM1 ONLY, on the same grounds the STM32F7 line states it. This part's RAM is
+# four memories that ABUT -- DTCM (128 KB) at 0x20000000, SRAM1 (368 KB) at 0x20020000, SRAM2
+# (16 KB) at 0x2007C000, an unbroken 512 KB span to 0x2007FFFF -- but they sit on different
+# interfaces. The DTCM is tightly coupled to the core rather than on the bus matrix for every
+# master, and RM0410 names SRAM1 alone "Main internal SRAM1". A 16 KB instruction TCM at the
+# instruction interface is reserved for the CPU entirely and is not RAM a program's data can use.
+
+[table]
+kind = "parts"
+family = "stm32f769"
+sources = [
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5: Table 1 register boundary addresses -- SRAM2 (16 KB) 0x2007C000-0x2007FFFF, SRAM1 (368 KB) 0x20020000-0x2007BFFF, DTCM (128 KB) 0x20000000-0x2001FFFF; the memory overview names 'Main internal SRAM1 (368 KB)'",
+    "STM32F765xx/STM32F767xx/STM32F768Ax/STM32F769xx datasheet DS11532 Rev 9: Table 139 ordering information scheme -- pin count N = 216 pins, flash size I = 2048 Kbytes, package H = TFBGA, which is what decodes the STM32F769NIH6 order code; section 3.5 gives system SRAM up to 512 Kbytes as SRAM1 368 KB plus SRAM2 16 KB plus DTCM-RAM 128 KB, with a separate 16 Kbyte instruction TCM and 4 Kbytes of backup SRAM",
+]
+
+[[parts]]
+part = "stm32f769ni"
+package = "216-pin TFBGA"
+flash = 0x200000
+ram = 0x5C000
+pins = [
+    "PA0", "PA9-PA10",
+    "PJ5", "PJ13",
+]
+source = "DS11532 Rev 9 ordering information (N = 216 pins, I = 2048 Kbytes flash, H = TFBGA) + RM0410 Rev 5 memory map (SRAM1 368 KB). The pin list is PARTIAL rather than the package's 216: PA9 and PA10 carry the virtual COM port, PA0 the user button, and PJ5 and PJ13 the two user LEDs -- and PORT J is the claim worth stating, because it exists only on the large packages and a part row that named it without evidence would be describing a package this board does not have. DS11532 Rev 9 Table 13 carries a row for PA0, PA9 and PA10, and UM2033 Rev 5 Table 4 assigns the two LEDs to port J by name."

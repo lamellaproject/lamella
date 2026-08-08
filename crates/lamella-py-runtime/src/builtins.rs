@@ -212,6 +212,10 @@ pub enum Builtin {
     /// `(5).is_integer()` -- always True. An int IS an integer; the method exists so a caller holding
     /// a number can ask without knowing whether it is an int or a float.
     IntIsInteger = 79,
+    /// The type of a coroutine object -- what calling an `async def` returns. A type object only.
+    /// DISTINCT from [`Builtin::GeneratorType`] because a program can tell them apart: a coroutine is
+    /// not an iterator, and `await` accepts one where `yield from` does not.
+    CoroutineType = 80,
 }
 
 impl Builtin {
@@ -300,6 +304,7 @@ impl Builtin {
             77 => Some(Builtin::Open),
             78 => Some(Builtin::Dir),
             79 => Some(Builtin::IntIsInteger),
+            80 => Some(Builtin::CoroutineType),
             _ => None,
         }
     }
@@ -391,6 +396,7 @@ impl Builtin {
             Builtin::BuiltinFunctionType => "builtin_function_or_method",
             Builtin::MethodType => "method",
             Builtin::GeneratorType => "generator",
+            Builtin::CoroutineType => "coroutine",
             Builtin::ModuleType => "module",
             Builtin::Open => "open",
             Builtin::Dir => "dir",
@@ -544,6 +550,8 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         Builtin::BuiltinFunctionType
     } else if model.is_generator(value) {
         Builtin::GeneratorType
+    } else if model.is_coroutine(value) {
+        Builtin::CoroutineType
     } else if model.is_module_object(value) {
         Builtin::ModuleType
     } else {
@@ -668,6 +676,7 @@ pub fn call_builtin(
             if let Some((re, im)) = model.complex_value(args[0]) {
                 return model.new_float(libm::hypot(re, im));
             }
+            #[cfg(feature = "float")]
             if let Some(f) = model.float_value(args[0]) {
                 return model.new_float(libm::fabs(f));
             }
@@ -771,14 +780,18 @@ pub fn call_builtin(
                     .with_message(Trap::TypeError, "sum() can't sum bytearray [use b''.join(seq) instead]"));
             }
             let elements = collect_iterable(model, &[iterable], functions, depth)?;
-            let all_numeric = model.as_f64(start).is_some()
-                && elements.iter().all(|&e| model.as_f64(e).is_some());
-            let any_float =
-                model.is_float(start) || elements.iter().any(|&e| model.is_float(e));
-            if all_numeric && any_float {
-                let start = model.as_f64(start).unwrap_or(0.0);
-                let total = neumaier_sum(start, elements.iter().map(|&e| model.as_f64(e).unwrap_or(0.0)));
-                return model.new_float(total);
+            #[cfg(feature = "float")]
+            {
+                let all_numeric = model.as_f64(start).is_some()
+                    && elements.iter().all(|&e| model.as_f64(e).is_some());
+                let any_float =
+                    model.is_float(start) || elements.iter().any(|&e| model.is_float(e));
+                if all_numeric && any_float {
+                    let start = model.as_f64(start).unwrap_or(0.0);
+                    let total =
+                        neumaier_sum(start, elements.iter().map(|&e| model.as_f64(e).unwrap_or(0.0)));
+                    return model.new_float(total);
+                }
             }
             let mut acc = start;
             for element in elements {
@@ -814,7 +827,9 @@ pub fn call_builtin(
         }
         Builtin::StrMaketrans => {
             let chars = |model: &ObjectModel, v: Value| {
-                model.str_value(v).map(|s| s.chars().collect::<alloc::vec::Vec<char>>())
+                model
+                    .str_bytes(v)
+                    .map(|s| crate::object::code_points(s).collect::<alloc::vec::Vec<u32>>())
             };
             let (from, to, drop) = match args {
                 [x, y] => (chars(model, *x), chars(model, *y), None),
@@ -859,7 +874,7 @@ pub fn call_builtin(
                 } else if model.is_long(*x) || model.is_bigint(*x) {
                     Ok(*x)
                 } else if model.is_str(*x) {
-                    let raw = model.str_value(*x).map(String::from).unwrap_or_default();
+                    let raw = String::from(model.str_text(*x)?);
                     let cleaned = strip_underscores(raw.trim());
                     if let Some(n) = cleaned.as_deref().and_then(|s| s.parse::<i128>().ok()) {
                         model.new_long(n)
@@ -899,18 +914,27 @@ pub fn call_builtin(
                 if !model.is_str(*x) {
                     return Err(Trap::TypeError);
                 }
-                let raw = model.str_value(*x).map(String::from).unwrap_or_default();
+                let raw = String::from(model.str_text(*x)?);
                 parse_int_radix(&raw, base, *x, model)
             }
             _ => Err(Trap::TypeError),
         },
+        #[cfg(not(feature = "float"))]
+        Builtin::Float => Err(Trap::FloatUnavailable),
+        #[cfg(feature = "float")]
         Builtin::Float => match args {
             [] => model.new_float(0.0),
             [x] => {
                 if let Some(f) = model.as_f64(*x) {
                     model.new_float(f)
                 } else if model.is_str(*x) {
-                    let text = model.str_value(*x).map(String::from).unwrap_or_default();
+                    let text = String::from(model.str_text(*x)?);
+                    #[cfg(not(feature = "float"))]
+                    {
+                        let _ = text;
+                        return Err(Trap::FloatUnavailable);
+                    }
+                    #[cfg(feature = "float")]
                     match parse_python_float(&text) {
                         Some(f) => model.new_float(f),
                         None => {
@@ -943,7 +967,13 @@ pub fn call_builtin(
             let [x] = args else {
                 return Err(Trap::TypeError);
             };
-            let text = model.str_value(*x).map(String::from).ok_or(Trap::TypeError)?;
+            let text = model.str_text(*x).map(String::from)?;
+            #[cfg(not(feature = "float"))]
+            {
+                let _ = text;
+                return Err(Trap::FloatUnavailable);
+            }
+            #[cfg(feature = "float")]
             match parse_hex_float(&text) {
                 Some(f) => model.new_float(f),
                 None => Err(model
@@ -957,7 +987,7 @@ pub fn call_builtin(
                 if let Some((re, im)) = model.as_complex(*x) {
                     model.new_complex(re, im)
                 } else if model.is_str(*x) {
-                    let text = model.str_value(*x).map(String::from).unwrap_or_default();
+                    let text = String::from(model.str_text(*x)?);
                     match parse_python_complex(&text) {
                         Some((re, im)) => model.new_complex(re, im),
                         None => Err(model.with_message(
@@ -1061,7 +1091,7 @@ pub fn call_builtin(
             if let Some(method) = model.find_dunder(arg, "__reversed__") {
                 return call_value(method, &[], functions, model, depth);
             }
-            let reversible = model.str_value(arg).is_some()
+            let reversible = model.str_bytes(arg).is_some()
                 || model.is_list(arg)
                 || model.is_tuple(arg)
                 || model.is_range(arg)
@@ -1093,9 +1123,9 @@ pub fn call_builtin(
             if args.len() != 1 {
                 return Err(Trap::TypeError);
             }
-            let s = model.str_value(args[0]).ok_or(Trap::TypeError)?;
-            let mut chars = s.chars();
-            match (chars.next(), chars.next()) {
+            let s = model.str_bytes(args[0]).ok_or(Trap::TypeError)?;
+            let mut points = crate::object::code_points(s);
+            match (points.next(), points.next()) {
                 (Some(c), None) => Value::fixnum(c as i32).ok_or(Trap::Overflow),
                 _ => Err(Trap::TypeError),
             }
@@ -1116,6 +1146,7 @@ pub fn call_builtin(
         }
         Builtin::Pow => match args {
             [base, exp] => {
+                #[cfg(feature = "float")]
                 if model.is_float(*base) || model.is_float(*exp) {
                     let b = model.as_f64(*base).ok_or(Trap::TypeError)?;
                     let e = model.as_f64(*exp).ok_or(Trap::TypeError)?;
@@ -1123,8 +1154,13 @@ pub fn call_builtin(
                 }
                 let e = exp.as_int().ok_or(Trap::TypeError)?;
                 if e < 0 {
-                    let b = model.as_f64(*base).ok_or(Trap::TypeError)?;
-                    return crate::interp::float_pow(b, e as f64, model);
+                    #[cfg(feature = "float")]
+                    {
+                        let b = model.as_f64(*base).ok_or(Trap::TypeError)?;
+                        return crate::interp::float_pow(b, e as f64, model);
+                    }
+                    #[cfg(not(feature = "float"))]
+                    return Err(Trap::FloatUnavailable);
                 }
                 let exp_u = u32::try_from(e).map_err(|_| Trap::Overflow)?;
                 if let Some(b) = model.as_i128(*base) {
@@ -1224,10 +1260,12 @@ pub fn call_builtin(
                 [x, n] => (*x, Some(*n)),
                 _ => return Err(Trap::TypeError),
             };
+            #[cfg(feature = "float")]
             if let Some(f) = model.float_value(value) {
                 let nd = ndigits.map(|n| n.as_int().ok_or(Trap::TypeError)).transpose()?;
-                round_float(f, nd, model)
-            } else if let Some(x) = model.as_i128(value) {
+                return round_float(f, nd, model);
+            }
+            if let Some(x) = model.as_i128(value) {
                 let nd = ndigits.map_or(Ok(0), |n| n.as_int().ok_or(Trap::TypeError))?;
                 model.new_long(round_half_even(x, nd))
             } else if let Some(method) = model.find_dunder(value, "__round__") {
@@ -1288,12 +1326,13 @@ pub fn call_builtin(
             } else if let Some(names) = match_args {
                 let mut cache = InlineCache::empty();
                 for name_val in names.iter().take(count) {
-                    let Some(attr) = model.str_value(*name_val).map(String::from) else {
+                    if model.str_bytes(*name_val).is_none() {
                         return Err(model.raise_named_exception(
                             "TypeError",
                             "__match_args__ elements must be strings",
                         ));
-                    };
+                    }
+                    let attr = String::from(model.str_text(*name_val)?);
                     match model.getattr(subject, &attr, &mut cache) {
                         Ok(v) => values.push(v),
                         Err(Trap::AttributeError) => return Ok(Value::NONE),
@@ -1328,7 +1367,7 @@ pub fn call_builtin(
         Builtin::Format => {
             let (value, spec) = match args {
                 [v] => (*v, String::new()),
-                [v, s] => (*v, model.str_value(*s).map(String::from).ok_or(Trap::TypeError)?),
+                [v, s] => (*v, model.str_text(*s).map(String::from)?),
                 _ => return Err(Trap::TypeError),
             };
             if let Some(method) = model.find_dunder(value, "__format__") {
@@ -1347,7 +1386,7 @@ pub fn call_builtin(
                 ),
                 [b, order] => (
                     model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?,
-                    model.str_value(*order).map(String::from).ok_or(Trap::TypeError)?,
+                    model.str_text(*order).map(String::from)?,
                 ),
                 _ => return Err(Trap::TypeError),
             };
@@ -1355,7 +1394,7 @@ pub fn call_builtin(
         }
         Builtin::BytesFromhex => {
             let [s] = args else { return Err(Trap::TypeError); };
-            let hex = model.str_value(*s).map(String::from).ok_or(Trap::TypeError)?;
+            let hex = model.str_text(*s).map(String::from)?;
             let digits: alloc::vec::Vec<char> = hex.chars().filter(|c| !c.is_whitespace()).collect();
             if digits.len() % 2 != 0 {
                 return Err(Trap::ValueError);
@@ -1410,6 +1449,7 @@ pub fn call_builtin(
         | Builtin::BuiltinFunctionType
         | Builtin::MethodType
         | Builtin::GeneratorType
+        | Builtin::CoroutineType
         | Builtin::ModuleType) => {
             let message = alloc::format!("cannot create '{}' instances", only_a_type.python_name());
             Err(model.raise_named_exception("TypeError", &message))
@@ -1420,7 +1460,7 @@ pub fn call_builtin(
                 [obj, name, default] => (*obj, *name, Some(*default)),
                 _ => return Err(Trap::TypeError),
             };
-            let attr = String::from(model.str_value(name).ok_or(Trap::TypeError)?);
+            let attr = String::from(model.str_text(name)?);
             let mut cache = InlineCache::empty();
             match getattr_hooked(obj, &attr, &mut cache, functions, model, depth) {
                 Ok(value) => Ok(value),
@@ -1466,7 +1506,7 @@ pub fn call_builtin(
             let (path, mode) = match args {
                 [path] => (*path, "r"),
                 [path, mode] => {
-                    let text = model.str_value(*mode).ok_or(Trap::TypeError)?;
+                    let text = model.str_text(*mode)?;
                     (*path, text)
                 }
                 _ => return Err(Trap::TypeError),
@@ -1476,8 +1516,8 @@ pub fn call_builtin(
                 Ok(parsed) => parsed,
                 Err(message) => return Err(model.raise_named_exception("ValueError", &message)),
             };
-            let path = match model.str_value(path) {
-                Some(path) => String::from(path),
+            let path = match model.str_bytes(path) {
+                Some(_) => String::from(model.str_text(path)?),
                 None => {
                     let kind = model.type_name_of(path);
                     let message = alloc::format!(
@@ -1527,7 +1567,7 @@ pub fn call_builtin(
             let [obj, name] = args else {
                 return Err(Trap::TypeError);
             };
-            let attr = String::from(model.str_value(*name).ok_or(Trap::TypeError)?);
+            let attr = String::from(model.str_text(*name)?);
             let mut cache = InlineCache::empty();
             match getattr_hooked(*obj, &attr, &mut cache, functions, model, depth) {
                 Ok(_) => Ok(Value::TRUE),
@@ -1543,7 +1583,7 @@ pub fn call_builtin(
             let [obj, name, value] = args else {
                 return Err(Trap::TypeError);
             };
-            let attr = String::from(model.str_value(*name).ok_or(Trap::TypeError)?);
+            let attr = String::from(model.str_text(*name)?);
             set_attr(*obj, &attr, *value, functions, model, depth)?;
             Ok(Value::NONE)
         }
@@ -1551,8 +1591,8 @@ pub fn call_builtin(
             let [obj, name] = args else {
                 return Err(Trap::TypeError);
             };
-            let attr = String::from(model.str_value(*name).ok_or(Trap::TypeError)?);
-            model.py_delattr_instance(*obj, &attr)?;
+            let attr = String::from(model.str_text(*name)?);
+            model.py_delattr(*obj, &attr)?;
             Ok(Value::NONE)
         }
         Builtin::Hash => {
@@ -1653,6 +1693,7 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
                     || model.is_unbound_method(value)
             }
             Some(Builtin::GeneratorType) => model.is_generator(value),
+            Some(Builtin::CoroutineType) => model.is_coroutine(value),
             Some(Builtin::ModuleType) => model.is_module_object(value),
             _ => return Err(Trap::TypeError),
         };
@@ -1766,7 +1807,7 @@ pub fn call_builtin_kw(
             let bytes = match posargs {
                 [b] => model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?,
                 [b, order] => {
-                    byteorder = model.str_value(*order).map(String::from).ok_or(Trap::TypeError)?;
+                    byteorder = model.str_text(*order).map(String::from)?;
                     model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?
                 }
                 _ => return Err(Trap::TypeError),
@@ -1777,7 +1818,7 @@ pub fn call_builtin_kw(
                     "signed" => signed = model.py_truthy(value)?.unwrap_or(false),
                     "byteorder" if posargs.len() == 1 => {
                         byteorder =
-                            model.str_value(value).map(String::from).ok_or(Trap::TypeError)?;
+                            model.str_text(value).map(String::from)?;
                     }
                     other => {
                         let message = alloc::format!(
@@ -1859,7 +1900,7 @@ fn print_kw(
         if value.is_none() {
             Ok(String::from(default))
         } else {
-            model.str_value(value).map(String::from).ok_or(Trap::TypeError)
+            model.str_text(value).map(String::from)
         }
     };
     let mut sep = String::from(" ");
@@ -1954,7 +1995,7 @@ fn dict_kw(
         _ => return Err(Trap::TypeError),
     };
     for &(name, value) in kwargs {
-        match entries.iter().position(|(k, _)| model.str_value(*k) == Some(name)) {
+        match entries.iter().position(|(k, _)| model.str_bytes(*k) == Some(name.as_bytes())) {
             Some(i) => entries[i].1 = value,
             None => {
                 let key = model.new_str(name)?;
@@ -2002,10 +2043,10 @@ fn call_str_dunder(
     depth: usize,
 ) -> Result<String, Trap> {
     let result = call_value(method, &[], functions, model, depth)?;
-    Ok(model
-        .str_value(result)
-        .map(String::from)
-        .unwrap_or_else(|| model.display(result)))
+    match model.str_bytes(result) {
+        Some(_) => Ok(String::from(model.str_text(result)?)),
+        None => model.display(result),
+    }
 }
 
 /// The display form of `value` for `print`/`str`: an instance's `__str__`, else its `__repr__`
@@ -2029,7 +2070,7 @@ fn display_arg(
     {
         return repr_arg(value, functions, model, depth);
     }
-    Ok(model.display(value))
+    model.display(value)
 }
 
 /// The repr form of `value` for `repr()`: an instance's `__repr__`, else the default repr. Recurses
@@ -2283,8 +2324,8 @@ fn bytes_from_args(
             Ok(out)
         }
         [source, encoding] => {
-            let text = model.str_value(*source).map(String::from).ok_or(Trap::TypeError)?;
-            let name = model.str_value(*encoding).map(String::from).ok_or(Trap::TypeError)?;
+            let text = model.str_text(*source).map(String::from)?;
+            let name = model.str_text(*encoding).map(String::from)?;
             match name.to_ascii_lowercase().replace('-', "").as_str() {
                 "utf8" | "ascii" => Ok(text.into_bytes()),
                 _ => Err(Trap::Unsupported),
@@ -2336,6 +2377,7 @@ pub(crate) fn collect_iterable(
 /// (case-insensitive), and `_` digit separators. `None` for anything else (the caller raises a
 /// `ValueError`). Rust's `f64` parser already accepts exactly this grammar EXCEPT the underscores
 /// and whitespace, which are handled here.
+#[cfg(feature = "float")]
 fn parse_python_float(s: &str) -> Option<f64> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -2349,6 +2391,7 @@ fn parse_python_float(s: &str) -> Option<f64> {
 /// the `p` exponent a power of TWO in decimal. `None` for anything malformed (the caller raises the
 /// ValueError). The significand accumulates in `f64`, exact for a normalized value (<= 13 hex
 /// fraction digits = 53 bits), so every representable double round-trips.
+#[cfg(feature = "float")]
 fn parse_hex_float(s: &str) -> Option<f64> {
     let trimmed = s.trim();
     let (negative, rest) = match trimmed.strip_prefix('-') {
@@ -2394,6 +2437,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 /// there is none.
 /// Neumaier compensated summation (an improved Kahan): tracks the lost low-order bits in `c` so a
 /// large-then-small run (`[1e20, 1, -1e20]`) keeps the small term. Backs `sum()` over floats.
+#[cfg(feature = "float")]
 fn neumaier_sum(start: f64, values: impl Iterator<Item = f64>) -> f64 {
     let mut sum = start;
     let mut compensation = 0.0;
@@ -2523,6 +2567,7 @@ fn parse_imag_coeff(s: &str) -> Option<f64> {
 /// `round(float[, ndigits])`: with no `ndigits`, the nearest integer with ties to even, as an `int`
 /// (`round(2.5) == 2`); with `ndigits`, the value rounded to that many places, as a `float`
 /// (`round(2.675, 2) == 2.67`). A non-finite float with no `ndigits` has no integer value.
+#[cfg(feature = "float")]
 fn round_float(f: f64, ndigits: Option<i64>, model: &mut ObjectModel) -> Result<Value, Trap> {
     match ndigits {
         None => {
@@ -2543,6 +2588,7 @@ fn round_float(f: f64, ndigits: Option<i64>, model: &mut ObjectModel) -> Result<
 }
 
 /// The nearest integral `f64` to `f`, ties to even (`2.5 -> 2.0`, `3.5 -> 4.0`, `-0.5 -> 0.0`).
+#[cfg(feature = "float")]
 fn round_half_even_f64(f: f64) -> f64 {
     let floor = libm::floor(f);
     let diff = f - floor;
@@ -2560,6 +2606,7 @@ fn round_half_even_f64(f: f64) -> f64 {
 /// `round(f, ndigits)` as a float. For `ndigits >= 0`, format to that many places -- Rust's
 /// formatter rounds half-to-even on the EXACT value, matching CPython's `float.__round__` -- and
 /// re-parse. For a negative `ndigits`, scale by `10^(-ndigits)`, round to even, and scale back.
+#[cfg(feature = "float")]
 fn round_to_digits(f: f64, ndigits: i64) -> f64 {
     if !f.is_finite() {
         return f;

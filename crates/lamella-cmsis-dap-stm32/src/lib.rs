@@ -1,5 +1,10 @@
 //! STMicroelectronics STM32 flash programming over a Lamella debug probe.
 
+mod h7;
+pub use h7::{
+    STM32H7_BANK2_BASE, STM32H7_FLASH_BASE, STM32H7_FLASH_WORD, STM32H7_SECTOR, Stm32H7Flash,
+};
+
 use lamella_probe_core::{CallFrame, ProbeError, TargetAccess};
 
 const FLASH_KEYR: u32 = 0x4002_3C04;
@@ -15,7 +20,7 @@ const CR_PSIZE_X32: u32 = 0b10 << 8;
 const CR_STRT: u32 = 1 << 16;
 const CR_LOCK: u32 = 1 << 31;
 
-/// STM32F4 embedded-flash programming, added to a CMSIS-DAP [`TargetAccess`] probe. Halt the core before
+/// STM32F4 embedded-flash programming, added to ANY [`TargetAccess`] probe. Halt the core before
 /// erasing or writing so it is not fetching from flash during the operation, and program only
 /// erased (0xFF) flash.
 pub trait Stm32F4Flash {
@@ -77,6 +82,36 @@ const F0_SR_BSY: u32 = 1 << 0;
 const F0_SR_PGERR: u32 = 1 << 2;
 const F0_SR_WRPRTERR: u32 = 1 << 4;
 const F0_SR_EOP: u32 = 1 << 5;
+
+/// The sector sizes of an STM32F4 with 1 MB of flash, in order from sector 0: four of 16 KB, one
+/// of 64 KB, then seven of 128 KB (RM0090).
+pub const STM32F4_SECTOR_SIZES: [usize; 12] = [
+    16 * 1024, 16 * 1024, 16 * 1024, 16 * 1024,
+    64 * 1024,
+    128 * 1024, 128 * 1024, 128 * 1024, 128 * 1024, 128 * 1024, 128 * 1024, 128 * 1024,
+];
+
+/// The sector sizes of an STM32F74x/F75x with 1 MB of flash, in order from sector 0 (RM0385).
+pub const STM32F7_SECTOR_SIZES: [usize; 8] = [
+    32 * 1024, 32 * 1024, 32 * 1024, 32 * 1024, 128 * 1024, 256 * 1024, 256 * 1024, 256 * 1024,
+];
+
+/// How many sectors from 0 an image of `len` bytes spans, given a family's sector `sizes`.
+///
+/// Saturates at `sizes.len()`: a part with more flash than the table describes is a table that
+/// needs extending, and quietly erasing fewer sectors than an image needs is exactly the failure
+/// this exists to prevent.
+#[must_use]
+pub fn sectors_covering(len: usize, sizes: &[usize]) -> u32 {
+    let mut covered = 0usize;
+    for (index, size) in sizes.iter().enumerate() {
+        covered += size;
+        if covered >= len {
+            return index as u32 + 1;
+        }
+    }
+    sizes.len() as u32
+}
 
 /// Page size on the parts this drives (RM0091 Table 5: 2 KB pages; an F091 has 128 of them).
 pub const STM32F0_PAGE: u32 = 2048;
@@ -218,4 +253,51 @@ fn wait_not_busy<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
         }
     }
     Err(ProbeError::Timeout("STM32 flash busy"))
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn the_f4_and_f7_geometries_are_not_interchangeable() {
+        let image = 200 * 1024;
+        assert_eq!(sectors_covering(image, &STM32F4_SECTOR_SIZES), 6);
+        assert_eq!(sectors_covering(image, &STM32F7_SECTOR_SIZES), 5);
+        assert_ne!(
+            sectors_covering(image, &STM32F4_SECTOR_SIZES),
+            sectors_covering(image, &STM32F7_SECTOR_SIZES),
+            "if these ever agree the test has stopped discriminating"
+        );
+    }
+
+    #[test]
+    fn a_sector_boundary_is_covered_by_that_sector_and_not_the_next() {
+        assert_eq!(sectors_covering(32 * 1024, &STM32F7_SECTOR_SIZES), 1);
+        assert_eq!(sectors_covering(32 * 1024 + 1, &STM32F7_SECTOR_SIZES), 2);
+        assert_eq!(sectors_covering(16 * 1024, &STM32F4_SECTOR_SIZES), 1);
+        assert_eq!(sectors_covering(16 * 1024 + 1, &STM32F4_SECTOR_SIZES), 2);
+    }
+
+    #[test]
+    fn an_image_larger_than_the_table_saturates_rather_than_wrapping() {
+        let huge = 4 * 1024 * 1024;
+        assert_eq!(sectors_covering(huge, &STM32F7_SECTOR_SIZES), STM32F7_SECTOR_SIZES.len() as u32);
+        assert_eq!(sectors_covering(huge, &STM32F4_SECTOR_SIZES), STM32F4_SECTOR_SIZES.len() as u32);
+    }
+
+    #[test]
+    fn the_tables_describe_the_flash_the_parts_actually_have() {
+        assert_eq!(
+            STM32F4_SECTOR_SIZES.iter().sum::<usize>(),
+            1024 * 1024,
+            "a 1 MB F4 is 4x16K + 64K + 7x128K = twelve sectors"
+        );
+        assert_eq!(
+            STM32F7_SECTOR_SIZES.iter().sum::<usize>(),
+            1024 * 1024,
+            "a 1 MB F7 is 4x32K + 128K + 3x256K = eight sectors"
+        );
+        assert_ne!(STM32F4_SECTOR_SIZES.len(), STM32F7_SECTOR_SIZES.len());
+    }
 }

@@ -1,0 +1,18 @@
+[package]
+name = "lamella-reactor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The shared scheduler reactor: the single block point a runtime's parked threads wait on."
+
+# A leaf, on the `lamella-gc` pattern: the block-point contract every language runtime and both
+# execution tiers drive, depending on nothing so any of them can depend on IT. The C# interpreter
+# (lamella-cil-runtime), a sibling language runtime, and the AOT native scheduler each supply a
+# `ReactorEnv` and share this one algorithm -- which is the property that keeps a socket park and a
+# sleep park landing in the same wait on every tier.
+[dependencies]
+
+[lints]
+workspace = true

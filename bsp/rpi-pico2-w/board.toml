@@ -16,7 +16,7 @@ sources = ["Raspberry Pi Pico 2 W datasheet (4 MB flash key-features list; p.9 w
 
 [memory]                    # chip flash = 0 (external XIP, gate-pinned); the
 flash = 0x400000            # soldered 4 MB QSPI chip is BOARD truth.
-source = "Pico 2 W datasheet key-features list ('RP2350 microcontroller with 4 MB of flash memory'). Conflict note: the same PDF's circuitry paragraph names 'Winbond W25Q16JV' -- a 2 Mbyte order code, a stale Pico W carry-over conflicting with the doc's own 4 MB statement -- so the chip NAME is deliberately not carried as fact."
+source = "Pico 2 W datasheet key-features list ('RP2350 microcontroller with 4 MB of flash memory'), and the fitted part is named by the schematic: RPI-PICO2W rev 2 sheet 1 gives U3 = W25Q32RVXHJQ, annotated '32MBit (4MiB) Flash' on the sheet. The datasheet's own circuitry paragraph names 'Winbond W25Q16JV' instead -- a 16 Mbit order code, half this board's stated size -- and that is a carry-over from the Pico W, whose datasheet names the same part correctly for a board that really does solder 2 MB (bsp/rpi-pico-w/board.toml). So the size and the part now agree from two documents, and the conflict is resolved as a stale sentence rather than left as an open disagreement."
 
 [[carriers]]
 kind = "native-usb"         # the chip's own USB device controller -- no bridge, and so no
@@ -89,6 +89,26 @@ source = "Pico 2 W datasheet p.9 + schematic: gSPI CS = GPIO25 (active low)"
 name = "cyw43439-clk"
 pin = "GP29"
 source = "Pico 2 W datasheet p.9 + schematic: gSPI CLK = GPIO29"
+
+# --- THE USER LED IS NOT ON THIS CHIP, AND THAT IS WHY THERE IS NO ROW FOR IT ------------------
+#
+# On the Pico 2 the green user LED is on GP25 and a program drives it directly. On this board GP25
+# is the CYW43439's chip select above, and the LED is on WL_GPIO0 -- a GPIO of the wireless chip --
+# so reaching it means bringing that chip up first: powering it through the WL_REG_ON line, loading
+# its firmware, then driving one of its pins. There is no sequence of RP2350 register writes that
+# lights it.
+#
+# A `[[devices]]` row states an RP2350 pin, and generation emits a port base, a pin INDEX and a
+# mask from it. WL_GPIO0 is not an RP2350 pin, so no honest row exists: generation refuses the name
+# outright, and the pin a porter would most plausibly reach for -- GP25, the LED on the two non-W
+# boards -- is refused too, because the chip-select row above already claims it. So this board says
+# where the LED is in prose and offers no constant, on the same ground the F429 gives for
+# withholding its VBUS indicators: a row here would offer a developer a light they do not own.
+#
+# TWO SOURCES AGREE. The Pico 2 W datasheet's section 2.1 pin list gives 'WL_GPIO0  OP connected to
+# user LED', and RPI-PICO2W rev 2 sheet 1 wires the net WL_GPIO0 through R3 (470R) to D2's anode, a
+# green LED whose cathode is at ground. The other two functions the plain board spends RP2350 pins
+# on moved the same way: VBUS sense is WL_GPIO2 and the SMPS power-save control is WL_GPIO1.
 
 [[plans]]
 name = "pll-150-48"

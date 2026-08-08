@@ -1,0 +1,74 @@
+# PIN map: pin x function -> (instance, signal) for the STM32U585.
+# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers (AF0..AF15) that the
+# AFRL/AFRH nibbles select.
+
+[table]
+kind = "pins"
+family = "stm32u585"
+sources = [
+    "STM32U585xx datasheet DS13086 Rev 10 (July 2024), Table 28 'Alternate function AF0 to AF7' (page 142 of 350), read from the page as laid out: the AF6 column is headed I2C3/MDF1/OCTOSPIM_P2/SPI3, and in the Port G block PG9's AF6 cell is SPI3_SCK, PG10's is SPI3_MISO, PG11's is SPI3_MOSI, PG12's is SPI3_NSS and PG13's is SPI3_RDY",
+    "STM32U585xx datasheet DS13086 Rev 10 (July 2024), Table 29 'Alternate function AF8 to AF15' (page 151 of 350), read from the page as laid out: the AF8 column is headed LPUART1/SDMMC1/UART4/5, and in the Port G block PG5's AF8 cell is LPUART1_CTS, PG6's is LPUART1_RTS/LPUART1_DE, PG7's is LPUART1_TX and PG8's is LPUART1_RX",
+]
+notes = [
+    "The six RGB LED legs this family's board drives are general-purpose outputs on PH10 to PH15, and a pin driven by its own port has no peripheral function to select. They carry no row here, and the absence is deliberate rather than pending.",
+]
+
+# --- LPUART1: a link to a companion processor, AF8 ---------------------------------------------
+
+[[pins]]
+pin = "PG5"
+function = "AF8"
+instance = "lpuart1"
+signal = "cts"
+source = "DS13086 Rev 10 Table 29, AF8 column (headed LPUART1/SDMMC1/UART4/5): PG5's cell is LPUART1_CTS."
+
+[[pins]]
+pin = "PG6"
+function = "AF8"
+instance = "lpuart1"
+signal = "rts"
+source = "DS13086 Rev 10 Table 29, AF8 column: PG6's cell is LPUART1_RTS/LPUART1_DE. The cell names TWO functions on one pin -- request-to-send and driver-enable -- which the peripheral selects between in its own control register rather than through a second AF number, so one row carries both and the signal named here is the flow-control one."
+
+[[pins]]
+pin = "PG7"
+function = "AF8"
+instance = "lpuart1"
+signal = "tx"
+source = "DS13086 Rev 10 Table 29, AF8 column: PG7's cell is LPUART1_TX."
+
+[[pins]]
+pin = "PG8"
+function = "AF8"
+instance = "lpuart1"
+signal = "rx"
+source = "DS13086 Rev 10 Table 29, AF8 column: PG8's cell is LPUART1_RX."
+
+# --- SPI3: a second link to a companion processor, AF6 -----------------------------------------
+
+[[pins]]
+pin = "PG9"
+function = "AF6"
+instance = "spi3"
+signal = "sck"
+source = "DS13086 Rev 10 Table 28, AF6 column (headed I2C3/MDF1/OCTOSPIM_P2/SPI3): PG9's cell is SPI3_SCK. Table 27 lists the same signal against this pin as SPI3_SCK(boot)."
+
+[[pins]]
+pin = "PG10"
+function = "AF6"
+instance = "spi3"
+signal = "miso"
+source = "DS13086 Rev 10 Table 28, AF6 column: PG10's cell is SPI3_MISO. Table 27 lists it as SPI3_MISO(boot)."
+
+[[pins]]
+pin = "PG12"
+function = "AF6"
+instance = "spi3"
+signal = "nss"
+source = "DS13086 Rev 10 Table 28, AF6 column: PG12's cell is SPI3_NSS. Table 27 lists it as SPI3_NSS(boot)."
+
+[[pins]]
+pin = "PG13"
+function = "AF6"
+instance = "spi3"
+signal = "rdy"
+source = "DS13086 Rev 10 Table 28, AF6 column: PG13's cell is SPI3_RDY -- a signal of the peripheral itself, under the SPI3 header, and not a general-purpose pin pressed into a handshake."

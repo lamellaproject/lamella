@@ -17,3 +17,20 @@ flash = 0x200000
 ram = 0x28000
 pins = []
 source = "ATSAM4SD32C datasheet (dual-plane 2 x 1 MB flash, 160 KB RAM)"
+
+# THE FAMILY'S SECOND PART, AND IT DIFFERS IN BOTH SIZES. Single-plane 1 MB where the sibling
+# above is dual-plane 2 MB, and 128 KB of SRAM where the sibling has 160. Nothing about a board
+# says which of the two is fitted, so a linker script that took either as "the SAM4S" would claim
+# memory one of them does not have.
+#
+# READ THE DESIGNATOR CHARACTER BY CHARACTER. The ordering table lists ATSAM4S16C beside
+# ATSAM4SA16C -- one letter apart, same 1024 KB flash, same LQFP100 package, and 160 KB of SRAM
+# instead of 128. The two rows sit next to each other, so a designator copied by eye lands on a
+# part with 32 KB that is not there.
+[[parts]]
+part = "atsam4s16c"
+package = "LQFP100"
+flash = 0x100000
+ram = 0x20000
+pins = ["PA5", "PC10", "PC17"]
+source = "SAM4S Series datasheet (Atmel-11100) ordering information: ATSAM4S16CA-AU / ATSAM4S16CB-AU is 1024 KB flash, 128 KB SRAM, LQFP100. The C suffix is the 100-pin member; the same table's ATSAM4SA16C rows are a different part at 160 KB SRAM. The pin list is PARTIAL and evidence-only: PA5, PC10 and PC17 are here because a board's control lines place them, each cited on its own row in that board file."

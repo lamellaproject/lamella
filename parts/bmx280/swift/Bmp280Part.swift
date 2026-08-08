@@ -11,6 +11,11 @@ public enum Bmp280Part {
     public static let PART: StaticString = "bmp280"
     public static let FAMILY: StaticString = "bmx280"
 
+    // sourcing: how far this part is established, on two INDEPENDENT axes -- a part can be strong on one and absent on the other, which is why they are not one rank. FACTS is `primary` (read from the part's own datasheet) or `secondary` (a primary vendor statement about this part carried by another document, named by DERIVED_FROM). VALIDATION is `none` (no physical part of this type has been made to answer), `identified` (one answered its identity register, against a negative control that tells the part from the wire) or `exercised` (one produced measurements a driver decoded). Anything above `none` states what was observed in EVIDENCE.
+    public static let SOURCING_FACTS: StaticString = "secondary"
+    public static let SOURCING_DERIVED_FROM: StaticString = "bme280"
+    public static let SOURCING_VALIDATION: StaticString = "none"
+
     // identity: the accepted values are a SET. A driver that accepts only one of them rejects a genuine part, and a rejected part reads as no part at all -- so on a mismatch, name the id received AND this set.
     public static let IDENTITY_REG: UInt32 = 0xD0
     public static let IDENTITY_WIDTH: UInt32 = 8

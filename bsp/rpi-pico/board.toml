@@ -36,6 +36,25 @@ function = "F2"
 tx = { pin = "GP0" }
 rx = { pin = "GP1" }
 
+# --- the board's own control: one LED, and it is plain GPIO ------------------------------------
+#
+# NO ALTERNATE FUNCTION IS INVOLVED, so this row states a pin and a level and nothing else -- which
+# is why it needs no pin-map row, while the uart binding above needed two. The LED's cathode is at
+# ground through its own series resistor, so the pin drives it directly and driving it HIGH lights
+# it.
+#
+# THE WIRELESS SIBLING DOES NOT SHARE THIS FACT. On the Pico W the same GP25 is the CYW43439's chip
+# select and the LED moves to the radio's own WL_GPIO0, so a blinky written against this row lights
+# nothing there and asserts the radio's chip select instead. bsp/rpi-pico-w/board.toml says so and
+# deliberately emits no LED constant.
+
+[[devices]]
+name = "led"
+kind = "gpio-out"
+pin = "GP25"
+active = "high"
+source = "Raspberry Pi Pico datasheet section 2.1 internal-function pin list: 'GPIO25  OP Connected to user LED'. The schematic appendix, Figure 19, (the Pico Rev3 board schematic) wires GPIO25 through R3 (470R, 1%, M1005, 63 mW) to D2's anode, a green LED whose cathode is at ground. The same document's test-point list gives 'TP5  GPIO25/LED (not recommended to be used)' and explains that TP5 taps the node between the resistor and the anode, which is why it 'will only swing from 0 V to the LED forward voltage' -- an independent confirmation of which end of the diode the pin drives."
+
 [[plans]]
 name = "xosc-12mhz"
 default = true

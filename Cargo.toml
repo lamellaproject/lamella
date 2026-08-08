@@ -33,3 +33,15 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# The profile for host-side batch runs of the compiler over a whole corpus, where an unoptimized
+# build is the difference between a run you can repeat and one you cannot: measured at 109 s per
+# file unoptimized against 4.07 s here.
+#
+# Debug assertions and overflow checks stay ON deliberately. An arithmetic overflow that panics in
+# one build and wraps in another is a different compiler, so a batch run that quietly traded the
+# checks away for speed would be measuring something other than what it reports.
+[profile.gate]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

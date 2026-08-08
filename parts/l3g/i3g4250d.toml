@@ -1,0 +1,122 @@
+# PART: ST I3G4250D three-axis digital gyroscope, industrial grade.
+#
+# Shares the whole L3G register address map with its sibling and differs from it in five places,
+# every one of which is stated below: the identity byte, the I2C slave address, the range each
+# full-scale code names, the rate each output-data-rate code selects, and the field layout of
+# CTRL_REG4. Everything else is inherited from the family base and FLATTENED INTO THE EMITTED
+# TABLE, so a reader of the emitted artifact never has to chase a base to see the whole truth.
+
+[table]
+kind = "device"
+family = "l3g"
+part = "i3g4250d"
+base = "l3g"
+sources = [
+    "ST I3G4250D datasheet DS10938 Rev 3: WHO_AM_I ch 7.1 table 18 (page 23), CTRL_REG1 ch 7.2 tables 19-20 and the DR/BW configuration table 21 (pages 23-24), CTRL_REG4 ch 7.5 tables 29-31 (page 26), the I2C slave address ch 5.1 and the SAD+read/write patterns table 12 (pages 16-17), mechanical characteristics table 3 (page 8), high-pass cutoff table 26 (page 25).",
+]
+notes = [
+    "The industrial-grade member of the pair: an extended operating temperature range, and a self-test the sibling's document does not describe.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
+#
+# Identified: a physical part of this type has answered its identity register, against a negative
+# control. That is one rung and not two -- it establishes that a part of this type is present and
+# reachable, and says nothing about whether any of the rate arithmetic below is right, because
+# nothing here has yet decoded a measurement.
+
+[sourcing]
+facts = "primary"
+validation = "exercised"
+evidence = "TWO readings, and the weaker one came first. IDENTIFIED: WHO_AM_I answered 0xD3 on 20 of 20 reads, over a software SPI master driving four plain GPIO pins with no controller and no driver involved. The negative control -- the same 20 reads with the device never selected -- returned 0xff, a different value, so the byte came from the part rather than from the state of an idle wire. Because the transfer used no peripheral at all, the answer also establishes the four pin facts under it: the byte cannot come back unless clock, both data lines and chip select are each right. EXERCISED: the part then ran its data path on a controller, over three passes and twelve measurements with no overrun reported -- the frame's read and auto-increment bits, the register map, CTRL_REG1's mode and rate fields, the status register's ready flag and the six-byte block read. Its four rate codes were COUNTED against a timer at 102.5, 205.0, 410.0 and 819.75 conversions per second, each within one part per thousand of a constant 2.4% above the figures the register chapter tabulates -- so the RATIOS this table states are confirmed by measurement, and the constant offset is the measuring clock rather than the part (an internal RC oscillator specified at plus or minus one percent only at 25 degrees). The negative control is a ceiling rather than a zero: powered down the part latches its ready flag, so the unpaced loop reaches 9221 Hz and every rate measured sits at least eleven times under it, which is what establishes that the count was paced by the device."
+
+# --- identity ------------------------------------------------------------------------------------
+#
+# ONE BIT APART FROM THE SIBLING'S, which is the whole reason an identity is checked as a SET rather
+# than compared to a constant a driver was written around: 0xD3 and 0xD4 differ in two bit
+# positions and neither is far from the other, so a driver that accepted "close enough" would accept
+# the wrong part.
+
+[identity]
+reg = 0x0F
+width = 8
+values = [0xD3]
+notes = "DS10938 Rev 3 table 17 gives the reset value as 11010011, and table 18 spells the same eight bits out. The sibling answers 0xD4."
+
+# --- I2C address: NOT the sibling's ----------------------------------------------------------------
+#
+# The two parts sit at DIFFERENT I2C addresses -- 110100x here against 110101x on the sibling -- so
+# a probe that scans for one of them at a fixed address does not find the other at all. This is the
+# difference that most changes what auto-detection means: the identity register cannot settle which
+# part is fitted until something has already addressed it correctly.
+
+[address]
+bus = "i2c"
+base = 0x68
+notes = "DS10938 Rev 3 ch 5.1: the slave address is 110100xb, and its table 12 gives the composed bytes as 0xD0/0xD1 with the strap low and 0xD2/0xD3 with it high -- which are the 7-bit addresses below shifted up with the read/write bit appended, not addresses in their own right. The strap pin cannot be left floating; floating leaves the address undefined."
+
+[[address.straps]]
+pin = "SDO"
+bit = 0
+low = 0x68
+high = 0x69
+
+# --- CTRL_REG4: the register whose FIELDS the two parts do not share --------------------------------
+#
+# The address map says this register is identical on both parts -- same address, same width, same
+# access, same reset default of zero -- and inside it they are not. Here bit 7 is a reserved zero
+# and bits 2:1 are the self-test selector; on the sibling bit 7 is the block-data-update enable and
+# bits 2:1 are reserved zeros that its document says must not be changed. So each of the two control
+# bits one part has is a bit the other part reserves, and a driver that carried either across would
+# be writing a reserved bit rather than getting a no-op.
+#
+# BDU APPEARS NOWHERE IN THIS DOCUMENT, which is worth stating as a fact about the part and not as
+# an omission here: there is no bit to set that holds the output registers still between the high
+# and low byte of one sample. What replaces it for a burst read is that the burst is one transfer.
+
+[registers.ctrl_reg4]
+reg = 0x23
+width = 8
+access = "read-write"
+fields = { sim = [0, 1], st = [1, 2], fs = [4, 2], ble = [6, 1] }
+notes = "Bit 7 is a reserved 0 and bit 3 is unused. BLE picks the byte order of the rate outputs (0: low byte at the lower address). FS selects the full scale. ST selects self-test. SIM picks the SPI wiring: 0 is the four-wire interface, 1 is three-wire with one shared data line."
+
+[enums.self_test]
+normal = 0
+positive_sign = 1
+negative_sign = 3
+notes = "CTRL_REG4's ST field. Code 2 is given as '--' in the document rather than as a mode, so it is absent here rather than mapped to anything. The self-test output change the two live codes produce is a figure in the mechanical table, not a register value."
+
+# --- full scale: the RANGE differs from the sibling's, the SENSITIVITY does not ---------------------
+
+[enums.full_scale_dps]
+"0" = 245
+"1" = 500
+"2" = 2000
+"3" = 2000
+notes = "Degrees per second, as the magnitude of a symmetric range: code 0 is plus or minus 245. The sibling's code 0 is plus or minus 250 for the same 8.75 millidegrees per digit, so the two parts name different ranges over an identical LSB. Codes 2 and 3 both select 2000."
+
+# --- output data rate: DIFFERENT FROM THE SIBLING'S, and the document disagrees with itself ---------
+#
+# THIS DOCUMENT STATES TWO DIFFERENT RATE SETS FOR THE SAME FOUR CODES. The register description
+# chapter states 100/200/400/800 Hz twice -- table 21, which maps DR and BW to a rate, and table 26,
+# whose four columns are headed with those same four rates -- and the mechanical characteristics
+# table 3 states 105/208/420/840 Hz for the same parameter. The values below are the ones the
+# register chapter gives, because it says them twice and because table 21 is the table indexed by
+# the code a driver writes; the other figure is recorded here so nobody later "corrects" this table
+# from that row without knowing it was read.
+#
+# THE GAP IS ABOUT FIVE PERCENT, WHICH IS THE SIZE THAT DOES NOT LOOK WRONG. A gyroscope's output is
+# a rate, and the thing built out of a rate is an angle, so a driver that integrates samples at an
+# assumed period accumulates the whole of that error and reports a plausible number the entire time.
+# Nothing in either document settles it; counting samples over a known interval on a part would, and
+# that is a measurement rather than another reading.
+
+[enums.odr_hz]
+"0" = 100
+"1" = 200
+"2" = 400
+"3" = 800
+notes = "Indexed by CTRL_REG1's DR field. BW selects the bandwidth within a rate and does not change it. The sibling's four rates are 95/190/380/760 Hz for the same four codes, so this is one of the two enumerations a driver cannot share between the parts."

@@ -3,6 +3,7 @@
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use lamella_syntax::ast::Literal;
 use alloc::collections::BTreeMap;
@@ -73,6 +74,14 @@ pub struct FieldSymbol {
     /// The compile-time constant value of a `const` field or enum member (folded at the use
     /// site instead of an `ldsfld`); `None` for an ordinary field.
     pub constant: Option<Literal>,
+    /// Whether the field is `required` (C# 11): every object creation must assign it in an
+    /// object initializer, or through a constructor carrying `[SetsRequiredMembers]`.
+    ///
+    /// Carried across an assembly boundary by a `RequiredMemberAttribute` (II.23.2), which the
+    /// reference reader decodes: there is no FieldAttributes bit for `required`, so the attribute
+    /// IS the encoding. Both halves closed together, as the earlier note here predicted they would
+    /// -- this compiler emits the attribute and reads it.
+    pub is_required: bool,
 }
 
 /// A property of a type (17.6), reduced to its name and type.
@@ -103,6 +112,8 @@ pub struct PropertySymbol {
     pub has_getter: bool,
     /// Whether this declaration provides a `set` accessor.
     pub has_setter: bool,
+    /// Whether the property is `required` (C# 11); see [`FieldSymbol::is_required`].
+    pub is_required: bool,
 }
 
 /// A field-like event of a type (17.7): its `add`/`remove` accessors combine/remove a
@@ -193,6 +204,13 @@ pub struct MethodSymbol {
     /// The `[Conditional("SYMBOL")]` symbols (24.4.2): a call to this method is omitted unless
     /// one of these is defined at the call site. Empty for an unconditional method.
     pub conditional: Vec<Box<str>>,
+    /// Whether this constructor carries `[System.Diagnostics.CodeAnalysis.SetsRequiredMembers]`:
+    /// it promises to set every `required` member of its type, so an object creation through it
+    /// needs no object initializer and draws no `CS9035`.
+    pub sets_required_members: bool,
+    /// The names of the method's OWN type parameters, in declaration order -- `["T"]` for
+    /// `T Id<T>(T x)`. Empty for every ordinary method, which is every C# 1.0 method.
+    pub type_parameters: Vec<Box<str>>,
 }
 
 impl MethodSymbol {
@@ -219,6 +237,33 @@ impl MethodSymbol {
     pub fn parameter_mode(&self, index: usize) -> Option<ParameterMode> {
         self.parameter_info.get(index).map(|info| info.mode)
     }
+
+    /// This generic method DEFINITION closed over `arguments`: the same method with every mention
+    /// of one of its own type parameters replaced, so `Id<int>` returns `int` and takes `int` where
+    /// `Id<T>` returns `T` and takes `T`.
+    ///
+    /// `None` when the argument count does not match the declared parameter count -- the same
+    /// refusal-never-partial-substitution rule [`TypeInfo::instantiate`] follows, and for the same
+    /// reason: a signature left half-substituted reads as ordinary and means something else.
+    #[must_use]
+    pub fn instantiate(&self, arguments: &[TypeSymbol]) -> Option<MethodSymbol> {
+        if arguments.len() != self.type_parameters.len() {
+            return None;
+        }
+        let bindings: BTreeMap<&str, &TypeSymbol> = self
+            .type_parameters
+            .iter()
+            .map(|parameter| &**parameter)
+            .zip(arguments)
+            .collect();
+        let mut closed = self.clone();
+        closed.type_parameters = Vec::new();
+        closed.return_type = substitute(&self.return_type, &bindings);
+        for parameter in &mut closed.parameters {
+            *parameter = substitute(parameter, &bindings);
+        }
+        Some(closed)
+    }
 }
 
 /// A named type with its members.
@@ -240,6 +285,9 @@ pub struct TypeInfo {
     pub properties: Vec<PropertySymbol>,
     /// The type's methods.
     pub methods: Vec<MethodSymbol>,
+    /// Names of members this build read the type's metadata for but could NOT decode, so they are
+    /// absent from `methods` above.
+    pub undecodable_members: Vec<Box<str>>,
     /// The type's field-like events (17.7), in addition to their backing delegate field in
     /// `fields`. Drives `+=`/`-=` routing through the accessors and `CS0070`.
     pub events: Vec<EventSymbol>,
@@ -268,6 +316,51 @@ pub struct TypeInfo {
     /// Whether the type is `abstract` -- it cannot be instantiated. Defaults to `false` for a
     /// referenced or synthetic type, the same safe under-report as `is_sealed`.
     pub is_abstract: bool,
+    /// The names of the type's declared type parameters, in declaration order -- `["T"]` for
+    /// `Box<T>`. Empty for every non-generic type, which is every C# 1.0 type.
+    pub type_parameters: Vec<Box<str>>,
+}
+
+/// A type's METADATA name: the declared name with its generic arity mangled in, per ECMA-335
+/// II.10.7.2 (`Box<T>` is `` Box`1 ``). An arity of 0 is the name unchanged, so every ordinary type
+/// is untouched.
+#[must_use]
+pub fn metadata_type_name(name: &str, arity: usize) -> String {
+    if arity == 0 {
+        String::from(name)
+    } else {
+        alloc::format!("{name}`{arity}")
+    }
+}
+
+/// `ty` with every type parameter named in `bindings` replaced by its argument, recursing through
+/// every position a parameter can hide in.
+fn substitute(ty: &TypeSymbol, bindings: &BTreeMap<&str, &TypeSymbol>) -> TypeSymbol {
+    match ty {
+        TypeSymbol::Named(parts) => match parts.split_first() {
+            Some((name, [])) => match bindings.get(&**name) {
+                Some(&argument) => argument.clone(),
+                None => ty.clone(),
+            },
+            _ => ty.clone(),
+        },
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => TypeSymbol::Instantiation {
+            definition: definition.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute(argument, bindings))
+                .collect(),
+        },
+        TypeSymbol::Array { element, rank } => substitute(element, bindings).into_array(*rank),
+        TypeSymbol::Pointer(element) => {
+            TypeSymbol::Pointer(Box::new(substitute(element, bindings)))
+        }
+        TypeSymbol::ByRef(element) => TypeSymbol::ByRef(Box::new(substitute(element, bindings))),
+        TypeSymbol::Special(_) | TypeSymbol::Error => ty.clone(),
+    }
 }
 
 impl TypeInfo {
@@ -283,6 +376,7 @@ impl TypeInfo {
             fields: Vec::new(),
             properties: Vec::new(),
             methods: Vec::new(),
+            undecodable_members: Vec::new(),
             events: Vec::new(),
             constructors: Vec::new(),
             enclosing: None,
@@ -291,7 +385,52 @@ impl TypeInfo {
             accessibility: Accessibility::Public,
             is_sealed: false,
             is_abstract: false,
+            type_parameters: Vec::new(),
         }
+    }
+
+    /// This generic DEFINITION closed over `arguments`: the same members, with every mention of a
+    /// type parameter replaced by the corresponding argument, so `Box<int>.Get()` returns `int`
+    /// where `Box<T>.Get()` returns `T`.
+    ///
+    /// `None` when the argument count does not match the declared parameter count.
+    #[must_use]
+    pub fn instantiate(&self, arguments: &[TypeSymbol]) -> Option<TypeInfo> {
+        if arguments.len() != self.type_parameters.len() {
+            return None;
+        }
+        let bindings: BTreeMap<&str, &TypeSymbol> = self
+            .type_parameters
+            .iter()
+            .map(|parameter| &**parameter)
+            .zip(arguments)
+            .collect();
+        let mut closed = self.clone();
+        closed.type_parameters = Vec::new();
+        for field in &mut closed.fields {
+            field.ty = substitute(&field.ty, &bindings);
+        }
+        for property in &mut closed.properties {
+            property.ty = substitute(&property.ty, &bindings);
+        }
+        for event in &mut closed.events {
+            event.ty = substitute(&event.ty, &bindings);
+        }
+        for method in closed
+            .methods
+            .iter_mut()
+            .chain(closed.constructors.iter_mut())
+        {
+            method.return_type = substitute(&method.return_type, &bindings);
+            for parameter in &mut method.parameters {
+                *parameter = substitute(parameter, &bindings);
+            }
+        }
+        for base in &mut closed.bases {
+            *base = substitute(base, &bindings);
+        }
+        closed.base = closed.base.as_ref().map(|base| substitute(base, &bindings));
+        Some(closed)
     }
 
     /// The field with the given name declared directly on this type (no
@@ -376,16 +515,24 @@ impl Model {
     /// The type a [`TypeSymbol`] refers to, if present. A predefined type resolves
     /// to its `System.<Name>` reference type; array and error types have none.
     #[must_use]
-    pub fn get_by_symbol(&self, ty: &TypeSymbol) -> Option<&TypeInfo> {
+    pub fn get_by_symbol(&self, ty: &TypeSymbol) -> Option<Cow<'_, TypeInfo>> {
         match ty {
             TypeSymbol::Named(parts) => {
                 let (namespace, name) = split_named(parts);
-                self.get(&namespace, name)
+                self.get(&namespace, name).map(Cow::Borrowed)
             }
             TypeSymbol::Special(SpecialType::Null) => None,
             TypeSymbol::Special(special) => {
                 let (namespace, name) = special.full_name();
-                self.get(namespace, name)
+                self.get(namespace, name).map(Cow::Borrowed)
+            }
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => {
+                let (namespace, name) = split_named(definition);
+                let definition = self.get(&namespace, &metadata_type_name(name, arguments.len()))?;
+                Some(Cow::Owned(definition.instantiate(arguments)?))
             }
             TypeSymbol::Array { .. }
             | TypeSymbol::Pointer(_)
@@ -493,8 +640,8 @@ impl Model {
     #[must_use]
     pub fn type_table(&self) -> TypeTable {
         let mut table = TypeTable::new();
-        for (namespace, name) in self.types.keys() {
-            table.insert(namespace, name);
+        for ((namespace, name), info) in &self.types {
+            table.insert_generic(namespace, name, info.type_parameters.clone());
         }
         table
     }
@@ -711,6 +858,7 @@ mod tests {
             is_volatile: false,
             accessibility: Accessibility::Public,
             constant: None,
+            is_required: false,
         });
         info.methods.push(MethodSymbol {
             name: "Area".into(),
@@ -726,6 +874,8 @@ mod tests {
             is_sealed: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
+            sets_required_members: false,
+            type_parameters: Vec::new(),
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
@@ -741,6 +891,8 @@ mod tests {
             is_sealed: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
+            sets_required_members: false,
+            type_parameters: Vec::new(),
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
@@ -756,6 +908,8 @@ mod tests {
             is_sealed: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
+            sets_required_members: false,
+            type_parameters: Vec::new(),
         });
         info
     }

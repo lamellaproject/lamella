@@ -1,0 +1,72 @@
+# BOARD binding: the Arduino UNO Q, an STM32U585AII6TR on Arduino's ABX00162/ABX00173 in the UNO
+# form factor -- a microcontroller sharing one board with a Qualcomm Dragonwing QRB2210 application
+# processor that runs Debian Linux.
+
+[table]
+kind = "board"
+board = "arduino-uno-q"
+vendor = "arduino"
+family = "stm32u585"
+part = "stm32u585ai"
+board_model = 36            # lamella_wire::board_model::ARDUINO_UNO_Q
+sources = [
+    "Arduino UNO Q user manual (SKU ABX00162-ABX00173), description and section 6: UNO Q combines the Qualcomm Dragonwing QRB2210 microprocessor, a quad-core Arm Cortex-A53 running Debian Linux, with the STMicroelectronics STM32U585 microcontroller, an Arm Cortex-M33 running Arduino Core on Zephyr OS; section 6.2 gives the microcontroller a 3.3 V I/O domain and the LED matrix, and section 7 states that the two processors communicate through Arduino Bridge, an RPC layer that accommodates multiple physical transports (USB CDC, UART, or SPI)",
+    "Arduino UNO Q user manual (SKU ABX00162-ABX00173): the RGB LED section gives RGB LED 3 (D27401) as LED3_R PH10, LED3_G PH11, LED3_B PH12 and RGB LED 4 (D27402) as LED4_R PH13, LED4_G PH14, LED4_B PH15, and states that the RGB LEDs are active-low, meaning they turn on when driven to logic 0",
+    "Arduino UNO Q schematics (ABX00162), sheet 19: the microcontroller symbol is designated STM32U585AII6TR_BGA169P, and its port H pins PH10 to PH15 carry the nets MCU_LED1_RED, MCU_LED1_GRN, MCU_LED1_BLU, MCU_LED2_RED, MCU_LED2_GRN and MCU_LED2_BLU, with PH4 to PH9 marked unconnected",
+    "Arduino UNO Q schematics (ABX00162), sheet 21 (title LED): D27401 and D27402 are LTST-C28NBEGK-SN RED_BLU_GRN_LED4P parts whose common pin is on PWR_3P3V and whose three cathodes each run through a resistor -- R2729/R2731/R2730 for MCU_LED1 and R2732/R2734/R2733 for MCU_LED2, values 1.1K, 1.1K and 820 ohm -- to the microcontroller nets; the same sheet carries the Charlieplexed LED matrix and the always-on power LED D27201",
+    "Arduino UNO Q schematics (ABX00162), sheets 7 and 9: MCU_JTAG_SWDIO, MCU_JTAG_SWCLK, MCU_BOOT0 and MCU_NRST are level-shifted from 3.3 V to 1.8 V by TXS0101/TXS0104 parts and land on the QRB2210's GPIO_25, GPIO_26, GPIO_37 and GPIO_38 respectively; the SPI3 and LPUART1 links land on GPIO_14/15/16/17/70 and GPIO_6/7/71/80",
+]
+notes = [
+    "The two SKUs, ABX00162 (2 GB / 16 GB) and ABX00173 (4 GB / 32 GB), differ only in the application processor's LPDDR4X and eMMC. Neither is reachable from the microcontroller, so the microcontroller-side board truth is identical across both and one board file covers them.",
+]
+
+# --- the carrier ------------------------------------------------------------------------------
+#
+# THERE IS NONE, DELIBERATELY. See the paragraph at the top of this file: the microcontroller's own
+# USB does not reach the connector, its LPUART1 lands on the application processor rather than on a
+# bridge, and there is no debug connector at all. No `[[carriers]]` row appears below because every
+# kind this schema can name would be a wire this board does not have.
+
+# --- control lines ----------------------------------------------------------------------------
+
+[[devices]]
+name = "led1_red"
+kind = "gpio-out"
+pin = "PH10"
+active = "low"
+source = "Schematic sheet 19 puts the net MCU_LED1_RED on the microcontroller's PH10, ball C13, and DS13086 Rev 10 Table 27 gives PH10 the ball C13 in its non-SMPS UFBGA169 column. Sheet 21 puts D27401's common pin on PWR_3P3V and returns this leg's cathode through a resistor to the net, so the pin sinks and the leg lights when driven low. The user manual names the same leg LED3_R and states outright that the RGB LEDs are active-low."
+
+[[devices]]
+name = "led1_green"
+kind = "gpio-out"
+pin = "PH11"
+active = "low"
+source = "Schematic sheet 19 puts MCU_LED1_GRN on PH11, ball D9, and DS13086 Rev 10 Table 27 gives PH11 the ball D9 in the non-SMPS UFBGA169 column. Sheet 21 draws this leg's cathode through R2731 back to the net from a common anode on PWR_3P3V, so the pin sinks. The manual names it LED3_G. This row is read from the schematic in its own right rather than by analogy with led1_red: the sheet draws all three cathodes."
+
+[[devices]]
+name = "led1_blue"
+kind = "gpio-out"
+pin = "PH12"
+active = "low"
+source = "Schematic sheet 19 puts MCU_LED1_BLU on PH12, ball B13, and DS13086 Rev 10 Table 27 gives PH12 the ball B13 in the non-SMPS UFBGA169 column. Sheet 21 draws this leg's cathode through R2730, 820 ohm, back to the net -- a different value from the two 1.1K resistors on the same package, which is a per-colour forward-voltage difference and not an error. The pin sinks. The manual names it LED3_B."
+
+[[devices]]
+name = "led2_red"
+kind = "gpio-out"
+pin = "PH13"
+active = "low"
+source = "Schematic sheet 19 puts MCU_LED2_RED on PH13, ball C12, and DS13086 Rev 10 Table 27 gives PH13 the ball C12 in the non-SMPS UFBGA169 column. Sheet 21 puts D27402's common pin on PWR_3P3V and returns this leg's cathode through a resistor to the net, so the pin sinks. The manual names this LED4_R -- a different ordinal for the same part, see the note above."
+
+[[devices]]
+name = "led2_green"
+kind = "gpio-out"
+pin = "PH14"
+active = "low"
+source = "Schematic sheet 19 puts MCU_LED2_GRN on PH14, ball C11, and DS13086 Rev 10 Table 27 gives PH14 the ball C11 in the non-SMPS UFBGA169 column. Sheet 21 draws this leg's cathode through R2734 back to a common anode on PWR_3P3V, so the pin sinks. The manual names it LED4_G."
+
+[[devices]]
+name = "led2_blue"
+kind = "gpio-out"
+pin = "PH15"
+active = "low"
+source = "Schematic sheet 19 puts MCU_LED2_BLU on PH15, ball A13, and DS13086 Rev 10 Table 27 gives PH15 the ball A13 in the non-SMPS UFBGA169 column. Sheet 21 draws this leg's cathode through R2733, 820 ohm, back to the net. The pin sinks. The manual names it LED4_B."

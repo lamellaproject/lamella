@@ -1,0 +1,52 @@
+# BOARD binding: the Arduino Portenta H7, an STM32H747XIH6 on Arduino's ABX00042 in the Portenta
+# form factor.
+
+[table]
+kind = "board"
+board = "portenta-h7"
+vendor = "arduino"
+family = "stm32h7"
+part = "stm32h747xi"
+board_model = 35            # lamella_wire::board_model::ARDUINO_PORTENTA_H7
+sources = [
+    "Arduino Portenta H7 Collective Datasheet (SKU ABX00042-ABX00045-ABX00046), description and comparison table: the family runs on two processors; the table separates Portenta H7 (ABX00042), Portenta H7 Lite (ABX00045) and Portenta H7 Lite Connected (ABX00046) by security element and connectivity only, and gives all three 8 MB SDRAM and 16 MB QSPI flash. Section 3.1 gives the USB-C connector and section 3.2 the high density connectors, whose pinout carries SWDIO and SWCK",
+    "Arduino Portenta H7 full pinout (ABX00042): the RGB LED table gives three rows -- red / A8 / LEDR, green / C7 / LEDG and blue / D7 / LEDB -- where the middle column is the microcontroller's BALL designator rather than a pin name",
+    "Arduino Portenta H7 schematics (SL-ABX00042 Rev V4.10, 5/16/2023, sheet STM32H747XIH6): the microcontroller symbol gives ball A8 as PK5, ball C7 as PK6 and ball D7 as PK7. DL1 is an SMLP34RGB2W3 whose three anodes are joined to the +3V1 rail and whose cathodes run through R12, R11 and R13, each 330 ohm, to the nets PK5, PK6 and PK7 respectively",
+    "STM32H747xI/G datasheet DS12930 Rev 1, Table 7 pin/ball definition: the TFBGA240+25 column gives PK5 at ball A8, PK6 at ball C7 and PK7 at ball D7, each an I/O pin with FT tolerance",
+]
+notes = [
+    "EVERY FACT IN THIS FILE HAS ANSWERED ON THE PART. The port's base and its clock-enable bit were checked by writing a register with the gate closed and again with it open, and the three legs by driving each pin in turn and reading the colour off the board: driving all three together lit all three, and driving one lit exactly one, which settles the colour of each leg and the direction of all three in a single pass. The document join below was reached first and independently, and the observation agreed with it.",
+]
+
+# --- the carrier ------------------------------------------------------------------------------
+#
+# THE MICROCONTROLLER'S OWN USB DEVICE CONTROLLER, over the USB-C connector J3. No bridge sits
+# between it and the host, so the row carries no vendor identity: a bridge has a USB identity of its
+# own to state and this path has only the device the target itself presents.
+
+[[carriers]]
+kind = "native-usb"
+default = true
+
+# --- control lines ----------------------------------------------------------------------------
+
+[[devices]]
+name = "led_red"
+kind = "gpio-out"
+pin = "PK5"
+active = "low"
+source = "The full pinout's RGB LED table gives the red leg against ball A8 under the net name LEDR. The schematics sheet STM32H747XIH6 gives ball A8 as PK5, and DS12930 Rev 1 Table 7's TFBGA240+25 column gives PK5 at ball A8 independently. The same schematic runs PK5 through R12, 330 ohm, to a cathode of DL1, an SMLP34RGB2W3 whose anodes sit on the +3V1 rail, so the pin sinks and the leg lights when it is driven low."
+
+[[devices]]
+name = "led_green"
+kind = "gpio-out"
+pin = "PK6"
+active = "low"
+source = "The full pinout's RGB LED table gives the green leg against ball C7 under the net name LEDG. The schematics sheet STM32H747XIH6 gives ball C7 as PK6, and DS12930 Rev 1 Table 7's TFBGA240+25 column gives PK6 at ball C7. The same schematic runs PK6 through R11, 330 ohm, to a cathode of DL1, whose anodes sit on the +3V1 rail, so the pin sinks and the leg lights when it is driven low. The resistor numbering is not in pin order -- R11 serves the middle pin of the three -- so a leg cannot be identified by its resistor's number."
+
+[[devices]]
+name = "led_blue"
+kind = "gpio-out"
+pin = "PK7"
+active = "low"
+source = "The full pinout's RGB LED table gives the blue leg against ball D7 under the net name LEDB. The schematics sheet STM32H747XIH6 gives ball D7 as PK7, and DS12930 Rev 1 Table 7's TFBGA240+25 column gives PK7 at ball D7. The same schematic runs PK7 through R13, 330 ohm, to a cathode of DL1, whose anodes sit on the +3V1 rail, so the pin sinks and the leg lights when it is driven low. This leg is read from the schematic in its own right rather than by analogy with the other two: the sheet draws all three cathodes."

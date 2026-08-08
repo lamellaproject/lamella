@@ -10,6 +10,15 @@ public enum Mkr1000Bindings {
     public static let BOARD_MODEL: UInt16 = 9
     public static let BOARD_VENDOR: String = "Arduino"
 
+    /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+    /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+    /// peripherals of the same kind can share no register at all, so a consumer that selects a
+    /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+    /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+    /// name a driver; and a uart is a different register map on every family, so the kind does
+    /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+    public static let WINC_SPI_DRIVER_FAMILY: String = "samd21-sercom"
+
     // -- WINC_SPI: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the
     // consumer composes ID | GEN | CLKEN per its runtime-selected plan) --
     public static let WINC_SPI_SERCOM_BASE: UInt32 = 0x42001000

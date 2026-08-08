@@ -11,6 +11,14 @@ pub enum TypeSymbol {
     Special(SpecialType),
     /// A named type given by its dotted name, not yet bound to a declaration.
     Named(Box<[Box<str>]>),
+    /// A constructed generic type -- one instantiation of a generic definition, `List<int>`
+    /// (ECMA-334 4th ed 25.5; ECMA-335 4th ed II.23.2.12 `GENERICINST`).
+    Instantiation {
+        /// The generic definition's dotted name, as [`TypeSymbol::Named`] carries one.
+        definition: Box<[Box<str>]>,
+        /// The type arguments, in declaration order; at least one.
+        arguments: Box<[TypeSymbol]>,
+    },
     /// An array type: `rank` dimensions of `element` (`int[]` is rank 1,
     /// `int[,]` rank 2).
     Array {
@@ -78,6 +86,7 @@ impl TypeSymbol {
     }
 }
 
+/// Renders a type as C# SOURCE would spell it, for a diagnostic.
 impl fmt::Display for TypeSymbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -90,6 +99,25 @@ impl fmt::Display for TypeSymbol {
                     f.write_str(part)?;
                 }
                 Ok(())
+            }
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => {
+                for (index, part) in definition.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(".")?;
+                    }
+                    f.write_str(part)?;
+                }
+                f.write_str("<")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{argument}")?;
+                }
+                f.write_str(">")
             }
             TypeSymbol::Array { element, rank } => {
                 write!(f, "{element}[")?;

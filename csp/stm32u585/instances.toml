@@ -1,0 +1,57 @@
+# INSTANCE map: where each STM32U585 block copy sits, plus its RCC clock-enable routing.
+# The record carries the enable REGISTER OFFSET as data because ST spreads the gates across banked
+# enable registers, so [base, rcc_en_off, rcc_en_bit] states each gate in full. `-1` = the row
+# gates nothing (the RCC itself).
+
+[table]
+kind = "instances"
+family = "stm32u585"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32U575xx/585xx reference manual RM0456 Rev 7: Table 6 memory map and peripheral register boundary addresses, read from the page as laid out -- GPIOA through GPIOJ on AHB2 from nonsecure 0x42020000 in 0x400 steps, with GPIOG at 0x42021800-0x42021BFF and GPIOH at 0x42021C00-0x42021FFF, and RCC at nonsecure 0x46020C00-0x46020FFF; the same table's secure column gives 0x52021800, 0x52021C00 and 0x56020C00",
+    "STM32U575xx/585xx reference manual RM0456 Rev 7 section 11.8.30, RCC AHB2 peripheral clock enable register 1 (RCC_AHB2ENR1): address offset 0x08C, reset value 0xC0000000 for STM32U575/585, with bit 6 GPIOGEN 'I/O port G clock enable' and bit 7 GPIOHEN 'I/O port H clock enable'",
+    "STM32U575xx/585xx reference manual RM0456 Rev 7 section 11.8.36, RCC APB3 peripheral clock enable register (RCC_APB3ENR): address offset 0x0A8, reset value 0x00000000, with bit 5 SPI3EN 'SPI3 clock enable' and bit 6 LPUART1EN 'LPUART1 clock enable'",
+    "STM32U575xx/585xx reference manual RM0456 Rev 7: Table 6 gives SPI3 nonsecure 0x46002000-0x460023FF and LPUART1 nonsecure 0x46002400-0x460027FF, both on APB3",
+]
+notes = [
+    "Every bit position here is taken from the reference manual's per-bit descriptions rather than from its register bit-map diagram: the diagram is a wide grid whose columns do not survive a text conversion, and this manual's does not -- its GPIOHEN cell converts adjacent to an I2C3RST from a different register entirely. The per-bit prose states the same fact unambiguously.",
+    "This family places two GPIO ports rather than the ten the part carries, because a present-list and an instance map here are evidence-only: a row is added when a board reaches the block. The board this family was built for reaches port H for its two RGB LEDs and port G for its links to the application processor.",
+    "SPI3 and LPUART1 sit in the 0x46000000 region on APB3 rather than in the APB1/APB2 space the vendor's other lines use, and their bit positions are ADJACENT -- SPI3EN at 5 and LPUART1EN at 6 -- while the GPIO ports' bits in the other register are also 6 and 7. Four small numbers over two registers, and only the register name distinguishes them.",
+]
+
+[[instances]]
+name = "gpiog"
+block = "gpio"
+base = 0x42021800
+rcc_en_off = 0x8C   # RCC_AHB2ENR1
+rcc_en_bit = 6      # GPIOGEN
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x42021C00
+rcc_en_off = 0x8C   # RCC_AHB2ENR1
+rcc_en_bit = 7      # GPIOHEN
+
+# --- the two links to a companion processor -------------------------------------------------
+
+[[instances]]
+name = "spi3"
+block = "spi"
+base = 0x46002000
+rcc_en_off = 0xA8   # RCC_APB3ENR
+rcc_en_bit = 5      # SPI3EN
+
+[[instances]]
+name = "lpuart1"
+block = "lpuart"
+base = 0x46002400
+rcc_en_off = 0xA8   # RCC_APB3ENR
+rcc_en_bit = 6      # LPUART1EN
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x46020C00
+rcc_en_off = -1
+rcc_en_bit = -1

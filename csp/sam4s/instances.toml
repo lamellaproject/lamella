@@ -2,6 +2,11 @@
 # binding references, with the sam3x-shaped record: the peripheral id is one number serving as
 # both the PMC clock-gate bit and the NVIC line; system controllers (PMC, EEFC) have no id
 # (-1 emits nothing). Block layouts arrive with the family's first generated driver.
+#
+# THE PORT ROWS SAY WHICH GROUP THEY ARE, RATHER THAN LEAVING IT TO THEIR NAMES. A pin named
+# PC10 has to resolve to the base address of the port group that backs it, and this vendor calls
+# that group PIOC where others call theirs PORTC, GPIOC or PORT0. `port` states the answer as
+# data, so nothing has to recognize the spelling.
 
 [table]
 kind = "instances"
@@ -21,14 +26,23 @@ base = 0x400E0400   # PMC_SCER at the block base; PCER1 +0x100
 pid = -1
 
 [[instances]]
+name = "pioa"
+block = "pio"
+port = "A"          # this instance IS the group pins named PA<n> resolve to
+base = 0x400E0E00
+pid = 11
+
+[[instances]]
 name = "piob"
 block = "pio"
+port = "B"          # this instance IS the group pins named PB<n> resolve to
 base = 0x400E1000
 pid = 12
 
 [[instances]]
 name = "pioc"
 block = "pio"
+port = "C"          # this instance IS the group pins named PC<n> resolve to
 base = 0x400E1200
 pid = 13
 

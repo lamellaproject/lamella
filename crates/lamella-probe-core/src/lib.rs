@@ -119,16 +119,42 @@ pub trait DapAccess {
         Ok(())
     }
 
-    /// Reads `count` values from one Access Port register back to back. See
-    /// [`write_ap_block`](Self::write_ap_block) for why the block form matters.
-    fn read_ap_block(&mut self, address: u8, count: usize) -> Result<Vec<u32>, ProbeError> {
-        let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            out.push(self.read_ap(address)?);
+    /// Reads `out.len()` values from one Access Port register back to back, into a CALLER-PROVIDED
+    /// buffer. See [`write_ap_block`](Self::write_ap_block) for why the block form matters.
+    ///
+    /// This is the read primitive, and it takes a buffer rather than returning one so that no layer
+    /// of this stack has to allocate: a master that is itself a microcontroller programming a second
+    /// microcontroller has no allocator to spare, and retrofitting that later would mean changing
+    /// every signature above here. [`DapAccessExt::read_ap_block`] is the allocating convenience for
+    /// callers that would rather have a `Vec`; it is deliberately NOT a member of this trait, so an
+    /// implementation cannot accelerate the convenience and leave the primitive on the slow path.
+    fn read_ap_block_into(&mut self, address: u8, out: &mut [u32]) -> Result<(), ProbeError> {
+        for slot in out.iter_mut() {
+            *slot = self.read_ap(address)?;
         }
+        Ok(())
+    }
+}
+
+/// The allocating conveniences over [`DapAccess`], provided for every implementation and overridable
+/// by none.
+///
+/// Splitting these out is what keeps the primitive honest. A `Vec`-returning method sitting in
+/// `DapAccess` beside the buffer one would be overridable, and an implementation that accelerated
+/// only the convenience would leave [`DapAccess::read_ap_block_into`] -- the form every allocation-
+/// free caller uses -- silently looping one word at a time. That is the batching cliff described on
+/// [`DapAccess::write_ap_block`], and putting the convenience on an extension trait makes it
+/// unreachable rather than merely documented.
+pub trait DapAccessExt: DapAccess {
+    /// Reads `count` values from one Access Port register into a freshly allocated buffer.
+    fn read_ap_block(&mut self, address: u8, count: usize) -> Result<Vec<u32>, ProbeError> {
+        let mut out = vec![0; count];
+        self.read_ap_block_into(address, &mut out)?;
         Ok(out)
     }
 }
+
+impl<D: DapAccess + ?Sized> DapAccessExt for D {}
 
 /// Lets a BORROWED accessor stand in for an owned one, so a caller holding only `&mut D` -- a probe
 /// discovery session that hands out its debug port, say -- can still wrap it in an [`ArmDap`]
@@ -160,8 +186,8 @@ impl<D: DapAccess + ?Sized> DapAccess for &mut D {
     fn write_ap_block(&mut self, address: u8, values: &[u32]) -> Result<(), ProbeError> {
         (**self).write_ap_block(address, values)
     }
-    fn read_ap_block(&mut self, address: u8, count: usize) -> Result<Vec<u32>, ProbeError> {
-        (**self).read_ap_block(address, count)
+    fn read_ap_block_into(&mut self, address: u8, out: &mut [u32]) -> Result<(), ProbeError> {
+        (**self).read_ap_block_into(address, out)
     }
 }
 
@@ -189,8 +215,13 @@ pub trait TargetAccess {
     fn read_word(&mut self, address: u32) -> Result<u32, ProbeError>;
     /// Writes a 32-bit word to target memory.
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError>;
-    /// Reads `count` consecutive words, batched where the probe allows.
-    fn read_words(&mut self, address: u32, count: usize) -> Result<Vec<u32>, ProbeError>;
+    /// Reads `out.len()` consecutive words into a CALLER-PROVIDED buffer, batched where the probe
+    /// allows.
+    ///
+    /// The buffer form is the primitive for the same reason it is one layer down -- see
+    /// [`DapAccess::read_ap_block_into`]. [`TargetAccessExt::read_words`] is the allocating
+    /// convenience, and lives on an extension trait so it cannot be overridden in place of this.
+    fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError>;
     /// Writes consecutive words, batched where the probe allows.
     fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError>;
 
@@ -243,6 +274,19 @@ pub trait TargetAccess {
     /// supplied scratch [`CallFrame`]. Used by flash algorithms that stage a loader into RAM.
     fn call_target(&mut self, address: u32, args: &[u32], frame: &CallFrame) -> Result<u32, ProbeError>;
 }
+
+/// The allocating conveniences over [`TargetAccess`], provided for every implementation and
+/// overridable by none -- the counterpart of [`DapAccessExt`], and split out for the same reason.
+pub trait TargetAccessExt: TargetAccess {
+    /// Reads `count` consecutive words into a freshly allocated buffer.
+    fn read_words(&mut self, address: u32, count: usize) -> Result<Vec<u32>, ProbeError> {
+        let mut out = vec![0; count];
+        self.read_words_into(address, &mut out)?;
+        Ok(out)
+    }
+}
+
+impl<T: TargetAccess + ?Sized> TargetAccessExt for T {}
 
 /// The primitives Cortex-M run control is built out of.
 ///
@@ -571,19 +615,18 @@ impl<D: DapAccess> TargetAccess for ArmDap<D> {
         self.write_drw_at(address, value)
     }
 
-    fn read_words(&mut self, address: u32, count: usize) -> Result<Vec<u32>, ProbeError> {
-        let mut out = Vec::with_capacity(count);
+    fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
         let mut address = address;
-        let mut remaining = count;
-        while remaining > 0 {
+        let mut remaining = out;
+        while !remaining.is_empty() {
             let to_boundary = ((TAR_WINDOW - (address & (TAR_WINDOW - 1))) / 4) as usize;
-            let batch = remaining.min(to_boundary);
+            let batch = remaining.len().min(to_boundary);
             self.dap.write_ap(AP_TAR, address)?;
-            out.extend_from_slice(&self.dap.read_ap_block(AP_DRW, batch)?);
+            self.dap.read_ap_block_into(AP_DRW, &mut remaining[..batch])?;
             address += (batch * 4) as u32;
-            remaining -= batch;
+            remaining = &mut remaining[batch..];
         }
-        Ok(out)
+        Ok(())
     }
 
     fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {

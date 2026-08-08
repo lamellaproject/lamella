@@ -1,0 +1,312 @@
+# PART FAMILY: ST three-axis digital gyroscopes sharing the L3G register map -- the L3GD20 and the
+# I3G4250D, its industrial-grade sibling. The two are drop-in replacements on one footprint and
+# share their whole register address map: every name, address, access type and reset default from
+# 0x00 to 0x38 is the same on both.
+#
+# A PART IS NOT A CHIP A PROGRAM RUNS ON, which is why this catalogue is a sibling of the chip
+# packages rather than part of one: a board states which BUSES exist, a part states its own
+# IDENTITY, and a probe joins the two at run time. A carrier can be populated with either of these
+# two parts on the same pads, so which one is fitted is discovered rather than declared.
+#
+# WHAT IS SHARED IS THE MAP, NOT EVERY FIELD INSIDE IT, and that distinction is the useful content
+# of this file. Held identical across both members and therefore stated here: the register
+# addresses, the widths, the access types, the field layouts of CTRL_REG1/2/3/5 and STATUS_REG, the
+# rate output format, both bus framings, and the SENSITIVITY -- the microdegrees per second each
+# output digit is worth, which is the number a driver multiplies by. Stated per member instead,
+# because the documents differ: the identity value, the I2C slave address, the full-scale RANGE each
+# code names, the output data rate each code selects, and the whole field layout of CTRL_REG4.
+#
+# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# deltas; generation RESOLVES the base and emits a fully flattened table per part. Nothing
+# downstream ever reads an inherited value, because a value that is only ever inherited is pinned
+# in no emitted artifact and so cannot be checked for drift between languages.
+#
+# REGISTER KEYS ARE THE DOCUMENTS' OWN NAMES, INCLUDING WHERE THAT DOUBLES A WORD. ST spells four
+# of these registers with REG already inside the name -- STATUS_REG, FIFO_CTRL_REG, FIFO_SRC_REG,
+# and the CTRL_REG1..5 set -- and the address constant an emitter derives appends `_REG` for "this
+# is the address". So `STATUS_REG_REG` is the address of the register the datasheet calls
+# STATUS_REG. A shorter key would read better and would not be the name a reader searching the
+# datasheet can find, so the document wins.
+
+[table]
+kind = "device-base"
+family = "l3g"
+sources = [
+    "ST I3G4250D datasheet DS10938 Rev 3: register address map ch 6 table 17 (page 22), register descriptions ch 7 (pages 23-30), digital interfaces ch 5 (I2C 5.1 pages 16-17, SPI 5.2 pages 18-20), mechanical characteristics table 3 (page 8).",
+    "ST L3GD20 datasheet DocID022116 Rev 2: register address map ch 6 table 17 (page 29), register descriptions ch 7 (pages 30-40), digital interfaces ch 5 (I2C 5.1 pages 21-23, SPI 5.2 pages 24-27), mechanical characteristics table 4 (page 8).",
+]
+notes = [
+    "Register width is 8 bits throughout the address map; the interface reads and writes one register per access, and a multi-byte quantity is read as a BURST from a starting register with the interface's auto-increment bit set. The three 16-bit rate outputs below are stated at their LOW byte's address with a width of 16, which is the shape a burst reads them in.",
+    "Reserved registers must not be written. The documents are explicit that writing them may change factory calibration data loaded at boot and lead to device malfunction, and the reserved ranges are large: 0x00-0x0E and 0x10-0x1F.",
+    "TWO BITS OF CTRL_REG2 ARE RESERVED WITH A VALUE, WHICH IS NOT THE SAME AS RESERVED. Its top two bits are loaded at boot and both documents say the loaded value must not be changed, so a read-modify-write is required there rather than a bare write of a composed field.",
+    "THE FIELD LAYOUTS BELOW ARE A SUBSET AND THE OMISSIONS ARE DELIBERATE. FIFO_CTRL_REG, FIFO_SRC_REG, INT1_CFG, INT1_SRC, the six INT1 threshold registers and INT1_DURATION carry their address, width and access and NO fields: the FIFO and the interrupt generator have not been transcribed. Their addresses are stated because the map is complete; treat the absent fields as untranscribed rather than as registers without structure.",
+    "THE HIGH-PASS CUTOFF TABLE IS NOT CARRIED. Both documents give the cutoff for each of ten HPCF codes at each of four output data rates, in fractions of a hertz down to 0.009 Hz. Those are the figures a fixed-point catalogue cannot state without either a float or a unit this schema has no other use for, and no reading of the rate output needs them.",
+]
+
+# --- buses ---------------------------------------------------------------------------------------
+#
+# The register MAP is shared by both buses; the ADDRESS TRANSFORM is not, and here the two buses do
+# not even give the register the same number of bits. Each bus therefore states its own transform as
+# a named dispatch rather than an expression.
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "The subaddress byte is seven bits of register address plus a top bit that enables address auto-increment, so a single-register access writes the address unchanged and only a burst sets the extra bit. A read is a write of the subaddress followed by a repeated start; both documents state that the repeated start is required rather than preferred."
+
+[buses.spi]
+kind = "spi"
+register_read_transform = "set-bit7"
+register_write_transform = "clear-bit7"
+read_protocol = "single-chip-select-address-then-clock-data"
+modes = [3]
+notes = "Four wires: CS, SPC, SDI, SDO. The clock is stopped HIGH while CS is high and both data lines are driven on the falling edge and captured on the rising edge, which is one clock arrangement and not a choice -- so this part states a single mode where a part that documents two would state both. A read or a write is 16 clocks, extended in blocks of 8 for a burst; the address byte and the data must ride ONE chip-select assertion."
+
+# --- identity ------------------------------------------------------------------------------------
+#
+# Required of every part. A member states its own accepted values; the base states only where to
+# look, because telling the two members apart is the whole purpose of the register.
+
+[identity]
+reg = 0x0F
+width = 8
+notes = "Verified before any other access. It is what tells the two parts apart on one footprint -- they differ here by a single bit -- and what distinguishes a real part from a declared simulator."
+
+# --- the framing bytes, as values rather than as prose ---------------------------------------------
+#
+# THE TWO BUSES DISAGREE ABOUT HOW WIDE A REGISTER ADDRESS IS, and that is the trap this section
+# exists to remove. On I2C the subaddress is SEVEN bits of address with auto-increment in the top
+# bit. On SPI the first byte is read/write in bit 7, auto-increment in bit 6, and only SIX bits of
+# address below that. A driver that composed the SPI byte the I2C way -- mask to 0x7F, set the top
+# bit -- reads correctly everywhere in this map, because the map stops at 0x38, and would be wrong
+# for the first register above 0x3F either part ever grew.
+
+[enums.spi_frame]
+read_bit = 0x80
+auto_increment_bit = 0x40
+address_mask = 0x3F
+notes = "Bit 0 of the frame as the documents count it -- first on the wire, so bit 7 of the byte -- is the read/write bit: 1 reads, 0 writes. Bit 1 on the wire is MS: 0 leaves the address unchanged across a multi-byte transfer, 1 auto-increments it."
+
+[enums.i2c_frame]
+auto_increment_bit = 0x80
+register_mask = 0x7F
+notes = "The MSb of the subaddress field enables auto-increment; the seven bits below it are the register address."
+
+# --- registers -----------------------------------------------------------------------------------
+#
+# `reg` is an OPERAND written on the wire, NOT an offset added to an instance base. The distinction
+# is load-bearing: a chip block uses `offset` for base-relative addressing, and a device register
+# composed as `base + offset` would compile, emit, and be silently wrong.
+#
+# CTRL_REG4 IS ABSENT FROM THIS FILE ON PURPOSE. Its address, width and access are the same on both
+# members but its FIELDS are not, so each member states the whole register and the family invariant
+# is left to be computed rather than asserted. What the two share -- the address, BLE, the
+# full-scale selector and SIM -- survives into the shared class; what only one has does not.
+
+[registers.who_am_i]
+reg = 0x0F
+width = 8
+access = "read-only"
+fields = { chip_id = [0, 8] }
+notes = "Device identification. The accepted values are stated per member."
+
+[registers.ctrl_reg1]
+reg = 0x20
+width = 8
+access = "read-write"
+fields = { xen = [0, 1], yen = [1, 1], zen = [2, 1], pd = [3, 1], bw = [4, 2], dr = [6, 2] }
+notes = "DR selects the output data rate and BW the bandwidth; the rate each DR code names is stated per member. PD with the three axis enables selects the power mode: PD 0 is power-down, PD 1 with all three axes disabled is sleep, PD 1 otherwise is normal. Reset value 0x07 -- powered down with all three axes already enabled."
+
+[registers.ctrl_reg2]
+reg = 0x21
+width = 8
+access = "read-write"
+fields = { hpcf = [0, 4], hpm = [4, 2] }
+notes = "High-pass filter mode and cutoff selection. Bits 6 and 7 are loaded at boot and must not be changed, so this register is written read-modify-write."
+
+[registers.ctrl_reg3]
+reg = 0x22
+width = 8
+access = "read-write"
+fields = { i2_empty = [0, 1], i2_orun = [1, 1], i2_wtm = [2, 1], i2_drdy = [3, 1], pp_od = [4, 1], h_lactive = [5, 1], i1_boot = [6, 1], i1_int1 = [7, 1] }
+notes = "Interrupt pin configuration. The I1_ bits route to the INT1 pin and the I2_ bits to DRDY/INT2. H_Lactive picks the active level for INT1 (0 high, 1 low) and PP_OD picks push-pull or open drain for both."
+
+[registers.ctrl_reg5]
+reg = 0x24
+width = 8
+access = "read-write"
+fields = { out_sel = [0, 2], int1_sel = [2, 2], hpen = [4, 1], fifo_en = [6, 1], boot = [7, 1] }
+notes = "BOOT reloads the memory content. HPen enables the high-pass filter, and Out_Sel then decides whether the data registers and FIFO see filtered data: 00 is unfiltered, 01 is high-pass filtered, 1x adds the second low-pass stage. INT1_Sel makes the same choice for the interrupt generator's input. Bit 5 is unused."
+
+[registers.reference]
+reg = 0x25
+width = 8
+access = "read-write"
+fields = { ref = [0, 8] }
+notes = "Reference value for interrupt generation. READING IT ALSO RESETS THE HIGH-PASS FILTER when the filter is in its default mode, which is why one of the two documents names this register REFERENCE/DATACAPTURE in its address map while both name it REFERENCE in the register description: it is one register with two roles, and a driver that reads it to inspect the reference also clears the filter."
+
+[registers.out_temp]
+reg = 0x26
+width = 8
+access = "read-only"
+fields = { temp = [0, 8] }
+notes = "Temperature data, 8 bits. Neither document states a scale factor or a reference point for it here, so nothing converts it to a temperature; it is stated as a register that exists and reads a byte."
+
+[registers.status_reg]
+reg = 0x27
+width = 8
+access = "read-only"
+fields = { xda = [0, 1], yda = [1, 1], zda = [2, 1], zyxda = [3, 1], xor = [4, 1], yor = [5, 1], zor = [6, 1], zyxor = [7, 1] }
+notes = "The DA bits report new data available, per axis and for the set; the OR bits report that new data overwrote a sample before it was read. Polling ZYXDA is what makes a read a whole measurement rather than three unrelated axes."
+
+[registers.out_x]
+reg = 0x28
+width = 16
+access = "read-only"
+fields = { out_x_l = [0, 8], out_x_h = [8, 8] }
+notes = "X-axis angular rate, 16 bits, two's complement. THE BYTE ORDER STATED HERE IS THE ONE BLE SELECTS BY DEFAULT: with CTRL_REG4's BLE at its reset value the low byte is at the LOWER address, 0x28, and the high byte at 0x29. Setting BLE swaps them, and a driver that sets it may not use this layout."
+
+[registers.out_y]
+reg = 0x2A
+width = 16
+access = "read-only"
+fields = { out_y_l = [0, 8], out_y_h = [8, 8] }
+notes = "Y-axis angular rate; same format and the same dependence on BLE as out_x."
+
+[registers.out_z]
+reg = 0x2C
+width = 16
+access = "read-only"
+fields = { out_z_l = [0, 8], out_z_h = [8, 8] }
+notes = "Z-axis angular rate; same format and the same dependence on BLE as out_x."
+
+[registers.fifo_ctrl_reg]
+reg = 0x2E
+width = 8
+access = "read-write"
+notes = "FIFO mode and watermark. Fields not transcribed."
+
+[registers.fifo_src_reg]
+reg = 0x2F
+width = 8
+access = "read-only"
+notes = "FIFO status. Fields not transcribed."
+
+[registers.int1_cfg]
+reg = 0x30
+width = 8
+access = "read-write"
+notes = "Interrupt generator configuration. Fields not transcribed."
+
+[registers.int1_src]
+reg = 0x31
+width = 8
+access = "read-only"
+notes = "Interrupt generator source. Fields not transcribed."
+
+[registers.int1_ths_xh]
+reg = 0x32
+width = 8
+access = "read-write"
+notes = "X-axis interrupt threshold, high byte. Fields not transcribed."
+
+[registers.int1_ths_xl]
+reg = 0x33
+width = 8
+access = "read-write"
+notes = "X-axis interrupt threshold, low byte. Fields not transcribed."
+
+[registers.int1_ths_yh]
+reg = 0x34
+width = 8
+access = "read-write"
+notes = "Y-axis interrupt threshold, high byte. Fields not transcribed."
+
+[registers.int1_ths_yl]
+reg = 0x35
+width = 8
+access = "read-write"
+notes = "Y-axis interrupt threshold, low byte. Fields not transcribed."
+
+[registers.int1_ths_zh]
+reg = 0x36
+width = 8
+access = "read-write"
+notes = "Z-axis interrupt threshold, high byte. Fields not transcribed."
+
+[registers.int1_ths_zl]
+reg = 0x37
+width = 8
+access = "read-write"
+notes = "Z-axis interrupt threshold, low byte. Fields not transcribed."
+
+[registers.int1_duration]
+reg = 0x38
+width = 8
+access = "read-write"
+notes = "Interrupt duration counter. Fields not transcribed. This is the last register of the map on both parts."
+
+# --- enumerations --------------------------------------------------------------------------------
+
+# THE SENSITIVITY IS SHARED WHERE THE RANGE IS NOT, WHICH IS THE SURPRISING HALF OF THIS FAMILY.
+# The two members disagree about what to CALL the lowest full-scale setting -- one says 245 dps and
+# the other 250 -- and agree exactly on what one output digit is WORTH at that setting. The number
+# a driver multiplies by is the second one, so the disagreement costs a caller nothing and would
+# cost a reader who noticed only the range names a lot.
+#
+# MICRODEGREES PER SECOND, AS INTEGERS. The documents give 8.75, 17.50 and 70 millidegrees per
+# second per digit; a facts table that carried 17.50 as a float would force floating point into
+# every emitted language for the sake of three rows, on a catalogue that has to work on a tier with
+# no floating point at all.
+[enums.sensitivity_udps_per_digit]
+"0" = 8750
+"1" = 17500
+"2" = 70000
+"3" = 70000
+notes = "Indexed by the CTRL_REG4 full-scale code. Code 3 selects the same range as code 2 on both parts, so it is worth the same. These are the typical figures; both documents also give a min and a max around them, and a part's real sensitivity is inside that spread rather than at the typical."
+
+[enums.ctrl_reg1_mode]
+power_down = 0x00
+sleep = 0x08
+normal_all_axes = 0x0F
+reset = 0x07
+notes = "The low nibble of CTRL_REG1 -- PD with the three axis enables -- as whole values rather than as bits to compose. `reset` is the value the register holds at power-up: powered down, with all three axes already enabled, so leaving power-down is a single write of `normal_all_axes`. Sleep keeps the device running with every axis disabled."
+
+[enums.hpf_mode]
+normal_reset_on_reference_read = 0
+reference_signal = 1
+normal = 2
+autoreset_on_interrupt = 3
+notes = "CTRL_REG2's HPM field. Codes 0 and 2 are both normal mode; they differ in that code 0's filter is reset by READING the reference register, which is the coupling that register's own notes describe."
+
+# --- sequences -----------------------------------------------------------------------------------
+#
+# Declarative steps, so the description is transport agnostic: the same sequence describes an I2C
+# transaction, an SPI one, and a call through a host import.
+
+[[sequences.enter_normal_mode]]
+step = "write-field"
+register = "ctrl_reg1"
+field = "pd"
+value = 1
+notes = "One write, because the reset value already has all three axes enabled: raising PD is the whole of leaving power-down. A driver that also wants a rate or a bandwidth writes DR and BW in the same byte."
+
+[[sequences.read_rate]]
+step = "poll-field-until"
+register = "status_reg"
+field = "zyxda"
+value = 1
+bounded = true
+notes = "Bounded so an absent or wedged part surfaces as an error rather than a hang. Waiting on ZYXDA rather than on the per-axis bits is what makes the three axes below one measurement."
+
+[[sequences.read_rate]]
+step = "burst-read"
+from = "out_x"
+length_from = "measurement.burst_length"
+notes = "One burst from the X low byte covers all three axes. The interface's auto-increment bit must be set for it -- without it the same address is re-read for every block and all three axes come back equal to X."
+
+[measurement]
+burst_length = 6
+resolution_bits = "16 per axis, two's complement, at every full-scale setting"

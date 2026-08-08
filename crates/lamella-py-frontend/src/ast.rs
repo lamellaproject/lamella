@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use lamella_py_bytecode::PyStr;
 
 /// A binary arithmetic or bitwise operator. The typed AOT lane lowers the integer forms; true
 /// division (`/`), exponentiation (`**`), and any float operand stay dynamic (the interpreter).
@@ -98,7 +99,10 @@ pub enum Expr {
     /// A bytes literal `b"..."` -- its decoded bytes. Dynamic (a heap `bytes`).
     Bytes(Vec<u8>),
     /// A string literal (its decoded value). A dynamic value -- no typed AOT lowering.
-    Str(String),
+    ///
+    /// WTF-8 rather than a `String`: a Python `str` is a sequence of code points, and a lone
+    /// surrogate is one of them but is not a Unicode scalar value. See [`PyStr`].
+    Str(PyStr),
     /// A `True` or `False` literal.
     Bool(bool),
     /// The `None` literal.
@@ -272,6 +276,10 @@ pub enum Expr {
     /// return value (its `StopIteration.value`). Like `yield`, it makes the enclosing function a
     /// generator.
     YieldFrom(Box<Expr>),
+    /// An `await expr` expression -- suspends the enclosing coroutine until the awaitable completes
+    /// and produces its result. Legal only inside an `async def` body; the operand is a `primary`,
+    /// so `await -x` is a syntax error and `await a ** b` is `(await a) ** b`.
+    Await(Box<Expr>),
     /// `name := value` -- the walrus (assignment expression): binds `name` and yields `value`.
     Walrus {
         /// The bound name (the target is a bare name).
@@ -354,6 +362,20 @@ impl AssignTarget {
             }
             AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {}
         }
+    }
+}
+
+/// The name an `import` clause binds, given its (possibly dotted) module name and its optional
+/// alias: the alias when one was written, else the module's ROOT segment.
+///
+/// `import a.b` binds `a` and `import a.b as x` binds `x` -- CPython's rule, and the reason the two
+/// cannot be told apart from the bound name alone is `import a.b as a`, which binds the name `a` to
+/// the module `a.b` rather than to `a`.
+#[must_use]
+pub fn import_bound_name<'a>(module: &'a str, alias: &'a Option<String>) -> &'a str {
+    match alias {
+        Some(name) => name,
+        None => module.split('.').next().unwrap_or(module),
     }
 }
 
@@ -504,6 +526,30 @@ pub enum Stmt {
         /// The `with` body.
         body: Vec<Stmt>,
     },
+    /// An `async for target in aiterable:` loop -- the ASYNC iterator protocol
+    /// (`__aiter__` / awaited `__anext__`, ending on `StopAsyncIteration`). A separate node from
+    /// [`Stmt::ForIter`] rather than a flag on it, because the two share no ops: the sync loop uses
+    /// `GetIter`/`ForIter` and this one desugars to awaited dunder calls.
+    AsyncFor {
+        /// The loop variable, bound to each item.
+        target: String,
+        /// The asynchronous iterable expression.
+        iterable: Expr,
+        /// The loop body.
+        body: Vec<Stmt>,
+        /// The `else` clause -- run when the iterator is exhausted, not when a `break` left the loop.
+        orelse: Vec<Stmt>,
+    },
+    /// An `async with context [as name]:` statement (a single context manager). The same PEP 343
+    /// protocol as [`Stmt::With`], but `__aenter__` / `__aexit__` and both awaited.
+    AsyncWith {
+        /// The context-manager expression, evaluated once.
+        context: Expr,
+        /// The optional `as name` target, bound to the awaited `__aenter__`'s result.
+        optional_name: Option<String>,
+        /// The `async with` body.
+        body: Vec<Stmt>,
+    },
     /// A `class Name [(Base, ...)]:` definition. The body holds method definitions (`FuncDef`)
     /// and class-attribute assignments (`Assign`).
     ClassDef {
@@ -531,8 +577,15 @@ pub enum Stmt {
     /// `import module [as alias], ...` -- import one or more modules, binding each to its `as`
     /// alias or the module name. Simple (undotted) module names only in this subset.
     Import {
-        /// Each `(module_name, bound_name)`.
-        modules: Vec<(String, String)>,
+        /// Each `(module_name, alias)`, where the module name may be DOTTED and the alias is the
+        /// `as` name when one was written.
+        ///
+        /// The alias is kept as an `Option` rather than pre-resolved to a bound name, because the
+        /// two cases bind DIFFERENT modules and not merely different names: `import a.b` binds the
+        /// ROOT `a`, while `import a.b as x` binds the LEAF `a.b`. Collapsing them loses that, and
+        /// `import a.b as a` -- whose alias equals the root -- is the case where the loss is
+        /// silent and wrong (CPython binds `a` to `a.b` there). Use [`import_bound_name`].
+        modules: Vec<(String, Option<String>)>,
     },
     /// `from module import name [as alias], ...` -- bind members off a module.
     ImportFrom {
@@ -615,6 +668,10 @@ pub struct FuncDef {
     pub ret: Option<Expr>,
     /// The function body.
     pub body: Vec<Stmt>,
+    /// Whether this is an `async def` -- a coroutine function. Calling it builds a coroutine object
+    /// instead of running the body, and `await` / `async for` / `async with` are legal only inside
+    /// one (they do not reach into a plain `def` nested in it).
+    pub is_async: bool,
 }
 
 /// A whole module: its top-level statements in source order (function definitions

@@ -3,6 +3,11 @@
 pub const PART: &str = "bmp280";
 pub const FAMILY: &str = "bmx280";
 
+/// sourcing: how far this part is established, on two INDEPENDENT axes -- a part can be strong on one and absent on the other, which is why they are not one rank. FACTS is `primary` (read from the part's own datasheet) or `secondary` (a primary vendor statement about this part carried by another document, named by DERIVED_FROM). VALIDATION is `none` (no physical part of this type has been made to answer), `identified` (one answered its identity register, against a negative control that tells the part from the wire) or `exercised` (one produced measurements a driver decoded). Anything above `none` states what was observed in EVIDENCE.
+pub const SOURCING_FACTS: &str = "secondary";
+pub const SOURCING_DERIVED_FROM: &str = "bme280";
+pub const SOURCING_VALIDATION: &str = "none";
+
 /// identity: the accepted values are a SET. A driver that accepts only one of them rejects a genuine part, and a rejected part reads as no part at all -- so on a mismatch, name the id received AND this set.
 pub const IDENTITY_REG: u32 = 0xD0;
 pub const IDENTITY_WIDTH: u32 = 8;

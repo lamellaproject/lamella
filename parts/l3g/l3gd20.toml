@@ -1,0 +1,112 @@
+# PART: ST L3GD20 three-axis digital gyroscope.
+#
+# Shares the whole L3G register address map with its sibling and differs from it in five places,
+# every one of which is stated below: the identity byte, the I2C slave address, the range each
+# full-scale code names, the rate each output-data-rate code selects, and the field layout of
+# CTRL_REG4. Everything else is inherited from the family base and FLATTENED INTO THE EMITTED
+# TABLE, so a reader of the emitted artifact never has to chase a base to see the whole truth.
+
+[table]
+kind = "device"
+family = "l3g"
+part = "l3gd20"
+base = "l3g"
+sources = [
+    "ST L3GD20 datasheet DocID022116 Rev 2: register address map ch 6 table 17 (page 29), CTRL_REG1 ch 7.2 tables 19-20 and the DR/BW configuration table 21 (pages 30-32), CTRL_REG4 ch 7.5 tables 29-30 (page 34), the I2C slave address ch 5.1 and the SAD+read/write patterns table 12 (pages 21-22), mechanical characteristics table 4 (page 8), high-pass cutoff table 26 (page 33).",
+]
+notes = [
+    "THIS DOCUMENT'S ADDRESS MAP MISSPELLS SIX REGISTER NAMES AND ITS OWN OTHER CHAPTERS DO NOT. Table 17 lists the six interrupt threshold registers as INT1_TSH_XH through INT1_TSH_ZL; the contents page, section 7.17 and tables 48 and 49 of the same document spell all six INT1_THS_*, and so does the sibling's address map. THS is the transposition that reads as a word -- threshold -- so the names carried here are the THS ones. That is a document defect and not a difference between the parts, and it is worth naming because it is exactly the kind of thing that would have shown up as six registers dropping out of the family's shared class.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
+#
+# Unvalidated, stated plainly: no physical part of this type has been made to answer any of it. The
+# sibling has, which raises no rank here -- the two are different silicon, and the one fact a part
+# of this type would answer with is precisely the one byte that differs between them.
+#
+# THE PAIR IS WHY THE TWO AXES ARE TWO. Both members of this family are primary and only one is
+# validated, where the other family in this catalogue has both members unvalidated and one of them
+# secondary. Each family varies on one axis and holds the other fixed, so neither could be ordered
+# on a single rank without calling one kind of shortfall the smaller.
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- identity ------------------------------------------------------------------------------------
+#
+# ONE BIT APART FROM THE SIBLING'S, which is the whole reason an identity is checked as a SET rather
+# than compared to a constant a driver was written around: 0xD4 and 0xD3 differ in two bit
+# positions and neither is far from the other, so a driver that accepted "close enough" would accept
+# the wrong part.
+
+[identity]
+reg = 0x0F
+width = 8
+values = [0xD4]
+notes = "DocID022116 Rev 2 table 17 gives the reset value as 11010100. The sibling answers 0xD3."
+
+# --- I2C address: NOT the sibling's ----------------------------------------------------------------
+#
+# The two parts sit at DIFFERENT I2C addresses -- 110101x here against 110100x on the sibling -- so
+# a probe that scans for one of them at a fixed address does not find the other at all. This is the
+# difference that most changes what auto-detection means: the identity register cannot settle which
+# part is fitted until something has already addressed it correctly.
+
+[address]
+bus = "i2c"
+base = 0x6A
+notes = "DocID022116 Rev 2 ch 5.1: the slave address is 110101xb, and its table 12 gives the composed bytes as 0xD4/0xD5 with the strap low and 0xD6/0xD7 with it high -- which are the 7-bit addresses below shifted up with the read/write bit appended, not addresses in their own right. Those composed bytes are also, coincidentally, near the two parts' identity values, and are not related to them."
+
+[[address.straps]]
+pin = "SDO"
+bit = 0
+low = 0x6A
+high = 0x6B
+
+# --- CTRL_REG4: the register whose FIELDS the two parts do not share --------------------------------
+#
+# The address map says this register is identical on both parts -- same address, same width, same
+# access, same reset default of zero -- and inside it they are not. Here bit 7 is the block-data-
+# update enable and bits 2:1 are reserved zeros this document says must not be changed; on the
+# sibling bit 7 is a reserved zero and bits 2:1 are a self-test selector. So each of the two control
+# bits one part has is a bit the other part reserves, and a driver that carried either across would
+# be writing a reserved bit rather than getting a no-op.
+#
+# BDU IS THE ONE OF THE TWO WITH REAL CONSEQUENCES FOR A READING, because it is what stops the
+# output registers being updated between the high and low byte of one sample. A driver that reads
+# the three axes as one burst does not need it; a driver that reads bytes one at a time on this part
+# can set it, and on the sibling has nothing to set.
+
+[registers.ctrl_reg4]
+reg = 0x23
+width = 8
+access = "read-write"
+fields = { sim = [0, 1], fs = [4, 2], ble = [6, 1], bdu = [7, 1] }
+notes = "Bits 2:1 are reserved zeros that must not be changed, and bit 3 is unused. BDU is block data update: 0 updates continuously, 1 holds the output registers until both the high and the low byte have been read. BLE picks the byte order of the rate outputs (0: low byte at the lower address). FS selects the full scale. SIM picks the SPI wiring: 0 is the four-wire interface, 1 is three-wire with one shared data line."
+
+# --- full scale: the RANGE differs from the sibling's, the SENSITIVITY does not ---------------------
+
+[enums.full_scale_dps]
+"0" = 250
+"1" = 500
+"2" = 2000
+"3" = 2000
+notes = "Degrees per second, as the magnitude of a symmetric range: code 0 is plus or minus 250. The sibling's code 0 is plus or minus 245 for the same 8.75 millidegrees per digit, so the two parts name different ranges over an identical LSB. Codes 2 and 3 both select 2000."
+
+# --- output data rate: DIFFERENT FROM THE SIBLING'S, and stated three times here --------------------
+#
+# WHERE THE SIBLING'S DOCUMENT CONTRADICTS ITSELF ABOUT THESE FOUR NUMBERS, THIS ONE DOES NOT. The
+# mechanical characteristics table 4, the DR/BW configuration table 21, and the four column headings
+# of the high-pass cutoff table 26 all give 95/190/380/760 Hz. That is the same three-place check
+# the sibling fails in one place, which is why its rates are recorded with a caveat and these are
+# not.
+
+[enums.odr_hz]
+"0" = 95
+"1" = 190
+"2" = 380
+"3" = 760
+notes = "Indexed by CTRL_REG1's DR field. BW selects the bandwidth within a rate and does not change it. The sibling's four rates are 100/200/400/800 Hz for the same four codes, so this is one of the two enumerations a driver cannot share between the parts."

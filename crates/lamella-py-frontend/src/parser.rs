@@ -11,6 +11,7 @@ use crate::ast::{
     Keyword, ModuleAst, ParamDef, Stmt, UnaryOp,
 };
 use crate::lexer::{FStringPart, Tok, Token};
+use lamella_py_bytecode::PyStr;
 
 /// Whether an expression is a `range(...)` call -- the counted-loop form of `for`.
 fn is_range_call(iter: &Expr) -> bool {
@@ -55,7 +56,7 @@ impl core::fmt::Display for ParseError {
 
 /// Parse a token stream (ending in [`Tok::Eof`]) into a module AST.
 pub fn parse(tokens: Vec<Token>) -> Result<ModuleAst, ParseError> {
-    let mut parser = Parser { tokens, pos: 0, temp_seq: 0, line_ended: true };
+    let mut parser = Parser { tokens, pos: 0, temp_seq: 0, line_ended: true, func_ctx: None };
     parser.parse_module()
 }
 
@@ -68,6 +69,15 @@ struct Parser {
     /// Whether the most recent simple statement ended the line (a real newline) rather than a `;`
     /// separator. An inline suite (`if c: a; b`) reads simple statements until the line ends.
     line_ended: bool,
+    /// The kind of function body being parsed: `Some(true)` inside an `async def`, `Some(false)`
+    /// inside a plain `def` or a `lambda`, `None` at module level. `await` / `async for` /
+    /// `async with` require `Some(true)`.
+    ///
+    /// It is SAVED AND RESTORED at each function boundary rather than inherited, because async-ness
+    /// does not reach inward: a plain `def` nested in an `async def` may not `await`, and CPython
+    /// says so ("'await' outside async function"). The three-state shape is what separates that
+    /// message from the module-level one ("'await' outside function").
+    func_ctx: Option<bool>,
 }
 
 /// A `case` pattern in the supported match subset. Structural (sequence / class / mapping) patterns
@@ -205,7 +215,7 @@ fn isinstance_of(subject: &Expr, cls: &Expr) -> Expr {
 /// `hasattr(subject, "attr")` -- guards a class keyword sub-pattern so a missing attribute is a
 /// non-match (CPython swallows the `AttributeError`), not an error, and gates the attribute read.
 fn has_attr(subject: &Expr, attr: &str) -> Expr {
-    call2("hasattr", subject.clone(), Expr::Str(String::from(attr)))
+    call2("hasattr", subject.clone(), Expr::Str(attr.into()))
 }
 
 /// One `case pattern [if guard]: body` clause.
@@ -726,6 +736,11 @@ impl Parser {
             Err(self.error(format!(
                 "'{word}' is a reserved keyword and cannot be used as a name"
             )))
+        } else if matches!(self.peek(), Tok::KwAsync | Tok::KwAwait) {
+            let word = if self.at(&Tok::KwAsync) { "async" } else { "await" };
+            Err(self.error(format!(
+                "'{word}' is a keyword in Python 3.7 and later and cannot be used as a name"
+            )))
         } else {
             Err(self.error("expected a name"))
         }
@@ -763,6 +778,7 @@ impl Parser {
             Tok::KwTry => self.parse_try(),
             Tok::KwWith => self.parse_with(),
             Tok::KwClass => self.parse_classdef(),
+            Tok::KwAsync => self.parse_async_statement(),
             Tok::At => self.parse_decorated(),
             Tok::Reserved(s) if s == "import" => self.parse_import(),
             Tok::Reserved(s) if s == "from" => self.parse_from_import(),
@@ -771,21 +787,35 @@ impl Parser {
         }
     }
 
-    /// `import module [as alias] (, module [as alias])*` -- simple (undotted) module names.
+    /// A module name in an import statement: `name ('.' name)*`. Returns the FULL dotted name and
+    /// its ROOT segment, because the two are bound differently -- see [`Self::parse_import`].
+    ///
+    /// Only the NAME is dotted here. Package machinery -- `__init__.py`, submodule resolution,
+    /// package-relative imports -- is a separate feature this does not imply: what a dotted name
+    /// resolves to is the runtime's question, and an unresolvable one is a `ModuleNotFoundError` at
+    /// run time exactly as it is in CPython.
+    fn parse_dotted_name(&mut self) -> Result<(String, String), ParseError> {
+        let root = self.expect_name()?;
+        let mut full = root.clone();
+        while self.eat(&Tok::Dot) {
+            full.push('.');
+            full.push_str(&self.expect_name()?);
+        }
+        Ok((full, root))
+    }
+
+    /// `import module [as alias] (, module [as alias])*`, where a module name may be dotted.
     fn parse_import(&mut self) -> Result<Stmt, ParseError> {
         self.advance();
         let mut modules = Vec::new();
         loop {
-            let module = self.expect_name()?;
-            if self.at(&Tok::Dot) {
-                return Err(self.error("dotted module names (import a.b) are not supported in this subset"));
-            }
-            let bound = if self.eat(&Tok::KwAs) {
-                self.expect_name()?
+            let (module, _root) = self.parse_dotted_name()?;
+            let alias = if self.eat(&Tok::KwAs) {
+                Some(self.expect_name()?)
             } else {
-                module.clone()
+                None
             };
-            modules.push((module, bound));
+            modules.push((module, alias));
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -794,14 +824,16 @@ impl Parser {
         Ok(Stmt::Import { modules })
     }
 
-    /// `from module import name [as alias] (, name [as alias])*`, or `from module import *`. Dotted
-    /// module names are out of this subset.
+    /// `from module import name [as alias] (, name [as alias])*`, or `from module import *`. The
+    /// module name may be dotted; a package-RELATIVE one (a leading dot) may not.
     fn parse_from_import(&mut self) -> Result<Stmt, ParseError> {
         self.advance();
-        let module = self.expect_name()?;
         if self.at(&Tok::Dot) {
-            return Err(self.error("dotted module names (from a.b import ...) are not supported in this subset"));
+            return Err(self.error(
+                "a package-relative import (from . import ...) is not supported in this subset",
+            ));
         }
+        let (module, _root) = self.parse_dotted_name()?;
         if !matches!(self.peek(), Tok::Reserved(s) if s == "import") {
             return Err(self.error("expected 'import' after the module name in a `from` import"));
         }
@@ -1166,6 +1198,7 @@ impl Parser {
         let inner = match self.peek() {
             Tok::KwDef => self.parse_funcdef()?,
             Tok::KwClass => self.parse_classdef()?,
+            Tok::KwAsync if matches!(self.peek2(), Tok::KwDef) => self.parse_funcdef_body(true)?,
             _ => return Err(self.error("a decorator must be followed by a 'def' or 'class'")),
         };
         Ok(Stmt::Decorated {
@@ -1630,6 +1663,16 @@ impl Parser {
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        self.parse_for_body(false)
+    }
+
+    /// `["async"] "for" targets "in" iterable ":" suite ["else" ":" suite]` -- the `async` already
+    /// consumed by the caller. The target machinery (starred names, tuple targets and their unpack
+    /// desugar) is shared; only two things differ for `async for`, and both are correctness rather
+    /// than convenience: the counted `range(...)` fast path is SKIPPED, because it would compile a
+    /// sync loop for a header CPython rejects at runtime for having no `__aiter__`, and the result
+    /// is an [`Stmt::AsyncFor`], which lowers to the async iterator protocol.
+    fn parse_for_body(&mut self, is_async: bool) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwFor, "'for'")?;
         let line = self.current_line();
         let mut targets = Vec::new();
@@ -1658,12 +1701,16 @@ impl Parser {
         if star.is_none() {
             if let [AssignTarget::Name(name)] = targets.as_slice() {
                 let target = name.clone();
-                if is_range_call(&iter) {
+                if !is_async && is_range_call(&iter) {
                     if let Ok((start, stop, step)) = self.range_bounds(iter.clone()) {
                         return Ok(Stmt::For { target, start, stop, step, body, orelse });
                     }
                 }
-                return Ok(Stmt::ForIter { target, iterable: iter, body, orelse });
+                return Ok(if is_async {
+                    Stmt::AsyncFor { target, iterable: iter, body, orelse }
+                } else {
+                    Stmt::ForIter { target, iterable: iter, body, orelse }
+                });
             }
         }
 
@@ -1679,11 +1726,10 @@ impl Parser {
             value: Expr::Name(tmp.clone()),
         });
         new_body.append(&mut body);
-        Ok(Stmt::ForIter {
-            target: tmp,
-            iterable: iter,
-            body: new_body,
-            orelse,
+        Ok(if is_async {
+            Stmt::AsyncFor { target: tmp, iterable: iter, body: new_body, orelse }
+        } else {
+            Stmt::ForIter { target: tmp, iterable: iter, body: new_body, orelse }
         })
     }
 
@@ -1871,6 +1917,13 @@ impl Parser {
     /// `with context ["as" name] ":" suite` -- a single context manager. Multiple managers in
     /// one `with` (`with a, b:`) are unsupported.
     fn parse_with(&mut self) -> Result<Stmt, ParseError> {
+        self.parse_with_body(false)
+    }
+
+    /// `["async"] "with" items ":" suite` -- the `async` already consumed by the caller. Item
+    /// parsing (including the PEP 617 parenthesized list) and the left-to-right nesting are shared;
+    /// an `async with` differs only in the node it builds, which awaits `__aenter__`/`__aexit__`.
+    fn parse_with_body(&mut self, is_async: bool) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwWith, "'with'")?;
         let items = if self.at(&Tok::LParen) {
             let saved = self.pos;
@@ -1888,10 +1941,10 @@ impl Parser {
         let body = self.parse_suite()?;
         let mut current = body;
         for (context, optional_name) in items.into_iter().rev() {
-            current = vec![Stmt::With {
-                context,
-                optional_name,
-                body: current,
+            current = vec![if is_async {
+                Stmt::AsyncWith { context, optional_name, body: current }
+            } else {
+                Stmt::With { context, optional_name, body: current }
             }];
         }
         Ok(current
@@ -1976,6 +2029,17 @@ impl Parser {
     }
 
     fn parse_funcdef(&mut self) -> Result<Stmt, ParseError> {
+        self.parse_funcdef_body(false)
+    }
+
+    /// `["async"] "def" name "(" params ")" ["->" annotation] ":" suite` -- the `async` (and the
+    /// `def`) already checked by the caller but not consumed. The body parses with `func_ctx` set to
+    /// this function's own async-ness and RESTORED afterwards, so the flag never leaks outward to a
+    /// sibling statement or inward past a nested `def`.
+    fn parse_funcdef_body(&mut self, is_async: bool) -> Result<Stmt, ParseError> {
+        if is_async {
+            self.expect(&Tok::KwAsync, "'async'")?;
+        }
         self.expect(&Tok::KwDef, "'def'")?;
         let name = self.expect_name()?;
         self.expect(&Tok::LParen, "'(' after the function name")?;
@@ -1987,13 +2051,47 @@ impl Parser {
             None
         };
         self.expect(&Tok::Colon, "':'")?;
-        let body = self.parse_suite()?;
+        let outer = self.func_ctx;
+        self.func_ctx = Some(is_async);
+        let body = self.parse_suite();
+        self.func_ctx = outer;
         Ok(Stmt::FuncDef(FuncDef {
             name,
             params,
             ret,
-            body,
+            body: body?,
+            is_async,
         }))
+    }
+
+    /// A statement opening with `async`: `async def`, `async for`, or `async with`. Nothing else
+    /// follows `async` in Python -- there is no `async lambda` and no `async class`.
+    fn parse_async_statement(&mut self) -> Result<Stmt, ParseError> {
+        match self.peek2() {
+            Tok::KwDef => self.parse_funcdef_body(true),
+            Tok::KwFor => {
+                self.require_async_context("async for")?;
+                self.advance();
+                self.parse_for_body(true)
+            }
+            Tok::KwWith => {
+                self.require_async_context("async with")?;
+                self.advance();
+                self.parse_with_body(true)
+            }
+            _ => Err(self.error("expected 'def', 'for' or 'with' after 'async'")),
+        }
+    }
+
+    /// Reject an async-only construct outside an `async def`, with CPython's own two messages: at
+    /// module level the complaint is that there is no function at all, inside a plain `def` that the
+    /// function is not async.
+    fn require_async_context(&self, what: &str) -> Result<(), ParseError> {
+        match self.func_ctx {
+            Some(true) => Ok(()),
+            Some(false) => Err(self.error(format!("'{what}' outside async function"))),
+            None => Err(self.error(format!("'{what}' outside function"))),
+        }
     }
 
     /// `parameter ("," parameter)* [","]`, where `parameter: identifier [":"
@@ -2185,10 +2283,20 @@ impl Parser {
     /// expression list).
     fn parse_yield(&mut self) -> Result<Expr, ParseError> {
         self.expect(&Tok::KwYield, "'yield'")?;
+        let in_async = self.func_ctx == Some(true);
         if matches!(self.peek(), Tok::Reserved(s) if s == "from") {
+            if in_async {
+                return Err(self.error("'yield from' inside async function"));
+            }
             self.advance();
             let value = self.parse_expr()?;
             return Ok(Expr::YieldFrom(Box::new(value)));
+        }
+        if in_async {
+            return Err(self.error(
+                "'yield' inside an 'async def' makes an async generator, \
+                 which is not supported in this subset",
+            ));
         }
         let bare = matches!(
             self.peek(),
@@ -2233,7 +2341,11 @@ impl Parser {
         self.expect(&Tok::KwLambda, "'lambda'")?;
         let params = self.parse_lambda_params()?;
         self.expect(&Tok::Colon, "':' after the lambda parameters")?;
-        let body = self.parse_expr()?;
+        let outer = self.func_ctx;
+        self.func_ctx = Some(false);
+        let body = self.parse_expr();
+        self.func_ctx = outer;
+        let body = body?;
         Ok(Expr::Lambda {
             params,
             body: Box::new(body),
@@ -2530,7 +2642,7 @@ impl Parser {
     /// `2 ** (-1)`, and `2 ** 3 ** 2` is `2 ** (3 ** 2)`. The right operand is a u_expr, so recursing
     /// through parse_unary yields both the right-associativity and a unary right operand.
     fn parse_power(&mut self) -> Result<Expr, ParseError> {
-        let base = self.parse_trailer()?;
+        let base = self.parse_await_primary()?;
         if self.eat(&Tok::DoubleStar) {
             let exp = self.parse_unary()?;
             return Ok(Expr::Binary {
@@ -2540,6 +2652,19 @@ impl Parser {
             });
         }
         Ok(base)
+    }
+
+    /// `await_primary: "await" primary | primary` -- the operand of `await` is a PRIMARY, not a
+    /// unary expression, which is what makes `await -a` a syntax error and `await a.b()` an await of
+    /// the whole call. Sitting here (under `**`, above the trailers) also gives `await a ** b` its
+    /// CPython reading, `(await a) ** b`.
+    fn parse_await_primary(&mut self) -> Result<Expr, ParseError> {
+        if !self.at(&Tok::KwAwait) {
+            return self.parse_trailer();
+        }
+        self.require_async_context("await")?;
+        self.advance();
+        Ok(Expr::Await(Box::new(self.parse_trailer()?)))
     }
 
     /// Postfix attribute reference (`primary "." identifier`), call (`primary "("
@@ -2643,7 +2768,7 @@ impl Parser {
                 },
             });
         }
-        Ok(acc.unwrap_or(Expr::Str(String::new())))
+        Ok(acc.unwrap_or(Expr::Str(PyStr::default())))
     }
 
     /// Desugar one `{expr[=][!conv][:spec]}` field. The expression is parsed; a `!r`/`!s` conversion
@@ -2676,15 +2801,15 @@ impl Parser {
         }
         let value = if let Some(spec) = spec {
             let template = match self.fstring_spec_expr(spec)? {
-                None => Expr::Str(format!("{{:{spec}}}")),
+                None => Expr::Str(format!("{{:{spec}}}").into()),
                 Some(spec_expr) => Expr::Binary {
                     op: BinOp::Add,
                     lhs: Box::new(Expr::Binary {
                         op: BinOp::Add,
-                        lhs: Box::new(Expr::Str(String::from("{:"))),
+                        lhs: Box::new(Expr::Str("{:".into())),
                         rhs: Box::new(spec_expr),
                     }),
-                    rhs: Box::new(Expr::Str(String::from("}"))),
+                    rhs: Box::new(Expr::Str("}".into())),
                 },
             };
             Expr::Call {
@@ -2706,7 +2831,7 @@ impl Parser {
         } else {
             Expr::Call {
                 func: Box::new(Expr::Attribute {
-                    value: Box::new(Expr::Str(String::from("{}"))),
+                    value: Box::new(Expr::Str("{}".into())),
                     attr: String::from("format"),
                 }),
                 args: vec![node],
@@ -2716,7 +2841,7 @@ impl Parser {
         match debug {
             Some(prefix) => Ok(Expr::Binary {
                 op: BinOp::Add,
-                lhs: Box::new(Expr::Str(String::from(prefix))),
+                lhs: Box::new(Expr::Str(prefix.into())),
                 rhs: Box::new(value),
             }),
             None => Ok(value),
@@ -2748,7 +2873,7 @@ impl Parser {
                 }
                 '{' => {
                     if !literal.is_empty() {
-                        parts.push(Expr::Str(core::mem::take(&mut literal)));
+                        parts.push(Expr::Str(core::mem::take(&mut literal).into()));
                     }
                     i += 1;
                     let start = i;
@@ -2780,7 +2905,7 @@ impl Parser {
             }
         }
         if !literal.is_empty() {
-            parts.push(Expr::Str(literal));
+            parts.push(Expr::Str(literal.into()));
         }
         Ok(Some(
             parts
@@ -2790,7 +2915,7 @@ impl Parser {
                     lhs: Box::new(a),
                     rhs: Box::new(b),
                 })
-                .unwrap_or_else(|| Expr::Str(String::new())),
+                .unwrap_or_else(|| Expr::Str(PyStr::default())),
         ))
     }
 
@@ -2800,7 +2925,13 @@ impl Parser {
     fn parse_embedded_expr(&self, raw: &str) -> Result<Expr, ParseError> {
         let tokens = crate::lexer::tokenize(raw.trim())
             .map_err(|e| self.error(format!("in f-string expression: {}", e.message)))?;
-        let mut sub = Parser { tokens, pos: 0, temp_seq: 0, line_ended: true };
+        let mut sub = Parser {
+            tokens,
+            pos: 0,
+            temp_seq: 0,
+            line_ended: true,
+            func_ctx: self.func_ctx,
+        };
         let expr = sub.parse_expr()?;
         if !matches!(sub.peek(), Tok::Newline | Tok::Eof) {
             return Err(self.error("unexpected trailing tokens in an f-string expression"));
@@ -2827,9 +2958,26 @@ impl Parser {
     /// The `for target(s) in iterable [if cond ...]` clause chain of a comprehension (the
     /// first `for` not yet consumed). Multiple `for`s nest; iterables and filters parse below
     /// the conditional, so a trailing `if` is a filter, not a conditional expression.
+    /// Whether a comprehension's clause chain starts here. `async` counts, even though an
+    /// asynchronous comprehension is refused: entering the comprehension path is what lets
+    /// `parse_comp_clauses` name the missing feature, where leaving it out would report the `async`
+    /// as an unexpected token closing a list display.
+    fn at_comp_clause(&self) -> bool {
+        self.at(&Tok::KwFor) || self.at(&Tok::KwAsync)
+    }
+
     fn parse_comp_clauses(&mut self) -> Result<Vec<CompClause>, ParseError> {
         let mut clauses = Vec::new();
-        while self.eat(&Tok::KwFor) {
+        loop {
+            if self.at(&Tok::KwAsync) {
+                return Err(self.error(
+                    "an asynchronous comprehension ('async for' in a comprehension) \
+                     is not supported in this subset",
+                ));
+            }
+            if !self.eat(&Tok::KwFor) {
+                break;
+            }
             let targets = self.parse_target_list()?;
             self.expect(&Tok::KwIn, "'in' in the comprehension")?;
             let iterable = self.parse_or()?;
@@ -2933,7 +3081,7 @@ impl Parser {
         }
         let key = self.parse_expr()?;
         if !self.eat(&Tok::Colon) {
-            if self.at(&Tok::KwFor) {
+            if self.at_comp_clause() {
                 let clauses = self.parse_comp_clauses()?;
                 self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
                 return Ok(Expr::SetComp {
@@ -2944,7 +3092,7 @@ impl Parser {
             return self.finish_set(DisplayElem::Plain(key));
         }
         let value = self.parse_expr()?;
-        if self.at(&Tok::KwFor) {
+        if self.at_comp_clause() {
             let clauses = self.parse_comp_clauses()?;
             self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
             return Ok(Expr::DictComp {
@@ -3026,7 +3174,7 @@ impl Parser {
                     return Err(self.error("positional argument follows keyword argument"));
                 }
                 let first = self.parse_expr()?;
-                if self.at(&Tok::KwFor) {
+                if self.at_comp_clause() {
                     if !out.is_empty() {
                         return Err(self.error(
                             "a generator expression must be parenthesized unless it is the sole argument",
@@ -3119,7 +3267,7 @@ impl Parser {
                 self.advance();
                 let mut joined = value;
                 while let Tok::Str(next) = self.peek().clone() {
-                    joined.push_str(&next);
+                    joined.append(&next);
                     self.advance();
                 }
                 Ok(Expr::Str(joined))
@@ -3135,7 +3283,7 @@ impl Parser {
                     return Ok(Expr::List(Vec::new()));
                 }
                 let first = self.parse_display_elem()?;
-                if matches!(first, DisplayElem::Plain(_)) && self.at(&Tok::KwFor) {
+                if matches!(first, DisplayElem::Plain(_)) && self.at_comp_clause() {
                     let DisplayElem::Plain(element) = first else {
                         unreachable!("guarded to a plain element")
                     };
@@ -3180,7 +3328,7 @@ impl Parser {
                     return Ok(Expr::Tuple(Vec::new()));
                 }
                 let first = self.parse_display_elem()?;
-                if matches!(first, DisplayElem::Plain(_)) && self.at(&Tok::KwFor) {
+                if matches!(first, DisplayElem::Plain(_)) && self.at_comp_clause() {
                     let DisplayElem::Plain(element) = first else {
                         unreachable!("guarded to a plain element")
                     };
@@ -4414,8 +4562,8 @@ else:
         assert!(parse_src("xs[1:2] += p\n").is_err());
         assert!(parse_src("1 = x\n").is_err());
         assert!(parse_src("def f(a=1, b): return a\n").is_err());
-        assert!(parse_src("import a.b\n").is_err());
-        assert!(parse_src("from a.b import *\n").is_err());
+        assert!(parse_src("from . import x\n").is_err());
+        assert!(parse_src("from .a import b\n").is_err());
     }
 
     #[test]
@@ -4428,12 +4576,22 @@ else:
     fn import_statements_parse() {
         assert!(matches!(
             &parse_ok("import math\n").body[0],
-            Stmt::Import { modules } if modules == &[("math".into(), "math".into())]
+            Stmt::Import { modules } if modules == &[(String::from("math"), None)]
         ));
         assert!(matches!(
             &parse_ok("import math as m\n").body[0],
-            Stmt::Import { modules } if modules == &[("math".into(), "m".into())]
+            Stmt::Import { modules }
+                if modules == &[(String::from("math"), Some(String::from("m")))]
         ));
+        assert!(matches!(
+            &parse_ok("import a.b.c\n").body[0],
+            Stmt::Import { modules } if modules == &[(String::from("a.b.c"), None)]
+        ));
+        assert_eq!(crate::ast::import_bound_name("a.b.c", &None), "a");
+        assert_eq!(
+            crate::ast::import_bound_name("a.b.c", &Some(String::from("x"))),
+            "x"
+        );
         assert!(matches!(
             &parse_ok("from math import sqrt\n").body[0],
             Stmt::ImportFrom { module, names }

@@ -1,0 +1,70 @@
+# BLOCK layout: the CH32V003 GPIO port block. Transcribed from the CH32V003 Reference Manual
+# V1.9 (WCH), section 7.3.1, with the document open.
+#
+# EIGHT PINS PER PORT, WHICH IS WHY THERE IS ONLY A CFGLR. The STM32F1 family this IP resembles
+# splits its per-pin configuration across CFGLR (pins 0-7) and CFGHR (pins 8-15); this part has no
+# CFGHR because it has no pins above 7, and Table 7-15 lists none. Every whole-port register here
+# is therefore 8 bits wide with the rest reserved -- a driver that writes a 16-bit port word
+# carried over from the F1 is writing into reserved space.
+
+[table]
+kind = "block"
+family = "ch32v003"
+block = "gpio"
+sources = [
+    "CH32V003 Reference Manual V1.9 (WCH), section 7.3.1: Table 7-15 register list and sections 7.3.1.1 through 7.3.1.6 for the bit fields",
+]
+notes = [
+    "CFGLR gives each pin a 4-bit cell at [4n]: MODE at [4n, 2] and CNF at [4n+2, 2]. MODE selects direction AND output slew (00 input, 01 output 10 MHz, 10 output 2 MHz, 11 output 30 MHz), so an output cell is never 00 -- the speed is not optional the way an STM32F4's OSPEEDR is.",
+    "CNF is read against MODE, not on its own: with MODE = 00 it selects the INPUT flavor (00 analog, 01 floating, 10 pull-up/pull-down, 11 reserved); with MODE > 00 it selects the OUTPUT flavor (00 push-pull, 01 open-drain, 10 alternate push-pull, 11 alternate open-drain). The same two bits mean different things either side of that test, which is the field a transcription gets wrong.",
+    "CFGLR resets to 0x44444444: every cell is CNF 01 / MODE 00, floating input. So a pin is an input until configured, and the whole-register reset value is what a read-modify-write must preserve for the pins it does not own.",
+    "BSHR is the register that makes a single pin safe to drive: writing a 1 into BS[n] sets the pin and a 1 into BR[n] clears it, with no read-modify-write and so no window in which a concurrent write to another pin can be lost. Writing 0 to either half does nothing. If BS and BR are both set for one pin, section 7.3.1.4 states that SET wins.",
+    "BCR is BSHR's clear half on its own at a separate address; it is redundant with BR and exists for drivers that prefer one register per direction.",
+]
+
+[registers.CFGLR]
+offset = 0x0
+width = 32
+fields = { MODE6 = [24, 2], CNF6 = [26, 2] }
+notes = "Per-pin configuration, 4 bits per pin at [4n] (PARTIAL: pin 6 stated, the one a board binds). Reset 0x44444444."
+
+[registers.INDR]
+offset = 0x8
+width = 32
+notes = "Port input level; bit n is pin n, [7:0] only and read-only. The manual notes these are read in 16-bit form."
+
+[registers.OUTDR]
+offset = 0xC
+width = 32
+notes = "Port output level; bit n is pin n, [7:0] only. Read-modify-write -- prefer BSHR, which needs no read."
+
+[registers.BSHR]
+offset = 0x10
+width = 32
+fields = { BS6 = [6, 1], BR6 = [22, 1] }
+notes = "Atomic set/reset. BS[n] at [n] sets pin n; BR[n] at [16+n] clears it. Only [7:0] and [23:16] are implemented, because the port has eight pins -- the F1's BR field runs to bit 31 and this one stops at 23."
+
+[registers.BCR]
+offset = 0x14
+width = 32
+fields = { BR6 = [6, 1] }
+notes = "Reset-only alias: BR[n] at [n] clears pin n. Bits [31:8] reserved."
+
+[registers.LCKR]
+offset = 0x18
+width = 32
+notes = "Configuration lock. LCK[n] at [n] for pins 0-7, and the LCKK key at [16]; the lock takes effect only after the manual's write sequence on the key."
+
+[constants]
+CFGLR_MODE_INPUT = 0
+CFGLR_MODE_OUTPUT_10MHZ = 1
+CFGLR_MODE_OUTPUT_2MHZ = 2
+CFGLR_MODE_OUTPUT_30MHZ = 3
+CFGLR_CNF_OUTPUT_PUSH_PULL = 0
+CFGLR_CNF_OUTPUT_OPEN_DRAIN = 1
+CFGLR_CNF_OUTPUT_AF_PUSH_PULL = 2
+CFGLR_CNF_OUTPUT_AF_OPEN_DRAIN = 3
+CFGLR_CNF_INPUT_ANALOG = 0
+CFGLR_CNF_INPUT_FLOATING = 1
+CFGLR_CNF_INPUT_PULL = 2
+CFGLR_RESET = 0x44444444

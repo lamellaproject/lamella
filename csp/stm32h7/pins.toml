@@ -1,0 +1,33 @@
+# PIN map: pin x function -> (instance, signal) for the STM32H7.
+# PARTIAL, evidence-only. Function ids are the ST alternate-function numbers (AF0..AF15) that the
+# AFRL/AFRH nibbles select.
+#
+# THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
+# its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
+
+[table]
+kind = "pins"
+family = "stm32h7"
+sources = [
+    "STM32H755xI datasheet DS12919 Rev 3, Table 9 'Alternate functions' (page 91), whose sixteen function columns are headed by AF number: the AF7 column is headed SPI2/3/6, USART1/2/3/6, UART7, SDMMC1, and PD8's AF7 cell is USART3_TX while PD9's is USART3_RX",
+]
+notes = [
+    "Only the two cells the board's virtual COM port claims are stated. The three user LEDs are plain GPIO rather than muxed functions, so they carry no row here -- a pin driven by the port itself has no alternate function to select, and a row asserting one would be a claim the board does not make.",
+    "DS12919 Table 8, the pin/ball definition, lists the same two signals against these pins in its alternate-function column, but that column carries no AF numbers. It is a check on the SIGNAL and not on the number, and the number is the half a driver writes into a register.",
+]
+
+# --- USART3: the virtual COM port -------------------------------------------------------------
+
+[[pins]]
+pin = "PD8"
+function = "AF7"
+instance = "usart3"
+signal = "tx"
+source = "DS12919 Rev 3 Table 9: PD8's AF7 cell is USART3_TX. UM2408 Rev 6 Table 12 corroborates the direction from the board's side, giving PD8 the function USART3 TX in its virtual COM port column."
+
+[[pins]]
+pin = "PD9"
+function = "AF7"
+instance = "usart3"
+signal = "rx"
+source = "DS12919 Rev 3 Table 9: PD9's AF7 cell is USART3_RX. UM2408 Rev 6 Table 12 gives PD9 the function USART3 RX, so the board and the part agree on the pair without either being read from the other."

@@ -1,6 +1,7 @@
 # PARTS table for the rp2040 family. PARTIAL pin present-list
 #, grown from silicon evidence only; complete from the datasheet pinout as bindings
-# demand rows (a binding whose pin is absent here refuses).
+# and boards demand rows. A binding whose pin is absent here refuses, and so does a board's
+# wired control line -- an LED or a button states a pin about a part exactly as a binding does.
 #
 # flash = 0: the RP2040 has NO internal flash -- code executes in place from an EXTERNAL QSPI
 # part through the XIP window, so a board's flash size is BOARD truth (its soldered chip),
@@ -16,5 +17,13 @@ part = "rp2040"
 package = "QFN-56"
 flash = 0
 ram = 0x42000
-pins = ["GP0", "GP1"]
-source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- the pin list is PARTIAL rather than the package's full set"
+pins = ["GP0-GP1", "GP7", "GP13", "GP16-GP17", "GP23-GP25", "GP29"]
+# TWO PROCESSOR SOCKETS, and the part has had them since the day this family landed -- nothing
+# above changed because nothing an IMAGE is built against differs between them. The datasheet
+# calls it a "symmetric dual-core processor complex": both cores are AHB-Lite masters on one bus
+# fabric reaching the same memory, so one image runs on both and a core reads CPUID to learn which
+# it is. Core 1 "sleeps (WFE with SCR.SLEEPDEEP enabled) and remains asleep until woken by user
+# code, via the mailbox" -- so boot is single-core and the SECOND core is started by the program.
+cores = { core0 = ["cortex-m0plus"], core1 = ["cortex-m0plus"] }
+cores_share_memory = true
+source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- the pin list is PARTIAL rather than the package's full set. Every pin here is inside the range section 2.19.1 states outright: RP2040 has 36 GPIOs in two banks, and the QSPI bank aside, the User bank is GPIO0 to GPIO29 for the programmer to use. What SELECTS the ten listed is evidence rather than the package: two are reached by a uart binding and the other eight by wired control lines. One cell can be reached for different purposes by different carriers -- GP25 drives an indicator on one and a chip select on another -- which is why nothing about a pin's USE belongs on this row."

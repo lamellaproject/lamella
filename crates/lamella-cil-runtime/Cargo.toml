@@ -9,6 +9,12 @@ description = "The Lamella virtual execution system: a CIL interpreter implement
 
 [dependencies]
 lamella-cil = { path = "../lamella-cil" }
+# The shared block point. A leaf crate rather than a module here, so a sibling language runtime can
+# park on the SAME reactor without depending on this interpreter.
+lamella-reactor = { path = "../lamella-reactor" }
+# The shared code-point byte codec. A leaf like the reactor: the WTF-8 BYTE form is a format a
+# sibling language runtime writes too, and one definition is the only way two writers stay identical.
+lamella-wtf8 = { path = "../lamella-wtf8" }
 lamella-token = { path = "../lamella-token" }
 # Accurate no_std transcendental math (sqrt/sin/cos/pow/log/exp), behind `math-transcendental`.
 # A MUSL/fdlibm port (the accurate option; a fast/approximate alternative is a future knob).

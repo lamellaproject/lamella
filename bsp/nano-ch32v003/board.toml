@@ -1,0 +1,62 @@
+# BOARD binding: the MuseLab nanoCH32V003 v1.0. A breadboard-format carrier for the
+# CH32V003F4U6, powered over USB-C and programmed through the single-wire debug pin. Board truth
+# ONLY: the one control line the board owns. Chip truth lives in csp/ch32v003/.
+#
+# THERE IS NO `[memory]` SECTION AND THAT IS CORRECT: this part has 16 KB of internal flash, so its
+# program store is PART truth and is stated once in csp/ch32v003/parts.toml. A board states a
+# memory region when it solders one, which the RP2040 boards do and this one does not.
+#
+# AND NO CARRIER, WHICH IS A FACT ABOUT THE PART RATHER THAN AN OMISSION. A carrier records how a
+# Lamella Link wire reaches the board. This part has 2 KB of SRAM and 16 KB of flash, which does
+# not host an interpreter and a wire protocol; it is reached by AOT-compiled images flashed whole
+# through the debug pin. So there is no wire to describe, and stating one would promise a
+# connection that cannot exist.
+
+[table]
+kind = "board"
+board = "nano-ch32v003"
+vendor = "muselab"
+family = "ch32v003"
+part = "ch32v003f4u6"
+board_model = 23            # lamella_wire::board_model::NANO_CH32V003
+sources = ["MuseLab nanoCH32V003 v1.0 schematic (the board designer's own published sheet, titled 'nanoCH32V003 v1.0'), read at cell level"]
+
+# --- the board's own control: one LED, and it is plain GPIO -------------------------------------
+#
+# NO ALTERNATE FUNCTION IS INVOLVED, so this row states a pin and a level and nothing else -- the
+# same shape the F429's user LEDs take, and the reason neither needs a pin-map row. The part's own
+# Table 2-1 gives PD6's main function after reset as plain PD6, so the pin needs no remapping to
+# be driven.
+#
+# THE SERIES RESISTOR IS 10 kOhm, WHICH IS TWO ORDERS ABOVE THE USUAL CHOICE and is worth stating
+# because it is a property a developer will notice before they suspect their code. A blue LED's
+# forward voltage sits close to this board's 3V3 rail, so the current through 10 kOhm is tens of
+# microamps: the LED lights, but faintly. A program that appears not to blink here should be read
+# in a dim room before it is debugged.
+
+[[devices]]
+name = "led"
+kind = "gpio-out"
+pin = "PD6"
+active = "high"
+source = "nanoCH32V003 v1.0 schematic, LED block: the net PD6 reaches D1's ANODE and D1's cathode returns through R1 (10 kOhm) to ground, so driving PD6 high lights it. D1 is a blue LED. The same sheet shows PD6 on pin 20 of the QFN20 package, which is the pin number the CH32V003 Datasheet V1.8 Table 2-1 gives for PD6 in its QFN20 column -- two documents agreeing on the same pin from opposite directions."
+
+# --- WHAT THE BOARD HAS THAT IS DELIBERATELY NOT A ROW -----------------------------------------
+#
+# THE PUSHBUTTON IS A RESET, NOT AN INPUT. It grounds PD7/NRST through C1, and NRST is the part's reset
+# function rather than a level a program reads -- pressing it restarts the program that would have
+# observed it. A row here would offer a developer a button they cannot sample, which is the same
+# ground the F429 gives for withholding its VBUS-present and over-current indicators.
+#
+# THE PROGRAMMING HEADER IS PD1/SWIO, AND IT IS THE ONE PIN A PROGRAM SHOULD LEAVE ALONE. The
+# board brings GND, 3V3 and PD1 out to a three-pin header, and PD1 is the single-wire debug
+# interface the WCH-Link talks through. It is a perfectly ordinary GPIO otherwise, which is the
+# hazard: a whole-register write to this port's CFGLR reconfigures the pin the probe is using, so
+# a driver on port D must read-modify-write. csp/ch32v003/instances.toml says so on the gpiod row.
+#
+# THE 24 MHz CRYSTAL IS REAL BUT HAS NOWHERE TO GO YET. X1 is a 24 MHz crystal with 20 pF loading
+# capacitors on PA1/OSCI and PA2/OSCO -- so this board can run from an external oscillator rather
+# than the internal RC, and that distinguishes it from other CH32V003 carriers. It is not stated
+# as a `[[plans]]` row because the family's RCC block does not yet carry the oscillator and
+# prescaler registers a plan is verified against, and a plan that named a rate without the
+# registers to compose it would be an unchecked number. It joins when that block lands.

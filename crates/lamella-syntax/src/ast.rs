@@ -53,6 +53,9 @@ pub enum ExprKind {
     Invocation {
         /// The expression being invoked.
         receiver: Box<Expr>,
+        /// The explicit type arguments at this call site -- the `int` of `Identity<int>(x)` --
+        /// empty for an ordinary call and for one whose arguments are inferred.
+        type_arguments: Vec<TypeRef>,
         /// The argument expressions, in order.
         arguments: Vec<Expr>,
     },
@@ -184,6 +187,13 @@ pub enum ExprKind {
         target: TypeRef,
         /// The constructor arguments, in order.
         arguments: Vec<Expr>,
+        /// The object or collection initializer `{ ... }` that follows (C# 3.0), if written.
+        ///
+        /// Independent of `arguments`: `new C(1) { F = 2 }` has both, `new C { F = 2 }` has only
+        /// this, and `new C()` has neither. An EMPTY `new C { }` is `Some` of an empty object
+        /// initializer rather than `None` -- the braces were written, and csc reports an empty one
+        /// as an OBJECT initializer.
+        initializer: Option<Initializer>,
     },
     /// An array creation `new element[lengths] extra-ranks` (14.5.10.2). When
     /// `lengths` is empty the size came from an initializer, which is not yet
@@ -245,6 +255,15 @@ pub enum TypeRefKind {
     Predefined(PredefinedType),
     /// A type name, its parts in order: `A.B.C` is `["A", "B", "C"]` (11.1).
     Name(Vec<Box<str>>),
+    /// A constructed generic type `A.B.C<T, U>` (C# 2.0; ECMA-334 4th ed 25.5): the definition's
+    /// name parts in the same order [`TypeRefKind::Name`] carries them, and the type arguments in
+    /// the order written. The arity is `arguments.len()`.
+    Generic {
+        /// The generic definition's name parts in order.
+        parts: Vec<Box<str>>,
+        /// The type arguments, in declaration order; at least one.
+        arguments: Vec<TypeRef>,
+    },
     /// An array type (12.1): an element type and the rank (dimension count) of
     /// this array. `int[][]` nests an `Array` whose element is another `Array`.
     Array {
@@ -545,6 +564,43 @@ pub struct QualifiedName {
     pub span: Span,
 }
 
+/// An object or collection initializer following a `new` (C# 3.0).
+///
+/// **Which one it is comes from the FIRST element, and csc names them differently in its
+/// diagnostics** (`'object initializer'` vs `'collection initializer'`), so they are separate
+/// variants rather than one list with a flag. An empty `{ }` is [`Initializer::Object`] --
+/// measured, and it is the tie-break the parser needs for a case with nothing to look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Initializer {
+    /// `{ F = 1, P = 2 }` -- assignments into the new object's own members.
+    Object(Vec<MemberInitializer>),
+    /// `{ 1, 2 }` -- elements handed to the type's `Add` method.
+    ///
+    /// The type must implement `IEnumerable` (csc CS1922) and have an applicable `Add`
+    /// (CS1061); neither is a syntactic condition, so both are the binder's to enforce.
+    Collection(Vec<Expr>),
+}
+
+/// One `name = value` inside an object initializer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberInitializer {
+    /// The member being initialized. A plain name, never qualified.
+    pub name: Box<str>,
+    /// What is assigned to it.
+    pub value: MemberInitializerValue,
+    /// The byte range the whole `name = value` covers.
+    pub span: Span,
+}
+
+/// The right-hand side of a member initializer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberInitializerValue {
+    /// `F = expr` -- an ordinary assignment.
+    Expression(Expr),
+    /// `F = { ... }` -- a NESTED initializer.
+    Nested(Initializer),
+}
+
 /// A `using` directive (16.3): import a namespace or define an alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsingDirective {
@@ -639,6 +695,15 @@ pub struct NamespaceDecl {
     pub usings: Vec<UsingDirective>,
     /// The namespace body's member declarations.
     pub members: Vec<NamespaceMember>,
+    /// Whether the declaration was written file-scoped -- `namespace N;` (C# 10) rather than
+    /// `namespace N { ... }`.
+    ///
+    /// **The two forms declare the same namespace and differ in nothing a consumer of this tree
+    /// can act on**, which is why the members are the same field: a file-scoped declaration's body
+    /// is everything up to the end of its container, already collected here. The flag records what
+    /// the source said, for a tree dump and for anything that has to reproduce the source shape;
+    /// the binder and the emitter ignore it.
+    pub file_scoped: bool,
     /// The byte range the declaration covers.
     pub span: Span,
 }
@@ -654,11 +719,27 @@ pub struct TypeDecl {
     pub kind: TypeKind,
     /// The type's name.
     pub name: Box<str>,
+    /// The type parameters declared after the name (C# 2.0): `class Box<T>` holds one. Empty for
+    /// an ordinary type, which is what every C# 1.0 declaration is.
+    pub type_parameters: Vec<TypeParameter>,
     /// The base class and/or interfaces listed after `:`.
     pub bases: Vec<TypeRef>,
     /// The type's members.
     pub members: Vec<Member>,
     /// The byte range the declaration covers.
+    pub span: Span,
+}
+
+/// One declared type parameter (C# 2.0): the `T` in `class Box<T>` or `T M<T>(T)`.
+///
+/// The name is the whole of it today. Constraints (`where T : IComparable`) are a separate clause
+/// that follows the parameter LIST rather than the parameter, so they are not a field here; they
+/// arrive with the constraint work and belong beside the declaration that carries them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeParameter {
+    /// The parameter's name.
+    pub name: Box<str>,
+    /// The byte range the name covers.
     pub span: Span,
 }
 
@@ -706,6 +787,13 @@ pub enum Modifier {
     Const,
     /// `unsafe`.
     Unsafe,
+    /// `required` (C# 11) -- an initializer the caller MUST supply.
+    ///
+    /// **The only CONTEXTUAL modifier in this list**, so unlike its neighbours it is not produced by
+    /// mapping a [`crate::token::Keyword`]: `required` is an ordinary identifier everywhere else,
+    /// and a field, local, parameter or type may still be named it. See
+    /// `Parser::required_is_a_modifier_here` for the two-token lookahead that tells the two apart.
+    Required,
 }
 
 /// A member of a type (17.2). Fields, methods, and constructors land first;
@@ -734,6 +822,11 @@ pub enum Member {
         return_type: TypeRef,
         /// The method name.
         name: Box<str>,
+        /// The type parameters declared after the name (C# 2.0): the `T` in `T M<T>(T x)`. Empty
+        /// for an ordinary method. These are the method's OWN parameters, distinct from any the
+        /// enclosing type declares -- the distinction the metadata encoding spells `!!0` against
+        /// `!0`.
+        type_parameters: Vec<TypeParameter>,
         /// The formal parameters.
         parameters: Vec<Parameter>,
         /// Whether the parameter list ends with csc's `__arglist` marker (parsed only under

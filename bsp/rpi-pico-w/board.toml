@@ -1,0 +1,132 @@
+# BOARD binding: the Raspberry Pi Pico W / Pico WH. The same RP2040, the same 12 MHz crystal and
+# the same 40-pin header wiring as the plain Pico, plus the board-soldered CYW43439 wireless chip --
+# recorded the way the pico2-w records its own, as device rows: the CYW is board-soldered rather
+# than an orderable module, so its wiring stays in this board file. Its gSPI is a BIT-BANGED
+# shared-line wire through the SIO block (there is no hardware spi instance to bind), so what this
+# board states is the four control lines.
+#
+# WHAT THIS FILE MAY CARRY: everything here DESCRIBES the board -- which RP2040 pin reaches which
+# control line, and at what level. Those are facts about the copper, published by Raspberry Pi in
+# the Pico W datasheet. The radio's operating firmware, its NVRAM image and its country-locale
+# matrix are Infineon's, redistributable only in conjunction with Raspberry Pi silicon, and they
+# live in a separate crate for that reason. No file under this directory carries any of them, and
+# a fact here that required one would have to move there.
+
+[table]
+kind = "board"
+board = "pico-w"
+vendor = "raspberry-pi"
+family = "rp2040"
+part = "rp2040"
+board_model = 22            # lamella_wire::board_model::PICO_W
+sources = ["Raspberry Pi Pico W datasheet (section 2.1 internal-function pin list; section 3.8 wireless interface; the Pico W Rev3 board schematic in the appendix, Figure 12)"]
+
+[memory]                    # the RP2040 has NO internal flash (chip flash = 0, gate-pinned) -- the
+flash = 0x200000            # 2 MB QSPI chip it XIPs from is BOARD truth.
+source = "Pico W datasheet key-features list ('RP2040 microcontroller with 2MB of flash memory'), and the fitted part agrees with that figure from two places in the same document: the circuitry paragraph names 'Winbond W25Q16JV' and the schematic appendix, Figure 12, gives U3 = W25Q16JVUXIQ, a 16 Mbit (2 MB) part. This board is where that name belongs, which is what settles the sibling: the Pico 2 W's datasheet names the W25Q16JV too, beside its own 4 MB statement, and its schematic fits a W25Q32RVXHJQ -- so the sentence there is a carry-over from this board rather than a disagreement about that one."
+
+[[carriers]]
+kind = "uart"               # a bare-UART Link carrier: the wire rides the uart0 binding through an
+role = "uart0"              # EXTERNAL bridge (RPi Debug Probe, any USB-UART dongle) -- no
+baud = 115200               # board-fixed USB identity to state.
+plan = "xosc-12mhz"
+default = true
+
+[[carriers]]
+kind = "native-usb"         # the SECOND wire: the chip's own USB device controller, driverless
+plan = "pll-125-48"         # WinUSB, no bridge and no jumpers. It runs at a DIFFERENT operating
+                            # point from the uart wire above -- the controller needs clk_usb =
+                            # 48 MHz, which the crystal alone cannot make -- so the two carriers
+                            # here name two plans.
+
+[[bindings]]
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+# --- The CYW43439's fixed control lines. The DATA line is a SHARED half-duplex DI/DO/IRQ line and
+#     CLK is a clock: neither has an asserted level, so neither states an `active` (the WINC
+#     module_pins precedent). The four are the SAME RP2040 pins the Pico 2 W uses, which is why one
+#     driver reaches the radio on both boards, and the row names are deliberately identical.
+#
+#     THESE FOUR PINS ARE THE WHOLE DIFFERENCE BETWEEN THIS BOARD AND THE PLAIN PICO. On the Pico,
+#     GP23 controls the regulator's power-save mode, GP24 senses VBUS, GP25 drives the user LED and
+#     GP29 measures VSYS through ADC3. Here every one of them belongs to the radio, and the three
+#     board functions they used to perform have moved onto the CYW43439's own pins (below). The
+#     schematic states the reassignment in one line: "GPIO 23 24 25 29 Are used for the wireless
+#     interface".
+
+[[devices]]
+name = "cyw43439-wl-reg-on"
+pin = "GP23"
+active = "high"
+source = "Pico W datasheet section 2.1: 'GPIO23  OP wireless power on signal'. The schematic appendix, Figure 12, names the net WL_ON. Driven high to power the chip's regulator on."
+
+[[devices]]
+name = "cyw43439-data"
+pin = "GP24"
+source = "Pico W datasheet section 2.1: 'GPIO24  OP/IP wireless SPI data/IRQ' -- section 3.8 states why one pin carries three things: 'The Infineon CYW43439 DIN/DOUT and IRQ all share one pin on the RP2040. Only when an SPI transaction isn't in progress is it suitable to check for IRQs.' the schematic appendix, Figure 12, names the net WL_D."
+
+[[devices]]
+name = "cyw43439-cs"
+pin = "GP25"
+active = "low"
+source = "Pico W datasheet section 2.1: 'GPIO25  OP wireless SPI CS - when high also enables GPIO29 ADC pin to read VSYS'. That sentence is what states the polarity rather than convention: HIGH is the deselected state, because it is the state in which the shared GP29 line is free to serve the ADC. The schematic appendix, Figure 12, names the net WL_CS."
+
+[[devices]]
+name = "cyw43439-clk"
+pin = "GP29"
+source = "Pico W datasheet section 2.1: 'GPIO29  OP/IP wireless SPI CLK/ADC mode (ADC3) to measure VSYS/3'. Section 3.8 gives the sharing rule: 'The CLK is shared with VSYS monitor, so only when there isn't an SPI transaction in progress can VSYS be read via the ADC', and the interface 'typically runs at 33MHz'. The schematic appendix, Figure 12, names the net WL_CLK."
+
+# --- THE USER LED IS NOT ON THIS CHIP, AND THAT IS WHY THERE IS NO ROW FOR IT ------------------
+#
+# On the Pico and the Pico 2 the green user LED is on GP25 and a program drives it directly. On
+# this board it is on WL_GPIO0 -- a GPIO of the CYW43439 -- so reaching it means bringing the
+# wireless chip up first: powering it through the WL_REG_ON line above, loading its firmware, and
+# then driving one of its pins. There is no sequence of RP2040 register writes that lights it.
+#
+# A `[[devices]]` row states an RP2040 pin, and generation emits a port base, a pin INDEX and a
+# mask from it. WL_GPIO0 is not an RP2040 pin, so no honest row exists: generation refuses the name
+# outright, and the only way to make a row that generates is to write an RP2040 pin that is not the
+# LED. Writing GP25 -- the LED's pin on the two non-W boards -- would emit a mask that asserts the
+# radio's chip select. So this board says where the LED is in prose and offers no constant, on the
+# same ground the F429 gives for withholding its VBUS indicators: a row here would offer a
+# developer a light they do not own.
+#
+# TWO SOURCES AGREE, AND THE DATASHEET CONTRADICTS ITSELF ON A THIRD. Section 2.1's pin list gives
+# 'WL_GPIO0  OP connected to user LED', and the schematic appendix, Figure 12, wires the net WL_GPIO0 through
+# R3 (470R) to D2's anode with its cathode at ground. But section 1's circuitry paragraph still
+# reads "Four RP2040 I/O are used for internal functions: driving an LED, on-board switch mode
+# power supply (SMPS) power control, and sensing the system voltages" -- a sentence that is true of
+# the plain Pico, whose datasheet carries it word for word, and false here, where section 2.1's own
+# table assigns all four of those pins to the radio. The table wins, as it did for the F746G's
+# codec bus. The other two functions in that sentence moved the same way: VBUS sense is WL_GPIO2
+# and the SMPS power-save control is WL_GPIO1.
+
+[[plans]]
+name = "xosc-12mhz"
+default = true
+source = "xosc"
+xosc_hz = 12000000          # the Pico W's soldered crystal: the schematic appendix, Figure 12, gives X1 = 12 MHz,
+                            # the Abracon ABM8-272-T3 the section 1 circuitry paragraph names.
+clk_peri_hz = 12000000      # clk_peri rides AUXSRC xosc directly (no divider) -- the generator
+                            # verifies this equality (state-and-verify)
+
+[[plans]]                   # the native-USB operating point. STATE-AND-VERIFY: this row states both
+name = "pll-125-48"         # the chosen divisors and the rates they produce, and generation refuses
+source = "pll_sys + pll_usb"  # unless hz == xosc * fbdiv / (p1 * p2).
+xosc_hz = 12000000
+clk_sys_hz = 125000000      # 12 MHz * 125 / (6 * 2), VCO 1500 MHz -- the RP2040's rated speed, kept
+pll_sys_fbdiv = 125         # above clk_usb so the POLLED controller is serviced fast enough for a
+pll_sys_postdiv1 = 6        # Full Speed host.
+pll_sys_postdiv2 = 2
+clk_usb_hz = 48000000       # 12 MHz * 100 / (5 * 5), VCO 1200 MHz -- the rate the USB device
+pll_usb_fbdiv = 100         # controller requires.
+pll_usb_postdiv1 = 5
+pll_usb_postdiv2 = 5
+clk_peri_hz = 12000000      # DELIBERATELY UNTOUCHED: the usb bring-up leaves clk_peri on the
+                            # crystal, so the uart keeps its exact 12 MHz divisor and a board
+                            # running the usb wire still talks to a bridge at 115200.

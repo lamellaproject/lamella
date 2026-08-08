@@ -1,5 +1,5 @@
 # The pure-Python bisect module, bundled as a MANAGED module (CPython accelerates it with the C
-# _bisect extension, which we have no equivalent for; CPython's own pure-Python fallback -- transcribed
+# _bisect extension, which has no equivalent here; CPython's own pure-Python fallback -- transcribed
 # here -- is behaviorally identical, so the differential verifies this against CPython's real bisect).
 # Bisection algorithms over a sorted list, with an optional `key` and `lo`/`hi` bounds.
 

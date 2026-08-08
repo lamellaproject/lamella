@@ -8,7 +8,7 @@ use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
     Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo,
-    TypeKind,
+    TypeKind, metadata_type_name,
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
@@ -83,6 +83,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     is_volatile: false,
                     accessibility: Accessibility::Public,
                     constant: Some(integer_literal(value)),
+                    is_required: false,
                 });
             }
             model.insert(info);
@@ -108,6 +109,8 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
+                sets_required_members: false,
+                type_parameters: Vec::new(),
             });
             model.insert(info);
         }
@@ -119,23 +122,32 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
 /// enclosing type (driving the `NestedClass` row + empty namespace at emission). Recurses
 /// for deeper nesting. Nested enums/delegates are a follow-up.
 fn collect_nested_types(declaration: &TypeDecl, namespace: &str, model: &mut Model) {
-    let enclosing_full = qualified_type_name(namespace, &declaration.name);
+    let enclosing_full = qualified_type_name(namespace, &declared_type_name(declaration));
     for member in &declaration.members {
         if let Member::NestedType(nested) = member {
             collect_namespace_member(nested, &enclosing_full, model);
             if let Some(name) = nested_member_name(nested) {
-                model.set_enclosing(&enclosing_full, name, &enclosing_full);
+                model.set_enclosing(&enclosing_full, &name, &enclosing_full);
             }
         }
     }
 }
 
-/// The simple name of a nested type member (a class/struct/interface/enum/delegate).
-fn nested_member_name(member: &NamespaceMember) -> Option<&str> {
+/// The metadata name a type declaration is collected under: its declared name with generic arity
+/// mangled in ([`crate::symbols::metadata_type_name`]). Every C# 1.0 declaration has no type
+/// parameters, so this is the declared name unchanged for all of them.
+pub(crate) fn declared_type_name(declaration: &TypeDecl) -> alloc::string::String {
+    metadata_type_name(&declaration.name, declaration.type_parameters.len())
+}
+
+/// The metadata name of a nested type member (a class/struct/interface/enum/delegate). An enum
+/// and a delegate cannot declare type parameters in the grammar we parse, so only a `Type` can
+/// carry an arity here.
+fn nested_member_name(member: &NamespaceMember) -> Option<alloc::string::String> {
     match member {
-        NamespaceMember::Type(declaration) => Some(declaration.name.as_ref()),
-        NamespaceMember::Enum(declaration) => Some(declaration.name.as_ref()),
-        NamespaceMember::Delegate(declaration) => Some(declaration.name.as_ref()),
+        NamespaceMember::Type(declaration) => Some(declared_type_name(declaration)),
+        NamespaceMember::Enum(declaration) => Some(declaration.name.to_string()),
+        NamespaceMember::Delegate(declaration) => Some(declaration.name.to_string()),
         NamespaceMember::Namespace(_) => None,
     }
 }
@@ -739,7 +751,16 @@ pub(crate) fn is_constant_form(expr: &Expr) -> bool {
 /// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
 /// methods.
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
-    let mut info = TypeInfo::new(namespace, &declaration.name, map_kind(declaration.kind));
+    let mut info = TypeInfo::new(
+        namespace,
+        &declared_type_name(declaration),
+        map_kind(declaration.kind),
+    );
+    info.type_parameters = declaration
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect();
     info.accessibility = accessibility_of(&declaration.modifiers);
     info.is_sealed = declaration.modifiers.iter().any(|m| matches!(m, Modifier::Sealed))
         || matches!(declaration.kind, SyntaxTypeKind::Struct);
@@ -798,6 +819,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         is_volatile: modifiers.iter().any(|m| matches!(m, Modifier::Volatile)),
                         accessibility,
                         constant,
+                        is_required: modifiers.iter().any(|m| matches!(m, Modifier::Required)),
                     });
                 }
             }
@@ -819,6 +841,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         is_volatile: false,
                         accessibility,
                         constant: None,
+                        is_required: false,
                     });
                     info.events.push(EventSymbol {
                         name: declarator.name.clone(),
@@ -846,6 +869,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 modifiers,
                 return_type,
                 name,
+                type_parameters,
                 parameters,
                 is_vararg,
                 explicit_interface,
@@ -871,6 +895,11 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     None => access(modifiers),
                 },
                 conditional: conditional_symbols_from_attributes(attributes),
+                sets_required_members: false,
+                type_parameters: type_parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect(),
             }),
             Member::Operator {
                 return_type,
@@ -891,6 +920,8 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
+                sets_required_members: false,
+                type_parameters: Vec::new(),
             }),
             Member::ConversionOperator {
                 direction,
@@ -911,6 +942,8 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
+                sets_required_members: false,
+                type_parameters: Vec::new(),
             }),
             Member::Property {
                 modifiers,
@@ -930,6 +963,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_sealed: is_sealed_member(modifiers),
                 has_getter: getter.is_some(),
                 has_setter: setter.is_some(),
+                is_required: modifiers.iter().any(|m| matches!(m, Modifier::Required)),
             }),
             Member::Indexer {
                 modifiers,
@@ -961,6 +995,8 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         is_sealed: indexer_is_sealed,
                         accessibility,
                         conditional: Vec::new(),
+                        sets_required_members: false,
+                        type_parameters: Vec::new(),
                     });
                 }
                 if setter.is_some() {
@@ -985,6 +1021,8 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         is_sealed: indexer_is_sealed,
                         accessibility,
                         conditional: Vec::new(),
+                        sets_required_members: false,
+                        type_parameters: Vec::new(),
                     });
                 }
             }
@@ -992,10 +1030,12 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 modifiers,
                 parameters,
                 is_vararg,
+                attributes,
                 ..
             } if !is_static(modifiers) => {
                 let mut ctor = constructor(parameters, access(modifiers));
                 ctor.is_vararg = *is_vararg;
+                ctor.sets_required_members = sets_required_members_from_attributes(attributes);
                 info.constructors.push(ctor)
             }
             _ => {}
@@ -1037,6 +1077,8 @@ fn constructor(
         is_sealed: false,
         accessibility,
         conditional: Vec::new(),
+        sets_required_members: false,
+        type_parameters: Vec::new(),
     }
 }
 
@@ -1065,6 +1107,22 @@ fn conditional_symbols_from_attributes(sections: &[AttributeSection]) -> Vec<Box
         }
     }
     symbols
+}
+
+/// Whether a source constructor carries `[System.Diagnostics.CodeAnalysis.SetsRequiredMembers]`.
+///
+/// Matched on the last name part with and without the `Attribute` suffix, exactly as
+/// [`conditional_symbols_from_attributes`] matches its own, and skipping a TARGETED section: a
+/// `[return: ...]` or `[assembly: ...]` attribute is not on the constructor even though it is
+/// written next to it.
+fn sets_required_members_from_attributes(sections: &[AttributeSection]) -> bool {
+    sections.iter().any(|section| {
+        section.target.is_none()
+            && section.attributes.iter().any(|attribute| {
+                let last = attribute.name.parts.last().map(|part| &**part);
+                last == Some("SetsRequiredMembers") || last == Some("SetsRequiredMembersAttribute")
+            })
+    })
 }
 
 /// Whether a parameter list ends in a `params` array.
@@ -1156,7 +1214,172 @@ mod tests {
     use alloc::string::ToString;
     use lamella_syntax::parser::parse_compilation_unit;
 
-    /// DIAGNOSTIC probe for the const-of-const mis-fold (@layering, 2026-07-28): does the second
+    /// Parses at C# 2, which is the only dialect whose parser produces a type-parameter list --
+    /// below it the parser reports CS8022 and hands back a declaration with none, so a test that
+    /// parsed at the default would measure a NON-generic declaration and pass for the wrong reason.
+    fn parse_at_v2(source: &str) -> lamella_syntax::ast::CompilationUnit {
+        let options = lamella_syntax::lexer::LexOptions {
+            version: lamella_syntax::version::LanguageVersion::CSharp2,
+            ..lamella_syntax::lexer::LexOptions::default()
+        };
+        lamella_syntax::parser::parse_compilation_unit_with(source, options).unit
+    }
+
+    /// ECMA-335 II.10.7.2: a generic type's metadata name carries its arity, so a definition
+    /// collected from SOURCE must be keyed the same way one read from a reference assembly is.
+    #[test]
+    fn a_generic_definition_is_collected_under_its_arity_mangled_name() {
+        let unit = parse_at_v2(
+            "namespace N { public class Box { } \
+                 public class Box<T> { } \
+                 public class Box<T, U> { } }",
+        );
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+
+        assert!(model.get("N", "Box").is_some(), "the non-generic Box");
+        assert!(model.get("N", "Box`1").is_some(), "Box<T>");
+        assert!(model.get("N", "Box`2").is_some(), "Box<T,U>");
+
+        let boxes = model
+            .type_keys()
+            .filter(|(namespace, name)| *namespace == "N" && name.starts_with("Box"))
+            .count();
+        assert_eq!(boxes, 3, "three arities of one name are three types");
+    }
+
+    /// A generic type ENCLOSING a nested one is keyed by its mangled name, so the nested type's
+    /// own key must be built from the mangled enclosing name too.
+    #[test]
+    fn a_type_nested_in_a_generic_one_is_keyed_under_the_mangled_enclosing_name() {
+        let unit = parse_at_v2("namespace N { public class Outer<T> { public class Inner { } } }");
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+
+        assert!(model.get("N", "Outer`1").is_some(), "the enclosing Outer<T>");
+        assert!(
+            model.get("N.Outer`1", "Inner").is_some(),
+            "Inner, under the mangled enclosing name; got {:?}",
+            model.type_keys().collect::<Vec<_>>()
+        );
+        assert!(
+            model.get("N.Outer", "Inner").is_none(),
+            "Inner must not also be reachable under the bare enclosing name"
+        );
+    }
+
+    #[test]
+    fn a_source_declared_generic_reaches_cs0305_through_the_real_type_table() {
+        use crate::diagnostic::Diagnostic;
+        use crate::resolve::resolve_type;
+        use crate::special::SpecialType;
+        use crate::types::TypeSymbol;
+        use lamella_syntax::span::Span;
+
+        let unit = parse_at_v2("namespace N { public class Box<T> { } }");
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        let table = model.type_table();
+
+        let wrong_arity = TypeSymbol::Instantiation {
+            definition: ["N".into(), "Box".into()].into(),
+            arguments: [
+                TypeSymbol::special(SpecialType::Int32),
+                TypeSymbol::special(SpecialType::Int32),
+            ]
+            .into(),
+        };
+        let mut diagnostics: Vec<Diagnostic> = Vec::new();
+        let resolved = resolve_type(&table, &wrong_arity, &mut diagnostics, Span::empty_at(0));
+
+        assert!(resolved.is_error());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code(), 305);
+        assert_eq!(
+            diagnostics[0].kind.to_string(),
+            "Using the generic type 'Box<T>' requires 1 type arguments"
+        );
+    }
+
+    /// `Box<int>` has the members `Box<T>` declares, with `T` replaced -- driven from SOURCE
+    /// through the real model, because that is the join `get_by_symbol` now has to make.
+    #[test]
+    fn an_instantiation_has_the_definitions_members_with_t_substituted() {
+        use crate::special::SpecialType;
+        use crate::types::TypeSymbol;
+
+        let unit = parse_at_v2(
+            "namespace N { \
+                 public class Base<T> { } \
+                 public class Widget { } \
+                 public class Box<T> : Base<T> { \
+                     public T Item; \
+                     public Widget Tool; \
+                     public T[] Many; \
+                     public Box<T> Inner; \
+                     public T Get() { return Item; } \
+                     public void Put(T value, Widget w) { } } }",
+        );
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+
+        let boxed = |argument: TypeSymbol| TypeSymbol::Instantiation {
+            definition: ["N".into(), "Box".into()].into(),
+            arguments: [argument].into(),
+        };
+        let int = TypeSymbol::special(SpecialType::Int32);
+        let string = TypeSymbol::special(SpecialType::String);
+        let widget = TypeSymbol::Named(["Widget".into()].into());
+
+        for argument in [int.clone(), string.clone()] {
+            let info = model
+                .get_by_symbol(&boxed(argument.clone()))
+                .unwrap_or_else(|| panic!("no type info for Box<{argument:?}>"));
+
+            assert_eq!(info.find_field("Item").unwrap().ty, argument, "a T field");
+            assert_eq!(
+                info.find_field("Many").unwrap().ty,
+                argument.clone().into_array(1),
+                "T[] substitutes its ELEMENT and stays an array"
+            );
+            assert_eq!(
+                info.find_field("Inner").unwrap().ty,
+                TypeSymbol::Instantiation {
+                    definition: ["Box".into()].into(),
+                    arguments: [argument.clone()].into(),
+                },
+                "Box<T> nested inside the definition closes to Box<argument>"
+            );
+            let get = info.methods.iter().find(|m| &*m.name == "Get").unwrap();
+            assert_eq!(get.return_type, argument, "a T return");
+            let put = info.methods.iter().find(|m| &*m.name == "Put").unwrap();
+            assert_eq!(put.parameters[0], argument, "a T parameter");
+
+            assert_eq!(info.find_field("Tool").unwrap().ty, widget, "a plain field");
+            assert_eq!(put.parameters[1], widget, "a plain parameter");
+            assert!(info.type_parameters.is_empty(), "closed: no parameters left");
+            assert_eq!(
+                info.bases.first(),
+                Some(&TypeSymbol::Instantiation {
+                    definition: ["Base".into()].into(),
+                    arguments: [argument.clone()].into(),
+                }),
+                "Box<T> : Base<T> closes its base too"
+            );
+        }
+
+        assert!(
+            model
+                .get_by_symbol(&TypeSymbol::Instantiation {
+                    definition: ["N".into(), "Box".into()].into(),
+                    arguments: [int, string].into(),
+                })
+                .is_none(),
+            "a wrong arity must not produce a partially substituted type"
+        );
+    }
+
+    /// DIAGNOSTIC probe for the const-of-const mis-fold: does the second
     /// pass actually fold these four shapes into the model, or is the loss downstream of it?
     #[test]
     fn resolve_constants_folds_a_const_that_names_another_const() {

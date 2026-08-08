@@ -1,0 +1,85 @@
+# BOARD binding: the SAM4S Xplained -- the plain Xplained, NOT the Xplained Pro that is this
+# family's other board. Identity-first, like its sibling: no peripheral bindings yet, because the
+# SAM4S family has no generated driver. What this file adds beyond identity is the board's control
+# lines, which need no driver -- a control pin rides no alternate function.
+#
+# THE PART IS NOT THE SIBLING'S, AND THAT IS THE POINT OF HAVING BOTH. The Pro carries an
+# ATSAM4SD32C: dual-plane, 2 MB of flash, 160 KB of SRAM. This carries an ATSAM4S16C: single
+# plane, 1 MB, 128 KB. Same family, same peripheral set, different memory -- so every fact below
+# is board truth and every size is part truth, and neither file states the other's.
+#
+# THREE DOCUMENTS AGREE ON THE FITTED PART, which is worth recording because the schematic alone
+# is ambiguous. Its symbol reads AT91SAM4S16-LQFP100 and its designator MN4 reads ATSAM4S16AU;
+# the datasheet's ordering table gives the 100-pin SAM4S16 as the C suffix with -AU as the LQFP100
+# package code; and the board's own user documentation says outright that the board is equipped
+# with a SAM4S16C in LQFP100.
+
+[table]
+kind = "board"
+board = "sam4s-xpld"
+vendor = "atmel"
+family = "sam4s"
+part = "atsam4s16c"
+board_model = 24            # lamella_wire::board_model::SAM4S_XPLAINED
+sources = [
+    "SAM4S Xplained board schematic revision B (SAM4S-XPLD_SCH_REVB, sheets 1, 4 and 5 of 5), from the kit files the vendor publishes for ATSAM4S-XPLD: sheet 4 the MCU, sheet 5 the user LEDs and buttons, sheet 1 the pin assignment summary.",
+    "SAM4S Xplained board documentation, hardware description: the board is equipped with a SAM4S16C device in LQFP100 package, and a SAM3U4C device in LQFP package is present to provide the JTAG and UART functions.",
+    "SAM4S Series datasheet (Atmel-11100) ordering information, for the package and memory sizes the part id resolves to.",
+]
+notes = [
+    "TWO FOOTPRINTS ON THIS BOARD ARE DELIBERATELY EMPTY, and both are marked DNP on the schematic: MN7, an AT25DF321 serial flash, and the QTouch slider. They are not absent features -- they are present footprints with nothing in them, which is a different thing for anything that probes. Neither gets a row here, because a row states what the board HAS.",
+    "The board also carries an external SRAM on the static memory bus (MN3, an IS66WV51216DBLL: 512K x 16, with A0-A18, D0-D15 and the four strobes wired to the MCU). It is NOT stated as a memory region yet: a region names the controller that brings it up, and this family places no static memory controller instance. That row lands with the controller.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+#
+# THE BRIDGE IS NOT THE SIBLING'S EITHER. The Xplained Pro carries an EDBG; this board carries a
+# SAM3U4C, which its documentation describes both as a JTAGICE bridge and as running J-Link OB
+# firmware with a CDC virtual COM port. What the host sees therefore depends on what is programmed
+# into that SAM3U rather than on the copper alone, and the carrier is stated as the bridged VCP it
+# presents in either case.
+#
+# The reset button is worth one sentence because it is asymmetric: pressing it drives NRST on the
+# SAM4S16 only. The bridge is not reset by it, so a wedged bridge and a wedged target are cleared
+# by different actions.
+
+[[carriers]]
+kind = "sam3u-vcp"          # the on-board SAM3U4C bridge's virtual COM port.
+baud = 115200
+default = true              # this board states no [[plans]] row, so the carrier names no
+                            # operating point.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# BOTH LEDS ARE ACTIVE LOW, and the schematic is explicit about it in a way a reader should not
+# have to infer: each LED's ANODE sits at VDD_MAIN_3U and its cathode returns through a 220 ohm
+# resistor to the pin. The pin sinks the current, so driving it LOW lights the LED. That is the
+# opposite of the arrangement where a pin drives the anode, and getting it backwards produces a
+# board whose LEDs are on until a program touches them.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PC10"
+active = "low"
+source = "Schematic revision B sheet 5, USER LEDS: VDD_MAIN_3U to the anode of D9 (LED Yellow), cathode through R127 220R to PC10. The pin sinks, so LOW lights it."
+
+[[devices]]
+name = "led1"
+kind = "gpio-out"
+pin = "PC17"
+active = "low"
+source = "Schematic revision B sheet 5, USER LEDS: VDD_MAIN_3U to the anode of D10 (LED Yellow), cathode through R128 220R to PC17. The pin sinks, so LOW lights it."
+
+# THE USER BUTTON HAS NO EXTERNAL PULL-UP AND THE SCHEMATIC SHOWS WHY: the only pull-up in that
+# block is R24, 47K, and it is marked DNP -- not fitted -- and it pulls up NRST rather than this
+# pin. So BP2 ties PA5 to ground when pressed and PA5 FLOATS when it is not, unless the part's own
+# internal pull-up is enabled. A driver that configures this as a plain input reads noise, which
+# presents as a button that is randomly already pressed rather than as a button that does not work.
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA5"
+active = "low"
+source = "Schematic revision B sheet 5, User Button: BP2 between PA5 and ground. The only pull-up drawn in that block is R24 47K marked DNP, and it is on the NRST net, not this one -- so this pin needs the part's internal pull-up."

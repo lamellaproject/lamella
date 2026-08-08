@@ -9,6 +9,8 @@ use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Op,
 
 use crate::bigint::BigInt;
 use crate::object::{DescriptorRead, DictViewKind, InlineCache, ObjectModel};
+#[cfg(feature = "gc-collect")]
+use crate::object::FinalizerSkip;
 use crate::trap::Trap;
 use crate::value::{Value, FIXNUM_MAX, FIXNUM_MIN};
 
@@ -67,16 +69,22 @@ pub struct Frame {
     /// sets it, `StoreName`/`LoadName` target it, `BuildClass` consumes it), else `None`. A GC root
     /// while set (traced by [`Frame::trace`]) so building the namespace cannot free it.
     class_namespace: Option<Value>,
-    /// Set only on an imported module's BODY frame: the rest of the `import` that pushed it, held
-    /// until the body finishes -- the module object to hand the importer, and the name to un-cache if
-    /// the body raises instead. A GC root while set (traced by [`Frame::trace`]): the module object
-    /// is reachable from nowhere else until the body completes and the importer binds it.
-    finishes_import: Option<ImportCompletion>,
-    /// Whether this frame is mid `yield from` delegation (an `Op::YieldFrom` episode). While set, a
-    /// resume of this generator re-runs YieldFrom (its ip was rewound to the op) with the sent value
-    /// on TOS above the sub-iterator; false marks the first entry (send `None`) and each completed
-    /// episode. Reset on reuse. Not a GC root -- the sub it refers to is on the eval stack.
-    yield_from_active: bool,
+    /// What the caller is owed when this frame returns, when that is something other than the value
+    /// the frame returns -- an imported module, or the instance a `__init__` was called on. `None` for
+    /// an ordinary call, which is most frames. **A GC root while set** (traced by [`Frame::trace`]):
+    /// in both cases the object is reachable from nowhere else the collector can see, and the code
+    /// this frame is running is exactly the code that triggers collections.
+    completes: Option<Completion>,
+    /// Whether this frame is mid DELEGATION -- a `yield from` ([`Op::YieldFrom`]) or an `await`
+    /// ([`Op::Await`]). While set, a resume re-runs that op (its ip was rewound to it) with the sent
+    /// value on TOS above the sub; false marks the first entry (resolve the sub, send `None`) and
+    /// each completed episode. Reset on reuse. Not a GC root -- the sub it refers to is on the eval
+    /// stack.
+    ///
+    /// ONE flag for both ops, not one each, because a frame is suspended at exactly one op: which arm
+    /// reads it is decided by where the ip points. Two flags could only ever disagree, and the way
+    /// they would disagree is a throw forwarded into the wrong sub.
+    delegating: bool,
 }
 
 impl Frame {
@@ -100,8 +108,8 @@ impl Frame {
             handled: Vec::new(),
             derefs: Vec::new(),
             class_namespace: None,
-            finishes_import: None,
-            yield_from_active: false,
+            completes: None,
+            delegating: false,
         }
     }
 
@@ -116,8 +124,8 @@ impl Frame {
         self.handled.clear();
         self.derefs.clear();
         self.class_namespace = None;
-        self.finishes_import = None;
-        self.yield_from_active = false;
+        self.completes = None;
+        self.delegating = false;
     }
 
     /// Pushes a value onto the evaluation stack.
@@ -196,8 +204,10 @@ impl Frame {
         if let Some(namespace) = self.class_namespace.as_mut() {
             Value::trace_slot(namespace, visit);
         }
-        if let Some(pending) = self.finishes_import.as_mut() {
-            Value::trace_slot(&mut pending.module_obj, visit);
+        match self.completes.as_mut() {
+            Some(Completion::Import(pending)) => Value::trace_slot(&mut pending.module_obj, visit),
+            Some(Completion::Init(instance)) => Value::trace_slot(instance, visit),
+            Some(Completion::Finalizer) | None => {}
         }
     }
 
@@ -263,10 +273,15 @@ pub(crate) fn binary(op: BinOp, a: Value, b: Value, model: &mut ObjectModel) -> 
     if model.is_complex(a) || model.is_complex(b) {
         return complex_binary(op, a, b, model);
     }
+    #[cfg(feature = "float")]
     if op == BinOp::TrueDiv || model.is_float(a) || model.is_float(b) {
         let x = model.as_f64(a).ok_or(Trap::TypeError)?;
         let y = model.as_f64(b).ok_or(Trap::TypeError)?;
         return float_binary(op, x, y, model);
+    }
+    #[cfg(not(feature = "float"))]
+    if op == BinOp::TrueDiv {
+        return Err(Trap::FloatUnavailable);
     }
     let (x, y) = match (model.as_i128(a), model.as_i128(b)) {
         (Some(x), Some(y)) => (x, y),
@@ -288,7 +303,10 @@ pub(crate) fn binary(op: BinOp, a: Value, b: Value, model: &mut ObjectModel) -> 
         BinOp::TrueDiv => unreachable!("true division took the float path"),
         BinOp::Pow => {
             if y < 0 {
+                #[cfg(feature = "float")]
                 return float_pow(x as f64, y as f64, model);
+                #[cfg(not(feature = "float"))]
+                return Err(Trap::FloatUnavailable);
             }
             let exp = u32::try_from(y).map_err(|_| Trap::Overflow)?;
             match x.checked_pow(exp) {
@@ -409,6 +427,7 @@ pub(crate) fn bigint_pow(base: &BigInt, exp: u32) -> BigInt {
 /// sign) exactly as CPython's `float_divmod`. A zero divisor for `/`, `//`, or `%` raises
 /// `ZeroDivisionError` (Python NEVER produces an IEEE infinity/NaN from float division by zero).
 /// The bitwise/shift operators do not apply to floats -- a `TypeError` (`1.0 & 2` in CPython).
+#[cfg(feature = "float")]
 fn float_binary(op: BinOp, x: f64, y: f64, model: &mut ObjectModel) -> Result<Value, Trap> {
     let result: f64 = match op {
         BinOp::Add => x + y,
@@ -447,6 +466,7 @@ fn float_binary(op: BinOp, x: f64, y: f64, model: &mut ObjectModel) -> Result<Va
 /// base to a NON-INTEGER power is a COMPLEX number in CPython (`float.__pow__` delegates to complex
 /// power); under the `complex` knob the interpreter returns that complex, else it yields `NaN`
 /// (libm::pow's result there) -- the documented divergence on a tier without complex.
+#[cfg(feature = "float")]
 pub(crate) fn float_pow(base: f64, exp: f64, model: &mut ObjectModel) -> Result<Value, Trap> {
     if base == 0.0 && exp < 0.0 {
         return Err(model.with_message(Trap::ZeroDivisionError, "zero to a negative power"));
@@ -570,6 +590,7 @@ fn complex_pow_polar((ar, ai): (f64, f64), (br, bi): (f64, f64)) -> Result<(f64,
 /// floor toward negative infinity, computed through `fmod` so the result matches CPython bit for
 /// bit (naively flooring `x / y` can round the wrong way near an integer). The precondition is
 /// `y != 0`.
+#[cfg(feature = "float")]
 fn float_floordiv(x: f64, y: f64) -> f64 {
     let modulus = libm::fmod(x, y);
     let mut div = (x - modulus) / y;
@@ -587,6 +608,7 @@ fn float_floordiv(x: f64, y: f64) -> f64 {
 /// Python's float modulo `x % y` (the remainder of CPython's `float_divmod`): `fmod` adjusted so
 /// the result takes the DIVISOR's sign (`-7.5 % 2 == 0.5`), and a zero remainder carries the
 /// divisor's sign (`-1.0 % 1.0 == 0.0`). The precondition is `y != 0`.
+#[cfg(feature = "float")]
 fn float_mod(x: f64, y: f64) -> f64 {
     let mut modulus = libm::fmod(x, y);
     if modulus != 0.0 {
@@ -1648,19 +1670,8 @@ pub(crate) fn compare(op: CmpOp, a: Value, b: Value, model: &ObjectModel) -> Res
             CmpOp::Is | CmpOp::IsNot => unreachable!("is/is not handled in the Op::Compare path"),
         };
         Ok(Value::from_bool(result))
-    } else if (model.is_float(a) || model.is_float(b)) && model.as_f64(a).is_some() && model.as_f64(b).is_some() {
-        let x = model.as_f64(a).unwrap_or(f64::NAN);
-        let y = model.as_f64(b).unwrap_or(f64::NAN);
-        let result = match op {
-            CmpOp::Lt => x < y,
-            CmpOp::Le => x <= y,
-            CmpOp::Eq => x == y,
-            CmpOp::Ne => x != y,
-            CmpOp::Gt => x > y,
-            CmpOp::Ge => x >= y,
-            CmpOp::Is | CmpOp::IsNot => unreachable!("is/is not handled in the Op::Compare path"),
-        };
-        Ok(Value::from_bool(result))
+    } else if let Some(compared) = float_compare(op, a, b, model) {
+        compared
     } else {
         match op {
             CmpOp::Eq => Ok(Value::from_bool(a == b)),
@@ -1668,6 +1679,41 @@ pub(crate) fn compare(op: CmpOp, a: Value, b: Value, model: &ObjectModel) -> Res
             _ => Err(Trap::TypeError),
         }
     }
+}
+
+
+/// The float arm of [`compare_values`]: a float against a number (the other operand an int/bool
+/// coerced to a double), compared as f64. `None` when neither operand is a float, which is what
+/// hands the decision back to the caller's chain.
+///
+/// A function rather than an `else if` arm so the whole thing can be COMPILED OUT: it is the last
+/// f64 arithmetic the no-float tier would otherwise carry. Rust's operators give Python's IEEE
+/// semantics directly -- every comparison with a NaN is false except `!=` (so `nan == nan` is
+/// False, `nan != nan` is True).
+#[cfg(feature = "float")]
+fn float_compare(op: CmpOp, a: Value, b: Value, model: &ObjectModel) -> Option<Result<Value, Trap>> {
+    if !model.is_float(a) && !model.is_float(b) {
+        return None;
+    }
+    let (x, y) = (model.as_f64(a)?, model.as_f64(b)?);
+    let result = match op {
+        CmpOp::Lt => x < y,
+        CmpOp::Le => x <= y,
+        CmpOp::Eq => x == y,
+        CmpOp::Ne => x != y,
+        CmpOp::Gt => x > y,
+        CmpOp::Ge => x >= y,
+        CmpOp::Is | CmpOp::IsNot => unreachable!("is/is not handled in the Op::Compare path"),
+    };
+    Some(Ok(Value::from_bool(result)))
+}
+
+/// The no-float tier's [`float_compare`]: nothing is a float here, so this arm never applies and
+/// `None` is the whole truth. Compiling it to a constant `None` is what removes the last `__adddf3`
+/// / `__divdf3` / `fmod` from a float-free image.
+#[cfg(not(feature = "float"))]
+fn float_compare(_op: CmpOp, _a: Value, _b: Value, _model: &ObjectModel) -> Option<Result<Value, Trap>> {
+    None
 }
 
 /// The maximum nesting of intra-module calls before the interpreter reports
@@ -1739,8 +1785,13 @@ pub fn run_bundle(bundle: Bundle, model: &mut ObjectModel) -> Result<Value, Trap
 /// re-entrant import mid-cycle thus sees an empty module, which is enough to break the cycle --
 /// exposing the partial-as-of-that-point state is a later refinement).
 fn begin_import(name: &str, model: &mut ObjectModel) -> Result<ImportOutcome, Trap> {
+    if let Some(outcome) = begin_unresolved_ancestor(name, model)? {
+        return Ok(outcome);
+    }
     if let Some(result) = model.import_builtin_module(name) {
-        return result.map(ImportOutcome::Ready);
+        let module = result?;
+        link_into_parent(name, module, model)?;
+        return Ok(ImportOutcome::Ready(module));
     }
     let Some(module_id) = model.managed_module_id(name) else {
         return Err(model.module_not_found(name));
@@ -1748,8 +1799,69 @@ fn begin_import(name: &str, model: &mut ObjectModel) -> Result<ImportOutcome, Tr
     let empty = model.new_dict(Vec::new())?;
     let module_obj = model.new_module(empty)?;
     model.cache_module(name, module_obj);
-    let completion = ImportCompletion { name: String::from(name), module_obj };
+    let completion =
+        ImportCompletion { name: String::from(name), module_obj, handback: ImportHandback::Push };
     Ok(ImportOutcome::RunBody { module_id, completion })
+}
+
+/// The NEAREST ancestor of a dotted `name` that is not resolved yet, begun -- or `None` when every
+/// ancestor is already available (which is always true of an undotted name, since it has none).
+///
+/// Innermost first: `a` before `a.b` before `a.b.c`. An ancestor that is a cached / host / native
+/// module needs nothing; one with a body to run comes back as [`ImportHandback::ReenterImport`], so
+/// the importer re-runs its op and this walk resumes at the next unresolved segment.
+fn begin_unresolved_ancestor(
+    name: &str,
+    model: &mut ObjectModel,
+) -> Result<Option<ImportOutcome>, Trap> {
+    let mut boundary = 0;
+    while let Some(dot) = name[boundary..].find('.') {
+        boundary += dot;
+        let ancestor = &name[..boundary];
+        boundary += 1;
+        if let Some(result) = model.import_builtin_module(ancestor) {
+            let module = result?;
+            link_into_parent(ancestor, module, model)?;
+            continue;
+        }
+        let Some(module_id) = model.managed_module_id(ancestor) else {
+            if model.has_managed_submodules(ancestor) {
+                let empty = model.new_dict(Vec::new())?;
+                let package = model.new_module(empty)?;
+                model.cache_module(ancestor, package);
+                link_into_parent(ancestor, package, model)?;
+                continue;
+            }
+            return Err(model.module_not_found(ancestor));
+        };
+        let empty = model.new_dict(Vec::new())?;
+        let module_obj = model.new_module(empty)?;
+        model.cache_module(ancestor, module_obj);
+        let completion = ImportCompletion {
+            name: String::from(ancestor),
+            module_obj,
+            handback: ImportHandback::ReenterImport,
+        };
+        return Ok(Some(ImportOutcome::RunBody { module_id, completion }));
+    }
+    Ok(None)
+}
+
+/// Binds a submodule as an ATTRIBUTE of its parent: after `import a.b`, `a.b` is reached by reading
+/// `b` off module `a`, because what `import a.b` BINDS is the root `a`.
+///
+/// A no-op for an undotted name, which has no parent. The parent is present by construction -- every
+/// ancestor is resolved before the leaf -- so a missing one is not a program error to report but a
+/// resolution order that broke, and it simply leaves the link unmade rather than inventing a module.
+fn link_into_parent(name: &str, module: Value, model: &mut ObjectModel) -> Result<(), Trap> {
+    let Some(dot) = name.rfind('.') else {
+        return Ok(());
+    };
+    let (parent_name, attribute) = (&name[..dot], &name[dot + 1..]);
+    let Some(parent) = model.cached_module(parent_name) else {
+        return Ok(());
+    };
+    model.set_module_attribute(parent, attribute, module)
 }
 
 /// The other half of an `import`, run when the module BODY's frame returns: builds the module's dict
@@ -1770,7 +1882,9 @@ fn finish_import(
     completion: ImportCompletion,
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
-    match build_module_namespace(module_id, completion.module_obj, model) {
+    match build_module_namespace(module_id, completion.module_obj, model)
+        .and_then(|()| link_into_parent(&completion.name, completion.module_obj, model))
+    {
         Ok(()) => Ok(completion.module_obj),
         Err(trap) => {
             model.uncache_module(&completion.name);
@@ -1807,13 +1921,18 @@ enum Flow {
     /// Call the planned Python function. The driver pushes a new [`Frame`] onto the explicit frame
     /// stack, so a deep Python call chain never grows the native stack -- and, since the frame
     /// carries its own module, so does a call into an IMPORTED module or a method of a class defined
-    /// in one. Builtins, class init, dunders and generator resumes still stay on [`call_value`]
-    /// (bounded native recursion).
+    /// in one. Builtins, dunders, `__new__` and generator resumes still stay on [`call_value`]
+    /// (bounded native recursion); a class `__init__` does not -- see [`Flow::Init`].
     Call(PendingPyCall),
     /// Run an imported module's BODY on this frame stack, then hand the caller the MODULE object
     /// (not the body's return value) -- see [`ImportCompletion`]. The same reason as [`Flow::Call`]:
     /// a body run on a nested driver loop reaches no safe point.
     ImportBody { module_id: u16, completion: ImportCompletion },
+    /// Run a class `__init__` on this frame stack, then hand the caller the INSTANCE (not what
+    /// `__init__` returned) -- see [`Completion::Init`]. Same reason again, and this is the one that
+    /// cost the most: a loop inside a constructor needed 96 KiB where the identical loop needed 4 KiB
+    /// at entry level, because a constructor reached through a callback collects nothing at all.
+    Init { instance: Value, pending: PendingPyCall },
     /// The current (generator) frame yielded `value`: [`drive`] stops and returns it, leaving the
     /// yielding frame on top of the stack for the resumer to re-suspend. Reached only during a
     /// generator resume -- a generator function's body runs nowhere else.
@@ -1854,6 +1973,53 @@ struct ImportCompletion {
     /// namespace is empty until the body completes; the importer receives THIS, not what the body
     /// returned.
     module_obj: Value,
+    /// What the importer gets when this body finishes.
+    handback: ImportHandback,
+}
+
+/// What the importer receives when an import body finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportHandback {
+    /// The ordinary case: this IS the module the `import` named, so it goes on the importer's eval
+    /// stack and the op is done.
+    Push,
+    /// This was an ANCESTOR resolved on the way to a dotted name -- `a` while importing `a.b`. The
+    /// importer's [`Op::ImportName`] has more of the chain left to walk, so nothing is pushed and the
+    /// op RE-RUNS instead (its ip rewound), finding this one cached and moving to the next segment.
+    ///
+    /// Re-entering rather than recursing is what keeps a chain of any depth on one frame stack: each
+    /// body is pushed by the driver as an ordinary frame, so the collector's safe point reaches every
+    /// one of them, which a nested driver loop per segment would not.
+    ReenterImport,
+}
+
+/// What a frame's caller receives INSTEAD of the value the frame returns.
+///
+/// Both cases exist for the same reason: the code in question -- a module body, a class `__init__` --
+/// used to run on a nested driver loop, where the collector's safe point cannot see the frames beneath
+/// it and so must not fire. Running it on the caller's own stack is what fixes that, and then the
+/// caller's `Op::Call` still has to end up with the right value on its eval stack. This is that value,
+/// riding the frame that has to finish first.
+///
+/// A frame has at most ONE of these -- a module body is not a `__init__` and vice versa -- which is why
+/// this is an enum rather than a field per case.
+#[derive(Debug)]
+enum Completion {
+    /// An imported module's BODY: hand the importer the MODULE object, not the body's return value.
+    Import(ImportCompletion),
+    /// A class `__init__`: hand the caller the INSTANCE. Python discards what `__init__` returns (and
+    /// CPython rejects a non-`None`), so the value this frame produces is not the answer to `C(...)`.
+    Init(Value),
+    /// A `__del__`: hand NOBODY anything. This frame was pushed by the safe point rather than by a
+    /// call, so the frame beneath it is an unrelated program frame in the middle of its own work --
+    /// pushing a value onto its operand stack would corrupt it.
+    ///
+    /// It is also an EXCEPTION BARRIER. CPython prints and swallows whatever a `__del__` raises
+    /// (measured: `Exception ignored while calling deallocator ...`, and the program carries on),
+    /// which is the only coherent answer when the finalizer runs at a moment the program did not
+    /// choose. Letting it propagate would raise, in arbitrary code, an exception that code has no way
+    /// to anticipate. [`unwind_exception`] stops here.
+    Finalizer,
 }
 
 /// What resolving an `import` produced: the module itself, or a body the driver has to run first.
@@ -1935,6 +2101,11 @@ struct PendingPyCall {
     /// Whether the callee is a generator function -- calling one RETURNS a generator object and
     /// runs no code, so the frame built here is suspended rather than pushed.
     is_generator: bool,
+    /// Whether the callee is a coroutine function (an `async def`). Calling one also runs no code and
+    /// returns an object holding the suspended frame -- the same shape, a different type, and the two
+    /// are INDEPENDENT: CPython's `CO_COROUTINE` and `CO_GENERATOR` are separate flags, so an
+    /// `async def` with a `yield` in it is a third thing and is refused by the front end.
+    is_coroutine: bool,
 }
 
 /// What [`plan_py_call`] made of a callee.
@@ -1991,6 +2162,7 @@ fn plan_py_call(
     let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
     let code = code_funcs.get(index as usize).ok_or(Trap::Malformed)?;
     let is_generator = code.is_generator;
+    let is_coroutine = code.is_coroutine;
     let must_bind = receiver.is_some()
         || func.as_function_index().is_none()
         || !kwargs.is_empty()
@@ -2007,7 +2179,28 @@ fn plan_py_call(
     } else {
         posargs
     };
-    Ok(PyCallPlan::Frame(PendingPyCall { index, args, cells, module, is_generator }))
+    Ok(PyCallPlan::Frame(PendingPyCall { index, args, cells, module, is_generator, is_coroutine }))
+}
+
+/// Builds the object a call RETURNS when the callee runs no body -- a generator function or an
+/// `async def`. Both allocate their suspended frame into the same arena and differ only in the type
+/// of the object that owns it.
+///
+/// One function for both, and used by every call op, because the alternative is the same three lines
+/// in four places: the `Call` / `CallKw` / `CallEx` arms and the nested `run_planned_call` path. A
+/// coroutine arm added to three of four is exactly the drift this shape exists to prevent.
+fn new_suspended_call(
+    pending: &PendingPyCall,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    let module = pending.module;
+    let suspended = new_planned_frame(pending, functions, model)?;
+    if pending.is_coroutine {
+        model.new_coroutine(suspended, module)
+    } else {
+        model.new_generator(suspended, module)
+    }
 }
 
 /// Builds the frame a planned call runs in, resolving the callee's code against its HOME module's
@@ -2032,19 +2225,22 @@ fn new_planned_frame(
     )
 }
 
-/// Runs a planned call on a NESTED driver loop and returns its value -- the callback path, for a
-/// callee reached from somewhere that has no frame stack to push onto (a dunder, a builtin's `key=`,
-/// a class initializer). The same plan pushed by [`Flow::Call`] instead runs on the caller's own
+/// Runs a planned call on a NESTED driver loop and returns its value -- the callback path, for a callee
+/// reached from somewhere that has no frame stack to push onto (a dunder, a builtin's `key=`, a
+/// `__new__`). The same plan pushed by [`Flow::Call`] or [`Flow::Init`] instead runs on the caller's own
 /// stack, which is the one the safe point can see.
+///
+/// **So a program's footprint depends on how its code was REACHED**, not only on what it does: the same
+/// constructor is 4 KiB called from a Python frame and 96 KiB called from a `key=`. Everything left on
+/// this path is a candidate for the same treatment [`Flow::Init`] just had.
 fn run_planned_call(
     pending: PendingPyCall,
     functions: &[CodeObject],
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if pending.is_generator {
-        let generator = new_planned_frame(&pending, functions, model)?;
-        return model.new_generator(generator, pending.module);
+    if pending.is_generator || pending.is_coroutine {
+        return new_suspended_call(&pending, functions, model);
     }
     let home_funcs = model.managed_functions_rc(pending.module);
     let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
@@ -2118,6 +2314,12 @@ pub(crate) fn call_value(
             PyCallPlan::NotAFrame(_) => Err(Trap::Malformed),
         };
     }
+    if model.is_weakref(callee) {
+        if args.is_empty() {
+            return Ok(model.weakref_target(callee));
+        }
+        return Err(Trap::TypeError);
+    }
     if let Some(id) = callee.as_builtin_id() {
         crate::builtins::call_builtin(id, args, functions, model, depth)
     } else if model.is_str_join(callee) {
@@ -2129,7 +2331,7 @@ pub(crate) fn call_value(
         model.call_bound_method(callee, &[list])
     } else if model.is_str_format_bound(callee) {
         let receiver = model.bound_receiver(callee);
-        let template = model.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
+        let template = model.str_text(receiver).map(String::from)?;
         let rendered = model.format_template(&template, args, &[], functions, depth)?;
         model.new_str(&rendered)
     } else if model.is_bound_method(callee) {
@@ -2175,7 +2377,7 @@ pub(crate) fn call_value(
             }
         } else if model.is_builtin_dunder_method(method_id) {
             model.call_bound_method(callee, args)
-        } else if model.is_generator(receiver) {
+        } else if model.is_generator(receiver) || model.is_coroutine(receiver) {
             call_generator_method(receiver, method_id, args, functions, model, depth)
         } else if model.is_set(receiver) || model.is_frozenset(receiver) {
             model.call_set_method_dyn(receiver, method_id, args, functions, depth)
@@ -2191,7 +2393,7 @@ pub(crate) fn call_value(
     } else if model.is_unbound_method(callee) {
         let (receiver, rest) = args.split_first().ok_or(Trap::TypeError)?;
         let name_value = model.unbound_method_name(callee);
-        let name = model.str_value(name_value).ok_or(Trap::TypeError)?.to_string();
+        let name = model.str_text(name_value)?.to_string();
         let bound = model.getattr(*receiver, &name, &mut crate::object::InlineCache::empty())?;
         call_value(bound, rest, functions, model, depth)
     } else if model.is_ntclass(callee) {
@@ -2287,6 +2489,46 @@ fn instantiate(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    match plan_instantiate(class, posargs, kwargs, functions, model, depth)? {
+        Instantiation::Done(value) => Ok(value),
+        Instantiation::RunInit { instance, pending } => {
+            run_planned_call(pending, functions, model, depth + 1)?;
+            Ok(instance)
+        }
+    }
+}
+
+/// What instantiating a class resolved to: a finished object, or an instance whose `__init__` still has
+/// to run.
+enum Instantiation {
+    /// Nothing Python-authored is left to run -- no user `__init__`, or a `__new__` that returned
+    /// something that is not an instance of this class.
+    Done(Value),
+    /// `instance` is allocated and initialized as far as it can be; `pending` is its `__init__`, bound
+    /// and ready. Whoever asked decides where that runs.
+    RunInit { instance: Value, pending: PendingPyCall },
+}
+
+/// Allocates the instance for `C(...)` and resolves its `__init__` WITHOUT running it.
+///
+/// Splitting the allocation from the initializer is what lets a class `__init__` run on the caller's own
+/// frame stack ([`Flow::Init`]) rather than on a nested driver loop -- and a nested driver loop is
+/// exactly what the collector's safe point cannot see past, so a loop inside a constructor never
+/// collected at all. Measured before this split, the same transient-long loop needed 96 KiB inside a
+/// constructor against 4 KiB everywhere else, at entry level AND inside an imported module -- the pair
+/// that made it evidence about instantiation rather than about modules.
+///
+/// **`__new__` is still run HERE, on the callback path**, and so is anything it calls. It is rare, it is
+/// usually a few lines, and pushing it too would need a second completion that resumes this function
+/// where it left off; `device_footprint.rs` measures what that still costs.
+fn plan_instantiate(
+    class: Value,
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Instantiation, Trap> {
     let instance = match model.find_new(class)? {
         Some(new) => {
             let mut new_args = Vec::with_capacity(posargs.len() + 1);
@@ -2294,22 +2536,33 @@ fn instantiate(
             new_args.extend_from_slice(posargs);
             let made = call_maybe_kw(new, &new_args, kwargs, functions, model, depth + 1)?;
             if !model.is_instance_of(made, class) {
-                return Ok(made);
+                return Ok(Instantiation::Done(made));
             }
             made
         }
         None => model.object_new(class, posargs, kwargs)?,
     };
     let actual = crate::builtins::type_of(instance, model).unwrap_or(class);
-    if let Some(init) = model.find_init(actual) {
-        let mut init_args = Vec::with_capacity(posargs.len() + 1);
-        init_args.push(instance);
-        init_args.extend_from_slice(posargs);
-        call_maybe_kw(init, &init_args, kwargs, functions, model, depth)?;
-    } else {
+    let Some(init) = model.find_init(actual) else {
         model.init_default_args(instance, posargs)?;
+        return Ok(Instantiation::Done(instance));
+    };
+    let mut init_args = Vec::with_capacity(posargs.len() + 1);
+    init_args.push(instance);
+    init_args.extend_from_slice(posargs);
+    match plan_py_call(init, init_args, kwargs, functions, model)? {
+        PyCallPlan::Frame(pending) if !pending.is_generator => {
+            Ok(Instantiation::RunInit { instance, pending })
+        }
+        PyCallPlan::Frame(pending) => {
+            run_planned_call(pending, functions, model, depth + 1)?;
+            Ok(Instantiation::Done(instance))
+        }
+        PyCallPlan::NotAFrame(init_args) => {
+            call_maybe_kw(init, &init_args, kwargs, functions, model, depth)?;
+            Ok(Instantiation::Done(instance))
+        }
     }
-    Ok(instance)
 }
 
 /// Calls `callee` with positional arguments and, when there are any, keywords -- the keyword path
@@ -2361,7 +2614,7 @@ fn call_value_kw(
             None => 1,
         };
         let mut byteorder = match posargs.get(1) {
-            Some(value) => model.str_value(*value).map(String::from).ok_or(Trap::TypeError)?,
+            Some(value) => model.str_text(*value).map(String::from)?,
             None => String::from("big"),
         };
         if posargs.len() > 2 {
@@ -2373,7 +2626,7 @@ fn call_value_kw(
                 "signed" => signed = model.py_truthy(value)?.unwrap_or(false),
                 "length" if posargs.is_empty() => length = value.as_int().ok_or(Trap::TypeError)?,
                 "byteorder" if posargs.len() < 2 => {
-                    byteorder = model.str_value(value).map(String::from).ok_or(Trap::TypeError)?;
+                    byteorder = model.str_text(value).map(String::from)?;
                 }
                 other => {
                     let message =
@@ -2388,7 +2641,7 @@ fn call_value_kw(
         list_sort_kw(posargs, kwargs, receiver, functions, model, depth)
     } else if model.is_str_format_bound(callee) {
         let receiver = model.bound_receiver(callee);
-        let template = model.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
+        let template = model.str_text(receiver).map(String::from)?;
         let rendered = model.format_template(&template, posargs, kwargs, functions, depth)?;
         model.new_str(&rendered)
     } else if model.is_dict_update_bound(callee) {
@@ -2730,6 +2983,20 @@ pub(crate) fn generator_method_id(name: &str) -> Option<u32> {
     }
 }
 
+/// The method id for a coroutine method `name` (`coro.send`/`.throw`/`.close`), or `None`.
+///
+/// The same three resume entry points a generator has and **deliberately not `__next__`**: a
+/// coroutine is not an iterator in CPython either, so `next(coro)` is a `TypeError` and `for x in
+/// coro` refuses. Offering `__next__` here is precisely what would make `for` appear to work on one.
+pub(crate) fn coroutine_method_id(name: &str) -> Option<u32> {
+    match name {
+        "send" => Some(GEN_SEND),
+        "throw" => Some(GEN_THROW),
+        "close" => Some(GEN_CLOSE),
+        _ => None,
+    }
+}
+
 fn resume_generator(
     generator: Value,
     resume: Resume,
@@ -2792,8 +3059,8 @@ fn drive_taken_generator(
             }
         }
         Resume::Throw(exc) => {
-            if frame.yield_from_active {
-                model.set_yield_from_throw(exc);
+            if frame.delegating {
+                model.set_delegated_throw(exc);
             } else {
                 match find_handler(&entry.exc_table, frame.ip as u32) {
                     Some(handler) => frame.enter_handler(exc, handler),
@@ -2806,8 +3073,8 @@ fn drive_taken_generator(
         }
         Resume::Close => {
             let exc = model.new_exception("GeneratorExit")?;
-            if frame.yield_from_active {
-                model.set_yield_from_throw(exc);
+            if frame.delegating {
+                model.set_delegated_throw(exc);
             } else {
                 match find_handler(&entry.exc_table, frame.ip as u32) {
                     Some(handler) => frame.enter_handler(exc, handler),
@@ -2906,60 +3173,90 @@ fn stop_or_value(value: Value, model: &mut ObjectModel) -> Result<Value, Trap> {
     }
 }
 
-/// One step of a `yield from` delegation ([`advance_yield_from`]): the sub either yielded a value
-/// (re-yield it) or is exhausted (its return value becomes the `yield from` expression's value).
-enum YieldFromStep {
+/// One step of a DELEGATION -- a `yield from` or an `await`: the sub either yielded a value
+/// (re-yield it, suspending this frame) or finished (its return value becomes the expression's value).
+enum DelegateStep {
     Yielded(Value),
     Returned(Value),
 }
 
-/// How to advance a `yield from` sub-iterator one step: forward a sent value (`send`/`next`) or throw
-/// an exception into it (`gen.throw`/`gen.close` into a delegating generator).
-enum YieldFromAction {
+/// How to advance a delegation's sub by one step: forward a sent value (`send`/`next`) or throw an
+/// exception into it (`gen.throw`/`gen.close`, `coro.throw`/`coro.close` into a delegating frame).
+enum DelegateAction {
     Send(Value),
     Throw(Value),
 }
 
-/// Drives the sub-iterator of a `yield from` by one step. A GENERATOR sub is resumed with the sent
-/// value or the thrown exception (its return value on exhaustion -- its `StopIteration.value` --
-/// becomes the step's `Returned`; a propagated raise returns `Err`). Any other iterable is advanced by
-/// one `next` for a send (a non-None send is a TypeError -- a plain iterator has no `send` -- and its
-/// return value is always `None`); a throw into a plain iterator raises the exception here.
-fn advance_yield_from(
+/// Drives a delegation's sub by ONE step, for both [`Op::YieldFrom`] and [`Op::Await`].
+///
+/// A `resumable` sub is one whose frame is a suspended frame: it is resumed with the sent value or the
+/// thrown exception, and its return value on exhaustion -- its `StopIteration.value` -- becomes the
+/// step's `Returned` (a propagated raise returns `Err`). Anything else is advanced by one `next` for a
+/// send (a non-None send is a TypeError -- a plain iterator has no `send` -- and its return value is
+/// always `None`); a throw into a plain iterator raises the exception here.
+fn advance_delegate(
     sub: Value,
-    action: YieldFromAction,
+    action: DelegateAction,
+    resumable: bool,
     functions: &[CodeObject],
     model: &mut ObjectModel,
     depth: usize,
-) -> Result<YieldFromStep, Trap> {
-    if model.is_generator(sub) {
+) -> Result<DelegateStep, Trap> {
+    if resumable {
         let resume = match action {
-            YieldFromAction::Send(value) => Resume::Send(value),
-            YieldFromAction::Throw(exc) => Resume::Throw(exc),
+            DelegateAction::Send(value) => Resume::Send(value),
+            DelegateAction::Throw(exc) => Resume::Throw(exc),
         };
         let value = resume_generator(sub, resume, functions, model, depth + 1)?;
         if value.is_stop() {
-            Ok(YieldFromStep::Returned(model.take_generator_return().unwrap_or(Value::NONE)))
+            Ok(DelegateStep::Returned(model.take_generator_return().unwrap_or(Value::NONE)))
         } else {
-            Ok(YieldFromStep::Yielded(value))
+            Ok(DelegateStep::Yielded(value))
         }
     } else {
         match action {
-            YieldFromAction::Send(send_value) => {
+            DelegateAction::Send(send_value) => {
                 if send_value != Value::NONE {
                     return Err(Trap::TypeError);
                 }
                 match py_next_value(sub, functions, model, depth + 1)? {
-                    Some(value) => Ok(YieldFromStep::Yielded(value)),
-                    None => Ok(YieldFromStep::Returned(Value::NONE)),
+                    Some(value) => Ok(DelegateStep::Yielded(value)),
+                    None => Ok(DelegateStep::Returned(Value::NONE)),
                 }
             }
-            YieldFromAction::Throw(exc) => {
+            DelegateAction::Throw(exc) => {
                 model.set_pending_exception(exc);
                 Err(Trap::Raised)
             }
         }
     }
+}
+
+/// Resolves what `await expr` delegates to -- CPython's two awaitables, and nothing else.
+///
+/// A COROUTINE is driven directly: its frame is a suspended frame, so a resume IS the step. An object
+/// defining `__await__` is asked for its iterator, and **that iterator is what a future is made of** --
+/// it yields while the result is not ready and returns it once it is, which is how control reaches the
+/// event loop at all.
+fn resolve_awaitable(
+    awaitable: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if model.is_coroutine(awaitable) {
+        if !model.has_suspended_frame(awaitable) {
+            let message = "cannot reuse already awaited coroutine";
+            return Err(model.raise_named_exception("RuntimeError", message));
+        }
+        return Ok(awaitable);
+    }
+    let Some(dunder) = model.find_dunder(awaitable, "__await__") else {
+        let type_name = model.tp_name_of(awaitable);
+        let message = alloc::format!("'{type_name}' object can't be awaited");
+        return Err(model.raise_named_exception("TypeError", &message));
+    };
+    call_value(dunder, &[], functions, model, depth + 1)
 }
 
 /// Attribute lookup with CPython's `__getattr__` fallback: the normal lookup first, and on an
@@ -3366,9 +3663,10 @@ fn new_frame(
 /// `Op::Call` / `Op::CallKw` of any Python function pushes a frame -- a plain one, a defaulted one,
 /// a closure, a bound method, and whichever module it comes from, because a frame carries the module
 /// it resolves against; `Op::Return` pops one and hands its value to the caller; a raise/trap
-/// unwinds across the frames, each consulting its own `exc_table`. Builtins, class init, dunders and
-/// generator resumes run through [`call_value`], which re-enters this driver -- bounded native
-/// recursion, guarded by `depth`.
+/// unwinds across the frames, each consulting its own `exc_table`. A class `__init__` is pushed here
+/// too, carrying the instance the caller is owed. Builtins, dunders, `__new__` and generator resumes
+/// run through [`call_value`], which re-enters this driver -- bounded native recursion, guarded by
+/// `depth`.
 ///
 /// GC: the collector traces EVERY frame on the stack, so a mid-call collection sees all roots
 /// (the fix for the old one-frame-at-a-time root gap). **That is why the module rides the frame:
@@ -3459,6 +3757,11 @@ fn drive_frames(
                 }
             });
         }
+        #[cfg(feature = "gc-collect")]
+        if outermost && model.has_pending_finalizers() && push_next_finalizer(frames, functions, model)
+        {
+            continue;
+        }
         let top = frames.len() - 1;
         if frames[top].module != current_module {
             current_module = frames[top].module;
@@ -3477,7 +3780,7 @@ fn drive_frames(
             Op::LoadConst(idx) => {
                 let c = code.consts.get(idx as usize).ok_or(Trap::Malformed)?;
                 let value = match c {
-                    Const::Str(s) => model.new_str(s)?,
+                    Const::Str(s) => model.new_str_wtf8(s.as_bytes())?,
                     Const::Int(n) => model.new_long(i128::from(*n))?,
                     Const::Float(bits) => model.new_float(f64::from_bits(*bits))?,
                     #[cfg(feature = "complex")]
@@ -3760,12 +4063,20 @@ fn drive_frames(
                     frame.push(result);
                 } else {
                     match plan_py_call(callee, call_args, &[], functions, model)? {
-                        PyCallPlan::Frame(pending) if pending.is_generator => {
-                            let module = pending.module;
-                            let generator = new_planned_frame(&pending, functions, model)?;
-                            frame.push(model.new_generator(generator, module)?);
+                        PyCallPlan::Frame(pending)
+                            if pending.is_generator || pending.is_coroutine =>
+                        {
+                            frame.push(new_suspended_call(&pending, functions, model)?);
                         }
                         PyCallPlan::Frame(pending) => return Ok(Flow::Call(pending)),
+                        PyCallPlan::NotAFrame(call_args) if model.is_class(callee) => {
+                            match plan_instantiate(callee, &call_args, &[], functions, model, depth)? {
+                                Instantiation::Done(value) => frame.push(value),
+                                Instantiation::RunInit { instance, pending } => {
+                                    return Ok(Flow::Init { instance, pending })
+                                }
+                            }
+                        }
                         PyCallPlan::NotAFrame(call_args) => {
                             let result = call_value(callee, &call_args, functions, model, depth + 1)?;
                             frame.push(result);
@@ -3877,12 +4188,18 @@ fn drive_frames(
                 let kwargs: Vec<(&str, Value)> =
                     names.iter().map(|s| s.as_str()).zip(kwvals).collect();
                 match plan_py_call(callee, call_args, &kwargs, functions, model)? {
-                    PyCallPlan::Frame(pending) if pending.is_generator => {
-                        let module = pending.module;
-                        let generator = new_planned_frame(&pending, functions, model)?;
-                        frame.push(model.new_generator(generator, module)?);
+                    PyCallPlan::Frame(pending) if pending.is_generator || pending.is_coroutine => {
+                        frame.push(new_suspended_call(&pending, functions, model)?);
                     }
                     PyCallPlan::Frame(pending) => return Ok(Flow::Call(pending)),
+                    PyCallPlan::NotAFrame(call_args) if model.is_class(callee) => {
+                        match plan_instantiate(callee, &call_args, &kwargs, functions, model, depth)? {
+                            Instantiation::Done(value) => frame.push(value),
+                            Instantiation::RunInit { instance, pending } => {
+                                return Ok(Flow::Init { instance, pending })
+                            }
+                        }
+                    }
                     PyCallPlan::NotAFrame(call_args) => {
                         let result =
                             call_value_kw(callee, &call_args, &kwargs, functions, model, depth + 1)?;
@@ -3890,11 +4207,7 @@ fn drive_frames(
                     }
                 }
             }
-            Op::CallEx {
-                argc,
-                kinds,
-                kwnames,
-            } => {
+            Op::CallEx { kinds, kwnames } => {
                 let kinds = match code.consts.get(kinds as usize) {
                     Some(Const::ArgKinds(k)) => k.clone(),
                     _ => return Err(Trap::Malformed),
@@ -3903,10 +4216,8 @@ fn drive_frames(
                     Some(Const::KwNames(n)) => n.clone(),
                     _ => return Err(Trap::Malformed),
                 };
-                if kinds.len() != argc as usize {
-                    return Err(Trap::Malformed);
-                }
-                let mut vals = Vec::with_capacity(argc as usize);
+                let argc = kinds.len();
+                let mut vals = Vec::with_capacity(argc);
                 for _ in 0..argc {
                     vals.push(frame.pop()?);
                 }
@@ -3930,7 +4241,7 @@ fn drive_frames(
                         3 => {
                             let entries = model.dict_entries(val).ok_or(Trap::TypeError)?;
                             for (key, value) in entries {
-                                let name = model.str_value(key).ok_or(Trap::TypeError)?.to_string();
+                                let name = model.str_text(key)?.to_string();
                                 kw_owned.push((name, value));
                             }
                         }
@@ -3940,12 +4251,18 @@ fn drive_frames(
                 let kwargs: Vec<(&str, Value)> =
                     kw_owned.iter().map(|(k, v)| (k.as_str(), *v)).collect();
                 match plan_py_call(callee, posargs, &kwargs, functions, model)? {
-                    PyCallPlan::Frame(pending) if pending.is_generator => {
-                        let module = pending.module;
-                        let generator = new_planned_frame(&pending, functions, model)?;
-                        frame.push(model.new_generator(generator, module)?);
+                    PyCallPlan::Frame(pending) if pending.is_generator || pending.is_coroutine => {
+                        frame.push(new_suspended_call(&pending, functions, model)?);
                     }
                     PyCallPlan::Frame(pending) => return Ok(Flow::Call(pending)),
+                    PyCallPlan::NotAFrame(posargs) if model.is_class(callee) => {
+                        match plan_instantiate(callee, &posargs, &kwargs, functions, model, depth)? {
+                            Instantiation::Done(value) => frame.push(value),
+                            Instantiation::RunInit { instance, pending } => {
+                                return Ok(Flow::Init { instance, pending })
+                            }
+                        }
+                    }
                     PyCallPlan::NotAFrame(posargs) => {
                         let result =
                             call_value_kw(callee, &posargs, &kwargs, functions, model, depth + 1)?;
@@ -3956,28 +4273,68 @@ fn drive_frames(
             Op::Yield => {
                 return Ok(Flow::Yield(frame.pop()?));
             }
-            Op::YieldFrom => {
-                let action = if let Some(exc) = model.take_yield_from_throw() {
-                    YieldFromAction::Throw(exc)
-                } else if frame.yield_from_active {
-                    YieldFromAction::Send(frame.pop()?)
+            Op::ListGrow { .. } => {}
+            Op::Await => {
+                let first_step = !frame.delegating;
+                let action = if let Some(exc) = model.take_delegated_throw() {
+                    DelegateAction::Throw(exc)
+                } else if frame.delegating {
+                    DelegateAction::Send(frame.pop()?)
                 } else {
-                    frame.yield_from_active = true;
-                    YieldFromAction::Send(Value::NONE)
+                    let awaitable = frame.pop()?;
+                    let sub = resolve_awaitable(awaitable, functions, model, depth)?;
+                    frame.push(sub);
+                    frame.delegating = true;
+                    DelegateAction::Send(Value::NONE)
                 };
                 let sub = frame.peek()?;
-                match advance_yield_from(sub, action, functions, model, depth) {
-                    Ok(YieldFromStep::Yielded(value)) => {
+                let resumable = model.is_coroutine(sub) || model.is_generator(sub);
+                match advance_delegate(sub, action, resumable, functions, model, depth) {
+                    Ok(DelegateStep::Yielded(value)) => {
                         frame.ip -= 1;
                         return Ok(Flow::Yield(value));
                     }
-                    Ok(YieldFromStep::Returned(result)) => {
+                    Ok(DelegateStep::Returned(result)) => {
                         frame.pop()?;
                         frame.push(result);
-                        frame.yield_from_active = false;
+                        frame.delegating = false;
+                    }
+                    Err(Trap::TypeError) if first_step && !resumable => {
+                        frame.delegating = false;
+                        let type_name = model.tp_name_of(sub);
+                        let message =
+                            alloc::format!("__await__() returned non-iterator of type '{type_name}'");
+                        return Err(model.raise_named_exception("TypeError", &message));
                     }
                     Err(trap) => {
-                        frame.yield_from_active = false;
+                        frame.delegating = false;
+                        return Err(trap);
+                    }
+                }
+            }
+            Op::YieldFrom => {
+                let action = if let Some(exc) = model.take_delegated_throw() {
+                    DelegateAction::Throw(exc)
+                } else if frame.delegating {
+                    DelegateAction::Send(frame.pop()?)
+                } else {
+                    frame.delegating = true;
+                    DelegateAction::Send(Value::NONE)
+                };
+                let sub = frame.peek()?;
+                let resumable = model.is_generator(sub);
+                match advance_delegate(sub, action, resumable, functions, model, depth) {
+                    Ok(DelegateStep::Yielded(value)) => {
+                        frame.ip -= 1;
+                        return Ok(Flow::Yield(value));
+                    }
+                    Ok(DelegateStep::Returned(result)) => {
+                        frame.pop()?;
+                        frame.push(result);
+                        frame.delegating = false;
+                    }
+                    Err(trap) => {
+                        frame.delegating = false;
                         return Err(trap);
                     }
                 }
@@ -4107,10 +4464,10 @@ fn drive_frames(
                     } else if let Some(delete) = model.instance_delete_descriptor(object, attr) {
                         call_value(delete, &[object], functions, model, depth + 1)?;
                     } else {
-                        model.py_delattr_instance(object, attr)?;
+                        model.py_delattr(object, attr)?;
                     }
                 } else {
-                    return Err(Trap::AttributeError);
+                    model.py_delattr(object, attr)?;
                 }
             }
             Op::DeleteFast(idx) => {
@@ -4213,20 +4570,31 @@ fn drive_frames(
         match flow {
             Ok(Flow::Next) => {}
             Ok(Flow::Return(value)) => {
-                let mut import = None;
+                let mut owed = None;
                 if let Some(mut done) = frames.pop() {
-                    import = done.finishes_import.take().map(|pending| (done.module, pending));
+                    owed = done.completes.take().map(|completion| (done.module, completion));
                     model.recycle_frame(done);
                 }
-                let handed = match import {
-                    Some((module_id, pending)) => match finish_import(module_id, pending, model) {
-                        Ok(module) => module,
-                        Err(trap) => {
-                            let ip = frames.last().map_or(0, |f| (f.ip as u32).saturating_sub(1));
-                            unwind_exception(trap, frames, ip, entry, functions, model)?;
-                            continue;
+                let handed = match owed {
+                    Some((_, Completion::Finalizer)) => continue,
+                    Some((module_id, Completion::Import(pending))) => {
+                        let handback = pending.handback;
+                        match finish_import(module_id, pending, model) {
+                            Ok(_) if handback == ImportHandback::ReenterImport => {
+                                if let Some(importer) = frames.last_mut() {
+                                    importer.ip = importer.ip.saturating_sub(1);
+                                }
+                                continue;
+                            }
+                            Ok(module) => module,
+                            Err(trap) => {
+                                let ip = frames.last().map_or(0, |f| (f.ip as u32).saturating_sub(1));
+                                unwind_exception(trap, frames, ip, entry, functions, model)?;
+                                continue;
+                            }
                         }
-                    },
+                    }
+                    Some((_, Completion::Init(instance))) => instance,
                     None => value,
                 };
                 match frames.last_mut() {
@@ -4258,7 +4626,7 @@ fn drive_frames(
                         Some(body) => {
                             new_frame(&body, CodeId::ModuleBody, &[], true, &[], module_id, model)
                                 .map_or_else(Some, |mut new| {
-                                    new.finishes_import = Some(completion);
+                                    new.completes = Some(Completion::Import(completion));
                                     frames.push(new);
                                     None
                                 })
@@ -4267,6 +4635,20 @@ fn drive_frames(
                 };
                 if let Some(trap) = trap {
                     model.uncache_module(&name);
+                    unwind_exception(trap, frames, faulting_ip, entry, functions, model)?;
+                }
+            }
+            Ok(Flow::Init { instance, pending }) => {
+                let trap = if frames.len() >= MAX_CALL_DEPTH {
+                    Some(Trap::RecursionError)
+                } else {
+                    new_planned_frame(&pending, functions, model).map_or_else(Some, |mut new| {
+                        new.completes = Some(Completion::Init(instance));
+                        frames.push(new);
+                        None
+                    })
+                };
+                if let Some(trap) = trap {
                     unwind_exception(trap, frames, faulting_ip, entry, functions, model)?;
                 }
             }
@@ -4281,6 +4663,56 @@ fn drive_frames(
 /// and this returns `Ok(())`. If the stack empties with no handler, the exception escapes -- it stays
 /// pending on the model and this returns `Err(trap)` for the driver's caller. A non-catchable internal
 /// fault (no exception object) also returns `Err(trap)`.
+/// Takes the next object whose `__del__` is due and pushes a frame that runs it, marked
+/// [`Completion::Finalizer`]. Reports whether a frame was pushed, so the caller knows to restart its
+/// loop rather than decode the op it was about to.
+///
+/// Every failure here declines to RAISE, and deliberately so: the program did not ask for this call,
+/// so a `__del__` that cannot be resolved, bound, or given a frame must not raise into whatever code
+/// the safe point happened to interrupt. The object is simply dropped, exactly as a finalizer that
+/// raised would be (see the barrier in [`unwind_exception`]).
+///
+/// **Each of them is COUNTED, though, and that is not the same question.** Declining to run a
+/// finalizer is sometimes the only safe answer; declining to MENTION it leaves "my `__del__` never
+/// ran" with no way to tell a runtime that skipped it from one that never had the feature. Every
+/// early return below records its reason on the model ([`ObjectModel::finalizer_skips`]).
+#[cfg(feature = "gc-collect")]
+fn push_next_finalizer(
+    frames: &mut Vec<Frame>,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+) -> bool {
+    let Some(object) = model.take_pending_finalizer() else {
+        return false;
+    };
+    let bound = match model.find_finalizer(object) {
+        Ok(bound) => bound,
+        Err(reason) => {
+            model.note_finalizer_skipped(reason);
+            return false;
+        }
+    };
+    if frames.len() >= MAX_CALL_DEPTH {
+        model.note_finalizer_skipped(FinalizerSkip::CallDepth);
+        return false;
+    }
+    let Ok(PyCallPlan::Frame(pending)) = plan_py_call(bound, Vec::new(), &[], functions, model) else {
+        model.note_finalizer_skipped(FinalizerSkip::Unresolvable);
+        return false;
+    };
+    match new_planned_frame(&pending, functions, model) {
+        Ok(mut new) => {
+            new.completes = Some(Completion::Finalizer);
+            frames.push(new);
+            true
+        }
+        Err(_) => {
+            model.note_finalizer_skipped(FinalizerSkip::Unresolvable);
+            false
+        }
+    }
+}
+
 fn unwind_exception(
     trap: Trap,
     frames: &mut Vec<Frame>,
@@ -4310,7 +4742,12 @@ fn unwind_exception(
             frames[top].enter_handler(exception, handler);
             return Ok(());
         }
-        if let Some(pending) = frames[top].finishes_import.take() {
+        if matches!(frames[top].completes, Some(Completion::Finalizer)) {
+            frames[top].completes = None;
+            frames.pop();
+            return Ok(());
+        }
+        if let Some(Completion::Import(pending)) = frames[top].completes.take() {
             model.uncache_module(&pending.name);
         }
         frames.pop();
@@ -4390,16 +4827,17 @@ mod tests {
             posonly_count: 0,
             kwonly_count: 0,
             is_generator: false,
+            is_coroutine: false,
             has_varargs: false,
             has_varkwargs: false,
             ret_ty: StaticType::Dynamic,
             n_locals,
             local_names: (0..n_locals).map(|i| format!("v{i}")).collect(),
-            cellvars: Vec::new(),
-            freevars: Vec::new(),
+            cellvars: Default::default(),
+            freevars: Default::default(),
             local_types: vec![StaticType::Dynamic; n_locals],
             consts,
-            names,
+            names: names.iter().collect(),
             ops,
             cache_count,
             exc_table: Vec::new(),
@@ -4582,11 +5020,11 @@ mod tests {
         let mut inner = code(0, 0, vec![Const::Int(1)], Vec::new(), 0,
             vec![LoadDeref(0), LoadConst(0), Binary(BinOp::Add), Return]);
         inner.name = String::from("inner");
-        inner.freevars = vec![String::from("v0")];
+        inner.freevars = ["v0"].into_iter().collect();
         let mut outer = code(2, 1, Vec::new(), vec![String::from("inner")], 0,
             vec![LoadClosure(0), MakeFunction { func: 0, flags: 0x04 }, StoreFast(1), LoadFast(1), Return]);
         outer.name = String::from("outer");
-        outer.cellvars = vec![String::from("v0")];
+        outer.cellvars = ["v0"].into_iter().collect();
         let entry = code(0, 0, vec![Const::Int(10)], vec![String::from("outer")], 0,
             vec![MakeFunction { func: 0, flags: 0 }, LoadConst(0), Call(1), Call(0), Return]);
         let functions = [outer, inner];
@@ -4601,12 +5039,12 @@ mod tests {
         let mut inc = code(0, 0, vec![Const::Int(1)], Vec::new(), 0,
             vec![LoadDeref(0), LoadConst(0), Binary(BinOp::Add), StoreDeref(0), LoadDeref(0), Return]);
         inc.name = String::from("inc");
-        inc.freevars = vec![String::from("v0")];
+        inc.freevars = ["v0"].into_iter().collect();
         let mut make_counter = code(2, 0, vec![Const::Int(0)], vec![String::from("inc")], 0,
             vec![LoadConst(0), StoreDeref(0), LoadClosure(0),
                  MakeFunction { func: 0, flags: 0x04 }, StoreFast(1), LoadFast(1), Return]);
         make_counter.name = String::from("make_counter");
-        make_counter.cellvars = vec![String::from("v0")];
+        make_counter.cellvars = ["v0"].into_iter().collect();
         let entry = code(1, 0, Vec::new(), vec![String::from("make_counter")], 0,
             vec![MakeFunction { func: 0, flags: 0 }, Call(0), StoreFast(0),
                  LoadFast(0), Call(0), LoadFast(0), Call(0), Binary(BinOp::Add), Return]);
@@ -4620,7 +5058,7 @@ mod tests {
     fn module_body_loadfast_reads_the_module_global() {
         use Op::*;
         let mut body = code(1, 0, Vec::new(), Vec::new(), 0, vec![LoadFast(0), Return]);
-        body.local_names = vec![String::from("count")];
+        body.local_names = ["count"].into_iter().collect();
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         model.set_global("count", Value::fixnum(42).unwrap());
         let result = run_module(&body, &[], &mut model).unwrap();
@@ -4633,7 +5071,7 @@ mod tests {
         let entry = code(
             1,
             0,
-            vec![Const::Str(String::from("C")), Const::None, Const::Int(5), Const::Int(1)],
+            vec![Const::Str("C".into()), Const::None, Const::Int(5), Const::Int(1)],
             vec![String::from("a"), String::from("b")],
             1,
             vec![
@@ -4664,7 +5102,7 @@ mod tests {
         let entry = code(
             1,
             0,
-            vec![Const::Str(String::from("C")), Const::None],
+            vec![Const::Str("C".into()), Const::None],
             vec![String::from("len"), String::from("n")],
             1,
             vec![
@@ -4685,6 +5123,7 @@ mod tests {
         assert!(result.as_builtin_id().is_some(), "C.n resolved to the len built-in");
     }
 
+    #[cfg(feature = "float")]
     #[test]
     fn import_math_and_call_a_function() {
         use Op::*;
@@ -4709,6 +5148,7 @@ mod tests {
         assert_eq!(model.as_f64(result), Some(2.0));
     }
 
+    #[cfg(feature = "float")]
     #[test]
     fn from_import_binds_a_member() {
         use Op::*;
@@ -4734,6 +5174,7 @@ mod tests {
         assert_eq!(model.as_f64(result), Some(3.0));
     }
 
+    #[cfg(feature = "float")]
     #[test]
     fn from_import_reads_a_constant() {
         use Op::*;
@@ -5252,6 +5693,7 @@ mod tests {
         assert_eq!(bin(BinOp::Mod, f(5), f(0)), Err(Trap::ZeroDivisionError));
     }
 
+    #[cfg(feature = "float")]
     #[test]
     fn float_arithmetic_matches_python() {
         let mut m = ObjectModel::new(Vec::new(), 16 * 1024);
@@ -5278,6 +5720,7 @@ mod tests {
         assert_eq!(unary(UnaryOp::Invert, three_five, &mut m), Err(Trap::TypeError));
     }
 
+    #[cfg(feature = "float")]
     #[test]
     fn exponentiation_matches_python() {
         let mut m = ObjectModel::new(Vec::new(), 16 * 1024);
@@ -5325,17 +5768,18 @@ mod tests {
         let ten_40 = m.new_bigint(crate::bigint::BigInt::from_decimal_str(&("1".to_string() + &"0".repeat(40))).unwrap()).unwrap();
         assert!(m.is_bigint(ten_40));
         let squared = binary(BinOp::Mul, ten_40, ten_40, &mut m).unwrap();
-        assert_eq!(m.display(squared), "1".to_string() + &"0".repeat(80));
+        assert_eq!(m.display(squared).unwrap(), "1".to_string() + &"0".repeat(80));
         let zero = binary(BinOp::Sub, ten_40, ten_40, &mut m).unwrap();
         assert_eq!(zero.as_fixnum(), Some(0));
         let two = Value::fixnum(2).unwrap();
         let big_pow = binary(BinOp::Pow, two, Value::fixnum(130).unwrap(), &mut m).unwrap();
-        assert_eq!(m.display(big_pow), "1361129467683753853853498429727072845824");
+        assert_eq!(m.display(big_pow).unwrap(), "1361129467683753853853498429727072845824");
         assert_eq!(compare(CmpOp::Gt, squared, ten_40, &m), Ok(Value::TRUE));
         let neg = unary(UnaryOp::Neg, ten_40, &mut m).unwrap();
-        assert_eq!(m.display(neg), "-1".to_string() + &"0".repeat(40));
+        assert_eq!(m.display(neg).unwrap(), "-1".to_string() + &"0".repeat(40));
     }
 
+    #[cfg(feature = "float")]
     #[test]
     fn float_comparison_matches_python_including_nan() {
         let m = &mut ObjectModel::new(Vec::new(), 16 * 1024);
@@ -5432,7 +5876,7 @@ mod tests {
         assert_eq!(bin(BinOp::LShift, f(1), f(40)).unwrap().as_fixnum(), None);
         let mut m = ObjectModel::new(Vec::new(), 16 * 1024);
         let big_shift = binary(BinOp::LShift, f(1), f(200), &mut m).unwrap();
-        assert_eq!(m.display(big_shift), "1606938044258990275541962092341162602522202993782792835301376");
+        assert_eq!(m.display(big_shift).unwrap(), "1606938044258990275541962092341162602522202993782792835301376");
     }
 
     #[test]
@@ -5505,7 +5949,7 @@ mod tests {
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), LoadConst(2), Call(3), Return]);
         assert_eq!(run(&max_prog, &[], &[], &mut model).unwrap().as_fixnum(), Some(5));
 
-        let len_prog = code(0, 0, vec![Const::Str(String::from("hello"))],
+        let len_prog = code(0, 0, vec![Const::Str("hello".into())],
             vec![String::from("len")], 0, vec![LoadGlobal(0), LoadConst(0), Call(1), Return]);
         assert_eq!(run(&len_prog, &[], &[], &mut model).unwrap().as_fixnum(), Some(5));
 
@@ -5518,13 +5962,13 @@ mod tests {
         use Op::*;
         let mut model = ObjectModel::new(Vec::new(), 4096);
 
-        let cat = code(0, 0, vec![Const::Str(String::from("ab")), Const::Str(String::from("cd"))],
+        let cat = code(0, 0, vec![Const::Str("ab".into()), Const::Str("cd".into())],
             vec![String::from("len")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), Binary(BinOp::Add), Call(1), Return]);
         assert_eq!(run(&cat, &[], &[], &mut model).unwrap().as_fixnum(), Some(4));
 
         let cmp = code(0, 0,
-            vec![Const::Str(String::from("a")), Const::Str(String::from("b")), Const::Int(1), Const::Int(0)],
+            vec![Const::Str("a".into()), Const::Str("b".into()), Const::Int(1), Const::Int(0)],
             Vec::new(), 0,
             vec![
                 LoadConst(0), LoadConst(1), Compare(CmpOp::Lt), PopJumpIfFalse(6),
@@ -5534,7 +5978,7 @@ mod tests {
         assert_eq!(run(&cmp, &[], &[], &mut model).unwrap().as_fixnum(), Some(1));
 
         let truthy = code(0, 0,
-            vec![Const::Str(String::from("")), Const::Int(1), Const::Int(0)],
+            vec![Const::Str("".into()), Const::Int(1), Const::Int(0)],
             Vec::new(), 0,
             vec![
                 LoadConst(0), PopJumpIfFalse(4),
@@ -5552,16 +5996,16 @@ mod tests {
             code(
                 0,
                 0,
-                vec![Const::Str(String::from("abc")), Const::Int(i)],
+                vec![Const::Str("abc".into()), Const::Int(i)],
                 Vec::new(),
                 1,
                 vec![LoadConst(0), LoadConst(1), Subscript { cache: 0 }, Return],
             )
         };
         let b = run(&index_prog(1), &[], &[], &mut model).unwrap();
-        assert_eq!(model.str_value(b), Some("b"));
+        assert_eq!(model.str_bytes(b), Some("b".as_bytes()));
         let c = run(&index_prog(-1), &[], &[], &mut model).unwrap();
-        assert_eq!(model.str_value(c), Some("c"));
+        assert_eq!(model.str_bytes(c), Some("c".as_bytes()));
         assert_eq!(run(&index_prog(5), &[], &[], &mut model), Err(Trap::IndexError));
     }
 
@@ -5572,13 +6016,13 @@ mod tests {
         let prog = code(
             0,
             0,
-            vec![Const::Str(String::from("abc"))],
+            vec![Const::Str("abc".into())],
             vec![String::from("upper")],
             1,
             vec![LoadConst(0), LoadAttr { name: 0, cache: 0 }, Call(0), Return],
         );
         let r = run(&prog, &[], &[], &mut model).unwrap();
-        assert_eq!(model.str_value(r), Some("ABC"));
+        assert_eq!(model.str_bytes(r), Some("ABC".as_bytes()));
     }
 
     #[test]
@@ -5589,7 +6033,7 @@ mod tests {
             0,
             0,
             vec![
-                Const::Str(String::from("hello")),
+                Const::Str("hello".into()),
                 Const::Int(1),
                 Const::Int(4),
                 Const::None,
@@ -5607,7 +6051,7 @@ mod tests {
             ],
         );
         let r = run(&prog, &[], &[], &mut model).unwrap();
-        assert_eq!(model.str_value(r), Some("ell"));
+        assert_eq!(model.str_bytes(r), Some("ell".as_bytes()));
     }
 
     #[cfg(feature = "gc-collect")]
@@ -5705,7 +6149,7 @@ mod tests {
     #[test]
     fn allocating_on_the_no_heap_tier_fails_loud() {
         use Op::*;
-        let code = code(0, 0, vec![Const::Str(String::from("x"))], Vec::new(), 0,
+        let code = code(0, 0, vec![Const::Str("x".into())], Vec::new(), 0,
             vec![LoadConst(0), Return]);
         let mut model = ObjectModel::new(Vec::new(), 0);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::OutOfMemory));
@@ -5818,6 +6262,7 @@ mod tests {
         assert_eq!(result.as_fixnum(), Some(5));
     }
 
+    #[cfg(feature = "bundled-stdlib")]
     #[test]
     fn a_native_module_shadows_a_managed_one_of_the_same_name() {
         use Op::*;
@@ -6060,7 +6505,7 @@ mod tests {
     #[test]
     fn a_binary_op_type_error_raises_with_a_cpython_message() {
         use Op::*;
-        let code = code(0, 0, vec![Const::Int(1), Const::Str(String::from("a"))], Vec::new(), 0,
+        let code = code(0, 0, vec![Const::Int(1), Const::Str("a".into())], Vec::new(), 0,
             vec![LoadConst(0), LoadConst(1), Binary(BinOp::Add), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
@@ -6075,7 +6520,7 @@ mod tests {
     #[test]
     fn an_ordering_comparison_type_error_raises_with_a_cpython_message() {
         use Op::*;
-        let code = code(0, 0, vec![Const::Int(1), Const::Str(String::from("a"))], Vec::new(), 0,
+        let code = code(0, 0, vec![Const::Int(1), Const::Str("a".into())], Vec::new(), 0,
             vec![LoadConst(0), LoadConst(1), Compare(CmpOp::Lt), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
@@ -6114,7 +6559,7 @@ mod tests {
     #[test]
     fn a_unary_op_type_error_raises_with_a_cpython_message() {
         use Op::*;
-        let code = code(0, 0, vec![Const::Str(String::from("a"))], Vec::new(), 0,
+        let code = code(0, 0, vec![Const::Str("a".into())], Vec::new(), 0,
             vec![LoadConst(0), Unary(UnaryOp::Neg), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));

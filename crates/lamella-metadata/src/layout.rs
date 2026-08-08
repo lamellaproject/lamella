@@ -58,6 +58,8 @@ pub enum LayoutError {
     NotAFieldType(SigType),
     /// A nested value-type field's token could not be resolved to its layout.
     UnresolvedValueType(Token),
+    /// A field's type still mentions a type parameter, so it has no layout yet.
+    GenericNotInstantiated(SigType),
 }
 
 /// Rounds `offset` up to the next multiple of `align` (a power of two >= 1).
@@ -130,6 +132,9 @@ fn field_shape(
         SigType::ValueType(token) => {
             let nested = resolve(*token).ok_or(LayoutError::UnresolvedValueType(*token))?;
             Ok((nested.size, nested.alignment, nested.reference_offsets))
+        }
+        SigType::Var(_) | SigType::MVar(_) | SigType::GenericInst { .. } => {
+            Err(LayoutError::GenericNotInstantiated(field.clone()))
         }
         SigType::Void | SigType::ByRef(_) | SigType::TypedByRef => {
             Err(LayoutError::NotAFieldType(field.clone()))

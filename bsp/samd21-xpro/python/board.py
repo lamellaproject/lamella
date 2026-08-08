@@ -20,9 +20,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "vcp": {
         "kind": "uart",
+        "driver_family": "samd21-sercom",
         "instance": "sercom3",
         "sercom_base": 0x42001400,
         "irq": 12,
@@ -36,6 +42,24 @@ FACTS = {
         "rxpo": 1,
         "baud_115200_osc8m_8mhz": 0xC505,
     },
+}
+
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "sercom0": {"block": "sercom", "base": 0x42000800, "gclk_core_id": 0x14, "apbc_bit": 0x2, "irq": 0x9},
+    "sercom1": {"block": "sercom", "base": 0x42000C00, "gclk_core_id": 0x15, "apbc_bit": 0x3, "irq": 0xA},
+    "sercom2": {"block": "sercom", "base": 0x42001000, "gclk_core_id": 0x16, "apbc_bit": 0x4, "irq": 0xB},
+    "sercom3": {"block": "sercom", "base": 0x42001400, "gclk_core_id": 0x17, "apbc_bit": 0x5, "irq": 0xC},
+    "sercom4": {"block": "sercom", "base": 0x42001800, "gclk_core_id": 0x18, "apbc_bit": 0x6, "irq": 0xD},
+    "sercom5": {"block": "sercom", "base": 0x42001C00, "gclk_core_id": 0x19, "apbc_bit": 0x7, "irq": 0xE},
+    "pm": {"block": "pm", "base": 0x40000400},
+    "gclk": {"block": "gclk", "base": 0x40000C00},
+    "porta": {"block": "port", "base": 0x41004400},
+    "portb": {"block": "port", "base": 0x41004480},
 }
 
 PLANS = {

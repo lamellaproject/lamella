@@ -1,0 +1,26 @@
+# PARTS table for the stm32u585 family. Pin lists are PARTIAL present-lists: they carry the pins the
+# boards reach, so a consumer must not read one as the package.
+
+[table]
+kind = "parts"
+family = "stm32u585"
+sources = [
+    "STM32U575xx/585xx reference manual RM0456 Rev 7: Figure 4 'Memory map based on IDAU mapping for STM32U575/585' -- SRAM1/2/3 nonsecure at 0x20000000-0x200C0000 as ONE contiguous span, SRAM4 nonsecure at 0x28000000-0x28004000, code from 0x00000000, secure aliases at +0x10000000; Table 6 memory map and peripheral register boundary addresses; section 3.5 embedded SRAMs",
+    "STM32U585xx datasheet DS13086 Rev 10 (July 2024): section 7 ordering information decodes STM32U585AII6TR as A = 169 balls, I = 2 Mbytes flash memory, I = UFBGA (7 x 7 mm), 6 = industrial -40 to 85 C, with NO `Q` dedicated-pinout suffix and TR = tape and reel; the feature list gives 2-Mbyte flash with ECC in 2 banks read-while-write and '786-Kbyte SRAM with ECC OFF or 722-Kbyte SRAM including up to 322-Kbyte SRAM with ECC ON'; Table 27 pin definitions gives a UFBGA169 ball for every pin listed below, read from the NON-SMPS column",
+]
+notes = [
+    "flash is the part's 2 Mbytes. DS13086 states it as two banks with read-while-write, of which 512 Kbytes are rated to 100 kcycles rather than the rest -- an endurance split this schema has no field for and which no consumer should infer from the single figure.",
+    "ECC is a CAPACITY setting on this part, not only an integrity one: DS13086's own feature line gives 786 Kbytes with ECC off against 722 with it on, and section 3.5 says that of SRAM3's 512 Kbytes, 256 support ECC while 192 are reachable without it. Nothing in this schema records which mode an image assumes, so the figure above is the ECC-OFF geometry and a consumer enabling ECC has less room than the row states.",
+    "SRAM2 is retained in Standby and the BKPSRAM survives into VBAT, so the excluded blocks are not merely smaller -- they have retention the stated block does not. A consumer that needs persistence across Standby needs SRAM2 specifically and cannot get it from this row.",
+]
+
+[[parts]]
+part = "stm32u585ai"
+package = "169-ball UFBGA"
+flash = 0x200000
+ram = 0xC0000
+pins = [
+    "PG5-PG13",
+    "PH10-PH15",
+]
+source = "DS13086 Rev 10 section 7 ordering information decoding STM32U585AII6TR: A = 169 balls, I = 2 Mbytes flash memory, I = UFBGA (7 x 7 mm), 6 = industrial -40 to 85 C."

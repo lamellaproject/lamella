@@ -3865,6 +3865,28 @@ pub struct StackMapEntry {
     pub tagged_offsets: Vec<u16>,
 }
 
+impl StackMapEntry {
+    /// The entry's wire bytes AFTER its `return_pc` word: `u16 frame_size; u16 saved_bytes;
+    /// u16 nrefs; u16 ref_offsets[nrefs]; u16 ntagged; u16 tagged_offsets[ntagged]`.
+    ///
+    /// Split out so the whole-map encoder and the per-function `.lamella_gcmap` fragment share ONE
+    /// definition of an entry's shape. The fragment carries this as an opaque byte run, which is
+    /// what keeps `lamella-link` from becoming a second reader of it: the linker rebases the
+    /// `return_pc` word it prepends and copies these bytes through untouched.
+    fn encode_tail(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.frame_size.to_le_bytes());
+        out.extend_from_slice(&self.saved_bytes.to_le_bytes());
+        out.extend_from_slice(&(self.ref_offsets.len() as u16).to_le_bytes());
+        for &offset in &self.ref_offsets {
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.tagged_offsets.len() as u16).to_le_bytes());
+        for &offset in &self.tagged_offsets {
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+}
+
 /// The GC stack maps for a lowered program -- one entry per safepoint (every call + allocation, on
 /// ALL register-allocation paths so the collector can step past any frame), sorted by `return_pc`
 /// for its binary search. A frame walk reads the saved LR at `SP + frame_size + saved_bytes - 4` and
@@ -3874,28 +3896,60 @@ pub struct StackMaps(pub Vec<StackMapEntry>);
 
 impl StackMaps {
     /// The little-endian wire format the collector consumes: `u32 count`, then each entry as
-    /// `u32 return_pc; u16 frame_size; u16 saved_bytes; u16 nrefs; u16 ref_offsets[nrefs]; u16 ntagged;
-    /// u16 tagged_offsets[ntagged]`. `ref_offsets` are unconditional `ObjectRef` roots;
-    /// `tagged_offsets` are `PyValue` roots the collector traces by tag. The tagged fields are
-    /// always present -- a C# image emits `ntagged = 0`.
+    /// `u32 return_pc` followed by [`StackMapEntry::encode_tail`]. `ref_offsets` are unconditional
+    /// `ObjectRef` roots; `tagged_offsets` are `PyValue` roots the collector traces by tag. The
+    /// tagged fields are always present -- a C# image emits `ntagged = 0`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.0.len() as u32).to_le_bytes());
         for entry in &self.0 {
             out.extend_from_slice(&entry.return_pc.to_le_bytes());
-            out.extend_from_slice(&entry.frame_size.to_le_bytes());
-            out.extend_from_slice(&entry.saved_bytes.to_le_bytes());
-            out.extend_from_slice(&(entry.ref_offsets.len() as u16).to_le_bytes());
-            for &offset in &entry.ref_offsets {
-                out.extend_from_slice(&offset.to_le_bytes());
-            }
-            out.extend_from_slice(&(entry.tagged_offsets.len() as u16).to_le_bytes());
-            for &offset in &entry.tagged_offsets {
-                out.extend_from_slice(&offset.to_le_bytes());
-            }
+            entry.encode_tail(&mut out);
         }
         out
+    }
+}
+
+/// The `.lamella_gcmap` carried section for `data`, or nothing when the object contributes no
+/// fragments. `flags: 0` is load-bearing: NOT `SHF_ALLOC`, so the fragments are an input the linker
+/// consumes and never bytes the target flashes.
+fn gcmap_carried_section(data: &[u8]) -> Vec<lamella_elf::Section<'_>> {
+    (!data.is_empty())
+        .then(|| lamella_elf::Section {
+            name: lamella_elf::STACKMAP_GCMAP_SECTION,
+            flags: 0,
+            addralign: 4,
+            data,
+            relocations: &[],
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Appends one function's `.lamella_gcmap` fragment (the layout is on
+/// [`lamella_elf::STACKMAP_GCMAP_SECTION`]): the owning function's symbol NAME, then each safepoint
+/// as its return address RELATIVE TO `func_offset` plus the entry's opaque tail.
+///
+/// The name is what ties the fragment to its function without a relocation, and it is why the linker
+/// can drop a fragment whose function did not survive: a dead function leaves no symbol to resolve.
+fn encode_gcmap_fragment(out: &mut Vec<u8>, name: &str, func_offset: u32, entries: &[StackMapEntry]) {
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut tail = Vec::new();
+    for entry in entries {
+        tail.clear();
+        entry.encode_tail(&mut tail);
+        out.extend_from_slice(&(entry.return_pc - func_offset).to_le_bytes());
+        out.extend_from_slice(&(tail.len() as u32).to_le_bytes());
+        out.extend_from_slice(&tail);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
     }
 }
 
@@ -4881,8 +4935,7 @@ pub fn lower_object_library_vtables(
 /// [`CilSourceMap`](crate::cil::CilSourceMap) rows (empty for a build with no debug info) and
 /// `lines` collects its native-offset -> CIL-offset pairs -- the same pair the flat path threads, so
 /// an object can carry the line table DWARF is generated from. Both are write-only with respect to
-/// the emitted code: passing an empty `source_map` leaves the bytes exactly as they were before this
-/// path could carry debug info.
+/// the emitted code: passing an empty `source_map` leaves the emitted bytes unchanged.
 #[allow(clippy::too_many_arguments)]
 fn lower_one_func(
     func: &Function,
@@ -5474,6 +5527,27 @@ fn emit_object_pass(
     let code_end = assembled
         .label_position(code_end_label)
         .unwrap_or(assembled.bytes.len() as u32);
+    let gcmap_section: Vec<u8> = if emit_entry {
+        let mut data = Vec::new();
+        for (i, &(start, end)) in map_ranges.iter().enumerate() {
+            if start == end {
+                continue;
+            }
+            let resolved: Vec<StackMapEntry> = stack_maps[start..end]
+                .iter()
+                .map(|entry| StackMapEntry {
+                    return_pc: assembled
+                        .label_position_by_id(entry.return_pc)
+                        .unwrap_or(offsets[i]),
+                    ..entry.clone()
+                })
+                .collect();
+            encode_gcmap_fragment(&mut data, names[i], offsets[i], &resolved);
+        }
+        data
+    } else {
+        Vec::new()
+    };
     let mut method_records: Vec<(usize, u32, u16, u16, Vec<u16>)> = Vec::new();
     for (i, &(start, end)) in map_ranges.iter().enumerate() {
         if start == end {
@@ -5728,28 +5802,6 @@ fn emit_object_pass(
             addend: final_addend,
         });
     }
-    if emit_entry && !stack_maps.is_empty() {
-        stack_maps.sort_by_key(|entry| entry.return_pc);
-        let blob_offset = text.len() as u32;
-        let blob = StackMaps(stack_maps).encode();
-        text.extend_from_slice(&blob);
-        symbols.push(lamella_elf::Symbol {
-            name: "__lamella_gc_stackmaps",
-            value: blob_offset,
-            size: blob.len() as u32,
-            binding: lamella_elf::Binding::Global,
-            kind: lamella_elf::SymbolType::NoType,
-            section: lamella_elf::SymbolSection::Text,
-        });
-        symbols.push(lamella_elf::Symbol {
-            name: "__lamella_text_base",
-            value: 0,
-            size: 0,
-            binding: lamella_elf::Binding::Global,
-            kind: lamella_elf::SymbolType::NoType,
-            section: lamella_elf::SymbolSection::Text,
-        });
-    }
     for (rec_index, &(i, code_size, frame_words, ret_lr_word, ref roots)) in
         method_records.iter().enumerate()
     {
@@ -5903,7 +5955,7 @@ fn emit_object_pass(
                         code.chain(cross).collect()
                     })
                     .collect();
-                let sections: Vec<lamella_elf::Section> = generated
+                let mut sections: Vec<lamella_elf::Section> = generated
                     .iter()
                     .enumerate()
                     .map(|(i, section)| lamella_elf::Section {
@@ -5914,6 +5966,7 @@ fn emit_object_pass(
                         relocations: &debug_relocs[i],
                     })
                     .collect();
+                sections.extend(gcmap_carried_section(&gcmap_section));
                 lamella_elf::write_relocatable_object_with_sections(
                     lamella_elf::Machine::Arm,
                     &text,
@@ -5923,11 +5976,12 @@ fn emit_object_pass(
                 )
             }
         }
-        None => lamella_elf::write_relocatable_object(
+        None => lamella_elf::write_relocatable_object_with_sections(
             lamella_elf::Machine::Arm,
             &text,
             &symbols,
             &relocations,
+            &gcmap_carried_section(&gcmap_section),
         ),
     };
     Ok(PassOutcome::Object(object, stub_report, line_tables))
@@ -6111,8 +6165,40 @@ mod tests {
             Some((1, 0x0200_0005))
         );
         assert_eq!(
+            crate::resolver::reference_handle_parts(lamella_ir::TypeHandle(handle)),
+            Some((1, 0x0200_0005))
+        );
+        assert_eq!(
             crate::resolver::reference_handle_parts(lamella_ir::TypeHandle(0x0200_0005)),
             None
+        );
+    }
+
+    #[test]
+    fn an_instantiations_descriptor_symbol_does_not_qualify_by_assembly() {
+        assert_ne!(
+            crate::generics::INSTANTIATION_HANDLE_TABLE,
+            lamella_ir::SYNTHETIC_ARRAY_HANDLE_TABLE,
+            "an instantiation's byte must not be a front end's synthesized-array byte"
+        );
+        let lib = DescQualifiers {
+            string: None,
+            own: Some("0bd4d82a".into()),
+            references: alloc::vec::Vec::new(),
+        };
+        let instantiation = (crate::generics::INSTANTIATION_HANDLE_TABLE << 24) | 0x0061_73ac;
+        assert_eq!(
+            descriptor_symbol(instantiation, &lib),
+            alloc::format!("__lamella_typedesc_{instantiation}"),
+            "an instantiation is unqualified even in a build that qualifies its own types"
+        );
+        assert_eq!(
+            descriptor_symbol(0x0200_0005, &lib),
+            "__lamella_typedesc_0bd4d82a_33554437"
+        );
+        assert_eq!(
+            descriptor_symbol(instantiation, &DescQualifiers::default()),
+            descriptor_symbol(instantiation, &lib)
         );
     }
 
@@ -9884,19 +9970,137 @@ mod tests {
         );
         let obj = lamella_elf::read_object(&lower_object(&[main, g], &["main", "g"], &[]).unwrap())
             .unwrap();
-        let sym = obj
+        let section = obj
+            .sections
+            .iter()
+            .find(|s| s.name == lamella_elf::STACKMAP_GCMAP_SECTION)
+            .expect("the GC stack-map fragments are emitted");
+        assert!(
+            section.data.len() > 8,
+            "the fragment carries a function name and at least one safepoint"
+        );
+        assert!(
+            !obj.symbols.iter().any(|s| s.name == "__lamella_gc_stackmaps"),
+            "the whole-program map is synthesized by lamella-link, not by the backend"
+        );
+
+        for (function, entries) in decode_gcmap_fragments(&section.data) {
+            let size = obj
+                .symbols
+                .iter()
+                .find(|s| s.name == function && s.kind == lamella_elf::SymbolType::Func)
+                .map(|s| s.size)
+                .unwrap_or_else(|| panic!("fragment names a function symbol: {function}"));
+            for rel_pc in entries {
+                assert!(
+                    rel_pc < size,
+                    "{function}: safepoint at +{rel_pc} is outside its {size}-byte extent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_small_functions_safepoint_is_an_offset_and_not_a_label_id() {
+        const CHAIN: usize = 40;
+        let mut blocks: Vec<BasicBlock> = Vec::new();
+        for i in 0..CHAIN {
+            blocks.push(BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(i as u32),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i as i64,
+                    },
+                )],
+                terminator: Some(Terminator::Jump {
+                    target: BlockId(i as u32 + 1),
+                    args: Vec::new(),
+                }),
+            });
+        }
+        blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: Vec::new(),
+            terminator: Some(Terminator::Return(Some(ValueId(0)))),
+        });
+        let big = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32; CHAIN],
+            entry: BlockId(0),
+            blocks,
+        };
+        let small = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(0),
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let obj = lamella_elf::read_object(
+            &lower_object(&[big, small], &["big", "small"], &[]).unwrap(),
+        )
+        .unwrap();
+        let section = obj
+            .sections
+            .iter()
+            .find(|s| s.name == lamella_elf::STACKMAP_GCMAP_SECTION)
+            .expect("the GC stack-map fragments are emitted");
+        let fragments = decode_gcmap_fragments(&section.data);
+        let (_, pcs) = fragments
+            .iter()
+            .find(|(name, _)| name == "small")
+            .expect("the late function contributes a fragment");
+        let size = obj
             .symbols
             .iter()
-            .find(|s| s.name == "__lamella_gc_stackmaps")
-            .expect("__lamella_gc_stackmaps is emitted");
-        assert!(
-            sym.defined,
-            "the GC stack-map symbol is a defined data symbol"
-        );
-        assert!(
-            sym.size > 4,
-            "the blob carries at least one safepoint entry past the u32 count"
-        );
+            .find(|s| s.name == "small" && s.kind == lamella_elf::SymbolType::Func)
+            .map(|s| s.size)
+            .expect("`small` is a function symbol");
+        assert!(!pcs.is_empty(), "an allocation is a safepoint");
+        for &rel_pc in pcs {
+            assert!(
+                rel_pc < size,
+                "`small`: safepoint at +{rel_pc} is outside its {size}-byte extent -- \
+                 that is a LABEL ID, not a return address"
+            );
+        }
+    }
+
+    /// `(function name, relative safepoint offsets)` per fragment in a `.lamella_gcmap` section --
+    /// the test-side reader for the layout documented on `lamella_elf::STACKMAP_GCMAP_SECTION`.
+    fn decode_gcmap_fragments(data: &[u8]) -> Vec<(String, Vec<u32>)> {
+        let rd = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at < data.len() {
+            let name_len = rd(at) as usize;
+            let name = String::from_utf8(data[at + 4..at + 4 + name_len].to_vec()).unwrap();
+            at = (at + 4 + name_len).next_multiple_of(4);
+            let count = rd(at) as usize;
+            at += 4;
+            let mut pcs = Vec::with_capacity(count);
+            for _ in 0..count {
+                pcs.push(rd(at));
+                let tail_len = rd(at + 4) as usize;
+                at = (at + 8 + tail_len).next_multiple_of(4);
+            }
+            out.push((name, pcs));
+        }
+        out
     }
 
     #[test]

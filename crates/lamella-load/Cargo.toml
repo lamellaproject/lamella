@@ -12,12 +12,22 @@ lamella-cil = { path = "../lamella-cil" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+# The closed generic instantiation set and the canonical spelling that names each one. Optional
+# because it is the `generics` capability's cost: a profile that refuses generics outright should
+# not link a closure walk. THE SAME crate the AOT tier consumes -- one collector, one spelling, and
+# the spelling is a v1-frozen wire identity that must not have a second implementation.
+lamella-generics = { path = "../lamella-generics", optional = true }
 [features]
 # Mirror lamella-cil-runtime's BCL surface tiers + capability knobs, so a minimal loader build
 # gates out the same bindings the interpreter does. The DEFAULT is the full desktop profile (the
 # differential's run-with-corlib runner = full ECMA-335 1st-ed compliance, incl. typed references);
 # a constrained target builds --no-default-features + an explicit subset.
-default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory", "debug-names"]
+default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory", "debug-names", "generics"]
+# Bake-time monomorphization: a closed generic instantiation becomes its own type identity, so a
+# program naming `Pair<int,string>` runs instead of being refused. OFF turns the whole pass into the
+# refusal that preceded it -- `ProfileViolation::UnloweredGeneric` still names every call site, so a
+# build without this capability REFUSES a generic program rather than mis-running one.
+generics = ["dep:lamella-generics"]
 bcl = ["lamella-cil-runtime/bcl"]
 NETMFv4_4 = ["bcl", "lamella-cil-runtime/NETMFv4_4"]
 exceptions = ["lamella-cil-runtime/exceptions"]
@@ -80,6 +90,7 @@ corlib-lazy = ["flash-image"]
 # The FAT backend (with the mkfs formatter) -- so a test can install a real RAM-disk StorageProvider
 # (MemoryBlockDevice + format + FatFs) and prove the mount-provider seam end to end over a real fs.
 lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }
+lamella-aot = { path = "../lamella-aot", default-features = false }
 
 [lints]
 workspace = true

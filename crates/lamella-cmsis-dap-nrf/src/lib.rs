@@ -126,11 +126,19 @@ pub fn flash_and_run<A: TargetAccess>(
     })
 }
 
-/// Open the BBC micro:bit's on-board CMSIS-DAP HID probe (VID 0x0d28, PID 0x0204) and
-/// [`flash_and_run`] `image` at flash 0 -- the one-call deploy for a connected micro:bit.
+/// The BBC micro:bit's on-board CMSIS-DAP HID probe. **Every micro:bit ever made presents these
+/// same two numbers**, which is why nothing here may open by them alone.
 #[cfg(feature = "microbit")]
-pub fn flash_microbit(image: &[u8]) -> Result<FlashReport, FlashError> {
-    let device = lamella_usbhid::Device::open(0x0d28, 0x0204, None)
+pub const MICROBIT_DAPLINK: (u16, u16) = (0x0d28, 0x0204);
+
+/// Open a micro:bit's on-board probe and [`flash_and_run`] `image` at flash 0 -- the one-call
+/// deploy. `serial` names WHICH micro:bit; `None` means the sole attached one.
+#[cfg(feature = "microbit")]
+pub fn flash_microbit(image: &[u8], serial: Option<&str>) -> Result<FlashReport, FlashError> {
+    let (vid, pid) = MICROBIT_DAPLINK;
+    let chosen = lamella_probe::resolve_serial(vid, pid, serial)
+        .map_err(|e| FlashError::ProbeOpen(e.to_string()))?;
+    let device = lamella_usbhid::Device::open(vid, pid, Some(&chosen))
         .map_err(|e| FlashError::ProbeOpen(format!("{e:?}")))?;
     let mut target = lamella_probe_core::ArmDap::new(lamella_cmsis_dap::Dap::new(device));
     flash_and_run(&mut target, 0x0, image)

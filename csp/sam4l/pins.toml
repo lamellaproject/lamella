@@ -1,0 +1,9 @@
+# PIN map for the SAM4L family: pin x function -> (instance, signal), or -> nothing. PARTIAL and
+# evidence-only -- a row joins when a binding needs it.
+
+[table]
+kind = "pins"
+family = "sam4l"
+sources = [
+    "ATSAM4L8/L4/L2 datasheet (Atmel-42023): the GPIO function multiplexing tables in the package and pinout chapter, for rows when a binding needs them",
+]

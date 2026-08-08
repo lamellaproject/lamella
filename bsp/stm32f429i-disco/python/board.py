@@ -9,6 +9,7 @@ BOARD_VENDOR = "St"
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
 # below, never through a surface-private enum.
 VCP = "vcp"
+MEMS_SPI = "mems-spi"
 
 CARRIER = {
     "kind": "stlink-vcp",
@@ -18,9 +19,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "vcp": {
         "kind": "uart",
+        "driver_family": "stm32f42x-usart",
         "instance": "usart1",
         "base": 0x40011000,
         "rcc_en_reg": 0x40023844,
@@ -44,6 +51,69 @@ FACTS = {
         "rx_afr_value": 0x700,
         "brr_115200_hsi_16mhz": 0x8B,
     },
+    "mems-spi": {
+        "kind": "spi",
+        "driver_family": "stm32f42x-spi",
+        "instance": "spi5",
+        "base": 0x40015000,
+        "rcc_en_reg": 0x40023844,
+        "rcc_en_mask": 0x100000,
+        "sck_port_rcc_en_reg": 0x40023830,
+        "sck_port_rcc_en_mask": 0x20,
+        "sck_moder_reg": 0x40021400,
+        "sck_moder_mask": 0xC000,
+        "sck_moder_value": 0x8000,
+        "sck_afr_reg": 0x40021420,
+        "sck_afr_mask": 0xF0000000,
+        "sck_afr_value": 0x50000000,
+        "miso_port_rcc_en_reg": 0x40023830,
+        "miso_port_rcc_en_mask": 0x20,
+        "miso_moder_reg": 0x40021400,
+        "miso_moder_mask": 0x30000,
+        "miso_moder_value": 0x20000,
+        "miso_afr_reg": 0x40021424,
+        "miso_afr_mask": 0xF,
+        "miso_afr_value": 0x5,
+        "mosi_port_rcc_en_reg": 0x40023830,
+        "mosi_port_rcc_en_mask": 0x20,
+        "mosi_moder_reg": 0x40021400,
+        "mosi_moder_mask": 0xC0000,
+        "mosi_moder_value": 0x80000,
+        "mosi_afr_reg": 0x40021424,
+        "mosi_afr_mask": 0xF0,
+        "mosi_afr_value": 0x50,
+        "cs_port_rcc_en_reg": 0x40023830,
+        "cs_port_rcc_en_mask": 0x4,
+        "cs_moder_reg": 0x40020800,
+        "cs_moder_mask": 0xC,
+        "cs_moder_value": 0x4,
+        "cs_bsrr_reg": 0x40020818,
+        "cs_bsrr_set": 0x2,
+        "cs_bsrr_clear": 0x20000,
+        "pclk_hz": 16000000,
+    },
+}
+
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "usart1": {"block": "usart", "base": 0x40011000, "rcc_en_off": 0x44, "rcc_en_bit": 0x4},
+    "spi5": {"block": "spi", "base": 0x40015000, "rcc_en_off": 0x44, "rcc_en_bit": 0x14},
+    "gpioa": {"block": "gpio", "base": 0x40020000, "rcc_en_off": 0x30, "rcc_en_bit": 0x0},
+    "gpiob": {"block": "gpio", "base": 0x40020400, "rcc_en_off": 0x30, "rcc_en_bit": 0x1},
+    "gpioc": {"block": "gpio", "base": 0x40020800, "rcc_en_off": 0x30, "rcc_en_bit": 0x2},
+    "gpiod": {"block": "gpio", "base": 0x40020C00, "rcc_en_off": 0x30, "rcc_en_bit": 0x3},
+    "gpioe": {"block": "gpio", "base": 0x40021000, "rcc_en_off": 0x30, "rcc_en_bit": 0x4},
+    "gpiof": {"block": "gpio", "base": 0x40021400, "rcc_en_off": 0x30, "rcc_en_bit": 0x5},
+    "gpiog": {"block": "gpio", "base": 0x40021800, "rcc_en_off": 0x30, "rcc_en_bit": 0x6},
+    "rcc": {"block": "rcc", "base": 0x40023800},
+    "usart2": {"block": "usart", "base": 0x40004400, "rcc_en_off": 0x40, "rcc_en_bit": 0x11},
+    "otg_fs": {"block": "otg-fs", "base": 0x50000000, "rcc_en_off": 0x34, "rcc_en_bit": 0x7},
+    "flash": {"block": "flash", "base": 0x40023C00},
+    "fmc": {"block": "fmc", "base": 0xA0000000, "rcc_en_off": 0x38, "rcc_en_bit": 0x0},
 }
 
 PLANS = {

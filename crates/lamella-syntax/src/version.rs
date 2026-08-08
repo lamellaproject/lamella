@@ -4,9 +4,9 @@ use core::fmt;
 
 /// A version of the C# language.
 ///
-/// Only [`LanguageVersion::CSharp1`] is implemented. Later variants exist so
-/// that the feature table and diagnostics can name versions we have not built
-/// yet; [`LanguageVersion::parse_flag`] refuses to select them.
+/// Every variant through [`LanguageVersion::SELECTABLE_MAX`] can be SELECTED, which is a statement
+/// about what we can gate against rather than about what we have built -- see
+/// [`Feature::is_implemented`] for the other half.
 ///
 /// Ordering follows release order, so `>=` is the natural way to ask whether a
 /// version is recent enough for a given feature.
@@ -22,19 +22,51 @@ pub enum LanguageVersion {
     CSharp3,
     /// C# 4.0. A gating label only; not yet implemented.
     CSharp4,
+    /// C# 5.0. A gating label only; not yet implemented. Present because the DIAGNOSTIC CODE for a
+    /// too-new feature is keyed on the version being compiled (see
+    /// [`LanguageVersion::feature_gate_code`]) and C# 5 has its own -- a gap in this enum would
+    /// silently borrow its neighbour's code.
+    CSharp5,
     /// C# 6.0 (ECMA-334 6th ed, 2022). A gating label only; not yet implemented.
     CSharp6,
     /// C# 7.0 (ECMA-334 7th ed, 2023 -- ISO/IEC 20619:2023 -- the latest ratified standard). A
     /// gating label only; not yet implemented.
     CSharp7,
+    /// C# 7.1. A gating label only. Present so a 7.x feature can be gated precisely -- see
+    /// `CSharp7_2`.
+    CSharp7_1,
+    /// C# 7.2. A gating label only, and it earns its place: a LEADING digit separator (`0x_FF`) is
+    /// a separate csc feature introduced here, so without this variant a compiler that implements
+    /// C# 7.0 separators would have to either accept `0x_FF` (which csc rejects at 7.0) or reject
+    /// it with the wrong required version.
+    CSharp7_2,
+    /// C# 7.3. A gating label only; present so the 7.x run is contiguous rather than having a hole
+    /// where 7.1 and 7.3 fall back to `Unsupported` while 7.2 works.
+    CSharp7_3,
+    /// C# 8.0. A gating label only; not yet implemented.
+    CSharp8,
+    /// C# 9.0 -- the rung that carries TOP-LEVEL STATEMENTS; a gating label only; not yet implemented.
+    CSharp9,
+    /// C# 10.0 -- the rung that carries FILE-SCOPED NAMESPACES.
+    /// A gating label only; not yet implemented.
+    CSharp10,
+    /// C# 11.0 -- the rung that carries REQUIRED MEMBERS. A gating label only; not yet
+    /// implemented.
+    CSharp11,
 }
 
 impl LanguageVersion {
-    /// The newest language version this compiler can process today.
-    pub const LATEST_SUPPORTED: LanguageVersion = LanguageVersion::CSharp1;
+    /// The dialect compiled when no `/langversion` is given.
+    pub const DEFAULT: LanguageVersion = LanguageVersion::CSharp1;
 
-    /// The version selected when the caller does not request one explicitly.
-    pub const DEFAULT: LanguageVersion = LanguageVersion::LATEST_SUPPORTED;
+    /// The newest dialect `/langversion` will select.
+    ///
+    /// **Selecting a dialect is NOT a claim that lcsc implements all of it.** A dialect decides
+    /// which constructs are PERMITTED; [`Feature::is_implemented`] decides which of those this build
+    /// can actually produce, and a construct needs both. So the ceiling can name every version we
+    /// can gate against, and a permitted-but-unbuilt construct is refused by name (`LAM0001`)
+    /// rather than by pretending the dialect forbids it.
+    pub const SELECTABLE_MAX: LanguageVersion = LanguageVersion::CSharp11;
 
     /// Returns `true` when `feature` is available in this language version.
     #[must_use]
@@ -42,11 +74,127 @@ impl LanguageVersion {
         self >= feature.introduced_in()
     }
 
-    /// Returns `true` when this compiler can actually compile this version,
-    /// rather than merely name it for gating.
+    /// Returns `true` when `/langversion` will select this dialect.
+    ///
+    /// This replaced an `is_implemented` that asked whether the compiler could compile the whole
+    /// version. That question stopped being answerable per-VERSION the moment capability moved to
+    /// [`Feature::is_implemented`]: lcsc gates C# 7 and builds a handful of its features, so "is
+    /// C# 7 implemented" has no true answer while "is C# 7 selectable" and "is this feature built"
+    /// both do.
     #[must_use]
-    pub fn is_implemented(self) -> bool {
-        self <= Self::LATEST_SUPPORTED
+    pub fn is_selectable(self) -> bool {
+        self <= Self::SELECTABLE_MAX
+    }
+
+    /// The diagnostic code csc reports when a feature is not available in THIS version.
+    ///
+    /// **The code names the version being COMPILED, not the version the feature needs** -- the
+    /// required version appears only in the message ("Please use language version 7.0 or greater").
+    /// A single hard-coded code is therefore right for exactly one language version and wrong for
+    /// every other, which is the shape this method exists to prevent.
+    ///
+    /// MEASURED, not read from a standard: a gating diagnostic is not described by ECMA-334 at all,
+    /// so csc is the only oracle there is. One compilation per
+    /// row against `csc /langversion:<v>`, 2026-08-02:
+    ///
+    /// | version | code | | version | code |
+    /// |---|---|---|---|---|
+    /// | C# 1 (ISO-1) | `CS8022` | | C# 7 | `CS8107` |
+    /// | C# 2 (ISO-2) | `CS8023` | | C# 8 | `CS8400` |
+    /// | C# 3 | `CS8024` | | C# 9 | `CS8773` |
+    /// | C# 4 | `CS8025` | | C# 10 | `CS8936` |
+    /// | C# 5 | `CS8026` | | C# 11 | `CS9058` |
+    /// | C# 6 | `CS8059` | | | |
+    ///
+    /// The first six rows came from a file using binary literals and digit separators, which C# 7
+    /// accepts -- so that run could not reach past 6, and the arms above 6 read C# 6's code for a
+    /// while on the reasoning that they were unreachable. **Raising the ceiling made them
+    /// reachable, and they were wrong.** The rows from 7 up are a second run, against a C# 12
+    /// construct, which every dialect below 12 gates.
+    ///
+    /// The lesson is worth more than the table: **"unreachable, so the value does not matter" has a
+    /// shelf life exactly as long as the input space stays fixed.** Two arms in this file were
+    /// wrong that way in one afternoon -- this one and [`Self::message_name`]'s C# 7 rendering.
+    ///
+    /// The 7.x point releases are here too -- 7.1 `CS8302`, 7.2 `CS8320`, 7.3 `CS8370` -- because a
+    /// LEADING digit separator (`0x_FF`) is a csc feature introduced at 7.2, and gating it needs a
+    /// version to name.
+    #[must_use]
+    pub fn feature_gate_code(self) -> u16 {
+        match self {
+            LanguageVersion::CSharp1 => 8022,
+            LanguageVersion::CSharp2 => 8023,
+            LanguageVersion::CSharp3 => 8024,
+            LanguageVersion::CSharp4 => 8025,
+            LanguageVersion::CSharp5 => 8026,
+            LanguageVersion::CSharp6 => 8059,
+            LanguageVersion::CSharp7 => 8107,
+            LanguageVersion::CSharp7_1 => 8302,
+            LanguageVersion::CSharp7_2 => 8320,
+            LanguageVersion::CSharp7_3 => 8370,
+            LanguageVersion::CSharp8 => 8400,
+            LanguageVersion::CSharp9 => 8773,
+            LanguageVersion::CSharp10 => 8936,
+            LanguageVersion::CSharp11 => 9058,
+        }
+    }
+
+    /// How csc spells this version inside a diagnostic message: `C# 1`, not `C# 1.0`.
+    ///
+    /// Measured from the message text, which reads "is not available in C# 1." A trailing `.0`
+    /// would make our message differ from csc's for a diagnostic whose whole purpose is to be
+    /// searched for verbatim.
+    #[must_use]
+    pub fn message_name(self) -> &'static str {
+        match self {
+            LanguageVersion::CSharp1 => "1",
+            LanguageVersion::CSharp2 => "2",
+            LanguageVersion::CSharp3 => "3",
+            LanguageVersion::CSharp4 => "4",
+            LanguageVersion::CSharp5 => "5",
+            LanguageVersion::CSharp6 => "6",
+            LanguageVersion::CSharp7 => "7.0",
+            LanguageVersion::CSharp7_1 => "7.1",
+            LanguageVersion::CSharp7_2 => "7.2",
+            LanguageVersion::CSharp7_3 => "7.3",
+            LanguageVersion::CSharp8 => "8.0",
+            LanguageVersion::CSharp9 => "9.0",
+            LanguageVersion::CSharp10 => "10.0",
+            LanguageVersion::CSharp11 => "11.0",
+        }
+    }
+
+    /// How csc spells this version as the REQUIRED one, in "Please use language version N or
+    /// greater".
+    ///
+    /// **A BARE MAJOR UP TO 6, AND `N.0` FROM 7 ON.** Measured, and I had it wrong first: I
+    /// generalized "7.0" from one feature's message into "always carries a minor part", and three
+    /// more measurements falsified it -- `static classes` asks for "2", `automatically implemented
+    /// properties` for "3", `async` for "5", `using static` for "6", while default interface
+    /// implementations ask for "8.0" and parameterless struct constructors for "10.0". The boundary
+    /// is real and it sits between 6 and 7.
+    ///
+    /// Deliberately a different rendering from [`Self::message_name`], which is the CURRENT version
+    /// in the same sentence: "not available in C# 1. Please use language version 7.0 or greater."
+    /// The asymmetry is csc's; matching it is the point, because the message is a search key.
+    #[must_use]
+    pub fn required_name(self) -> &'static str {
+        match self {
+            LanguageVersion::CSharp1 => "1",
+            LanguageVersion::CSharp2 => "2",
+            LanguageVersion::CSharp3 => "3",
+            LanguageVersion::CSharp4 => "4",
+            LanguageVersion::CSharp5 => "5",
+            LanguageVersion::CSharp6 => "6",
+            LanguageVersion::CSharp7 => "7.0",
+            LanguageVersion::CSharp7_1 => "7.1",
+            LanguageVersion::CSharp7_2 => "7.2",
+            LanguageVersion::CSharp7_3 => "7.3",
+            LanguageVersion::CSharp8 => "8.0",
+            LanguageVersion::CSharp9 => "9.0",
+            LanguageVersion::CSharp10 => "10.0",
+            LanguageVersion::CSharp11 => "11.0",
+        }
     }
 
     /// Parses a csc-compatible `/langversion` value such as `ISO-1`, `1`,
@@ -63,10 +211,49 @@ impl LanguageVersion {
             return Ok(Self::DEFAULT);
         }
         if value.eq_ignore_ascii_case("latest") || value.eq_ignore_ascii_case("latestmajor") {
-            return Ok(Self::LATEST_SUPPORTED);
+            return Ok(Self::SELECTABLE_MAX);
         }
         if value.eq_ignore_ascii_case("iso-1") || value == "1" || value == "1.0" {
             return Ok(Self::CSharp1);
+        }
+        if value.eq_ignore_ascii_case("iso-2") || value == "2" || value == "2.0" {
+            return Ok(Self::CSharp2);
+        }
+        if value == "3" || value == "3.0" {
+            return Ok(Self::CSharp3);
+        }
+        if value == "4" || value == "4.0" {
+            return Ok(Self::CSharp4);
+        }
+        if value == "5" || value == "5.0" {
+            return Ok(Self::CSharp5);
+        }
+        if value == "6" || value == "6.0" {
+            return Ok(Self::CSharp6);
+        }
+        if value == "7" || value == "7.0" {
+            return Ok(Self::CSharp7);
+        }
+        if value == "7.1" {
+            return Ok(Self::CSharp7_1);
+        }
+        if value == "7.2" {
+            return Ok(Self::CSharp7_2);
+        }
+        if value == "7.3" {
+            return Ok(Self::CSharp7_3);
+        }
+        if value == "8" || value == "8.0" {
+            return Ok(Self::CSharp8);
+        }
+        if value == "9" || value == "9.0" {
+            return Ok(Self::CSharp9);
+        }
+        if value == "10" || value == "10.0" {
+            return Ok(Self::CSharp10);
+        }
+        if value == "11" || value == "11.0" {
+            return Ok(Self::CSharp11);
         }
         if is_known_future_version(value) {
             return Err(LanguageVersionError::Unsupported);
@@ -82,12 +269,23 @@ impl LanguageVersion {
             LanguageVersion::CSharp2 => "ISO-2",
             LanguageVersion::CSharp3 => "3",
             LanguageVersion::CSharp4 => "4",
+            LanguageVersion::CSharp5 => "5",
             LanguageVersion::CSharp6 => "6",
             LanguageVersion::CSharp7 => "7",
+            LanguageVersion::CSharp7_1 => "7.1",
+            LanguageVersion::CSharp7_2 => "7.2",
+            LanguageVersion::CSharp7_3 => "7.3",
+            LanguageVersion::CSharp8 => "8",
+            LanguageVersion::CSharp9 => "9",
+            LanguageVersion::CSharp10 => "10",
+            LanguageVersion::CSharp11 => "11",
         }
     }
 
-    /// A human-readable name such as `C# 1.0`.
+    /// A human-readable name such as `C# 1.0`, for OUR OWN prose (driver errors, help text).
+    ///
+    /// Not for a csc-matched diagnostic: csc spells the same version two other ways depending on
+    /// where in the sentence it lands. See [`Self::message_name`] and [`Self::required_name`].
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
@@ -95,8 +293,16 @@ impl LanguageVersion {
             LanguageVersion::CSharp2 => "C# 2.0",
             LanguageVersion::CSharp3 => "C# 3.0",
             LanguageVersion::CSharp4 => "C# 4.0",
+            LanguageVersion::CSharp5 => "C# 5.0",
             LanguageVersion::CSharp6 => "C# 6.0",
             LanguageVersion::CSharp7 => "C# 7.0",
+            LanguageVersion::CSharp7_1 => "C# 7.1",
+            LanguageVersion::CSharp7_2 => "C# 7.2",
+            LanguageVersion::CSharp7_3 => "C# 7.3",
+            LanguageVersion::CSharp8 => "C# 8.0",
+            LanguageVersion::CSharp9 => "C# 9.0",
+            LanguageVersion::CSharp10 => "C# 10.0",
+            LanguageVersion::CSharp11 => "C# 11.0",
         }
     }
 }
@@ -115,7 +321,6 @@ impl fmt::Display for LanguageVersion {
 /// [`LanguageVersion`] variant exists.
 fn is_known_future_version(value: &str) -> bool {
     const KNOWN: &[&str] = &[
-        "iso-2", "2", "2.0", "3", "4", "5", "6", "7", "7.1", "7.2", "7.3", "8", "9", "10", "11",
         "12", "13", "14", "preview",
     ];
     KNOWN.iter().any(|known| value.eq_ignore_ascii_case(known))
@@ -132,25 +337,53 @@ fn is_known_future_version(value: &str) -> bool {
 pub enum Feature {
     /// Generic types and methods, for example `List<T>`. Introduced in C# 2.0.
     Generics,
+    /// A `static` class -- abstract and sealed, with no synthesized default constructor.
+    /// Introduced in C# 2.0. **The one feature whose emit path is complete while the dialect still
+    /// refuses it**; see [`Feature::is_implemented`].
+    StaticClasses,
     /// Anonymous methods, for example `delegate (int x) { return x; }`.
     /// Introduced in C# 2.0.
     AnonymousMethods,
     /// Nullable value types, for example `int?`. Introduced in C# 2.0.
     NullableValueTypes,
     /// The null-coalescing operator `??` (`a ?? b`). Introduced in C# 2.0.
+    ///
+    /// **The one feature in this table whose name could not be measured**, because csc's ISO-1 is
+    /// lenient about `??` and accepts it at every selectable dialect -- so it never emits a gate to
+    /// read a name off. lcsc is deliberately stricter here; the description is therefore OURS,
+    /// written in csc's style rather than copied from it.
     NullCoalescing,
     /// The namespace alias qualifier `::` (`global::System`). Introduced in C# 2.0.
     NamespaceAlias,
     /// An access modifier on a property, indexer, or event accessor, for example `private set`.
     /// Introduced in C# 2.0.
     AccessorAccessibility,
-    /// The `=>` operator -- lambda expressions, and later expression-bodied members.
-    /// Introduced in C# 3.0.
-    LambdaArrow,
-    /// Object and collection initializers, for example `new C { F = 1 }` or
-    /// `new List { 1, 2 }`, initializing members or adding elements after `new`.
-    /// Introduced in C# 3.0.
-    ObjectAndCollectionInitializers,
+    /// A lambda expression, `x => x`. Introduced in C# 3.0.
+    LambdaExpression,
+    /// An expression-bodied method, `int M() => 1;`. Introduced in **C# 6.0**.
+    ///
+    /// **Split out of the old `LambdaArrow` after measuring csc, which reports
+    /// `'expression-bodied method' ... Please use language version 6 or greater` -- three releases
+    /// after the lambda that shares its token.** While the two were one variant, a dialect of C# 3,
+    /// 4 or 5 PERMITTED an expression-bodied member that csc rejects; that is the accepts-invalid
+    /// column, and it was harmless only because neither half is built yet.
+    ExpressionBodiedMethod,
+    /// An expression-bodied property, `int P => 1;`. Introduced in **C# 6.0**.
+    ///
+    /// A separate variant because csc names the MEMBER KIND in the message -- `'expression-bodied
+    /// property'`, not `'expression-bodied method'` -- and this message is a search key. Measured
+    /// beside the method form. (csc has further kinds, notably expression-bodied constructors and
+    /// accessors at C# 7.0; they get variants when there is a site to raise them from.)
+    ExpressionBodiedProperty,
+    /// An object initializer, `new C { F = 1 }`. Introduced in C# 3.0.
+    ObjectInitializer,
+    /// A collection initializer, `new ArrayList { 1, 2 }`. Introduced in C# 3.0.
+    ///
+    /// Same version as [`Feature::ObjectInitializer`] and a different NOUN, which is the whole
+    /// reason the two are separate variants: one enum entry could carry the right version and only
+    /// ever half the right message. csc tells them apart by whether the first element is an
+    /// assignment, and so do we.
+    CollectionInitializer,
     /// An anonymous object creation `new { A = 1, ... }`, producing an instance of a
     /// compiler-synthesized anonymous type. Introduced in C# 3.0.
     AnonymousObjectCreation,
@@ -163,45 +396,158 @@ pub enum Feature {
     /// A `using static` directive (`using static System.Math;`), importing a type's static
     /// members into scope. Introduced in C# 6.0.
     UsingStatic,
+    /// An automatically implemented property -- a concrete `{ get; set; }` whose accessors have no
+    /// bodies. Introduced in C# 3.0.
+    AutoProperties,
+    /// `switch` on a `bool` governing expression. Introduced in C# 2.0. (C# 1.0 restricts the
+    /// governing type to the integral types, `char`, `string` and enums.)
+    SwitchOnBool,
+    /// Binary integer literals, `0b1010_0101`. Introduced in C# 7.0.
+    BinaryLiterals,
+    /// Digit separators in a numeric literal, `1_000_000`. Introduced in C# 7.0.
+    DigitSeparators,
+    /// Top-level statements -- a compilation unit whose statements ARE the program, with no
+    /// enclosing type and no `Main`. Introduced in C# 9.0.
+    TopLevelStatements,
+    /// A file-scoped namespace declaration -- `namespace N;` rather than `namespace N { ... }`.
+    /// Introduced in C# 10.0. It is pure
+    /// syntax: no metadata, no runtime, no binder change, so it is the highest ratio of
+    /// files-unblocked to work on the compatibility list.
+    FileScopedNamespaces,
+    /// A `required` member -- an initializer the caller MUST supply. Introduced in C# 11.0.
+    RequiredMembers,
+    /// A digit separator IMMEDIATELY AFTER a base prefix -- `0x_FF`, `0b_1010`. Introduced in
+    /// C# 7.2, a full release AFTER separators themselves.
+    ///
+    /// **csc treats this as its own feature and rejects it at C# 7.0** ("Feature ''leading digit
+    /// separator'' is not available in C# 7.0"), measured. So a compiler that implemented C# 7.0
+    /// separators and allowed a leading one would ACCEPT what csc rejects -- the serious column.
+    LeadingDigitSeparator,
+    /// A record type -- a class or struct with generated value equality, `with`, `ToString` and
+    /// `Deconstruct`. Introduced in C# 9.0.
+    ///
+    /// **Sequenced AFTER generics deliberately**: a record is a code generator whose output binds
+    /// `IEquatable<T>`.
+    Records,
 }
 
 impl Feature {
+    /// Whether **lcsc has built** this feature, as distinct from whether a language version
+    /// PERMITS it ([`Self::introduced_in`]).
+    ///
+    /// **The two questions are independent and conflating them is the trap this method exists to
+    /// prevent.** A selectable `/langversion:7` must not be read as "lcsc implements C# 7": it
+    /// selects a DIALECT, and this table says which of that dialect's features we can actually
+    /// compile. A feature the dialect permits and we have not built has to be refused by NAME --
+    /// telling the user to "use language version 7 or greater" when they already did would be a
+    /// lie, and one that sends them looking for a compiler switch that cannot help.
+    #[must_use]
+    pub fn is_implemented(self) -> bool {
+        match self {
+            Feature::StaticClasses | Feature::BinaryLiterals | Feature::DigitSeparators => true,
+            Feature::FileScopedNamespaces => true,
+            Feature::ObjectInitializer | Feature::CollectionInitializer => true,
+            Feature::Generics
+            | Feature::AnonymousMethods
+            | Feature::NullableValueTypes
+            | Feature::NullCoalescing
+            | Feature::NamespaceAlias
+            | Feature::AccessorAccessibility
+            | Feature::LambdaExpression
+            | Feature::ExpressionBodiedMethod
+            | Feature::ExpressionBodiedProperty
+            | Feature::AnonymousObjectCreation
+            | Feature::DefaultParameterValues
+            | Feature::NamedArguments
+            | Feature::NullConditional
+            | Feature::UsingStatic
+            | Feature::AutoProperties
+            | Feature::SwitchOnBool
+
+            | Feature::TopLevelStatements
+            | Feature::LeadingDigitSeparator
+            | Feature::RequiredMembers
+            | Feature::Records => false,
+        }
+    }
+
     /// The first language version in which this feature is available.
     #[must_use]
     pub fn introduced_in(self) -> LanguageVersion {
         match self {
             Feature::Generics
+            | Feature::StaticClasses
             | Feature::AnonymousMethods
             | Feature::NullableValueTypes
             | Feature::NullCoalescing
             | Feature::AccessorAccessibility
             | Feature::NamespaceAlias => LanguageVersion::CSharp2,
-            Feature::LambdaArrow
-            | Feature::ObjectAndCollectionInitializers
+            Feature::LambdaExpression
+            | Feature::ObjectInitializer
+            | Feature::CollectionInitializer
             | Feature::AnonymousObjectCreation => LanguageVersion::CSharp3,
             Feature::DefaultParameterValues | Feature::NamedArguments => LanguageVersion::CSharp4,
+            Feature::SwitchOnBool => LanguageVersion::CSharp2,
+            Feature::AutoProperties => LanguageVersion::CSharp3,
+            Feature::ExpressionBodiedMethod | Feature::ExpressionBodiedProperty => {
+                LanguageVersion::CSharp6
+            }
             Feature::NullConditional | Feature::UsingStatic => LanguageVersion::CSharp6,
+            Feature::BinaryLiterals | Feature::DigitSeparators => LanguageVersion::CSharp7,
+            Feature::LeadingDigitSeparator => LanguageVersion::CSharp7_2,
+            Feature::TopLevelStatements | Feature::Records => LanguageVersion::CSharp9,
+            Feature::FileScopedNamespaces => LanguageVersion::CSharp10,
+            Feature::RequiredMembers => LanguageVersion::CSharp11,
         }
     }
 
-    /// A short noun phrase for the feature, used in "feature requires C# N"
-    /// diagnostics.
+    /// The noun phrase csc quotes in `Feature '<name>' is not available in C# N`.
+    ///
+    /// | we said | csc says |
+    /// |---|---|
+    /// | nullable value types | **nullable types** |
+    /// | the namespace alias qualifier `'::'` | **namespace alias qualifier** |
+    /// | accessor access modifiers | **access modifiers on properties** |
+    /// | lambda and expression-bodied members (`'=>'`) | **lambda expression** *and* **expression-bodied method** / **expression-bodied property**, separately |
+    /// | object and collection initializers | **object initializer** *and* **collection initializer**, separately |
+    /// | optional parameters | **optional parameter** (singular) |
+    /// | named arguments | **named argument** (singular) |
+    /// | null-conditional operators (`'?.'` and `'?['`) | **null propagating operator** (one name, both operators -- measured) |
+    ///
+    /// **The pattern in our errors is that we described the LANGUAGE and csc names the
+    /// CONSTRUCT**: a parenthesized operator spelling, a plural where csc reports one occurrence,
+    /// and two features merged where the message has to pick one noun. The last kind is the one
+    /// that cost something real -- see [`Feature::ExpressionBodiedMethod`], where the merge also
+    /// carried the wrong VERSION.
     #[must_use]
     pub fn description(self) -> &'static str {
         match self {
             Feature::Generics => "generics",
             Feature::AnonymousMethods => "anonymous methods",
-            Feature::NullableValueTypes => "nullable value types",
-            Feature::NullCoalescing => "the null-coalescing operator '??'",
-            Feature::NamespaceAlias => "the namespace alias qualifier '::'",
-            Feature::AccessorAccessibility => "accessor access modifiers",
-            Feature::LambdaArrow => "lambda and expression-bodied members ('=>')",
-            Feature::ObjectAndCollectionInitializers => "object and collection initializers",
+            Feature::NullableValueTypes => "nullable types",
+            Feature::NullCoalescing => "null coalescing operator",
+            Feature::NamespaceAlias => "namespace alias qualifier",
+            Feature::AccessorAccessibility => "access modifiers on properties",
+            Feature::LambdaExpression => "lambda expression",
+            Feature::ExpressionBodiedMethod => "expression-bodied method",
+            Feature::ExpressionBodiedProperty => "expression-bodied property",
+            Feature::ObjectInitializer => "object initializer",
+            Feature::CollectionInitializer => "collection initializer",
             Feature::AnonymousObjectCreation => "anonymous types",
-            Feature::DefaultParameterValues => "optional parameters",
-            Feature::NamedArguments => "named arguments",
-            Feature::NullConditional => "null-conditional operators ('?.' and '?[')",
+            Feature::DefaultParameterValues => "optional parameter",
+            Feature::NamedArguments => "named argument",
+            Feature::NullConditional => "null propagating operator",
+            Feature::StaticClasses => "static classes",
             Feature::UsingStatic => "using static",
+            Feature::AutoProperties => "automatically implemented properties",
+            Feature::SwitchOnBool => "switch on boolean type",
+            Feature::BinaryLiterals => "binary literals",
+            Feature::DigitSeparators => "digit separators",
+            Feature::LeadingDigitSeparator => "leading digit separator",
+            Feature::TopLevelStatements => "top-level statements",
+            Feature::FileScopedNamespaces => "file-scoped namespace",
+            Feature::RequiredMembers => "required members",
+            Feature::Records => "records",
         }
     }
 }
@@ -235,9 +581,10 @@ mod tests {
     #[test]
     fn default_and_latest_are_csharp1() {
         assert_eq!(LanguageVersion::DEFAULT, LanguageVersion::CSharp1);
-        assert_eq!(LanguageVersion::LATEST_SUPPORTED, LanguageVersion::CSharp1);
-        assert!(LanguageVersion::CSharp1.is_implemented());
-        assert!(!LanguageVersion::CSharp2.is_implemented());
+        assert_eq!(LanguageVersion::SELECTABLE_MAX, LanguageVersion::CSharp11);
+        assert_ne!(LanguageVersion::DEFAULT, LanguageVersion::SELECTABLE_MAX);
+        assert!(LanguageVersion::CSharp1.is_selectable());
+        assert!(LanguageVersion::CSharp11.is_selectable());
     }
 
     #[test]
@@ -254,28 +601,202 @@ mod tests {
     }
 
     #[test]
-    fn parse_flag_accepts_csharp1_spellings() {
-        for value in [
-            "ISO-1",
-            "iso-1",
-            "1",
-            "1.0",
-            " 1 ",
-            "default",
-            "latest",
-            "LATESTMAJOR",
+    fn permitted_and_implemented_are_two_independent_bits() {
+        assert!(Feature::StaticClasses.is_implemented());
+        assert!(LanguageVersion::CSharp2.supports(Feature::StaticClasses));
+        assert!(!LanguageVersion::CSharp1.supports(Feature::StaticClasses));
+
+        assert!(LanguageVersion::CSharp2.supports(Feature::Generics));
+        assert!(!Feature::Generics.is_implemented());
+
+        for feature in [
+            Feature::Generics,
+            Feature::StaticClasses,
+            Feature::AnonymousMethods,
+            Feature::NullableValueTypes,
+            Feature::NullCoalescing,
+            Feature::NamespaceAlias,
+            Feature::AccessorAccessibility,
+            Feature::LambdaExpression,
+            Feature::ExpressionBodiedMethod,
+            Feature::ExpressionBodiedProperty,
+            Feature::ObjectInitializer,
+            Feature::CollectionInitializer,
+            Feature::AnonymousObjectCreation,
+            Feature::DefaultParameterValues,
+            Feature::NamedArguments,
+            Feature::NullConditional,
+            Feature::UsingStatic,
         ] {
+            let admitted = LanguageVersion::DEFAULT.supports(feature) && feature.is_implemented();
+            assert!(
+                !admitted,
+                "{feature:?} would be admitted under the default dialect; every feature in this \
+                 table is post-1.0 and the default is ISO-1"
+            );
+        }
+    }
+
+    #[test]
+    fn the_feature_gate_code_names_the_version_being_compiled() {
+        assert_eq!(LanguageVersion::CSharp1.feature_gate_code(), 8022);
+        assert_eq!(LanguageVersion::CSharp2.feature_gate_code(), 8023);
+        assert_eq!(LanguageVersion::CSharp3.feature_gate_code(), 8024);
+        assert_eq!(LanguageVersion::CSharp4.feature_gate_code(), 8025);
+        assert_eq!(LanguageVersion::CSharp5.feature_gate_code(), 8026);
+        assert_eq!(LanguageVersion::CSharp6.feature_gate_code(), 8059);
+        let codes = [
+            LanguageVersion::CSharp1,
+            LanguageVersion::CSharp2,
+            LanguageVersion::CSharp3,
+            LanguageVersion::CSharp4,
+            LanguageVersion::CSharp5,
+            LanguageVersion::CSharp6,
+        ]
+        .map(LanguageVersion::feature_gate_code);
+        for window in codes.windows(2) {
+            assert_ne!(window[0], window[1], "each version has its OWN gate code");
+        }
+    }
+
+    #[test]
+    fn a_version_renders_differently_as_current_and_as_required() {
+        assert_eq!(LanguageVersion::CSharp1.message_name(), "1");
+        assert_eq!(LanguageVersion::CSharp2.message_name(), "2");
+
+        assert_eq!(LanguageVersion::CSharp2.required_name(), "2");
+        assert_eq!(LanguageVersion::CSharp5.required_name(), "5");
+        assert_eq!(LanguageVersion::CSharp6.required_name(), "6");
+        assert_eq!(LanguageVersion::CSharp7.required_name(), "7.0");
+
+        assert_eq!(LanguageVersion::CSharp6.message_name(), "6");
+        assert_eq!(LanguageVersion::CSharp7.message_name(), "7.0");
+        assert_eq!(LanguageVersion::CSharp9.message_name(), "9.0");
+    }
+
+    /// Every `Feature`, so a property can be stated over the whole table. A new variant is caught
+    /// by the exhaustive `match` in `description`; adding it here is what makes it caught HERE too.
+    const EVERY_FEATURE: &[Feature] = &[
+        Feature::Generics,
+        Feature::StaticClasses,
+        Feature::AnonymousMethods,
+        Feature::NullableValueTypes,
+        Feature::NullCoalescing,
+        Feature::NamespaceAlias,
+        Feature::AccessorAccessibility,
+        Feature::LambdaExpression,
+        Feature::ExpressionBodiedMethod,
+        Feature::ExpressionBodiedProperty,
+        Feature::ObjectInitializer,
+        Feature::CollectionInitializer,
+        Feature::AnonymousObjectCreation,
+        Feature::DefaultParameterValues,
+        Feature::NamedArguments,
+        Feature::NullConditional,
+        Feature::UsingStatic,
+        Feature::AutoProperties,
+        Feature::SwitchOnBool,
+        Feature::BinaryLiterals,
+        Feature::DigitSeparators,
+        Feature::LeadingDigitSeparator,
+        Feature::TopLevelStatements,
+        Feature::FileScopedNamespaces,
+        Feature::RequiredMembers,
+        Feature::Records,
+    ];
+
+    #[test]
+    fn every_feature_name_is_the_one_csc_quotes() {
+        assert_eq!(Feature::NullableValueTypes.description(), "nullable types");
+        assert_eq!(Feature::NamespaceAlias.description(), "namespace alias qualifier");
+        assert_eq!(
+            Feature::AccessorAccessibility.description(),
+            "access modifiers on properties"
+        );
+        assert_eq!(Feature::LambdaExpression.description(), "lambda expression");
+        assert_eq!(Feature::ObjectInitializer.description(), "object initializer");
+        assert_eq!(Feature::CollectionInitializer.description(), "collection initializer");
+        assert_eq!(Feature::DefaultParameterValues.description(), "optional parameter");
+        assert_eq!(Feature::NamedArguments.description(), "named argument");
+        assert_eq!(Feature::NullConditional.description(), "null propagating operator");
+
+        for feature in EVERY_FEATURE {
+            let description = feature.description();
+            assert!(
+                !description.contains('\''),
+                "{feature:?}'s description carries its own quotes ({description:?}); the renderer \
+                 supplies them"
+            );
+            assert!(
+                !description.is_empty() && !description.ends_with('.'),
+                "{feature:?}'s description is a noun phrase, not a sentence: {description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lambda_and_an_expression_bodied_member_share_a_token_and_not_a_version() {
+        assert_eq!(Feature::LambdaExpression.introduced_in(), LanguageVersion::CSharp3);
+        assert_eq!(
+            Feature::ExpressionBodiedMethod.introduced_in(),
+            LanguageVersion::CSharp6
+        );
+        assert_eq!(
+            Feature::ExpressionBodiedProperty.introduced_in(),
+            LanguageVersion::CSharp6
+        );
+        assert!(!LanguageVersion::CSharp5.supports(Feature::ExpressionBodiedMethod));
+        assert!(LanguageVersion::CSharp5.supports(Feature::LambdaExpression));
+
+        assert_eq!(
+            Feature::ObjectInitializer.introduced_in(),
+            Feature::CollectionInitializer.introduced_in()
+        );
+        assert_ne!(
+            Feature::ObjectInitializer.description(),
+            Feature::CollectionInitializer.description()
+        );
+    }
+
+    #[test]
+    fn parse_flag_accepts_csharp1_spellings() {
+        for value in ["ISO-1", "iso-1", "1", "1.0", " 1 ", "default"] {
             assert_eq!(
                 LanguageVersion::parse_flag(value),
                 Ok(LanguageVersion::CSharp1),
                 "value was {value:?}"
             );
         }
+        for value in ["latest", "LATESTMAJOR"] {
+            assert_eq!(
+                LanguageVersion::parse_flag(value),
+                Ok(LanguageVersion::SELECTABLE_MAX),
+                "value was {value:?}"
+            );
+        }
+        assert_ne!(
+            LanguageVersion::parse_flag("default"),
+            LanguageVersion::parse_flag("latest"),
+            "default and latest answer different questions"
+        );
     }
 
     #[test]
     fn parse_flag_reports_unimplemented_versions_distinctly() {
-        for value in ["ISO-2", "2", "2.0", "7.3", "14", "preview"] {
+        for (value, expected) in [
+            ("ISO-2", LanguageVersion::CSharp2),
+            ("2", LanguageVersion::CSharp2),
+            ("2.0", LanguageVersion::CSharp2),
+            ("6", LanguageVersion::CSharp6),
+            ("7", LanguageVersion::CSharp7),
+            ("7.0", LanguageVersion::CSharp7),
+            ("7.2", LanguageVersion::CSharp7_2),
+            ("7.3", LanguageVersion::CSharp7_3),
+            ("11", LanguageVersion::CSharp11),
+        ] {
+            assert_eq!(LanguageVersion::parse_flag(value), Ok(expected), "value was {value:?}");
+        }
+        for value in ["12", "14", "preview"] {
             assert_eq!(
                 LanguageVersion::parse_flag(value),
                 Err(LanguageVersionError::Unsupported),

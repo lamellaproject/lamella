@@ -1,0 +1,60 @@
+# BOARD binding: the Arduino GIGA R1 WiFi, an STM32H747XIH6 on Arduino's ABX00063 in the Mega form
+# factor.
+
+[table]
+kind = "board"
+board = "arduino-giga-r1-wifi"
+vendor = "arduino"
+family = "stm32h7"
+part = "stm32h747xi"
+board_model = 33            # lamella_wire::board_model::ARDUINO_GIGA_R1_WIFI
+sources = [
+    "Arduino GIGA R1 WiFi user manual (SKU ABX00063), features section: the microcontroller is an STM32H747XIH6 with a 32-bit Arm Cortex-M7 core with double-precision FPU up to 480 MHz and a 32-bit Arm Cortex-M4 core with FPU up to 240 MHz. The same section gives the memory as 2 MB flash and 1 MB RAM on the STM32H747XI, 16 MB of NOR flash on an AT25SF128A-MHB-T over a QSPI interface, and 8 MB of SDRAM on an AS4C4M16SA.",
+    "Arduino GIGA R1 WiFi user manual (SKU ABX00063) section 6.1, the front-view component table: DL2 is an RGB SMLP34RGB2W3 common anode LED, DL1 is the power LED, PB1 is the RESET button, PB2 is the BOOT0 button, and the populated integrated circuits are U1 the microcontroller, U3 the 8 MB SDRAM, U4 the secure element, U5 the wireless module, U6 and U7 the buck converters and U8 the 16 MB flash. Section 13.5 states that the board has a built-in bootloader which allows flashing over USB, entered by double-tapping the reset button right after power-up.",
+    "Arduino GIGA R1 WiFi full pinout (ABX00063, page 1 of 9, 12 Jul 2023): the microcontroller is drawn as an STM32H747XIH6; the RGB LED's three legs are PI12 as D86 RED, PJ13 as D87 GREEN and PE3 as D88 BLUE; PC13/BOOT0 is the BOOT0_BUTTON, annotated 'It can be used as USER button'; RESET_BUTTON goes to the reset pin. The same page carries a boxed warning that pins A8, A9, A10 and A11 are ONLY analog pins, no GPIO peripherals, and draws the four as PC2_C, PC3_C, PA1_C and PA0_C.",
+    "Arduino GIGA R1 WiFi schematics (ABX00063 V1.6, 19 Dec 2023), sheet TOP.SchDoc: DL2's pin 4 is tied to +3V3 and its three remaining legs run through R11, R12 and R13, each 330 ohm, to the nets PI12, PE3 and PJ13, which the sheet's own test points label RED, BLUE and GREEN. Push-button PB2 connects +3V3 to the net carrying BOOT0 and PC13; push-button PB1 connects the reset pin to ground.",
+    "Arduino GIGA R1 WiFi schematics (ABX00063 V1.6), sheet STM32H747.SchDoc: R4, 100 kohm, holds the BOOT0/PC13 net to ground, and that net reaches the microcontroller at ball E8 (BOOT0) and at ball E3 (PC13). The same sheet gives PA0_C ball T1, PA1_C ball T2, PC2_C ball R1 and PC3_C ball R2, beside PA0 at N5, PA1 at N4, PC2 at M3 and PC3 at M4.",
+]
+notes = [
+]
+
+# --- the carrier ------------------------------------------------------------------------------
+#
+# THE MICROCONTROLLER'S OWN USB DEVICE CONTROLLER, over the USB-C connector J12, which the manual
+# lists as the programming port. There is no bridge between it and the host, which is why the row
+# carries no vendor identity: a bridge has a USB identity of its own to state and this path has
+# only the device the target itself presents.
+
+[[carriers]]
+kind = "native-usb"
+default = true
+
+# --- control lines ----------------------------------------------------------------------------
+
+[[devices]]
+name = "led_red"
+kind = "gpio-out"
+pin = "PI12"
+active = "low"
+source = "Arduino GIGA R1 WiFi full pinout page 1 gives PI12 as the RED leg of the RGB LED, at digital pin D86. The schematics sheet TOP.SchDoc wires that net through R11, 330 ohm, to a cathode of DL2, whose pin 4 is the common anode at +3V3, and taps the same net at a test point labelled RED. The user manual's component table names DL2 an RGB SMLP34RGB2W3 common anode LED, so the pin sinks and the leg lights when it is driven low."
+
+[[devices]]
+name = "led_green"
+kind = "gpio-out"
+pin = "PJ13"
+active = "low"
+source = "Arduino GIGA R1 WiFi full pinout page 1 gives PJ13 as the GREEN leg of the RGB LED, at digital pin D87. The schematics sheet TOP.SchDoc wires that net through R13, 330 ohm, to a cathode of DL2 and taps it at a test point labelled GREEN, and the STM32H747.SchDoc sheet brings the same net to ball E10 of the package. DL2's pin 4 is the common anode at +3V3, so the pin sinks and the leg lights when it is driven low."
+
+[[devices]]
+name = "led_blue"
+kind = "gpio-out"
+pin = "PE3"
+active = "low"
+source = "Arduino GIGA R1 WiFi full pinout page 1 gives PE3 as the BLUE leg of the RGB LED, at digital pin D88. The schematics sheet TOP.SchDoc wires that net through R12, 330 ohm, to a cathode of DL2 and taps it at a test point labelled BLUE. DL2's pin 4 is the common anode at +3V3, so the pin sinks and the leg lights when it is driven low. This leg is stated on the same evidence as the other two rather than by analogy with them: the schematic draws all three cathodes."
+
+[[devices]]
+name = "button"
+kind = "gpio-in"
+pin = "PC13"
+active = "high"
+source = "Arduino GIGA R1 WiFi full pinout page 1 labels PC13/BOOT0 as BOOT0_BUTTON and states that it can be used as USER button. The schematics sheet TOP.SchDoc gives push-button PB2 one terminal on +3V3 and the other on the net carrying BOOT0 and PC13, and sheet STM32H747.SchDoc holds that net to ground through R4, 100 kohm. So the pin reads low while the button is open and high while it is pressed, and the idle level is defined by a fitted resistor rather than left floating."

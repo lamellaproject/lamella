@@ -3,6 +3,7 @@
 /// Every bundled module's name, sorted. The set a host can offer without a filesystem.
 pub const BUNDLED_MODULES: &[&str] = &[
     "array",
+    "asyncio",
     "bisect",
     "copy",
     "functools",
@@ -27,6 +28,7 @@ pub const BUNDLED_MODULES: &[&str] = &[
 pub fn bundled_module(name: &str) -> Option<&'static str> {
     Some(match name {
         "array" => include_str!("../pystdlib/array.py"),
+        "asyncio" => include_str!("../pystdlib/asyncio.py"),
         "bisect" => include_str!("../pystdlib/bisect.py"),
         "copy" => include_str!("../pystdlib/copy.py"),
         "functools" => include_str!("../pystdlib/functools.py"),
@@ -57,6 +59,7 @@ pub fn bundled_module(_name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "bundled-stdlib")]
     #[test]
     fn every_listed_module_resolves_and_parses() {
         for name in BUNDLED_MODULES {

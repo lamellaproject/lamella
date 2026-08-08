@@ -786,6 +786,19 @@ pub struct Module {
     /// `newobj` tokens that construct a multi-dimensional array (an array TypeSpec's
     /// `.ctor`), mapped to the array's rank -- newobj allocates from that many lengths.
     md_array_ctors: BTreeMap<u64, u16>,
+    /// Member tokens whose parent `TypeSpec` is a GENERIC INSTANTIATION rather than an array --
+    /// recorded at load, reported by [`Module::validate_profile`], and never serialized.
+    ///
+    /// It is BAKE-TIME ONLY and deliberately absent from the frozen image: a baked module has been
+    /// lowered by definition, so carrying this to the device would be carrying the question rather
+    /// than the answer, and it would cost a column in a format about to freeze.
+    ///
+    /// It exists because the two things a `TypeSpec` parent can now mean are indistinguishable to
+    /// everything downstream. The loader files a `.ctor` under such a parent as a multi-dimensional
+    /// array constructor -- correct when the only `TypeSpec` members were array members, and wrong
+    /// for `Box<int>::.ctor` -- and drops every other name silently. Recording it HERE, where the
+    /// parent kind is actually known, is the only place the distinction still exists.
+    unlowered_generics: BTreeSet<u64>,
     /// `newobj` tokens that construct a `System.Text.StringBuilder`, mapped to the
     /// constructor's parameter count -- newobj allocates a builder (seeded from a string arg).
     string_builder_ctors: BTreeMap<u64, u16>,
@@ -1577,6 +1590,32 @@ pub enum ProfileViolation {
         /// The unresolved token.
         token: u32,
     },
+    /// A body reaches a member through a GENERIC INSTANTIATION that bake-time lowering never
+    /// replaced, so the image would carry a call to a type that does not exist in it.
+    ///
+    /// # Why this is its own violation rather than an [`UnresolvedCall`](Self::UnresolvedCall)
+    ///
+    /// It is not detected by asking a resolver, and it cannot be: before generics, a `MemberRef`
+    /// whose parent is a `TypeSpec` could only be an ARRAY member, so the loader files a `.ctor`
+    /// there as a multi-dimensional array constructor and drops every other name. A generic
+    /// instantiation is now also a `TypeSpec` parent, so `Box<int>::.ctor` was recorded as a rank-1
+    /// md-array ctor and `Box<int>::Tag()` was dropped without a word. **Both silences have one
+    /// root**: a parent kind that used to mean one thing now means two.
+    ///
+    /// The consequence is the failure this whole check exists to prevent -- measured, not supposed:
+    /// a generic program baked clean, and on the device the `newobj` constructed something as an
+    /// array and the next call trapped with "resolved to no method". Asking `call_target` cannot
+    /// separate this from ordinary interface dispatch, because an interface method legitimately has
+    /// a recorded target and no resolvable body. **The metadata separates them and a resolver
+    /// cannot**, which is why this is recorded where the `TypeSpec` is classified.
+    UnloweredGeneric {
+        /// The method whose body names it.
+        method: MethodId,
+        /// Its recorded display name, when the build carries debug names.
+        name: Option<String>,
+        /// The `MemberRef` token reaching through the instantiation.
+        token: u32,
+    },
 }
 
 #[cfg(feature = "code-in-place")]
@@ -1608,6 +1647,19 @@ impl core::fmt::Display for ProfileViolation {
                     " calls token 0x{token:08X}, which resolves to nothing under this profile"
                 )
             }
+            ProfileViolation::UnloweredGeneric {
+                method,
+                name,
+                token,
+            } => {
+                describe(f, method, name)?;
+                write!(
+                    f,
+                    " reaches token 0x{token:08X} through a generic instantiation that bake-time \
+                     lowering did not replace, so the deployed image would call a type it does not \
+                     contain"
+                )
+            }
         }
     }
 }
@@ -1627,11 +1679,30 @@ pub enum BakeError {
     /// The image's recorded content checksum does not match its bytes (corruption / truncation /
     /// a partially-written flash image).
     ChecksumMismatch {
-        /// The checksum recorded in the image's header (word 18).
+        /// The checksum recorded in the image's header.
         stored: u64,
         /// The checksum recomputed from the image's directory + arena as read.
         computed: u64,
     },
+    /// The image REQUIRES a format feature this build does not implement.
+    ///
+    /// This is the difference between "a newer toolchain wrote this" and "this runtime cannot run
+    /// it", and it is why the version number alone is not the gate: an image that uses nothing new
+    /// stays runnable by an older device, and one that does is refused BY NAME rather than by a
+    /// number that says only "not mine".
+    UnsupportedFeatures {
+        /// Everything the image asked for.
+        required: u64,
+        /// The bits this build does not implement -- the reason for the refusal.
+        unsupported: u64,
+    },
+    /// The header is structurally wrong: it declares fewer words than this build must read, or a
+    /// reserved word is non-zero.
+    ///
+    /// A non-zero reserved word means a writer used a slot WITHOUT declaring the matching feature
+    /// bit, so the image would otherwise be misread as if the field were absent. Refusing is the
+    /// point: the zero-check is what catches a forgotten feature bit.
+    BadHeader,
 }
 
 impl core::fmt::Display for BakeError {
@@ -1650,6 +1721,15 @@ impl core::fmt::Display for BakeError {
             BakeError::ChecksumMismatch { stored, computed } => {
                 write!(f, "baked image checksum mismatch: header {stored:#018x}, computed {computed:#018x}")
             }
+            BakeError::UnsupportedFeatures { required, unsupported } => write!(
+                f,
+                "baked image requires format features {required:#018x}, of which \
+                 {unsupported:#018x} are not implemented by this build",
+            ),
+            BakeError::BadHeader => f.write_str(
+                "baked image header is malformed: too few declared words, or a reserved word is \
+                 not zero",
+            ),
         }
     }
 }
@@ -1698,14 +1778,14 @@ fn image_checksum(directory: &[u8], arena: &[u8]) -> u64 {
 /// device already hold this exact image?) without parsing or hashing the whole image. Not gated on
 /// `code-in-place`: a deploy HOST that never boots an image still needs it to content-address one.
 pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
-    if image.get(..4) != Some(&b"LMLI"[..]) {
+    if image.get(..4) != Some(&BAKED_IMAGE_MAGIC[..]) {
         return None;
     }
     let version = u32::from_le_bytes(image.get(4..8)?.try_into().ok()?);
     if version != BAKED_IMAGE_VERSION {
         return None;
     }
-    let at = 8 + 18 * 8;
+    let at = 8 + HEADER_CHECKSUM_INDEX * 8;
     Some(u64::from_le_bytes(image.get(at..at + 8)?.try_into().ok()?))
 }
 
@@ -1727,20 +1807,75 @@ pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
 pub fn verified_image_checksum(image: &[u8]) -> Option<u64> {
     let stored = baked_image_checksum(image)?;
     let words = image.get(8..)?;
-    let directory_len = image_word(words, 16)? as usize;
-    let arena_len = image_word(words, 17)? as usize;
-    let directory_start: usize = 8 + 19 * 8;
+    let directory_len = image_word(words, HEADER_DIRECTORY_LEN_INDEX)? as usize;
+    let arena_len = image_word(words, HEADER_ARENA_LEN_INDEX)? as usize;
+    let directory_start = baked_directory_start(image_word(words, HEADER_WORD_COUNT_INDEX)?)?;
     let arena_start = directory_start.checked_add(directory_len)?;
     let directory = image.get(directory_start..arena_start)?;
     let arena = image.get(arena_start..arena_start.checked_add(arena_len)?)?;
     (image_checksum(directory, arena) == stored).then_some(stored)
 }
 
-/// The baked-image format version. v3 repurposed the `newarr` element table's payload from a
-/// byte width to a [`PrimKind`] code (packed primitive arrays) -- a v2 image's widths would
-/// misdecode as kinds, so `from_baked` rejects it (rebake). v2 added the content checksum
-/// (header word 18); v1 had no checksum and a shorter header.
-const BAKED_IMAGE_VERSION: u32 = 3;
+/// The baked-image format version, and the magic that guards it.
+const BAKED_IMAGE_VERSION: u32 = 1;
+
+/// The image magic. See [`BAKED_IMAGE_VERSION`] for why it moved with the reset.
+const BAKED_IMAGE_MAGIC: &[u8; 4] = b"LML1";
+
+
+/// Header word 0: how many `u64` words the header holds, INCLUDING this one.
+const HEADER_WORD_COUNT_INDEX: usize = 0;
+
+/// Header word 1: the feature bits this image REQUIRES of the runtime. See [`SUPPORTED_FEATURES`].
+const HEADER_REQUIRED_FEATURES_INDEX: usize = 1;
+
+/// The format's payload words begin after the two structural words above.
+const HEADER_PAYLOAD_BASE: usize = 2;
+
+/// How many payload words the format defines today (entry .. checksum).
+const HEADER_PAYLOAD_WORDS: usize = 19;
+
+/// Payload word 16: the directory length in bytes.
+const HEADER_DIRECTORY_LEN_INDEX: usize = HEADER_PAYLOAD_BASE + 16;
+/// Payload word 17: the arena length in bytes.
+const HEADER_ARENA_LEN_INDEX: usize = HEADER_PAYLOAD_BASE + 17;
+/// Payload word 18: the CRC-64 over directory + arena.
+const HEADER_CHECKSUM_INDEX: usize = HEADER_PAYLOAD_BASE + 18;
+
+/// Reserved words, which a reader validates are ZERO.
+const HEADER_RESERVED_BASE: usize = HEADER_PAYLOAD_BASE + HEADER_PAYLOAD_WORDS;
+/// How many reserved words this build writes and validates.
+const HEADER_RESERVED_WORDS: usize = 3;
+
+/// How many header words this build WRITES. A reader must not assume this of an image.
+const HEADER_WORDS: usize = HEADER_RESERVED_BASE + HEADER_RESERVED_WORDS;
+
+/// Feature bits an image may require of the runtime. **None is defined yet, and that is correct:**
+/// v1 requires nothing beyond the base format, so every v1 image sets zero and any runtime that
+/// understands the base format can boot it. Generics and async are the first two expected to claim
+/// a bit; a compact bake layout is a candidate but is NOT reserved here, because which knobs exist
+/// is a question for measurement rather than for this constant.
+const SUPPORTED_FEATURES: u64 = 0;
+
+/// What an image THIS build bakes declares it requires. Zero: nothing beyond the base format.
+///
+/// Deliberately a separate constant from [`SUPPORTED_FEATURES`], which is what a runtime
+/// IMPLEMENTS. They are equal today and they are not the same question -- a toolchain that gains a
+/// feature raises what it may WRITE, a runtime that gains one raises what it may READ, and the
+/// whole point of the mask is that those two move independently.
+const IMAGE_REQUIRED_FEATURES: u64 = 0;
+
+/// The byte offset of the directory in an image whose header declares `header_words` words.
+///
+/// `None` when the image declares FEWER words than this build must read -- a truncated or foreign
+/// header, not something to be read optimistically.
+fn baked_directory_start(header_words: u64) -> Option<usize> {
+    let declared = usize::try_from(header_words).ok()?;
+    if declared < HEADER_WORDS {
+        return None;
+    }
+    declared.checked_mul(8)?.checked_add(8)
+}
 
 /// Packs a by-name index key: the member/type handle in the high 40 bits, the name id in the low
 /// 24. `None` if either exceeds its field (the entry then stays in the builder map).
@@ -3341,12 +3476,20 @@ impl Module {
         let method_count = self.methods.len();
         let mut method_records: Vec<(u32, u32, u32, u32, u32, u32)> =
             Vec::with_capacity(method_count);
+        let mut code_ranges: BTreeMap<&[u8], u32> = BTreeMap::new();
         for (id, method) in self.methods.iter().enumerate() {
             match method {
                 Method::Managed { body, arg_count } => {
                     let code = body.code();
-                    let code_offset = self.arena.bytes.len() as u32;
-                    self.arena.bytes.to_mut().extend_from_slice(code);
+                    let code_offset = match code_ranges.get(code) {
+                        Some(&shared) => shared,
+                        None => {
+                            let at = self.arena.bytes.len() as u32;
+                            self.arena.bytes.to_mut().extend_from_slice(code);
+                            code_ranges.insert(code, at);
+                            at
+                        }
+                    };
                     let eh = body.eh();
                     let eh_offset = self.arena.bytes.len() as u32;
                     for clause in eh {
@@ -3430,8 +3573,10 @@ impl Module {
         }
 
         let mut out = Vec::new();
-        out.extend_from_slice(b"LMLI");
+        out.extend_from_slice(&BAKED_IMAGE_MAGIC[..]);
         out.extend_from_slice(&BAKED_IMAGE_VERSION.to_le_bytes());
+        image_push(&mut out, HEADER_WORDS as u64);
+        image_push(&mut out, IMAGE_REQUIRED_FEATURES);
         image_push(&mut out, entry.map_or(0, |method| u64::from(method) + 1));
         image_push(&mut out, method_count as u64);
         image_push(&mut out, method_table as u64);
@@ -3456,6 +3601,14 @@ impl Module {
         image_push(&mut out, directory.len() as u64);
         image_push(&mut out, self.arena.bytes.len() as u64);
         image_push(&mut out, image_checksum(&directory, &self.arena.bytes));
+        for _ in 0..HEADER_RESERVED_WORDS {
+            image_push(&mut out, 0);
+        }
+        debug_assert_eq!(
+            out.len(),
+            8 + HEADER_WORDS * 8,
+            "the header written must be exactly the header declared in word 0"
+        );
         out.extend_from_slice(&directory);
         out.extend_from_slice(&self.arena.bytes);
         Ok(out)
@@ -3469,7 +3622,7 @@ impl Module {
     /// [`BakeError`] for a non-image, a version mismatch, or an intrinsic id this build lacks.
     #[cfg(feature = "code-in-place")]
     pub fn from_baked(image: &'static [u8]) -> Result<(Module, Option<MethodId>), BakeError> {
-        if image.get(..4) != Some(b"LMLI") {
+        if image.get(..4) != Some(BAKED_IMAGE_MAGIC) {
             return Err(BakeError::NotAnImage);
         }
         let version = image
@@ -3481,7 +3634,20 @@ impl Module {
             return Err(BakeError::WrongVersion(version));
         }
         let words = &image[8..];
-        let word = |index: usize| image_word(words, index).ok_or(BakeError::NotAnImage);
+        let raw = |index: usize| image_word(words, index).ok_or(BakeError::NotAnImage);
+        let required = raw(HEADER_REQUIRED_FEATURES_INDEX)?;
+        let unsupported = required & !SUPPORTED_FEATURES;
+        if unsupported != 0 {
+            return Err(BakeError::UnsupportedFeatures { required, unsupported });
+        }
+        let directory_start =
+            baked_directory_start(raw(HEADER_WORD_COUNT_INDEX)?).ok_or(BakeError::BadHeader)?;
+        for index in 0..HEADER_RESERVED_WORDS {
+            if raw(HEADER_RESERVED_BASE + index)? != 0 {
+                return Err(BakeError::BadHeader);
+            }
+        }
+        let word = |index: usize| raw(HEADER_PAYLOAD_BASE + index);
         let entry = word(0)?;
         let method_count = word(1)? as usize;
         let method_table = word(2)? as usize;
@@ -3501,7 +3667,6 @@ impl Module {
         let directory_len = word(16)? as usize;
         let arena_len = word(17)? as usize;
         let stored_checksum = word(18)?;
-        let directory_start = 8 + 19 * 8;
         let arena_start = directory_start + directory_len;
         let directory = image
             .get(directory_start..arena_start)
@@ -3833,6 +3998,14 @@ impl Module {
                 let lamella_cil::Operand::Token(token) = instruction.operand else {
                     continue;
                 };
+                if self.is_unlowered_generic(asm, token) {
+                    violations.push(ProfileViolation::UnloweredGeneric {
+                        method,
+                        name: name(),
+                        token: token.0,
+                    });
+                    continue;
+                }
                 let unresolved = match instruction.opcode {
                     Opcode::Call | Opcode::Jmp | Opcode::Ldftn => {
                         self.resolve(asm, token).is_none()
@@ -5343,6 +5516,25 @@ impl Module {
         self.md_array_ctors.insert(asm_key(asm, token.0), rank);
     }
 
+    /// Record that `token` reaches a member through a GENERIC INSTANTIATION that nothing has
+    /// lowered. Called from the loader, at the one place that still knows what kind of `TypeSpec`
+    /// the member's parent is.
+    pub fn mark_unlowered_generic(&mut self, asm: u8, token: Token) {
+        self.unlowered_generics.insert(asm_key(asm, token.0));
+    }
+
+    /// Withdraw the mark above, because `token` HAS now been lowered: a monomorphizer created the
+    /// instantiation's own type identity and bound this token to a member of it.
+    pub fn clear_unlowered_generic(&mut self, asm: u8, token: Token) {
+        self.unlowered_generics.remove(&asm_key(asm, token.0));
+    }
+
+    /// Whether `token` reaches through an unlowered generic instantiation.
+    #[must_use]
+    pub fn is_unlowered_generic(&self, asm: u8, token: Token) -> bool {
+        self.unlowered_generics.contains(&asm_key(asm, token.0))
+    }
+
     /// The rank of the multi-dimensional array `token` constructs in assembly `asm`, if it
     /// constructs one.
     #[must_use]
@@ -6234,5 +6426,61 @@ mod tests {
         assert!(module.implements_interface(derived, ilist));
         assert!(module.implements_interface(derived, ienumerable));
         assert!(!module.implements_interface(derived, icomparer));
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_later_format_may_append_directory_columns_and_this_build_skips_them() {
+        let word_at = |image: &[u8], index: usize| image_word(&image[8..], index).expect("header word");
+        let put_word = |image: &mut [u8], index: usize, value: u64| {
+            let at = 8 + index * 8;
+            image[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        };
+
+        let mut module = Module::new();
+        let image = module.write_baked(None).expect("bake an empty module");
+
+        let leaked: &'static [u8] = Box::leak(image.clone().into_boxed_slice());
+        assert!(Module::from_baked(leaked).is_ok(), "the unmodified image must load");
+
+        let header_words = word_at(&image, HEADER_WORD_COUNT_INDEX);
+        let directory_start = baked_directory_start(header_words).expect("directory offset");
+        let directory_len = word_at(&image, HEADER_DIRECTORY_LEN_INDEX) as usize;
+        let arena_len = word_at(&image, HEADER_ARENA_LEN_INDEX) as usize;
+        let directory = &image[directory_start..directory_start + directory_len];
+        let arena = &image[directory_start + directory_len..directory_start + directory_len + arena_len];
+
+        let mut extended = Vec::from(directory);
+        for word in [0xBDEu64, 2, 0xDEAD_BEEF, 7] {
+            image_push(&mut extended, word);
+        }
+        let mut grown = Vec::from(&image[..directory_start]);
+        grown.extend_from_slice(&extended);
+        grown.extend_from_slice(arena);
+        put_word(&mut grown, HEADER_DIRECTORY_LEN_INDEX, extended.len() as u64);
+        put_word(&mut grown, HEADER_CHECKSUM_INDEX, image_checksum(&extended, arena));
+
+        let leaked: &'static [u8] = Box::leak(grown.into_boxed_slice());
+        assert!(
+            Module::from_baked(leaked).is_ok(),
+            "appended directory columns must be SKIPPED, not fatal -- without this, B-device \
+             cannot be added after the v1 format freeze"
+        );
+
+        let mut gated = image.clone();
+        let claimed = 1u64 << 0;
+        assert_eq!(SUPPORTED_FEATURES & claimed, 0, "pick a bit this build does NOT implement");
+        put_word(&mut gated, HEADER_REQUIRED_FEATURES_INDEX, claimed);
+        let leaked: &'static [u8] = Box::leak(gated.into_boxed_slice());
+        match Module::from_baked(leaked) {
+            Err(BakeError::UnsupportedFeatures { required, unsupported }) => {
+                assert_eq!(required, claimed);
+                assert_eq!(unsupported, claimed, "the refusal must NAME the bit it cannot serve");
+            }
+            other => panic!(
+                "an image requiring an unimplemented feature must be refused BY NAME, got {:?}",
+                other.map(|_| "loaded")
+            ),
+        }
     }
 }

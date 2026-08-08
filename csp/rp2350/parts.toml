@@ -20,4 +20,10 @@ package = "QFN-60"
 flash = 0
 ram = 0x80000
 pins = ["GP0-GP1", "GP4-GP5", "GP16-GP19", "GP23-GP29"]
+# TWO PROCESSOR SOCKETS, AND EACH ONE RUNS EITHER ARCHITECTURE. This is why the field below lists
+# architectures per socket rather than naming one: the ARCHSEL register "has one bit for each
+# processor socket", so which core sits in a socket is SELECTED rather than fixed, and the part
+# offers four combinations. Both Arm and both RISC-V are the ones a single image can use.
+cores = { core0 = ["cortex-m33", "hazard3"], core1 = ["cortex-m33", "hazard3"] }
+cores_share_memory = true
 source = "RP2350 datasheet 4.2 (520 kB SRAM = 8 x 64 kB striped to 0x2007ffff + 2 x 4 kB; this row states the contiguous 512 KB window) + ch 1 (QFN-60/RP2350A, external QSPI flash) -- PARTIAL pin list: GP0/1 uart, GP4/5 i2c, GP16-19 spi, GP23-25 + GP29 the wireless-module control lines a board may wire, GP26-29 the ADC channel pads (adc block channel map). The pin list is PARTIAL rather than the package's full set"

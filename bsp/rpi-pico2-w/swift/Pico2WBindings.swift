@@ -10,6 +10,18 @@ public enum Pico2WBindings {
     public static let BOARD_MODEL: UInt16 = 10
     public static let BOARD_VENDOR: String = "RaspberryPi"
 
+    /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+    /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+    /// peripherals of the same kind can share no register at all, so a consumer that selects a
+    /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+    /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+    /// name a driver; and a uart is a different register map on every family, so the kind does
+    /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+    public static let UART0_DRIVER_FAMILY: String = "rp2350-uart"
+    public static let SPI0_DRIVER_FAMILY: String = "rp2350-spi"
+    public static let I2C0_DRIVER_FAMILY: String = "rp2350-i2c"
+    public static let ADC_DRIVER_FAMILY: String = "rp2350-adc"
+
     // -- UART0: a pl011 uart binding descriptor --
     public static let UART0_BASE: UInt32 = 0x40070000
     public static let UART0_RESET_MASK: UInt32 = 0x4000240

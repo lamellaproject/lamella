@@ -1,0 +1,29 @@
+# INSTANCE map for the SAM4E family -- identity-first: ONLY the placed block copies a current
+# binding or control line references. Block layouts arrive with the family's first generated
+# driver, and the rest of the instance map with its first binding.
+#
+# THE PORT ROWS SAY WHICH GROUP THEY ARE, RATHER THAN LEAVING IT TO THEIR NAMES. A pin named PD22
+# has to resolve to the base address of the port group that backs it, and this vendor calls that
+# group PIOD where others call theirs PORTD or GPIOD.
+
+[table]
+kind = "instances"
+family = "sam4e"
+record = ["base", "pid"]
+sources = [
+    "SAM4E Series datasheet (Atmel-11157): peripheral identifiers table (PIOA 9, PIOB 10, PIOC 11, PIOD 12, PIOE 13), and the PIO register addresses given per controller as 0x400E0E00 (PIOA), 0x400E1000 (PIOB), 0x400E1200 (PIOC), 0x400E1400 (PIOD), 0x400E1600 (PIOE)",
+]
+
+[[instances]]
+name = "pioa"
+block = "pio"
+port = "A"          # this instance IS the group pins named PA<n> resolve to
+base = 0x400E0E00
+pid = 9
+
+[[instances]]
+name = "piod"
+block = "pio"
+port = "D"          # this instance IS the group pins named PD<n> resolve to
+base = 0x400E1400
+pid = 12

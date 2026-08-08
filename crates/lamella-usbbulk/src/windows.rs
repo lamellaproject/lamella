@@ -184,33 +184,24 @@ fn guid_from_str(s: &str) -> Option<GUID> {
     Some(GUID { data1, data2, data3, data4 })
 }
 
+/// Lists the CMSIS-DAP v2 devices -- the same body [`enumerate_guid`] runs, and it must be.
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
-    let mut out = Vec::new();
-    unsafe {
-        for path in iface_paths(&DAP_V2_GUID) {
-            if let Some((vendor_id, product_id)) = vid_pid_from_path(&path) {
-                out.push(DeviceInfo {
-                    vendor_id,
-                    product_id,
-                    serial_number: instance_id_from_path(&path),
-                    product: None,
-                });
-            }
-        }
-    }
-    Ok(out)
+    unsafe { Ok(enumerate_iface(&DAP_V2_GUID)) }
 }
 
 /// List the devices registered under a caller-supplied interface GUID, with each device's
-/// product and serial strings where they can be read. The serial always falls back to the
-/// device path's instance id (= the serial for a serial-bearing device), so a device that is
-/// busy in another host still lists identifiably; the product string needs a brief read-only
-/// open of the interface.
+/// product and serial strings where they can be read.
 pub fn enumerate_guid(interface_guid: &str) -> Result<Vec<DeviceInfo>> {
     let guid = guid_from_str(interface_guid).ok_or_else(|| Error::Os("bad interface GUID".into()))?;
+    unsafe { Ok(enumerate_iface(&guid)) }
+}
+
+/// The shared body. The serial falls back to the device path's instance id when the descriptor
+/// cannot be read -- which keeps a device another host is driving listed rather than invisible.
+unsafe fn enumerate_iface(guid: &GUID) -> Vec<DeviceInfo> {
     let mut out = Vec::new();
     unsafe {
-        for path in iface_paths(&guid) {
+        for path in iface_paths(guid) {
             let Some((vendor_id, product_id)) = vid_pid_from_path(&path) else { continue };
             let mut info = DeviceInfo {
                 vendor_id,
@@ -242,7 +233,7 @@ pub fn enumerate_guid(interface_guid: &str) -> Result<Vec<DeviceInfo>> {
             out.push(info);
         }
     }
-    Ok(out)
+    out
 }
 
 /// See [`crate::diagnose`]. Checks the requested interface GUID first, then falls back to the

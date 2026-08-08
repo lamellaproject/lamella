@@ -18,9 +18,15 @@ CARRIER = {
 # Per-role descriptor dicts, grouped by the role each belongs to.
 # Emitted from this board's facts, like every other language's support for it:
 # an UPPER_SNAKE name in the shared facts is a lowercase key here.
+#
+# "kind" and "driver_family" are read TOGETHER and neither answers alone: kind is what the
+# application asked for -- a uart, an spi -- and driver_family is which REGISTER MAP is behind
+# it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
+# name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
     "vcp": {
         "kind": "uart",
+        "driver_family": "sam3x-uart",
         "instance": "uart",
         "base": 0x400E0800,
         "pid": 8,
@@ -33,6 +39,17 @@ FACTS = {
         "mck_hz": 84000000,
         "brgr_cd_115200_plla_84mhz": 46,
     },
+}
+
+# The chip's instance map: every block this family places, with its base address and
+# the block layout it follows. A role descriptor above states a PERIPHERAL; a bring-up also
+# touches blocks that belong to the chip rather than to any one role -- an oscillator, a clock
+# controller, a reset controller -- and those are one per chip, so they are stated once here.
+# Bases only: register offsets and bit encodings belong to the driver that knows the block.
+INSTANCES = {
+    "uart": {"block": "uart", "base": 0x400E0800, "pid": 0x8},
+    "pmc": {"block": "pmc", "base": 0x400E0600},
+    "pioa": {"block": "pio", "base": 0x400E0E00, "pid": 0xB},
 }
 
 PLANS = {

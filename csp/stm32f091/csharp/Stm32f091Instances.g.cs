@@ -14,5 +14,21 @@ namespace Lamella.Generated
         public const uint GPIOA_RCC_EN_BIT = 17;
         public const uint GPIOA_RCC_EN_MASK = 0x20000;
         public const uint RCC_BASE = 0x40021000;
+        public const uint GPIOC_BASE = 0x48000800;
+        public const uint GPIOC_RCC_EN_OFF = 20;
+        public const uint GPIOC_RCC_EN_BIT = 19;
+        public const uint GPIOC_RCC_EN_MASK = 0x80000;
+        public const uint GPIOD_BASE = 0x48000C00;
+        public const uint GPIOD_RCC_EN_OFF = 20;
+        public const uint GPIOD_RCC_EN_BIT = 20;
+        public const uint GPIOD_RCC_EN_MASK = 0x100000;
+        public const uint GPIOE_BASE = 0x48001000;
+        public const uint GPIOE_RCC_EN_OFF = 20;
+        public const uint GPIOE_RCC_EN_BIT = 21;
+        public const uint GPIOE_RCC_EN_MASK = 0x200000;
+        public const uint GPIOF_BASE = 0x48001400;
+        public const uint GPIOF_RCC_EN_OFF = 20;
+        public const uint GPIOF_RCC_EN_BIT = 22;
+        public const uint GPIOF_RCC_EN_MASK = 0x400000;
     }
 }

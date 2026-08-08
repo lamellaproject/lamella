@@ -56,7 +56,7 @@ impl fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 /// The host USB transport: a WCH-Link probe's bulk interface via the shared [`lamella_usbbulk`] backend.
-/// Open the device with `lamella_usbbulk::Device::open(WCH_VID, WCH_PID_RV, None)` (it selects the
+/// Open the device with `lamella_probe::open_bulk(WCH_VID, WCH_PID_RV, serial)` (it selects the
 /// class-0xFF interface's bulk OUT `0x01` / IN `0x81` pipes), then hand it to [`WchLink::new`]. Reads use
 /// a fixed one-second timeout, matching the probe's prompt command replies.
 #[cfg(feature = "usbbulk")]

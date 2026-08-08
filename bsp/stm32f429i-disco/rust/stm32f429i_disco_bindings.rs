@@ -4,6 +4,16 @@
 pub const BOARD_MODEL: u16 = 21;
 pub const BOARD_VENDOR: &str = "St";
 
+/// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+/// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+/// peripherals of the same kind can share no register at all, so a consumer that selects a
+/// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+/// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+/// name a driver; and a uart is a different register map on every family, so the kind does
+/// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+pub const VCP_DRIVER_FAMILY: &str = "stm32f42x-usart";
+pub const MEMS_SPI_DRIVER_FAMILY: &str = "stm32f42x-spi";
+
 pub const VCP_BASE: u32 = 0x40011000;
 pub const VCP_RCC_EN_REG: u32 = 0x40023844;
 pub const VCP_RCC_EN_MASK: u32 = 0x10;
@@ -25,6 +35,43 @@ pub const VCP_RX_AFR_MASK: u32 = 0xF00;
 pub const VCP_RX_AFR_VALUE: u32 = 0x700;
 pub const VCP_PCLK_HZ: u32 = 16000000;
 pub const VCP_BRR_115200_HSI_16MHZ: u32 = 0x8B;
+
+pub const MEMS_SPI_BASE: u32 = 0x40015000;
+pub const MEMS_SPI_RCC_EN_REG: u32 = 0x40023844;
+pub const MEMS_SPI_RCC_EN_MASK: u32 = 0x100000;
+pub const MEMS_SPI_SCK_PORT_RCC_EN_REG: u32 = 0x40023830;
+pub const MEMS_SPI_SCK_PORT_RCC_EN_MASK: u32 = 0x20;
+pub const MEMS_SPI_SCK_MODER_REG: u32 = 0x40021400;
+pub const MEMS_SPI_SCK_MODER_MASK: u32 = 0xC000;
+pub const MEMS_SPI_SCK_MODER_VALUE: u32 = 0x8000;
+pub const MEMS_SPI_SCK_AFR_REG: u32 = 0x40021420;
+pub const MEMS_SPI_SCK_AFR_MASK: u32 = 0xF0000000;
+pub const MEMS_SPI_SCK_AFR_VALUE: u32 = 0x50000000;
+pub const MEMS_SPI_MISO_PORT_RCC_EN_REG: u32 = 0x40023830;
+pub const MEMS_SPI_MISO_PORT_RCC_EN_MASK: u32 = 0x20;
+pub const MEMS_SPI_MISO_MODER_REG: u32 = 0x40021400;
+pub const MEMS_SPI_MISO_MODER_MASK: u32 = 0x30000;
+pub const MEMS_SPI_MISO_MODER_VALUE: u32 = 0x20000;
+pub const MEMS_SPI_MISO_AFR_REG: u32 = 0x40021424;
+pub const MEMS_SPI_MISO_AFR_MASK: u32 = 0xF;
+pub const MEMS_SPI_MISO_AFR_VALUE: u32 = 0x5;
+pub const MEMS_SPI_MOSI_PORT_RCC_EN_REG: u32 = 0x40023830;
+pub const MEMS_SPI_MOSI_PORT_RCC_EN_MASK: u32 = 0x20;
+pub const MEMS_SPI_MOSI_MODER_REG: u32 = 0x40021400;
+pub const MEMS_SPI_MOSI_MODER_MASK: u32 = 0xC0000;
+pub const MEMS_SPI_MOSI_MODER_VALUE: u32 = 0x80000;
+pub const MEMS_SPI_MOSI_AFR_REG: u32 = 0x40021424;
+pub const MEMS_SPI_MOSI_AFR_MASK: u32 = 0xF0;
+pub const MEMS_SPI_MOSI_AFR_VALUE: u32 = 0x50;
+pub const MEMS_SPI_CS_PORT_RCC_EN_REG: u32 = 0x40023830;
+pub const MEMS_SPI_CS_PORT_RCC_EN_MASK: u32 = 0x4;
+pub const MEMS_SPI_CS_MODER_REG: u32 = 0x40020800;
+pub const MEMS_SPI_CS_MODER_MASK: u32 = 0xC;
+pub const MEMS_SPI_CS_MODER_VALUE: u32 = 0x4;
+pub const MEMS_SPI_CS_BSRR_REG: u32 = 0x40020818;
+pub const MEMS_SPI_CS_BSRR_SET: u32 = 0x2;
+pub const MEMS_SPI_CS_BSRR_CLEAR: u32 = 0x20000;
+pub const MEMS_SPI_PCLK_HZ: u32 = 16000000;
 
 pub const LED_GREEN_PORT_BASE: u32 = 0x40021800;
 pub const LED_GREEN_PIN: u32 = 13;

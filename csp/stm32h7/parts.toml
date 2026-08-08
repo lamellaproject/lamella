@@ -1,0 +1,47 @@
+# PARTS table for the stm32h7 family. Pin lists are PARTIAL present-lists: they carry the pins the
+# boards reach, so a consumer must not read one as the package.
+
+[table]
+kind = "parts"
+family = "stm32h7"
+sources = [
+    "STM32H745/755 and STM32H747/757 reference manual RM0399 Rev 4: Table 6 memory map -- flash memory bank 1 at 0x08000000-0x080FFFFF and bank 2 at 0x08100000-0x081FFFFF, AXI SRAM at 0x24000000-0x2407FFFF, SRAM1/2/3 at 0x30000000/0x30020000/0x30040000, SRAM4 at 0x38000000, backup SRAM at 0x38800000; section 2.4 gives up to 864 Kbytes of system SRAM plus 128 Kbytes of data TCM, 64 Kbytes of instruction TCM and 4 Kbytes of backup SRAM",
+    "STM32H755xI datasheet DS12919 Rev 3: the ordering scheme in section 8 decodes STM32H755ZIT6 as Z = 144 pins, I = 2 Mbytes flash memory, T = LQFP, 6 = -40 to 85 C; the feature list gives a Cortex-M7 core with double-precision FPU up to 480 MHz beside a Cortex-M4 core with FPU up to 240 MHz, and Table 8 carries an LQFP144 pin number for every pin listed below",
+    "STM32H747xI/G datasheet DS12930 Rev 1: the ordering scheme in section 8 decodes STM32H747XIH6 as X = 240 balls, I = 2 Mbytes flash memory, H = TFBGA, 6 = -40 to 85 C, under a device subfamily line reading '747 = STM32H7x7 dual core MIPI-DSI line'; the feature list gives the same core pair and the same 2 Mbytes of flash; Table 7, the pin/ball definition, carries five package columns of which TFBGA240+25 is the fifth, and gives a ball designator in that column for every pin listed below",
+]
+notes = [
+    "flash is the part's 2 Mbytes and that figure is NOT an image's budget on this part -- see the row's own note, which is the one thing here a consumer can get wrong silently.",
+    "ram is the AXI SRAM alone and the rest of the SRAM is documented-excluded, for the same reason the stm32f769 row states SRAM1 alone: the schema has one figure and this part has five system SRAM blocks over three power domains, at three separate addresses, with 192 Kbytes of TCM that only one of the two cores can reach at all. A single number can only honestly be the largest contiguous span both cores address, which is the AXI SRAM.",
+    "Every address is from RM0399's own tables rather than from the vendor's other lines, and the bases do NOT agree with them: this part places its GPIO ports and its RCC at 0x58020000 and above, where the F4 and F7 lines place them at 0x40020000 and 0x40023800. A row copied across would be wrong on every peripheral in the D3 domain.",
+    "Two rows below carry the same silicon in two packages, and neither pin list is evidence for the other. DS12930 Table 7 prints five package columns side by side, and a signal present in one is routinely absent from the next: of the four pins the 240-ball row states, two appear in NO other column of that table -- PI12 and PJ13 exist on that package alone. So each row's list is read from the column naming its OWN package, and a reader must not resolve a pin against the wrong row.",
+]
+
+[[parts]]
+part = "stm32h755zi"
+package = "144-pin LQFP"
+flash = 0x200000
+ram = 0x80000
+pins = [
+    "PB0", "PB14",
+    "PD8-PD9",
+    "PE1",
+]
+cores = { cm7 = ["cortex-m7f"], cm4 = ["cortex-m4f"] }
+cores_share_memory = true
+source = "DS12919 Rev 3 section 8 ordering information (Z = 144 pins, I = 2 Mbytes flash, T = LQFP) decoding the STM32H755ZIT6 that UM2408 Rev 6 Table 1 names as this carrier's target. flash 0x200000 is that 2 Mbytes; RM0399 Rev 4 Table 6 splits it into bank 1 at 0x08000000-0x080FFFFF and bank 2 at 0x08100000-0x081FFFFF, one megabyte each. ram 0x80000 is the AXI SRAM at 0x24000000-0x2407FFFF, which DS12919's feature list counts inside 864 Kbytes of user SRAM and RM0399 section 2.4 places in the D1 domain as the block for application data not held in DTCM. The two core architectures are DS12919's own words -- a Cortex-M7 core with double-precision FPU and a Cortex-M4 core with FPU -- and their boot addresses are RM0399 Table 9's ST-programmed BCM7_ADD0 and BCM4_ADD0. The pin list is PARTIAL rather than the package's 144: PD8 and PD9 carry the virtual COM port and PB0, PE1 and PB14 the three user LEDs, and DS12919 Table 8 gives each of the five an LQFP144 pin number -- PB0 at 49, PB14 at 74, PD8 at 76, PD9 at 77 and PE1 at 139."
+
+[[parts]]
+part = "stm32h747xi"
+package = "240-ball TFBGA"
+flash = 0x200000
+ram = 0x80000
+pins = [
+    "PC13",
+    "PE3",
+    "PI12",
+    "PJ13",
+    "PK5", "PK6", "PK7",
+]
+cores = { cm7 = ["cortex-m7f"], cm4 = ["cortex-m4f"] }
+cores_share_memory = true
+source = "DS12930 Rev 1 section 8 ordering information decoding STM32H747XIH6: X = 240 balls, I = 2 Mbytes flash memory, H = TFBGA, 6 = -40 to 85 C, under the device subfamily entry '747 = STM32H7x7 dual core MIPI-DSI line'. flash 0x200000 is that 2 Mbytes, which RM0399 Rev 4 Table 6 splits into bank 1 at 0x08000000-0x080FFFFF and bank 2 at 0x08100000-0x081FFFFF. ram 0x80000 is the AXI SRAM at 0x24000000-0x2407FFFF: DS12930's feature list counts a megabyte of RAM, and that figure is a SUM over 192 Kbytes of TCM, 864 Kbytes of user SRAM and 4 Kbytes of backup SRAM lying at three separate addresses across three independently switchable power domains, so the largest contiguous span both processors address is the AXI SRAM and that is the figure a single field can honestly hold. The two core architectures are DS12930's own words. The pin list is PARTIAL rather than the package's 240, and every entry carries a TFBGA240+25 ball designator from DS12930 Table 7 read from the page as laid out: PC13 at E3, PE3 at D3, PI12 at H1, PJ13 at E10, PK5 at A8, PK6 at C7 and PK7 at D7. PI12 and PJ13 have no designator in any other package column of that table, so the list could not have been derived from the 144-pin row above."

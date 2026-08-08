@@ -283,9 +283,9 @@ fn layout_strings(program: &mut [Function]) -> Result<StringLayout, LowerError> 
 /// Builds a string blob in this build's storage encoding -- the unit count as a little-endian `u32`,
 /// then either the UTF-16LE units or a byte length and the UTF-8/WTF-8 bytes.
 ///
-/// Delegates to the ONE place that owns the layout rather than spelling it out again: this function
-/// used to hardcode UTF-16, so a `--features wasm,string-utf8` build was accepted and silently
-/// produced a UTF-16 image.
+/// Delegates to the ONE place that owns the layout rather than spelling it out again: hardcoding
+/// UTF-16 here would let a `--features wasm,string-utf8` build be accepted and silently produce a
+/// UTF-16 image.
 fn string_blob(utf16: &[u16]) -> Result<Vec<u8>, LowerError> {
     crate::stringgen::string_blob_bytes(utf16).map_err(|e| LowerError::UnencodableStringUnit {
         unit: e.unit,
@@ -2721,7 +2721,7 @@ mod tests {
 
     /// A `callvirt` lowers to a `call_indirect` through the funcref table: func0 allocates a type whose
     /// vtable slot 0 is func1, then dispatches -- so the module gains a table section, an element
-    /// segment, and the indirect-call opcode (previously `CallVirtual` was `Unsupported`).
+    /// segment, and the indirect-call opcode.
     #[test]
     fn lowers_a_callvirt_to_call_indirect() {
         let caller = Function {
@@ -2790,8 +2790,7 @@ mod tests {
     }
 
     /// An interface `callvirt` lowers to an itable search + `call_indirect`: the descriptor carries the
-    /// `(tag, funcref-index)` pair in a data segment, and the module gains the indirect-call opcode
-    /// (previously `CallInterface` was `Unsupported` on wasm).
+    /// `(tag, funcref-index)` pair in a data segment, and the module gains the indirect-call opcode.
     #[test]
     fn lowers_a_callinterface_to_itable_search() {
         const TAG: u32 = 0x8000_1234;
@@ -2932,7 +2931,7 @@ mod tests {
     }
 
     /// A VOID `callvirt` (`returns_value: false`) interns a no-result signature, so `call_indirect`
-    /// matches a `void` target -- previously the assumed i32 result trapped as a type mismatch.
+    /// matches a `void` target; assuming an i32 result would trap as a type mismatch.
     #[test]
     fn lowers_a_void_callvirt_to_a_void_signature() {
         let caller = Function {

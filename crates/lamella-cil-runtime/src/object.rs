@@ -135,26 +135,8 @@ pub(crate) fn decode_string(store: &StrStore) -> Cow<'_, [u16]> {
     Cow::Owned(units)
 }
 
-/// Appends `code` to `out` in UTF-8's byte form. Shared by the WTF-8 encoder; split out so
-/// the surrogate decision above it reads as the one thing that distinguishes the tier.
 #[cfg(feature = "string-utf8-wtf8")]
-fn push_code_point(code: u32, out: &mut Vec<u8>) {
-    if code < 0x80 {
-        out.push(code as u8);
-    } else if code < 0x800 {
-        out.push(0xC0 | (code >> 6) as u8);
-        out.push(0x80 | (code & 0x3F) as u8);
-    } else if code < 0x1_0000 {
-        out.push(0xE0 | (code >> 12) as u8);
-        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
-        out.push(0x80 | (code & 0x3F) as u8);
-    } else {
-        out.push(0xF0 | (code >> 18) as u8);
-        out.push(0x80 | ((code >> 12) & 0x3F) as u8);
-        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
-        out.push(0x80 | (code & 0x3F) as u8);
-    }
-}
+use lamella_wtf8::{next_code_point, push_code_point};
 
 /// Encodes UTF-16 code units into WTF-8 bytes.
 ///
@@ -202,28 +184,7 @@ fn encode_string(units: &[u16]) -> Result<StrStore, UnencodableChar> {
 pub(crate) fn decode_string(store: &StrStore) -> Cow<'_, [u16]> {
     let mut units = Vec::new();
     let mut i = 0;
-    while i < store.len() {
-        let lead = store[i];
-        let (mut code, width) = if lead < 0x80 {
-            (u32::from(lead), 1)
-        } else if lead & 0xE0 == 0xC0 {
-            (u32::from(lead & 0x1F), 2)
-        } else if lead & 0xF0 == 0xE0 {
-            (u32::from(lead & 0x0F), 3)
-        } else if lead & 0xF8 == 0xF0 {
-            (u32::from(lead & 0x07), 4)
-        } else {
-            units.push(0xFFFD);
-            i += 1;
-            continue;
-        };
-        if i + width > store.len() {
-            units.push(0xFFFD);
-            break;
-        }
-        for continuation in &store[i + 1..i + width] {
-            code = (code << 6) | u32::from(continuation & 0x3F);
-        }
+    while let Some((code, width)) = next_code_point(store, i) {
         i += width;
         if code < 0x1_0000 {
             units.push(code as u16);

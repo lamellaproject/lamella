@@ -5376,6 +5376,88 @@ pub fn monitor_wait(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
     Ok(None)
 }
 
+/// `System.Threading.Monitor.TryEnterLockTimeout(object, int)`: the BLOCKING half of
+/// `Monitor.TryEnter(object, int)` -- queue for the lock and park until it is handed over or the
+/// timeout passes.
+///
+/// The managed side has already tried and failed to take the lock, so this only queues. Like the
+/// timed wait it returns nothing and the verdict is read afterwards through
+/// [`monitor_wait_timed_out`], because the answer does not exist until the wake.
+///
+/// UNLIKE a timed wait, a timeout here LEAVES THE QUEUE: `TryEnter` returning false means the caller
+/// does not hold the lock and is not going to, so staying queued would hand it a lock nobody is
+/// waiting to receive.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the arguments are not `(object, int)`.
+pub fn monitor_try_enter_timeout(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(millis)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    if !vm.lock_queue_timed_acquire(obj.0, thread) {
+        return Ok(None);
+    }
+    let deadline = vm.now_millis().map_or(0, |now| now.saturating_add(millis.max(0) as u64));
+    vm.request_block_on_lock_until(None, deadline);
+    Ok(None)
+}
+
+/// `System.Threading.Monitor.WaitLockTimeout(object, int)`: [`monitor_wait`] with a DEADLINE. The
+/// thread parks in the wait-set exactly as an untimed wait does, and is additionally woken once
+/// `millisecondsTimeout` has passed -- reacquiring the lock either way, per .NET's contract that
+/// `Wait` returns holding the lock whichever way it ended.
+///
+/// It returns nothing, because the answer does not exist yet: this call returns BEFORE the thread
+/// parks, and whether the wait ends by pulse or by deadline is decided at WAKE time. The managed
+/// `Wait(object, int)` therefore reads [`monitor_wait_timed_out`] once it resumes -- the same
+/// two-step a socket op uses when it re-polls after its park.
+///
+/// A non-positive timeout still parks and is simply already due, so it behaves as the immediate
+/// poll .NET specifies for 0 rather than becoming an untimed wait -- which is the one degradation
+/// that would silently reintroduce the defect this exists to fix.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the arguments are not `(object, int)`; [`Trap::SynchronizationLock`]
+/// if the running thread does not own the lock.
+pub fn monitor_wait_timeout(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(millis)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    if !vm.lock_is_owner(obj.0, thread) {
+        return Err(Trap::SynchronizationLock);
+    }
+    let deadline = vm.now_millis().map_or(0, |now| now.saturating_add(millis.max(0) as u64));
+    let woken = vm.lock_wait(obj.0, thread);
+    vm.request_block_on_lock_until(woken, deadline);
+    Ok(None)
+}
+
+/// `System.Threading.Monitor.WaitTimedOut()`: whether THIS thread's most recent timed
+/// `Monitor.Wait` ended by its deadline rather than by a pulse -- the bool that
+/// `Wait(object, int)` returns, inverted (`true` here means `Wait` returns `false`).
+///
+/// Reading it CONSUMES it, so a later wait cannot inherit an earlier verdict.
+///
+/// # Errors
+/// None; a thread with no recorded timeout reports `false`.
+pub fn monitor_wait_timed_out(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    let thread = vm.current_thread_id();
+    let timed_out = vm.take_wait_timed_out(thread);
+    Ok(Some(Value::Int32(i32::from(timed_out))))
+}
+
 /// `System.Threading.Monitor.PulseLock(object)`: moves ONE thread blocked in `Monitor.Wait` on the
 /// object into the lock's acquire-queue (it is handed the lock when the running thread later
 /// releases it). The running thread must own the lock; a no-op if none are waiting. Backs

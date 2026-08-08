@@ -1,0 +1,39 @@
+# PIN map for the CH32V003 family: pin x function -> (instance, signal), or -> nothing. PARTIAL
+# and evidence-only -- a row joins when a binding needs it, and a row naming a pin outside every
+# part's present-list is refused.
+#
+# THE ROW BELOW IS THE UNROUTED SHAPE, AND THIS PART IS THE PLAIN CASE FOR IT. The only pin a
+# carrier of this family places is PD6, and what it places there is a plain output -- because PD6's
+# main function after reset is already PD6. That is something Table 2-1 states, not something the
+# table is missing: the row names the cell that was read, states that no controller is behind it,
+# and cites the page. As prose the same sentence is checked against nothing, cannot be quoted by a
+# refusal, and is indistinguishable from a table nobody has filled in yet.
+#
+# WHAT THE ROW DOES NOT SAY IS THE HALF THAT MATTERS. PD6 is not an unused pin: Table 2-1 gives it
+# a default alternate function (URX/A6 -- USART_RX and ADC channel 6) and remapping functions
+# (T2CH3_3/UTX_2). Those are OTHER cells of the same pin, and a row states one cell. A reader who
+# took "no controller reaches PD6" from the row below would have the pin wrong; what it states is
+# that no controller is reached THROUGH THE RESET FUNCTION, which is exactly the fact a control
+# pin rides on.
+#
+# FUNCTION IDS HERE ARE TABLE 2-1's OWN COLUMN NAMES, because this part carries no per-pin function
+# NUMBER for a row to name. The table's three function columns are the main function after reset,
+# the default alternate function, and the remapping function; a pin reaches the second through
+# CFGLR's CNF field selecting an alternate push-pull or open-drain output, and the third through an
+# AFIO_PCFR1 remap as well. So `main` is the reset column and `default-alt` is the second. The
+# remapping column needs a spelling that carries WHICH remap -- its cells name variants, as in
+# T2CH3_3 for TIM2 channel 3's third remap -- and that arrives with the first row that needs one.
+
+[table]
+kind = "pins"
+family = "ch32v003"
+sources = [
+    "CH32V003 Datasheet V1.8 (WCH) Table 2-1 Pin definitions, page 11: per pin, the main function after reset, the default alternate function, and the remapping function, each in its own column",
+    "CH32V003 Reference Manual V1.9 (WCH) section 7.3.1.1 (CFGLR CNF selects the alternate-function output modes) and section 7.3.2.1 (AFIO_PCFR1 remap)",
+]
+
+[[pins]]
+pin = "PD6"
+function = "main"
+instance = "none"
+source = "CH32V003 Datasheet V1.8 Table 2-1 (page 11), the PD6 row: pin type I/O/A, and the 'Main function (after reset)' column reads PD6 -- the port pin itself. No peripheral is reached through this cell, so a carrier driving PD6 as a plain output configures no alternate function and needs no mux. The same row's other two columns are separate cells and are not stated here: 'Default alternate function' reads URX/A6 and 'Remapping function' reads T2CH3_3/UTX_2."

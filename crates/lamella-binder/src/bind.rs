@@ -14,6 +14,10 @@ pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
         TypeRefKind::Name(parts) => {
             TypeSymbol::Named(parts.iter().cloned().collect()).fold_builtin()
         }
+        TypeRefKind::Generic { parts, arguments } => TypeSymbol::Instantiation {
+            definition: parts.iter().cloned().collect(),
+            arguments: arguments.iter().map(bind_type).collect(),
+        },
         TypeRefKind::Array { element, rank } => bind_type(element).into_array(*rank),
         TypeRefKind::Pointer(element) => {
             TypeSymbol::Pointer(alloc::boxed::Box::new(bind_type(element)))

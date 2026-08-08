@@ -6,7 +6,8 @@ use crate::declaration::{
     accessibility_of, collect_into, is_constant_form, model_const_values, qualified_type_name,
     resolve_const_expr, resolve_constants,
 };
-use crate::diagnostic::{Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition};
+use crate::diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition, compiling_version};
+use lamella_syntax::version::{Feature, LanguageVersion};
 use crate::reference::load_assembly;
 use crate::special::SpecialType;
 use crate::symbols::{Accessibility, Model, TypeInfo};
@@ -49,6 +50,28 @@ pub fn bind_compilation_unit_with_references_and_options(
     references: &[Assembly],
     unsafe_option_missing: bool,
 ) -> Vec<Diagnostic> {
+    bind_compilation_unit_with_dialect(
+        unit,
+        references,
+        unsafe_option_missing,
+        LanguageVersion::DEFAULT,
+    )
+}
+
+/// Like [`bind_compilation_unit_with_references_and_options`], but compiling `language_version`
+/// rather than the default dialect.
+///
+/// A separate entry point rather than a fourth parameter on the old one, so that every existing
+/// caller keeps compiling ECMA-334 1st edition without being edited -- the default is a conformance
+/// decision and it should take a deliberate act to move off it, not a parameter someone can pass by
+/// position. **Only a driver that parsed `/langversion` calls this.**
+#[must_use]
+pub fn bind_compilation_unit_with_dialect(
+    unit: &CompilationUnit,
+    references: &[Assembly],
+    unsafe_option_missing: bool,
+    language_version: LanguageVersion,
+) -> Vec<Diagnostic> {
     let mut model = Model::new();
     for reference in references {
         load_assembly(&mut model, reference);
@@ -59,6 +82,7 @@ pub fn bind_compilation_unit_with_references_and_options(
     resolve_constants(&mut model, core::slice::from_ref(unit));
     let mut binder = Binder::with_model(model);
     binder.set_unsafe_option_missing(unsafe_option_missing);
+    binder.set_language_version(language_version);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
@@ -373,6 +397,7 @@ fn validate_enum_members(binder: &mut Binder, namespace: &str, declaration: &Enu
             Modifier::Override => "override",
             Modifier::Extern => "extern",
             Modifier::Const => "const",
+            Modifier::Required => "required",
         };
         binder.report(Diagnostic::new(
             DiagnosticKind::ModifierNotValidForItem {
@@ -485,6 +510,16 @@ fn invalid_delegate_modifier(modifier: &Modifier) -> Option<&'static str> {
 
 fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaration: &DelegateDecl) {
     validate_parameter_names(binder, &declaration.parameters);
+    binder.gate_generic_use_including_elements(
+        &bind_type(&declaration.return_type),
+        declaration.return_type.span,
+    );
+    for parameter in &declaration.parameters {
+        binder.gate_generic_use_including_elements(
+            &bind_type(&parameter.ty),
+            parameter.ty.span,
+        );
+    }
     if let Some(name) = restricted_array_element(&declaration.return_type) {
         binder.report(Diagnostic::new(
             DiagnosticKind::RestrictedTypeArrayElement { ty: name.into() },
@@ -514,7 +549,7 @@ fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaratio
         let model = binder.model();
         model
             .get_by_symbol(&delegate)
-            .map_or(ACCESS_FULL, |info| effective_info_mask(model, info))
+            .map_or(ACCESS_FULL, |info| effective_info_mask(model, &info))
     };
     let return_ty = binder.canonicalize(&bind_type(&declaration.return_type));
     if exposes_less_accessible(effective_type_mask(binder.model(), &return_ty), delegate_mask) {
@@ -579,6 +614,147 @@ fn validate_volatile_fields(binder: &mut Binder, namespace: &str, declaration: &
     }
 }
 
+/// The declaration rules for a `required` member (C# 11), measured against csc one compilation per
+/// row. Three diagnostics, and which one a member draws depends on WHY it cannot be required:
+///
+/// | declaration | csc |
+/// |---|---|
+/// | a settable instance field or property, visible enough | clean |
+/// | a method, constructor, indexer, event, static or `const` member, or the TYPE itself | `CS0106` |
+/// | a `readonly` field, or a property with no `set` | `CS9034` |
+/// | less visible than the type that declares it | `CS9032` |
+fn validate_required_members(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    if declaration.modifiers.iter().any(|m| matches!(m, Modifier::Required)) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::ModifierNotValidForItem {
+                modifier: "required".into(),
+            },
+            declaration.span,
+        ));
+    }
+    let type_full = qualified_type_name(namespace, &declaration.name);
+    let type_mask = effective_type_mask(binder.model(), &named_symbol(namespace, &declaration.name));
+    for member in &declaration.members {
+        if matches!(member, Member::Destructor { .. }) {
+            continue;
+        }
+        let Some(modifiers) = member_modifiers(member) else {
+            continue;
+        };
+        if !modifiers.iter().any(|m| matches!(m, Modifier::Required)) {
+            continue;
+        }
+        let settable = match member {
+            Member::Field {
+                modifiers,
+                declarators,
+                ..
+            } => {
+                let is_static = modifiers.iter().any(|m| matches!(m, Modifier::Static))
+                    || modifiers.iter().any(|m| matches!(m, Modifier::Const));
+                let is_readonly = modifiers.iter().any(|m| matches!(m, Modifier::Readonly));
+                if is_static {
+                    None
+                } else {
+                    Some(
+                        declarators
+                            .iter()
+                            .map(|declarator| (declarator.name.clone(), !is_readonly))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }
+            Member::Property {
+                modifiers,
+                name,
+                setter,
+                ..
+            } => {
+                if modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
+                    None
+                } else {
+                    Some(alloc::vec![(name.clone(), setter.is_some())])
+                }
+            }
+            _ => None,
+        };
+        let Some(members) = settable else {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ModifierNotValidForItem {
+                    modifier: "required".into(),
+                },
+                member_span(member),
+            ));
+            continue;
+        };
+        let accessibility = crate::declaration::accessibility_of(modifiers);
+        for (name, is_settable) in members {
+            let qualified = alloc::format!("{type_full}.{name}");
+            if !is_settable {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::RequiredMemberMustBeSettable {
+                        member: qualified.clone().into(),
+                    },
+                    member_span(member),
+                ));
+            }
+            if !required_member_is_visible_enough(accessibility, type_mask) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::RequiredMemberLessVisible {
+                        member: qualified.into(),
+                        containing_type: type_full.clone().into(),
+                    },
+                    member_span(member),
+                ));
+            }
+        }
+    }
+}
+
+/// Whether a `required` member declared with `accessibility` is reachable from everywhere its
+/// containing type is (whose effective domain is `type_mask`). See
+/// [`validate_required_members`] for why `protected` cannot be answered by the mask alone.
+fn required_member_is_visible_enough(accessibility: Accessibility, type_mask: u8) -> bool {
+    match accessibility {
+        Accessibility::Public => true,
+        Accessibility::Internal => type_mask & access_mask(Accessibility::Internal) == type_mask,
+        Accessibility::Protected | Accessibility::ProtectedInternal | Accessibility::Private => {
+            false
+        }
+    }
+}
+
+/// A member's modifier list, for the checks that care about one regardless of member kind.
+/// `None` for a member kind that has none of its own.
+fn member_modifiers(member: &Member) -> Option<&[Modifier]> {
+    match member {
+        Member::Field { modifiers, .. }
+        | Member::Method { modifiers, .. }
+        | Member::Constructor { modifiers, .. }
+        | Member::Property { modifiers, .. }
+        | Member::EventField { modifiers, .. }
+        | Member::Indexer { modifiers, .. }
+        | Member::Operator { modifiers, .. }
+        | Member::Destructor { modifiers, .. } => Some(modifiers),
+        _ => None,
+    }
+}
+
+/// The span a member-level diagnostic lands on.
+fn member_span(member: &Member) -> Span {
+    match member {
+        Member::Field { span, .. }
+        | Member::Method { span, .. }
+        | Member::Constructor { span, .. }
+        | Member::Property { span, .. }
+        | Member::EventField { span, .. }
+        | Member::Indexer { span, .. }
+        | Member::Operator { span, .. }
+        | Member::Destructor { span, .. } => *span,
+        _ => Span::empty_at(0),
+    }
+}
+
 /// Whether `ty` is a type a `volatile` field may have (17.4.3). Reference types and the permitted
 /// integer/char/float/bool value types are allowed; a struct or a wider numeric (long, ulong,
 /// double, decimal) is not. Conservative for what the model cannot classify (a pointer, byref,
@@ -605,12 +781,15 @@ fn is_permitted_volatile_type(model: &Model, ty: &TypeSymbol) -> bool {
                 crate::symbols::TypeKind::Class
                 | crate::symbols::TypeKind::Interface
                 | crate::symbols::TypeKind::Delegate => true,
-                crate::symbols::TypeKind::Enum => enum_underlying_permitted(info).unwrap_or(true),
+                crate::symbols::TypeKind::Enum => enum_underlying_permitted(&info).unwrap_or(true),
                 crate::symbols::TypeKind::Struct => false,
             },
             None => true,
         },
-        TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => true,
+        TypeSymbol::Instantiation { .. }
+        | TypeSymbol::Pointer(_)
+        | TypeSymbol::ByRef(_)
+        | TypeSymbol::Error => true,
     }
 }
 
@@ -1012,7 +1191,10 @@ fn is_valid_attribute_parameter_type(model: &Model, ty: &TypeSymbol) -> bool {
                 && !matches!(**element, TypeSymbol::Array { .. })
                 && is_valid_attribute_parameter_type(model, element)
         }
-        TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => false,
+        TypeSymbol::Instantiation { .. }
+        | TypeSymbol::Pointer(_)
+        | TypeSymbol::ByRef(_)
+        | TypeSymbol::Error => false,
     }
 }
 
@@ -1483,7 +1665,8 @@ fn validate_interface_members(binder: &mut Binder, declaration: &TypeDecl) {
         binder.report(Diagnostic::new(
             DiagnosticKind::FeatureRequiresLaterVersion {
                 feature: "default interface implementation".into(),
-                required: "C# 8.0".into(),
+                required: "8.0".into(),
+                    current: compiling_version(),
             },
             span,
         ));
@@ -1569,7 +1752,8 @@ fn validate_constructors(binder: &mut Binder, declaration: &TypeDecl) {
             binder.report(Diagnostic::new(
                 DiagnosticKind::FeatureRequiresLaterVersion {
                     feature: "parameterless struct constructors".into(),
-                    required: "C# 10.0".into(),
+                    required: "10.0".into(),
+                        current: compiling_version(),
                 },
                 *span,
             ));
@@ -1629,6 +1813,7 @@ fn validate_destructors(binder: &mut Binder, declaration: &TypeDecl) {
                 Modifier::Readonly => "readonly",
                 Modifier::Volatile => "volatile",
                 Modifier::Const => "const",
+                Modifier::Required => "required",
             };
             binder.report(Diagnostic::new(
                 DiagnosticKind::ModifierNotValidForItem {
@@ -1665,6 +1850,12 @@ fn validate_parameter_names(binder: &mut Binder, parameters: &[Parameter]) {
 }
 
 fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    let type_parameters = binder.enter_type_parameters(&declaration.type_parameters);
+    bind_type_bodies_inner(binder, namespace, declaration);
+    binder.exit_type_parameters(&type_parameters);
+}
+
+fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     let enclosing = named_symbol(namespace, &declaration.name);
     for member in &declaration.members {
         let parameters = match member {
@@ -1677,6 +1868,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         validate_parameter_names(binder, parameters);
     }
     validate_volatile_fields(binder, namespace, declaration);
+    validate_required_members(binder, namespace, declaration);
     validate_operator_modifiers(binder, declaration);
     validate_operator_arity(binder, declaration);
     validate_conversion_operators(binder, declaration);
@@ -1916,14 +2108,22 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 .flatten()
                 .any(|accessor| accessor.body.is_none());
             if !bodyless_allowed && has_bodyless_accessor {
-                binder.report(Diagnostic::new(
-                    DiagnosticKind::FeatureRequiresLaterVersion {
-                        feature: "automatically implemented properties".into(),
-                        required: "C# 3.0".into(),
-                    },
-                    *span,
-                ));
+                binder.gate_feature(Feature::AutoProperties, *span);
             }
+        }
+    }
+    if !declaration.type_parameters.is_empty() {
+        binder.gate_feature(Feature::Generics, declaration.span);
+    }
+    for member in &declaration.members {
+        if let Member::Method {
+            type_parameters,
+            span,
+            ..
+        } = member
+            && !type_parameters.is_empty()
+        {
+            binder.gate_feature(Feature::Generics, *span);
         }
     }
     if declaration.kind == TypeKind::Class
@@ -1932,13 +2132,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             .iter()
             .any(|modifier| matches!(modifier, Modifier::Static))
     {
-        binder.report(Diagnostic::new(
-            DiagnosticKind::FeatureRequiresLaterVersion {
-                feature: "static classes".into(),
-                required: "C# 2.0".into(),
-            },
-            declaration.span,
-        ));
+        binder.gate_feature(Feature::StaticClasses, declaration.span);
     }
     if declaration.kind == TypeKind::Class
         && declaration.modifiers.iter().any(|m| matches!(m, Modifier::Abstract))
@@ -2193,7 +2387,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         let model = binder.model();
         model
             .get_by_symbol(&enclosing)
-            .map_or(ACCESS_FULL, |info| effective_info_mask(model, info))
+            .map_or(ACCESS_FULL, |info| effective_info_mask(model, &info))
     };
     if declaration.kind == TypeKind::Class {
         if let Some(base) = binder
@@ -2551,6 +2745,12 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         binder.resolve_named_type(&bind_type(base), base.span);
     }
     for member in &declaration.members {
+        let signature_parameters = match member {
+            Member::Method {
+                type_parameters, ..
+            } => binder.enter_type_parameters(type_parameters),
+            _ => alloc::vec::Vec::new(),
+        };
         match member {
             Member::Field { ty, .. }
             | Member::Indexer { ty, .. }
@@ -2596,6 +2796,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             }
             _ => {}
         }
+        binder.exit_type_parameters(&signature_parameters);
     }
     binder.exit_type();
     for member in &declaration.members {
@@ -2604,11 +2805,13 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 modifiers,
                 return_type,
                 name,
+                type_parameters,
                 parameters,
                 is_vararg,
                 body: Some(body),
                 ..
             } => {
+                let method_parameters = binder.enter_type_parameters(type_parameters);
                 let params = bound_parameters(parameters);
                 if *is_vararg {
                     binder.set_next_method_vararg();
@@ -2622,6 +2825,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                     is_static_member(modifiers),
                     body,
                 );
+                binder.exit_type_parameters(&method_parameters);
             }
             Member::Operator {
                 return_type,
@@ -2784,11 +2988,14 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 let field_ty = binder.canonicalize(&bind_type(ty));
                 let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
                 for declarator in declarators {
-                    let is_private = binder
+                    let access = binder
                         .model()
                         .get_by_symbol(&enclosing)
-                        .and_then(|info| info.find_field(&declarator.name))
-                        .is_some_and(|field| field.accessibility == Accessibility::Private);
+                        .and_then(|info| {
+                            info.find_field(&declarator.name)
+                                .map(|field| field.accessibility)
+                        })
+                        .unwrap_or(Accessibility::Private);
                     let is_candidate =
                         !is_const && !field_ty.is_void() && declarator.name != declaration.name;
                     if is_candidate {
@@ -2809,7 +3016,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                             declarator.span,
                             shared_prefix,
                             eligible_never_used,
-                            is_private,
+                            access,
                             default_value,
                         );
                     }
@@ -3231,7 +3438,12 @@ fn effective_type_mask(model: &Model, ty: &TypeSymbol) -> u8 {
         | TypeSymbol::ByRef(element) => effective_type_mask(model, element),
         TypeSymbol::Named(_) => model
             .get_by_symbol(ty)
-            .map_or(ACCESS_FULL, |info| effective_info_mask(model, info)),
+            .map_or(ACCESS_FULL, |info| effective_info_mask(model, &info)),
+        TypeSymbol::Instantiation { arguments, .. } => arguments
+            .iter()
+            .fold(ACCESS_FULL, |mask, argument| {
+                mask & effective_type_mask(model, argument)
+            }),
     }
 }
 
@@ -3263,7 +3475,7 @@ fn type_is_resolvable(model: &Model, ty: &TypeSymbol) -> bool {
         TypeSymbol::Array { element, .. }
         | TypeSymbol::Pointer(element)
         | TypeSymbol::ByRef(element) => type_is_resolvable(model, element),
-        TypeSymbol::Error => false,
+        TypeSymbol::Instantiation { .. } | TypeSymbol::Error => false,
     }
 }
 
@@ -3304,6 +3516,617 @@ mod tests {
             .collect();
         codes.sort_unstable();
         codes
+    }
+
+    /// Like [`sorted_codes`], but compiling `version` rather than the default dialect. Returns each
+    /// diagnostic's namespace with its number, because under a selected dialect the two gate
+    /// failures are told apart by the PREFIX and a bare `u16` would not distinguish `CS0001` from
+    /// `LAM0001`.
+    fn sorted_codes_at(unit: &str, version: LanguageVersion) -> Vec<(CodeNamespace, u16)> {
+        let unit = parse_compilation_unit(unit).unit;
+        let mut codes: Vec<(CodeNamespace, u16)> =
+            bind_compilation_unit_with_dialect(&unit, &[], false, version)
+                .iter()
+                .map(|d| (d.namespace(), d.code()))
+                .collect();
+        codes.sort_unstable_by_key(|&(_, code)| code);
+        codes
+    }
+
+    /// Like [`sorted_codes_at`], but PARSING under `version` as well as binding under it.
+    fn sorted_codes_parsed_at(unit: &str, version: LanguageVersion) -> Vec<(CodeNamespace, u16)> {
+        let options = lamella_syntax::lexer::LexOptions {
+            version,
+            ..lamella_syntax::lexer::LexOptions::default()
+        };
+        let unit = lamella_syntax::parser::parse_compilation_unit_with(unit, options).unit;
+        let mut codes: Vec<(CodeNamespace, u16)> =
+            bind_compilation_unit_with_dialect(&unit, &[], false, version)
+                .iter()
+                .map(|d| (d.namespace(), d.code()))
+                .collect();
+        codes.sort_unstable_by_key(|&(_, code)| code);
+        codes
+    }
+
+    #[test]
+    fn a_type_parameter_is_a_type_inside_its_declaration_and_nowhere_else() {
+        use crate::diagnostic::CodeNamespace;
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(
+            sorted_codes_parsed_at("public class Box<T> { public T Value; }", v2),
+            [(CodeNamespace::Lam, 1)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class Box<T> { public T Value; } public class Other { public T Leaked; }",
+                v2
+            ),
+            [(CodeNamespace::Lam, 1), (CodeNamespace::Cs, 246)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class T { } public class Box<T> { public T Value; } public class After { public T Kept; }",
+                v2
+            ),
+            [(CodeNamespace::Lam, 1)]
+        );
+    }
+
+    /// Every syntactic position a type reference can occupy, as a `{}`-substituted program
+    /// fragment. Used by the use-site gate table below and by its control, which puts a
+    /// NON-generic type through the identical list -- so a row that passes for the wrong reason
+    /// (a binder that refuses every type, or one that never binds that position at all) fails the
+    /// control instead of passing quietly.
+    const TYPE_POSITIONS: &[(&str, &str)] = &[
+        ("field", "class U {{ {0} f; }}"),
+        ("static field", "class U {{ static {0} f; }}"),
+        ("array field", "class U {{ {0}[] f; }}"),
+        ("return type", "class U {{ {0} M() {{ return null; }} }}"),
+        ("parameter", "class U {{ void M({0} p) {{ }} }}"),
+        ("ref parameter", "class U {{ void M(ref {0} p) {{ }} }}"),
+        ("local", "class U {{ void M() {{ {0} x; }} }}"),
+        ("local with initializer", "class U {{ void M() {{ {0} x = null; }} }}"),
+        ("property", "class U {{ {0} P {{ get {{ return null; }} }} }}"),
+        ("indexer", "class U {{ {0} this[int i] {{ get {{ return null; }} }} }}"),
+        ("indexer parameter", "class U {{ int this[{0} i] {{ get {{ return 0; }} }} }}"),
+        ("base list", "class U : {0} {{ }}"),
+        ("object creation", "class U {{ void M() {{ object o = new {0}(); }} }}"),
+        ("array creation", "class U {{ void M() {{ object o = new {0}[2]; }} }}"),
+        ("cast", "class U {{ void M(object o) {{ object x = ({0})o; }} }}"),
+        ("is", "class U {{ void M(object o) {{ bool b = o is {0}; }} }}"),
+        ("as", "class U {{ void M(object o) {{ object x = o as {0}; }} }}"),
+        ("typeof", "class U {{ void M() {{ object t = typeof({0}); }} }}"),
+        ("catch", "class U {{ void M() {{ try {{ }} catch ({0} e) {{ }} }} }}"),
+        ("foreach", "class U {{ void M(object[] c) {{ foreach ({0} x in c) {{ }} }} }}"),
+        ("delegate return", "delegate {0} D();"),
+        ("delegate parameter", "delegate void D({0} p);"),
+        ("operator parameter", "class U {{ public static bool operator !({0} a) {{ return false; }} }}"),
+    ];
+
+    /// Substitutes `ty` into a [`TYPE_POSITIONS`] template. (The templates double their braces so
+    /// C#'s own braces survive; this is the only substitution they need.)
+    fn at_position(template: &str, ty: &str) -> alloc::string::String {
+        template.replace("{0}", ty).replace("{{", "{").replace("}}", "}")
+    }
+
+    /// How many times `source` draws the not-built refusal, and every code it drew.
+    fn refusal_count(source: &str, version: LanguageVersion) -> (usize, Vec<(CodeNamespace, u16)>) {
+        let codes = sorted_codes_parsed_at(source, version);
+        let count = codes
+            .iter()
+            .filter(|&&(namespace, code)| namespace == CodeNamespace::Lam && code == 1)
+            .count();
+        (count, codes)
+    }
+
+    #[test]
+    fn a_generic_use_is_refused_in_every_position_a_type_can_appear() {
+        let v2 = LanguageVersion::CSharp2;
+
+        let mut holes = Vec::new();
+        let mut wrong_message = Vec::new();
+        for (position, template) in TYPE_POSITIONS {
+            let program = at_position(template, "Nope<int>");
+            let (refusals, codes) = refusal_count(&program, v2);
+            if refusals != 1 {
+                holes.push(alloc::format!("{position}: {refusals} refusals, {codes:?}"));
+            }
+            if codes.contains(&(CodeNamespace::Cs, 8022)) {
+                wrong_message.push(alloc::format!("{position}: {codes:?}"));
+            }
+        }
+        assert!(holes.is_empty(), "positions with no use-site gate: {holes:#?}");
+        assert!(
+            wrong_message.is_empty(),
+            "a use site told a C# 2 compilation to raise its language version: {wrong_message:#?}"
+        );
+    }
+
+    #[test]
+    fn the_use_site_gate_fires_on_the_generic_use_and_not_on_the_position() {
+        let v2 = LanguageVersion::CSharp2;
+
+        let mut wrong = Vec::new();
+        let mut unbound = Vec::new();
+        for (position, template) in TYPE_POSITIONS {
+            let program = at_position(template, "Nope");
+            let (refusals, codes) = refusal_count(&program, v2);
+            if refusals != 0 {
+                wrong.push(alloc::format!("{position}: {codes:?}"));
+            }
+            if !codes.contains(&(CodeNamespace::Cs, 246)) {
+                unbound.push(alloc::format!("{position}: {codes:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "ordinary types drew a refusal: {wrong:#?}");
+        assert_eq!(
+            unbound,
+            ["delegate return: []", "delegate parameter: []"],
+            "the set of positions that never resolve their type has changed"
+        );
+    }
+
+    #[test]
+    fn a_declaration_phase_refusal_stops_the_body_from_being_bound() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(
+            sorted_codes_parsed_at("class U { void M() { Undeclared q; } }", v2),
+            [(CodeNamespace::Cs, 246)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class Box<T> { } class U { void M() { Undeclared q; } }",
+                v2
+            ),
+            [(CodeNamespace::Lam, 1)]
+        );
+    }
+
+    #[test]
+    fn a_nested_or_array_generic_use_is_refused_once_and_not_once_per_level() {
+        let v2 = LanguageVersion::CSharp2;
+        let refusals = |source: &str| refusal_count(source, v2).0;
+
+        assert_eq!(refusals("public class Box<T> { } class U { Box<int> f; }"), 2);
+        assert_eq!(refusals("public class Box<T> { } class U { Box<int>[] f; }"), 2);
+        assert_eq!(refusals("public class Box<T> { } class U { Box<int>[][] f; }"), 2);
+        assert_eq!(
+            refusals("public class Box<T> { } class U { Box<Box<int>> f; }"),
+            2
+        );
+        assert_eq!(
+            refusals("public class Box<T> { } class U { Box<int> f; Box<int> g; }"),
+            3
+        );
+    }
+
+    #[test]
+    fn a_nested_type_argument_list_closes_on_a_right_shift_token() {
+        let v2 = LanguageVersion::CSharp2;
+
+        let (refusals, codes) = refusal_count("class U { Nope<Nope<int>> f; }", v2);
+        assert_eq!(refusals, 1, "{codes:?}");
+        let (refusals, codes) = refusal_count("class U { Nope<Nope<Nope<int>>> f; }", v2);
+        assert_eq!(refusals, 1, "{codes:?}");
+        let (refusals, codes) = refusal_count("class U { Nope<int, Nope<int>> f; }", v2);
+        assert_eq!(refusals, 1, "{codes:?}");
+    }
+
+    #[test]
+    fn a_right_shift_in_an_expression_survives_the_declaration_speculation() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "class U { void M() { int a = 1, b = 8, c = 2; bool x = a<b>>c; } }",
+                v2
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "class U { void M() { int a = 1, b = 8, c = 2; bool x = a < (b >> c); } }",
+                v2
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "class U { void M() { int a = 1, b = 8, c = 2; int x = a<b>>c; } }",
+                v2
+            ),
+            [(CodeNamespace::Cs, 29)]
+        );
+    }
+
+    #[test]
+    fn a_generic_declaration_is_refused_as_not_built_rather_than_as_not_permitted() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(
+            sorted_codes_parsed_at("public class C<T> { }", v2),
+            [(CodeNamespace::Lam, 1)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class E { public int M<T>(int x) { return x; } }", v2),
+            [(CodeNamespace::Lam, 1)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at("public class C<T> { }", LanguageVersion::CSharp1),
+            []
+        );
+
+        assert_eq!(sorted_codes_parsed_at("public class C { }", v2), []);
+        assert_eq!(
+            sorted_codes_parsed_at("public class E { public int M(int x) { return x; } }", v2),
+            []
+        );
+    }
+
+    #[test]
+    fn an_object_initializer_binds_its_members_against_the_type_being_created() {
+        let v3 = LanguageVersion::CSharp3;
+
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { static C M(){ return new C { Nope = 1 }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 117)]
+        );
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { public readonly int F; static C M(){ return new C { F = 1 }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 191)]
+        );
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { public int P { get { return 1; } } \
+                 static C M(){ return new C { P = 1 }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 200)]
+        );
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { public static int F; static C M(){ return new C { F = 1 }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 1914)]
+        );
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { public int F; static C M(){ return new C { F = \"s\" }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 29)]
+        );
+
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { public int F; static C M(){ return new C { F = 1 }; } }",
+                v3
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn a_collection_initializer_needs_both_the_interface_and_the_method() {
+        let v3 = LanguageVersion::CSharp3;
+
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { public void Add(int x){} static C M(){ return new C { 1, 2 }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 1922)]
+        );
+        assert_eq!(
+            sorted_codes_at(
+                "public interface IEnumerable { } \
+                 public class C : IEnumerable { static C M(){ return new C { 1 }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 1061)]
+        );
+        assert_eq!(
+            sorted_codes_at(
+                "public interface IEnumerable { } \
+                 public class C : IEnumerable { public void Add(int x){} \
+                 static C M(){ return new C { 1 }; } }",
+                v3
+            ),
+            []
+        );
+
+        assert_eq!(
+            sorted_codes_at(
+                "public class C { public int GetEnumerator(){ return 0; } public void Add(int x){} \
+                 static C M(){ return new C { 1 }; } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 1922)]
+        );
+    }
+
+    #[test]
+    fn an_object_initializer_assigns_the_members_it_names() {
+        let v3 = LanguageVersion::CSharp3;
+        assert!(
+            !sorted_codes_at(
+                "class C { public int F; C M(){ return new C { F = 1 }; } }",
+                v3
+            )
+            .iter()
+            .any(|&(_, code)| code == 649),
+            "an initialized field must not be reported never-assigned"
+        );
+        assert!(
+            sorted_codes_at("class C { public int F; C M(){ return new C(); } }", v3)
+                .iter()
+                .any(|&(_, code)| code == 649),
+            "the control must still report the field as never assigned"
+        );
+
+        assert_eq!(
+            sorted_codes_at(
+                "public class D { public int G; } \
+                 public class C { public D F = new D(); \
+                 static C M(){ return new C { F = { G = 1 } }; } }",
+                v3
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn a_required_members_declaration_rules_are_csc_s() {
+        let v11 = LanguageVersion::CSharp11;
+
+        for source in [
+            "public class C { public required void M() { } }",
+            "public class C { public required static int S; }",
+            "public class C { public required const int K = 1; }",
+            "public class C { public required C() { } }",
+            "public class C { public required int this[int i] { get { return 0; } set { } } }",
+            "public delegate void H(); public class C { public required event H E; }",
+            "public required class C { }",
+        ] {
+            assert!(
+                sorted_codes_parsed_at(source, v11)
+                    .iter()
+                    .any(|&(_, code)| code == 106),
+                "expected CS0106 for {source}"
+            );
+        }
+
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public required readonly int F; }", v11),
+            [(CodeNamespace::Cs, 9034)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { public required int P { get { return 0; } } }",
+                v11
+            ),
+            [(CodeNamespace::Cs, 9034)]
+        );
+
+        for source in [
+            "public class C { private required int F; }",
+            "public class C { internal required int F; }",
+            "public class C { protected required int F; }",
+            "public class C { protected internal required int F; }",
+            "internal class C { protected required int F; }",
+            "public class Outer { protected class C { protected required int F; } }",
+            "public class Outer { protected class C { internal required int F; } }",
+        ] {
+            assert!(
+                sorted_codes_parsed_at(source, v11)
+                    .iter()
+                    .any(|&(_, code)| code == 9032),
+                "expected CS9032 for {source}"
+            );
+        }
+
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public required int F; }", v11),
+            []
+        );
+        for source in [
+            "internal class C { internal required int F; }",
+            "internal class C { public required int F; }",
+        ] {
+            assert!(
+                !sorted_codes_parsed_at(source, v11)
+                    .iter()
+                    .any(|&(_, code)| code == 106 || (9030..=9036).contains(&code)),
+                "expected no required-member diagnostic for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_required_member_must_be_set_where_the_object_is_created() {
+        let v11 = LanguageVersion::CSharp11;
+
+        for source in [
+            "public class C { public required int P; \
+             static C M(){ return new C(); } }",
+            "public class C { public required int P; public C() { P = 1; } \
+             static C M(){ return new C(); } }",
+            "public struct S { public required int P; } \
+             public class U { static S M(){ return new S(); } }",
+            "public class B { public required int P; } public class D : B { } \
+             public class U { static D M(){ return new D { }; } }",
+        ] {
+            assert!(
+                sorted_codes_parsed_at(source, v11)
+                    .iter()
+                    .any(|&(_, code)| code == 9035),
+                "expected CS9035 for {source}"
+            );
+        }
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { public required int P; public required int Q; \
+                 static C M(){ return new C { P = 1 }; } }",
+                v11
+            ),
+            [(CodeNamespace::Cs, 9035)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class D { public int G; } \
+                 public class C { public required D F; \
+                 static C M(){ return new C { F = { G = 1 } }; } }",
+                v11
+            ),
+            [(CodeNamespace::Cs, 9036)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { public required int P; static C M(){ return new C { P = 1 }; } }",
+                v11
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { public int P; static C M(){ return new C(); } }",
+                v11
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn sets_required_members_exempts_a_creation_and_an_abstract_type_reports_only_cs0144() {
+        let v11 = LanguageVersion::CSharp11;
+        let attribute = "namespace System.Diagnostics.CodeAnalysis { \
+                         public class SetsRequiredMembersAttribute { } } ";
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &format!(
+                    "{attribute} public class C {{ public required int P; \
+                     [System.Diagnostics.CodeAnalysis.SetsRequiredMembers] public C(int p) {{ P = p; }} \
+                     static C M(){{ return new C(1); }} }}"
+                ),
+                v11
+            ),
+            []
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &format!(
+                    "{attribute} public class B {{ public required int P; }} \
+                     public class D : B {{ \
+                     [System.Diagnostics.CodeAnalysis.SetsRequiredMembers] public D() {{ P = 1; }} }} \
+                     public class U {{ static D M(){{ return new D(); }} }}"
+                ),
+                v11
+            ),
+            []
+        );
+
+        assert!(
+            sorted_codes_parsed_at(
+                &format!(
+                    "{attribute} public class C {{ public required int P; \
+                     public C(int p) {{ P = p; }} \
+                     static C M(){{ return new C(1); }} }}"
+                ),
+                v11
+            )
+            .iter()
+            .any(|&(_, code)| code == 9035),
+            "a constructor WITHOUT [SetsRequiredMembers] must still draw CS9035"
+        );
+
+        assert!(
+            sorted_codes_parsed_at(
+                &format!(
+                    "{attribute} public class C {{ public required int P; \
+                     public C() {{ }} \
+                     [System.Diagnostics.CodeAnalysis.SetsRequiredMembers] public C(int p) {{ P = p; }} \
+                     static C M(){{ return new C(); }} }}"
+                ),
+                v11
+            )
+            .iter()
+            .any(|&(_, code)| code == 9035),
+            "the exemption belongs to the chosen constructor, not to the type"
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public abstract class A { public required int P; } \
+                 public class U { static object M(){ return new A(); } }",
+                v11
+            ),
+            [(CodeNamespace::Cs, 144)]
+        );
+    }
+
+    #[test]
+    fn an_override_may_not_drop_required() {
+        let v11 = LanguageVersion::CSharp11;
+        assert!(
+            sorted_codes_parsed_at(
+                "public class B { public virtual required int P { get { return 0; } set { } } } \
+                 public class D : B { public override int P { get { return 0; } set { } } }",
+                v11
+            )
+            .iter()
+            .any(|&(_, code)| code == 9030),
+            "an override that drops `required` must draw CS9030"
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class B { public virtual required int P { get { return 0; } set { } } } \
+                 public class D : B { public override required int P { get { return 0; } set { } } }",
+                v11
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn a_selected_dialect_admits_what_it_permits_and_we_built() {
+        const STATIC_CLASS: &str = "static class S { public static int F() { return 1; } }";
+        const SWITCH_ON_BOOL: &str =
+            "public class C { public int M(bool b) { switch (b) { default: return 0; } } }";
+
+        assert_eq!(
+            sorted_codes_at(STATIC_CLASS, LanguageVersion::CSharp1),
+            [(CodeNamespace::Cs, 8022)]
+        );
+        assert_eq!(
+            sorted_codes_at(SWITCH_ON_BOOL, LanguageVersion::CSharp1),
+            [(CodeNamespace::Cs, 8022)]
+        );
+
+        assert_eq!(sorted_codes_at(STATIC_CLASS, LanguageVersion::CSharp2), []);
+        assert_eq!(
+            sorted_codes_at(SWITCH_ON_BOOL, LanguageVersion::CSharp2),
+            [(CodeNamespace::Lam, 1)]
+        );
+
+        assert_eq!(sorted_codes(STATIC_CLASS), [8022]);
     }
 
     /// Like [`sorted_codes`], but scanned under the typedref knob so `__arglist` (and the
@@ -4514,6 +5337,39 @@ mod tests {
     }
 
     #[test]
+    fn cs0649_keys_on_effective_accessibility_not_the_field_modifier() {
+
+        assert_eq!(sorted_codes("public class C { public int F; int Get() { return F; } }"), []);
+        assert_eq!(sorted_codes("public class C { protected int F; int Get() { return F; } }"), []);
+        assert_eq!(
+            sorted_codes("public class C { protected internal int F; int Get() { return F; } }"),
+            []
+        );
+        assert_eq!(sorted_codes("public class C { internal int F; int Get() { return F; } }"), [649]);
+        assert_eq!(sorted_codes("public class C { private int F; int Get() { return F; } }"), [649]);
+
+        assert_eq!(sorted_codes("internal class C { public int F; int Get() { return F; } }"), [649]);
+
+        assert_eq!(sorted_codes("class C { public int F; int Get() { return F; } }"), [649]);
+
+        assert_eq!(
+            sorted_codes(
+                "internal class Outer { public class Inner { public int F; int Get() { return F; } } }"
+            ),
+            [649]
+        );
+        assert_eq!(
+            sorted_codes(
+                "public class Outer { public class Inner { public int F; int Get() { return F; } } }"
+            ),
+            []
+        );
+
+        assert_eq!(sorted_codes("internal class C { public int F; }"), [649]);
+        assert_eq!(sorted_codes("internal class C { private int F; }"), [169]);
+    }
+
+    #[test]
     fn a_field_an_event_accessor_assigns_is_assigned() {
         assert_eq!(
             sorted_codes(
@@ -5070,6 +5926,8 @@ mod tests {
                 is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
+                sets_required_members: false,
+                type_parameters: Vec::new(),
             });
             model.insert(object);
             model
@@ -5293,6 +6151,8 @@ mod tests {
                 is_sealed: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
+                sets_required_members: false,
+                type_parameters: Vec::new(),
             });
             model.insert(object);
             let mut seam = TypeInfo::new("", "Seam", TypeKind::Class);
@@ -5311,6 +6171,8 @@ mod tests {
                 is_sealed: false,
                 accessibility: Accessibility::ProtectedInternal,
                 conditional: Vec::new(),
+                sets_required_members: false,
+                type_parameters: Vec::new(),
             });
             model.insert(seam);
             model
@@ -5393,6 +6255,8 @@ mod tests {
             is_sealed: false,
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
+            sets_required_members: false,
+            type_parameters: Vec::new(),
         });
         bcl.insert(console);
 

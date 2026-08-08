@@ -52,6 +52,13 @@ function = "AF4"
 scl = { pin = "PH7" }
 sda = { pin = "PH8" }
 
+# THE CODEC DOES NOT HAVE THIS BUS TO ITSELF: PH7 carries both AUDIO_SCL and LCD_SCL, and PH8 both
+# AUDIO_SDA and LCD_SDA, so the display's capacitive touch controller sits here too and answers at
+# 0x38. That controller is deliberately not a row below -- this board's manual records the display
+# as changing between board revisions, and an address alone does not identify a part. What a driver
+# needs from it is here: a bus check on this instance meets a second device, and holding the bus
+# for a long codec sequence delays touch reporting.
+
 # THE BOARD IS ITS OWN ORACLE FOR THIS BUS, which is worth stating because almost no board is.
 # The codec is soldered on, so a bus check here needs nothing plugged in and nothing wired -- and
 # its register 0 reads back a value that SPELLS ITS OWN PART NUMBER. A value like that cannot be
@@ -63,7 +70,37 @@ name = "wm8994"
 kind = "i2c-device"
 role = "codec-i2c"
 address = 0x1A
-source = "UM1907 Rev 7 section 6.8 (the board carries an audio codec) with its pin assignment table (I2C3_SCL = PH7, I2C3_SDA = PH8), the two read together and the pin table preferred where they conflict. Found on silicon: 100 trials of 100 walked all 112 addresses of both buses, with a device answering at 0x1A whose register 0 reads 0x8994; the negative control disconnected the bus lines and failed 5 times out of 5."
+source = "UM1907 Rev 7 section 6.8 (the board carries an audio codec) with its pin assignment table (I2C3_SCL = PH7, I2C3_SDA = PH8), the two read together and the pin table preferred where they conflict. Corroborated by the MB1191 schematic rev B-03, which routes AUDIO_SCL to PH7 and AUDIO_SDA to PH8 and states the part's default address as 00110100, the eight-bit write form of 0x1A. Found on silicon: 100 trials of 100 walked all 112 addresses of both buses, with a device answering at 0x1A whose register 0 reads 0x8994; the negative control disconnected the bus lines and failed 5 times out of 5."
+
+# THIS BUS IS BROUGHT OUT THREE TIMES ON THE SAME TWO PINS, and that is the fact to have before
+# wiring anything: PB8 carries EXT_SCL, DCMI_SCL and ARD_D15, and PB9 carries EXT_SDA, DCMI_SDA
+# and ARD_D14. So the I2C extension connector, the camera module connector and the Arduino
+# header's dedicated SDA/SCL pair are ONE bus -- a device on any of the three shares an address
+# space with devices on the other two, and none of them can be addressed independently.
+#
+# NOT THE ARDUINO CONVENTION, which is the trap a shield brings with it: on an Uno the ANALOG pins
+# A4 and A5 carry I2C. AS THIS BOARD IS BUILT THEY DO NOT. Each analog pin has a PAIR of solder
+# bridges and exactly one of each pair is fitted -- A4 takes PF7 (ADC3_IN5) through SB5 and not PB9
+# through SB4, A5 takes PF6 (ADC3_IN4) through SB3 and not PB8 through SB1. A shield driving I2C on
+# its analog pins therefore reaches two ADC inputs. The alternative routing exists as unfitted
+# bridges, so reaching it is rework rather than configuration, and nothing here claims A4/A5.
+#
+# A disagreement between the two documents, recorded because a reader who trusts the board manual's
+# function column would chase a pin that is doing something else entirely: that column gives A5 as
+# ADC3_IN4 (PC0) while its own pin column says PF6, and PC0 is USB_OTG_HS_ULPI_STP. The schematic
+# labels the net ADC3_IN4 on PF6, and the channel numbering of the rows above it (PF10 IN8, PF9
+# IN7, PF8 IN6) continues to PF6 IN4. The pin column is the one to believe.
+#
+# Sourced from UM1907 Rev 7 (Table 4, Table 6 and the I/O assignment table) read together with the
+# MB1191 schematic rev B-03 sheets 3 and 8. The schematic is what settles the analog pins: the
+# manual states the alternative and refers to a table that does not record which way it is built.
+[[bindings]]
+role = "header-i2c"
+kind = "i2c"
+instance = "i2c1"
+function = "AF4"
+scl = { pin = "PB8" }
+sda = { pin = "PB9" }
 
 # --- external memory -----------------------------------------------------------------------
 #
@@ -137,7 +174,8 @@ source = "UM1907 Rev 7 section 6.13: a 128-Mbit SDRAM of which 'only the lowest 
 #     July and returned garbage in the same month.
 
 [memory.qspi.device]
-part = "16-Mbyte quad-SPI NOR"
+part = "N25Q128A13EF840E"    # the fitted device, named by the board schematic; a 16-Mbyte
+                             # quad-SPI NOR, which is what `size` and `address_bits` state.
 identity = 0x20BA18         # the JEDEC identity, read off the wire rather than transcribed.
 address_bits = 24
 chip_select_high_cycles = 2 # the MINIMUM CYCLE COUNT, not the field: the controller's field is
@@ -146,7 +184,7 @@ chip_select_high_cycles = 2 # the MINIMUM CYCLE COUNT, not the field: the contro
                             # controller's business and generation's job.
 clock_idle = 0              # the clock rests LOW while chip select is high (the controller calls
                             # this mode 0). A device expecting the other misreads its first bit.
-source = "Read on silicon over 400 cold bring-ups, in four read configurations, each preceded by a negative control that had to fail: the identity is what the part answered, and the configuration is the one that executed instructions out of the memory-mapped window 100 times out of 100."
+source = "The order code is the one the MB1191 schematic rev B-03 fits. Read on silicon over 400 cold bring-ups, in four read configurations, each preceded by a negative control that had to fail: the identity is what the part answered, and the configuration is the one that executed instructions out of the memory-mapped window 100 times out of 100."
 
 # The four read configurations, weakest to fastest. The instruction phase stays SINGLE-LINE in all
 # of them -- a quad read means quad DATA (and, for the last, quad address); the command that asks
@@ -173,7 +211,7 @@ data_lines = 1
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
-source = "100 of 100 cold bring-ups at a 16 MHz interface clock, where the part answered 6. Measured again on 2026-07-29 by the same firmware at the same clock, walking every count in the range rather than every second one, it answered 8 -- its datasheet's own figure -- and read back 100 of 100 at that. Both counts are observations of this part; the count is not a constant of it."
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, where the part answered 6 -- its datasheet's own figure -- and read back 100 of 100 at that. Both counts are observations of this part; the count is not a constant of it."
 
 [[memory.qspi.reads]]
 name = "quad_output_read"
@@ -184,7 +222,6 @@ data_lines = 4
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
-source = "100 of 100 cold bring-ups at a 16 MHz interface clock, data on four lines and the address still on one, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 8 and read back 100 of 100 at that."
 
 [[memory.qspi.reads]]
 name = "quad_io_read"
@@ -195,10 +232,11 @@ data_lines = 4
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
-source = "100 of 100 cold bring-ups at a 16 MHz interface clock, address and data both on four lines, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 10 -- the figure associated with this part's full-rate quad I/O -- and read back 100 of 100 at that. The largest gap of the four, on the fastest configuration."
 
 [memory.sdram.device]
-part = "128-Mbit SDRAM, 16 of its 32 data lines wired"
+part = "MT48LC4M32B2B5-6A"  # the fitted device, named by the board schematic. What it IS -- a
+                            # 128-Mbit SDRAM with 16 of its 32 data lines wired -- is stated as
+                            # data below, in the `data_bits` and `device_data_bits` pair.
 bank = 1                    # SDNE0 and SDCKE0 are the wired pair, so this is the controller's
                             # bank 1. Bank 2 would answer at a different window and does not exist.
 column_bits = 8
@@ -242,7 +280,7 @@ refresh_rows = 4096          # ...across 4096 of them. THE COUNT IS NOT HERE: it
                              # this board at one operating point.
 refresh_burst = 8
 settle_us = 100
-source = "All 8 accessible Mbytes swept word by word, then 100 cold bring-ups out of 100, each ending in a read after a wait of 300 ms -- several times the 64 ms the device is specified to hold for, which is the only check that proves refresh is running rather than that the memory has not decayed yet. The negative control drove the bank's select line as a plain output held high and failed 5 times out of 5. The settling delay and the auto-refresh burst are the reference manual's TYPICAL figures, not the fitted device's own: this board's part number has not been transcribed, and both are values where longer and more are safe."
+source = "All 8 accessible Mbytes swept word by word, then 100 cold bring-ups out of 100, each ending in a read after a wait of 300 ms -- several times the 64 ms the device is specified to hold for, which is the only check that proves refresh is running rather than that the memory has not decayed yet. The negative control drove the bank's select line as a plain output held high and failed 5 times out of 5. The settling delay and the auto-refresh burst are the reference manual's TYPICAL figures rather than the fitted device's own. The part is named above now, so what stands between these two figures and the device's own is its datasheet; both are values where longer and more are safe, so the typicals are the conservative choice until then."
 
 [[plans]]
 name = "hsi-16mhz"

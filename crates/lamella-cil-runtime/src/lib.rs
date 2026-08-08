@@ -18,7 +18,7 @@ pub mod module;
 pub mod mount;
 pub mod net;
 pub mod object;
-pub mod reactor;
+pub use lamella_reactor as reactor;
 pub mod serial;
 pub mod aead;
 pub mod tls;

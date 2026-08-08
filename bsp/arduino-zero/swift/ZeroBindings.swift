@@ -11,6 +11,16 @@ public enum ZeroBindings {
     public static let BOARD_VENDOR: String = "Arduino"
     public static let CARRIER_USB_VID: UInt16 = 0x03EB
 
+    /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+    /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+    /// peripherals of the same kind can share no register at all, so a consumer that selects a
+    /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+    /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+    /// name a driver; and a uart is a different register map on every family, so the kind does
+    /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+    public static let VCP_DRIVER_FAMILY: String = "samd21-sercom"
+    public static let HEADER_I2C_DRIVER_FAMILY: String = "samd21-sercom"
+
     // -- VCP: a sercom-usart binding descriptor --
     public static let VCP_SERCOM_BASE: UInt32 = 0x42001C00
     public static let VCP_IRQ: UInt32 = 14

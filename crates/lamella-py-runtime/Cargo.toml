@@ -8,8 +8,9 @@ authors.workspace = true
 description = "Lamella's Python runtime: the bytecode interpreter, the dynamic object model, and built-ins."
 
 [features]
-default = ["gc-collect", "complex", "bundled-stdlib", "introspection"]
-complex = []
+default = ["gc-collect", "float", "complex", "bundled-stdlib", "introspection"]
+float = ["dep:libm"]
+complex = ["float"]
 bundled-stdlib = []
 introspection = []
 gc-collect = ["lamella-gc/gc-collect"]
@@ -23,15 +24,25 @@ lamella-gc = { path = "../lamella-gc", default-features = false }
 # The shared bytecode contract (single source of truth): the interpreter executes
 # what the front end emits, so both depend on this one definition of the bytecode.
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }
+# The shared scheduler reactor: the ONE OS block point, as a leaf crate with no dependencies of its
+# own so anything may take it. This runtime supplies a `ReactorEnv` (its clock, and its network seam
+# when it has one) and drives that shared implementation rather than writing a second event loop --
+# which is what its own charter asks for, naming "a sibling language runtime's event loop".
+lamella-reactor = { path = "../lamella-reactor" }
 # The shared Unicode Character Database properties: str predicates (isalpha/isspace/...)
 # classify code points exactly as CPython, from one tree-shakeable table. The str predicates use
 # only the categories tier, so opt out of `normalization` (and `alloc` in the crate).
 lamella-unicode = { path = "../lamella-unicode", default-features = false }
+# The shared code-point byte codec. A Python `str` is a sequence of CODE POINTS and a Rust `String`
+# is a sequence of SCALAR VALUES; the difference between those two sets is exactly the surrogate
+# block, so the string arena holds WTF-8 bytes rather than a `String`. This crate is the ONE
+# definition of that byte form, shared with the C# string tiers and with the constant pool the front
+# end emits, so a `str` cannot mean different bytes in a baked image than it does on the heap.
+lamella-wtf8 = { path = "../lamella-wtf8" }
 # The MUSL/fdlibm port (an accurate `no_std` libm). `core` has the f64 arithmetic operators but NOT
 # floor/fmod, which the float `//` and `%` need (CPython's exact float_divmod), so bind them here
-# rather than hand-roll fdlibm. Only floor/fmod/trunc are referenced, so the transcendentals
-# dead-code-eliminate; a `float` size knob can drop it entirely on a no-float tier.
-libm = "0.2.16"
+# rather than hand-roll fdlibm.
+libm = { version = "0.2.16", optional = true }
 
 [dev-dependencies]
 lamella-py-frontend = { path = "../lamella-py-frontend" }

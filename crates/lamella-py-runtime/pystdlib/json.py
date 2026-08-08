@@ -1,6 +1,7 @@
 """JSON encoding and decoding, after RFC 8259 and CPython's json package.
 
-CPython's json is pure Python with an optional C accelerator.
+CPython's json is pure Python with an optional C accelerator; the two agree on observable
+behaviour, and this module is verified against them.
 
 Two deliberate departures from CPython's implementation:
 
@@ -11,6 +12,9 @@ Two deliberate departures from CPython's implementation:
   which would invalidate an id-keyed marker; the ancestor stack cannot go stale.
   CPython drops each marker once the container is encoded, so only a true ancestor
   cycle is a ValueError either way -- a repeated sibling reference encodes twice.
+
+NOT PROVIDED: encoding detection for UTF-16/32 input -- `loads` takes str, or bytes/bytearray
+assumed UTF-8 -- and the C accelerator's `memo` key interning.
 
 A LONE surrogate escape (`"\\ud834"` with no trailing low surrogate) decodes to a
 one-character string in CPython but raises ValueError here: a str holds UTF-8, which

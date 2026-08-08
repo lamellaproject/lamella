@@ -16,6 +16,7 @@ lamella-asm-wasm = { path = "../lamella-asm-wasm", optional = true }
 # The AOT compiler reads an assembly's metadata to resolve call/ldstr tokens (the
 # MetadataResolver); the core IR->native lowering itself stays metadata-free.
 lamella-metadata = { path = "../lamella-metadata" }
+lamella-generics = { path = "../lamella-generics" }
 # Metadata tokens: the MetadataResolver names a constructor/catch type token's declaring
 # type (the exception-tag seam).
 lamella-token = { path = "../lamella-token" }
@@ -27,7 +28,12 @@ lamella-link = { path = "../lamella-link" }
 lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam" }
-lamella-usbhid = { path = "../lamella-usbhid" }
+# Probe SELECTION, so a deploy example names which board it writes. Opening by vendor/product alone
+# takes whichever interface the OS hands over -- an order that changes with plug order and reboots --
+# and a write to the wrong board SUCCEEDS. `open_hid` resolves it through the ladder instead:
+# explicit serial, then LAMELLA_PROBE_SERIAL, then the sole probe of that vid/pid, then REFUSE.
+#
+lamella-probe = { path = "../lamella-probe" }
 
 [features]
 default = ["arm32"]

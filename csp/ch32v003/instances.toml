@@ -1,0 +1,43 @@
+# INSTANCE map for the CH32V003 family -- identity-first: ONLY the blocks a binding or a board
+# control line places appear here. The full peripheral set arrives with the family's first
+# generated driver.
+#
+# THIS PART HAS PORTS A, C AND D AND NO PORT B. That is not an omission here: the reference
+# manual's own GPIO register list (Table 7-15) has three columns, x = A/C/D, and the clock-enable
+# register leaves the bit where port B's enable would sit marked Reserved. A driver written
+# against the STM32F1 this IP resembles, which does have a port B, would enable a clock that does
+# not exist and configure a port that is not there.
+
+[table]
+kind = "instances"
+family = "ch32v003"
+record = ["base"]
+sources = [
+    "CH32V003 Reference Manual V1.9 (WCH): Table 3-1 RCC register list, Table 7-15 GPIO register list",
+]
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x40021000   # CH32V003 RM V1.9 Table 3-1: R32_RCC_CTLR at 0x40021000 is the block's first
+                    # register, so this is the base the register offsets in blocks/rcc.toml are
+                    # taken from. The clock-enable register a GPIO port needs is at offset 0x18.
+
+[[instances]]
+name = "gpioa"      # NAMED FOR WHAT THE MANUAL CALLS IT. The register list spells these
+block = "gpio"      # R32_GPIOA_* / R32_GPIOC_* / R32_GPIOD_*, so the instance ids follow the
+base = 0x40010800   # document rather than a house convention. RM V1.9 Table 7-15:
+                    # R32_GPIOA_CFGLR at 0x40010800.
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x40011000   # RM V1.9 Table 7-15: R32_GPIOC_CFGLR at 0x40011000.
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x40011400   # RM V1.9 Table 7-15: R32_GPIOD_CFGLR at 0x40011400. This is the port the
+                    # single-wire debug pin lives on (PD1/SWIO), so a read-modify-write is not
+                    # merely tidy here -- a whole-register write to CFGLR while a probe is
+                    # attached reconfigures the pin the probe is talking through.

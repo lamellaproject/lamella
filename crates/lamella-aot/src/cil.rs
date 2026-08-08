@@ -380,6 +380,20 @@ pub trait CallResolver {
         None
     }
 
+    /// The type HANDLES an `unbox`/`unbox.any` to the operand type ACCEPTS -- the descriptors a boxed
+    /// value may legally carry for the cast to succeed (III.4.32, III.4.33).
+    ///
+    /// A SET rather than the operand's own handle, because of the enum/underlying interchange: an
+    /// enum unboxes as itself, as any enum sharing its EXACT underlying primitive, and as that
+    /// primitive. Comparing one handle would reject all of those, which .NET accepts -- so this is
+    /// not `boxed_layout().handle`.
+    ///
+    /// Empty by default, and an empty set means "emit no check" -- the pre-existing behaviour, so a
+    /// resolver that does not implement this is no worse off than before.
+    fn unbox_accepted_handles(&self, _operand: &Operand) -> Vec<TypeHandle> {
+        Vec::new()
+    }
+
     /// The MIR type a `box`/`unbox.any` value type lowers to: `i32` for a sub-word or 32-bit scalar,
     /// `f32`/`i64`/`f64` for the wider scalars, or a `ValueType` for a struct. Used to type the
     /// `unbox.any` result so a multi-word scalar reads its full width. Defaults to None.
@@ -834,6 +848,8 @@ fn lower_with_source(
                     Some(TrapKind::Cast(_))
                         | Some(TrapKind::CastClass(_))
                         | Some(TrapKind::CastClassChain(_))
+                        | Some(TrapKind::ConvOverflow { .. })
+                        | Some(TrapKind::Overflow(_))
                 )
             {
                 return None;
@@ -1853,8 +1869,8 @@ fn addr_base(
 /// 24 bytes as an explicit `box`, so the prefix buys no allocation either.
 ///
 /// The emitted pair is exactly [`Opcode::Box`]'s -- an `Alloc` plus a `FieldStore` of the value at
-/// offset 0 -- so a call the front end used to spell `ldloc; box; callvirt` lowers identically when
-/// it spells it `ldloca; constrained.; callvirt`.
+/// offset 0 -- so a call spelled `ldloc; box; callvirt` and one spelled
+/// `ldloca; constrained.; callvirt` lower identically.
 #[allow(clippy::too_many_arguments)]
 fn box_constrained_receiver(
     constrained: &Operand,
@@ -4400,11 +4416,26 @@ fn eh_landing(
 enum TrapKind {
     /// An array element access: `index >= length` (unsigned) -> `IndexOutOfRangeException`.
     Bounds,
+    /// `stelem.ref`: the bounds check above, and THEN the covariant-store type check III.4.28
+    /// requires -> `ArrayTypeMismatchException`. Two checks with two different exceptions, so they
+    /// cannot fold into one condition -- the bounds check's in-range edge runs the store check, and
+    /// only its pass edge reaches the store.
+    ///
+    /// Array covariance makes `object[] o = new string[2]` legal, so the element type the store must
+    /// satisfy is the array's RUNTIME one and is not knowable at compile time. It is read from the
+    /// array's own descriptor (`element_desc@16`) and the stored value's type is walked up its
+    /// base-pointer chain against it -- the same scan `castclass` uses.
+    BoundsThenArrayStore,
     /// A field load on an object from the stack: `base == 0` -> `NullReferenceException`.
     NullRef,
-    /// `unbox.any T`: the boxed value's TypeDesc must equal `&TypeDesc(T)` (the carried `handle`) --
-    /// an exact type check, since a value type has no subtypes -> `InvalidCastException`.
-    Cast(TypeHandle),
+    /// `unbox T` / `unbox.any T`: the boxed value's TypeDesc must be one of the ACCEPTED descriptors
+    /// -> `InvalidCastException`.
+    ///
+    /// A SET, not one handle: III.4.32 admits the enum/underlying interchange, so an enum unboxes as
+    /// itself, as any enum with the SAME underlying primitive, and as that primitive. A struct's set
+    /// is just itself, so it costs the single compare this always emitted. See
+    /// `resolver::unbox_accepted_handles` for why the set is bounded to BOX TARGETS.
+    Cast(Vec<TypeHandle>),
     /// `castclass T`: the object's runtime TypeDesc must be one of the target's accepted handles
     /// (`T` plus its in-program subtypes); if none match -> `InvalidCastException`.
     CastClass(Vec<TypeHandle>),
@@ -4456,6 +4487,9 @@ const CAST_CHAIN_THRESHOLD: usize = 4;
 fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapKind> {
     let opcode = inst.opcode;
     if control_flow::is_may_trap_access(opcode) {
+        if opcode == Opcode::StelemRef {
+            return Some(TrapKind::BoundsThenArrayStore);
+        }
         return Some(TrapKind::Bounds);
     }
     if matches!(opcode, Opcode::Ldfld | Opcode::Stfld)
@@ -4463,9 +4497,10 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
     {
         return Some(TrapKind::NullRef);
     }
-    if opcode == Opcode::UnboxAny {
-        if let Some(layout) = resolver.boxed_layout(&inst.operand) {
-            return Some(TrapKind::Cast(layout.handle));
+    if matches!(opcode, Opcode::Unbox | Opcode::UnboxAny) {
+        let accepted = resolver.unbox_accepted_handles(&inst.operand);
+        if !accepted.is_empty() {
+            return Some(TrapKind::Cast(accepted));
         }
     }
     if opcode == Opcode::Castclass {
@@ -4735,7 +4770,10 @@ fn eval_stack_widths(
 
 fn trap_operand_types(inst: &Instruction, wide: bool, resolver: &dyn CallResolver) -> Vec<MirType> {
     let opcode = inst.opcode;
-    if matches!(opcode, Opcode::Ldfld | Opcode::UnboxAny | Opcode::Castclass) {
+    if matches!(
+        opcode,
+        Opcode::Ldfld | Opcode::Unbox | Opcode::UnboxAny | Opcode::Castclass
+    ) {
         return vec![MirType::ObjectRef];
     }
     if opcode == Opcode::Stfld {
@@ -4995,6 +5033,79 @@ fn null_passes_the_cast(
 /// access block through a landing carrying the locals plus the operands, so the access runs with the
 /// check passed.
 #[allow(clippy::too_many_arguments)]
+/// The byte offset of `element_desc` in an ARRAY type descriptor -- the fifth word of
+/// `[MARK|rank@0][element_kind@4][type_tag@8][base_ptr@12][element_desc@16]`, the layout
+/// `resolver::string_descriptor_words` and the array-descriptor emitter both write and
+/// `tests/array_element_desc.rs` pins against a real assembly.
+const ARRAY_ELEMENT_DESC_OFFSET: i32 = 16;
+
+/// Builds a block that raises a builtin exception by name and routes it like a `throw`, returning
+/// its block index. The tag is the name-hash a matching `catch` computes, so it dispatches.
+///
+/// Factored out because `stelem.ref` needs TWO of these with two different exceptions -- an
+/// `IndexOutOfRangeException` for the bounds check and an `ArrayTypeMismatchException` for the
+/// covariant-store check -- and a second copy of this sequence is a second place for the tag
+/// convention to drift.
+#[allow(clippy::too_many_arguments)]
+fn build_builtin_throw_block(
+    exception_name: &str,
+    throw_clauses: &[usize],
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+    finally_protect: Option<usize>,
+    finally_is_innermost: bool,
+    finally_handler_block: &[usize],
+    resolver: &dyn CallResolver,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> Result<usize, CilError> {
+    let tag = resolver
+        .builtin_exception_tag("System", exception_name)
+        .ok_or(CilError::UnsupportedControlFlow(
+            ControlFlowGap::NoBuiltinExceptionTag,
+        ))?;
+    let mut trap_insts: Vec<(ValueId, Inst)> = Vec::new();
+    let tag_value = new_value(value_types, MirType::I32);
+    trap_insts.push((
+        tag_value,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(tag),
+        },
+    ));
+    let mut trap_stack = vec![tag_value];
+    let trap_terminator = build_eh_throw(
+        throw_clauses,
+        catch_clauses,
+        handler_block_of_clause,
+        finally_protect,
+        finally_is_innermost,
+        finally_handler_block,
+        resolver,
+        &mut trap_stack,
+        locals,
+        local_count,
+        local_types,
+        value_types,
+        &mut trap_insts,
+        split_blocks,
+        block_count,
+        propagate_fixups,
+    )?;
+    let trap = block_count + split_blocks.len();
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts: trap_insts,
+        terminator: Some(trap_terminator),
+    });
+    Ok(trap)
+}
+
 fn build_trap_access_check(
     access_block: usize,
     kind: TrapKind,
@@ -5015,8 +5126,9 @@ fn build_trap_access_check(
     block_count: usize,
     propagate_fixups: &mut Vec<usize>,
 ) -> Result<Terminator, CilError> {
+    let covariant_store = matches!(kind, TrapKind::BoundsThenArrayStore);
     let (failed, exception_name) = match kind {
-        TrapKind::Bounds => {
+        TrapKind::Bounds | TrapKind::BoundsThenArrayStore => {
             let array = operands[0];
             let index = operands[1];
             let length = new_value(value_types, MirType::I32);
@@ -5059,19 +5171,49 @@ fn build_trap_access_check(
             ));
             (is_null, "NullReferenceException")
         }
-        TrapKind::Cast(handle) => {
+        TrapKind::Cast(handles) => {
             let object = operands[0];
             let box_desc = new_value(value_types, MirType::I32);
             insts.push((box_desc, Inst::LoadTypeDesc { object }));
-            let expected = new_value(value_types, MirType::I32);
-            insts.push((expected, Inst::TypeDescAddr { handle }));
+            let mut matched: Option<ValueId> = None;
+            for handle in &handles {
+                let expected = new_value(value_types, MirType::I32);
+                insts.push((expected, Inst::TypeDescAddr { handle: *handle }));
+                let eq = new_value(value_types, MirType::I32);
+                insts.push((
+                    eq,
+                    Inst::Compare {
+                        op: CmpOp::Eq,
+                        lhs: box_desc,
+                        rhs: expected,
+                    },
+                ));
+                matched = Some(match matched {
+                    None => eq,
+                    Some(prev) => {
+                        let any = new_value(value_types, MirType::I32);
+                        insts.push((
+                            any,
+                            Inst::Binary {
+                                op: BinOp::Or,
+                                lhs: prev,
+                                rhs: eq,
+                            },
+                        ));
+                        any
+                    }
+                });
+            }
+            let matched = matched.unwrap_or(box_desc);
+            let zero = new_value(value_types, MirType::I32);
+            insts.push((zero, zero_inst(MirType::I32)));
             let mismatch = new_value(value_types, MirType::I32);
             insts.push((
                 mismatch,
                 Inst::Compare {
-                    op: CmpOp::Ne,
-                    lhs: box_desc,
-                    rhs: expected,
+                    op: CmpOp::Eq,
+                    lhs: matched,
+                    rhs: zero,
                 },
             ));
             (mismatch, "InvalidCastException")
@@ -5290,22 +5432,8 @@ fn build_trap_access_check(
         }
     };
 
-    let tag = resolver
-        .builtin_exception_tag("System", exception_name)
-        .ok_or(CilError::UnsupportedControlFlow(
-            ControlFlowGap::NoBuiltinExceptionTag,
-        ))?;
-    let mut trap_insts: Vec<(ValueId, Inst)> = Vec::new();
-    let tag_value = new_value(value_types, MirType::I32);
-    trap_insts.push((
-        tag_value,
-        Inst::ConstInt {
-            ty: MirType::I32,
-            value: i64::from(tag),
-        },
-    ));
-    let mut trap_stack = vec![tag_value];
-    let trap_terminator = build_eh_throw(
+    let trap = build_builtin_throw_block(
+        exception_name,
         throw_clauses,
         catch_clauses,
         handler_block_of_clause,
@@ -5313,22 +5441,14 @@ fn build_trap_access_check(
         finally_is_innermost,
         finally_handler_block,
         resolver,
-        &mut trap_stack,
         locals,
         local_count,
         local_types,
         value_types,
-        &mut trap_insts,
         split_blocks,
         block_count,
         propagate_fixups,
     )?;
-    let trap = block_count + split_blocks.len();
-    split_blocks.push(BasicBlock {
-        params: Vec::new(),
-        insts: trap_insts,
-        terminator: Some(trap_terminator),
-    });
 
     let landing = block_count + split_blocks.len();
     let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
@@ -5350,11 +5470,148 @@ fn build_trap_access_check(
         }),
     });
 
+    let in_range = if covariant_store {
+        let array = operands[0];
+        let value = operands[2];
+        let mut check_insts: Vec<(ValueId, Inst)> = Vec::new();
+        let zero = new_value(value_types, MirType::I32);
+        check_insts.push((
+            zero,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: 0,
+            },
+        ));
+        let array_desc = new_value(value_types, MirType::I32);
+        check_insts.push((array_desc, Inst::LoadTypeDesc { object: array }));
+        let elem_desc_offset = new_value(value_types, MirType::I32);
+        check_insts.push((
+            elem_desc_offset,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: i64::from(ARRAY_ELEMENT_DESC_OFFSET),
+            },
+        ));
+        let elem_desc_addr = new_value(value_types, MirType::I32);
+        check_insts.push((
+            elem_desc_addr,
+            Inst::Binary {
+                op: BinOp::Add,
+                lhs: array_desc,
+                rhs: elem_desc_offset,
+            },
+        ));
+        let elem_rel = new_value(value_types, MirType::I32);
+        check_insts.push((
+            elem_rel,
+            Inst::Load {
+                address: elem_desc_addr,
+                width: 4,
+                signed: false,
+            },
+        ));
+        let elem_desc = new_value(value_types, MirType::I32);
+        check_insts.push((
+            elem_desc,
+            Inst::Binary {
+                op: BinOp::Add,
+                lhs: array_desc,
+                rhs: elem_rel,
+            },
+        ));
+        let value_desc = new_value(value_types, MirType::I32);
+        check_insts.push((value_desc, Inst::LoadTypeDesc { object: value }));
+        let matched = new_value(value_types, MirType::I32);
+        check_insts.push((
+            matched,
+            Inst::CastClassScan {
+                args: alloc::vec![value_desc, elem_desc],
+            },
+        ));
+        let unmatched = new_value(value_types, MirType::I32);
+        check_insts.push((
+            unmatched,
+            Inst::Compare {
+                op: CmpOp::Eq,
+                lhs: matched,
+                rhs: zero,
+            },
+        ));
+        let value_present = new_value(value_types, MirType::I32);
+        check_insts.push((
+            value_present,
+            Inst::Compare {
+                op: CmpOp::Ne,
+                lhs: value_desc,
+                rhs: zero,
+            },
+        ));
+        let elem_known = new_value(value_types, MirType::I32);
+        check_insts.push((
+            elem_known,
+            Inst::Compare {
+                op: CmpOp::Ne,
+                lhs: elem_rel,
+                rhs: zero,
+            },
+        ));
+        let checkable = new_value(value_types, MirType::I32);
+        check_insts.push((
+            checkable,
+            Inst::Binary {
+                op: BinOp::And,
+                lhs: value_present,
+                rhs: elem_known,
+            },
+        ));
+        let mismatch = new_value(value_types, MirType::I32);
+        check_insts.push((
+            mismatch,
+            Inst::Binary {
+                op: BinOp::And,
+                lhs: unmatched,
+                rhs: checkable,
+            },
+        ));
+        let store_trap = build_builtin_throw_block(
+            "ArrayTypeMismatchException",
+            throw_clauses,
+            catch_clauses,
+            handler_block_of_clause,
+            finally_protect,
+            finally_is_innermost,
+            finally_handler_block,
+            resolver,
+            locals,
+            local_count,
+            local_types,
+            value_types,
+            split_blocks,
+            block_count,
+            propagate_fixups,
+        )?;
+        let check = block_count + split_blocks.len();
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: check_insts,
+            terminator: Some(Terminator::Branch {
+                cond: mismatch,
+                if_true: BlockId(store_trap as u32),
+                true_args: Vec::new(),
+                if_false: BlockId(landing as u32),
+                false_args: Vec::new(),
+            }),
+        });
+        check
+    } else {
+        landing
+    };
+
     Ok(Terminator::Branch {
         cond: failed,
         if_true: BlockId(trap as u32),
         true_args: Vec::new(),
-        if_false: BlockId(landing as u32),
+        if_false: BlockId(in_range as u32),
         false_args: Vec::new(),
     })
 }
@@ -6492,7 +6749,10 @@ mod control_flow {
         for (i, inst) in code.iter().enumerate() {
             let is_field_null_deref = matches!(inst.opcode, Opcode::Ldfld | Opcode::Stfld)
                 && is_reference_field(&inst.operand);
-            let is_cast = matches!(inst.opcode, Opcode::UnboxAny | Opcode::Castclass);
+            let is_cast = matches!(
+                inst.opcode,
+                Opcode::Unbox | Opcode::UnboxAny | Opcode::Castclass
+            );
             let is_div_rem = matches!(
                 inst.opcode,
                 Opcode::Div | Opcode::DivUn | Opcode::Rem | Opcode::RemUn
@@ -6529,13 +6789,11 @@ mod control_flow {
                 matches!(clause.kind, EhKind::Catch(_))
                     && (clause.try_range.start as usize..clause.try_range.end as usize).contains(&i)
             });
-            if ((is_may_trap_access(inst.opcode)
-                || is_field_null_deref
-                || is_div_rem
-                || is_overflow
-                || is_conv_ovf)
+            if ((is_may_trap_access(inst.opcode) || is_field_null_deref || is_div_rem)
                 && in_catch_try)
                 || is_cast
+                || is_conv_ovf
+                || is_overflow
             {
                 leaders.insert(i);
             }
@@ -7278,6 +7536,140 @@ mod tests {
         )
         .unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn a_checked_conversion_outside_a_try_is_still_range_checked() {
+        struct TaggedOverflow;
+        const TAG: u32 = 0x00C0_FFEE;
+        impl CallResolver for TaggedOverflow {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+                Some(TAG)
+            }
+        }
+        let raises_overflow = |op: Opcode| {
+            let body = MethodBodyImage {
+                max_stack: 2,
+                init_locals: false,
+                local_var_sig: None,
+                code: vec![
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::simple(op),
+                    Instruction::simple(Opcode::Ret),
+                ]
+                .into_boxed_slice(),
+                handlers: Vec::new().into_boxed_slice(),
+            };
+            let (func, _) = lower_method_typed(&body, &TaggedOverflow, &[MirType::I64], &[])
+                .expect("a checked narrowing lowers with no enclosing try");
+            assert!(lamella_ir::verify(&func).is_ok());
+            func.blocks.iter().flat_map(|b| &b.insts).any(|(_, inst)| {
+                matches!(inst, Inst::ConstInt { value, .. } if *value == i64::from(TAG))
+            })
+        };
+        assert!(
+            raises_overflow(Opcode::ConvOvfI4),
+            "conv.ovf.i4 with no enclosing try must still raise OverflowException on a value the \
+             target cannot hold -- the exception PROPAGATES to a caller that may catch it, which is \
+             why a cast is unconditional here too"
+        );
+        assert!(
+            !raises_overflow(Opcode::ConvI4),
+            "conv.i4 is unchecked and must not raise: it truncates by definition"
+        );
+    }
+
+    #[test]
+    fn a_covariant_array_store_is_type_checked_against_the_runtime_element_type() {
+        struct TaggedTraps;
+        impl CallResolver for TaggedTraps {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn builtin_exception_tag(&self, _: &str, name: &str) -> Option<u32> {
+                match name {
+                    "IndexOutOfRangeException" => Some(0x0000_1111),
+                    "ArrayTypeMismatchException" => Some(0x0000_2222),
+                    _ => Some(0x0000_3333),
+                }
+            }
+            fn is_catch_all_type(&self, _: &Operand) -> bool {
+                true
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::simple(Opcode::StelemRef),
+                Instruction::new(Opcode::Leave, Operand::Target(7)),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Leave, Operand::Target(7)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 5 },
+                handler_range: lamella_cil::InstructionRange { start: 5, end: 7 },
+                kind: EhKind::Catch(lamella_token::Token(0x0100_0001)),
+            }]
+            .into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &TaggedTraps,
+            &[MirType::ObjectRef, MirType::ObjectRef],
+            &[],
+        )
+        .expect("a covariant store inside a try lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<&Inst> = func.blocks.iter().flat_map(|b| &b.insts).map(|(_, i)| i).collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::CastClassScan { .. })),
+            "a covariant store must walk the value's type against the array's element type"
+        );
+        assert!(
+            insts.iter().any(
+                |i| matches!(i, Inst::ConstInt { value, .. } if *value == 0x0000_2222)
+            ),
+            "the failing store must raise ArrayTypeMismatchException, not the bounds check's \
+             IndexOutOfRangeException"
+        );
+        let mut prim = body.code.to_vec();
+        prim[3] = Instruction::simple(Opcode::StelemI4);
+        let prim_body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: false,
+            local_var_sig: None,
+            code: prim.into_boxed_slice(),
+            handlers: body.handlers.clone(),
+        };
+        let (prim_func, _) = lower_method_typed(
+            &prim_body,
+            &TaggedTraps,
+            &[MirType::ObjectRef, MirType::I32],
+            &[],
+        )
+        .expect("a primitive element store inside a try lowers");
+        let prim_insts: Vec<&Inst> =
+            prim_func.blocks.iter().flat_map(|b| &b.insts).map(|(_, i)| i).collect();
+        assert!(
+            !prim_insts.iter().any(|i| matches!(i, Inst::CastClassScan { .. })),
+            "a primitive element store must not carry a covariant type check"
+        );
+        assert!(
+            prim_insts.iter().any(
+                |i| matches!(i, Inst::ConstInt { value, .. } if *value == 0x0000_1111)
+            ),
+            "a primitive element store still carries its bounds check"
+        );
     }
 
     #[test]
@@ -8195,7 +8587,6 @@ mod tests {
 
     #[test]
     fn lowers_reference_array_element_access() {
-        use lamella_token::Token;
         struct Arrays;
         impl CallResolver for Arrays {
             fn resolve(&self, _: &Operand) -> Option<CallInfo> {
@@ -8251,7 +8642,6 @@ mod tests {
 
     #[test]
     fn lowers_long_array_element_access() {
-        use lamella_token::Token;
         struct LongArrays;
         impl CallResolver for LongArrays {
             fn resolve(&self, _: &Operand) -> Option<CallInfo> {
@@ -8306,7 +8696,6 @@ mod tests {
 
     #[test]
     fn lowers_box_and_unbox() {
-        use lamella_token::Token;
         struct BoxMock;
         impl CallResolver for BoxMock {
             fn resolve(&self, _: &Operand) -> Option<CallInfo> {
@@ -8382,7 +8771,6 @@ mod tests {
 
     #[test]
     fn lowers_box_unbox_ldobj() {
-        use lamella_token::Token;
         struct BoxMock;
         impl CallResolver for BoxMock {
             fn resolve(&self, _: &Operand) -> Option<CallInfo> {

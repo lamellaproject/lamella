@@ -1,0 +1,78 @@
+# BOARD binding: the 32F769IDISCOVERY (STM32F769I-DISCO), an STM32F769NI carrier.
+
+[table]
+kind = "board"
+board = "stm32f769i-disco"
+vendor = "st"
+family = "stm32f769"
+part = "stm32f769ni"
+board_model = 30            # lamella_wire::board_model::STM32F769I_DISCO
+sources = [
+    "UM2033 Rev 5 (Discovery kit with STM32F769NI MCU) section 5.15: the serial interface USART1 is directly available as a virtual COM port of the PC, connected to the ST-LINK/V2-1 USB connector, configured with 115200 b/s, 8 bits data, no parity, one stop bit and no flow control.",
+    "UM2033 Rev 5 section 5.16 and Table 4 (control port assignment): LD1 USER1 on PJ13 and LD2 USER2 on PJ5; the blue button B1 is the user button and the black button B2 is the reset. To light a LED a zero low-logic state must be written to the port; when B1 is depressed the logic state is 1.",
+    "UM2033 Rev 5 pin table: PA9 carries USART1_TX against the label VCP_TX, PA10 carries USART1_RX against VCP_RX, and PA0/WKUP carries the label B_USER.",
+]
+notes = [
+    "LD3 and LD4 are deliberately not device rows. LD3 is the ARDUINO signal LED on PA12 rather than a user LED, and LD4 on PD4 indicates an OTG overcurrent condition -- neither is a general-purpose indicator a program should be told it owns.",
+    "The user button is on PA0, which is also the part's wake-up pin. UM2033 describes B1 as usable 'as a digital input or as a wake-up alternate function' -- this row states the digital-input reading, which is the one a program polls; the wake-up path is a power-management fact nothing here models.",
+]
+
+# --- the carrier -----------------------------------------------------------------------------
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge's VCP, on connector CN16.
+role = "vcp"
+baud = 115200
+plan = "hsi-16mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart1"
+function = "AF7"
+tx = { pin = "PA9" }
+rx = { pin = "PA10" }
+
+# --- the operating point ----------------------------------------------------------------------
+#
+# THE PART'S OWN RESET STATE, deliberately. This part can reach 216 MHz through its PLL, and every
+# route there is a configuration a program performs rather than a fact the board states. The
+# internal oscillator is running at reset on every unit, so a plan naming it holds regardless of
+# what the board's crystals are populated with -- and the divisor below is then a fact about the
+# part and the rate rather than about a bring-up nobody has written yet.
+
+[[plans]]
+name = "hsi-16mhz"
+default = true
+source = "hsi"
+hsi_hz = 16000000           # the F7 reset clock: HSI at 16 MHz, no PLL, prescalers 1.
+pclk_hz = 16000000          # APB2, where USART1 sits. Equal to HSI under reset prescalers, which
+                            # the generator verifies rather than assumes.
+
+# --- control lines ---------------------------------------------------------------------------
+#
+# BOTH USER LEDS ARE ACTIVE LOW and the manual says so outright rather than leaving it to a
+# schematic: a zero written to the port lights the LED. Read backwards, a board's LEDs are ON from
+# reset until a program touches them, so a blink driver's opening write looks like it worked.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "PJ13"
+active = "low"
+source = "UM2033 Rev 5 Table 4: LD1, named USER1, is assigned to PJ13. Section 5.16: to light a LED, a zero low-logic state must be written in the corresponding GPIO register."
+
+[[devices]]
+name = "led1"
+kind = "gpio-out"
+pin = "PJ5"
+active = "low"
+source = "UM2033 Rev 5 Table 4: LD2, named USER2, is assigned to PJ5. Section 5.16: to light a LED, a zero low-logic state must be written in the corresponding GPIO register."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "PA0"
+active = "high"
+source = "UM2033 Rev 5 section 5.16: the blue button B1 is available as a digital input, and when the button is depressed the logic state is 1, otherwise the logic state is 0. Its pin is PA0 -- the manual's pin table gives PA0/WKUP the board label B_USER."

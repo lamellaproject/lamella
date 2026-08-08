@@ -312,6 +312,7 @@ pub struct IncrementalSession {
     context: DeltaContext,
     instance: ObjectRef,
     root_slot: usize,
+    console_watermark: usize,
     compiler: Option<lamella_assemble::Session>,
     lazy_corlib: Option<Vec<u8>>,
 }
@@ -371,6 +372,29 @@ impl IncrementalSession {
             .bootstrap()
             .map_err(|error| format!("cannot emit bootstrap: {error:?}"))?;
         Self::open_from_bytes(&bootstrap, Some(compiler), Some(&corlib), None)
+    }
+
+    /// Opens a compiler-driven incremental session over the reference set DISCOVERED the same way
+    /// [`ReplSession::new`] discovers it -- `LAMELLA_CORLIB`, else a `corlib.dll` beside the
+    /// executable, else `LAMELLA_REF_DIR`. The zero-configuration constructor an interactive
+    /// front end needs.
+    pub fn open_compiler_discovered() -> Result<IncrementalSession, String> {
+        let tools = Toolchain::discover()?;
+        match tools.references.split_first() {
+            None => Err("no reference assemblies were discovered".to_string()),
+            Some((corlib, [])) => Self::open_compiler_with_corlib(corlib),
+            Some(_) => {
+                let assemblies = tools
+                    .references
+                    .iter()
+                    .map(|bytes| {
+                        Assembly::read(bytes)
+                            .map_err(|error| format!("cannot read reference metadata: {error:?}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::open_compiler(&assemblies)
+            }
+        }
     }
 
     /// Opens a compiler-driven incremental session that resolves managed corlib members LAZILY: the
@@ -434,6 +458,7 @@ impl IncrementalSession {
         run(&module, &mut vm, ctor, vec![Value::Object(instance)])
             .map_err(|trap| format!("trap running {REPL_CTOR_NAME}: {trap}"))?;
         let instance = current_instance(&vm, root_slot)?;
+        let vm_output_len = vm.output().len();
 
         Ok(IncrementalSession {
             vm,
@@ -441,6 +466,7 @@ impl IncrementalSession {
             context: DeltaContext::new_at(type_id, name_index, type_index, first_delta_asm),
             instance,
             root_slot,
+            console_watermark: vm_output_len,
             compiler,
             lazy_corlib: lazy_corlib_bytes.map(<[u8]>::to_vec),
         })
@@ -567,6 +593,16 @@ impl IncrementalSession {
         self.instance = current_instance(&self.vm, self.root_slot)?;
 
         Ok(self.display(result))
+    }
+
+    /// The console output written since the last call -- what `Console.WriteLine` produced, as
+    /// opposed to the VALUE display the `submit_*` methods return.
+    pub fn take_console_output(&mut self) -> String {
+        let output = self.vm.output();
+        let fresh = output.get(self.console_watermark..).unwrap_or(&[]);
+        let text = String::from_utf16_lossy(fresh);
+        self.console_watermark = output.len();
+        text
     }
 
     /// Renders a submission's return value for display: void (`None`) as `""`, otherwise exactly

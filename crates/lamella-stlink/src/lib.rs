@@ -16,12 +16,32 @@ pub mod product_id {
     pub const V2: u16 = 0x3748;
     /// ST-Link/V2-1 (on-board on Nucleo/Discovery/EVAL boards; composite with MSD + VCP).
     pub const V2_1: u16 = 0x374b;
-    /// ST-Link/V3 in its various interface combinations.
+    /// The second id ST assigns to the ST-LINK/V2-1 generation (TN1235: "374B or 3752 for
+    /// ST-LINK/V2-1"). On this bench it is an **STLINK-V2EC** -- the V2 generation's USB Type-C
+    /// variant, fitted to the most recent boards of that generation.
+    ///
+    /// Measured on a NUCLEO-C071RB before the document was found, and the two agree: the probe
+    /// reports generation 2 (JTAG v45 / SWIM v30) and enumerates a debug interface and a virtual
+    /// COM port and nothing else.
+    pub const V2EC: u16 = 0x3752;
+    /// An STLINK-V3 WITHOUT bridge functions -- the form embedded on demonstration boards.
     pub const V3E: u16 = 0x374e;
-    /// ST-Link/V3S.
+    /// The second id for an STLINK-V3 without bridge functions (TN1235).
+    pub const V3_NO_BRIDGE_ALT: u16 = 0x3754;
+    /// An STLINK-V3 WITH bridge functions -- the standalone probes (V3SET, V3MODS), which also
+    /// carry a second virtual COM port.
     pub const V3S: u16 = 0x374f;
-    /// ST-Link/V3 with two virtual COM ports.
-    pub const V3_2VCP: u16 = 0x3753;
+    /// The second id for an STLINK-V3 with bridge functions (TN1235).
+    pub const V3_BRIDGE_ALT: u16 = 0x3753;
+    /// STLINK-V3PWR: a V3-family debug probe with an energy-measurement channel.
+    ///
+    /// Read off the device rather than recalled: it enumerates as a composite whose second virtual
+    /// COM port names itself `STLink Virtual COM Port PWR`, which is the probe stating what it is.
+    /// The DEBUG interface is an ordinary V3 one, so nothing above this constant changes.
+    pub const V3PWR: u16 = 0x3757;
+
+    /// Every V3-generation product id, so a caller can search the family rather than one member.
+    pub const V3_FAMILY: [u16; 5] = [V3E, V3_NO_BRIDGE_ALT, V3S, V3_BRIDGE_ALT, V3PWR];
 }
 
 const CMD_GET_VERSION: u8 = 0xf1;
@@ -40,6 +60,12 @@ const DEBUG_WRITEMEM_32BIT: u8 = 0x08;
 const DEBUG_WRITEMEM_8BIT: u8 = 0x0d;
 const DEBUG_APIV2_DRIVE_NRST: u8 = 0x3c;
 const DEBUG_EXIT: u8 = 0x21;
+/// APIv3 only: set / read the communication frequency. A V3 has no default and refuses debug mode
+/// until one is set -- see [`StLink::enter_swd`].
+const DEBUG_APIV3_SET_COM_FREQ: u8 = 0x61;
+const DEBUG_APIV3_GET_COM_FREQ: u8 = 0x62;
+/// The wire the APIv3 frequency commands are being asked about (0 = SWD, 1 = JTAG).
+const COM_FREQ_MODE_SWD: u8 = 0x00;
 /// Sub-command of CMD_DFU: leave firmware-update mode.
 const DFU_EXIT: u8 = 0x07;
 
@@ -51,6 +77,14 @@ const DEBUG_ENTER_SWD: u8 = 0xa3;
 /// Status byte a debug sub-command returns when it succeeded.
 const DEBUG_ERR_OK: u8 = 0x80;
 
+/// The fastest SWD rate [`StLink::enter_swd`] will negotiate on a V3, in kHz.
+///
+/// A ceiling, not a target: the probe's own list decides the value and this only bounds it. Bring-up
+/// runs over flying leads as often as over a board trace, and the fastest rate a probe can name is
+/// not one every wire can carry -- a marginal clock fails as unreliable reads, which is a far worse
+/// failure than a slower link.
+const MAX_NEGOTIATED_KHZ: u32 = 4000;
+
 /// Asks the probe how the LAST read or write actually went.
 ///
 /// This query is not optional bookkeeping: `DEBUG_READMEM_*` and `DEBUG_WRITEMEM_*` report success
@@ -59,17 +93,43 @@ const DEBUG_ERR_OK: u8 = 0x80;
 /// done nothing.
 const DEBUG_APIV2_GETLASTRWSTATUS: u8 = 0x3b;
 
+/// The wider transfer-status query, and the one every current probe actually answers.
+///
+/// Same status byte, in a 12-byte reply that additionally carries the FAULTING ADDRESS at offset 4.
+const DEBUG_APIV2_GETLASTRWSTATUS2: u8 = 0x3e;
+
+/// The oldest V2 JTAG/SWD firmware that answers [`DEBUG_APIV2_GETLASTRWSTATUS2`].
+const FIRST_JTAG_WITH_WIDE_STATUS: u8 = 15;
+
 const DEBUG_ERR_FAULT: u8 = 0x81;
+const DEBUG_ERR_GET_IDCODE: u8 = 0x09;
 const DEBUG_ERR_WRITE: u8 = 0x0c;
 const DEBUG_ERR_WRITE_VERIFY: u8 = 0x0d;
 const DEBUG_ERR_AP_WAIT: u8 = 0x10;
 const DEBUG_ERR_AP_FAULT: u8 = 0x11;
 const DEBUG_ERR_AP_ERROR: u8 = 0x12;
+const DEBUG_ERR_AP_PARITY: u8 = 0x13;
 const DEBUG_ERR_DP_WAIT: u8 = 0x14;
 const DEBUG_ERR_DP_FAULT: u8 = 0x15;
 const DEBUG_ERR_DP_ERROR: u8 = 0x16;
+const DEBUG_ERR_DP_PARITY: u8 = 0x17;
+const DEBUG_ERR_AP_WDATA: u8 = 0x18;
+const DEBUG_ERR_AP_STICKY: u8 = 0x19;
+const DEBUG_ERR_AP_STICKY_OVERRUN: u8 = 0x1a;
+/// The access port named in the transfer does not exist on this target. The one code here that was
+/// observed rather than taken from the reference: reading through access port 7 of an STM32H747
+/// answers exactly this, and names the address it refused.
+const DEBUG_ERR_BAD_AP: u8 = 0x1d;
 
-/// Maps a `GETLASTRWSTATUS` code to the failure it names, or `None` when the transfer completed.
+/// Whether a probe of this firmware vintage answers [`DEBUG_APIV2_GETLASTRWSTATUS2`].
+///
+/// Split out from the transfer path so the DECISION is testable without a probe, the same reason
+/// [`rw_status_failure`] is.
+fn wide_status_supported(stlink: u8, jtag: u8) -> bool {
+    stlink >= 3 || jtag >= FIRST_JTAG_WITH_WIDE_STATUS
+}
+
+/// Maps a transfer-status code to the failure it names, or `None` when the transfer completed.
 ///
 /// Split out from the transfer path so the DECISION is testable without a probe: the wiring is
 /// two lines, this is where a wrong answer would actually live.
@@ -77,14 +137,21 @@ fn rw_status_failure(status: u8) -> Option<&'static str> {
     match status {
         DEBUG_ERR_OK => None,
         DEBUG_ERR_FAULT => Some("the ST-Link reported a transfer fault"),
+        DEBUG_ERR_GET_IDCODE => Some("the ST-Link could not read the target's IDCODE"),
         DEBUG_ERR_WRITE => Some("the ST-Link reported a memory write error"),
         DEBUG_ERR_WRITE_VERIFY => Some("the ST-Link's post-write verify did not match"),
         DEBUG_ERR_AP_WAIT => Some("the access port answered WAIT and the transfer did not complete"),
         DEBUG_ERR_AP_FAULT => Some("the access port answered FAULT -- the address is unmapped, or the bus refused it"),
         DEBUG_ERR_AP_ERROR => Some("the access port reported an error"),
+        DEBUG_ERR_AP_PARITY => Some("the access port's reply failed its parity check"),
         DEBUG_ERR_DP_WAIT => Some("the debug port answered WAIT and the transfer did not complete"),
         DEBUG_ERR_DP_FAULT => Some("the debug port answered FAULT -- check target power and reset"),
         DEBUG_ERR_DP_ERROR => Some("the debug port reported an error"),
+        DEBUG_ERR_DP_PARITY => Some("the debug port's reply failed its parity check"),
+        DEBUG_ERR_AP_WDATA => Some("the access port reported a write-data error"),
+        DEBUG_ERR_AP_STICKY => Some("the access port has a sticky error set from an earlier transfer"),
+        DEBUG_ERR_AP_STICKY_OVERRUN => Some("the access port has a sticky overrun set from an earlier transfer"),
+        DEBUG_ERR_BAD_AP => Some("the target has no such access port"),
         _ => Some("the ST-Link reported an unrecognized transfer status"),
     }
 }
@@ -150,6 +217,9 @@ pub struct Version {
 /// A connected ST-Link.
 pub struct StLink {
     device: Device,
+    /// Whether this probe answers the wider transfer-status query. Resolved from the firmware
+    /// version on first use and remembered, because it is asked after EVERY memory access.
+    wide_status: Option<bool>,
 }
 
 impl StLink {
@@ -179,7 +249,7 @@ impl StLink {
         }
         let device = Device::open_interface(ST_DEBUG_INTERFACE_GUID, ST_VENDOR_ID, product_id, serial)
             .map_err(|_| ProbeError::Device("could not open the ST-Link debug interface"))?;
-        Ok(StLink { device })
+        Ok(StLink { device, wide_status: None })
     }
 
     /// Sends a command and reads `reply_len` bytes back. `command` is zero-padded to the packet size
@@ -261,11 +331,69 @@ impl StLink {
         if matches!(self.current_mode(), Ok(Mode::Dfu)) {
             self.exit_dfu()?;
         }
+        if self.version().is_ok_and(|v| v.stlink >= 3) {
+            self.negotiate_com_freq()?;
+        }
         let reply = self.transact(&[CMD_DEBUG, DEBUG_APIV2_ENTER, DEBUG_ENTER_SWD], 2)?;
         if reply[0] != DEBUG_ERR_OK {
             return Err(ProbeError::Device("ST-Link refused to enter SWD debug mode"));
         }
         Ok(())
+    }
+
+    /// The SWD frequencies (kHz) this probe reports it supports, fastest first (APIv3 only).
+    ///
+    /// The 52-byte reply carries the entry count at offset 8 and the frequencies as little-endian
+    /// 32-bit words from offset 12.
+    pub fn com_frequencies(&mut self) -> Result<Vec<u32>, ProbeError> {
+        let reply = self.transact(&[CMD_DEBUG, DEBUG_APIV3_GET_COM_FREQ, COM_FREQ_MODE_SWD], 52)?;
+        if reply[0] != DEBUG_ERR_OK {
+            return Err(ProbeError::Device("ST-Link refused to report its SWD frequencies"));
+        }
+        let entries = (reply[8] as usize).min((reply.len() - 12) / 4);
+        Ok((0..entries)
+            .map(|i| {
+                let at = 12 + i * 4;
+                u32::from_le_bytes([reply[at], reply[at + 1], reply[at + 2], reply[at + 3]])
+            })
+            .collect())
+    }
+
+    /// Sets the SWD communication frequency in kHz (APIv3 only).
+    pub fn set_com_freq(&mut self, khz: u32) -> Result<(), ProbeError> {
+        let f = khz.to_le_bytes();
+        let reply = self.transact(
+            &[
+                CMD_DEBUG,
+                DEBUG_APIV3_SET_COM_FREQ,
+                COM_FREQ_MODE_SWD,
+                0,
+                f[0],
+                f[1],
+                f[2],
+                f[3],
+            ],
+            8,
+        )?;
+        if reply[0] != DEBUG_ERR_OK {
+            return Err(ProbeError::Device("ST-Link refused the requested SWD frequency"));
+        }
+        Ok(())
+    }
+
+    /// Picks a frequency from the ones the probe REPORTS, and sets it.
+    fn negotiate_com_freq(&mut self) -> Result<(), ProbeError> {
+        let offered = self.com_frequencies()?;
+        let chosen = offered
+            .iter()
+            .copied()
+            .filter(|&khz| khz <= MAX_NEGOTIATED_KHZ)
+            .max()
+            .or_else(|| offered.iter().copied().min())
+            .ok_or(ProbeError::Device(
+                "ST-Link reported no SWD frequencies at all, so none can be selected",
+            ))?;
+        self.set_com_freq(chosen)
     }
 
     /// Reads the target's debug-port IDCODE -- the first thing that proves a TARGET is on the other
@@ -315,15 +443,26 @@ impl StLink {
         Ok(data)
     }
 
+    /// Whether this probe answers the wider transfer-status query, asking the probe once.
+    fn uses_wide_status(&mut self) -> bool {
+        if let Some(known) = self.wide_status {
+            return known;
+        }
+        let wide = self
+            .version()
+            .is_ok_and(|version| wide_status_supported(version.stlink, version.jtag));
+        self.wide_status = Some(wide);
+        wide
+    }
+
     /// Asks the probe whether the last read or write completed, and turns "no" into an error.
-    ///
-    /// Uses `GETLASTRWSTATUS` (APIv2) rather than the newer `GETLASTRWSTATUS2`: the whole crate
-    /// already speaks APIv2 unconditionally, whereas the wider query sits behind a firmware feature
-    /// flag we do not currently interrogate. The 12-byte form additionally reports the faulting
-    /// ADDRESS, which is worth having later -- but not at the cost of a version check this fix does
-    /// not otherwise need.
     fn check_last_rw_status(&mut self) -> Result<(), ProbeError> {
-        let reply = self.transact(&[CMD_DEBUG, DEBUG_APIV2_GETLASTRWSTATUS], 2)?;
+        let (opcode, reply_len) = if self.uses_wide_status() {
+            (DEBUG_APIV2_GETLASTRWSTATUS2, 12)
+        } else {
+            (DEBUG_APIV2_GETLASTRWSTATUS, 2)
+        };
+        let reply = self.transact(&[CMD_DEBUG, opcode], reply_len)?;
         match rw_status_failure(reply[0]) {
             None => Ok(()),
             Some(reason) => Err(ProbeError::Device(reason)),
@@ -476,22 +615,19 @@ impl TargetAccess for StLink {
         StLink::write_word(self, address, value)
     }
 
-    fn read_words(&mut self, address: u32, count: usize) -> Result<Vec<u32>, ProbeError> {
-        let mut out = Vec::with_capacity(count);
+    fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
         let mut address = address;
-        let mut remaining = count;
-        while remaining > 0 {
-            let batch = remaining.min(MAX_TRANSFER / 4);
+        let mut remaining = out;
+        while !remaining.is_empty() {
+            let batch = remaining.len().min(MAX_TRANSFER / 4);
             let bytes = self.read_mem32(address, (batch * 4) as u16)?;
-            out.extend(
-                bytes
-                    .chunks_exact(4)
-                    .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])),
-            );
+            for (slot, word) in remaining[..batch].iter_mut().zip(bytes.chunks_exact(4)) {
+                *slot = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            }
             address += (batch * 4) as u32;
-            remaining -= batch;
+            remaining = &mut remaining[batch..];
         }
-        Ok(out)
+        Ok(())
     }
 
     fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
@@ -643,6 +779,32 @@ mod tests {
                 "unrecognized status 0x{status:02x} must not be treated as success"
             );
         }
+    }
+
+
+    #[test]
+    fn a_v3_takes_the_wide_query_without_consulting_its_jtag_field() {
+        assert!(wide_status_supported(3, 1), "a V3 must take the wide query whatever its JTAG field says");
+        assert!(wide_status_supported(3, 0));
+        assert!(wide_status_supported(4, 0), "a later generation must not fall back either");
+    }
+
+    #[test]
+    fn a_v2_takes_the_wide_query_from_its_firmware_version() {
+        assert!(wide_status_supported(2, 39), "the bench V2-1 (JTAG v39) answers the wide query");
+        assert!(wide_status_supported(2, FIRST_JTAG_WITH_WIDE_STATUS));
+        assert!(!wide_status_supported(2, FIRST_JTAG_WITH_WIDE_STATUS - 1));
+        assert!(!wide_status_supported(2, 0));
+    }
+
+    #[test]
+    fn a_bad_access_port_is_reported_as_a_failure() {
+        assert_eq!(rw_status_failure(DEBUG_ERR_BAD_AP), Some("the target has no such access port"));
+    }
+
+    #[test]
+    fn the_v3s_constant_answer_is_not_success() {
+        assert!(rw_status_failure(0x42).is_some());
     }
 
     #[test]

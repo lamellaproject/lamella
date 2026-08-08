@@ -63,9 +63,9 @@ pub(crate) struct UnencodableUnit {
 /// A well-formed surrogate PAIR combines into one four-byte code point in BOTH -- encoding it as two
 /// three-byte surrogates instead is CESU-8, which passes every vector that does not contain a pair.
 ///
-/// UNDER STRICT `string-utf8` A LONE SURROGATE IS REFUSED, not replaced with U+FFFD. It used to be
-/// replaced, which matched `Encoding.UTF8`'s default fallback and was the wrong rule for this
-/// operation: this is string CONSTRUCTION, which never loses data, and the interpreter now raises
+/// UNDER STRICT `string-utf8` A LONE SURROGATE IS REFUSED, not replaced with U+FFFD. Replacing it
+/// would match `Encoding.UTF8`'s default fallback, which is the wrong rule for this
+/// operation: this is string CONSTRUCTION, which never loses data, and the interpreter raises
 /// `EncoderFallbackException` rather than substituting. A REFUSAL rather than a mirror of that throw,
 /// because the AOT knows the offending unit at COMPILE time -- every unit reaching this encoder comes
 /// from a literal in the metadata, since the built-string helpers join storage bytes and never
@@ -1494,9 +1494,9 @@ mod tests {
     }
 
 
-    /// `"x" + (string)null` is `"x"` in .NET, and this helper's very first instruction used to be
-    /// `a.length` -- a `FieldLoad` through a null pointer. `string-concat-object` printed 13 correct
-    /// lines and then died on `"param=" + ex.ParamName`.
+    /// `"x" + (string)null` is `"x"` in .NET, so this helper cannot open with `a.length` -- that is a
+    /// `FieldLoad` through a null pointer, and a program concatenating a null string dies on it after
+    /// however many correct lines preceded it.
     ///
     /// PINS THE INVARIANT, NOT THE INSTRUCTION LIST: no read of either operand may name the raw
     /// parameter. Every length read, every element read, and (under a byte tier) every storage-address
@@ -1678,9 +1678,9 @@ mod tests {
     /// itself; and strict UTF-8 REFUSES it. Asserted in all three directions so none can quietly become
     /// another.
     ///
-    /// The strict arm used to assert `[0xEF, 0xBF, 0xBD]` -- U+FFFD, the silent replacement. That is
-    /// the assertion this change inverts: substituting is `Encoding.UTF8`'s default fallback and the
-    /// wrong rule for string CONSTRUCTION, which never loses data.
+    /// The strict arm must NOT accept `[0xEF, 0xBF, 0xBD]` -- U+FFFD, the silent replacement.
+    /// Substituting is `Encoding.UTF8`'s default fallback and the wrong rule for string
+    /// CONSTRUCTION, which never loses data.
     #[test]
     fn a_lone_surrogate_separates_the_three_tiers() {
         let encoded = encode_string_bytes(&[0xD800]);

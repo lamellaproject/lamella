@@ -109,6 +109,18 @@ pub enum DapError {
     },
     /// A transfer returned a non-OK acknowledge.
     Ack(Ack),
+    /// The probe does not implement the command sent (it replied `0xFF` rather than echoing).
+    Unsupported {
+        /// The command id the probe refused.
+        command: u8,
+    },
+    /// The probe accepted the command and reported that it FAILED: a non-`DAP_OK` status byte.
+    Status {
+        /// The command id sent.
+        command: u8,
+        /// The status byte returned (`0xFF` is `DAP_ERROR`; other values are undefined).
+        status: u8,
+    },
     /// An operation polled past its limit without completing (names what was awaited).
     Timeout(&'static str),
     /// The target device reported an operation failure (names the device-side condition) --
@@ -128,6 +140,14 @@ impl std::fmt::Display for DapError {
                 )
             }
             DapError::Ack(ack) => write!(f, "transfer not acknowledged: {ack:?}"),
+            DapError::Unsupported { command } => write!(
+                f,
+                "the probe does not implement command {command:#04x}"
+            ),
+            DapError::Status { command, status } => {
+                let meaning = if *status == proto::DAP_ERROR { " (DAP_ERROR)" } else { "" };
+                write!(f, "command {command:#04x} failed: status {status:#04x}{meaning}")
+            }
             DapError::Timeout(what) => write!(f, "timed out waiting for {what}"),
             DapError::Device(what) => write!(f, "target device error: {what}"),
         }
@@ -192,7 +212,8 @@ impl<T: Transport> Dap<T> {
         &self.transport
     }
 
-    /// Sends a command and returns the reply slice, checking the command-id echo.
+    /// Sends a command and returns the reply slice, checking the command-id echo AND the reply's
+    /// status.
     ///
     /// A MISMATCHED ECHO IS RESYNCHRONIZED, NOT REPORTED, and that is what makes a probe
     /// recoverable. Replies are strictly ordered one per command, so an echo that names a
@@ -207,18 +228,32 @@ impl<T: Transport> Dap<T> {
         let want = request.first().copied().unwrap_or(0);
         let mut got = 0;
         let mut matched = None;
+        let mut refused = false;
         for _ in 0..=STALE_REPLY_LIMIT {
-            let n = self.transport.read_packet(&mut self.reply)?;
+            let n = match self.transport.read_packet(&mut self.reply) {
+                Ok(n) => n,
+                Err(_) if refused => return Err(DapError::Unsupported { command: want }),
+                Err(e) => return Err(e.into()),
+            };
             got = self.reply.first().copied().unwrap_or(0);
             if got == want {
                 matched = Some(n);
                 break;
             }
+            refused |= got == proto::INVALID_COMMAND;
         }
-        match matched {
-            Some(n) => Ok(&self.reply[..n]),
-            None => Err(DapError::Unexpected { expected: want, got }),
+        let n = match matched {
+            Some(n) => n,
+            None if refused => return Err(DapError::Unsupported { command: want }),
+            None => return Err(DapError::Unexpected { expected: want, got }),
+        };
+        if proto::has_status_byte(want) {
+            let status = self.reply.get(1).copied().unwrap_or(proto::DAP_ERROR);
+            if status != proto::DAP_OK {
+                return Err(DapError::Status { command: want, status });
+            }
         }
+        Ok(&self.reply[..n])
     }
 
     /// Reads a `DAP_Info` string from the probe itself (no target involved): `id` 0x01 vendor,
@@ -240,6 +275,22 @@ impl<T: Transport> Dap<T> {
         Ok(reply.get(2..2 + len).unwrap_or(&[]).to_vec())
     }
 
+    /// Asks the probe for `port` and confirms it actually selected it.
+    ///
+    /// `DAP_Connect` answers with the port it initialized rather than a status byte, and
+    /// [`proto::CONNECT_FAILED`] is how it reports that it could not. That is a refusal in a field
+    /// nothing was reading: a probe with no SWD support, or one whose mode is pinned to JTAG,
+    /// answered "failed" and every subsequent transaction then failed for its own reasons, none of
+    /// which named the connect.
+    fn connect_port(&mut self, port: Port) -> Result<(), DapError> {
+        let reply = self.command(&proto::connect(port))?;
+        match reply.get(1).copied().unwrap_or(proto::CONNECT_FAILED) {
+            proto::CONNECT_FAILED => Err(DapError::Device("probe could not initialize SWD mode")),
+            got if got != port as u8 => Err(DapError::Device("probe selected a different port")),
+            _ => Ok(()),
+        }
+    }
+
     /// Connects to the target over SWD: select the port, set the clock, then send the
     /// line-reset and JTAG-to-SWD switch sequence (ADIv5). Clocks at 1 MHz; see
     /// [`connect_swd_at`](Self::connect_swd_at) to choose the rate.
@@ -254,7 +305,7 @@ impl<T: Transport> Dap<T> {
     /// perfectly at a few hundred kHz -- a failure that looks exactly like bad wiring while the
     /// wiring is fine.
     pub fn connect_swd_at(&mut self, clock_hz: u32) -> Result<(), DapError> {
-        self.command(&proto::connect(Port::Swd))?;
+        self.connect_port(Port::Swd)?;
         self.command(&proto::swj_clock(clock_hz))?;
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
         self.command(&proto::swj_sequence(16, &[0x9e, 0xe7]))?;
@@ -271,13 +322,15 @@ impl<T: Transport> Dap<T> {
     ///
     /// The alert value and the `0x1A` activation code are Arm-architectural constants (every SWD-DP
     /// recognizes them); the bit stream is least-significant-bit-first, matching every other SWD sequence.
-    /// This wakes a SINGLE debug port; a part that puts several targets on ONE SWD bus additionally needs a
-    /// DP `TARGETSEL` write to pick one (multi-drop), and an ADIv6 DP addresses its APs by address rather
-    /// than the ADIv5 `APSEL` field -- both are unsupported here
-    /// (their `TARGETSEL` no-acknowledge write and the ADIv6 `SELECT` encoding cannot be confirmed against a
-    /// mock alone, and shipping unverified wire protocol would be worse than a clear seam).
+    ///
+    /// This wakes the bus, not a particular port. On a part that puts several debug ports on ONE SWD bus
+    /// every port stays tristated until one is addressed, so follow this with
+    /// [`select_multidrop_target`](Self::select_multidrop_target). An ADIv6 DP, which addresses its APs
+    /// by address rather than by the ADIv5 `APSEL` field, is not supported: this crate does not ship wire
+    /// protocol it has not exercised against the part, because a plausible-looking sequence that is wrong
+    /// costs more to find than an absent one.
     pub fn connect_swd_from_dormant(&mut self) -> Result<(), DapError> {
-        self.command(&proto::connect(Port::Swd))?;
+        self.connect_port(Port::Swd)?;
         self.command(&proto::swj_clock(1_000_000))?;
         self.command(&proto::swj_sequence(8, &[0xff]))?;
         self.command(&proto::swj_sequence(128, &DORMANT_TO_SWD_ALERT))?;
@@ -285,6 +338,66 @@ impl<T: Transport> Dap<T> {
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
         self.command(&proto::swj_sequence(8, &[0x00]))?;
         Ok(())
+    }
+
+    /// Releases the debug port: the probe stops driving SWCLK/SWDIO and the target is left to run.
+    ///
+    /// **A diagnostic that connects and never releases can leave a board unusable**, and it looks
+    /// like the board's fault rather than the tool's: a debug port abandoned mid-transaction can
+    /// stop the application running and the device enumerating, so the next person sees dead
+    /// hardware rather than a tool that did not tidy up. Any tool that only inspects should end
+    /// here, and one whose sequence may fail partway should end here on the failing path too.
+    pub fn release(&mut self) -> Result<(), DapError> {
+        self.command(&proto::disconnect())?;
+        Ok(())
+    }
+
+    /// Reads the current levels of the probe's SWD pins, without driving anything.
+    ///
+    /// The one diagnostic that separates "the target is not answering" from "there is no target":
+    /// every transaction failure looks identical on a bus with nothing attached, so a run that
+    /// concludes anything about a wire protocol should be able to say the wire exists first.
+    ///
+    /// Bit 0 is SWCLK, bit 1 SWDIO, bit 7 nRESET (CMSIS-DAP `DAP_SWJ_Pins`).
+    pub fn read_swd_pins(&mut self) -> Result<u8, DapError> {
+        let reply = self.command(&proto::swj_pins(0, 0, 0))?;
+        Ok(reply.get(1).copied().unwrap_or(0))
+    }
+
+    /// Selects ONE debug port on a shared multi-drop SWD bus, then confirms it answers.
+    ///
+    /// # Why this exists, and why it is a bit sequence rather than a transfer
+    ///
+    /// A part that puts several debug ports on one SWD bus gives each an address, and **every port
+    /// tristates its outputs until one is addressed** -- so on such a part nothing responds at all
+    /// until this runs, including the `DPIDR` read that would normally prove the link.
+    ///
+    /// The select write is the one DP write **nobody acknowledges**: the ports that were not
+    /// addressed have gone quiet, and the one that was has not yet taken over the bus, so the three
+    /// acknowledge bits are driven by no one. A normal `DAP_Transfer` reports that as a protocol
+    /// fault, which is why this is driven as a raw bit sequence instead.
+    ///
+    /// # The sequence, and the one thing that has to be RELEASED rather than driven
+    ///
+    /// A line reset first (a select is only honored from the reset state) and at least two idle
+    /// cycles, then the 8-bit write request for DP register `0x0C`, then five bits of
+    /// turnaround-and-acknowledge, then the 32-bit address with even parity.
+    pub fn select_multidrop_target(&mut self, target_id: u32) -> Result<u32, DapError> {
+        use proto::SwdPhase;
+        const SELECT_REQUEST: u8 = 0x99;
+
+        self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
+        self.command(&proto::swj_sequence(8, &[0x00]))?;
+
+        let mut data = target_id.to_le_bytes().to_vec();
+        data.push(u8::from(target_id.count_ones() % 2 == 1));
+        self.command(&proto::swd_sequence(&[
+            SwdPhase::Out { cycles: 8, data: &[SELECT_REQUEST] },
+            SwdPhase::In { cycles: 5 },
+            SwdPhase::Out { cycles: 33, data: &data },
+        ]))?;
+
+        self.read_idcode()
     }
 
     /// Reads the Debug Port `IDCODE` (`DPIDR`) -- the first transaction after connecting,
@@ -699,6 +812,9 @@ impl From<DapError> for lamella_probe_core::ProbeError {
             DapError::Ack(ack) => P::Ack(ack.into()),
             DapError::Timeout(what) => P::Timeout(what),
             DapError::Device(what) => P::Device(what),
+            refusal @ (DapError::Unsupported { .. } | DapError::Status { .. }) => {
+                P::Protocol(refusal.to_string())
+            }
         }
     }
 }
@@ -753,27 +869,27 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
         Ok(())
     }
 
-    /// The read counterpart of [`write_ap_block`](Self::write_ap_block).
-    fn read_ap_block(
+    /// The read counterpart of [`write_ap_block`](Self::write_ap_block), streaming straight into the
+    /// caller's buffer so a bulk read allocates nothing at any layer.
+    fn read_ap_block_into(
         &mut self,
         address: u8,
-        count: usize,
-    ) -> Result<Vec<u32>, lamella_probe_core::ProbeError> {
+        out: &mut [u32],
+    ) -> Result<(), lamella_probe_core::ProbeError> {
         /// 64-byte reply packet: 4 header bytes + 14 x 4-byte values.
         const WORDS_PER_PACKET: usize = 14;
-        let mut out = Vec::with_capacity(count);
-        let mut remaining = count;
-        while remaining > 0 {
-            let batch = remaining.min(WORDS_PER_PACKET);
+        let mut remaining = out;
+        while !remaining.is_empty() {
+            let batch = remaining.len().min(WORDS_PER_PACKET);
             let reply =
                 self.command(&proto::transfer_block_read(proto::ap_read(address), batch as u16))?;
-            let (done, ack) = proto::parse_block_read(reply, &mut out)?;
+            let (done, ack) = proto::parse_block_read(reply, &mut remaining[..batch])?;
             if ack != Ack::Ok || done as usize != batch {
                 return Err(lamella_probe_core::ProbeError::Ack(ack.into()));
             }
-            remaining -= batch;
+            remaining = &mut remaining[batch..];
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -831,6 +947,73 @@ pub mod testing {
 mod tests {
     use super::testing::{Mock, echo};
     use super::*;
+    use lamella_probe_core::DapAccess;
+
+    /// A `DAP_TransferBlock` read reply: the command byte, the completed count, an OK acknowledge,
+    /// then one little-endian word per completed transfer.
+    fn block_reply(words: &[u32]) -> Vec<u8> {
+        let mut v = vec![proto::cmd::TRANSFER_BLOCK];
+        v.extend_from_slice(&(words.len() as u16).to_le_bytes());
+        v.push(0x01);
+        for word in words {
+            v.extend_from_slice(&word.to_le_bytes());
+        }
+        v
+    }
+
+    /// A block read LONGER THAN ONE PROBE PACKET must land every word in its own slot, in order,
+    /// across the packet boundary.
+    ///
+    /// This is the bulk path every flash program and verify rides, and nothing exercised
+    /// it: an off-by-one in the chunking would corrupt a deploy while every unit test stayed green,
+    /// and the first instrument to notice would be a flash verify failing on real silicon.
+    #[test]
+    fn block_read_spans_packets_and_preserves_order() {
+        const PER_PACKET: usize = 14;
+        const TOTAL: usize = 20;
+
+        let expected: Vec<u32> = (0..TOTAL as u32).map(|i| 0xa000_0000 + i).collect();
+        let replies = vec![block_reply(&expected[..PER_PACKET]), block_reply(&expected[PER_PACKET..])];
+
+        let mut dap = Dap::new(Mock::new(replies));
+        let mut out = [0u32; TOTAL];
+        dap.read_ap_block_into(0x0c, &mut out).unwrap();
+
+        assert_eq!(out.to_vec(), expected, "words must arrive in order across the packet boundary");
+
+        let sent = &dap.transport().sent;
+        assert_eq!(sent.len(), 2, "20 words is two packets");
+        assert_eq!(sent[0], proto::transfer_block_read(proto::ap_read(0x0c), PER_PACKET as u16).to_vec());
+        assert_eq!(
+            sent[1],
+            proto::transfer_block_read(proto::ap_read(0x0c), (TOTAL - PER_PACKET) as u16).to_vec()
+        );
+    }
+
+    /// A reply carrying more words than the caller's buffer is refused, never written past the end.
+    #[test]
+    fn block_read_refuses_a_reply_longer_than_the_buffer() {
+        let mut out = [0u32; 2];
+        let reply = block_reply(&[1, 2, 3, 4]);
+        assert!(proto::parse_block_read(&reply, &mut out).is_err());
+    }
+
+    #[test]
+    fn block_read_refuses_a_short_transfer_and_leaves_no_partial_fill() {
+        const SENTINEL: u32 = 0xdead_beef;
+        let mut out = [SENTINEL; 4];
+        let reply = block_reply(&[0x1111_1111, 0x2222_2222]);
+        let mut dap = Dap::new(Mock::new(vec![reply]));
+
+        let result = dap.read_ap_block_into(0x0c, &mut out);
+
+        assert!(result.is_err(), "a transfer count below the request must not be reported as success");
+        assert_eq!(
+            out[2..],
+            [SENTINEL, SENTINEL],
+            "the tail the probe never sent must not be presented as data"
+        );
+    }
 
     #[test]
     fn connect_then_read_idcode() {
@@ -875,7 +1058,17 @@ mod tests {
     #[test]
     fn a_stale_reply_is_discarded_and_the_command_still_answers() {
         let replies = vec![
-            vec![0xff, 0, 0],
+            echo(proto::cmd::SWJ_CLOCK, &[0x00]),
+            vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x77, 0x14, 0xb1, 0x0b],
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        assert_eq!(dap.read_idcode().unwrap(), 0x0bb1_1477);
+    }
+
+    #[test]
+    fn a_stale_refusal_is_still_only_backlog_when_the_real_echo_is_behind_it() {
+        let replies = vec![
+            vec![proto::INVALID_COMMAND, 0, 0],
             vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x77, 0x14, 0xb1, 0x0b],
         ];
         let mut dap = Dap::new(Mock::new(replies));
@@ -884,9 +1077,72 @@ mod tests {
 
     #[test]
     fn a_probe_that_never_echoes_the_command_is_still_an_error() {
-        let replies = vec![vec![0xff, 0, 0]; STALE_REPLY_LIMIT + 1];
+        let replies = vec![vec![proto::cmd::TRANSFER_BLOCK, 0, 0]; STALE_REPLY_LIMIT + 1];
         let mut dap = Dap::new(Mock::new(replies));
         assert!(matches!(dap.read_idcode(), Err(DapError::Unexpected { .. })));
+    }
+
+    #[test]
+    fn an_unimplemented_command_is_named_rather_than_timing_out() {
+        let mut dap = Dap::new(Mock::new(vec![
+            echo(proto::cmd::SWJ_SEQUENCE, &[proto::DAP_OK]),
+            echo(proto::cmd::SWJ_SEQUENCE, &[proto::DAP_OK]),
+            vec![proto::INVALID_COMMAND, 0x00],
+        ]));
+        let err = dap.select_multidrop_target(0x0100_2927).unwrap_err();
+        assert!(
+            matches!(err, DapError::Unsupported { command } if command == proto::cmd::SWD_SEQUENCE),
+            "expected an Unsupported naming DAP_SWD_Sequence, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_dap_error_status_fails_the_command_that_earned_it() {
+        let replies = vec![
+            echo(proto::cmd::CONNECT, &[Port::Swd as u8]),
+            echo(proto::cmd::SWJ_CLOCK, &[proto::DAP_ERROR]),
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        let err = dap.connect_swd().unwrap_err();
+        assert!(
+            matches!(err, DapError::Status { command, status }
+                if command == proto::cmd::SWJ_CLOCK && status == proto::DAP_ERROR),
+            "expected a Status naming DAP_SWJ_Clock, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_status_check_does_not_fire_on_a_reply_whose_second_byte_is_not_a_status() {
+        let mut dap = Dap::new(Mock::new(vec![
+            echo(proto::cmd::INFO, &[0x04, b'v', b'1', b'.', b'0']),
+            echo(proto::cmd::SWJ_PINS, &[proto::PIN_SWDIO]),
+            vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x77, 0x14, 0xb1, 0x0b],
+            echo(proto::cmd::CONNECT, &[Port::Swd as u8]),
+        ]));
+        assert_eq!(dap.info_string(0x01).unwrap(), "v1.0");
+        assert_eq!(dap.read_swd_pins().unwrap(), proto::PIN_SWDIO);
+        assert_eq!(dap.read_idcode().unwrap(), 0x0bb1_1477);
+        dap.connect_port(Port::Swd).unwrap();
+    }
+
+    #[test]
+    fn reading_the_swd_pins_returns_the_levels_and_not_the_echoed_command_id() {
+        let mut dap = Dap::new(Mock::new(vec![echo(
+            proto::cmd::SWJ_PINS,
+            &[proto::PIN_SWDIO | proto::PIN_NRESET],
+        )]));
+        let pins = dap.read_swd_pins().unwrap();
+        assert_eq!(pins, proto::PIN_SWDIO | proto::PIN_NRESET);
+        assert_ne!(pins, proto::cmd::SWJ_PINS, "the echoed command id, not the pin levels");
+    }
+
+    #[test]
+    fn a_probe_that_could_not_select_swd_says_so_at_the_connect() {
+        let mut dap = Dap::new(Mock::new(vec![echo(
+            proto::cmd::CONNECT,
+            &[proto::CONNECT_FAILED],
+        )]));
+        assert!(matches!(dap.connect_swd(), Err(DapError::Device(_))));
     }
 
     #[test]

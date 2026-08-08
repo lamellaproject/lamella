@@ -1,0 +1,17 @@
+# PIN map for the SAM4E family: pin x function -> (instance, signal), or -> nothing. PARTIAL and
+# evidence-only -- a row joins when a binding needs it, and a row naming a pin outside every part's
+# present-list is refused.
+#
+# EMPTY OF ROWS, AND THAT IS A PROPERTY OF WHAT THIS FAMILY HAS BOUND SO FAR. The only pins placed
+# are a board's LED and user button, and a control pin rides no alternate function -- it is driven
+# as a plain output or read as a plain input, so it needs no cell here.
+#
+# WHEN ROWS DO ARRIVE THEY WILL COVER SIGNALS THE SIBLING SERIES HAVE NO PINS FOR AT ALL: this part
+# carries an Ethernet MAC and two CAN controllers, and neither the SAM4S nor the SAM4N has either.
+
+[table]
+kind = "pins"
+family = "sam4e"
+sources = [
+    "SAM4E Series datasheet (Atmel-11157): the I/O line peripheral multiplexing tables, for rows when a binding needs them",
+]

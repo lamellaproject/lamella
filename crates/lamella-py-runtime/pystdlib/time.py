@@ -8,6 +8,10 @@
 # `time()` is the WALL clock and can jump when the system clock is adjusted; `monotonic()` cannot go
 # backwards but has an arbitrary origin, so only differences of it mean anything. `perf_counter()` is
 # the same source as `monotonic()` here, which the standard permits.
+#
+# NOT PROVIDED: the calendar surface (`localtime`, `gmtime`, `mktime`, `strftime`, `struct_time`),
+# which needs a timezone database and a civil-calendar conversion rather than a wrapper over a
+# counter.
 import _time
 
 _NS_PER_SECOND = 1000000000

@@ -1,0 +1,21 @@
+# PARTS table for the SAM4E family: this vendor's connectivity SAM4, with an Ethernet MAC and dual
+# CAN that its siblings do not carry. The pin present-list is PARTIAL and evidence-only.
+
+[table]
+kind = "parts"
+family = "sam4e"
+sources = [
+    "SAM4E Series datasheet (Atmel-11157) table 49-1 ordering codes: ATSAM4E16EA-AU is 1024 KB flash, 128 KB RAM, LQFP144",
+]
+notes = [
+    "THE ORDERING TABLE'S SIZE COLUMNS ARE MERGED CELLS SPANNING A ROW GROUP, so pulling the characters out of that page in reading order drops them entirely and leaves every ordering code with no flash or RAM beside it. The figures here were read from the page as laid out.",
+    "THIS CORE HAS A FLOATING POINT UNIT where the SAM4S and SAM4N cores do not, and nothing in this table states that. The parts schema can carry an instruction-set profile, but its validation is written for RISC-V profile names and refuses anything else, so there is no way here to say that one ARM part has hardware floating point and its sibling does not. Recorded as a gap rather than worked around.",
+]
+
+[[parts]]
+part = "atsam4e16e"
+package = "LQFP144"
+flash = 0x100000
+ram = 0x20000
+pins = ["PA2", "PD22"]
+source = "SAM4E Series datasheet (Atmel-11157) table 49-1: ATSAM4E16EA-AU / ATSAM4E16EA-AUR, 1024 KB flash, 128 KB RAM, LQFP144. The E suffix is the 144-pin member; the same table's ATSAM4E16C rows are the 100-pin part at the same two sizes. The pin list is PARTIAL: PA2 and PD22 are here because a board's control lines place them, each cited on its own row in that board file."

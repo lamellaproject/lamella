@@ -55,7 +55,9 @@ compile = [
 ]
 # Adds the in-page AOT exporter (lamella_aot_build: CIL -> a flashable chip image, e.g. micro:bit, or
 # a .wasm widget) so Studio compiles the user's C# all the way to a microcontroller image client-side.
-aot = ["dep:lamella-aot"]
+# serde_json carries the build's `{ error }` envelope, so a failed lowering reports WHY to the page
+# instead of collapsing into an empty buffer.
+aot = ["dep:lamella-aot", "dep:serde_json"]
 # Adds the in-page Python runner (lamella_py_run: Python source -> compile + run main() -> rendered
 # result + diagnostics) so Studio compiles + runs the user's Python client-side. Off by default.
 py = ["dep:lamella-py-frontend", "dep:lamella-py-runtime"]

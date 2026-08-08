@@ -8,10 +8,11 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use lamella_syntax::version::LanguageVersion;
 use lamella_binder::{
-    Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, ConversionKind,
+    Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, CodeNamespace, ConversionKind,
     Diagnostic as BinderDiagnostic, FieldReference, Model, SpecialType, TypeSymbol,
-    bind_compilation_unit_with_references_and_options, bind_type, collect_into, load_assembly,
+    bind_compilation_unit_with_dialect, bind_type, collect_into, load_assembly,
     parameter_symbol, resolve_constants,
 };
 use lamella_cil::{Instruction, MethodBodyImage, encode_with_offsets, write_method_body};
@@ -19,8 +20,9 @@ use lamella_metadata::signature::element;
 use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_name};
 use lamella_pe::{
     DebugDocument, ImageBuilder, LocalVariable, MethodDebug, SequencePoint, TypeSig,
-    field_signature, local_signature, method_signature, property_signature, type_signature,
-    vararg_call_site_signature, vararg_method_signature,
+    field_signature, generic_method_signature, local_signature, method_signature,
+    method_spec_signature, property_signature, type_signature, vararg_call_site_signature,
+    vararg_method_signature,
 };
 use lamella_syntax::ast::{
     AssignmentOperator, AttributeArgument, AttributeSection, CompilationUnit, ConstructorInitializer,
@@ -90,11 +92,15 @@ const ENUM_VALUE_FIELD_FLAGS: u16 = FIELD_PUBLIC | 0x0200 | 0x0400;
 const ENUM_MEMBER_FIELD_FLAGS: u16 = FIELD_PUBLIC | FIELD_STATIC | FIELD_LITERAL | FIELD_HAS_DEFAULT;
 
 /// A diagnostic from any stage of compilation -- parsing or binding -- reduced to
-/// what a driver reports: the `CSxxxx` code, the rendered message, and the span.
+/// what a driver reports: the code with its namespace, the rendered message, and the span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
-    /// The C# compiler code (`CSxxxx`).
+    /// The numeric part of the code. Render it with [`Diagnostic::namespace`]'s prefix, never with
+    /// a hard-coded `CS` -- not every diagnostic lcsc emits is one csc has a concept of.
     pub code: u16,
+    /// Which namespace the code belongs to: `CS` where csc shares the condition, `LAM` where it
+    /// does not.
+    pub namespace: CodeNamespace,
     /// Whether it stops compilation (an error) or not (a warning).
     pub severity: Severity,
     /// The rendered message.
@@ -107,6 +113,7 @@ impl Diagnostic {
     pub(crate) fn from_syntax(diagnostic: &SyntaxDiagnostic) -> Diagnostic {
         Diagnostic {
             code: diagnostic.code(),
+            namespace: CodeNamespace::Cs,
             severity: diagnostic.severity(),
             message: format!("{}", diagnostic.kind),
             span: diagnostic.span,
@@ -116,6 +123,7 @@ impl Diagnostic {
     pub(crate) fn from_binder(diagnostic: &BinderDiagnostic) -> Diagnostic {
         Diagnostic {
             code: diagnostic.code(),
+            namespace: diagnostic.namespace(),
             severity: diagnostic.severity(),
             message: format!("{}", diagnostic.kind),
             span: diagnostic.span,
@@ -159,7 +167,7 @@ pub fn compile_unit_with_references(
     assembly_name: &str,
     references: &[Assembly],
 ) -> Compilation {
-    compile(unit, module_name, assembly_name, references, None, false, false, false)
+    compile(unit, module_name, assembly_name, references, None, false, false, false, LanguageVersion::DEFAULT)
 }
 
 /// Like [`compile_unit_with_references`], but also emits a standalone Portable PDB
@@ -183,6 +191,7 @@ pub fn compile_unit_with_debug(
         false,
         false,
         false,
+        LanguageVersion::DEFAULT,
     )
 }
 
@@ -224,6 +233,7 @@ pub fn compile_source_with(
     options: LexOptions,
 ) -> Compilation {
     let native_interop = options.native_interop;
+    let language_version = options.version;
     let unsafe_option_missing = !options.unsafe_code;
     let embed_pdb = options.embed_pdb;
     let parsed = parse_compilation_unit_with(source, options);
@@ -250,6 +260,7 @@ pub fn compile_source_with(
         native_interop,
         unsafe_option_missing,
         embed_pdb,
+        language_version,
     );
     if !parse_diagnostics.is_empty() {
         let mut diagnostics = parse_diagnostics;
@@ -268,9 +279,10 @@ fn compile(
     native_interop: bool,
     unsafe_option_missing: bool,
     embed_pdb: bool,
+    language_version: LanguageVersion,
 ) -> Compilation {
     let diagnostics: Vec<Diagnostic> =
-        bind_compilation_unit_with_references_and_options(unit, references, unsafe_option_missing)
+        bind_compilation_unit_with_dialect(unit, references, unsafe_option_missing, language_version)
         .iter()
         .map(Diagnostic::from_binder)
         .collect();
@@ -337,6 +349,7 @@ pub fn compile_sources_with(
     let mut units: Vec<CompilationUnit> = Vec::with_capacity(sources.len());
     let mut syntax_error = false;
     let native_interop = options.native_interop;
+    let language_version = options.version;
     let embed_pdb = options.embed_pdb;
     let unsafe_option_missing = !options.unsafe_code;
     for (source, _path) in sources {
@@ -816,6 +829,7 @@ fn emit_one_attribute(
             return_type: TypeSymbol::Special(SpecialType::Void),
             is_static: false,
             is_vararg: false,
+            instantiation: None,
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
@@ -895,10 +909,9 @@ fn encode_value(
         if let Some(constant) = binder
             .model()
             .get_by_symbol(enclosing)
-            .and_then(|info| info.find_field(name))
-            .and_then(|field| field.constant.as_ref())
+            .and_then(|info| info.find_field(name).and_then(|f| f.constant.clone()))
         {
-            return encode_literal(constant, &resolved, blob);
+            return encode_literal(&constant, &resolved, blob);
         }
     }
     match &expr.kind {
@@ -1151,10 +1164,9 @@ fn is_reference_base_class(ty: &TypeSymbol) -> bool {
 fn enum_underlying(model: &Model, enum_ty: &TypeSymbol) -> SpecialType {
     match model
         .get_by_symbol(enum_ty)
-        .and_then(|info| info.find_field("value__"))
-        .map(|field| &field.ty)
+        .and_then(|info| info.find_field("value__").map(|field| field.ty.clone()))
     {
-        Some(TypeSymbol::Special(special)) => *special,
+        Some(TypeSymbol::Special(special)) => special,
         _ => SpecialType::Int32,
     }
 }
@@ -1517,8 +1529,12 @@ fn emit_interface(
     declaration: &TypeDecl,
 ) -> Result<(), crate::EmitError> {
     let nil = Token::new(TYPE_DEF, 0);
-    let type_token = image.add_type(namespace, &declaration.name, nil, INTERFACE_FLAGS);
-    let own = named_symbol(namespace, &declaration.name);
+    let type_token = image.add_type(namespace, &declared_type_name(declaration), nil, INTERFACE_FLAGS);
+    let enclosing = declared_type_symbol(namespace, declaration);
+    for (number, parameter) in declaration.type_parameters.iter().enumerate() {
+        image.add_generic_param(type_token, number as u16, 0, &parameter.name);
+    }
+    let own = declared_type_symbol(namespace, declaration);
     let direct: Vec<TypeSymbol> = binder
         .model()
         .get_by_symbol(&own)
@@ -1553,12 +1569,12 @@ fn emit_interface(
         {
             let parameter_sigs: Vec<TypeSig> = parameters
                 .iter()
-                .map(|parameter| type_sig(tokens, &parameter_symbol(parameter)))
+                .map(|parameter| member_type_sig(tokens, &enclosing, &parameter_symbol(parameter)))
                 .collect::<Result<_, _>>()?;
             let signature = method_signature(
                 true,
                 &parameter_sigs,
-                &type_sig(tokens, &bind_type(return_type))?,
+                &member_type_sig(tokens, &enclosing, &bind_type(return_type))?,
             );
             image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS);
         }
@@ -1570,7 +1586,7 @@ fn emit_interface(
         } = member
         {
             let property_ty = bind_type(ty);
-            let element = type_sig(tokens, &property_ty)?;
+            let element = member_type_sig(tokens, &enclosing, &property_ty)?;
             let property = image.add_property(name, &property_signature(true, &[], &element), 0);
             if getter.is_some() {
                 let signature = method_signature(true, &[], &element);
@@ -1602,10 +1618,10 @@ fn emit_interface(
         } = member
         {
             let name = indexer_name(attributes);
-            let element = type_sig(tokens, &bind_type(ty))?;
+            let element = member_type_sig(tokens, &enclosing, &bind_type(ty))?;
             let indices: Vec<TypeSig> = parameters
                 .iter()
-                .map(|parameter| type_sig(tokens, &bind_type(&parameter.ty)))
+                .map(|parameter| member_type_sig(tokens, &enclosing, &bind_type(&parameter.ty)))
                 .collect::<Result<_, _>>()?;
             let property =
                 image.add_property(&name, &property_signature(true, &indices, &element), 0);
@@ -1649,7 +1665,7 @@ fn emit_interface(
                     .ok_or(crate::EmitError::Unsupported(
                         "an interface event whose delegate type has no metadata token",
                     ))?;
-            let signature = method_signature(true, &[type_sig(tokens, &event_ty)?], &TypeSig::Void);
+            let signature = method_signature(true, &[member_type_sig(tokens, &enclosing, &event_ty)?], &TypeSig::Void);
             for declarator in declarators {
                 let event = image.add_event(&declarator.name, event_type_token);
                 let add = image.add_abstract_method(
@@ -1895,19 +1911,18 @@ fn emit_type(
     debug: Option<&DebugContext>,
 ) -> Result<(), crate::EmitError> {
     let is_struct = declaration.kind == TypeKind::Struct;
-    let enclosing = named_symbol(namespace, &declaration.name);
+    let enclosing = declared_type_symbol(namespace, declaration);
     if matches!(declaration.kind, TypeKind::Interface) {
         mint_member_signature_types(binder, &declaration.members, image, tokens);
         return emit_interface(image, binder, tokens, namespace, declaration);
     }
     let (base_class, nested_in): (Option<TypeSymbol>, Option<Box<str>>) = {
         let info = binder.model().get_by_symbol(&enclosing);
-        let base = if is_struct {
-            None
-        } else {
-            info.and_then(|info| info.base.clone())
+        let (base, enclosing_of) = match &info {
+            Some(info) => (info.base.clone(), info.enclosing.clone()),
+            None => (None, None),
         };
-        (base, info.and_then(|info| info.enclosing.clone()))
+        (if is_struct { None } else { base }, enclosing_of)
     };
     let is_system_object = namespace == "System" && &*declaration.name == "Object";
     let (base, flags) = if is_struct {
@@ -1942,7 +1957,10 @@ fn emit_type(
     if declaration.modifiers.contains(&Modifier::Static) {
         flags |= TYPE_ABSTRACT | TYPE_SEALED;
     }
-    let type_token = image.add_type(metadata_namespace, &declaration.name, base, flags);
+    let type_token = image.add_type(metadata_namespace, &declared_type_name(declaration), base, flags);
+    for (number, parameter) in declaration.type_parameters.iter().enumerate() {
+        image.add_generic_param(type_token, number as u16, 0, &parameter.name);
+    }
     if let Some(enclosing_full) = &nested_in {
         if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
             image.add_nested_class(type_token, enclosing_token);
@@ -1987,6 +2005,9 @@ fn emit_type(
             for declarator in declarators {
                 if let Some(field_token) = tokens.field(&enclosing, &declarator.name) {
                     emit_attributes(image, binder, tokens, &enclosing, field_token, attributes);
+                    if modifiers.contains(&Modifier::Required) {
+                        emit_required_member_marker(image, tokens, field_token);
+                    }
                 }
             }
         }
@@ -2021,7 +2042,7 @@ fn emit_type(
             Some(object_base_ctor(image, tokens))
         };
         let body = Stmt::new(StmtKind::Block(Vec::new()), declaration.span);
-        emit_constructor(
+        let token = emit_constructor(
             image,
             binder,
             &enclosing,
@@ -2035,6 +2056,9 @@ fn emit_type(
             None,
             debug,
         )?;
+        if binder.has_required_members_in_chain(&enclosing) {
+            emit_required_members_constructor_guard(image, tokens, token);
+        }
     }
     if needs_static_constructor(declaration) {
         let mut statements = static_field_initializer_statements(declaration);
@@ -2118,7 +2142,9 @@ fn emit_type(
                 ..
             } if modifiers.contains(&Modifier::Abstract) => {
                 let token =
-                    emit_abstract_method(image, tokens, modifiers, name, return_type, parameters)?;
+                    emit_abstract_method(
+                        image, tokens, &enclosing, modifiers, name, return_type, parameters,
+                    )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
             Member::Operator {
@@ -2203,6 +2229,11 @@ fn emit_type(
                     debug,
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
+                if !sets_required_members(attributes)
+                    && binder.has_required_members_in_chain(&enclosing)
+                {
+                    emit_required_members_constructor_guard(image, tokens, token);
+                }
             }
             Member::Destructor {
                 body, attributes, ..
@@ -2248,6 +2279,9 @@ fn emit_type(
                 debug,
             )?;
             emit_attributes(image, binder, tokens, &enclosing, property, attributes);
+            if modifiers.contains(&Modifier::Required) {
+                emit_required_member_marker(image, tokens, property);
+            }
             first_property.get_or_insert(property);
         }
         if let Member::Indexer {
@@ -2280,6 +2314,9 @@ fn emit_type(
         image.add_property_map(type_token, first);
     }
     emit_default_member_attribute(image, tokens, type_token, &declaration.members);
+    if declares_required_member(declaration) {
+        emit_required_member_marker(image, tokens, type_token);
+    }
     let mut first_event = None;
     for member in &declaration.members {
         if let Member::EventField {
@@ -2539,6 +2576,7 @@ fn event_accessor_body(field: &str, operator: AssignmentOperator) -> Stmt {
 fn emit_abstract_method(
     image: &mut ImageBuilder,
     tokens: &Tokens,
+    enclosing: &TypeSymbol,
     modifiers: &[Modifier],
     name: &str,
     return_type: &TypeRef,
@@ -2546,12 +2584,12 @@ fn emit_abstract_method(
 ) -> Result<Token, crate::EmitError> {
     let parameter_sigs: Vec<TypeSig> = parameters
         .iter()
-        .map(|parameter| type_sig(tokens, &parameter_symbol(parameter)))
+        .map(|parameter| member_type_sig(tokens, &enclosing, &parameter_symbol(parameter)))
         .collect::<Result<_, _>>()?;
     let signature = method_signature(
         true,
         &parameter_sigs,
-        &type_sig(tokens, &bind_type(return_type))?,
+        &member_type_sig(tokens, &enclosing, &bind_type(return_type))?,
     );
     let flags = member_visibility(modifiers) | slot_flags(modifiers);
     Ok(image.add_abstract_method(name, &signature, flags))
@@ -2680,10 +2718,10 @@ fn emit_explicit_interface_impl(
                 ))?;
             let parameter_sigs: Vec<TypeSig> = parameter_types
                 .iter()
-                .map(|ty| type_sig(tokens, ty))
+                .map(|ty| member_type_sig(tokens, enclosing, ty))
                 .collect::<Result<_, _>>()?;
             let signature =
-                method_signature(true, &parameter_sigs, &type_sig(tokens, return_symbol)?);
+                method_signature(true, &parameter_sigs, &member_type_sig(tokens, enclosing, return_symbol)?);
             let type_ref = image.type_ref(&namespace, &name);
             let member_token = image.member_ref(type_ref, member, &signature);
             tokens.insert_method(&interface_symbol, member, parameter_types, member_token);
@@ -2920,6 +2958,7 @@ fn emit_destructor(
     let finalize = emit_bound_body(
         image,
         tokens,
+        enclosing,
         "Finalize",
         &void,
         &[],
@@ -2940,7 +2979,7 @@ fn emit_destructor(
     let declaration = match tokens.method(&object, "Finalize", &[]) {
         Some(token) => token,
         None => {
-            let signature = method_signature(true, &[], &type_sig(tokens, &void)?);
+            let signature = method_signature(true, &[], &member_type_sig(tokens, enclosing, &void)?);
             let type_ref = image.type_ref("System", "Object");
             let member_token = image.member_ref(type_ref, "Finalize", &signature);
             tokens.insert_method(&object, "Finalize", &[], member_token);
@@ -2969,6 +3008,7 @@ fn base_finalizer_reference(
         return_type: TypeSymbol::Special(SpecialType::Void),
         is_static: false,
         is_vararg: false,
+        instantiation: None,
     }
 }
 
@@ -3045,6 +3085,7 @@ fn emit_method_body(
     emit_bound_body(
         image,
         tokens,
+        enclosing,
         name,
         return_symbol,
         params,
@@ -3065,6 +3106,7 @@ fn emit_method_body(
 fn emit_bound_body(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol)],
@@ -3117,7 +3159,7 @@ fn emit_bound_body(
             .iter()
             .enumerate()
             .map(|(slot, ty)| {
-                let sig = type_sig(tokens, ty)?;
+                let sig = member_type_sig(tokens, enclosing, ty)?;
                 Ok(if pinned_slots.contains(&(slot as u16)) {
                     TypeSig::Pinned(Box::new(sig))
                 } else {
@@ -3160,7 +3202,7 @@ fn emit_bound_body(
         .iter()
         .enumerate()
         .map(|(index, (_, ty))| {
-            let sig = type_sig(tokens, ty)?;
+            let sig = member_type_sig(tokens, enclosing, ty)?;
             Ok(if byref_flags.get(index).copied().unwrap_or(false) {
                 TypeSig::ByRef(Box::new(sig))
             } else {
@@ -3169,12 +3211,12 @@ fn emit_bound_body(
         })
         .collect::<Result<_, _>>()?;
     let signature = if is_vararg {
-        vararg_method_signature(!is_static, &parameter_sigs, &type_sig(tokens, return_symbol)?)
+        vararg_method_signature(!is_static, &parameter_sigs, &member_type_sig(tokens, enclosing, return_symbol)?)
     } else {
         method_signature(
             !is_static,
             &parameter_sigs,
-            &type_sig(tokens, return_symbol)?,
+            &member_type_sig(tokens, enclosing, return_symbol)?,
         )
     };
     let method = image.add_method(
@@ -3277,7 +3319,7 @@ fn emit_property(
         Some(interface) => explicit_interface_member_name(interface, name),
         None => String::from(name),
     };
-    let signature = property_signature(!is_static, &[], &type_sig(tokens, &property_ty)?);
+    let signature = property_signature(!is_static, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
     let property = image.add_property(&property_name, &signature, 0);
     let void = TypeSymbol::Special(SpecialType::Void);
 
@@ -3305,7 +3347,7 @@ fn emit_property(
             }
             Some(token)
         } else if is_abstract {
-            let signature = method_signature(true, &[], &type_sig(tokens, &property_ty)?);
+            let signature = method_signature(true, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
             Some(image.add_abstract_method(&method_name, &signature, flags))
         } else {
             None
@@ -3348,7 +3390,7 @@ fn emit_property(
             Some(token)
         } else if is_abstract {
             let signature =
-                method_signature(true, &[type_sig(tokens, &property_ty)?], &TypeSig::Void);
+                method_signature(true, &[member_type_sig(tokens, enclosing, &property_ty)?], &TypeSig::Void);
             Some(image.add_abstract_method(&method_name, &signature, flags))
         } else {
             None
@@ -3433,9 +3475,9 @@ fn emit_indexer(
         index_params.iter().map(|(_, ty)| ty.clone()).collect();
     let index_sigs: Vec<TypeSig> = index_params
         .iter()
-        .map(|(_, ty)| type_sig(tokens, ty))
+        .map(|(_, ty)| member_type_sig(tokens, enclosing, ty))
         .collect::<Result<_, _>>()?;
-    let element_sig = type_sig(tokens, &element_ty)?;
+    let element_sig = member_type_sig(tokens, enclosing, &element_ty)?;
     let property =
         image.add_property(name, &property_signature(true, &index_sigs, &element_sig), 0);
     let void = TypeSymbol::Special(SpecialType::Void);
@@ -3547,6 +3589,7 @@ fn emit_default_member_attribute(
             return_type: TypeSymbol::Special(SpecialType::Void),
             is_static: false,
             is_vararg: false,
+            instantiation: None,
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
@@ -3557,6 +3600,124 @@ fn emit_default_member_attribute(
     encode_ser_string(&name, &mut blob);
     blob.extend_from_slice(&0u16.to_le_bytes());
     image.add_custom_attribute(type_token, constructor, &blob);
+}
+
+/// The message csc puts in a required-members constructor guard, byte for byte. Measured from a
+/// csc-built assembly, not transcribed from documentation: a guard whose text drifts is still a
+/// guard, but it stops being the SAME guard, and the point of matching csc is that a consumer
+/// cannot tell our output from its.
+const REQUIRED_MEMBERS_OBSOLETE_MESSAGE: &str =
+    "Constructors of types with required members are not supported in this version of your compiler.";
+
+/// Mints the `MemberRef` for an attribute constructor the PROGRAM never names -- the compiler
+/// synthesizes these -- and returns its token. `None` when the type or constructor cannot be
+/// resolved, which is the same lenient posture [`emit_attributes`] takes.
+fn synthesized_attribute_ctor(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    namespace: &str,
+    name: &str,
+    parameters: &[TypeSymbol],
+) -> Option<Token> {
+    let declaring = named_symbol(namespace, name);
+    if tokens.method(&declaring, ".ctor", parameters).is_none() {
+        let constructor_ref = lamella_binder::MethodReference {
+            declaring_type: declaring.clone(),
+            name: ".ctor".into(),
+            parameters: parameters.to_vec(),
+            return_type: TypeSymbol::Special(SpecialType::Void),
+            is_static: false,
+            is_vararg: false,
+            instantiation: None,
+        };
+        mint_member_ref(&constructor_ref, image, tokens);
+    }
+    tokens.method(&declaring, ".ctor", parameters)
+}
+
+/// `[System.Runtime.CompilerServices.RequiredMemberAttribute]` on a required field, a required
+/// property, or the type that DECLARES one.
+///
+/// `required` has no metadata flag of its own (II.22.15/II.22.34 have no bit for it), so this
+/// attribute IS the encoding -- which is why a consumer that does not decode custom attributes
+/// reads every imported member as not-required.
+fn emit_required_member_marker(image: &mut ImageBuilder, tokens: &mut Tokens, target: Token) {
+    let Some(constructor) = synthesized_attribute_ctor(
+        image,
+        tokens,
+        "System.Runtime.CompilerServices",
+        "RequiredMemberAttribute",
+        &[],
+    ) else {
+        return;
+    };
+    image.add_custom_attribute(target, constructor, &[0x01, 0x00, 0x00, 0x00]);
+}
+
+/// The pair csc puts on every constructor of a type with required members that is not itself
+/// `[SetsRequiredMembers]`: `[Obsolete(<message>, error: true)]` and
+/// `[CompilerFeatureRequired("RequiredMembers")]`.
+fn emit_required_members_constructor_guard(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    constructor_token: Token,
+) {
+    if let Some(obsolete) = synthesized_attribute_ctor(
+        image,
+        tokens,
+        "System",
+        "ObsoleteAttribute",
+        &[
+            TypeSymbol::Special(SpecialType::String),
+            TypeSymbol::Special(SpecialType::Boolean),
+        ],
+    ) {
+        let mut blob = alloc::vec![0x01u8, 0x00];
+        encode_ser_string(REQUIRED_MEMBERS_OBSOLETE_MESSAGE, &mut blob);
+        blob.push(0x01);
+        blob.extend_from_slice(&0u16.to_le_bytes());
+        image.add_custom_attribute(constructor_token, obsolete, &blob);
+    }
+    if let Some(feature) = synthesized_attribute_ctor(
+        image,
+        tokens,
+        "System.Runtime.CompilerServices",
+        "CompilerFeatureRequiredAttribute",
+        &[TypeSymbol::Special(SpecialType::String)],
+    ) {
+        let mut blob = alloc::vec![0x01u8, 0x00];
+        encode_ser_string("RequiredMembers", &mut blob);
+        blob.extend_from_slice(&0u16.to_le_bytes());
+        image.add_custom_attribute(constructor_token, feature, &blob);
+    }
+}
+
+/// Whether an attribute list carries `[SetsRequiredMembers]` -- the one thing that exempts a
+/// constructor from the guard pair and from `CS9035`.
+///
+/// Matched on the LAST name part, with and without the `Attribute` suffix, exactly as
+/// [`indexer_name`] matches: a program may write the attribute qualified or not, and C# lets the
+/// suffix be omitted (17.2).
+fn sets_required_members(attributes: &[AttributeSection]) -> bool {
+    attributes.iter().any(|section| {
+        section.attributes.iter().any(|attribute| {
+            attribute.name.parts.last().is_some_and(|last| {
+                &**last == "SetsRequiredMembers" || &**last == "SetsRequiredMembersAttribute"
+            })
+        })
+    })
+}
+
+/// Whether this declaration itself declares a `required` field or property -- the condition for the
+/// TYPE-level marker, which is deliberately not the condition for the constructor guard. See
+/// [`lamella_binder::Binder::has_required_members_in_chain`].
+fn declares_required_member(declaration: &TypeDecl) -> bool {
+    declaration.members.iter().any(|member| match member {
+        Member::Field { modifiers, .. } | Member::Property { modifiers, .. } => {
+            modifiers.contains(&Modifier::Required)
+        }
+        _ => false,
+    })
 }
 
 /// The `MethodDef` name of a property accessor: `I.get_P` for an explicit-interface
@@ -3632,7 +3793,7 @@ fn emit_field(
     declarators: &[VariableDeclarator],
 ) -> Result<(), crate::EmitError> {
     let field_ty = bind_type(ty);
-    let signature = field_signature(&type_sig(tokens, &field_ty)?);
+    let signature = field_signature(&member_type_sig(tokens, enclosing, &field_ty)?);
     let visibility = member_visibility(modifiers);
     let is_const = modifiers.contains(&Modifier::Const);
     let is_static = is_const || modifiers.contains(&Modifier::Static);
@@ -3917,27 +4078,32 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 }
             }
             if let Some(method) = method {
-                if let (_, Some(extras)) = crate::expr::split_vararg_arguments(arguments) {
-                    if !extras.is_empty() {
-                        mint_vararg_site_ref(method, extras, image, tokens);
-                    }
-                }
-                let def_key = if method.is_vararg {
-                    crate::expr::vararg_lookup_params(&method.parameters, &[])
+                if let Some(instantiation) = method.instantiation.as_deref() {
+                    mint_generic_call_site(method, instantiation, image, tokens);
                 } else {
-                    method.parameters.clone()
-                };
-                if tokens
-                    .method(&method.declaring_type, &method.name, &def_key)
-                    .is_none()
-                {
-                    mint_member_ref(method, image, tokens);
+                    if let (_, Some(extras)) = crate::expr::split_vararg_arguments(arguments) {
+                        if !extras.is_empty() {
+                            mint_vararg_site_ref(method, extras, image, tokens);
+                        }
+                    }
+                    let def_key = if method.is_vararg {
+                        crate::expr::vararg_lookup_params(&method.parameters, &[])
+                    } else {
+                        method.parameters.clone()
+                    };
+                    if tokens
+                        .method(&method.declaring_type, &method.name, &def_key)
+                        .is_none()
+                    {
+                        mint_member_ref(method, image, tokens);
+                    }
                 }
             }
         }
         BoundExprKind::ObjectCreation {
             arguments,
             constructor,
+            initializer: _,
         } => {
             for argument in arguments {
                 mint_in_expr(argument, image, tokens);
@@ -4023,6 +4189,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 return_type: expr.ty.clone(),
                 is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
                 is_vararg: false,
+                instantiation: None,
             };
             if tokens
                 .method(&getter.declaring_type, &getter.name, &getter.parameters)
@@ -4058,6 +4225,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     return_type: TypeSymbol::Special(SpecialType::Char),
                     is_static: false,
                     is_vararg: false,
+                    instantiation: None,
                 };
                 if tokens
                     .method(&getter.declaring_type, &getter.name, &getter.parameters)
@@ -4105,6 +4273,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     return_type: TypeSymbol::Special(SpecialType::Void),
                     is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
                     is_vararg: false,
+                    instantiation: None,
                 };
                 if tokens
                     .method(&setter.declaring_type, &setter.name, &setter.parameters)
@@ -4193,6 +4362,7 @@ fn get_type_from_handle_reference() -> lamella_binder::MethodReference {
         return_type: crate::expr::system_type_symbol(),
         is_static: true,
         is_vararg: false,
+        instantiation: None,
     }
 }
 
@@ -4206,6 +4376,7 @@ pub(crate) fn offset_to_string_data_reference() -> lamella_binder::MethodReferen
         return_type: TypeSymbol::Special(SpecialType::Int32),
         is_static: true,
         is_vararg: false,
+        instantiation: None,
     }
 }
 
@@ -4226,6 +4397,7 @@ fn string_concat_reference(both_strings: bool) -> lamella_binder::MethodReferenc
         return_type: string,
         is_static: true,
         is_vararg: false,
+        instantiation: None,
     }
 }
 
@@ -4240,6 +4412,7 @@ fn string_equality_reference() -> lamella_binder::MethodReference {
         return_type: TypeSymbol::Special(SpecialType::Boolean),
         is_static: true,
         is_vararg: false,
+        instantiation: None,
     }
 }
 
@@ -4343,6 +4516,106 @@ fn mint_vararg_site_ref(
     tokens.insert_method(&method.declaring_type, &method.name, &key_params, member);
 }
 
+/// Mints the two rows a generic CALL SITE needs and records the second one under the site key:
+///
+/// 1. the `MemberRef` naming the generic DEFINITION, whose signature is still open (`!!0`), and
+/// 2. the `MethodSpec` (II.22.29) that closes it over the type arguments THIS site named.
+fn mint_generic_call_site(
+    method: &lamella_binder::MethodReference,
+    instantiation: &lamella_binder::MethodInstantiation,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    let site_key =
+        crate::expr::generic_site_lookup_params(&instantiation.parameters, &instantiation.arguments);
+    if tokens
+        .method(&method.declaring_type, &method.name, &site_key)
+        .is_some()
+    {
+        return;
+    }
+    let Some(definition) = mint_generic_definition_ref(method, instantiation, image, tokens) else {
+        return;
+    };
+    for argument in &instantiation.arguments {
+        mint_named_type_token(argument, image, tokens);
+    }
+    let arguments: Result<Vec<TypeSig>, _> = instantiation
+        .arguments
+        .iter()
+        .map(|ty| type_sig(tokens, ty))
+        .collect();
+    let Ok(arguments) = arguments else {
+        return;
+    };
+    let spec = image.method_spec(definition, &method_spec_signature(&arguments));
+    tokens.insert_method(&method.declaring_type, &method.name, &site_key, spec);
+}
+
+/// The token naming the generic DEFINITION a `MethodSpec` instantiates: a `MemberRef` carrying the
+/// GENERIC calling convention, its `GenParamCount`, and `!!n` wherever the open signature mentions
+/// one of the method's own type parameters. Recorded under the definition's OPEN parameter key, so
+/// several sites over one method mint it once.
+fn mint_generic_definition_ref(
+    method: &lamella_binder::MethodReference,
+    instantiation: &lamella_binder::MethodInstantiation,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) -> Option<Token> {
+    if let Some(token) = tokens.type_token(&method.declaring_type)
+        && token.table() == TYPE_DEF
+    {
+        return None;
+    }
+    if method.is_vararg {
+        return None;
+    }
+    if let Some(token) = tokens.method(
+        &method.declaring_type,
+        &method.name,
+        &instantiation.parameters,
+    ) {
+        return Some(token);
+    }
+    let (namespace, name) = split_type_name(&method.declaring_type)?;
+    mint_named_type_token(&method.declaring_type, image, tokens);
+    for ty in instantiation
+        .parameters
+        .iter()
+        .chain(core::iter::once(&instantiation.return_type))
+    {
+        if !mentions_type_parameter(ty, &instantiation.type_parameters) {
+            mint_named_type_token(ty, image, tokens);
+        }
+    }
+    let parameter_sigs: Result<Vec<TypeSig>, _> = instantiation
+        .parameters
+        .iter()
+        .map(|ty| open_type_sig(tokens, ty, method_scope(instantiation)))
+        .collect();
+    let (Ok(parameter_sigs), Ok(return_sig)) = (
+        parameter_sigs,
+        open_type_sig(tokens, &instantiation.return_type, method_scope(instantiation)),
+    ) else {
+        return None;
+    };
+    let signature = generic_method_signature(
+        !method.is_static,
+        instantiation.type_parameters.len() as u32,
+        &parameter_sigs,
+        &return_sig,
+    );
+    let type_ref = image.type_ref(&namespace, &name);
+    let member = image.member_ref(type_ref, &method.name, &signature);
+    tokens.insert_method(
+        &method.declaring_type,
+        &method.name,
+        &instantiation.parameters,
+        member,
+    );
+    Some(member)
+}
+
 /// Mints a `MemberRef` (a FieldRef) for a field on a type outside this module -- the
 /// persistent REPL `__Repl` (a session variable) or a BCL field -- so emission can name
 /// it. Mirrors [`mint_member_ref`]: the declaring type and the field's own type are
@@ -4440,6 +4713,18 @@ fn mint_type_token(image: &mut ImageBuilder, tokens: &mut Tokens, ty: &TypeSymbo
         TypeSymbol::ByRef(element) => {
             mint_type_token(image, tokens, element);
             None
+        }
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => {
+            mint_type_token(image, tokens, &definition_symbol(definition, arguments.len()));
+            for argument in arguments {
+                mint_type_token(image, tokens, argument);
+            }
+            type_sig(tokens, ty)
+                .ok()
+                .map(|sig| image.type_spec(&type_signature(&sig)))
         }
         TypeSymbol::Error => None,
     };
@@ -4714,8 +4999,7 @@ fn emit_decimal_constant_attribute(
     }) = binder
         .model()
         .get_by_symbol(enclosing)
-        .and_then(|info| info.find_field(name))
-        .and_then(|f| f.constant.clone())
+        .and_then(|info| info.find_field(name).and_then(|f| f.constant.clone()))
     else {
         return;
     };
@@ -4734,6 +5018,7 @@ fn emit_decimal_constant_attribute(
         return_type: TypeSymbol::Special(SpecialType::Void),
         is_static: false,
         is_vararg: false,
+        instantiation: None,
     };
     mint_member_ref(&reference, image, tokens);
     let Some(ctor) = tokens.method(&attr_ty, ".ctor", &params) else {
@@ -4994,6 +5279,17 @@ fn declares_instance_constructor(declaration: &TypeDecl) -> bool {
 
 /// Maps a bound type to its signature form. A named type resolves to the `Class`
 /// of its `TypeDef` token; array types come later.
+/// The generic DEFINITION `definition` of `arity` parameters, as the plain named symbol the token
+/// table holds it under: its last part carries the arity mangled in (ECMA-335 II.10.7.2), because
+/// that is the one spelling both a source-collected and a reference-read definition arrive with.
+fn definition_symbol(definition: &[Box<str>], arity: usize) -> TypeSymbol {
+    let mut parts: Vec<Box<str>> = definition.to_vec();
+    if let Some(last) = parts.last_mut() {
+        *last = lamella_binder::metadata_type_name(last, arity).into();
+    }
+    TypeSymbol::Named(parts.into())
+}
+
 fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitError> {
     let canonical = tokens.canonical(ty);
     let ty = &canonical;
@@ -5036,6 +5332,28 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
         TypeSymbol::ByRef(element) => {
             return Ok(TypeSig::ByRef(Box::new(type_sig(tokens, element)?)));
         }
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => {
+            let named = definition_symbol(definition, arguments.len());
+            let token = tokens.type_token(&named).ok_or(crate::EmitError::Unsupported(
+                "a generic definition outside this module in a signature",
+            ))?;
+            let head = if tokens.is_struct(&named) || tokens.is_enum(&named) {
+                TypeSig::ValueType(token)
+            } else {
+                TypeSig::Class(token)
+            };
+            let mut lowered = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                lowered.push(type_sig(tokens, argument)?);
+            }
+            return Ok(TypeSig::GenericInst {
+                definition: Box::new(head),
+                arguments: lowered,
+            });
+        }
         TypeSymbol::Error => {
             return Err(crate::EmitError::Unsupported(
                 "the error type has no signature",
@@ -5064,6 +5382,124 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
             ));
         }
     })
+}
+
+/// The type parameters in scope where a signature is written: the METHOD's own, and the DECLARING
+/// TYPE's. Both are live at once inside a generic method of a generic type.
+#[derive(Clone, Copy, Default)]
+struct GenericScope<'a> {
+    /// The enclosing METHOD's own parameters -- `!!n` ([`TypeSig::MVar`]). Empty for an ordinary
+    /// method, which is every method a C# 1.0 program declares.
+    method: &'a [Box<str>],
+    /// The declaring TYPE's parameters -- `!n` ([`TypeSig::Var`]).
+    declaring: &'a [Box<str>],
+}
+
+/// [`type_sig`] for a signature that is still OPEN over the parameters in `scope`: a mention of one
+/// encodes as `!!n` or `!n` at its declaration position, everything else lowers exactly as a closed
+/// type does.
+fn open_type_sig(
+    tokens: &Tokens,
+    ty: &TypeSymbol,
+    scope: GenericScope,
+) -> Result<TypeSig, crate::EmitError> {
+    if let TypeSymbol::Named(parts) = ty
+        && let [only] = &parts[..]
+    {
+        if let Some(number) = scope.method.iter().position(|name| name == only) {
+            return Ok(TypeSig::MVar(number as u32));
+        }
+        if let Some(number) = scope.declaring.iter().position(|name| name == only) {
+            return Ok(TypeSig::Var(number as u32));
+        }
+    }
+    match ty {
+        TypeSymbol::Array { element, rank } => {
+            let element = Box::new(open_type_sig(tokens, element, scope)?);
+            Ok(if *rank == 1 {
+                TypeSig::SzArray(element)
+            } else {
+                TypeSig::Array {
+                    element,
+                    rank: u32::from(*rank),
+                }
+            })
+        }
+        TypeSymbol::Pointer(element) => Ok(TypeSig::Pointer(Box::new(open_type_sig(tokens, element, scope)?))),
+        TypeSymbol::ByRef(element) => Ok(TypeSig::ByRef(Box::new(open_type_sig(tokens, element, scope)?))),
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => {
+            let named = definition_symbol(definition, arguments.len());
+            let token = tokens.type_token(&named).ok_or(crate::EmitError::Unsupported(
+                "a generic definition outside this module in a signature",
+            ))?;
+            let head = if tokens.is_struct(&named) || tokens.is_enum(&named) {
+                TypeSig::ValueType(token)
+            } else {
+                TypeSig::Class(token)
+            };
+            let mut lowered = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                lowered.push(open_type_sig(tokens, argument, scope)?);
+            }
+            Ok(TypeSig::GenericInst {
+                definition: Box::new(head),
+                arguments: lowered,
+            })
+        }
+        _ => type_sig(tokens, ty),
+    }
+}
+
+/// The scope for a generic method's own OPEN signature, as a call site instantiates it.
+fn method_scope(instantiation: &lamella_binder::MethodInstantiation) -> GenericScope<'_> {
+    GenericScope {
+        method: &instantiation.type_parameters,
+        declaring: &[],
+    }
+}
+
+/// [`type_sig`] for a MEMBER signature of `declaring`: a mention of one of the declaring type's own
+/// parameters encodes as `!n`, everything else exactly as before.
+///
+/// This is the form every member-signature site uses, and it takes the DECLARING TYPE rather than a
+/// parameter list so the scope is derived from data the site already holds. A site writing an
+/// EXTERNAL member passes that member's own declaring type, which this module did not declare and
+/// which therefore has no parameters recorded -- so an imported signature can never pick up a `!n`
+/// belonging to whatever type happened to be emitting. See `Tokens::type_parameters`.
+fn member_type_sig(
+    tokens: &Tokens,
+    declaring: &TypeSymbol,
+    ty: &TypeSymbol,
+) -> Result<TypeSig, crate::EmitError> {
+    open_type_sig(
+        tokens,
+        ty,
+        GenericScope {
+            method: &[],
+            declaring: tokens.type_parameters(declaring),
+        },
+    )
+}
+
+/// Whether `ty` mentions one of the method's own type parameters at any depth -- so it has no
+/// `TypeRef` to mint and asking for one would invent a type named `T`.
+fn mentions_type_parameter(ty: &TypeSymbol, type_parameters: &[Box<str>]) -> bool {
+    match ty {
+        TypeSymbol::Named(parts) => matches!(
+            &parts[..],
+            [only] if type_parameters.iter().any(|name| name == only)
+        ),
+        TypeSymbol::Array { element, .. }
+        | TypeSymbol::Pointer(element)
+        | TypeSymbol::ByRef(element) => mentions_type_parameter(element, type_parameters),
+        TypeSymbol::Instantiation { arguments, .. } => arguments
+            .iter()
+            .any(|argument| mentions_type_parameter(argument, type_parameters)),
+        _ => false,
+    }
 }
 
 /// Walks the units in emission order, assigning each method its `MethodDef` token
@@ -5102,9 +5538,17 @@ fn collect_tokens(
     for member in members {
         match member {
             NamespaceMember::Type(declaration) => {
-                let declaring = named_symbol(namespace, &declaration.name);
+                let declaring = declared_type_symbol(namespace, declaration);
                 *next_type += 1;
                 tokens.insert_type(&declaring, Token::new(TYPE_DEF, *next_type));
+                tokens.insert_type_parameters(
+                    &declaring,
+                    declaration
+                        .type_parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
+                );
                 let is_struct = declaration.kind == TypeKind::Struct;
                 let is_interface = declaration.kind == TypeKind::Interface;
                 let is_cil_primitive =
@@ -5495,6 +5939,17 @@ fn type_symbol_from_dotted(full: &str) -> TypeSymbol {
     TypeSymbol::Named(full.split('.').map(Box::<str>::from).collect()).fold_builtin()
 }
 
+/// The METADATA name of a declared type: `` Box`1 `` for `class Box<T>` (ECMA-335 II.10.7.2),
+/// and the name unchanged for every non-generic declaration.
+fn declared_type_name(declaration: &TypeDecl) -> String {
+    lamella_binder::metadata_type_name(&declaration.name, declaration.type_parameters.len())
+}
+
+/// [`declared_type_name`] as the symbol the token table and the model are keyed by.
+fn declared_type_symbol(namespace: &str, declaration: &TypeDecl) -> TypeSymbol {
+    named_symbol(namespace, &declared_type_name(declaration))
+}
+
 fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
     let mut parts: Vec<Box<str>> = Vec::new();
     if !namespace.is_empty() {
@@ -5522,12 +5977,596 @@ mod tests {
     use super::*;
     use lamella_syntax::parser::parse_compilation_unit;
 
+    /// A constructed generic type lowers to `GENERICINST` over its DEFINITION's token.
+    #[test]
+    fn a_constructed_generic_lowers_to_genericinst_over_the_mangled_definition() {
+        let mangled = TypeSymbol::Named(["App".into(), "Box`1".into()].into());
+        let mut tokens = Tokens::new();
+        tokens.insert_type(&mangled, Token::new(0x02, 4));
+
+        let boxed_int = TypeSymbol::Instantiation {
+            definition: ["App".into(), "Box".into()].into(),
+            arguments: [TypeSymbol::Special(SpecialType::Int32)].into(),
+        };
+        let sig = type_sig(&tokens, &boxed_int).expect("an instantiation lowers");
+        match sig {
+            TypeSig::GenericInst {
+                definition,
+                arguments,
+            } => {
+                assert_eq!(*definition, TypeSig::Class(Token::new(0x02, 4)));
+                assert_eq!(arguments, vec![TypeSig::Int32]);
+            }
+            other => panic!("expected GENERICINST, got {other:?}"),
+        }
+
+        let nested = TypeSymbol::Instantiation {
+            definition: ["App".into(), "Box".into()].into(),
+            arguments: [boxed_int.clone()].into(),
+        };
+        match type_sig(&tokens, &nested).expect("a nested instantiation lowers") {
+            TypeSig::GenericInst { arguments, .. } => {
+                assert!(
+                    matches!(arguments.as_slice(), [TypeSig::GenericInst { .. }]),
+                    "the argument must itself be an instantiation: {arguments:?}"
+                );
+            }
+            other => panic!("expected GENERICINST, got {other:?}"),
+        }
+
+        let wrong_arity = TypeSymbol::Instantiation {
+            definition: ["App".into(), "Box".into()].into(),
+            arguments: [
+                TypeSymbol::Special(SpecialType::Int32),
+                TypeSymbol::Special(SpecialType::Int32),
+            ]
+            .into(),
+        };
+        assert!(type_sig(&tokens, &wrong_arity).is_err(), "a wrong arity must not resolve");
+    }
+
+    /// An instantiation gets a `TypeSpec` minted from its `GENERICINST` signature -- the token
+    /// `ldelema`/`ldobj` need for a generic STRUCT array.
+    #[test]
+    fn each_instantiation_mints_its_own_typespec() {
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        let definition = TypeSymbol::Named(["App".into(), "Box`1".into()].into());
+        let definition_token = image.type_ref("App", "Box`1");
+        tokens.insert_type(&definition, definition_token);
+
+        let of = |argument: TypeSymbol| TypeSymbol::Instantiation {
+            definition: ["App".into(), "Box".into()].into(),
+            arguments: [argument].into(),
+        };
+        let int = of(TypeSymbol::Special(SpecialType::Int32));
+        let string = of(TypeSymbol::Special(SpecialType::String));
+
+        mint_type_token(&mut image, &mut tokens, &int);
+        mint_type_token(&mut image, &mut tokens, &string);
+
+        let int_token = tokens.type_token(&int).expect("Box<int> is minted");
+        let string_token = tokens.type_token(&string).expect("Box<string> is minted");
+        assert_eq!(int_token.table(), lamella_metadata::tables::table::TYPE_SPEC);
+        assert_eq!(string_token.table(), lamella_metadata::tables::table::TYPE_SPEC);
+        assert_ne!(
+            int_token, string_token,
+            "two instantiations of one definition must not share a token"
+        );
+        assert_ne!(int_token, definition_token);
+        assert_ne!(string_token, definition_token);
+
+        mint_type_token(&mut image, &mut tokens, &int);
+        assert_eq!(tokens.type_token(&int), Some(int_token));
+    }
+
+    #[test]
+    fn value_ness_follows_the_definition_but_a_token_does_not() {
+        let definition = TypeSymbol::Named(["App".into(), "Pair`1".into()].into());
+        let mut tokens = Tokens::new();
+        tokens.insert_type(&definition, Token::new(0x02, 9));
+        tokens.insert_struct(&definition);
+
+        let of = |argument: TypeSymbol| TypeSymbol::Instantiation {
+            definition: ["App".into(), "Pair".into()].into(),
+            arguments: [argument].into(),
+        };
+        let int = of(TypeSymbol::Special(SpecialType::Int32));
+        let string = of(TypeSymbol::Special(SpecialType::String));
+
+        assert!(tokens.is_struct(&int), "Pair<int> is a value type because Pair`1 is");
+        assert!(tokens.is_struct(&string), "and so is Pair<string>");
+
+        assert!(
+            tokens.type_token(&int).is_none(),
+            "an instantiation must not inherit its definition's token"
+        );
+        assert!(tokens.type_token(&string).is_none());
+
+        let plain = TypeSymbol::Named(["App".into(), "Widget".into()].into());
+        assert!(!tokens.is_struct(&plain), "an unrecorded plain type is not a struct");
+        tokens.insert_struct(&plain);
+        assert!(tokens.is_struct(&plain));
+    }
+
+
+    const GENERIC_FIXTURE: &str = "generic-methods.dll";
+    const NESTED_FIXTURE: &str = "generic-params.dll";
+
+    /// A csc-built reference assembly from `lamella-metadata`'s fixture directory, read at RUN time.
+    fn reference_fixture(name: &str) -> Option<Vec<u8>> {
+        let directory = format!(
+            "{}/../lamella-metadata/tests/fixtures",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if !std::path::Path::new(&directory).is_dir() {
+            eprintln!("{directory} absent (a stripped drop); skipping");
+            return None;
+        }
+        let path = format!("{directory}/{name}");
+        Some(std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("the fixture directory exists but {path} does not read: {error}")
+        }))
+    }
+
+    /// `expression` parsed inside a `Main` under C# 2 and bound against the generic-method fixture.
+    /// `None` when the fixture is unavailable -- see [`reference_fixture`].
+    fn bound_expression(expression: &str) -> Option<BoundExpr> {
+        let reference = reference_fixture(GENERIC_FIXTURE)?;
+        Some(bound_expression_against(&reference, expression))
+    }
+
+    /// `expression` parsed inside a `Main` under C# 2 and bound against `reference`.
+    fn bound_expression_against(reference: &[u8], expression: &str) -> BoundExpr {
+        let source = format!("class C {{ static void Main() {{ {expression}; }} }}\n");
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let unit = parse_compilation_unit_with(&source, options).unit;
+        let NamespaceMember::Type(declaration) = &unit.members[0] else {
+            panic!("the fixture source declares a class");
+        };
+        let Member::Method { body: Some(body), .. } = &declaration.members[0] else {
+            panic!("the fixture source declares a method with a body");
+        };
+        let StmtKind::Block(statements) = &body.kind else {
+            panic!("a method body is a block");
+        };
+        let StmtKind::Expression(expr) = &statements[0].kind else {
+            panic!("the body's one statement is an expression statement");
+        };
+        let assembly = Assembly::read(reference).expect("the fixture parses");
+        let mut model = Model::new();
+        load_assembly(&mut model, &assembly);
+        Binder::with_model(model).bind_expression(expr)
+    }
+
+    /// The token operand of the `call`/`callvirt` the expression lowers to.
+    fn emitted_call_token(
+        expr: &BoundExpr,
+        image: &mut ImageBuilder,
+        tokens: &mut Tokens,
+    ) -> Result<Token, crate::EmitError> {
+        mint_in_expr(expr, image, tokens);
+        let mut out = Vec::new();
+        crate::expr::emit_expression(expr, &crate::frame::Frame::empty(), tokens, &mut out)?;
+        let call = out
+            .iter()
+            .rev()
+            .find(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    lamella_cil::Opcode::Call | lamella_cil::Opcode::Callvirt
+                )
+            })
+            .expect("the expression lowers to a call");
+        match call.operand {
+            lamella_cil::Operand::Token(token) => Ok(token),
+            ref other => panic!("a call names its target by token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_generic_call_names_its_own_method_spec_and_not_the_definition() {
+        let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        let site = emitted_call_token(&expr, &mut image, &mut tokens).expect("a generic call emits");
+
+        assert_eq!(
+            site.table(),
+            lamella_metadata::tables::table::METHOD_SPEC,
+            "the call must name a MethodSpec row, not the method it instantiates"
+        );
+        let definition = tokens
+            .method(
+                &named_symbol("Fixture", "Util"),
+                "Id",
+                &[TypeSymbol::Named(["T".into()].into())],
+            )
+            .expect("the open definition is minted under its OPEN parameter key");
+        assert_eq!(definition.table(), lamella_metadata::tables::table::MEMBER_REF);
+        assert_ne!(site, definition);
+    }
+
+    /// Two instantiations of one definition are two rows over one `MemberRef`, and the arguments
+    /// survive the blob round trip.
+    #[test]
+    fn two_instantiations_of_one_method_are_two_rows_over_one_member_ref() {
+        let Some(int_call) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
+        let Some(string_call) = bound_expression("Fixture.Util.Id<string>(\"x\")") else { return };
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        let int_site =
+            emitted_call_token(&int_call, &mut image, &mut tokens).expect("Id<int> emits");
+        let string_site =
+            emitted_call_token(&string_call, &mut image, &mut tokens).expect("Id<string> emits");
+        assert_ne!(int_site, string_site, "two instantiations are two rows");
+
+        let pe = image.finish(Token::new(0, 0), true);
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("the emitted image parses");
+
+        let definition = assembly
+            .method_spec_method(int_site)
+            .expect("a MethodSpec names the method it instantiates");
+        assert_eq!(assembly.method_spec_method(string_site), Some(definition));
+
+        assert_eq!(
+            assembly.method_spec_instantiation(int_site),
+            Some(alloc::vec![lamella_metadata::SigType::I4])
+        );
+        assert_eq!(
+            assembly.method_spec_instantiation(string_site),
+            Some(alloc::vec![lamella_metadata::SigType::String])
+        );
+
+        let member = assembly
+            .member_ref(definition.row())
+            .expect("the definition is a MemberRef");
+        assert_eq!(member.name(), Some("Id"));
+        assert_eq!(
+            member.signature_blob(),
+            &[0x10, 0x01, 0x01, 0x1E, 0x00, 0x1E, 0x00],
+            "the open definition is GENERIC over one parameter and spelled with !!0"
+        );
+    }
+
+    #[test]
+    fn a_second_type_parameter_is_numbered_by_its_own_position() {
+        let Some(expr) = bound_expression("Fixture.Util.Two<int, string>(1, \"x\")") else { return };
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        let site = emitted_call_token(&expr, &mut image, &mut tokens).expect("Two<int,string> emits");
+
+        let pe = image.finish(Token::new(0, 0), true);
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("the emitted image parses");
+
+        assert_eq!(
+            assembly.method_spec_instantiation(site),
+            Some(alloc::vec![
+                lamella_metadata::SigType::I4,
+                lamella_metadata::SigType::String
+            ])
+        );
+        let definition = assembly
+            .method_spec_method(site)
+            .expect("a MethodSpec names the method it instantiates");
+        let member = assembly
+            .member_ref(definition.row())
+            .expect("the definition is a MemberRef");
+        assert_eq!(member.name(), Some("Two"));
+        assert_eq!(
+            member.signature_blob(),
+            &[0x10, 0x02, 0x02, 0x1E, 0x00, 0x1E, 0x00, 0x1E, 0x01],
+            "the second parameter is !!1 -- its own declaration position, not the first's"
+        );
+    }
+
+    #[test]
+    fn a_generic_call_without_its_row_refuses_rather_than_naming_the_definition() {
+        let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
+        let BoundExprKind::Call { method: Some(method), .. } = &expr.kind else {
+            panic!("the expression bound to a call");
+        };
+        let instantiation = method
+            .instantiation
+            .as_deref()
+            .expect("the binder recorded the call site's type arguments");
+
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        mint_generic_definition_ref(method, instantiation, &mut image, &mut tokens)
+            .expect("the definition mints");
+
+        let mut out = Vec::new();
+        let emitted =
+            crate::expr::emit_expression(&expr, &crate::frame::Frame::empty(), &tokens, &mut out);
+        assert!(
+            emitted.is_err(),
+            "a generic call with no MethodSpec must refuse, not fall back to the definition"
+        );
+    }
+
+    #[test]
+    fn a_this_module_generic_definition_is_refused_rather_than_wrongly_instantiated() {
+        let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        tokens.insert_type(&named_symbol("Fixture", "Util"), Token::new(TYPE_DEF, 2));
+
+        mint_in_expr(&expr, &mut image, &mut tokens);
+        let mut out = Vec::new();
+        assert!(
+            crate::expr::emit_expression(&expr, &crate::frame::Frame::empty(), &tokens, &mut out)
+                .is_err(),
+            "a MethodSpec over a non-generic MethodDef signature is refused, not written"
+        );
+    }
+
+    #[test]
+    fn a_generic_method_on_a_generic_type_is_refused_rather_than_named_wrongly() {
+        let Some(reference) = reference_fixture(NESTED_FIXTURE) else { return };
+        let expr = bound_expression_against(
+            &reference,
+            "new Fixture.Holder<int>().Echo<string>(\"x\")",
+        );
+        let BoundExprKind::Call { method: Some(method), .. } = &expr.kind else {
+            panic!("the expression bound to a call");
+        };
+        assert!(
+            method.instantiation.is_some(),
+            "the call site's type arguments are recorded even here"
+        );
+        assert!(
+            matches!(method.declaring_type, TypeSymbol::Instantiation { .. }),
+            "the declaring type is the INSTANTIATION, which is what has no TypeRef"
+        );
+
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        assert!(
+            emitted_call_token(&expr, &mut image, &mut tokens).is_err(),
+            "a member of an instantiated generic type is refused, not emitted against a TypeRef"
+        );
+    }
+
+    /// Compiles `source` to an image AS IF the generics gate were already lifted.
+    fn image_of_gated_source(source: &str) -> Vec<u8> {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(source, options);
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "the source must PARSE cleanly under C# 2: {:?}",
+            parsed.diagnostics
+        );
+        let units = alloc::vec![parsed.unit];
+        let references: Vec<Assembly> = Vec::new();
+        for diagnostic in lamella_binder::bind_compilation_unit_with_dialect(
+            &units[0],
+            &references,
+            false,
+            LanguageVersion::CSharp2,
+        ) {
+            assert_eq!(
+                diagnostic.code(),
+                1,
+                "the ONLY diagnostic may be the generics gate: {}",
+                diagnostic.kind
+            );
+        }
+        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+            .expect("the barrier is minted from the assertion above, not from a bare `false`");
+        let (image, _) = build_image(&program, "test.dll", "test", None, false, false)
+            .expect("a generic declaration emits");
+        image
+    }
+
+    #[test]
+    fn a_declared_generic_type_is_mangled_and_carries_its_parameter_rows() {
+        let image = image_of_gated_source("namespace App { public class Box<T> { } }\n");
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+
+        let boxed = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name.starts_with("Box")))
+            .expect("the declared type is in the image");
+        assert_eq!(
+            boxed.name().map(|n| n.name),
+            Some("Box`1"),
+            "the arity is part of the metadata name (II.10.7.2)"
+        );
+
+        let by_owner = assembly.type_parameter_names();
+        assert_eq!(
+            by_owner.get(&boxed.token().row()).map(|names| names.as_slice()),
+            Some(["T"].as_slice()),
+            "the type's parameter is named in metadata"
+        );
+    }
+
+    #[test]
+    fn parameter_rows_are_numbered_by_position_and_only_generic_types_get_them() {
+        let image = image_of_gated_source(
+            "namespace App { public class Pair<TKey, TValue> { } public class Plain { } }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+
+        let owner_of = |name: &str| {
+            let row = assembly
+                .type_defs()
+                .find(|t| t.name().is_some_and(|n| n.name == name))
+                .unwrap_or_else(|| panic!("{name} is in the image"))
+                .token()
+                .row();
+            row << 1
+        };
+        let rows: Vec<(u32, u32, Option<&str>)> = assembly
+            .generic_params()
+            .map(|(number, _flags, owner, name)| (number, owner, name))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (0, owner_of("Pair`2"), Some("TKey")),
+                (1, owner_of("Pair`2"), Some("TValue")),
+            ],
+            "numbered by declaration position, owned by the TypeDef, and nothing for `Plain`"
+        );
+    }
+
+    #[test]
+    fn a_member_naming_its_types_parameter_encodes_var_not_mvar() {
+        let image = image_of_gated_source(
+            "namespace App { public class Box<T> { public T Value; public T Get() { return Value; } } }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let boxed = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Box`1"))
+            .expect("Box`1 is in the image");
+
+        let field = boxed.fields().next().expect("Box declares a field");
+        assert_eq!(field.name(), Some("Value"));
+        assert_eq!(
+            field.signature(),
+            Some(lamella_metadata::SigType::Var(0)),
+            "a field of the type's own parameter is `!0` -- not a class ref, and not `!!0`"
+        );
+
+        let get = boxed
+            .methods()
+            .find(|m| m.name() == Some("Get"))
+            .expect("Box declares Get");
+        assert_eq!(
+            get.signature_blob(),
+            &[0x20, 0x00, 0x13, 0x00],
+            "an instance method returning the type's own parameter is HASTHIS + `!0`"
+        );
+    }
+
+    #[test]
+    fn a_non_generic_call_still_names_a_member_ref() {
+        let Some(expr) = bound_expression("Fixture.Util.Plain(1)") else { return };
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        let site = emitted_call_token(&expr, &mut image, &mut tokens).expect("a plain call emits");
+        assert_eq!(site.table(), lamella_metadata::tables::table::MEMBER_REF);
+    }
+
+    /// A generic STRUCT instantiates to a VALUE type, not a reference type. The two are not
+    /// interchangeable in a signature: emitting `Class` for a value type decodes cleanly and boxes
+    /// where nothing should be boxed, which is the quiet half of the same family as the cast hole.
+    #[test]
+    fn an_instantiated_generic_struct_lowers_to_a_value_type() {
+        let mangled = TypeSymbol::Named(["App".into(), "Pair`1".into()].into());
+        let mut tokens = Tokens::new();
+        tokens.insert_type(&mangled, Token::new(0x02, 9));
+        tokens.insert_struct(&mangled);
+
+        let sig = type_sig(
+            &tokens,
+            &TypeSymbol::Instantiation {
+                definition: ["App".into(), "Pair".into()].into(),
+                arguments: [TypeSymbol::Special(SpecialType::Int32)].into(),
+            },
+        )
+        .expect("an instantiated struct lowers");
+        match sig {
+            TypeSig::GenericInst { definition, .. } => {
+                assert_eq!(*definition, TypeSig::ValueType(Token::new(0x02, 9)));
+            }
+            other => panic!("expected GENERICINST, got {other:?}"),
+        }
+    }
+
     #[test]
     fn validated_program_is_minted_only_by_a_clean_bind() {
         let no_units: &[CompilationUnit] = &[];
         let no_refs: &[Assembly] = &[];
         assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, false).is_some());
         assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, true).is_none());
+    }
+
+    #[test]
+    fn an_object_initializer_emits_a_store_per_member_and_leaves_the_object() {
+        let unit = parse_compilation_unit(
+            "namespace App { \
+               public class Inner { public int G; } \
+               public class C { \
+                 public int F; \
+                 private int p; \
+                 public int P { get { return p; } set { p = value; } } \
+                 public Inner N; \
+                 public static C Make() { return new C { F = 1, P = 2, N = { G = 3 } }; } \
+               } }",
+        )
+        .unit;
+
+        let result = compile(
+            &unit,
+            "app.dll",
+            "app",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp3,
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "an object initializer should compile clean at C# 3: {:?}",
+            result.diagnostics
+        );
+        let with_initializer = body_of(&result.image.expect("an image"), "Make");
+
+        let control_unit = parse_compilation_unit(
+            "namespace App { \
+               public class Inner { public int G; } \
+               public class C { \
+                 public int F; \
+                 private int p; \
+                 public int P { get { return p; } set { p = value; } } \
+                 public Inner N; \
+                 public static C Make() { return new C(); } \
+               } }",
+        )
+        .unit;
+        let control = compile(
+            &control_unit,
+            "app.dll",
+            "app",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp3,
+        );
+        let without = body_of(&control.image.expect("an image"), "Make");
+
+        assert!(
+            with_initializer > without,
+            "the initializer must emit a store per member: body was {with_initializer} bytes \
+             with it and {without} without -- equal means the members were dropped"
+        );
+    }
+
+    /// The IL byte length of the named method in `image`, for comparing two emissions of one
+    /// program shape.
+    fn body_of(image: &[u8], method: &str) -> usize {
+        let assembly = Assembly::read(image).expect("the reader parses the image");
+        assembly
+            .type_defs()
+            .flat_map(|ty| ty.methods().collect::<Vec<_>>())
+            .find(|m| m.name() == Some(method))
+            .and_then(|m| m.body())
+            .map(|body| body.code.len())
+            .unwrap_or_else(|| panic!("no body for {method}"))
     }
 
     #[test]
@@ -6227,6 +7266,176 @@ mod tests {
             ctor.custom_attributes().count(),
             1,
             "the [Mark] attribute is emitted on the constructor row"
+        );
+    }
+
+    /// The attribute names on one metadata row, so a test can state placement rather than a count.
+    fn attribute_names_on(assembly: &Assembly, parent: lamella_token::Token) -> Vec<String> {
+        let mut names: Vec<String> = assembly
+            .custom_attributes(parent)
+            .filter_map(|attribute| {
+                assembly
+                    .resolve_method(attribute.constructor)
+                    .and_then(|ctor| ctor.declaring_type)
+                    .map(|declaring| alloc::format!("{}.{}", declaring.namespace, declaring.name))
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn required_members_are_marked_and_their_constructors_guarded() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp11,
+            ..LexOptions::default()
+        };
+        let source = "namespace System.Diagnostics.CodeAnalysis { public class SetsRequiredMembersAttribute { } } \
+             namespace App { \
+               public class Base { public required int F; public Base() { } \
+                 [System.Diagnostics.CodeAnalysis.SetsRequiredMembers] public Base(int f) { F = f; } } \
+               public class Derived : Base { public Derived() { } } \
+               public class Plain { public int G; public Plain() { } } \
+             }";
+        let unit = parse_compilation_unit_with(source, options).unit;
+        let result = compile(
+            &unit,
+            "app.dll",
+            "app",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp11,
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "the program should compile clean at C# 11: {:?}",
+            result.diagnostics
+        );
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("reads back");
+
+        const REQUIRED: &str = "System.Runtime.CompilerServices.RequiredMemberAttribute";
+        const FEATURE: &str = "System.Runtime.CompilerServices.CompilerFeatureRequiredAttribute";
+        const OBSOLETE: &str = "System.ObsoleteAttribute";
+        const SETS: &str = "System.Diagnostics.CodeAnalysis.SetsRequiredMembersAttribute";
+
+        let base = assembly.find_type("App", "Base").expect("App.Base");
+        assert_eq!(attribute_names_on(&assembly, base.token()), [REQUIRED]);
+        let field = base.fields().find(|f| f.name() == Some("F")).expect("F");
+        assert_eq!(attribute_names_on(&assembly, field.token()), [REQUIRED]);
+
+        let mut guarded = 0;
+        let mut exempt = 0;
+        for ctor in base.methods().filter(|m| m.name() == Some(".ctor")) {
+            let names = attribute_names_on(&assembly, ctor.token());
+            if names == [SETS] {
+                exempt += 1;
+            } else if names == [OBSOLETE, FEATURE] || names == [FEATURE, OBSOLETE] {
+                guarded += 1;
+            } else {
+                panic!("unexpected attributes on a constructor: {names:?}");
+            }
+        }
+        assert_eq!((guarded, exempt), (1, 1), "one guarded ctor and one exempt");
+
+        let derived = assembly.find_type("App", "Derived").expect("App.Derived");
+        assert_eq!(
+            attribute_names_on(&assembly, derived.token()),
+            Vec::<String>::new(),
+            "a derived type declaring nothing required carries no type-level marker"
+        );
+        let derived_ctor = derived
+            .methods()
+            .find(|m| m.name() == Some(".ctor"))
+            .expect("Derived..ctor");
+        assert_eq!(
+            attribute_names_on(&assembly, derived_ctor.token()),
+            [OBSOLETE, FEATURE],
+            "an inherited requirement still guards the derived constructor"
+        );
+
+        let plain = assembly.find_type("App", "Plain").expect("App.Plain");
+        assert_eq!(attribute_names_on(&assembly, plain.token()), Vec::<String>::new());
+        let plain_field = plain.fields().find(|f| f.name() == Some("G")).expect("G");
+        assert_eq!(attribute_names_on(&assembly, plain_field.token()), Vec::<String>::new());
+        let plain_ctor = plain
+            .methods()
+            .find(|m| m.name() == Some(".ctor"))
+            .expect("Plain..ctor");
+        assert_eq!(attribute_names_on(&assembly, plain_ctor.token()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_required_member_is_required_across_an_assembly_boundary() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp11,
+            ..LexOptions::default()
+        };
+        let build_library = |source: &str| {
+            let unit = parse_compilation_unit_with(source, options.clone()).unit;
+            let result = compile(
+                &unit,
+                "lib.dll",
+                "lib",
+                &[],
+                None,
+                false,
+                false,
+                false,
+                LanguageVersion::CSharp11,
+            );
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            result.image.expect("library image")
+        };
+        let consumer_codes = |reference: &Assembly| {
+            let program =
+                parse_compilation_unit_with("public class P { public object M() { return new Lib.C(); } }", options.clone())
+                    .unit;
+            let compiled = compile(
+                &program,
+                "p.dll",
+                "p",
+                core::slice::from_ref(reference),
+                None,
+                false,
+                false,
+                false,
+                LanguageVersion::CSharp11,
+            );
+            compiled
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<u16>>()
+        };
+
+        let required_image =
+            build_library("namespace Lib { public class C { public required int F; public C() { } } }");
+        let required = Assembly::read(&required_image).expect("library assembly");
+        assert_eq!(
+            consumer_codes(&required),
+            [9035],
+            "an IMPORTED required member must still be required at the creation site"
+        );
+
+        let plain_image =
+            build_library("namespace Lib { public class C { public int F; public C() { } } }");
+        let plain = Assembly::read(&plain_image).expect("library assembly");
+        assert_eq!(consumer_codes(&plain), Vec::<u16>::new());
+
+        let exempt_image = build_library(
+            "namespace System.Diagnostics.CodeAnalysis { public class SetsRequiredMembersAttribute { } } \
+             namespace Lib { public class C { public required int F; \
+               [System.Diagnostics.CodeAnalysis.SetsRequiredMembers] public C() { F = 1; } } }",
+        );
+        let exempt = Assembly::read(&exempt_image).expect("library assembly");
+        assert_eq!(
+            consumer_codes(&exempt),
+            Vec::<u16>::new(),
+            "an imported [SetsRequiredMembers] constructor exempts the creation"
         );
     }
 

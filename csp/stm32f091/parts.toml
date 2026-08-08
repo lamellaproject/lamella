@@ -1,10 +1,17 @@
 # PARTS table for the stm32f091 family. PARTIAL.
 #
-# ram: 32 KB, RM0091-exact ("32 Kbytes of static SRAM"). flash = 0 is a DEFERRAL, not a
-# statement: RM0091 states only "up to 256 Kbyte of flash memory" for the line, and the
-# exact F091RC size is deferred to the datasheet. NOTE this 0 is NOT the external-XIP
-# convention -- the part has internal flash; nothing consumes the value until the real size
-# lands with its citation.
+# THE FAMILY NAME IS TOO NARROW FOR ITS CONTENTS, and that is a naming question rather than a
+# structural one. RM0091's introduction states its own scope: it "applies to the STM32F031x4/x6,
+# STM32F051x4/x6/x8, STM32F071x8/xB, STM32F091xB/xC, STM32F042x4/x6, STM32F072x8/xB,
+# STM32F038x6, STM32F048x6, STM32F058x8, STM32F078xB and STM32F098xC devices" -- eleven lines
+# under one manual and one pin-function table. So a part from any of them belongs to this family,
+# and the second row below is an STM32F072 rather than an STM32F091.
+#
+# ram: 32 KB on the F091RC, RM0091-exact ("32 Kbytes of static SRAM"). flash = 0 on THAT ROW is a
+# DEFERRAL, not a statement: RM0091 gives only "up to 256 Kbyte of flash memory" for the line, and
+# the exact F091RC size waits on its datasheet. NOTE this 0 is NOT the external-XIP convention --
+# the part has internal flash; nothing consumes the value until the real size lands with its
+# citation. The F072VB row states both sizes, because a document names them for that exact part.
 
 [table]
 kind = "parts"
@@ -17,3 +24,17 @@ flash = 0
 ram = 0x8000
 pins = ["PA2-PA3"]
 source = "RM0091 (32 Kbytes SRAM; flash 'up to 256 Kbyte' -- exact F091RC size DEFERRED to the DS) -- the pin list is PARTIAL rather than the package's full set"
+
+[[parts]]
+part = "stm32f072vb"
+package = "LQFP100"
+flash = 0x20000
+ram = 0x4000
+pins = [
+    "PA0",
+    "PC13",
+    "PD8-PD11",
+    "PE2-PE3",
+    "PF9-PF10",
+]
+source = "UM1714 Rev 1 (STM32072B-EVAL), which names the fitted part STM32F072VBT6 and states its memory directly: 'internal 16KB SRAM and 128KB Flash'. That is a BOARD manual rather than the part's own datasheet, and it is said here rather than left implicit -- the sizes are ST's statement about this exact order code, but a reader wanting the line's full range still has to open the STM32F072 datasheet. The order code agrees with the sizes independently: in ST's F0 scheme V = 100 pins and B = 128 Kbytes of flash, so LQFP100 and 0x20000 are two readings of the same string. The pin list is PARTIAL rather than the package's 100: PD8-PD11 are the four user LEDs, PC13 the tamper key, and PA0/PE2/PE3/PF9/PF10 the joystick's select and its four directions, all from UM1714 Rev 1 Table 34 'STM32072B-EVAL IO assignment'."

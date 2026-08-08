@@ -24,3 +24,14 @@ lamella-aot = { path = "../lamella-aot" }
 lamella-metadata = { path = "../lamella-metadata" }
 # device-dap-server flashes the built image on launch (F5 = deploy + debug).
 lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
+lamella-stlink = { path = "../lamella-stlink", optional = true }
+lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32", optional = true }
+
+[features]
+default = []
+## Lets `device-dap-server` drive an ST-Link and program STM32 flash, so an ST board with an
+## on-board debugger can be deployed to and natively debugged over its one USB cable.
+st = ["dep:lamella-stlink", "dep:lamella-cmsis-dap-stm32"]
+
+[dev-dependencies]
+lamella-stlink = { path = "../lamella-stlink" }

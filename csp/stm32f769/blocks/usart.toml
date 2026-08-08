@@ -1,0 +1,67 @@
+# BLOCK layout: the STM32F769 USART. PARTIAL -- the registers and fields a byte-at-a-time channel
+# needs, plus the ones that decide the frame. Offsets are instance-base-relative.
+
+[table]
+kind = "block"
+family = "stm32f769"
+block = "usart"
+sources = [
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5: USART_CR1 34.8.1 (address offset 0x00), USART_BRR 34.8.4 (0x0C), USART_ISR 34.8.8 (0x1C), USART_RDR 34.8.10 (0x24), USART_TDR 34.8.11 (0x28)",
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5, per-bit descriptions: CR1 UE bit 0, RE bit 2, TE bit 3, PS bit 9, PCE bit 10, M0 bit 12, OVER8 bit 15, M1 bit 28; ISR RXNE bit 5, TC bit 6, TXE bit 7, BUSY bit 16",
+]
+notes = [
+    "8N1 = CR1.M[1:0] = 00 (8 data bits), CR2.STOP = 00 (1 stop bit), CR1.PCE = 0 (no parity), CR1.OVER8 = 0 (16x oversampling). All are reset values, so CR1 = UE | TE | RE is a complete 8N1 config.",
+    "The word length is TWO BITS IN TWO PLACES -- M0 at bit 12 and M1 at bit 28 -- so a driver that treated word length as one field would set half of it and read back a value it never wrote.",
+    "TX: poll ISR.TXE (transmit data register empty), write the byte to TDR. RX: poll ISR.RXNE, read RDR. ISR.TC = transmission complete, the shift register drained -- which is the flag to wait on before cutting power or changing the baud rate, and not the one to wait on between bytes.",
+    "Every bit position is from the per-bit descriptions rather than the register bit-map diagram, whose columns do not survive a text conversion.",
+]
+
+[registers.CR1]
+offset = 0x0
+width = 32
+fields = { UE = [0, 1], RE = [2, 1], TE = [3, 1], IDLEIE = [4, 1], RXNEIE = [5, 1], TCIE = [6, 1], TXEIE = [7, 1], PEIE = [8, 1], PS = [9, 1], PCE = [10, 1], M0 = [12, 1], OVER8 = [15, 1], M1 = [28, 1] }
+notes = "UE = USART enable, TE/RE = transmitter/receiver enable. Word length M[1:0] = {M1(28), M0(12)}: 00 = 8 data bits. OVER8 0 = 16x oversampling. PCE 0 = no parity."
+
+[registers.CR2]
+offset = 0x4
+width = 32
+fields = { STOP = [12, 2] }
+notes = "STOP = 00 gives one stop bit, which is the reset value."
+
+[registers.CR3]
+offset = 0x8
+width = 32
+fields = { }
+
+[registers.BRR]
+offset = 0xC
+width = 32
+fields = { BRR = [0, 16] }
+notes = "Baud rate. With OVER8 = 0, BRR = USARTDIV = round(f_ck / baud). f_ck is the SELECTED USART kernel clock rather than a fixed one, and the APB it sits on differs by instance -- USART1 is on APB2 where USART2/3 and the UARTs are on APB1. So the rate is a plan fact established per board; this block states the arithmetic only."
+
+[registers.ISR]
+offset = 0x1C
+width = 32
+fields = { PE = [0, 1], FE = [1, 1], NF = [2, 1], ORE = [3, 1], IDLE = [4, 1], RXNE = [5, 1], TC = [6, 1], TXE = [7, 1], BUSY = [16, 1] }
+notes = "Status. TXE = TDR empty (room to write), TC = transmission complete, RXNE = RDR holds a received byte."
+
+[registers.ICR]
+offset = 0x20
+width = 32
+fields = { }
+notes = "Interrupt flag clear. A status flag on this IP is cleared by writing here rather than by a read-then-read-data dance."
+
+[registers.RDR]
+offset = 0x24
+width = 32
+fields = { RDR = [0, 9] }
+notes = "Receive data (read once RXNE = 1). Low 8 bits at 8-bit word length."
+
+[registers.TDR]
+offset = 0x28
+width = 32
+fields = { TDR = [0, 9] }
+notes = "Transmit data (write once TXE = 1). Low 8 bits at 8-bit word length."
+
+[parameters]
+baud = "16x oversampling (OVER8 = 0): BRR = round(f_ck / baud). The rate comes from the board plan; the divisor is generated."

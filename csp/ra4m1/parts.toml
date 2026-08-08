@@ -1,0 +1,37 @@
+# PARTS table for the ra4m1 family. Pin lists are PARTIAL present-lists: they carry the pins the
+# boards reach, so a consumer must not read one as the package.
+#
+# WHAT ADMITS A PART TO THIS FAMILY, AND WHY THE TEST READS TWO DOCUMENTS RATHER THAN ONE. A family
+# here owns ONE hardware manual and one pin-function table. This vendor scopes a manual by the GROUP
+# named in its title rather than by an introduction enumerating part numbers: the RA4M1 Group User's
+# Manual: Hardware says of itself only that it "describes the product specification of the
+# microcontroller (MCU) superset", which names no products at all, and the word RA6 does not occur
+# anywhere in its 1454 pages. The enumeration lives in a separate document, the RA4M1 Group
+# Datasheet, whose Table 1.13 lists the seven orderable products of the group. So a part joins when
+# the manual's title names its group AND that datasheet's product list carries its order code, and
+# an RA6-series group is a different manual and a different family whatever its part number
+# resembles.
+
+[table]
+kind = "parts"
+family = "ra4m1"
+sources = [
+    "Renesas RA4M1 Group Datasheet R01DS0355EJ0110 Rev.1.10 (Sep 29, 2023): section 1.3 Part Numbering, Figure 1.2, gives the part numbering scheme as thirteen fields, of which the code flash memory size field reads B = 256 KB, the operating temperature field 2 = -40 C to 85 C and 3 = -40 C to 105 C, and the package type field FP = LQFP 100 pins, FM = LQFP 64 pins, FL = LQFP 48 pins, LJ = LGA 100 pins, NB = QFN 64 pins, NE = QFN 48 pins, NF = QFN 40 pins. Table 1.13, the product list, gives seven product part numbers against package codes, and prints 256 KB code flash, 8 KB data flash and 32 KB SRAM as cells merged across every row of the table",
+    "Renesas RA4M1 Group User's Manual: Hardware R01UH0887EJ0110 Rev.1.10 (Sep 29, 2023): section 19.2.5 defines a pin's name as Pmn with m = 0 to 9 and n = 00 to 15; Table 19.1, I/O Ports specifications, gives a per-package column of the pins each port carries, and its 64-pin column reads PORT0 = P000 to P004 and P010 to P015 (11 pins), PORT1 = P100 to P113 (14 pins), PORT2 = P200, P201, P204 to P206, P212 to P215 (9 pins), PORT3 = P300 to P304 (5 pins), PORT4 = P400 to P402 and P407 to P411 (8 pins), PORT5 = P500 to P502 (3 pins), PORT6 to PORT8 absent, PORT9 = P914 and P915 (2 pins), totalling 52 pins",
+]
+notes = [
+    "The memory figures are read from a table whose Code flash, Data flash and SRAM cells are MERGED down the whole product list, so they are one statement about every member of the group rather than a row-by-row reading. That was settled by rendering the page: a text conversion of the same table prints those cells as blank on every row after the first, which is indistinguishable from a value the conversion dropped.",
+    "Table 19.1 gives a different pin set per package, and a package column is evidence only about its own package. PORT1 runs to P115 on the 100-pin part and stops at P113 on the 64-pin one, so a pin resolved against the wrong column can be a pin the package does not physically carry.",
+    "The pin list below is held to what a board drives rather than to the package's 52 pins. A present-list is evidence-only: a pin is added when a board reaches it.",
+]
+
+[[parts]]
+part = "r7fa4m1ab3cfm"
+package = "64-pin LQFP"
+flash = 0x40000
+ram = 0x8000
+pins = [
+    "P0.12", "P0.13",
+    "P1.11",
+]
+source = "R01DS0355EJ0110 Rev.1.10 Figure 1.2 decoding R7FA4M1AB3CFM: B = 256 KB code flash, 3 = -40 C to 105 C, FM = LQFP 64 pins. Table 1.13 carries the same part number against package code PLQP0064KB-C with 256 KB code flash, 8 KB data flash and 32 KB SRAM, so flash 0x40000 and ram 0x8000 are each stated twice by documents that do not derive from one another. The core is the Arm Cortex-M4 the datasheet's feature list names for the group. The pin list is PARTIAL rather than the package's 52: P1.11 drives a user LED and P0.12 and P0.13 drive two more, and R01UH0887EJ0110 Rev.1.10 Table 19.1 carries all three in its 64-pin column, which gives PORT0 as P000 to P004 and P010 to P015 and PORT1 as P100 to P113."

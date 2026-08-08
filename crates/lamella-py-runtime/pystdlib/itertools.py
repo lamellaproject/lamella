@@ -1,7 +1,8 @@
 """Iterator building blocks, after the CPython itertools reference implementations.
 
 CPython implements these in C; each is documented with a pure-Python equivalent, and
-that equivalent is what this module realizes.
+that equivalent is what this module realizes, and its observable behaviour is verified
+against CPython's own itertools.
 
 Known deltas from the C module: these are generator functions and plain classes, so
 `type(count(1))` is a generator, not `itertools.count`, and the C types' pickling and

@@ -154,6 +154,14 @@ pub struct Vm {
     /// the compactor remaps these keys at every collection ([`run_collection`]) just as it does the
     /// exception-message table.
     locks: BTreeMap<u32, LockState>,
+    /// Threads whose most recent timed `Monitor.Wait` ended by its DEADLINE rather than by a pulse.
+    ///
+    /// The outcome cannot be the parking intrinsic's return value: that call returns BEFORE the
+    /// thread parks, and which way the wait ends is not known until it is woken. So the wait is two
+    /// calls -- park, then read this -- the same shape a socket op uses when it re-polls after its
+    /// park. An id is inserted only on a timeout and REMOVED when read, so a later untimed wait
+    /// cannot inherit an older wait's verdict.
+    wait_timeouts: BTreeSet<u32>,
     /// The host clock seam for timed waits (`Thread.Sleep`, the scheduler's idle-block). `now_millis`
     /// reads a monotonic millisecond count; `sleep_millis` blocks the OS thread that many ms. The
     /// no_std core has no clock, so the embedder sets these (the host from `std::time`; a device from
@@ -360,7 +368,7 @@ impl Vm {
         }
         if let Some(state) = self.locks.get_mut(&obj) {
             if !state.waiters.iter().any(|waiter| waiter.thread == thread) {
-                state.waiters.push(LockWaiter { thread, depth: 1 });
+                state.waiters.push(LockWaiter { thread, depth: 1, abandonable: false });
             }
         }
         false
@@ -427,7 +435,7 @@ impl Vm {
     pub fn lock_wait(&mut self, obj: u32, thread: u32) -> Option<u32> {
         let state = self.locks.get_mut(&obj)?;
         let depth = state.count;
-        state.waiting.push(LockWaiter { thread, depth });
+        state.waiting.push(LockWaiter { thread, depth, abandonable: false });
         state.grant_to_next_waiter()
     }
 
@@ -456,7 +464,86 @@ impl Vm {
     /// then the lock has been handed to it, so it resumes already holding it. `wake`, if set, is a
     /// contender that a `Monitor.Wait`'s release just handed the lock -- the scheduler wakes it too.
     pub fn request_block_on_lock(&mut self, wake: Option<u32>) {
-        self.thread_op = Some(ThreadOp::BlockOnLock { wake });
+        self.thread_op = Some(ThreadOp::BlockOnLock { wake, deadline: None });
+    }
+
+    /// As [`request_block_on_lock`](Self::request_block_on_lock), but the park is BOUNDED: the
+    /// reactor also wakes the thread once `deadline` (monotonic ms) passes, whether or not it was
+    /// pulsed. Backs `Monitor.Wait(object, int)`.
+    pub fn request_block_on_lock_until(&mut self, wake: Option<u32>, deadline: u64) {
+        self.thread_op = Some(ThreadOp::BlockOnLock { wake, deadline: Some(deadline) });
+    }
+
+    /// Queue `thread` for a TIMED acquire of `obj`'s lock -- the blocking half of
+    /// `Monitor.TryEnter(object, int)`. Returns `true` if it was queued (so the caller parks);
+    /// `false` if the lock turned out to be takeable and is now HELD (so the caller must not park).
+    ///
+    /// The second case is defensive rather than expected: the managed side tries first and only
+    /// calls this on contention, and nothing runs between the two on a cooperative scheduler. But a
+    /// park with no one to wake it is a hang, so the takeable case is handled rather than assumed
+    /// away.
+    pub fn lock_queue_timed_acquire(&mut self, obj: u32, thread: u32) -> bool {
+        if self.lock_try(obj, thread) {
+            return false;
+        }
+        if let Some(state) = self.locks.get_mut(&obj) {
+            if !state.waiters.iter().any(|waiter| waiter.thread == thread) {
+                state.waiters.push(LockWaiter { thread, depth: 1, abandonable: true });
+            }
+        }
+        true
+    }
+
+    /// A deadline fired on a thread parked against a lock: decide what actually happened and leave
+    /// it correctly queued. Returns `true` when the thread may run now, `false` when it must stay
+    /// blocked for a hand-off.
+    ///
+    /// THE RACE THIS EXISTS TO GET RIGHT: a hand-off and the deadline can land in the same block
+    /// point, and the two live in the SAME acquire-queue with opposite obligations. So the answer
+    /// comes from WHICH queue the thread is in and, within the acquire-queue, from whether it is
+    /// allowed to abandon:
+    ///
+    /// * still in the condition WAIT-SET -- a timed `Monitor.Wait` that was never pulsed. A real
+    ///   timeout, and it does NOT skip reacquisition: .NET returns from `Wait` holding the lock
+    ///   either way, so it takes the lock if free and otherwise queues like a contended `Enter`.
+    /// * in the acquire-queue and ABANDONABLE -- a timed `TryEnter` that ran out of time. A real
+    ///   timeout, and it leaves the queue: its answer is "no", and staying would hand it a lock
+    ///   nobody is waiting to receive.
+    /// * in the acquire-queue and NOT abandonable -- a `Wait` a pulse already moved there, which is
+    ///   owed the lock. NOT a timeout; waking it here would return it without the lock.
+    /// * in neither -- it already holds the lock (a hand-off got there first). Runnable, and not a
+    ///   timeout.
+    pub fn resolve_lock_deadline(&mut self, thread: u32) -> bool {
+        for (_, state) in self.locks.iter_mut() {
+            if let Some(index) = state.waiting.iter().position(|w| w.thread == thread) {
+                let waiter = state.waiting.remove(index);
+                self.wait_timeouts.insert(thread);
+                return if state.owner.is_none() {
+                    state.owner = Some(waiter.thread);
+                    state.count = waiter.depth;
+                    true
+                } else {
+                    state.waiters.push(waiter);
+                    false
+                };
+            }
+            if let Some(index) = state.waiters.iter().position(|w| w.thread == thread) {
+                if !state.waiters[index].abandonable {
+                    return false;
+                }
+                state.waiters.remove(index);
+                self.wait_timeouts.insert(thread);
+                return true;
+            }
+        }
+        true
+    }
+
+    /// Whether `thread`'s most recent timed `Monitor.Wait` ended by its deadline, CONSUMING the
+    /// verdict so a later wait cannot read a stale one. Backs the managed `Wait(object, int)`'s
+    /// return value.
+    pub fn take_wait_timed_out(&mut self, thread: u32) -> bool {
+        self.wait_timeouts.remove(&thread)
     }
 
     /// Requests that the scheduler wake thread `id`, blocked on a `Monitor` lock that a release
@@ -1142,9 +1229,26 @@ impl Vm {
     }
 
     /// The current wall time in 100-nanosecond ticks since the .NET epoch: the value last set by
-    /// [`Vm::set_now_ticks`] PLUS the monotonic time elapsed since that set (so the clock advances),
-    /// or 0 (the epoch) if never set. The `datetime_now_ticks` intrinsic returns this to the managed
+    /// [`Vm::set_now_ticks`] PLUS the monotonic time elapsed since that set (so the clock advances).
+    /// With no wall clock set it reads FORWARD FROM THE EPOCH by the monotonic clock, and with no
+    /// clock seam at all it is 0. The `datetime_now_ticks` intrinsic returns this to the managed
     /// `DateTime.Now`/`UtcNow`.
+    ///
+    /// # Why the unset case still advances
+    ///
+    /// Two questions hide behind one reading. **What is the date** is unknown without an RTC, a seed
+    /// or a sync, and the epoch is the honest answer to it. **How much time has passed** is a
+    /// different question, and a board with a clock seam can answer it. Returning a CONSTANT for the
+    /// unset case answered the second question wrongly in order to answer the first one honestly.
+    ///
+    /// That is not hypothetical: no serve firmware in this tree sets a wall clock, so `DateTime` was
+    /// pinned to the epoch on EVERY board while `Environment.TickCount` -- the same seam, one
+    /// accessor over -- advanced normally. A self-timing benchmark reported `0 ms` for real work and
+    /// its checksum gate passed, which is a wrong answer delivered silently.
+    ///
+    /// [`Vm::clock_is_set`] still reports **false** here, and that split is load-bearing: this is not
+    /// a claim about the date, and the adaptive TLS policy keys on `clock_is_set` to decide whether
+    /// certificate dates can be validated. A clock reading year 1 must not start validating dates.
     #[must_use]
     pub fn now_ticks(&self) -> i64 {
         match self.wall_anchor {
@@ -1152,7 +1256,9 @@ impl Vm {
                 let elapsed_ms = self.now_millis().unwrap_or(anchor_ms).saturating_sub(anchor_ms);
                 anchor_ticks.saturating_add((elapsed_ms as i64).saturating_mul(10_000))
             }
-            None => 0,
+            None => i64::try_from(self.now_millis().unwrap_or(0))
+                .unwrap_or(i64::MAX)
+                .saturating_mul(10_000),
         }
     }
 
@@ -1638,7 +1744,12 @@ enum ThreadOp {
     /// waiters) or a `Monitor.Wait` (parked in the condition wait-set). The scheduler parks it until
     /// a later wake hands it the lock. `wake`, if set, is a contender that a `Monitor.Wait`'s release
     /// just handed the lock -- the scheduler makes it runnable in the same step.
-    BlockOnLock { wake: Option<u32> },
+    BlockOnLock {
+        wake: Option<u32>,
+        /// A TIMED `Monitor.Wait`'s bound (monotonic ms): the reactor also wakes the thread when it
+        /// passes. `None` = wait until pulsed, however long that is.
+        deadline: Option<u64>,
+    },
     /// Wake thread `id`, blocked on a `Monitor` lock that a release just handed to it.
     WakeThread { id: u32 },
     /// Block the running thread until `now` + this many milliseconds (`Thread.Sleep`).
@@ -1679,6 +1790,16 @@ struct LockState {
 struct LockWaiter {
     thread: u32,
     depth: u32,
+    /// Whether this waiter may ABANDON the acquire-queue when its deadline fires.
+    ///
+    /// A timed `Monitor.TryEnter` may: it promised an answer within the timeout and its answer is
+    /// "no, you do not have the lock". A waiter a `Pulse` moved here from the condition wait-set may
+    /// NOT -- .NET's `Wait` reacquires the lock before returning EVEN WHEN IT TIMED OUT, so
+    /// abandoning would return it to managed code without the lock its next line assumes it holds.
+    ///
+    /// The two sit in the SAME queue with opposite obligations, which is exactly why this is
+    /// recorded at enqueue rather than inferred from where the thread is found.
+    abandonable: bool,
 }
 
 impl LockState {
@@ -1724,6 +1845,15 @@ enum ThreadState {
     /// Blocked on a `Monitor` lock; set back to `Ready` by a [`ThreadOp::WakeThread`] when the
     /// lock's owner releases and hands it over.
     Blocked,
+    /// Blocked against a lock with a DEADLINE: a timed `Monitor.Wait` parked in the condition
+    /// wait-set, or a timed `Monitor.TryEnter` queued for the lock. Both park exactly like
+    /// [`Blocked`](Self::Blocked) and are ALSO woken by the reactor once this monotonic-millisecond
+    /// deadline passes; both answer the same question, "did I get it in time".
+    ///
+    /// A deadline wake is NOT simply `Ready` -- a timed-out `Wait` must reacquire the lock first,
+    /// and a thread the hand-off already reached is not timed out at all. See
+    /// [`Vm::resolve_lock_deadline`], which decides between them.
+    BlockedUntil(u64),
     /// Sleeping until this monotonic-millisecond deadline (`Thread.Sleep`); woken by the scheduler's
     /// `idle_wait` once the deadline passes.
     Sleeping(u64),
@@ -1734,6 +1864,12 @@ enum ThreadState {
     IoWait(u32, Option<u64>),
     /// Finished (its `result` is set).
     Done,
+}
+
+/// Whether a thread is parked on a `Monitor` lock -- untimed or with a deadline. Both are woken the
+/// same way by a lock HAND-OFF; only the reactor tells them apart.
+fn is_lock_blocked(state: &ThreadState) -> bool {
+    matches!(state, ThreadState::Blocked | ThreadState::BlockedUntil(_))
 }
 
 /// The next runnable thread at or after `start` (round-robin, wrapping); `None` once every thread is
@@ -1775,6 +1911,7 @@ fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
     for slot in threads.iter() {
         match slot.state {
             ThreadState::Sleeping(deadline) => parks.push((slot.id, WaitReason::Sleep(deadline))),
+            ThreadState::BlockedUntil(deadline) => parks.push((slot.id, WaitReason::Sleep(deadline))),
             ThreadState::IoWait(handle, deadline) => {
                 parks.push((slot.id, WaitReason::Io(handle)));
                 if let Some(deadline) = deadline {
@@ -1791,6 +1928,14 @@ fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
                 if woken.contains(&slot.id) {
                     if let ThreadState::IoWait(handle, Some(_)) = slot.state {
                         vm.net_deregister(handle);
+                    }
+                    if let ThreadState::BlockedUntil(_) = slot.state {
+                        if vm.resolve_lock_deadline(slot.id) {
+                            slot.state = ThreadState::Ready;
+                        } else {
+                            slot.state = ThreadState::Blocked;
+                        }
+                        continue;
                     }
                     slot.state = ThreadState::Ready;
                 }
@@ -2026,11 +2171,14 @@ pub fn run_interruptible(
                     }
                     cursor = index + 1;
                 }
-                Some(ThreadOp::BlockOnLock { wake }) => {
-                    threads[index].state = ThreadState::Blocked;
+                Some(ThreadOp::BlockOnLock { wake, deadline }) => {
+                    threads[index].state = match deadline {
+                        Some(deadline) => ThreadState::BlockedUntil(deadline),
+                        None => ThreadState::Blocked,
+                    };
                     if let Some(id) = wake {
                         for slot in &mut threads {
-                            if slot.id == id && slot.state == ThreadState::Blocked {
+                            if slot.id == id && is_lock_blocked(&slot.state) {
                                 slot.state = ThreadState::Ready;
                             }
                         }
@@ -2039,7 +2187,7 @@ pub fn run_interruptible(
                 }
                 Some(ThreadOp::WakeThread { id }) => {
                     for slot in &mut threads {
-                        if slot.id == id && slot.state == ThreadState::Blocked {
+                        if slot.id == id && is_lock_blocked(&slot.state) {
                             slot.state = ThreadState::Ready;
                         }
                     }
@@ -2360,6 +2508,7 @@ impl Session {
                 if !service() {
                     return Ok(ThreadStatus::Interrupted);
                 }
+                let _ = vm.now_millis();
                 if vm.live_thread_count() > 1 {
                     return Ok(ThreadStatus::Yielded);
                 }
@@ -2415,6 +2564,9 @@ impl Session {
     }
 
     fn at_breakpoint(&self) -> bool {
+        if self.breakpoints.is_empty() {
+            return false;
+        }
         match self.frames.last() {
             Some(frame) => {
                 self.breakpoints
@@ -4691,7 +4843,7 @@ fn step(
                     let value = vm
                         .heap()
                         .instance_field(object, slot)
-                        .ok_or(Trap::UnresolvedField(token))?;
+                        .ok_or(Trap::FieldSlotMissing { field: token, slot })?;
                     frame.stack.push(value);
                 }
                 Value::ByRef(location) => {
@@ -4704,7 +4856,7 @@ fn step(
                     let value = fields
                         .get(slot as usize)
                         .cloned()
-                        .ok_or(Trap::UnresolvedField(token))?;
+                        .ok_or(Trap::FieldSlotMissing { field: token, slot })?;
                     frame.stack.push(value);
                 }
                 Value::Null => return Err(Trap::NullReference),
@@ -4721,7 +4873,7 @@ fn step(
             match frame.pop()? {
                 Value::Object(object) => {
                     if !vm.heap_mut().set_instance_field(object, slot, value) {
-                        return Err(Trap::UnresolvedField(token));
+                        return Err(Trap::FieldSlotMissing { field: token, slot });
                     }
                 }
                 Value::ByRef(location) => {
@@ -4952,7 +5104,7 @@ fn step(
             if vm.statics_len() < module.static_field_count() {
                 vm.init_statics(&module.decode_static_defaults());
             }
-            let value = vm.static_field(slot).ok_or(Trap::UnresolvedField(token))?;
+            let value = vm.static_field(slot).ok_or(Trap::FieldSlotMissing { field: token, slot: slot as u32 })?;
             frame.stack.push(value);
         }
         Opcode::Stsfld => {
@@ -7039,6 +7191,44 @@ mod tests {
 
         MONO_MS.store(6000, Ordering::Relaxed);
         assert_eq!(vm.now_ticks(), base + 5000 * 10_000);
+    }
+
+    /// The unset clock READS FORWARD, and a device is the whole reason: no serve firmware in this
+    /// tree sets a wall clock, so this is the arm every board actually takes. It used to be a
+    /// constant, which made `DateTime.UtcNow` unable to measure a duration on ANY board -- while
+    /// `Environment.TickCount`, one accessor away on the SAME seam, advanced normally.
+    ///
+    /// Both halves are asserted because only the pair is the fix: an advancing clock whose
+    /// `clock_is_set` also flipped would tell the adaptive TLS policy that a year-1 clock is
+    /// trustworthy, and every certificate would fail as "not yet valid".
+    #[test]
+    fn an_unset_wall_clock_still_advances_and_still_reports_itself_unset() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static MONO_MS: AtomicU64 = AtomicU64::new(0);
+        fn mono_ms() -> u64 {
+            MONO_MS.load(Ordering::Relaxed)
+        }
+        fn no_sleep(_ms: u64) {}
+
+        let mut vm = Vm::default();
+        assert_eq!(vm.now_ticks(), 0);
+        assert!(!vm.clock_is_set());
+
+        vm.set_clock(mono_ms, no_sleep);
+        assert_eq!(vm.now_ticks(), 0);
+
+        let start = vm.now_ticks();
+        MONO_MS.store(250, Ordering::Relaxed);
+        let end = vm.now_ticks();
+        assert_eq!(end - start, 250 * 10_000, "an unset clock must still measure a duration");
+
+        assert!(!vm.clock_is_set(), "advancing is not a claim about the date");
+
+        let base = 637_000_000_000_000_000i64;
+        vm.set_now_ticks(base);
+        assert!(vm.clock_is_set());
+        MONO_MS.store(1250, Ordering::Relaxed);
+        assert_eq!(vm.now_ticks(), base + 1000 * 10_000);
     }
 
     #[test]
