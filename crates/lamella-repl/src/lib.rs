@@ -380,6 +380,13 @@ impl IncrementalSession {
     /// executable, else `LAMELLA_REF_DIR`. The zero-configuration constructor an interactive
     /// front end needs.
     ///
+    /// **An interactive front end needs this constructor specifically, and the reason is
+    /// reference-typed state.** Every other compiler-driven constructor here makes the CALLER supply
+    /// the corlib, which a prompt cannot do -- so the `lamella-repl` binary used
+    /// [`ReplSession::new`], which configures itself but evaluates reference-typed state wrongly:
+    /// `string s = "hi";` then `s + "!"` prints `!!`, a wrong answer with no error. Discovering the
+    /// reference set was the whole of the gap; the incremental emit behind it already worked.
+    ///
     /// The single-reference case -- the normal one, a Lamella `corlib.dll` -- takes the RESIDENT
     /// corlib path, so managed corlib members a submission names resolve by name. A multi-reference
     /// set (`LAMELLA_REF_DIR`) type-checks against all of them with none resident, which is

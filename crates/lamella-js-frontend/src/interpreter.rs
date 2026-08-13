@@ -605,6 +605,13 @@ pub(crate) enum PrototypeKind {
 
 impl Closure {
     /// `IsConstructor` for a closure, in ONE place.
+    ///
+    /// **ONE DEFINITION, BECAUSE A RULE WRITTEN THREE TIMES GAINS ITS NEXT CASE IN ONE OF THEM.**
+    /// `is_constructor`, `[[Construct]]`'s refusal ladder and the decision to give a function a
+    /// `prototype` each spelled `!is_arrow && !is_method` separately; adding generators to the
+    /// first two and not the third is a `new g()` that refuses while `g.prototype.constructor`
+    /// still points back at `g`. The repair is to name the rule once and call it, rather than to
+    /// write a careful fourth copy.
     #[must_use]
     pub(crate) fn constructs(&self) -> bool {
         !self.is_arrow && !self.is_method && !self.is_generator

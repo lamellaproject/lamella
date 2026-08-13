@@ -1,6 +1,8 @@
 //! Embedding the interpreter: run a managed assembly and capture its result.
 
 pub mod abi;
+pub mod clock;
+pub mod console;
 #[cfg(feature = "aot")]
 pub mod aot;
 #[cfg(feature = "bake")]
@@ -100,6 +102,8 @@ fn run_static(assembly_bytes: &'static [u8], corlib_bytes: Option<&'static [u8]>
     };
 
     let mut vm = Vm::new();
+    clock::install(&mut vm);
+    console::install(&mut vm);
     match run(&program.module, &mut vm, program.entry, Vec::new()) {
         Ok(result) => RunResult {
             stdout: vm.output_string(),
@@ -206,6 +210,20 @@ mod tests {
         assert_eq!(result.stdout, "Hello, World!\n");
         assert_eq!(result.exit_code, 0);
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn the_console_tap_streams_the_same_text_the_buffer_ends_up_with() {
+        let Some(bytes) = fixture("hello.dll") else {
+            eprintln!("hello.dll absent; skipping");
+            return;
+        };
+        let _ = console::take_streamed();
+        let result = run_bytes(&bytes);
+        let chunks = console::take_streamed();
+
+        assert_eq!(chunks.concat(), result.stdout);
+        assert!(!chunks.is_empty(), "the tap fired at least once");
     }
 
     #[test]

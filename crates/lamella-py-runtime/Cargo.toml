@@ -43,6 +43,11 @@ lamella-wtf8 = { path = "../lamella-wtf8" }
 # The MUSL/fdlibm port (an accurate `no_std` libm). `core` has the f64 arithmetic operators but NOT
 # floor/fmod, which the float `//` and `%` need (CPython's exact float_divmod), so bind them here
 # rather than hand-roll fdlibm.
+# Twenty-four distinct `libm` functions are referenced, not just those three: `math` binds `pow`,
+# `log`, `log2`, `log10`, `exp`, `exp2`, `sqrt`, `hypot`, `sin`, `cos`, `tan`, `asin`, `acos`,
+# `atan`, `atan2`, `ldexp`, `frexp`, `modf`, `copysign`, `fabs` and `ceil` on top of them. In the
+# linked micro:bit v2 firmware `libm` is about 19 KB, and none of it dead-strips while `math` is
+# reachable -- `float` is the knob that drops it.
 libm = { version = "0.2.16", optional = true }
 
 [dev-dependencies]

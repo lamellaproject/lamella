@@ -341,6 +341,21 @@ mod tests {
     }
 
     /// **WHAT SURVIVES A RESUMPTION MUST NOT DEPEND ON THE PARAMETER LIST**, and this measures it.
+    ///
+    /// # THIS TEST WAS WRITTEN ASSERTING THE OPPOSITE, ON PURPOSE
+    ///
+    /// Before a body could suspend, `body_environment` gave a resumption the parameter environment
+    /// for a SIMPLE parameter list and a fresh one otherwise -- so an uninitialized `var` answered
+    /// 2 on the second resumption with simple parameters and 1 with a default. Nothing could reach
+    /// that from JavaScript, because a body containing a `yield` did not parse, so it was pinned
+    /// rather than repaired: a level check that would go red the day the transform landed.
+    ///
+    /// It did, and the asymmetry was a real wrong answer the moment it became reachable --
+    /// `function* g(a = 1) { var n = 0; yield 1; n = n + 1; yield n; }` gave `undefined` where a
+    /// conforming engine gives 1. The repair is [`crate::interpreter::GeneratorContext::body_scope`]:
+    /// the environment is built ONCE and every resumption runs in it, which is what the standard
+    /// suspends. The assertion is now the equality, and restoring the asymmetry to make something
+    /// else pass would restore the defect.
     #[test]
     fn what_a_resumption_carries_does_not_depend_on_the_parameter_list() {
         let simple = resume_twice(

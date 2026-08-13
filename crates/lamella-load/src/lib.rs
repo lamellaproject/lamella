@@ -3757,8 +3757,8 @@ mod same_assembly_list_ctor_tests {
     /// THIS IS A DECISION TEST, NOT A BEHAVIOR TEST, AND THE DIFFERENCE IS WHY IT IS HERE. The
     /// defect it guards is DORMANT: `mark_same_assembly_ctors` only marks a ctor that the assembly
     /// actually `newobj`s, and no corlib code constructs a collection internally today. So a test
-    /// that loads the corlib and inspects the marking passes whether or not the names are listed --
-    /// I wrote that test first, and only red-proving it showed it was measuring nothing.
+    /// that loads the corlib and inspects the marking passes whether or not the names are listed, so
+    /// it measures nothing. Red-proving is what shows that; the test itself looks fine.
     ///
     /// What CAN be pinned is the decision. Re-adding a name here fails this, which is the moment to
     /// re-read why it was removed: the managed body and a native instance disagree about whether

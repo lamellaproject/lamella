@@ -947,7 +947,7 @@ struct PrivateField {
 /// Whether an assembly other than this one could ASSIGN a field of `access` declared in `declaring`
 /// -- the condition CS0649 is withheld under.
 ///
-/// **Measured against csc `/langversion:ISO-1`, one compilation per row**:
+/// **Measured against csc `/langversion:ISO-1`, one compilation per row:**
 ///
 /// | field | enclosing type | csc |
 /// |---|---|---|
@@ -5268,7 +5268,7 @@ impl Binder {
     /// WOULD change resolution, and would make `T(v)` ambiguous wherever `T(int)` also exists),
     /// the candidates are re-examined here with by-reference-ness ignored.
     ///
-    /// THE TEST IS BY-REFERENCE SHAPE ALONE, NOT BY TYPE, and I had that wrong at first. csc
+    /// THE TEST IS BY-REFERENCE SHAPE ALONE, NOT BY TYPE, which is not the obvious reading. csc
     /// reports the modifier whenever NO same-arity candidate accepts the argument's byref-ness at
     /// that position -- even when the type would not convert either. `Take(ref s)` with a `string`
     /// against `Take(int)` is `CS1615`, not the conversion complaint: the keyword is wrong at every
@@ -6188,9 +6188,9 @@ impl Binder {
     /// an enumeration. csc demands it anyway as the marker that the type is a collection at all,
     /// which is why this is a separate check from having an `Add` and gets its own diagnostic.
     ///
-    /// **THE INTERFACE, NOT A `GetEnumerator` METHOD, AND I MEASURED THAT AFTER ASSUMING
-    /// OTHERWISE.** The first version of this asked whether a `GetEnumerator` was reachable,
-    /// reasoning that the interface's only content is that method. csc disagrees: a class with a
+    /// **THE INTERFACE, NOT A `GetEnumerator` METHOD, AND THE DIFFERENCE IS OBSERVABLE.** Asking
+    /// whether a `GetEnumerator` is reachable looks equivalent, on the reasoning that the
+    /// interface's only content is that method. csc disagrees: a class with a
     /// public `IEnumerator GetEnumerator()` and an `Add`, but no `: IEnumerable`, is still CS1922.
     /// The check is nominal, so duck-typing it would ACCEPT a program csc rejects.
     ///
@@ -10094,11 +10094,10 @@ fn dotted_name_parts(expr: &Expr) -> Option<Vec<Box<str>>> {
 /// `receiver_ty`: the receiver itself when that is already an instantiation, and otherwise the
 /// declaration's own [`self_instantiation`] -- so `` H`1 `` is never the answer for a generic type.
 ///
-/// One walk resolves fields and properties, a second resolves methods, a third finds a property's
-/// two accessor declarers, and each spelled this closure out again. The first two gained the
-/// self-instantiation case and the third did not, so a generic type's own PROPERTY stayed erased
-/// while its fields and methods were repaired -- the same defect surviving in the one position
-/// nobody edited. Call this; do not write the match again.
+/// **This is the single definition of that choice, and three separate walks depend on it**: one
+/// resolves fields and properties, one resolves methods, and one finds a property's two accessor
+/// declarers. Call this rather than spelling the match out again -- a rule written three times is
+/// a rule that gains its next case in one or two of them.
 fn member_declaring_type(receiver_ty: &TypeSymbol, info: &TypeInfo) -> TypeSymbol {
     let declaring = type_symbol_in(&info.namespace, &info.name);
     match receiver_ty {

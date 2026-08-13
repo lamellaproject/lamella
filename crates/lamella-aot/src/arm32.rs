@@ -10025,6 +10025,7 @@ mod tests {
         }
     }
 
+    /// THE CONTROL THAT ACTUALLY SEPARATES THE TWO CANDIDATES, WHERE THE OBVIOUS ONE DOES NOT.
     /// Checking "is the safepoint inside its function" against a two-function toy passes under BOTH
     /// the fix and the defect, because a small label id is also a plausible small offset. **A LABEL
     /// ID IS A COUNTER GLOBAL TO THE ENCODER; AN OFFSET IS FUNCTION-LOCAL.** So the place they must

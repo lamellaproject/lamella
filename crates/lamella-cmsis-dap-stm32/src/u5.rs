@@ -52,7 +52,7 @@ pub const STM32U5_MAX_PAGES_PER_BANK: u32 = 256;
 /// Reads the part's flash size and derives how many pages one of its two banks holds.
 ///
 /// One extra register read per erase, which is nothing against a page erase, and it removes a whole
-/// class of "right for the board I had" from this module.
+/// class of "right for one board, wrong for its siblings" from this module.
 fn u5_pages_per_bank<A: TargetAccess>(target: &mut A) -> Result<u32, ProbeError> {
     let kb = target.read_word(STM32U5_FLASH_SIZE_REG)? & 0xffff;
     if kb == 0 || kb > 2 * 1024 * 2 {

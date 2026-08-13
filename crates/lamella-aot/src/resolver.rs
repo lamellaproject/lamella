@@ -3101,7 +3101,7 @@ impl<'a> MetadataResolver<'a> {
     /// GATE.** Declining the LAYOUT withheld the descriptor and let the image out with none: the
     /// bodies still lowered, the allocation still proceeded, and the dispatch went through a
     /// descriptor that was not there. MEASURED, one variable changed -- a program whose generic
-    /// definition gained one `virtual` built to a 105,252-byte image and HARD FAULTED on an emulated
+    /// definition gained one `virtual` BUILT CLEANLY and then HARD FAULTED on an emulated
     /// Cortex-M0 where the same program without it answered 42. A refusal on the way to an emitter's
     /// INPUT stops a product being made; only a refusal where the build can FAIL stops the build.
     fn instantiated_reference_layout(&self, spec: Token) -> Option<ReferenceLayout> {

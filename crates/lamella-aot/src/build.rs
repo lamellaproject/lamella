@@ -128,11 +128,12 @@ pub enum BuildError {
     /// AN INSTANTIATION WHOSE DEFINITION DECLARES VIRTUALS OR IMPLEMENTS INTERFACES, whose vtable
     /// and itable would have to be built from SUBSTITUTED signatures and are not yet.
     ///
+    /// **THIS REFUSES THE BUILD BECAUSE THE OLD REFUSAL ONLY DROPPED THE DESCRIPTOR.**
     /// `MetadataResolver::instantiated_reference_layout` declines such an instantiation, and
     /// `instantiation_descriptors` then filters it out -- which keeps a WRONG descriptor from being
     /// emitted and does nothing about the image. MEASURED: a program whose generic definition gains
-    /// one `virtual` method builds to a 105,252-byte image and HARD FAULTS on an emulated Cortex-M0,
-    /// with the identical program minus the `virtual` answering 42. A filter is not a gate.
+    /// one `virtual` method BUILDS CLEANLY and then HARD FAULTS on an emulated Cortex-M0, with the
+    /// identical program minus the `virtual` answering 42. A filter is not a gate.
     UndispatchableInstantiation {
         /// The instantiation's canonical spelling, so the refusal names what cannot be dispatched.
         instantiation: alloc::string::String,
@@ -2264,7 +2265,10 @@ fn rebase_identities(func: &mut Function, ordinal: u8) -> Result<bool, MonoGap> 
 /// **A FILTER IS NOT A GATE, AND THIS IS THE GATE.** The descriptor path declines an instantiation
 /// it cannot describe exactly, and then simply leaves it out -- which keeps a WRONG descriptor from
 /// being emitted and does nothing whatever about the image. The bodies still lower, the allocation
-/// still proceeds, and the dispatch goes through a descriptor that is not there.
+/// still proceeds, and the dispatch goes through a descriptor that is not there. MEASURED, one
+/// variable changed: a program whose generic definition gained one `virtual` BUILT CLEANLY and then
+/// HARD FAULTED on an emulated Cortex-M0, where the same program without it answered 42. Nothing
+/// reported anything.
 ///
 /// **IT ASKS THE EMITTER'S OWN QUESTION RATHER THAN A SECOND PREDICATE, AND THAT IS WHY IT
 /// NARROWS BY ITSELF.** The first version of this gate re-derived "does the definition declare a

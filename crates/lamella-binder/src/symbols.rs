@@ -363,11 +363,13 @@ pub struct TypeInfo {
     /// **THE POINT IS TO STOP A REFUSAL ARRIVING AS AN ABSENCE.** A signature the decoder declines
     /// -- today, any generic one -- yields `None`, and a consumer that skipped it would report the
     /// member as not existing. That is a false statement about someone else's assembly: the member
-    /// is there and we cannot read it. Recording the name lets the failing lookup say which of the
-    /// two it is.
+    /// is there and this build cannot read it. Recording the name lets the failing lookup say which
+    /// of the two it is.
     ///
-    /// **IT DELIBERATELY DOES NOT MAKE THE TYPE UNUSABLE.** The
-    /// refusal has to fire on USE of a specific member and stay silent otherwise.
+    /// **IT DELIBERATELY DOES NOT MAKE THE TYPE UNUSABLE.** Refusing an assembly outright is not
+    /// available: a large share of a real framework assembly's methods carry signatures this
+    /// decoder declines, so a load-time refusal would reject the reference set every compilation
+    /// uses. The refusal has to fire on USE of a specific member and stay silent otherwise.
     pub undecodable_members: Vec<Box<str>>,
     /// The type's field-like events (17.7), in addition to their backing delegate field in
     /// `fields`. Drives `+=`/`-=` routing through the accessors and `CS0070`.

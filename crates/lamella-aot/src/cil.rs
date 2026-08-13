@@ -83,6 +83,11 @@ pub enum CilError {
     GenericValueTypeSlot(alloc::string::String),
     /// A `catch (T)` clause bound NO tag, so nothing in flight could ever match it and the handler
     /// would be silently dead.
+    ///
+    /// Named separately from `Unsupported(Throw)` because `throw` is not what this is about -- the
+    /// clause is. Reporting it as a throw failure sends a reader to the throw lowering, which is
+    /// correct and always was. Same reasoning [`CilError::UnsupportedControlFlow`] carries one
+    /// variant up: a refusal that names the wrong instruction is worse than one that names none.
     UnmatchableCatchType,
 }
 

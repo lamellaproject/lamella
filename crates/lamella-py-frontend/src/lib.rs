@@ -352,6 +352,13 @@ print(fib(10))
         assert!(matches!(err, FrontendError::Parse(_)));
     }
 
+    /// Lines survive the WIRE: through the trailing debug section the bytecode format reserves, and
+    /// with NO change to [`lamella_py_bytecode::FORMAT_VERSION`].
+    ///
+    /// That reservation is what this row measures rather than argues. The section carries a line
+    /// table per code object, and an artifact this build writes declares the SAME format version it
+    /// declared before -- so a device whose reader predates line tables reads this artifact, skips a
+    /// section it does not understand, and runs the program without them.
     #[test]
     fn line_tables_survive_the_wire_without_a_version_bump() {
         use bytecode::{FeatureFlags, FORMAT_VERSION};

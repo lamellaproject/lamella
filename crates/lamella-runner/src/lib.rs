@@ -1977,6 +1977,15 @@ pub fn load_deployed(
 ///
 /// # On a device this retains one image per request, and only one allocator hides that
 ///
+/// A bump arena's reset between evaluations does reclaim this leak: the reset moves one pointer and
+/// takes every allocation with it, dropped or not. **A reclaiming heap does not.** Its per-request
+/// rewind is a no-op by construction -- it frees through `Drop`, and a leaked allocation never
+/// drops. So the board whose collector actually reclaims is the board that runs out first, which is
+/// the reverse of what the two allocators' names suggest.
+///
+/// **And the bump arena is not vindicated by hiding it**: it rewinds N images' worth of leak per
+/// request rather than not having them.
+///
 /// **A device that serves repeatedly should bound this** by supplying an [`ImageResidence`] to
 /// [`serve_one_baked_with_residence`], which reuses one buffer instead of retaining every image.
 /// This entry point keeps leaking because a host runner evaluating once has nothing to gain from a

@@ -59,7 +59,7 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 /// already points at. The four wire bytes are incidental; what it buys is in memory, where an enum
 /// is as wide as its widest variant and a three-word payload sets that width.
 ///
-/// Version 27 gave a module a trailing length-prefixed DEBUG SECTION, empty in every artifact this
+/// This version gave a module a trailing length-prefixed DEBUG SECTION, empty in every artifact this
 /// build writes. It costs four bytes a module and buys the ability to add source positions later
 /// without moving this number. It shipped EMPTY and now carries line tables, which is the
 /// reservation paying out rather than a second format change.
@@ -1997,7 +1997,7 @@ fn put_module_content(buf: &mut Vec<u8>, module: &Module) {
 /// Write the module's debug section: one line table per code object, in the order the code objects
 /// were just written (functions, then the body).
 ///
-/// This fills the section reserved at format 27 WITHOUT moving the version, which is the whole
+/// This fills the debug section the format reserves WITHOUT moving [`FORMAT_VERSION`], which is the whole
 /// reason the four bytes were spent: a reader built before line tables existed skips the section by
 /// its declared length and loses only diagnostics it never had.
 fn put_debug_section(buf: &mut Vec<u8>, module: &Module) {
