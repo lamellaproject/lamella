@@ -74,6 +74,24 @@ pub(crate) const REF_CELL_HANDLE: lamella_ir::TypeHandle = lamella_ir::TypeHandl
 pub(crate) const EXCEPTION_CELL_HANDLE: lamella_ir::TypeHandle =
     lamella_ir::TypeHandle(0xFFFF_FFFE);
 
+/// Whether `handle` marks a FRAME CELL rather than a metadata type -- the anonymous scalar cell
+/// (`TypeHandle(0)`), [`REF_CELL_HANDLE`], or [`EXCEPTION_CELL_HANDLE`].
+///
+/// **A FRAME CELL HAS NO TYPE IDENTITY TO RESPELL, WHICH IS WHY `build::rebase_identities` MUST ASK
+/// THIS BEFORE IT REBASES A `ValueType` SLOT.** That pass exists to turn an identity the OWNER minted
+/// out of its own tables into the CALLER's spelling. These three are minted by the LOWERING, out of
+/// no tables at all: the doc comments above say they live outside the metadata-token space and are
+/// never looked up for layout. Handing one to the rebase asks which of the caller's types occupies
+/// row `0x00000000` or `0xFFFFFFFF`, and the honest answer -- none -- came back as a refusal of the
+/// whole body.
+///
+pub(crate) fn is_frame_cell_handle(handle: lamella_ir::TypeHandle) -> bool {
+    matches!(
+        handle,
+        lamella_ir::TypeHandle(0) | REF_CELL_HANDLE | EXCEPTION_CELL_HANDLE
+    )
+}
+
 /// Whether `ty` is a [`REF_CELL_HANDLE`] reference cell -- a memory-homed reference local whose word
 /// the GC must trace as an object reference.
 ///

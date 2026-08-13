@@ -1286,29 +1286,31 @@ impl Binder {
         let Some(key) = crate::flow::field_type_key(declaring) else {
             return Box::from("");
         };
-        let parameters = self
-            .model
-            .get_by_symbol(declaring)
-            .map(|info| info.type_parameters.clone())
-            .unwrap_or_default();
-        if parameters.is_empty() {
-            return key;
-        }
-        let (prefix, last) = match key.rfind('.') {
-            Some(dot) => (&key[..=dot], &key[dot + 1..]),
-            None => ("", &key[..]),
-        };
-        let bare = crate::symbols::unmangled_type_name(last);
-        let mut rendered = String::from(prefix);
-        rendered.push_str(&bare);
-        rendered.push('<');
-        for (index, parameter) in parameters.iter().enumerate() {
-            if index > 0 {
-                rendered.push(',');
+        let mut rendered = String::new();
+        let mut prefix: Vec<Box<str>> = Vec::new();
+        for segment in key.split('.') {
+            prefix.push(segment.into());
+            if !rendered.is_empty() {
+                rendered.push('.');
             }
-            rendered.push_str(parameter);
+            rendered.push_str(&crate::symbols::unmangled_type_name(segment));
+            let parameters = self
+                .model
+                .get_by_symbol(&TypeSymbol::Named(prefix.clone().into_boxed_slice()))
+                .map(|info| info.type_parameters.clone())
+                .unwrap_or_default();
+            if parameters.is_empty() {
+                continue;
+            }
+            rendered.push('<');
+            for (index, parameter) in parameters.iter().enumerate() {
+                if index > 0 {
+                    rendered.push(',');
+                }
+                rendered.push_str(parameter);
+            }
+            rendered.push('>');
         }
-        rendered.push('>');
         rendered.into()
     }
 
@@ -1835,7 +1837,7 @@ impl Binder {
     /// form a `new`/cast produces. Mirrors [`Model::canonicalize_signatures`] for the types the
     /// body re-binds from syntax; non-reporting (an unresolved name stays as is for the normal
     /// resolver to diagnose). Arrays and pointers canonicalize their element type.
-    pub(crate) fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
+    pub fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
         match ty {
             TypeSymbol::Named(parts) if parts.len() == 1 => self
                 .model
@@ -8254,23 +8256,18 @@ impl Binder {
     ) -> bool {
         let mut suffix = String::from(".");
         suffix.push_str(&member.name);
-        let wanted = dotted_type_name(interface);
-        if wanted.is_empty() {
-            return false;
-        }
         let Some(info) = self.model.get_by_symbol(class_ty) else {
             return false;
         };
+        let wanted = self.canonicalize(interface);
         info.methods.iter().any(|declared| {
-            let Some(qualifier) = declared.name.strip_suffix(&suffix) else {
+            let Some(written) = declared.explicit_interface.as_ref() else {
                 return false;
             };
-            if qualifier.is_empty() || declared.parameters != member.parameters {
+            if !declared.name.ends_with(&suffix) || declared.parameters != member.parameters {
                 return false;
             }
-            let parts: Vec<Box<str>> = qualifier.split('.').map(Box::from).collect();
-            let written = TypeSymbol::Named(parts.into_boxed_slice());
-            dotted_type_name(&self.resolve_type(&written)) == wanted
+            self.canonicalize(written) == wanted
         })
     }
 
@@ -8879,7 +8876,7 @@ impl Binder {
         }
         if let Some(receiver) = self.session_receiver.clone() {
             if let Some((stable, ty)) = self.session_fields.get(name).cloned() {
-                let repl_type = self.current_type.clone().unwrap_or(TypeSymbol::Error);
+                let repl_type = self.current_type_as_value();
                 return self.session_field_access(&receiver, &repl_type, &stable, &ty);
             }
         }
@@ -9054,12 +9051,38 @@ impl Binder {
         error_expr()
     }
 
+    /// The enclosing type AS AN EXPRESSION'S TYPE: `current_type`, SELF-INSTANTIATED where it is
+    /// generic -- so `this` inside `Box<T>` is `Box<T>` and never the bare definition `` Box`1 ``.
+    ///
+    /// **A GENERIC TYPE COULD NOT REFER TO ITSELF BY NAME, AND THIS IS WHY.** `current_type` holds
+    /// the DECLARING symbol, whose last part is arity-mangled (II.10.7.2). Handing that out as an
+    /// expression's type makes `Box<T> b = this;` compare `` Box`1 `` against `Box<T>` and report
+    /// **CS0029**, on a program csc compiles -- and likewise `public Box<T> Self() { return this; }`
+    /// and a `Box<T>` field assigned `this`. Every linked list, tree, `Clone()` and fluent method
+    /// that names its own type is written this way.
+    ///
+    /// **CALL THIS; DO NOT WRITE THE MATCH AGAIN.** Every site that answers "the enclosing type, as
+    /// a value" goes through here -- `this`, the REPL session receiver, and the session-field read
+    /// -- so that the self-instantiation cannot be present at some of them and missing at others.
+    /// [`member_declaring_type`] is the same rule for a MEMBER's declaring type and carries the
+    /// same instruction.
+    ///
+    fn current_type_as_value(&self) -> TypeSymbol {
+        let Some(current) = self.current_type.clone() else {
+            return TypeSymbol::Error;
+        };
+        match self.model.get_by_symbol(&current) {
+            Some(info) => self_instantiation(&current, &info.type_parameters).unwrap_or(current),
+            None => current,
+        }
+    }
+
     /// The `this` access, typed as the enclosing type (the error type when there
     /// is none, for recovery).
     fn this_expr(&self) -> BoundExpr {
         BoundExpr {
             kind: BoundExprKind::This,
-            ty: self.current_type.clone().unwrap_or(TypeSymbol::Error),
+            ty: self.current_type_as_value(),
         }
     }
 
@@ -9073,7 +9096,7 @@ impl Binder {
         match &self.session_receiver {
             Some(name) => BoundExpr {
                 kind: BoundExprKind::Local(name.clone()),
-                ty: self.current_type.clone().unwrap_or(TypeSymbol::Error),
+                ty: self.current_type_as_value(),
             },
             None => self.this_expr(),
         }
@@ -10857,6 +10880,7 @@ mod tests {
             is_required: false,
         });
         widget.methods.push(MethodSymbol {
+            explicit_interface: None,
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
@@ -11016,6 +11040,7 @@ mod tests {
             is_required: false,
         });
         widget.methods.push(MethodSymbol {
+            explicit_interface: None,
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
@@ -11452,6 +11477,7 @@ mod tests {
             parameters: Vec<TypeSymbol>,
         ) -> MethodSymbol {
             MethodSymbol {
+                explicit_interface: None,
                 name: name.into(),
                 return_type,
                 parameters,
@@ -11734,6 +11760,7 @@ mod tests {
         };
         let int = || TypeSymbol::Special(SpecialType::Int32);
         let accessor = |name: &str, parameters: Vec<TypeSymbol>| MethodSymbol {
+            explicit_interface: None,
             name: name.into(),
             return_type: int(),
             parameters,
@@ -12688,6 +12715,7 @@ mod tests {
         let int = TypeSymbol::Special(SpecialType::Int32);
         let mut calc = TypeInfo::new("", "Calc", TypeKind::Class);
         calc.methods.push(MethodSymbol {
+            explicit_interface: None,
             name: "F".into(),
             return_type: int.clone(),
             parameters: alloc::vec![int.clone()],

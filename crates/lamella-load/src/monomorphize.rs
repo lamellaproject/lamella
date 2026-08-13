@@ -16,7 +16,7 @@ use super::{
     FIELD, FieldNameIndex, MEMBER_REF, METHOD_DEF, METHOD_SPEC, TYPE_DEF, TYPE_REF, TYPE_SPEC,
     TypeNameIndex,
     arg_count, cast_elem_of_sig, default_field_value, full_type_name,
-    type_name_key,
+    type_key, type_name_key,
 };
 
 /// The metadata table id the rewritten tokens live in.
@@ -76,10 +76,17 @@ pub fn collect_instantiations<'pe>(
     closed
         .into_iter()
         .filter_map(|found| {
-            let (definition, arguments) = rows
+            let (definition, arguments) = match rows
                 .iter()
                 .find(|(name, _)| name.as_str() == found.name.as_ref())
-                .map(|(_, parts)| parts.clone())?;
+                .map(|(_, parts)| parts.clone())
+            {
+                Some(parts) => parts,
+                None => (
+                    found.definition.clone().into_string(),
+                    payload_free_arguments(&found.arguments)?,
+                ),
+            };
             Some(Instantiation {
                 definition,
                 arguments,
@@ -87,6 +94,30 @@ pub fn collect_instantiations<'pe>(
             })
         })
         .collect()
+}
+
+/// The walk's decoded arguments as this assembly's signatures, when every one of them is a type the
+/// element byte fully describes -- `int`, `string`, `object`, and arrays of those.
+///
+/// `None` the moment one is not, because the rest of what a `Named` or constructed argument means
+/// lives in a token, and a token means nothing outside the assembly that wrote it.
+#[cfg(feature = "generics")]
+fn payload_free_arguments(arguments: &[lamella_generics::TypeArg]) -> Option<Vec<SigType>> {
+    arguments.iter().map(payload_free_argument).collect()
+}
+
+/// One argument, per [`payload_free_arguments`].
+#[cfg(feature = "generics")]
+fn payload_free_argument(argument: &lamella_generics::TypeArg) -> Option<SigType> {
+    match argument {
+        lamella_generics::TypeArg::Primitive(byte) => {
+            lamella_metadata::signature::payload_free_sig(*byte)
+        }
+        lamella_generics::TypeArg::SzArray(element) => {
+            Some(SigType::SzArray(Box::new(payload_free_argument(element)?)))
+        }
+        _ => None,
+    }
 }
 
 /// One closed instantiation to lower.
@@ -335,22 +366,56 @@ pub enum Refusal {
     /// and calls the base's `M<int>` on an object whose type overrides it. Measured by removing the
     /// check -- zero violations and the wrong answer, with nothing to look for at bake time.
     ///
-    /// # The shape it no longer covers, and the three it still does
+    /// # One mechanism per name
     ///
-    /// A `MethodSpec` row naming a virtual method of one of this program's own types IS lowered now
-    /// -- see the dispatch note on `lower_method_pairs`. What still draws this refusal:
+    /// The five variants below are that refusal, separated. A refusal name is read as the CAUSE by
+    /// everyone downstream, so a single name spanning several causes teaches each reader the wrong
+    /// one and hides the day any one of them is fixed. Each of the five moves independently when its
+    /// own mechanism lands.
     ///
-    /// - a virtual generic call reached from INSIDE a duplicated body (a deferred method site),
-    ///   which needs the enclosing pair's arguments threaded through the receiver as well;
-    /// - an override the closure found in an assembly this program does not itself declare, whose
-    ///   body would have to be copied out of that assembly and dispatched from here;
-    /// - a lowered body that no loaded type dispatches to, which means the hierarchy this pass read
-    ///   and the one the ordinary load built disagree. That one is a defect rather than a boundary
-    ///   and it is refused for the same reason as the others: the mark stands and the bake names it.
+    /// This variant is the first of them: a virtual generic call reached from INSIDE a duplicated
+    /// body (a deferred method site), which would need the enclosing pair's type arguments threaded
+    /// through the receiver as well as through the call.
+    VirtualGenericInDuplicatedBody {
+        /// The `MethodSpec` token.
+        token: u32,
+        /// The method's name.
+        method: String,
+    },
+    /// The declaring type's name, the method's signature, or the pair label did not decode, so there
+    /// is nothing to plan a body against. A metadata-shape refusal rather than a capability one: it
+    /// says the rows could not be read, not that the shape is unsupported.
+    VirtualGenericDeclarationUnreadable {
+        /// The `MethodSpec` token.
+        token: u32,
+        /// The method's name.
+        method: String,
+    },
+    /// The override closure reached a type this program does not itself declare -- either the walk
+    /// cannot enter its assembly, or no program-side pair could be located for it. Its body would
+    /// have to be copied out of that assembly and dispatched from here, which this pass does not do.
+    VirtualGenericOverrideNotInThisProgram {
+        /// The `MethodSpec` token.
+        token: u32,
+        /// The method's name.
+        method: String,
+    },
+    /// Every override was planned but at least one body did not come back from emission, so the site
+    /// would dispatch a derived receiver to a base body. **A partial success is worse than none**,
+    /// which is why the whole site is refused rather than the missing arm alone.
+    VirtualGenericBodyNotEmitted {
+        /// The `MethodSpec` token.
+        token: u32,
+        /// The method's name.
+        method: String,
+    },
+    /// A lowered body that no loaded type dispatches to: the hierarchy this pass read and the one
+    /// the ordinary load built have diverged.
     ///
-    /// The three are named here rather than left to the message, which says only that no
-    /// receiver-chosen body could be lowered.
-    VirtualGenericMethod {
+    /// **This one reports a DEFECT rather than a limit.** The other four say a shape is not lowered
+    /// here; this one says two readings of the same hierarchy disagree, so seeing it means something
+    /// is wrong rather than merely unsupported. Treat it as a bug report, not a capability gap.
+    VirtualGenericDispatchDiverged {
         /// The `MethodSpec` token.
         token: u32,
         /// The method's name.
@@ -400,8 +465,20 @@ impl fmt::Display for Refusal {
             Refusal::ExceptionTagCollision { first, second, tag } => {
                 write!(formatter, "`{first}` and `{second}` both mint exception tag 0x{tag:08X}, so a `catch` of either would catch the other")
             }
-            Refusal::VirtualGenericMethod { token, method } => {
-                write!(formatter, "the generic call at token 0x{token:08X} names the VIRTUAL method `{method}`, whose body is chosen by the receiver at run time and not by the token, and no receiver-chosen body could be lowered for it here")
+            Refusal::VirtualGenericInDuplicatedBody { token, method } => {
+                write!(formatter, "the generic call at token 0x{token:08X} names the VIRTUAL method `{method}` from inside a duplicated body, so the enclosing pair's type arguments would have to be threaded through the receiver as well")
+            }
+            Refusal::VirtualGenericDeclarationUnreadable { token, method } => {
+                write!(formatter, "the VIRTUAL generic method `{method}` at token 0x{token:08X} has a declaring type, signature or pair label that did not decode, so there is nothing to plan a body against")
+            }
+            Refusal::VirtualGenericOverrideNotInThisProgram { token, method } => {
+                write!(formatter, "the VIRTUAL generic method `{method}` at token 0x{token:08X} is overridden in an assembly this program does not declare, so its body cannot be copied out and dispatched from here")
+            }
+            Refusal::VirtualGenericBodyNotEmitted { token, method } => {
+                write!(formatter, "the VIRTUAL generic method `{method}` at token 0x{token:08X} had an override whose body did not emit, and a site that dispatched a derived receiver to a base body would be worse than a refusal")
+            }
+            Refusal::VirtualGenericDispatchDiverged { token, method } => {
+                write!(formatter, "the VIRTUAL generic method `{method}` at token 0x{token:08X} lowered a body no loaded type dispatches to, so the override closure and the load's own hierarchy disagree -- a defect rather than a limit")
             }
         }
     }
@@ -1130,7 +1207,7 @@ fn lower_method_pairs<'pe>(
             continue;
         };
         if method.flags() & super::METHOD_VIRTUAL != 0 {
-            lowering.refusals.push(Refusal::VirtualGenericMethod {
+            lowering.refusals.push(Refusal::VirtualGenericInDuplicatedBody {
                 token: site.token,
                 method: method.name().unwrap_or("").into(),
             });
@@ -1415,14 +1492,14 @@ fn expand_virtual_rows<'pe>(
             .and_then(|type_def| type_def.name())
             .map(full_type_name);
         let (Some(declaring), Some(signature)) = (declaring, method.signature()) else {
-            lowering.refusals.push(Refusal::VirtualGenericMethod {
+            lowering.refusals.push(Refusal::VirtualGenericDeclarationUnreadable {
                 token: token.0,
                 method: name,
             });
             continue;
         };
         if !walk.can_walk(&declaring) {
-            lowering.refusals.push(Refusal::VirtualGenericMethod {
+            lowering.refusals.push(Refusal::VirtualGenericOverrideNotInThisProgram {
                 token: token.0,
                 method: name,
             });
@@ -1447,7 +1524,7 @@ fn expand_virtual_rows<'pe>(
             }
         }
         if refused {
-            lowering.refusals.push(Refusal::VirtualGenericMethod {
+            lowering.refusals.push(Refusal::VirtualGenericOverrideNotInThisProgram {
                 token: token.0,
                 method: name,
             });
@@ -1494,7 +1571,7 @@ fn expand_virtual_rows<'pe>(
             bodies.push((position, row));
         }
         if refused || bodies.is_empty() {
-            lowering.refusals.push(Refusal::VirtualGenericMethod {
+            lowering.refusals.push(Refusal::VirtualGenericDeclarationUnreadable {
                 token: token.0,
                 method: name,
             });
@@ -1568,7 +1645,7 @@ fn dispatch_virtual_sites(
             }
         }
         if !complete || lowered.is_empty() {
-            lowering.refusals.push(Refusal::VirtualGenericMethod {
+            lowering.refusals.push(Refusal::VirtualGenericBodyNotEmitted {
                 token: site.token.0,
                 method: site.method.clone(),
             });
@@ -1589,7 +1666,7 @@ fn dispatch_virtual_sites(
             reached.insert(body);
         }
         if reached.len() != lowered.len() {
-            lowering.refusals.push(Refusal::VirtualGenericMethod {
+            lowering.refusals.push(Refusal::VirtualGenericDispatchDiverged {
                 token: site.token.0,
                 method: site.method.clone(),
             });
@@ -1737,7 +1814,13 @@ fn names_a_token(sig: &SigType) -> bool {
 }
 
 /// Whether a signature mentions a type parameter of either kind, anywhere inside it.
-fn mentions_parameter(sig: &SigType) -> bool {
+///
+/// `pub(crate)` for the LOADER's benefit as well as this pass's, and sharing it is the point rather
+/// than tidiness. The loader has to ask the same question of a `MemberRef`'s `TypeSpec` parent --
+/// "is this an instantiation, or a definition naming itself?" -- and [`token_is_open`] already
+/// answers it here for the COPY path. Two spellings of one rule is the shape where a new case
+/// (another `SigType` that can carry a parameter) reaches one of them and not the other.
+pub(crate) fn mentions_parameter(sig: &SigType) -> bool {
     match sig {
         SigType::Var(_) | SigType::MVar(_) => true,
         SigType::GenericInst {
@@ -2184,7 +2267,13 @@ fn bind_type_operand<'pe>(
             Ok(())
         }
         other => {
-            module.bind_type_name(asm, synthetic, primitive_display_name(other).into());
+            let display = primitive_display_name(other);
+            if !display.is_empty() {
+                if let Some(&type_id) = type_index.get(&type_key("System", display)) {
+                    module.bind_type_token(asm, synthetic, type_id);
+                }
+            }
+            module.bind_type_name(asm, synthetic, display.into());
             Ok(())
         }
     }
@@ -2256,7 +2345,10 @@ fn definition_static_position<'pe>(
 }
 
 /// The simple name a primitive `SigType` displays under, for `typeof(T).Name`.
-fn primitive_display_name(sig: &SigType) -> &'static str {
+/// `pub(crate)` because the LAZY corlib tier needs the same mapping: a primitive type argument may be
+/// BOXED by the definition's body, and a box whose corlib type was never materialized has no id for a
+/// `callvirt` to resolve its receiver through.
+pub(crate) fn primitive_display_name(sig: &SigType) -> &'static str {
     match sig {
         SigType::Boolean => "Boolean",
         SigType::Char => "Char",
@@ -2460,25 +2552,38 @@ fn bind_closed_member_refs<'pe>(
             });
             continue;
         };
-        let Some(id) = entry.methods.get(position).copied().flatten() else {
+        let bodyless = methods[position].raw.is_none();
+        let id = match entry.methods.get(position).copied().flatten() {
+            Some(id) => Some(id),
+            None if bodyless => None,
+            None => {
+                lowering.refusals.push(Refusal::UnboundAfterSubstitution {
+                    instantiation: want.name.clone(),
+                    token: token.0,
+                });
+                continue;
+            }
+        };
+        if let Some(id) = id {
+            module.bind_token(asm, token, id);
+        }
+        let key = substituted_sig_key(
+            definition_assembly,
+            name,
+            &methods[position].params,
+            &want.arguments,
+            methods[position].generic_arity,
+        );
+        if let Some(key) = key.clone() {
+            let count = u16::try_from(params.len() + 1).unwrap_or(u16::MAX);
+            module.bind_call_target(asm, token, key, count);
+        }
+        if id.is_none() && key.is_none() {
             lowering.refusals.push(Refusal::UnboundAfterSubstitution {
                 instantiation: want.name.clone(),
                 token: token.0,
             });
             continue;
-        };
-        module.bind_token(asm, token, id);
-        if let Some(key) =
-            substituted_sig_key(
-                definition_assembly,
-                name,
-                &methods[position].params,
-                &want.arguments,
-                methods[position].generic_arity,
-            )
-        {
-            let count = u16::try_from(params.len() + 1).unwrap_or(u16::MAX);
-            module.bind_call_target(asm, token, key, count);
         }
         module.clear_unlowered_generic(asm, token);
     }

@@ -177,6 +177,46 @@ pub fn element_byte(ty: &super::SigType) -> u8 {
     }
 }
 
+/// [`element_byte`] read backwards, for the PAYLOAD-FREE bytes only.
+///
+/// # Why this is partial, and why the partiality is the point
+///
+/// `element_byte` is total because every `SigType` has a byte. The inverse is NOT: a byte says which
+/// KIND of type, and for nine of them the kind is all it says. `CLASS` and `VALUETYPE` are followed
+/// by a `TypeDefOrRef`, `SZARRAY` / `PTR` / `BYREF` / `ARRAY` by an element type, `GENERICINST` by a
+/// definition and its arguments, and `VAR` / `MVAR` by a number. **Answering `Some` for any of those
+/// would mean inventing the part the byte does not carry**, which is the same objection
+/// `element_byte`'s own documentation raises against callers that want one byte to be an identity.
+///
+/// So this answers only where the byte IS the whole type, and `None` everywhere else. A caller that
+/// needs a named or constructed type has to get it from a signature blob, which is the only place
+/// the rest of the information exists.
+#[must_use]
+pub fn payload_free_sig(byte: u8) -> Option<super::SigType> {
+    use super::SigType;
+    Some(match byte {
+        element::VOID => SigType::Void,
+        element::BOOLEAN => SigType::Boolean,
+        element::CHAR => SigType::Char,
+        element::I1 => SigType::I1,
+        element::U1 => SigType::U1,
+        element::I2 => SigType::I2,
+        element::U2 => SigType::U2,
+        element::I4 => SigType::I4,
+        element::U4 => SigType::U4,
+        element::I8 => SigType::I8,
+        element::U8 => SigType::U8,
+        element::R4 => SigType::R4,
+        element::R8 => SigType::R8,
+        element::STRING => SigType::String,
+        element::TYPEDBYREF => SigType::TypedByRef,
+        element::I => SigType::IntPtr,
+        element::U => SigType::UIntPtr,
+        element::OBJECT => SigType::Object,
+        _ => return None,
+    })
+}
+
 /// An error decoding a signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigError {
@@ -661,6 +701,71 @@ mod tests {
                 rank: 2
             }
         );
+    }
+
+    /// **THE ENCODER AND ITS INVERSE MUST AGREE ON EVERY BYTE THEY BOTH CLAIM**, and nothing in
+    /// the type system connects them -- they are two `match`es over the same alphabet, written apart.
+    ///
+    /// The round trip is asserted in both directions on purpose. `payload_free_sig(element_byte(t))
+    /// == t` catches a byte the inverse maps to the WRONG type; the second half catches a byte the
+    /// inverse claims and should not, which is the dangerous direction: answering `Some` for
+    /// `CLASS` or `GENERICINST` would hand a caller a type with the token or the arguments simply
+    /// missing, and that type would then be laid out and dispatched as though it were complete.
+    #[test]
+    fn the_payload_free_inverse_round_trips_and_claims_nothing_more() {
+        let payload_free = [
+            SigType::Void,
+            SigType::Boolean,
+            SigType::Char,
+            SigType::I1,
+            SigType::U1,
+            SigType::I2,
+            SigType::U2,
+            SigType::I4,
+            SigType::U4,
+            SigType::I8,
+            SigType::U8,
+            SigType::R4,
+            SigType::R8,
+            SigType::String,
+            SigType::TypedByRef,
+            SigType::IntPtr,
+            SigType::UIntPtr,
+            SigType::Object,
+        ];
+        for ty in &payload_free {
+            assert_eq!(
+                payload_free_sig(element_byte(ty)).as_ref(),
+                Some(ty),
+                "{ty:?} must survive element_byte -> payload_free_sig unchanged"
+            );
+        }
+
+        let carries_more = [
+            SigType::Class(Token::new(0x02, 1)),
+            SigType::ValueType(Token::new(0x02, 1)),
+            SigType::SzArray(Box::new(SigType::I4)),
+            SigType::Pointer(Box::new(SigType::I4)),
+            SigType::ByRef(Box::new(SigType::I4)),
+            SigType::Array {
+                element: Box::new(SigType::I4),
+                rank: 2,
+            },
+            SigType::Var(0),
+            SigType::MVar(0),
+            SigType::GenericInst {
+                definition: Box::new(SigType::Class(Token::new(0x02, 1))),
+                arguments: alloc::vec![SigType::I4],
+            },
+        ];
+        for ty in &carries_more {
+            assert_eq!(
+                payload_free_sig(element_byte(ty)),
+                None,
+                "{ty:?} carries more than its byte, so the inverse must refuse it rather than \
+                 answer with the payload missing"
+            );
+        }
     }
 
     #[test]

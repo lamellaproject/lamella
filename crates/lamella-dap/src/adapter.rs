@@ -543,6 +543,7 @@ impl Debugger {
                     "output",
                     Some(json!({ "category": "stderr", "output": format!("{message}\n") })),
                 ));
+                events.push(("exited", Some(json!({ "exitCode": -1 }))));
                 events.push(("terminated", None));
             }
         }
@@ -964,6 +965,90 @@ mod tests {
         fn take_output(&mut self) -> Option<String> {
             self.banner.take()
         }
+    }
+
+    /// A backend whose program FAULTS on resume -- the trap case.
+    struct FaultingBackend;
+
+    impl DebugBackend for FaultingBackend {
+        fn launch(&mut self) -> bool {
+            true
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Fault("call token 0x0A000003 resolved to no method".to_string())
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn resolve_source_breakpoint(&self, _document: &str, _line: u32) -> Option<u64> {
+            None
+        }
+        fn stack(&self) -> Vec<Frame> {
+            Vec::new()
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// A FAULTED session must report a NON-ZERO exit, and this is the regression it exists to catch.
+    ///
+    /// The fault arm used to emit `terminated` with no `exited` at all. A host with no `exited` event
+    /// has nothing to read an exit code from, so it shows the default -- success. Measured: a trapped
+    /// program reported "Ready" and exit 0, with the only evidence of failure one line of stderr in a
+    /// pane the user may not be looking at.
+    ///
+    /// The remedy belongs here rather than in each host: a host inferring failure by grepping stderr for
+    /// trap text is a heuristic every consumer would reimplement slightly differently.
+    #[test]
+    fn a_faulted_session_reports_a_nonzero_exit_rather_than_a_silent_success() {
+        let mut dbg = Debugger::with_backend(Box::new(FaultingBackend));
+        dbg.handle(&request(1, "launch", None));
+        let out = dbg.handle(&request(2, "continue", None));
+
+        let exited = out.iter().find_map(|m| match m {
+            Message::Event(e) if e.event == "exited" => e.body.clone(),
+            _ => None,
+        });
+        assert!(
+            exited.is_some(),
+            "a fault must emit an `exited` event -- without one a host reads success by default"
+        );
+        assert_eq!(
+            exited.and_then(|b| b.get("exitCode").and_then(serde_json::Value::as_i64)),
+            Some(-1),
+            "and the code must be non-zero, matching what the non-debug run path reports for a trap"
+        );
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, Message::Event(e) if e.event == "terminated")),
+            "the session still terminates"
+        );
+        assert!(
+            out.iter().any(|m| matches!(m, Message::Event(e)
+                if e.event == "output"
+                    && e.body.as_ref().is_some_and(|b| b
+                        .get("output")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|s| s.contains("resolved to no method"))))),
+            "and the fault text still rides out on stderr"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 // Lamella managed corlib (from scratch). -- System.Collections.Generic.List<T>
-#if LAMELLA_SURFACE_GENERICS
+#if LAMELLA_SURFACE_NETFX_2_0
 namespace System.Collections.Generic
 {
 
     /// A dynamically sized list of `T`, backed by an array that grows by doubling.
-    public class List<T> : IEnumerable
+    public class List<T> : IEnumerable<T>, IEnumerable
     {
         private T[] items;
         private int size;
@@ -100,7 +100,12 @@ namespace System.Collections.Generic
         }
 
         /// An enumerator over the elements, in order.
-        public IEnumerator GetEnumerator()
+        public IEnumerator<T> GetEnumerator()
+        {
+            return new ListEnumerator<T>(items, size);
+        }
+
+        IEnumerator IEnumerable.GetEnumerator()
         {
             object[] boxed = new object[size];
             int i = 0;

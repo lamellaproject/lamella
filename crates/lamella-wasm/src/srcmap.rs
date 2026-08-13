@@ -9,7 +9,7 @@
 #![allow(unsafe_code)]
 
 use crate::abi::result_buffer;
-use lamella_load::{load_with_corlib_and_library_unfrozen, load_with_corlib_unfrozen};
+use lamella_load::{load_with_corlib_and_libraries_unfrozen, load_with_corlib_unfrozen};
 use lamella_metadata::{Assembly, PortablePdb};
 use lamella_token::Token;
 
@@ -34,14 +34,31 @@ fn error_payload(message: &str) -> Vec<u8> {
 }
 
 fn srcmap(corlib: &[u8], library: &[u8], app: &[u8], pdb: &[u8], trim: bool) -> Vec<u8> {
+    if library.is_empty() {
+        srcmap_libs(corlib, &[], app, pdb, trim)
+    } else {
+        srcmap_libs(corlib, &[library], app, pdb, trim)
+    }
+}
+
+/// The same source map over ANY number of library assemblies -- the driver-stack shape. Must accept
+/// the SAME reference set the bake did, or the method_id numbering it produces will not match the
+/// image on the device and every stop would highlight the wrong line.
+fn srcmap_libs(corlib: &[u8], libraries: &[&[u8]], app: &[u8], pdb: &[u8], trim: bool) -> Vec<u8> {
     crate::abi::with_static(corlib, |corlib| {
-        crate::abi::with_static(library, |library| {
-            crate::abi::with_static(app, |app| srcmap_inner(corlib, library, app, pdb, trim))
+        crate::abi::with_static_all(libraries, |libraries| {
+            crate::abi::with_static(app, |app| srcmap_inner(corlib, libraries, app, pdb, trim))
         })
     })
 }
 
-fn srcmap_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8], pdb_bytes: &[u8], trim: bool) -> Vec<u8> {
+fn srcmap_inner(
+    corlib: &'static [u8],
+    libraries: &[&'static [u8]],
+    app: &'static [u8],
+    pdb_bytes: &[u8],
+    trim: bool,
+) -> Vec<u8> {
     let corlib_asm = match Assembly::read(corlib) {
         Ok(assembly) => assembly,
         Err(error) => return error_payload(&format!("corlib parse: {error:?}")),
@@ -50,18 +67,19 @@ fn srcmap_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8
         Ok(assembly) => assembly,
         Err(error) => return error_payload(&format!("app parse: {error:?}")),
     };
-    let library_asm = if library.is_empty() {
-        None
-    } else {
+    let mut library_asms = Vec::with_capacity(libraries.len());
+    for (index, library) in libraries.iter().enumerate() {
         match Assembly::read(library) {
-            Ok(assembly) => Some(assembly),
-            Err(error) => return error_payload(&format!("library parse: {error:?}")),
+            Ok(assembly) => library_asms.push(assembly),
+            Err(error) => return error_payload(&format!("library {index} parse: {error:?}")),
         }
-    };
+    }
 
-    let (loaded, app_asm_index) = match &library_asm {
-        Some(library_asm) => (load_with_corlib_and_library_unfrozen(&corlib_asm, library_asm, &app_asm), 2u8),
-        None => (load_with_corlib_unfrozen(&corlib_asm, &app_asm), 1u8),
+    let app_asm_index = u8::try_from(1 + library_asms.len()).unwrap_or(u8::MAX);
+    let loaded = if library_asms.is_empty() {
+        load_with_corlib_unfrozen(&corlib_asm, &app_asm)
+    } else {
+        load_with_corlib_and_libraries_unfrozen(&corlib_asm, &library_asms, &app_asm)
     };
     let mut loaded = match loaded {
         Ok(loaded) => loaded,
@@ -154,6 +172,41 @@ pub unsafe extern "C" fn lamella_srcmap(
     result_buffer(srcmap(
         read(corlib_ptr, corlib_len),
         read(lib_ptr, lib_len),
+        read(app_ptr, app_len),
+        read(pdb_ptr, pdb_len),
+        trim != 0,
+    ))
+}
+
+/// The source map over ANY number of library assemblies -- the companion to `lamella_bake_libs`, and
+/// it must be given the SAME reference set that bake was, or the `method_id`s will not line up with
+/// the image on the device. `libs` is packed as `[u32 count]` then `count` x `[u32 len][.dll bytes]`.
+///
+/// # Safety
+/// Each pointer/length pair must be a buffer the host filled via a prior `lamella_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_srcmap_libs(
+    corlib_ptr: *const u8,
+    corlib_len: usize,
+    libs_ptr: *const u8,
+    libs_len: usize,
+    app_ptr: *const u8,
+    app_len: usize,
+    pdb_ptr: *const u8,
+    pdb_len: usize,
+    trim: u32,
+) -> *mut u8 {
+    let read = |ptr: *const u8, len: usize| -> &[u8] {
+        if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(ptr, len) }
+        }
+    };
+    let libs = crate::abi::split_refs(read(libs_ptr, libs_len));
+    result_buffer(srcmap_libs(
+        read(corlib_ptr, corlib_len),
+        &libs,
         read(app_ptr, app_len),
         read(pdb_ptr, pdb_len),
         trim != 0,

@@ -16,5 +16,15 @@ lamella-debug-backend = { path = "../lamella-debug-backend" }
 # directly, and ArmDap implements it over any CMSIS-DAP adapter.
 lamella-probe-core = { path = "../lamella-probe-core" }
 
+[dev-dependencies]
+# The on-silicon example drives the backend through a real ST-Link. A DEV-dependency on purpose:
+# the backend itself must not know which probe family it is over, and a normal dependency here
+# would quietly make one of them privileged.
+lamella-stlink = { path = "../lamella-stlink" }
+# The CMSIS-DAP arm of the same example: lamella-probe opens the probe and ArmDap bridges it to the
+# same target seam. Carrying BOTH families here is what keeps the backend honest about being
+# probe-neutral -- one of them alone would let a family-specific assumption pass unnoticed.
+lamella-probe = { path = "../lamella-probe" }
+
 [lints]
 workspace = true

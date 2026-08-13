@@ -67,6 +67,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut references = Vec::new();
     let mut emit_debug = true;
     let mut lex = LexOptions::default();
+    lex.version = LanguageVersion::SELECTABLE_MAX;
     for arg in args {
         if let Some(path) = strip_option(arg, &["/reference:", "-r:", "--reference="]) {
             references.push(path.to_owned());
@@ -404,7 +405,16 @@ mod tests {
         assert_eq!(selected("latest"), LanguageVersion::SELECTABLE_MAX);
 
         let bare = [String::from("App.cs")];
-        assert_eq!(parse_args(&bare).expect("bare parse").lex.version, LanguageVersion::DEFAULT);
+        assert_eq!(
+            parse_args(&bare).expect("bare parse").lex.version,
+            LanguageVersion::SELECTABLE_MAX,
+            "the driver ships the product rung"
+        );
+        assert_ne!(
+            LanguageVersion::DEFAULT,
+            LanguageVersion::SELECTABLE_MAX,
+            "the conformance default and the product ceiling answer different questions"
+        );
         assert_eq!(LanguageVersion::DEFAULT, LanguageVersion::CSharp1);
 
         for v in ["/langversion:12", "/langversion:14", "/langversion:preview"] {
@@ -452,8 +462,8 @@ mod tests {
 
     #[test]
     fn an_absolute_unix_path_is_a_source_file_not_an_option() {
-        let options = parse_args(&[String::from("/home/me/Program.cs")]).unwrap();
-        assert_eq!(options.sources, ["/home/me/Program.cs"]);
+        let options = parse_args(&[String::from("/opt/src/Program.cs")]).unwrap();
+        assert_eq!(options.sources, ["/opt/src/Program.cs"]);
         let unsafe_options = parse_args(&[String::from("/unsafe"), String::from("a.cs")]).unwrap();
         assert!(unsafe_options.lex.unsafe_code);
         assert_eq!(unsafe_options.sources, ["a.cs"]);

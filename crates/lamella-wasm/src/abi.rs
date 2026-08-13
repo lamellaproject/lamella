@@ -168,6 +168,54 @@ pub(crate) fn with_static<T>(bytes: &[u8], f: impl FnOnce(&'static [u8]) -> T) -
     result
 }
 
+/// Splits the references buffer (`[u32 count]` then `count` x `[u32 len][bytes]`) into the
+/// individual assembly byte slices; stops at the first malformed length. Shared by the compile ABI,
+/// the REPL ABI (which packs its compile references the same way) and the multi-library bake -- so
+/// it lives here, ungated, rather than behind any one feature.
+pub(crate) fn split_refs(refs: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let Some(count) = refs
+        .get(0..4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    else {
+        return out;
+    };
+    let mut offset = 4usize;
+    for _ in 0..count {
+        let Some(len) = refs
+            .get(offset..offset + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        else {
+            break;
+        };
+        offset += 4;
+        let Some(blob) = refs.get(offset..offset + len) else {
+            break;
+        };
+        out.push(blob);
+        offset += len;
+    }
+    out
+}
+
+/// [`with_static`] for a LIST of buffers -- stages every one, runs `f`, then reclaims them all.
+/// A driver-stack bake loads several library assemblies at once, and nesting `with_static` cannot
+/// express a count known only at run time. Same contract and same safety argument as the singular
+/// form: `f` returns an OWNED value, so nothing borrows the staged buffers once it has returned.
+pub(crate) fn with_static_all<T>(buffers: &[&[u8]], f: impl FnOnce(&[&'static [u8]]) -> T) -> T {
+    let staged: Vec<&'static [u8]> = buffers
+        .iter()
+        .map(|bytes| &*Box::leak(bytes.to_vec().into_boxed_slice()))
+        .collect();
+    let result = f(&staged);
+    for bytes in staged {
+        unsafe {
+            drop(Box::from_raw(core::ptr::from_ref::<[u8]>(bytes).cast_mut()));
+        }
+    }
+    result
+}
+
 /// Whether the runtime is ready -- always true once the module is instantiated.
 #[unsafe(no_mangle)]
 pub extern "C" fn lamella_is_ready() -> i32 {

@@ -92,6 +92,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Delegate);
             info.accessibility = accessibility_of(&declaration.modifiers);
             info.methods.push(MethodSymbol {
+                explicit_interface: None,
                 name: "Invoke".into(),
                 return_type: bind_type(&declaration.return_type),
                 parameters: declaration
@@ -123,7 +124,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
 /// enclosing type (driving the `NestedClass` row + empty namespace at emission). Recurses
 /// for deeper nesting. Nested enums/delegates are a follow-up.
 fn collect_nested_types(declaration: &TypeDecl, namespace: &str, model: &mut Model) {
-    let enclosing_full = qualified_type_name(namespace, &declared_type_name(declaration));
+    let enclosing_full = declared_full_name(namespace, declaration);
     for member in &declaration.members {
         if let Member::NestedType(nested) = member {
             collect_namespace_member(nested, &enclosing_full, model);
@@ -151,6 +152,26 @@ fn nested_member_name(member: &NamespaceMember) -> Option<alloc::string::String>
         NamespaceMember::Delegate(declaration) => Some(declaration.name.to_string()),
         NamespaceMember::Namespace(_) => None,
     }
+}
+
+/// A declaration's own full name IN THE MODEL'S KEY SPACE: its namespace joined to its metadata
+/// name, so `class Box<T>` is `` Box`1 `` and not `Box` ([`declared_type_name`]). The string form
+/// of the symbol every consumer looks the declaration up by, and the scope its nested types and
+/// its `const` fields are keyed under.
+///
+/// **CALL THIS WHEREVER A WALK DESCENDS INTO A TYPE, IN EITHER CRATE.** The model keys a nested
+/// type under this exact string ([`collect_nested_types`]), so a walk that spells the enclosing
+/// name any other way asks about a type that does not exist -- and the miss is silent, because
+/// "no such type" and "a type with no members" are the same answer. A body bound under the
+/// unmangled spelling reported `CS0103: the name 'index' does not exist in the current context`
+/// for the nested type's OWN field, and an assembler that descended the same way emitted the
+/// nested type as a TOP-LEVEL `TypeDef` while its use sites named the nested one -- an image that
+/// compiles and cannot load.
+///
+/// A non-generic declaration mangles to itself, so this is the declared name unchanged for every
+/// C# 1.0 program.
+pub fn declared_full_name(namespace: &str, declaration: &TypeDecl) -> alloc::string::String {
+    qualified_type_name(namespace, &declared_type_name(declaration))
 }
 
 /// Joins a namespace (possibly empty) and a simple name into a dotted full name.
@@ -503,7 +524,7 @@ fn collect_enum_decls<'a>(
             out.push((namespace.to_string(), &declaration.name, &declaration.members));
         }
         NamespaceMember::Type(declaration) => {
-            let full = qualified_type_name(namespace, &declaration.name);
+            let full = declared_full_name(namespace, declaration);
             for member in &declaration.members {
                 if let Member::NestedType(nested) = member {
                     collect_enum_decls(nested, &full, out);
@@ -529,7 +550,7 @@ fn collect_const_field_decls<'a>(
             }
         }
         NamespaceMember::Type(declaration) => {
-            let full = qualified_type_name(namespace, &declaration.name);
+            let full = declared_full_name(namespace, declaration);
             for member in &declaration.members {
                 match member {
                     Member::Field {
@@ -919,6 +940,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     Some(interface) => explicit_interface_member_name(interface, name).into(),
                     None => name.clone(),
                 },
+                explicit_interface: explicit_interface.as_ref().map(bind_type),
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(parameter_symbol).collect(),
                 parameter_info: crate::bind::parameter_infos(parameters),
@@ -953,6 +975,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                explicit_interface: None,
                 name: operator.method_name(parameters.len()).into(),
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(parameter_symbol).collect(),
@@ -976,6 +999,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                explicit_interface: None,
                 name: direction.method_name().into(),
                 return_type: bind_type(target),
                 parameters: parameters.iter().map(parameter_symbol).collect(),
@@ -1030,6 +1054,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let indexer_is_sealed = is_sealed_member(modifiers);
                 if getter.is_some() {
                     info.methods.push(MethodSymbol {
+                        explicit_interface: None,
                         name: "get_Item".into(),
                         return_type: element.clone(),
                         parameters: indices.clone(),
@@ -1057,6 +1082,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     let mut parameters = indices;
                     parameters.push(element);
                     info.methods.push(MethodSymbol {
+                        explicit_interface: None,
                         name: "set_Item".into(),
                         return_type: TypeSymbol::Special(SpecialType::Void),
                         parameters,
@@ -1114,6 +1140,7 @@ fn constructor(
     accessibility: Accessibility,
 ) -> MethodSymbol {
     MethodSymbol {
+        explicit_interface: None,
         name: ".ctor".into(),
         return_type: TypeSymbol::Special(SpecialType::Void),
         parameters: parameters.iter().map(parameter_symbol).collect(),

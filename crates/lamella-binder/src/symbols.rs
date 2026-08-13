@@ -234,6 +234,23 @@ pub struct MethodSymbol {
     /// are separate overloads distinguished only by this count -- so ECMA-334 14.5.5.1 selects
     /// candidates by comparing it against the call site's type-argument count.
     pub type_parameters: Vec<Box<str>>,
+    /// The interface an EXPLICIT implementation qualifies itself with, AS WRITTEN and unresolved --
+    /// `IEnumerable<T>` for `IEnumerator<T> IEnumerable<T>.GetEnumerator()`. `None` for every
+    /// ordinary member, which is nearly all of them.
+    ///
+    /// **IT TRAVELS AS A SYMBOL BECAUSE A CONSTRUCTED TYPE CANNOT TRAVEL AS TEXT.** The member is
+    /// also registered under a mangled `<interface>.<member>` NAME -- what keeps ordinary
+    /// simple-name lookup from finding it, and what metadata records. That name cannot answer
+    /// WHICH interface: splitting it at its last `.` recovers `IEnumerable.M` and cannot recover
+    /// `IBox<int>.M`, and the arguments are the whole of what tells
+    /// `class C : IBox<int>, IBox<string>` apart. Recovering them from the string would mean
+    /// re-parsing generated text, nested arguments and all.
+    ///
+    /// Unresolved on purpose: collection runs before the model is complete, so this is
+    /// [`crate::bind_type`]'s syntactic reading. [`Binder::explicitly_implements`] resolves it
+    /// against the use site's scope, which is what makes `IEnumerable<T>` and
+    /// `System.Collections.Generic.IEnumerable<T>` one member rather than two.
+    pub explicit_interface: Option<TypeSymbol>,
     /// The constraints on each of this method's OWN type parameters (25.7), in the same order.
     ///
     /// **May be SHORTER than `type_parameters`, unlike the type-level pair**, and
@@ -1348,6 +1365,7 @@ mod tests {
             is_required: false,
         });
         info.methods.push(MethodSymbol {
+            explicit_interface: None,
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
@@ -1366,6 +1384,7 @@ mod tests {
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            explicit_interface: None,
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
@@ -1384,6 +1403,7 @@ mod tests {
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            explicit_interface: None,
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Double)],

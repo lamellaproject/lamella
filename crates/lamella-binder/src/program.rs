@@ -1869,7 +1869,9 @@ fn validate_interface_members(binder: &mut Binder, declaration: &TypeDecl) {
     let default_implementation = |binder: &mut Binder, span| {
         binder.report(Diagnostic::new(
             DiagnosticKind::FeatureRequiresLaterVersion {
-                feature: "default interface implementation".into(),
+                feature: lamella_syntax::version::Feature::DefaultInterfaceImplementation
+                    .description()
+                    .into(),
                 required: "8.0".into(),
                     current: compiling_version(),
             },
@@ -1956,7 +1958,9 @@ fn validate_constructors(binder: &mut Binder, declaration: &TypeDecl) {
         {
             binder.report(Diagnostic::new(
                 DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: "parameterless struct constructors".into(),
+                    feature: lamella_syntax::version::Feature::ParameterlessStructConstructor
+                        .description()
+                        .into(),
                     required: "10.0".into(),
                         current: compiling_version(),
                 },
@@ -3299,11 +3303,8 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             }
             Member::NestedType(nested) => {
                 if let NamespaceMember::Type(nested_decl) = nested.as_ref() {
-                    let enclosing_full = if namespace.is_empty() {
-                        String::from(&*declaration.name)
-                    } else {
-                        alloc::format!("{namespace}.{}", declaration.name)
-                    };
+                    let enclosing_full =
+                        crate::declaration::declared_full_name(namespace, declaration);
                     bind_type_bodies(binder, &enclosing_full, nested_decl);
                 }
             }
@@ -6248,6 +6249,7 @@ mod tests {
             let mut model = Model::new();
             let mut object = TypeInfo::new("System", "Object", TypeKind::Class);
             object.methods.push(MethodSymbol {
+                explicit_interface: None,
                 name: "ToString".into(),
                 return_type: TypeSymbol::Special(SpecialType::String),
                 parameters: Vec::new(),
@@ -6474,6 +6476,7 @@ mod tests {
             let mut model = Model::new();
             let mut object = TypeInfo::new("System", "Object", TypeKind::Class);
             object.methods.push(MethodSymbol {
+                explicit_interface: None,
                 name: "ToString".into(),
                 return_type: TypeSymbol::Special(SpecialType::String),
                 parameters: Vec::new(),
@@ -6495,6 +6498,7 @@ mod tests {
             let mut seam = TypeInfo::new("", "Seam", TypeKind::Class);
             seam.is_external = seam_is_external;
             seam.methods.push(MethodSymbol {
+                explicit_interface: None,
                 name: "Read".into(),
                 return_type: TypeSymbol::Special(SpecialType::Int32),
                 parameters: vec![TypeSymbol::Special(SpecialType::Int32)],
@@ -6580,6 +6584,7 @@ mod tests {
         let mut bcl = Model::new();
         let mut console = TypeInfo::new("System", "Console", TypeKind::Class);
         console.methods.push(MethodSymbol {
+            explicit_interface: None,
             name: "WriteLine".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::String)],

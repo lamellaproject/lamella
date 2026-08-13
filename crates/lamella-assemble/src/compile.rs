@@ -96,6 +96,9 @@ const FIELD_HAS_DEFAULT: u16 = 0x8000;
 const CTOR_FLAGS: u16 = 0x0006 | 0x0800 | 0x1000;
 const CCTOR_FLAGS: u16 = 0x0001 | METHOD_STATIC | METHOD_HIDEBYSIG | 0x0800 | 0x1000;
 const SPECIAL_NAME: u16 = 0x0800;
+const SETTER_VALUE_PARAMETER: &str = "value";
+const DELEGATE_CTOR_TARGET: &str = "object";
+const DELEGATE_CTOR_METHOD: &str = "method";
 const IL_MANAGED: u16 = 0x0000;
 const FINALIZE_FLAGS: u16 = 0x0004 | METHOD_VIRTUAL | METHOD_HIDEBYSIG;
 const ENUM_TYPE_FLAGS: u32 = 0x0000_0001 | 0x0000_0100;
@@ -1486,7 +1489,7 @@ fn emit_namespace(
                     declaration,
                     debug,
                 )?;
-                let enclosing_full = qualified_dotted(namespace, &declaration.name);
+                let enclosing_full = lamella_binder::declared_full_name(namespace, declaration);
                 for member in &declaration.members {
                     if let Member::NestedType(nested) = member {
                         if matches!(
@@ -1675,7 +1678,9 @@ fn emit_interface(
                 &parameter_sigs,
                 &member_type_sig(tokens, &enclosing, &bind_type(return_type))?,
             );
-            image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS);
+            let method =
+                image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS, &parameter_names(parameters));
+            emit_param_array_marker(image, tokens, method, parameters);
         }
     }
     let mut first_property = None;
@@ -1693,6 +1698,7 @@ fn emit_interface(
                     &accessor_name("get_", name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                    &[],
                 );
                 image.add_method_semantics(SEMANTICS_GETTER, token, property);
             }
@@ -1702,6 +1708,7 @@ fn emit_interface(
                     &accessor_name("set_", name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                    &[SETTER_VALUE_PARAMETER.into()],
                 );
                 image.add_method_semantics(SEMANTICS_SETTER, token, property);
             }
@@ -1730,6 +1737,7 @@ fn emit_interface(
                     &accessor_name("get_", &name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                    &parameter_names(parameters),
                 );
                 image.add_method_semantics(SEMANTICS_GETTER, token, property);
             }
@@ -1737,10 +1745,13 @@ fn emit_interface(
                 let mut signature_params = indices.clone();
                 signature_params.push(element.clone());
                 let signature = method_signature(true, &signature_params, &TypeSig::Void);
+                let mut names = parameter_names(parameters);
+                names.push(SETTER_VALUE_PARAMETER.into());
                 let token = image.add_abstract_method(
                     &accessor_name("set_", &name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                    &names,
                 );
                 image.add_method_semantics(SEMANTICS_SETTER, token, property);
             }
@@ -1771,12 +1782,14 @@ fn emit_interface(
                     &accessor_name("add_", &declarator.name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                    &[SETTER_VALUE_PARAMETER.into()],
                 );
                 image.add_method_semantics(SEMANTICS_ADDON, add, event);
                 let remove = image.add_abstract_method(
                     &accessor_name("remove_", &declarator.name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                    &[SETTER_VALUE_PARAMETER.into()],
                 );
                 image.add_method_semantics(SEMANTICS_REMOVEON, remove, event);
                 first_event.get_or_insert(event);
@@ -1801,15 +1814,28 @@ fn emit_delegate(
     namespace: &str,
     declaration: &DelegateDecl,
 ) -> Result<(), crate::EmitError> {
-    mint_signature_type(binder, &bind_type(&declaration.return_type), &[], image, tokens);
+    let inherited = enclosing_type_parameters(binder, &named_symbol(namespace, &declaration.name));
+    mint_signature_type(
+        binder,
+        &bind_type(&declaration.return_type),
+        &[],
+        &inherited,
+        image,
+        tokens,
+    )?;
     for parameter in &declaration.parameters {
-        mint_signature_type(binder, &bind_type(&parameter.ty), &[], image, tokens);
+        mint_signature_type(binder, &bind_type(&parameter.ty), &[], &inherited, image, tokens)?;
     }
     let base = system_base(image, tokens, "MulticastDelegate");
     image.add_type(namespace, &declaration.name, base, DELEGATE_TYPE_FLAGS);
     let ctor_signature =
         method_signature(true, &[TypeSig::Object, TypeSig::NativeInt], &TypeSig::Void);
-    image.add_runtime_method(".ctor", &ctor_signature, DELEGATE_CTOR_FLAGS);
+    image.add_runtime_method(
+        ".ctor",
+        &ctor_signature,
+        DELEGATE_CTOR_FLAGS,
+        &[DELEGATE_CTOR_TARGET.into(), DELEGATE_CTOR_METHOD.into()],
+    );
     let return_sig = type_sig(tokens, &bind_type(&declaration.return_type))?;
     let parameter_sigs: Vec<TypeSig> = declaration
         .parameters
@@ -1829,7 +1855,13 @@ fn emit_delegate(
         })
         .collect::<Result<_, _>>()?;
     let invoke_signature = method_signature(true, &parameter_sigs, &return_sig);
-    image.add_runtime_method("Invoke", &invoke_signature, DELEGATE_INVOKE_FLAGS);
+    let invoke = image.add_runtime_method(
+        "Invoke",
+        &invoke_signature,
+        DELEGATE_INVOKE_FLAGS,
+        &parameter_names(&declaration.parameters),
+    );
+    emit_param_array_marker(image, tokens, invoke, &declaration.parameters);
     Ok(())
 }
 
@@ -2061,6 +2093,21 @@ fn emit_type_inner(
         .iter()
         .map(|parameter| parameter.name.clone())
         .collect();
+    let inherited_parameters = enclosing_type_parameters(binder, &enclosing);
+    if !inherited_parameters.is_empty() {
+        let holds_static_state = declaration.members.iter().any(|member| match member {
+            Member::Field { modifiers, .. } | Member::EventField { modifiers, .. } => {
+                modifiers.contains(&Modifier::Static) && !modifiers.contains(&Modifier::Const)
+            }
+            Member::Constructor { modifiers, .. } => modifiers.contains(&Modifier::Static),
+            _ => false,
+        });
+        if holds_static_state {
+            return Err(crate::EmitError::Unsupported(
+                "static state in a type nested inside a generic type",
+            ));
+        }
+    }
     for index in 0..own_parameters.len() as u32 {
         if tokens.var_spec(index).is_none() {
             let spec = image.type_spec(&type_signature(&TypeSig::Var(index)));
@@ -2068,7 +2115,14 @@ fn emit_type_inner(
         }
     }
     if matches!(declaration.kind, TypeKind::Interface) {
-        mint_member_signature_types(binder, &declaration.members, &own_parameters, image, tokens);
+        mint_member_signature_types(
+            binder,
+            &declaration.members,
+            &own_parameters,
+            &inherited_parameters,
+            image,
+            tokens,
+        )?;
         return emit_interface(image, binder, tokens, namespace, declaration);
     }
     let (base_class, nested_in): (Option<TypeSymbol>, Option<Box<str>>) = {
@@ -2135,7 +2189,14 @@ fn emit_type_inner(
         }
     }
     emit_attributes(image, binder, tokens, &enclosing, type_token, &declaration.attributes);
-    mint_member_signature_types(binder, &declaration.members, &own_parameters, image, tokens);
+    mint_member_signature_types(
+        binder,
+        &declaration.members,
+        &own_parameters,
+        &inherited_parameters,
+        image,
+        tokens,
+    )?;
     let direct_interfaces: Vec<TypeSymbol> = binder
         .model()
         .get_by_symbol(&enclosing)
@@ -2762,7 +2823,7 @@ fn event_accessor_body(field: &str, operator: AssignmentOperator) -> Stmt {
 /// dispatches to the overriding method in a derived type.
 fn emit_abstract_method(
     image: &mut ImageBuilder,
-    tokens: &Tokens,
+    tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     modifiers: &[Modifier],
     name: &str,
@@ -2779,7 +2840,9 @@ fn emit_abstract_method(
         &member_type_sig(tokens, &enclosing, &bind_type(return_type))?,
     );
     let flags = member_visibility(modifiers) | slot_flags(modifiers);
-    Ok(image.add_abstract_method(name, &signature, flags))
+    let method = image.add_abstract_method(name, &signature, flags, &parameter_names(parameters));
+    emit_param_array_marker(image, tokens, method, parameters);
+    Ok(method)
 }
 
 /// Emits one method, with its OWN type parameters in scope for the whole emission.
@@ -2899,6 +2962,7 @@ fn emit_one_method_in_scope(
             &return_symbol,
             body_token,
         )?;
+        emit_param_array_marker(image, tokens, body_token, parameters);
         return Ok(body_token);
     }
     let is_static = modifiers.contains(&Modifier::Static);
@@ -2922,7 +2986,7 @@ fn emit_one_method_in_scope(
     {
         flags |= METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_HIDEBYSIG;
     }
-    emit_method_body(
+    let method = emit_method_body(
         image,
         binder,
         tokens,
@@ -2939,7 +3003,9 @@ fn emit_one_method_in_scope(
         flags,
         None,
         debug,
-    )
+    )?;
+    emit_param_array_marker(image, tokens, method, parameters);
+    Ok(method)
 }
 
 /// Emits the `MethodImpl` row that wires an explicit interface implementation: it
@@ -2971,7 +3037,27 @@ fn emit_explicit_interface_impl(
         .ok_or(crate::EmitError::Unsupported(
             "an explicit interface impl on a type with no metadata token",
         ))?;
-    let interface_symbol = binder.resolve_type(&bind_type(interface));
+    let interface_symbol = binder.canonicalize(&binder.resolve_type(&bind_type(interface)));
+    if let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = &interface_symbol
+    {
+        let declaration = constructed_interface_member_ref(
+            image,
+            binder,
+            tokens,
+            enclosing,
+            &interface_symbol,
+            definition,
+            arguments,
+            member,
+            parameter_types,
+            return_symbol,
+        )?;
+        image.add_method_impl(class, body, declaration);
+        return Ok(());
+    }
     let declaration = match tokens.method(&interface_symbol, member, parameter_types) {
         Some(token) => token,
         None => {
@@ -2993,6 +3079,150 @@ fn emit_explicit_interface_impl(
     };
     image.add_method_impl(class, body, declaration);
     Ok(())
+}
+
+/// The `MemberRef` a `MethodImpl` names when the interface it implements is CONSTRUCTED
+/// (`IEnumerable<T>`, `IBox<int>`): a `TypeSpec` for the instantiation, and the member's signature
+/// written in terms of the INTERFACE DEFINITION'S OWN parameters (`!0`), never the implementing
+/// class's.
+///
+/// **THE SIGNATURE COMES FROM THE INTERFACE, NOT FROM THE DECLARATION THAT IMPLEMENTS IT.** The two
+/// coincide for `Bag<T> : IEnumerable<T>`, where the class's `T` and the interface's `!0` are the
+/// same position -- and they do NOT for `Two : IBox<int>`, whose `int IBox<int>.Get()` is written
+/// with the argument substituted while the referenced member is still `!0 Get()`. Taking the
+/// declaration's types would name a member the interface does not declare, and II.22.25 wants the
+/// one it does.
+#[allow(clippy::too_many_arguments)]
+fn constructed_interface_member_ref(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    interface: &TypeSymbol,
+    definition: &[Box<str>],
+    arguments: &[TypeSymbol],
+    member: &str,
+    parameter_types: &[TypeSymbol],
+    return_symbol: &TypeSymbol,
+) -> Result<Token, crate::EmitError> {
+    let declaring_parameters = tokens.type_parameters(enclosing).to_vec();
+    let saved_scope = tokens.enter_body_scope(&[], &declaring_parameters);
+    let minted = mint_type_spec(interface, definition, arguments, image, tokens);
+    tokens.restore_body_scope(saved_scope);
+    let parent = minted.ok_or(crate::EmitError::Unsupported(
+        "a constructed interface with no TypeSpec",
+    ))?;
+    let definition_symbol = definition_symbol(definition, arguments.len());
+    let wanted_parameters: Vec<TypeSymbol> =
+        parameter_types.iter().map(|ty| binder.canonicalize(ty)).collect();
+    let wanted_return = binder.canonicalize(return_symbol);
+    let index = {
+        let substituted = binder.model().get_by_symbol(interface).ok_or(
+            crate::EmitError::Unsupported("an explicit interface impl of an unresolvable interface"),
+        )?;
+        substituted
+            .methods
+            .iter()
+            .position(|candidate| {
+                &*candidate.name == member
+                    && candidate.parameters.len() == wanted_parameters.len()
+                    && candidate
+                        .parameters
+                        .iter()
+                        .zip(&wanted_parameters)
+                        .all(|(a, b)| binder.canonicalize(a) == *b)
+                    && binder.canonicalize(&candidate.return_type) == wanted_return
+            })
+            .ok_or(crate::EmitError::Unsupported(
+                "an explicit interface impl of a member the interface does not declare",
+            ))?
+    };
+    let (type_parameters, declared) = {
+        let info = binder.model().get_by_symbol(&definition_symbol).ok_or(
+            crate::EmitError::Unsupported("an explicit interface impl of an unresolvable interface"),
+        )?;
+        let declared = info.methods.get(index).cloned().ok_or(
+            crate::EmitError::Unsupported("an explicit interface impl of a member the interface does not declare"),
+        )?;
+        (info.type_parameters.clone(), declared)
+    };
+    for ty in declared
+        .parameters
+        .iter()
+        .chain(core::iter::once(&declared.return_type))
+    {
+        if !mentions_type_parameter(ty, &type_parameters) {
+            mint_named_type_token(ty, image, tokens);
+        }
+    }
+    let scope = GenericScope {
+        method: &[],
+        declaring: &type_parameters,
+    };
+    let parameter_sigs: Vec<TypeSig> = declared
+        .parameters
+        .iter()
+        .map(|ty| open_type_sig(tokens, ty, scope))
+        .collect::<Result<_, _>>()?;
+    let return_sig = open_type_sig(tokens, &declared.return_type, scope)?;
+    let signature = method_signature(true, &parameter_sigs, &return_sig);
+    Ok(image.member_ref(parent, member, &signature))
+}
+
+/// The declared name of each parameter, in order -- the `Param` rows (II.22.33) that make up a
+/// method's `ParamList` run, so a debugger shows `count` rather than `arg1` and a parameter-targeted
+/// attribute has a row to hang off.
+fn parameter_names(parameters: &[Parameter]) -> Vec<Box<str>> {
+    parameters.iter().map(|parameter| parameter.name.clone()).collect()
+}
+
+/// The names out of a BOUND parameter list -- the `(name, type)` pairs the accessor and body
+/// paths build, as against [`parameter_names`]'s syntactic ones.
+fn bound_parameter_names(parameters: &[(Box<str>, TypeSymbol)]) -> Vec<Box<str>> {
+    parameters.iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// Whether `parameters` ends in a `params` array (17.5.1.4). Only the LAST parameter can be one,
+/// which is why the marker below has a single row to find -- the last DECLARED parameter, which is
+/// not necessarily the last row of the method's run.
+fn ends_in_params_array(parameters: &[Parameter]) -> bool {
+    parameters
+        .last()
+        .is_some_and(|parameter| parameter.modifier == Some(ParameterModifier::Params))
+}
+
+/// Emits `[System.ParamArrayAttribute]` on the last declared parameter of `method` when
+/// `parameters` ends in a `params` array (17.5.1.4) -- the empty-argument marker blob, matching
+/// what csc writes byte for byte.
+///
+/// **THIS IS THE ONLY RECORD THAT SURVIVES THE ASSEMBLY BOUNDARY.** `params` is a call-site rule,
+/// and a call site in another assembly has nothing but metadata to read: without this row the
+/// method's signature says `int[]` and every expanded call against it -- `Add(1, 2, 3)` -- draws
+/// CS1501 instead of binding. A single-file program never notices, because there the binder still
+/// has the source. Reading the attribute back has always worked -- it is how a BCL `params` method
+/// binds -- so the gap was one-sided: a library this compiler produced was one it could not then
+/// call in expanded form.
+///
+/// Silently skipped if `System.ParamArrayAttribute` does not resolve -- a corlib being compiled
+/// before that type exists, which is the same lenient posture the other synthesized markers take.
+fn emit_param_array_marker(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    method: Token,
+    parameters: &[Parameter],
+) {
+    if !ends_in_params_array(parameters) {
+        return;
+    }
+    let Some(&param) = image.method_parameters(method).get(parameters.len() - 1) else {
+        return;
+    };
+    let Some(constructor) =
+        synthesized_attribute_ctor(image, tokens, "System", "ParamArrayAttribute", &[])
+    else {
+        return;
+    };
+    image.add_custom_attribute(param, constructor, &[0x01, 0x00, 0x00, 0x00]);
 }
 
 /// The `ref`/`out` (byref) flag of each parameter, in order -- parallel to the bound
@@ -3065,7 +3295,7 @@ fn string_literal_value(expr: &Expr) -> Option<String> {
 /// boundary the target cannot honor.
 fn emit_pinvoke_method(
     image: &mut ImageBuilder,
-    tokens: &Tokens,
+    tokens: &mut Tokens,
     modifiers: &[Modifier],
     name: &str,
     return_type: &TypeRef,
@@ -3102,7 +3332,8 @@ fn emit_pinvoke_method(
     let signature = method_signature(false, &parameter_sigs, &return_sig);
     let flags =
         member_visibility(modifiers) | METHOD_STATIC | METHOD_HIDEBYSIG | METHOD_PINVOKE_IMPL;
-    let method = image.add_pinvoke_method(name, &signature, flags);
+    let method = image.add_pinvoke_method(name, &signature, flags, &parameter_names(parameters));
+    emit_param_array_marker(image, tokens, method, parameters);
     let module_ref = image.add_module_ref(&dll_import.library);
     image.add_impl_map(method, dll_import.mapping_flags, &dll_import.entry_point, module_ref);
     Ok(())
@@ -3182,7 +3413,7 @@ fn emit_constructor(
             prologue.leading_body = field_initializer_statements(declaration).len();
         }
     }
-    emit_method_body(
+    let ctor = emit_method_body(
         image,
         binder,
         tokens,
@@ -3199,7 +3430,9 @@ fn emit_constructor(
         CTOR_FLAGS,
         prologue.as_ref(),
         debug,
-    )
+    )?;
+    emit_param_array_marker(image, tokens, ctor, parameters);
+    Ok(ctor)
 }
 
 /// Emits a destructor as the parameterless `Finalize` override -- a `family virtual`
@@ -3460,7 +3693,7 @@ fn emit_bound_body_in_scope(
         declaring: declaring_parameters,
     };
     let arg_base = u16::from(!is_static);
-    let parameter_names: Vec<Box<str>> = params.iter().map(|(name, _)| name.clone()).collect();
+    let parameter_names = bound_parameter_names(params);
     let byref_params: Vec<(Box<str>, TypeSymbol)> = params
         .iter()
         .enumerate()
@@ -3689,7 +3922,7 @@ fn emit_property(
             Some(token)
         } else if is_abstract {
             let signature = method_signature(true, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
-            Some(image.add_abstract_method(&method_name, &signature, flags))
+            Some(image.add_abstract_method(&method_name, &signature, flags, &[]))
         } else {
             None
         };
@@ -3733,7 +3966,7 @@ fn emit_property(
         } else if is_abstract {
             let signature =
                 method_signature(true, &[member_type_sig(tokens, enclosing, &property_ty)?], &TypeSig::Void);
-            Some(image.add_abstract_method(&method_name, &signature, flags))
+            Some(image.add_abstract_method(&method_name, &signature, flags, &bound_parameter_names(&params)))
         } else {
             None
         };
@@ -3835,12 +4068,18 @@ fn emit_indexer(
             )?)
         } else if is_abstract {
             let signature = method_signature(true, &index_sigs, &element_sig);
-            Some(image.add_abstract_method(&getter_name, &signature, flags))
+            Some(image.add_abstract_method(
+                &getter_name,
+                &signature,
+                flags,
+                &bound_parameter_names(&index_params),
+            ))
         } else {
             None
         };
         if let Some(token) = token {
             emit_attributes(image, binder, tokens, enclosing, token, &getter.attributes);
+            emit_param_array_marker(image, tokens, token, parameters);
             image.add_method_semantics(SEMANTICS_GETTER, token, property);
         }
     }
@@ -3862,12 +4101,18 @@ fn emit_indexer(
             let mut signature_params = index_sigs.clone();
             signature_params.push(element_sig.clone());
             let signature = method_signature(true, &signature_params, &TypeSig::Void);
-            Some(image.add_abstract_method(&setter_name, &signature, flags))
+            Some(image.add_abstract_method(
+                &setter_name,
+                &signature,
+                flags,
+                &bound_parameter_names(&params),
+            ))
         } else {
             None
         };
         if let Some(token) = token {
             emit_attributes(image, binder, tokens, enclosing, token, &setter.attributes);
+            emit_param_array_marker(image, tokens, token, parameters);
             image.add_method_semantics(SEMANTICS_SETTER, token, property);
         }
     }
@@ -5641,13 +5886,42 @@ fn is_type_parameter(ty: &TypeSymbol, scope: ParameterScope<'_>) -> bool {
     matches!(&parts[..], [only] if scope.iter().any(|names| names.iter().any(|name| name == only)))
 }
 
+/// The type parameters declared by the ENCLOSING types of `ty`, walking the whole chain outward --
+/// `T` for anything declared inside `class Box<T>`, however deeply nested.
+///
+/// A nested type sees these names lexically (they are in scope through its whole body) while
+/// declaring none of them itself, so it is the one context where a name can be a type parameter of
+/// the program and not a parameter of the declaration being emitted. Every caller wants that
+/// distinction; none of them wants to walk the chain.
+fn enclosing_type_parameters(binder: &Binder, ty: &TypeSymbol) -> Vec<Box<str>> {
+    let mut names: Vec<Box<str>> = Vec::new();
+    let mut enclosing = binder
+        .model()
+        .get_by_symbol(ty)
+        .and_then(|info| info.enclosing.clone());
+    let mut seen: Vec<Box<str>> = Vec::new();
+    while let Some(full) = enclosing {
+        if seen.contains(&full) {
+            break;
+        }
+        seen.push(full.clone());
+        let Some(info) = binder.model().get_by_symbol(&type_symbol_from_dotted(&full)) else {
+            break;
+        };
+        names.extend(info.type_parameters.iter().cloned());
+        enclosing = info.enclosing.clone();
+    }
+    names
+}
+
 fn mint_signature_type(
     binder: &Binder,
     syntactic: &TypeSymbol,
     scope: ParameterScope<'_>,
+    inherited: &[Box<str>],
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
-) {
+) -> Result<(), crate::EmitError> {
     if let TypeSymbol::Instantiation {
         definition,
         arguments,
@@ -5661,31 +5935,37 @@ fn mint_signature_type(
             tokens.insert_type(&named, token);
         }
         for argument in arguments {
-            mint_signature_type(binder, argument, scope, image, tokens);
+            mint_signature_type(binder, argument, scope, inherited, image, tokens)?;
         }
-        return;
+        return Ok(());
     }
     if let TypeSymbol::Array { element, .. }
     | TypeSymbol::Pointer(element)
     | TypeSymbol::ByRef(element) = syntactic
     {
-        mint_signature_type(binder, element, scope, image, tokens);
-        return;
+        mint_signature_type(binder, element, scope, inherited, image, tokens)?;
+        return Ok(());
     }
     if is_type_parameter(syntactic, scope) {
-        return;
+        return Ok(());
+    }
+    if is_type_parameter(syntactic, &[inherited]) {
+        return Err(crate::EmitError::Unsupported(
+            "a nested type naming its enclosing type's type parameter",
+        ));
     }
     let needs_ref = matches!(
         syntactic,
         TypeSymbol::Named(_) | TypeSymbol::Special(SpecialType::Decimal)
     );
     if !needs_ref || tokens.type_token(syntactic).is_some() {
-        return;
+        return Ok(());
     }
     if let Some((namespace, name)) = split_type_name(&binder.resolve_type(syntactic)) {
         let token = image.type_ref(&namespace, &name);
         tokens.insert_type(syntactic, token);
     }
+    Ok(())
 }
 
 /// Mints the external types named in a type's member SIGNATURES (field, method
@@ -5714,14 +5994,22 @@ fn mint_member_signature_types(
     binder: &Binder,
     members: &[Member],
     declaring_parameters: &[Box<str>],
+    inherited_parameters: &[Box<str>],
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
-) {
+) -> Result<(), crate::EmitError> {
     let mint = |syntactic: &TypeSymbol,
                 own: &[Box<str>],
                 image: &mut ImageBuilder,
                 tokens: &mut Tokens| {
-        mint_signature_type(binder, syntactic, &[declaring_parameters, own], image, tokens);
+        mint_signature_type(
+            binder,
+            syntactic,
+            &[declaring_parameters, own],
+            inherited_parameters,
+            image,
+            tokens,
+        )
     };
     for member in members {
         match member {
@@ -5729,14 +6017,14 @@ fn mint_member_signature_types(
             | Member::Property { ty, .. }
             | Member::EventField { ty, .. }
             | Member::Event { ty, .. } => {
-                mint(&bind_type(ty), &[], image, tokens);
+                mint(&bind_type(ty), &[], image, tokens)?;
             }
             Member::Indexer {
                 ty, parameters, ..
             } => {
-                mint(&bind_type(ty), &[], image, tokens);
+                mint(&bind_type(ty), &[], image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
                 }
             }
             Member::Method {
@@ -5749,9 +6037,9 @@ fn mint_member_signature_types(
                     .iter()
                     .map(|parameter| parameter.name.clone())
                     .collect();
-                mint(&bind_type(return_type), &own, image, tokens);
+                mint(&bind_type(return_type), &own, image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &own, image, tokens);
+                    mint(&bind_type(&parameter.ty), &own, image, tokens)?;
                 }
             }
             Member::Operator {
@@ -5759,27 +6047,28 @@ fn mint_member_signature_types(
                 parameters,
                 ..
             } => {
-                mint(&bind_type(return_type), &[], image, tokens);
+                mint(&bind_type(return_type), &[], image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
                 }
             }
             Member::ConversionOperator {
                 target, parameters, ..
             } => {
-                mint(&bind_type(target), &[], image, tokens);
+                mint(&bind_type(target), &[], image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
                 }
             }
             Member::Constructor { parameters, .. } => {
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
                 }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// Mints the metadata token a `box`/`unbox.any` names for the value type `ty`. A
@@ -6723,7 +7012,7 @@ fn collect_tokens(
                         }
                     }
                 }
-                let enclosing_full = qualified_dotted(namespace, &declaration.name);
+                let enclosing_full = lamella_binder::declared_full_name(namespace, declaration);
                 for member in &declaration.members {
                     if let Member::NestedType(nested) = member {
                         if matches!(
@@ -6795,16 +7084,6 @@ fn collect_tokens(
                 );
             }
         }
-    }
-}
-
-/// Joins a namespace (possibly empty) and a simple name into a dotted full name -- used
-/// to key a nested type under its enclosing type (e.g. `"Outer"` + `"Inner"`).
-fn qualified_dotted(namespace: &str, name: &str) -> String {
-    if namespace.is_empty() {
-        String::from(name)
-    } else {
-        format!("{namespace}.{name}")
     }
 }
 
@@ -10879,6 +11158,107 @@ mod tests {
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert!(result.image.is_some());
         assert!(result.pdb.is_some());
+    }
+
+    /// A `params` method declared in ONE assembly and called in expanded form from ANOTHER.
+    ///
+    /// **THE SECOND ASSEMBLY IS THE ENTIRE TEST.** In a single compilation the binder still has
+    /// the source, so `Add(1, 2, 3)` binds from the syntax and a lost `[ParamArrayAttribute]`
+    /// shows up nowhere. Across the boundary there is only metadata: with no marker the callee's
+    /// signature reads as a plain `int[]` parameter, the expanded call finds no applicable
+    /// overload, and the consumer fails with CS1501. That is the shape every real program has --
+    /// corlib is a separate assembly -- and it is what this test was written against, having first
+    /// been measured as a failure.
+    #[test]
+    fn a_params_method_binds_expanded_across_an_assembly_boundary() {
+        let library = compile_source(
+            "public class Sum { public static int Add(params int[] values) { return 0; } }",
+            "lib.cs",
+            "lib.dll",
+            "lib",
+            &[],
+            false,
+        );
+        let library_image = library.image.expect("the library emits");
+        let reference = Assembly::read(&library_image).expect("the emitted library parses");
+        let consumer = compile_source(
+            "class Program { static int Main() { return Sum.Add(1, 2, 3); } }",
+            "app.cs",
+            "app.dll",
+            "app",
+            &[reference],
+            false,
+        );
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "an expanded call on an imported params method must bind: {:?}",
+            consumer.diagnostics
+        );
+        assert!(consumer.image.is_some(), "the consumer emits");
+    }
+
+    /// Every member kind that can DECLARE a parameter array marks it in metadata.
+    ///
+    /// **ENUMERATED BECAUSE THE MARKING IS SPREAD OVER SIX EMIT PATHS AND LANDED IN FIVE.** A
+    /// concrete method, an abstract one, an interface method, a delegate's `Invoke`, an indexer
+    /// accessor, a constructor and a P/Invoke each reach a different `add_*_method`, and the first
+    /// pass wired every path but the ordinary concrete method -- the one nearly every program
+    /// uses. A test naming one kind would have passed. The set below is compared WHOLE, so a new
+    /// member kind that forgets the marker fails here rather than at a user's assembly boundary.
+    ///
+    /// The expected names come from reading the source beside them; the actual ones are read back
+    /// out of the emitted image through `param_array_params` -- the same function the importer
+    /// uses, so this measures what a consumer would actually see.
+    #[test]
+    fn every_member_kind_that_can_declare_a_params_array_marks_it() {
+        let result = compile_source(
+            "public delegate void Sink(params int[] items);
+             public interface IAccept { int Take(params int[] values); }
+             public abstract class Shape
+             {
+                 public abstract int Abstract(params int[] rest);
+                 public int Concrete(params int[] rest) { return 0; }
+                 public int this[params int[] index] { get { return 0; } }
+                 public Shape(params int[] seed) { }
+                 public int Unmarked(int plain) { return plain; }
+             }",
+            "kinds.cs",
+            "kinds.dll",
+            "kinds",
+            &[],
+            false,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let Some(image) = result.image else {
+            panic!("the declarations emit: {:?}", result.emit_error)
+        };
+        let assembly = Assembly::read(&image).expect("the emitted image parses");
+        let marked_rows = assembly.param_array_params();
+        let mut marked: Vec<String> = Vec::new();
+        for type_def in assembly.type_defs() {
+            for method in type_def.methods() {
+                let Some(name) = method.name() else { continue };
+                if method
+                    .params()
+                    .any(|parameter| marked_rows.contains(&parameter.token().row()))
+                {
+                    marked.push(name.into());
+                }
+            }
+        }
+        marked.sort();
+        assert_eq!(
+            marked,
+            alloc::vec![
+                ".ctor".to_string(),
+                "Abstract".to_string(),
+                "Concrete".to_string(),
+                "Invoke".to_string(),
+                "Take".to_string(),
+                "get_Item".to_string(),
+            ],
+            "the marked members must be exactly the ones declaring a parameter array"
+        );
     }
 
     #[test]

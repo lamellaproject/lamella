@@ -767,6 +767,38 @@ impl ImageBuilder {
         }
     }
 
+    /// The `Param` tokens (II.22.33) of `method`'s parameter list, in row order -- the
+    /// `HasCustomAttribute` parents (II.22.10) a parameter-targeted attribute such as
+    /// `[ParamArrayAttribute]` on a `params` array hangs off.
+    ///
+    /// Computed the way a READER computes the run (II.22.26): it starts at this `MethodDef`'s
+    /// `ParamList` and ends where the NEXT `MethodDef`'s starts, or at the end of the `Param`
+    /// table when this is the last method added.
+    ///
+    /// **Read back rather than remembered.** The alternative -- having each `add_*_method` hand
+    /// its caller the rows it just minted -- is only correct while nothing else has been added
+    /// since, and that is an invisible contract on a builder whose whole job is to keep adding
+    /// rows. Following the column the builder itself wrote stays right whenever it is asked.
+    ///
+    /// A method's own parameters come first, in declaration order, so index `n - 1` is the last
+    /// declared parameter; [`add_return_param`](Self::add_return_param) appends its sequence-0
+    /// row after them, so the run's LAST entry is not necessarily a declared parameter.
+    #[must_use]
+    pub fn method_parameters(&self, method: Token) -> Vec<Token> {
+        if method.table() != table::METHOD_DEF {
+            return Vec::new();
+        }
+        let param_list = |row: u32| match self.tables.cell(table::METHOD_DEF, row, 5) {
+            Some(&Column::Index(table::PARAM, first)) => Some(first),
+            _ => None,
+        };
+        let Some(first) = param_list(method.row()) else {
+            return Vec::new();
+        };
+        let end = param_list(method.row() + 1).unwrap_or_else(|| self.tables.row_count(table::PARAM) + 1);
+        (first..end).map(|row| Token::new(table::PARAM, row)).collect()
+    }
+
     /// Adds a `Param` row (II.22.33) for a method's return value: `Flags` 0, `Sequence` 0,
     /// no name. Call immediately after the owning method's [`add_method`] and before any
     /// later method, so the row falls inside this method's `ParamList` run; it is then the
@@ -784,24 +816,43 @@ impl ImageBuilder {
 
     /// Adds an abstract `MethodDef` (RVA 0, no body, IL impl) -- an interface method or
     /// an abstract class method. `flags` carries Abstract | Virtual.
-    pub fn add_abstract_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
-        self.add_bodyless_method(name, signature, flags, 0)
+    pub fn add_abstract_method(
+        &mut self,
+        name: &str,
+        signature: &[u8],
+        flags: u16,
+        parameters: &[Box<str>],
+    ) -> Token {
+        self.add_bodyless_method(name, signature, flags, 0, parameters)
     }
 
     /// Adds a runtime-implemented `MethodDef` (RVA 0, no body, `Runtime` impl) -- a
     /// delegate's `.ctor` or `Invoke`, whose body the runtime supplies.
-    pub fn add_runtime_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
-        self.add_bodyless_method(name, signature, flags, 0x0003)
+    pub fn add_runtime_method(
+        &mut self,
+        name: &str,
+        signature: &[u8],
+        flags: u16,
+        parameters: &[Box<str>],
+    ) -> Token {
+        self.add_bodyless_method(name, signature, flags, 0x0003, parameters)
     }
 
     /// A `MethodDef` with no IL body (RVA 0); `impl_flags` is 0 (IL/abstract) or
     /// `0x0003` (`Runtime`).
+    ///
+    /// **`parameters` IS NOT OPTIONAL DETAIL HERE.** A bodyless method minted none of these rows
+    /// until it was added, which cost two things at once: a debugger showed an interface or
+    /// abstract method's arguments as `argN`, and -- because a parameter-targeted attribute needs
+    /// a `Param` row to hang off (II.22.10) -- there was nowhere to record that the last one is a
+    /// `params` array. A method with no body still has parameters.
     fn add_bodyless_method(
         &mut self,
         name: &str,
         signature: &[u8],
         flags: u16,
         impl_flags: u16,
+        parameters: &[Box<str>],
     ) -> Token {
         let name = self.strings.intern(name);
         let signature = self.blobs.intern(signature);
@@ -817,6 +868,7 @@ impl ImageBuilder {
                 Column::Index(table::PARAM, first_param),
             ],
         );
+        self.add_param_rows(parameters);
         self.method_debug.push(MethodDebug {
             sequence_points: Vec::new(),
             local_signature: 0,
@@ -832,8 +884,14 @@ impl ImageBuilder {
     /// MethodImplAttributes set `PreserveSig` (0x0080), the C# `[DllImport]` default: the native
     /// return is used as-is. Without it the CLR treats the return as an HRESULT and shuffles it
     /// (so e.g. an `int` result is lost).
-    pub fn add_pinvoke_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
-        self.add_bodyless_method(name, signature, flags, 0x0080)
+    pub fn add_pinvoke_method(
+        &mut self,
+        name: &str,
+        signature: &[u8],
+        flags: u16,
+        parameters: &[Box<str>],
+    ) -> Token {
+        self.add_bodyless_method(name, signature, flags, 0x0080, parameters)
     }
 
     /// Adds a `ModuleRef` row (II.22.31) naming an unmanaged module (a DLL), returning its token --

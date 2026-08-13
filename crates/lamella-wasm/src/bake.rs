@@ -6,7 +6,7 @@
 
 #![allow(unsafe_code)]
 
-use lamella_load::{load_with_corlib_and_library_unfrozen, load_with_corlib_unfrozen};
+use lamella_load::{load_with_corlib_and_libraries_unfrozen, load_with_corlib_unfrozen};
 use lamella_metadata::Assembly;
 
 use crate::abi::result_buffer;
@@ -31,16 +31,32 @@ fn error_payload(message: &str) -> Vec<u8> {
 /// inputs are staged via [`crate::abi::with_static`] (leaked, then reclaimed once the OWNED image is
 /// produced) -- a repeated in-page bake does not leak.
 fn bake(corlib: &[u8], library: &[u8], app: &[u8], trim: bool) -> Vec<u8> {
+    if library.is_empty() {
+        bake_libs(corlib, &[], app, trim)
+    } else {
+        bake_libs(corlib, &[library], app, trim)
+    }
+}
+
+/// The same bake over ANY number of library assemblies -- the driver-stack shape, where an app using
+/// `System.Device.Gpio` also loads the `Lamella.Hardware` its `GpioController` resolves buses
+/// through. Staged the same way as [`bake`]; see [`crate::abi::with_static_all`].
+fn bake_libs(corlib: &[u8], libraries: &[&[u8]], app: &[u8], trim: bool) -> Vec<u8> {
     crate::abi::with_static(corlib, |corlib| {
-        crate::abi::with_static(library, |library| {
-            crate::abi::with_static(app, |app| bake_inner(corlib, library, app, trim))
+        crate::abi::with_static_all(libraries, |libraries| {
+            crate::abi::with_static(app, |app| bake_inner(corlib, libraries, app, trim))
         })
     })
 }
 
 /// The bake itself, over `'static` assembly bytes (the `code-in-place` load requires it). Every
 /// borrow of the inputs is confined here, so the caller can reclaim them once this returns.
-fn bake_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8], trim: bool) -> Vec<u8> {
+fn bake_inner(
+    corlib: &'static [u8],
+    libraries: &[&'static [u8]],
+    app: &'static [u8],
+    trim: bool,
+) -> Vec<u8> {
     let corlib_asm = match Assembly::read(corlib) {
         Ok(assembly) => assembly,
         Err(error) => return error_payload(&format!("corlib parse: {error:?}")),
@@ -49,20 +65,18 @@ fn bake_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8],
         Ok(assembly) => assembly,
         Err(error) => return error_payload(&format!("app parse: {error:?}")),
     };
-    let library_asm = if library.is_empty() {
-        None
-    } else {
+    let mut library_asms = Vec::with_capacity(libraries.len());
+    for (index, library) in libraries.iter().enumerate() {
         match Assembly::read(library) {
-            Ok(assembly) => Some(assembly),
-            Err(error) => return error_payload(&format!("library parse: {error:?}")),
+            Ok(assembly) => library_asms.push(assembly),
+            Err(error) => return error_payload(&format!("library {index} parse: {error:?}")),
         }
-    };
+    }
 
-    let loaded = match &library_asm {
-        Some(library_asm) => {
-            load_with_corlib_and_library_unfrozen(&corlib_asm, library_asm, &app_asm)
-        }
-        None => load_with_corlib_unfrozen(&corlib_asm, &app_asm),
+    let loaded = if library_asms.is_empty() {
+        load_with_corlib_unfrozen(&corlib_asm, &app_asm)
+    } else {
+        load_with_corlib_and_libraries_unfrozen(&corlib_asm, &library_asms, &app_asm)
     };
     let mut loaded = match loaded {
         Ok(loaded) => loaded,
@@ -138,6 +152,40 @@ pub unsafe extern "C" fn lamella_bake(
     result_buffer(bake(
         read(corlib_ptr, corlib_len),
         read(lib_ptr, lib_len),
+        read(app_ptr, app_len),
+        trim != 0,
+    ))
+}
+
+/// Bakes a program against corlib and ANY NUMBER of library assemblies. See the module doc: `libs`
+/// is `[u32 count]` then `count` x `[u32 len][.dll bytes]`, the packing the compile ABI already uses,
+/// and the returned payload is identical to [`lamella_bake`]'s.
+///
+/// A zero-length (or zero-count) `libs` is allowed and bakes corlib + app.
+///
+/// # Safety
+/// Each pointer/length pair must be a buffer the host filled via a prior `lamella_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_bake_libs(
+    corlib_ptr: *const u8,
+    corlib_len: usize,
+    libs_ptr: *const u8,
+    libs_len: usize,
+    app_ptr: *const u8,
+    app_len: usize,
+    trim: u32,
+) -> *mut u8 {
+    let read = |ptr: *const u8, len: usize| -> &[u8] {
+        if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(ptr, len) }
+        }
+    };
+    let libs = crate::abi::split_refs(read(libs_ptr, libs_len));
+    result_buffer(bake_libs(
+        read(corlib_ptr, corlib_len),
+        &libs,
         read(app_ptr, app_len),
         trim != 0,
     ))

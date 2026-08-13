@@ -2213,6 +2213,9 @@ fn rebase_identities(func: &mut Function, ordinal: u8) -> Result<bool, MonoGap> 
         .chain(func.value_types.iter_mut())
     {
         if let MirType::ValueType { handle, .. } = slot {
+            if crate::stackmaps::is_frame_cell_handle(*handle) {
+                continue;
+            }
             match crate::resolver::argument_world_handle(*handle) {
                 Some(caller) => *handle = caller,
                 None => {

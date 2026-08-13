@@ -92,6 +92,19 @@ impl TableStream {
         }
     }
 
+    /// One cell of an already-added row (1-based `row`), or `None` when the table, row, or
+    /// column is absent. The read half of [`set_cell`](Self::set_cell): it lets a builder
+    /// follow a row-index column it wrote earlier -- e.g. walking a `MethodDef`'s `ParamList`
+    /// run (II.22.26) -- instead of recomputing the index from the order calls happened to
+    /// be made in.
+    #[must_use]
+    pub fn cell(&self, table: u8, row: u32, column: usize) -> Option<&Column> {
+        self.rows
+            .get(&table)?
+            .get((row as usize).wrapping_sub(1))?
+            .get(column)
+    }
+
     /// Records that `table` is emitted in sorted key order, so its bit is set in the
     /// `#~` sorted mask. Some readers reject a sorted-by-spec table (e.g. the PDB's
     /// `LocalScope`) that does not claim it. The caller must actually add the rows

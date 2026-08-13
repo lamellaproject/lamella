@@ -447,7 +447,9 @@ name = "lamella-dap-probe"
 version = "0.0.0"
 dependencies = [
  "lamella-debug-backend",
+ "lamella-probe",
  "lamella-probe-core",
+ "lamella-stlink",
 ]
 
 [[package]]

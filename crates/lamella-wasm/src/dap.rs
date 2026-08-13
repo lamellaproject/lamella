@@ -5,7 +5,7 @@
 use core::cell::RefCell;
 
 use lamella_dap::{Debugger, Message};
-use lamella_load::load;
+use lamella_load::{load, load_with_corlib};
 
 use crate::abi::result_buffer;
 
@@ -16,11 +16,20 @@ thread_local! {
 
 /// Loads a program and starts a debug session, returning a 1-based handle, or 0 on
 /// a load failure.
-fn create(bytes: &[u8], pdb: Option<Vec<u8>>) -> u32 {
+fn create(bytes: &[u8], pdb: Option<Vec<u8>>, corlib: Option<&[u8]>) -> u32 {
     let Ok(assembly) = lamella_metadata::Assembly::read(bytes) else {
         return 0;
     };
-    let Ok(program) = load(&assembly) else {
+    let corlib_assembly = match corlib.map(lamella_metadata::Assembly::read) {
+        None => None,
+        Some(Ok(corlib)) => Some(corlib),
+        Some(Err(_)) => return 0,
+    };
+    let loaded = match corlib_assembly.as_ref() {
+        Some(corlib) => load_with_corlib(corlib, &assembly),
+        None => load(&assembly),
+    };
+    let Ok(program) = loaded else {
         return 0;
     };
     let debugger = match pdb {
@@ -70,7 +79,7 @@ fn dispose(handle: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lamella_dap_create(ptr: *const u8, len: usize) -> u32 {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    create(bytes, None)
+    create(bytes, None, None)
 }
 
 /// Starts a source-mapped debug session for the assembly at `prog_ptr..prog_ptr + prog_len`
@@ -89,7 +98,37 @@ pub unsafe extern "C" fn lamella_dap_create_with_pdb(
 ) -> u32 {
     let bytes = unsafe { core::slice::from_raw_parts(prog_ptr, prog_len) };
     let pdb_bytes = unsafe { core::slice::from_raw_parts(pdb_ptr, pdb_len) };
-    create(bytes, Some(pdb_bytes.to_vec()))
+    create(bytes, Some(pdb_bytes.to_vec()), None)
+}
+
+/// [`lamella_dap_create_with_pdb`] with a managed corlib loaded alongside the program, so a DEBUG
+/// session resolves exactly what a RUN does. Returns a 1-based handle, or 0 on failure (including a
+/// corlib that does not parse -- the host's mistake, and a session that cannot resolve is worse than none).
+///
+/// **Prefer this whenever the host has a corlib.** Without one the loader reaches only its own intrinsic
+/// bindings, so any corlib method with a MANAGED body traps mid-session while the SAME program runs fine
+/// through `lamella_run_with_corlib`. A program that runs and then fails to debug is the worst place to
+/// discover that difference.
+///
+/// # Safety
+/// All three pointer/length pairs must be buffers the host filled via prior `lamella_alloc` calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_dap_create_with_corlib(
+    prog_ptr: *const u8,
+    prog_len: usize,
+    pdb_ptr: *const u8,
+    pdb_len: usize,
+    corlib_ptr: *const u8,
+    corlib_len: usize,
+) -> u32 {
+    let bytes = unsafe { core::slice::from_raw_parts(prog_ptr, prog_len) };
+    let pdb = if pdb_len == 0 {
+        None
+    } else {
+        Some(unsafe { core::slice::from_raw_parts(pdb_ptr, pdb_len) }.to_vec())
+    };
+    let corlib = unsafe { core::slice::from_raw_parts(corlib_ptr, corlib_len) };
+    create(bytes, pdb, Some(corlib))
 }
 
 /// Dispatches a DAP request (JSON at `ptr..ptr + len`) to session `handle`,
@@ -158,7 +197,7 @@ mod tests {
             eprintln!("hello.dll absent; skipping");
             return;
         };
-        let handle = create(&bytes, None);
+        let handle = create(&bytes, None, None);
         assert_ne!(handle, 0);
 
         let init = reply_text(
@@ -187,7 +226,7 @@ mod tests {
             eprintln!("hello.dll absent; skipping");
             return;
         };
-        let handle = create(&bytes, Some(Vec::new()));
+        let handle = create(&bytes, Some(Vec::new()), None);
         assert_ne!(handle, 0);
         reply_text(
             handle,

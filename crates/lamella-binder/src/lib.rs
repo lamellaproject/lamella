@@ -33,7 +33,8 @@ pub use bound::{
 };
 pub use conversion::has_implicit_conversion;
 pub use declaration::{
-    collect_into, collect_model, collect_types, constraints_by_parameter, resolve_constants,
+    collect_into, collect_model, collect_types, constraints_by_parameter, declared_full_name,
+    resolve_constants,
 };
 pub use diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment, switch_section_reachability};

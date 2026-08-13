@@ -84,6 +84,19 @@ sources_of() {
         while IFS= read -r f; do printf '%s/%s\n' "$dir" "$f"; done)
 }
 
+# The language version follows the capability surface -- the same rule, condition and rung as
+# build-managed.ps1, which compiles these same sources and states the reasoning in full.
+# `corlib/System/Collections/Generic/*.cs` is guarded by LAMELLA_SURFACE_NETFX_2_0, so that symbol is
+# what brings generic sources into the compile, and at C# 1.0 they are refused with CS8022 rather
+# than passing by unused.
+#
+# Matched with the separators around it, so a symbol that merely ends in one of these names cannot
+# match.
+case ";$define;" in
+    *";LAMELLA_SURFACE_NETFX_2_0;"*|*";LAMELLA_SURFACE_GENERICS;"*) langversion="--langversion=2" ;;
+    *) langversion="--langversion=1" ;;
+esac
+
 # --- corlib ------------------------------------------------------------------------------------
 corlib_dll="$out/corlib.dll"
 mapfile -t corlib_src < <(sources_of "$root/corlib" "")
@@ -96,7 +109,7 @@ echo "corlib (${#corlib_src[@]} sources) -> $corlib_dll"
 # --unsafe: the corlib carries unsafe source (String's char* constructors and its pinnable
 # reference). None of the libs/ assemblies do, so the flag stays on the one compilation that needs
 # it rather than becoming a blanket -- the point of an opt-in is that it is scoped.
-"$lcsc" "${corlib_src[@]}" "--define=$define" --unsafe "--out=$corlib_dll" --no-debug
+"$lcsc" "${corlib_src[@]}" "$langversion" "--define=$define" --unsafe "--out=$corlib_dll" --no-debug
 
 # --- libs --------------------------------------------------------------------------------------
 for entry in "${assemblies[@]}"; do
@@ -110,7 +123,7 @@ for entry in "${assemblies[@]}"; do
         for d in "${dep_list[@]}"; do refs+=("--reference=$out/$d.dll"); done
     fi
     echo "$name (${#src[@]} sources) -> $out/$name.dll"
-    "$lcsc" "${src[@]}" "--define=$define" "${refs[@]}" "--out=$out/$name.dll" --no-debug
+    "$lcsc" "${src[@]}" "$langversion" "--define=$define" "${refs[@]}" "--out=$out/$name.dll" --no-debug
 done
 
 echo

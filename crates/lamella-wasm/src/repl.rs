@@ -8,7 +8,7 @@ use lamella_metadata::Assembly;
 use lamella_wire_host::engine::{CompileFailure, LoopbackLink, Outcome, Repl, ReplCompiler};
 
 use crate::abi::result_buffer;
-use crate::compile::split_refs;
+use crate::abi::split_refs;
 
 thread_local! {
     /// The one live REPL session (the transcript lives here, across `eval` calls). wasm is
@@ -32,8 +32,18 @@ impl ReplCompiler for WasmCompiler {
     fn compile(&self, source: &str) -> Result<Vec<u8>, CompileFailure> {
         let references: Vec<Assembly> =
             self.references.iter().filter_map(|bytes| Assembly::read(bytes).ok()).collect();
-        let compiled =
-            lamella_assemble::compile_source(source, "Repl.cs", "__Repl", "__Repl", &references, false);
+        let compiled = lamella_assemble::compile_source_with(
+            source,
+            "Repl.cs",
+            "__Repl",
+            "__Repl",
+            &references,
+            false,
+            lamella_syntax::lexer::LexOptions {
+                version: lamella_syntax::version::LanguageVersion::SELECTABLE_MAX,
+                ..lamella_syntax::lexer::LexOptions::default()
+            },
+        );
         if let Some(image) = compiled.image {
             return Ok(image);
         }

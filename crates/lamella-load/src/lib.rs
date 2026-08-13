@@ -1417,12 +1417,28 @@ pub fn load_program_lazy_corlib<'c, 'p>(
     };
     #[cfg(not(feature = "generics"))]
     let generic_definitions: Vec<String> = Vec::new();
+    #[cfg(feature = "generics")]
+    let boxed_type_arguments: Vec<String> = {
+        let mut names: Vec<String> = instantiations
+            .iter()
+            .flat_map(|want| want.arguments.iter())
+            .map(monomorphize::primitive_display_name)
+            .filter(|name| !name.is_empty())
+            .map(|name| String::from(name))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
+    #[cfg(not(feature = "generics"))]
+    let boxed_type_arguments: Vec<String> = Vec::new();
     materialize_corlib_refs(
         &mut module,
         &mut resolution,
         program,
         corlib,
         &generic_definitions,
+        &boxed_type_arguments,
     );
     let program_type_offset = module.type_count();
     let entry = load_assembly(
@@ -1484,7 +1500,7 @@ pub fn load_delta_with_corlib<'d, 'c>(
     delta: &Assembly<'d>,
     corlib: &SourceAssembly<'c>,
 ) -> Result<DeltaInfo, DeltaError> {
-    materialize_corlib_refs(module, &mut context.resolution, delta, corlib, &[]);
+    materialize_corlib_refs(module, &mut context.resolution, delta, corlib, &[], &[]);
     let delta_asm = context.next_delta_asm;
     let info = load_delta(module, context, delta)?;
     if let Some(name) = first_unresolved_call(module, delta, delta_asm, corlib) {
@@ -1590,6 +1606,7 @@ fn materialize_corlib_refs<'c>(
     assembly: &Assembly,
     corlib: &SourceAssembly<'c>,
     generic_definitions: &[String],
+    boxed_type_arguments: &[String],
 ) {
     let mut seen: BTreeSet<Token> = BTreeSet::new();
     let mut type_tokens: Vec<Token> = Vec::new();
@@ -1665,6 +1682,12 @@ fn materialize_corlib_refs<'c>(
                 name,
                 &mut walk,
             );
+        }
+    }
+    for name in boxed_type_arguments {
+        let name = TypeName { namespace: "System", name };
+        if corlib_defines_type(corlib, name) {
+            materialize_corlib_type(module, resolution, corlib, name, &mut walk);
         }
     }
     for definition in generic_definitions {
@@ -3463,11 +3486,23 @@ fn bind_bcl_calls(
         }
 
         let function = if parent.table() == TYPE_SPEC {
-            if matches!(
-                assembly.type_spec_signature(parent),
-                Some(lamella_metadata::SigType::GenericInst { .. })
-            ) {
-                module.mark_unlowered_generic(asm, *token);
+            let spec = assembly.type_spec_signature(parent);
+            if matches!(spec, Some(lamella_metadata::SigType::GenericInst { .. })) {
+                if spec.as_ref().is_some_and(monomorphize::mentions_parameter) {
+                    bind_own_generic_member(
+                        assembly,
+                        module,
+                        asm,
+                        index,
+                        spec.as_ref(),
+                        method_name,
+                        params,
+                        signature.as_ref().map(|sig| &sig.return_type),
+                        *token,
+                    );
+                } else {
+                    module.mark_unlowered_generic(asm, *token);
+                }
                 continue;
             }
             match method_name {
@@ -3533,6 +3568,52 @@ fn bind_bcl_calls(
             }
         };
         module.bind_token(asm, *token, id);
+    }
+}
+
+/// Binds a `MemberRef` reached through the declaring type's OWN OPEN instantiation -- `List<!0>`
+/// named from inside `List<T>` -- to that definition's own member.
+///
+/// # Why this is a lookup through the SAME index the `TypeRef` arm uses
+///
+/// The member being named is an ordinary `MethodDef` of an ordinary `TypeDef`, already loaded and
+/// already in `index` -- method loading inserts every method under `name_key` before this pass runs.
+/// The only thing the `TypeSpec` spelling changes is where the DECLARING TYPE's name comes from: the
+/// `GenericInst`'s definition rather than the parent token itself. Everything after that is the
+/// existing rule, so it is called rather than restated.
+///
+/// # What it deliberately does NOT do
+///
+/// It binds only what it can name. A definition token that is not a `TypeDef`/`TypeRef` this
+/// assembly can spell, or a member the index does not hold, leaves the token UNBOUND -- and an
+/// unbound call token is refused by the bake as an `UnresolvedCall`. That is the safe direction:
+/// the failure of a missed bind here is loud, exactly as [`monomorphize`]'s synthetic tokens are.
+fn bind_own_generic_member(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    index: &NameIndex,
+    spec: Option<&lamella_metadata::SigType>,
+    method_name: &str,
+    params: &[SigType],
+    return_type: Option<&SigType>,
+    token: Token,
+) {
+    let Some(lamella_metadata::SigType::GenericInst { definition, .. }) = spec else {
+        return;
+    };
+    let definition_token = match definition.as_ref() {
+        lamella_metadata::SigType::Class(token) | lamella_metadata::SigType::ValueType(token) => {
+            *token
+        }
+        _ => return,
+    };
+    let Some((namespace, type_name)) = assembly.type_token_full_name(definition_token) else {
+        return;
+    };
+    let key = name_key(assembly, &namespace, &type_name, method_name, params, return_type);
+    if let Some(&target) = index.get(&key) {
+        module.bind_token(asm, token, target);
     }
 }
 

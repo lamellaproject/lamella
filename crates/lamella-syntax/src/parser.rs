@@ -1720,7 +1720,9 @@ impl Parser {
             return self.parse_indexer(modifiers, ty, start);
         }
         if matches!(self.current().kind, TokenKind::Identifier(_))
-            && (self.next_is(Punctuator::OpenParen) || self.next_is(Punctuator::LessThan))
+            && (self.next_is(Punctuator::OpenParen)
+                || (self.next_is(Punctuator::LessThan)
+                    && !self.explicit_interface_qualifier_ahead()))
         {
             let (name, _) = self.expect_identifier();
             let type_parameters = self.parse_type_parameter_list();
@@ -1748,51 +1750,79 @@ impl Parser {
                 span: Span::new(start, end),
             };
         }
-        if matches!(self.current().kind, TokenKind::Identifier(_)) && self.next_is(Punctuator::Dot) {
+        if self.explicit_interface_qualifier_ahead() {
+            let restore_position = self.position;
+            let restore_diagnostics = self.diagnostics.len();
             let name_start = self.current().span.start;
             let (first, mut prev_end) = self.expect_identifier();
             let mut parts = Vec::new();
             parts.push(first);
+            let mut arguments: Vec<TypeRef> = Vec::new();
+            let mut arguments_on: Option<usize> = None;
             let mut interface_end = prev_end;
+            if self.current_punctuator() == Some(Punctuator::LessThan)
+                && self.generic_type_name_ahead()
+            {
+                let (list, list_end, _) = self.parse_type_argument_list(false);
+                arguments = list;
+                arguments_on = Some(parts.len() - 1);
+                prev_end = list_end;
+            }
             while self.current_punctuator() == Some(Punctuator::Dot) {
                 self.bump();
                 interface_end = prev_end;
                 let (part, part_end) = self.expect_identifier();
                 parts.push(part);
                 prev_end = part_end;
+                if self.current_punctuator() == Some(Punctuator::LessThan)
+                    && self.generic_type_name_ahead()
+                {
+                    let (list, list_end, _) = self.parse_type_argument_list(false);
+                    arguments = list;
+                    arguments_on = Some(parts.len() - 1);
+                    prev_end = list_end;
+                }
             }
             let member = parts.pop().expect("a qualified member name has >= 2 parts");
-            let explicit_interface = TypeRef::new(
-                TypeRefKind::Name(parts),
-                Span::new(name_start, interface_end),
-            );
-            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
-                return self.parse_property(modifiers, ty, member, Some(explicit_interface), start);
+            if arguments.is_empty() || arguments_on == Some(parts.len().saturating_sub(1)) {
+                let interface_kind = if arguments.is_empty() {
+                    TypeRefKind::Name(parts)
+                } else {
+                    TypeRefKind::Generic { parts, arguments }
+                };
+                let explicit_interface =
+                    TypeRef::new(interface_kind, Span::new(name_start, interface_end));
+                if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                    return self
+                        .parse_property(modifiers, ty, member, Some(explicit_interface), start);
+                }
+                let type_parameters = self.parse_type_parameter_list();
+                let (parameters, arglist) = self.parse_parameter_list();
+                let constraints = self.parse_type_parameter_constraint_clauses();
+                let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                    let block = self.parse_block();
+                    let end = block.span.end;
+                    (Some(block), end)
+                } else {
+                    let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+                    (None, end)
+                };
+                return Member::Method {
+                    modifiers,
+                    return_type: ty,
+                    name: member,
+                    type_parameters,
+                    constraints,
+                    parameters,
+                    is_vararg: arglist.is_some(),
+                    body,
+                    explicit_interface: Some(explicit_interface),
+                    attributes: Vec::new(),
+                    span: Span::new(start, end),
+                };
             }
-            let type_parameters = self.parse_type_parameter_list();
-            let (parameters, arglist) = self.parse_parameter_list();
-            let constraints = self.parse_type_parameter_constraint_clauses();
-            let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
-                let block = self.parse_block();
-                let end = block.span.end;
-                (Some(block), end)
-            } else {
-                let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
-                (None, end)
-            };
-            return Member::Method {
-                modifiers,
-                return_type: ty,
-                name: member,
-                type_parameters,
-                constraints,
-                parameters,
-                is_vararg: arglist.is_some(),
-                body,
-                explicit_interface: Some(explicit_interface),
-                attributes: Vec::new(),
-                span: Span::new(start, end),
-            };
+            self.position = restore_position;
+            self.diagnostics.truncate(restore_diagnostics);
         }
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::OpenBrace)
@@ -3495,6 +3525,33 @@ impl Parser {
     /// commit to different nodes, and a shared one would have to hand back which follower matched.
     fn generic_type_name_ahead(&mut self) -> bool {
         self.type_argument_list_ahead(Punctuator::Dot)
+    }
+
+    /// Whether a member declaration's name begins an EXPLICIT INTERFACE IMPLEMENTATION's qualifier
+    /// (20.4.1) -- `IFace.Member`, or the constructed form `IEnumerable<int>.GetEnumerator`.
+    ///
+    /// The bare case is one token of lookahead. The constructed case cannot be, because a `<` after
+    /// an identifier is ambiguous with a comparison and only the follower resolves it; so it defers
+    /// to [`Parser::generic_type_name_ahead`], which speculates a type-argument list closing on a
+    /// `.` -- exactly this shape. That predicate is FALSE for `void I.M<T>()`, whose list closes on
+    /// a `(`, so the generic-METHOD path this one sits above cannot be captured by it.
+    fn explicit_interface_qualifier_ahead(&mut self) -> bool {
+        if !matches!(self.current().kind, TokenKind::Identifier(_)) {
+            return false;
+        }
+        if self.next_is(Punctuator::Dot) {
+            return true;
+        }
+        if !self.next_is(Punctuator::LessThan) {
+            return false;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        self.bump();
+        let committed = self.generic_type_name_ahead();
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        committed
     }
 
     fn generic_call_ahead(&mut self) -> bool {

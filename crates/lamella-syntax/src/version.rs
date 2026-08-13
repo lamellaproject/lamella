@@ -78,6 +78,27 @@ impl LanguageVersion {
     /// rather than by pretending the dialect forbids it.
     pub const SELECTABLE_MAX: LanguageVersion = LanguageVersion::CSharp11;
 
+    /// Every selectable dialect, in release order, so a check across "all the rungs" is DERIVED
+    /// rather than transcribed. Kept complete by the same two compiler-enforced halves as
+    /// [`Feature::ALL`]: an exhaustive `match` that stops compiling when a variant is added, and a
+    /// length assertion that fails until the variant is listed here too.
+    pub const ALL_SELECTABLE: [LanguageVersion; 14] = [
+        LanguageVersion::CSharp1,
+        LanguageVersion::CSharp2,
+        LanguageVersion::CSharp3,
+        LanguageVersion::CSharp4,
+        LanguageVersion::CSharp5,
+        LanguageVersion::CSharp6,
+        LanguageVersion::CSharp7,
+        LanguageVersion::CSharp7_1,
+        LanguageVersion::CSharp7_2,
+        LanguageVersion::CSharp7_3,
+        LanguageVersion::CSharp8,
+        LanguageVersion::CSharp9,
+        LanguageVersion::CSharp10,
+        LanguageVersion::CSharp11,
+    ];
+
     /// Returns `true` when `feature` is available in this language version.
     #[must_use]
     pub fn supports(self, feature: Feature) -> bool {
@@ -469,6 +490,14 @@ pub enum Feature {
     /// `IEquatable<T>`, so it cannot land before the thing it generates against. 44 uses in
     /// dotnet/iot, 11 in nanoFramework.
     Records,
+    /// A default (bodied) member on an interface -- C# 8.0. Gated in the BINDER rather than the
+    /// parser: the syntax is an ordinary member with a body and only the enclosing type's kind
+    /// makes it a feature.
+    DefaultInterfaceImplementation,
+    /// An explicit parameterless constructor on a struct -- C# 10.0. Also binder-gated, and for
+    /// the same reason: the declaration is well-formed and the enclosing type's kind is what
+    /// makes it late.
+    ParameterlessStructConstructor,
 }
 
 impl Feature {
@@ -513,9 +542,56 @@ impl Feature {
             | Feature::TopLevelStatements
             | Feature::LeadingDigitSeparator
             | Feature::RequiredMembers
-            | Feature::Records => false,
+            | Feature::Records
+            | Feature::DefaultInterfaceImplementation
+            | Feature::ParameterlessStructConstructor => false,
         }
     }
+
+    /// Every feature this compiler gates on, so a check over "all of them" is DERIVED rather than
+    /// transcribed.
+    ///
+    ///
+    /// **A HAND-WRITTEN LIST OF FEATURES IS A LIST OF THE FEATURES SOMEBODY REMEMBERED.** The
+    /// rung tests below used to name their own table, and it had drifted to seventeen of
+    /// twenty-seven -- ten features, including `Records`, `RequiredMembers` and
+    /// `TopLevelStatements`, were asserted about by nothing at all. A gate whose population is
+    /// typed out by hand tests the day it was written.
+    ///
+    /// Two things keep this honest and they are both compiler-enforced, not remembered: the
+    /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
+    /// and the length assertion beside it fails until the variant is added HERE too.
+    pub const ALL: [Feature; 29] = [
+        Feature::Generics,
+        Feature::StaticClasses,
+        Feature::AnonymousMethods,
+        Feature::NullableValueTypes,
+        Feature::DefaultOperator,
+        Feature::NullCoalescing,
+        Feature::NamespaceAlias,
+        Feature::AccessorAccessibility,
+        Feature::LambdaExpression,
+        Feature::ExpressionBodiedMethod,
+        Feature::ExpressionBodiedProperty,
+        Feature::ObjectInitializer,
+        Feature::CollectionInitializer,
+        Feature::AnonymousObjectCreation,
+        Feature::DefaultParameterValues,
+        Feature::NamedArguments,
+        Feature::NullConditional,
+        Feature::UsingStatic,
+        Feature::AutoProperties,
+        Feature::SwitchOnBool,
+        Feature::BinaryLiterals,
+        Feature::DigitSeparators,
+        Feature::TopLevelStatements,
+        Feature::FileScopedNamespaces,
+        Feature::RequiredMembers,
+        Feature::LeadingDigitSeparator,
+        Feature::Records,
+        Feature::DefaultInterfaceImplementation,
+        Feature::ParameterlessStructConstructor,
+    ];
 
     /// The first language version in which this feature is available.
     #[must_use]
@@ -545,6 +621,8 @@ impl Feature {
             Feature::TopLevelStatements | Feature::Records => LanguageVersion::CSharp9,
             Feature::FileScopedNamespaces => LanguageVersion::CSharp10,
             Feature::RequiredMembers => LanguageVersion::CSharp11,
+            Feature::DefaultInterfaceImplementation => LanguageVersion::CSharp8,
+            Feature::ParameterlessStructConstructor => LanguageVersion::CSharp10,
         }
     }
 
@@ -603,6 +681,8 @@ impl Feature {
             Feature::FileScopedNamespaces => "file-scoped namespace",
             Feature::RequiredMembers => "required members",
             Feature::Records => "records",
+            Feature::DefaultInterfaceImplementation => "default interface implementation",
+            Feature::ParameterlessStructConstructor => "parameterless struct constructors",
         }
     }
 }
@@ -697,6 +777,112 @@ mod tests {
     }
 
     #[test]
+    fn every_selectable_version_is_in_all_selectable() {
+        for version in LanguageVersion::ALL_SELECTABLE {
+            match version {
+                LanguageVersion::CSharp1
+                | LanguageVersion::CSharp2
+                | LanguageVersion::CSharp3
+                | LanguageVersion::CSharp4
+                | LanguageVersion::CSharp5
+                | LanguageVersion::CSharp6
+                | LanguageVersion::CSharp7
+                | LanguageVersion::CSharp7_1
+                | LanguageVersion::CSharp7_2
+                | LanguageVersion::CSharp7_3
+                | LanguageVersion::CSharp8
+                | LanguageVersion::CSharp9
+                | LanguageVersion::CSharp10
+                | LanguageVersion::CSharp11 => {}
+            }
+            assert!(
+                version.is_selectable(),
+                "{version:?} is listed in ALL_SELECTABLE but is not selectable"
+            );
+        }
+        assert_eq!(
+            LanguageVersion::ALL_SELECTABLE.len(),
+            14,
+            "a LanguageVersion variant was added without being added to ALL_SELECTABLE"
+        );
+        assert_eq!(
+            *LanguageVersion::ALL_SELECTABLE.last().expect("non-empty"),
+            LanguageVersion::SELECTABLE_MAX,
+            "ALL_SELECTABLE must end at the ceiling"
+        );
+    }
+
+    #[test]
+    fn every_feature_is_in_all() {
+        for feature in Feature::ALL {
+            match feature {
+                Feature::Generics
+                | Feature::StaticClasses
+                | Feature::AnonymousMethods
+                | Feature::NullableValueTypes
+                | Feature::DefaultOperator
+                | Feature::NullCoalescing
+                | Feature::NamespaceAlias
+                | Feature::AccessorAccessibility
+                | Feature::LambdaExpression
+                | Feature::ExpressionBodiedMethod
+                | Feature::ExpressionBodiedProperty
+                | Feature::ObjectInitializer
+                | Feature::CollectionInitializer
+                | Feature::AnonymousObjectCreation
+                | Feature::DefaultParameterValues
+                | Feature::NamedArguments
+                | Feature::NullConditional
+                | Feature::UsingStatic
+                | Feature::AutoProperties
+                | Feature::SwitchOnBool
+                | Feature::BinaryLiterals
+                | Feature::DigitSeparators
+                | Feature::TopLevelStatements
+                | Feature::FileScopedNamespaces
+                | Feature::RequiredMembers
+                | Feature::LeadingDigitSeparator
+                | Feature::Records
+                | Feature::DefaultInterfaceImplementation
+                | Feature::ParameterlessStructConstructor => {}
+            }
+        }
+        assert_eq!(
+            Feature::ALL.len(),
+            29,
+            "a Feature variant was added without being added to Feature::ALL"
+        );
+    }
+
+    #[test]
+    fn supports_is_exactly_at_or_after_the_introducing_version() {
+        for feature in Feature::ALL {
+            let introduced = feature.introduced_in();
+            for version in LanguageVersion::ALL_SELECTABLE {
+                assert_eq!(
+                    version.supports(feature),
+                    version >= introduced,
+                    "{feature:?} (introduced in {introduced:?}) is mis-gated at {version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_rung_admits_no_post_1_0_feature() {
+        for feature in Feature::ALL {
+            if feature.introduced_in() == LanguageVersion::CSharp1 {
+                continue;
+            }
+            let admitted = LanguageVersion::DEFAULT.supports(feature) && feature.is_implemented();
+            assert!(
+                !admitted,
+                "{feature:?} would be admitted under the default dialect; it is post-1.0 and the                  default is ISO-1"
+            );
+        }
+    }
+
+    #[test]
     fn the_feature_gate_code_names_the_version_being_compiled() {
         assert_eq!(LanguageVersion::CSharp1.feature_gate_code(), 8022);
         assert_eq!(LanguageVersion::CSharp2.feature_gate_code(), 8023);
@@ -763,6 +949,8 @@ mod tests {
         Feature::FileScopedNamespaces,
         Feature::RequiredMembers,
         Feature::Records,
+        Feature::DefaultInterfaceImplementation,
+        Feature::ParameterlessStructConstructor,
     ];
 
     #[test]

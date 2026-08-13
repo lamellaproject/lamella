@@ -26,6 +26,14 @@ all = "warn"
 
 # The device-image profile the size gate links with: smallest-code settings, panics abort
 # (the bare-metal shim provides the handler; no unwinder ships).
+#
+# SYMBOLS ARE KEPT ON PURPOSE. A device that stops responding is diagnosed by matching program
+# counters recovered over the debug port to function names, and that cannot be done after the fact:
+# flipping this setting CHANGES THE EMITTED IMAGE, so a rebuild with symbols is a different build
+# from the one on the chip. The symbol table has to be in the artifact that was flashed. Measured
+# cost of keeping it: 32 bytes on a 315 KB image, 0.01%. The names themselves do not reach the
+# device -- a symbol table is not a loadable section, so nothing here enlarges what is programmed
+# into flash.
 [profile.flash]
 inherits = "release"
 opt-level = "z"

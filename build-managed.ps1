@@ -97,6 +97,21 @@ $out = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 $defineArg = @("/define:$($Define -join ';')")
 
+# The language version follows the capability surface, and it is stated here rather than left to a
+# default. `corlib/System/Collections/Generic/*.cs` is guarded by LAMELLA_SURFACE_NETFX_2_0, so that
+# symbol is what brings generic sources into the compile -- and at C# 1.0 they are refused with
+# CS8022 rather than passing by unused. LAMELLA_SURFACE_GENERICS selects the same rung, for a caller
+# who names it directly.
+#
+# The C# 1.0 branch is written out rather than left implicit. A surface with no generic sources in it
+# is compiled as C# 1.0 and refuses a 2.0 construct anywhere in these sources, which is what keeps a
+# 1.0 build honest; passing no version at all would instead inherit whatever the compiler's own
+# default is, and that default is the newest language version it supports.
+$langArg = @('/langversion:1')
+if ($Define -contains 'LAMELLA_SURFACE_NETFX_2_0' -or $Define -contains 'LAMELLA_SURFACE_GENERICS') {
+    $langArg = @('/langversion:2')
+}
+
 # Sorted, so the emitted metadata does not depend on the filesystem's enumeration order.
 #
 # EVERY CALLER MUST WRAP THIS IN @(). PowerShell unrolls a function's output onto the pipeline, so a
@@ -126,7 +141,7 @@ Write-Host "corlib ($($corlibSrc.Count) sources) -> $corlibDll"
 # /unsafe: the corlib carries unsafe source (String's char* constructors and its pinnable
 # reference). None of the libs/ assemblies do, so the flag stays on the one compilation that
 # needs it rather than becoming a blanket -- the point of an opt-in is that it is scoped.
-& $Lcsc @corlibSrc @defineArg /unsafe "/out:$corlibDll" /debug-
+& $Lcsc @corlibSrc @langArg @defineArg /unsafe "/out:$corlibDll" /debug-
 if ($LASTEXITCODE -ne 0) { throw "corlib compile failed ($LASTEXITCODE)" }
 
 # --- libs --------------------------------------------------------------------------------------
@@ -138,7 +153,7 @@ foreach ($assembly in $Assemblies) {
     $refs = @("/reference:$corlibDll")
     foreach ($r in $assembly.references) { $refs += "/reference:$(Join-Path $out "$r.dll")" }
     Write-Host "$name ($($src.Count) sources) -> $dll"
-    & $Lcsc @src @defineArg @refs /target:library "/out:$dll" /debug-
+    & $Lcsc @src @langArg @defineArg @refs /target:library "/out:$dll" /debug-
     if ($LASTEXITCODE -ne 0) { throw "$name compile failed ($LASTEXITCODE)" }
 }
 

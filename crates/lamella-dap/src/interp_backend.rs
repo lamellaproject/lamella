@@ -84,8 +84,9 @@ impl InterpreterBackend {
         let mut method_rid = BTreeMap::new();
         let mut seq_boundaries = BTreeMap::new();
         if let Ok(pdb) = PortablePdb::read(&pdb_bytes) {
+            let program_asm = module.method_asm(entry);
             for rid in 1..=pdb.method_count() {
-                if let Some(id) = module.resolve(0, Token::new(METHOD_DEF, rid)) {
+                if let Some(id) = module.resolve(program_asm, Token::new(METHOD_DEF, rid)) {
                     method_rid.insert(id, rid);
                     let offsets: BTreeSet<u32> = pdb
                         .sequence_points(rid)
@@ -291,7 +292,9 @@ impl DebugBackend for InterpreterBackend {
                 .find(|candidate| basename(candidate) == target)?;
             pdb.resolve_breakpoint(&document, line)
         })?;
-        let method = self.module.resolve(0, Token::new(METHOD_DEF, method_rid))?;
+        let method = self
+            .module
+            .resolve(self.module.method_asm(self.entry), Token::new(METHOD_DEF, method_rid))?;
         let index = self.il_offset_to_index(method, il_offset)?;
         Some(encode_address(method, index))
     }

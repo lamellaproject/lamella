@@ -207,6 +207,7 @@ fn type_info(
             .get(&method.rid())
             .map_or(&[], Vec::as_slice);
         let symbol = MethodSymbol {
+            explicit_interface: None,
             name: method_name.into(),
             return_type: sigtype_to_symbol(
                 assembly,

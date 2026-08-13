@@ -368,6 +368,31 @@ pub enum PredefinedType {
     Void,
 }
 
+impl PredefinedType {
+    /// The C# keyword this type is written with, `int` for [`PredefinedType::Int`].
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            PredefinedType::Bool => "bool",
+            PredefinedType::Byte => "byte",
+            PredefinedType::Sbyte => "sbyte",
+            PredefinedType::Short => "short",
+            PredefinedType::Ushort => "ushort",
+            PredefinedType::Int => "int",
+            PredefinedType::Uint => "uint",
+            PredefinedType::Long => "long",
+            PredefinedType::Ulong => "ulong",
+            PredefinedType::Char => "char",
+            PredefinedType::Float => "float",
+            PredefinedType::Double => "double",
+            PredefinedType::Decimal => "decimal",
+            PredefinedType::String => "string",
+            PredefinedType::Object => "object",
+            PredefinedType::Void => "void",
+        }
+    }
+}
+
 /// A statement: a [`StmtKind`] and the source [`Span`] it covers (clause 15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stmt {
@@ -1138,17 +1163,101 @@ impl Member {
 /// registering it under this mangled name keeps ordinary simple-name lookup of the
 /// member from finding it (so it is reachable only through the interface). `member`
 /// is the bare member name; `interface_ref` is the qualifying interface type.
+///
+/// A CONSTRUCTED interface carries its type arguments, `IBox<int>.M`, and carrying them is
+/// what keeps the two members of `class C : IBox<int>, IBox<string>` apart -- both are legal
+/// on one class, and the ARITY they share cannot separate them.
+///
+/// The interface is spelled as it was WRITTEN, so two source spellings of one type key
+/// differently. Only a declaration and the check that credits it are compared, and both reach
+/// this function from the same syntax, so they agree by construction.
 #[must_use]
 pub fn explicit_interface_member_name(interface_ref: &TypeRef, member: &str) -> String {
     let mut name = String::new();
-    if let TypeRefKind::Name(parts) = &interface_ref.kind {
-        for part in parts {
-            name.push_str(part);
-            name.push('.');
+    match &interface_ref.kind {
+        TypeRefKind::Name(parts) => {
+            for part in parts {
+                name.push_str(part);
+                name.push('.');
+            }
         }
+        TypeRefKind::Generic { parts, arguments } => {
+            for part in parts {
+                name.push_str(part);
+                name.push('.');
+            }
+            name.pop();
+            name.push('<');
+            for (index, argument) in arguments.iter().enumerate() {
+                if index > 0 {
+                    name.push(',');
+                }
+                write_type_ref(&mut name, argument);
+            }
+            name.push_str(">.");
+        }
+        _ => {}
     }
     name.push_str(member);
     name
+}
+
+/// Appends a type reference's source spelling to `text`, for the mangled names in
+/// [`explicit_interface_member_name`].
+fn write_type_ref(text: &mut String, ty: &TypeRef) {
+    match &ty.kind {
+        TypeRefKind::Predefined(predefined) => text.push_str(predefined.keyword()),
+        TypeRefKind::Name(parts) => {
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    text.push('.');
+                }
+                text.push_str(part);
+            }
+        }
+        TypeRefKind::Generic { parts, arguments } => {
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    text.push('.');
+                }
+                text.push_str(part);
+            }
+            text.push('<');
+            for (index, argument) in arguments.iter().enumerate() {
+                if index > 0 {
+                    text.push(',');
+                }
+                write_type_ref(text, argument);
+            }
+            text.push('>');
+        }
+        TypeRefKind::Array { element, rank } => {
+            write_type_ref(text, element);
+            text.push('[');
+            for _ in 1..*rank {
+                text.push(',');
+            }
+            text.push(']');
+        }
+        TypeRefKind::Pointer(element) => {
+            write_type_ref(text, element);
+            text.push('*');
+        }
+        TypeRefKind::Unbound { parts, arity } => {
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    text.push('.');
+                }
+                text.push_str(part);
+            }
+            text.push('<');
+            for _ in 1..*arity {
+                text.push(',');
+            }
+            text.push('>');
+        }
+        TypeRefKind::Error => text.push('?'),
+    }
 }
 
 /// Whether a conversion operator is implicit or explicit (17.9.3).

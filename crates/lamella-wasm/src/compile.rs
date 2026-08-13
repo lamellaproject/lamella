@@ -27,34 +27,7 @@ fn line_col(source: &str, offset: usize) -> (u32, u32) {
     (line, column)
 }
 
-/// Splits the references buffer (`[u32 count]` then `count` x `[u32 len][bytes]`) into
-/// the individual assembly byte slices; stops at the first malformed length. Shared with
-/// the REPL ABI, which packs its compile references the same way.
-pub(crate) fn split_refs(refs: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let Some(count) = refs
-        .get(0..4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-    else {
-        return out;
-    };
-    let mut offset = 4usize;
-    for _ in 0..count {
-        let Some(len) = refs
-            .get(offset..offset + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
-        else {
-            break;
-        };
-        offset += 4;
-        let Some(blob) = refs.get(offset..offset + len) else {
-            break;
-        };
-        out.push(blob);
-        offset += len;
-    }
-    out
-}
+use crate::abi::split_refs;
 
 /// Compiles `source` against `refs` in the DEBUG configuration (the default) -- see [`compile_with`].
 fn compile(source: &[u8], refs: &[u8]) -> Vec<u8> {
@@ -81,7 +54,10 @@ fn compile_with(source: &[u8], refs: &[u8], debug: bool) -> Vec<u8> {
         "Program",
         &assemblies,
         debug,
-        lamella_syntax::lexer::LexOptions::default(),
+        lamella_syntax::lexer::LexOptions {
+            version: lamella_syntax::version::LanguageVersion::SELECTABLE_MAX,
+            ..lamella_syntax::lexer::LexOptions::default()
+        },
     );
 
     let diagnostics: Vec<serde_json::Value> = result
@@ -351,6 +327,24 @@ mod tests {
         assert!(image_len > 0, "expected an emitted image");
         assert_eq!(json["diagnostics"].as_array().unwrap().len(), 0);
         assert!(json["emitError"].is_null());
+    }
+
+    #[test]
+    fn the_browser_compiles_generics_rather_than_gating_them() {
+        let payload = compile(
+            b"class Box<T> { public T Held; } class Program { static int Main() { return 0; } }",
+            &0u32.to_le_bytes(),
+        );
+        let (json, image_len) = parse(&payload);
+        let diagnostics = json["diagnostics"].as_array().unwrap();
+        let errors: Vec<_> =
+            diagnostics.iter().filter(|d| d["severity"] == "error").collect();
+        assert!(errors.is_empty(), "the browser rung must not reject generics; got {errors:?}");
+        assert!(
+            !diagnostics.iter().any(|d| d["code"] == 8022),
+            "CS8022 means the browser is compiling at a rung that forbids the feature: {diagnostics:?}"
+        );
+        assert!(image_len > 0, "expected an emitted image for a generic type");
     }
 
     #[test]

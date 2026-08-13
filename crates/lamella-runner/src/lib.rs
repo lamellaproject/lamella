@@ -1975,6 +1975,8 @@ pub fn load_deployed(
 /// copying it, and the type it produces is not generic over a lifetime, so the bytes must outlive
 /// every reference the run can create. One leak per evaluation.
 ///
+/// # On a device this retains one image per request, and only one allocator hides that
+///
 /// **A device that serves repeatedly should bound this** by supplying an [`ImageResidence`] to
 /// [`serve_one_baked_with_residence`], which reuses one buffer instead of retaining every image.
 /// This entry point keeps leaking because a host runner evaluating once has nothing to gain from a

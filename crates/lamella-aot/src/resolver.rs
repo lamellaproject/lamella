@@ -575,11 +575,28 @@ impl<'a> MetadataResolver<'a> {
         let index = self
             .mono
             .index_of(&name, member.name()?, &signature.parameters)?;
+        let (_, _, arguments) = self.instantiated_parent(spec)?;
+        self.monomorphized_call_info(index, signature, &arguments)
+    }
+
+    /// A call bound to a monomorphized body at `index`, typed for the caller: the shared tail of
+    /// [`Self::monomorphized_call`] and [`Self::monomorphized_self_call`].
+    ///
+    /// **EXTRACTED RATHER THAN RESTATED, because the two differ only in HOW they find the
+    /// instantiation and not in what they do with it.** One reads the arguments off a `TypeSpec`
+    /// parent; the other is inside the definition and already holds them. Everything after that --
+    /// the result substitution, the argument count, the target -- is one rule, and a second copy of
+    /// it is how the result type comes to be substituted on one path and not the other.
+    fn monomorphized_call_info(
+        &self,
+        index: u32,
+        signature: &MethodSig,
+        arguments: &[SigType],
+    ) -> Option<CallInfo> {
         let has_result = !matches!(signature.return_type, SigType::Void);
         let result_type = if has_result {
-            let (_, _, arguments) = self.instantiated_parent(spec)?;
             let arguments =
-                caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+                caller_resolved_arguments(arguments, self.argument_world(), &self.references)?;
             let closed = crate::generics::substitute_sig(&signature.return_type, &arguments)?;
             Some(mir_type_across(
                 &closed,
@@ -597,6 +614,57 @@ impl<'a> MetadataResolver<'a> {
             result_type,
             target: CallTarget::Internal(index),
         })
+    }
+
+    /// An IN-BODY SIBLING CALL spelled as a bare `MethodDef` -- `Add` calling `Grow()` from inside
+    /// `List<T>` -- bound to the monomorphized body for the instantiation in force.
+    ///
+    /// **A DEFINITION CALLING ITS OWN MEMBER NEED NOT NAME AN INSTANTIATION, AND THE TWO SPELLINGS
+    /// ARE BOTH LEGAL.** csc, and lcsc since `5fd7f35ea0`, emit a `MemberRef` parented by a
+    /// `TypeSpec` over the type's own parameters, which [`Self::monomorphized_call`] resolves. An
+    /// older lcsc emits the definition's own `MethodDef` row, which carries no instantiation at all
+    /// -- the enclosing body supplies it. Without this arm that spelling reached `resolve_method`,
+    /// bound to the OPEN definition's rid, and refused as `UnresolvedCall`.
+    ///
+    /// The key is built the way the `TypeSpec` path builds its own, through the SAME speller, so the
+    /// two cannot disagree about the string the plan is holding: the declaring type instantiated over
+    /// its own parameters (`` List`1<!0> ``), spelled with the arguments in force.
+    ///
+    /// **THE ARITY GUARD IS WHAT KEEPS THIS FROM ANSWERING FOR A TYPE IT IS NOT ABOUT.** A bare
+    /// `MethodDef` naming a non-generic type's method, or a generic type of a different arity, spells
+    /// a key the plan does not hold and misses -- but requiring the counts to match refuses it before
+    /// the lookup rather than relying on a string not to collide.
+    fn monomorphized_self_call(&self, token: Token, signature: &MethodSig) -> Option<CallInfo> {
+        if self.mono.is_empty()
+            || token.table() != table::METHOD_DEF
+            || self.type_arguments.is_empty()
+        {
+            return None;
+        }
+        let declaring = self.type_token_of(token)?;
+        let arity = self
+            .assembly
+            .generic_params()
+            .filter(|&(_, _, owner, _)| owner & 1 == 0 && (owner >> 1) == declaring.row())
+            .count();
+        if arity != self.type_arguments.len() {
+            return None;
+        }
+        let open = SigType::GenericInst {
+            definition: alloc::boxed::Box::new(SigType::Class(declaring)),
+            arguments: (0..self.type_arguments.len() as u32).map(SigType::Var).collect(),
+        };
+        let name = crate::generics::spell_sig_across(
+            self.assembly,
+            self.argument_world(),
+            &open,
+            &self.type_arguments,
+        )?;
+        let method = self.assembly.resolve_method(token)?;
+        let index = self
+            .mono
+            .index_of(&name, method.name?, &signature.parameters)?;
+        self.monomorphized_call_info(index, signature, &self.type_arguments)
     }
 
     /// A `callvirt` on a GENERIC INTERFACE instantiation -- `` IBox`1<int32>::Get() `` -- typed for
@@ -2894,6 +2962,21 @@ impl<'a> MetadataResolver<'a> {
         crate::generics::substitute_sig(&signature, &self.type_arguments)
     }
 
+    /// What a TYPE OPERAND denotes once this resolver's instantiation is applied, for the ONE operand
+    /// shape whose meaning changes under one: a `TypeSpec`. `None` for every other token and for a
+    /// body with no instantiation in force, which leaves each caller on the path it was already on.
+    fn closed_operand_sig(&self, token: Token) -> Option<SigType> {
+        if token.table() != table::TYPE_SPEC {
+            return None;
+        }
+        if self.layout_arguments.is_empty() && self.method_arguments.is_empty() {
+            return None;
+        }
+        let signature = self.assembly.type_spec_signature(token)?;
+        let closed = self.apply_instantiation(&signature)?;
+        (closed != signature).then_some(closed)
+    }
+
     /// The element of `new T[n]` where the operand is a `TypeSpec` and an instantiation is in force:
     /// the closed ARGUMENT's identity, size and kind. `None` leaves [`CallResolver::array_element`]
     /// on the path it was already on, which is what keeps every ordinary program on exactly the bytes
@@ -2916,10 +2999,7 @@ impl<'a> MetadataResolver<'a> {
     /// any other, which is what makes this array's descriptor the SAME one a program-side
     /// `new int[n]` names rather than a second copy of it.
     fn substituted_array_element(&self, spec: Token) -> Option<ArrayElement> {
-        if self.type_arguments.is_empty() {
-            return None;
-        }
-        let (namespace, name) = primitive_sig_name(&self.closed_spec_signature(spec)?)?;
+        let (namespace, name) = primitive_sig_name(&self.closed_operand_sig(spec)?)?;
         let element = self
             .assembly
             .find_type(namespace, name)
@@ -3339,6 +3419,9 @@ impl CallResolver for MetadataResolver<'_> {
         let method = self.assembly.resolve_method(*token)?;
         let signature = method.signature.as_ref()?;
         if let Some(info) = self.monomorphized_call(*token, signature) {
+            return Some(info);
+        }
+        if let Some(info) = self.monomorphized_self_call(*token, signature) {
             return Some(info);
         }
         if let Some(info) = self.instantiated_interface_call(*token, signature) {
@@ -4228,6 +4311,15 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
+        if let Some(closed) = self.closed_operand_sig(*token) {
+            return mir_type_across(
+                &closed,
+                self.assembly,
+                self.argument_assembly,
+                self.references(),
+                &TargetLayout::ilp32(),
+            );
+        }
         if let Some(name) = self.assembly.type_token_name(*token) {
             if name.namespace == "System" {
                 match name.name {
@@ -4255,6 +4347,15 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
+        if let Some(closed) = self.closed_operand_sig(*token) {
+            return mir_type_across(
+                &closed,
+                self.assembly,
+                self.argument_assembly,
+                self.references(),
+                &TargetLayout::ilp32(),
+            );
+        }
         if let Some(name) = self.assembly.type_token_name(*token) {
             if name.namespace == "System" {
                 match name.name {
