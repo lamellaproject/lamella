@@ -81,6 +81,11 @@ pub enum TypeSig {
     Var(u32),
     /// A generic parameter of the METHOD itself, by its zero-based number: `!!0` is the `T` of
     /// `T Identity<T>(T)` (`ELEMENT_TYPE_MVAR`).
+    ///
+    /// **Distinct from [`TypeSig::Var`] and NOT interchangeable with it.** A generic method inside
+    /// a generic type has both numbering spaces live at once, and `!0` and `!!0` are different
+    /// types there. Encoding one as the other produces a signature that decodes without error and
+    /// means something else.
     MVar(u32),
     /// An instantiation of a generic type: `Box<int>`, or `Box<!0>` inside another generic
     /// (`ELEMENT_TYPE_GENERICINST`).
@@ -197,6 +202,17 @@ pub fn method_signature(has_this: bool, parameters: &[TypeSig], return_type: &Ty
 ///
 /// `generic_parameters` is how many type parameters the METHOD declares -- the `1` of
 /// `T Identity<T>(T)`. Its types are referred to as [`TypeSig::MVar`], numbered from zero.
+///
+/// **`GenParamCount` IS BINDING-SIGNIFICANT, NOT BOOKKEEPING.** II.23.2.1 says both `MethodDef`
+/// and `MemberRef` shall carry the GENERIC convention together with the count, because it is what
+/// lets the runtime **overload generic methods by their number of type parameters** -- `M<T>()` and
+/// `M<T,U>()` are different methods and this field is the difference.
+///
+/// **AND THE `GenericParam` ROW DOES NOT MAKE A METHOD GENERIC -- THIS CONVENTION DOES. MEASURED,
+/// NOT INFERRED FROM THE PAGE:** emitting the row while writing an ordinary signature makes csc
+/// answer **CS0308, "the non-generic method cannot be used with type arguments"**, at a call site
+/// that otherwise compiles. The two must agree and the SIGNATURE wins, so a writer that adds the row
+/// and forgets the convention produces metadata that contradicts itself.
 #[must_use]
 pub fn generic_method_signature(
     has_this: bool,
@@ -220,6 +236,12 @@ pub fn generic_method_signature(
 
 /// Encodes a `MethodSpec` instantiation blob (II.23.2.15): the generic ARGUMENTS at one call site
 /// to a generic method, as `GENERICINST GenArgCount Type*`.
+///
+/// **THE LEADING BYTE IS `0x0A`, NOT `ELEMENT_TYPE_GENERICINST` (0x15), AND THE TWO ARE EASY TO
+/// CONFUSE BECAUSE THEY SHARE A NAME.** II.23.2.15's `GENERICINST` is a CALLING CONVENTION value
+/// (`IMAGE_CEE_CS_CALLCONV_GENERICINST`); the 0x15 of the same name is an ELEMENT TYPE used inside a
+/// type signature. They live in different namespaces and appear in different positions. Writing 0x15
+/// here produces a blob a reader will not recognize as an instantiation at all.
 #[must_use]
 pub fn method_spec_signature(arguments: &[TypeSig]) -> Vec<u8> {
     let mut out = vec![calling::GENERICINST];

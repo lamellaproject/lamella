@@ -55,8 +55,30 @@ const NOT_IMPLEMENTED_BITS: u32 = 0b10_0010;
 
 /// The most negative integer representable as a fixnum (the rest overflow to a
 /// bignum).
+///
+/// # What crossing this bound costs, and where the other tier's bound is
+///
+/// Promotion to a bignum is correct and it is not free: an integer outside this range becomes a
+/// heap object, so a working set of wide values costs several times what the same count of narrow
+/// ones does. Measured on 624 words -- a Mersenne Twister state, which is where it was first noticed
+/// -- the smallest object heap the program survives in is about five times larger when the values
+/// span a 32-bit word than when they stay inside this range.
+///
+/// **The ahead-of-time tier's bound is not this one.** An annotated `int` lowers to a machine
+/// integer there, and a `list[int]` to a packed array of them, so the whole 32-bit band this range
+/// excludes is register-and-array work on that tier and heap objects here. **The band is not
+/// exotic**: `x & 0xFFFFFFFF` is how ordinary embedded Python writes a register, a CRC, a checksum
+/// or a packet field.
+///
+/// So this runtime previews the other tier's BEHAVIOR faithfully and its MEMORY does not, at exactly
+/// the values embedded code produces -- both tiers compute the same answers, which is why no test
+/// comparing outputs can see the difference. Held to by `the_bound_is_a_memory_divergence.rs`.
+///
+/// Widening it is not a free choice: a 32-bit value would need a tag bit this representation does
+/// not have.
 pub const FIXNUM_MIN: i32 = -(1 << 30);
-/// The most positive integer representable as a fixnum.
+/// The most positive integer representable as a fixnum. See [`FIXNUM_MIN`] for what values outside
+/// the range cost and for how this bound differs from the ahead-of-time tier's.
 pub const FIXNUM_MAX: i32 = (1 << 30) - 1;
 
 impl Value {

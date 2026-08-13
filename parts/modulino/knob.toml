@@ -1,0 +1,26 @@
+# PART: the Arduino Modulino Knob node.
+#
+# Quadrature encoder with a push button, read by the node's MCU. What answers on the bus is the node's FIRMWARE, so the interface is a property of a
+# software release rather than of a part. See `modulino.toml` for what that means for every member.
+
+[table]
+kind = "device"
+family = "modulino"
+part = "knob"
+base = "modulino"
+sources = [
+    "Arduino Modulino Knob user manual ABX00107, section 7.5 'I2C Address Reference': default address 0x76, hardware address 0x3A, editable to any custom address in software.",
+]
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- a disagreement worth carrying ------------------------------------------------------------
+#
+# THE MANUAL'S TWO COLUMNS DISAGREE WITH EACH OTHER HERE, and this is the only member where they do: 0x76 shifted down is 0x3B, not the 0x3A the hardware column states. A unit on this bench answered 0x3A, so the hardware column is the one the bus bears out and the shift is what fails.
+
+[address]
+bus = "i2c"
+base = 0x3A
+notes = "Arduino ABX00107 section 7.5 prints TWO columns: 0x76 under the product's own name and 0x3A under 'Hardware I2C Address'. The second is the 7-bit address a bus scan sees and is the one stated here; the first is that value shifted up with the read/write bit appended, and writing it into a 7-bit field addresses something else. A node of this type answered address 0x3A on an I2C walk of a Raspberry Pi Pico 2. That establishes only that SOMETHING acknowledged that address: these nodes carry no identity register, so nothing read can say which one it was, and the address is software-assignable so it is not evidence of type either. It matches the manual's 'Hardware I2C Address' column (0x3A) and not its headline column (0x76)."

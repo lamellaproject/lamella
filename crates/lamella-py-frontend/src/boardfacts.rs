@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ast::{
-    Assign, AssignTarget, CallArg, CompClause, Expr, Keyword, ModuleAst, ParamDef, Stmt,
+    Assign, AssignTarget, CallArg, CompClause, Expr, Keyword, ModuleAst, ParamDef, Stmt, StmtKind,
 };
 
 /// A value a generated board module can state: an integer, a string, or a dict of them.
@@ -94,11 +94,11 @@ impl BoardFacts {
             .map_err(|e| BoardFactError::Unparsable(format!("{e:?}")))?;
         let mut module = BTreeMap::new();
         for stmt in &ast.body {
-            if let Stmt::Assign(Assign {
+            if let StmtKind::Assign(Assign {
                 target,
                 value: Some(value),
                 ..
-            }) = stmt
+            }) = &stmt.kind
             {
                 if let Some(fact) = literal(value) {
                     module.insert(target.clone(), fact);
@@ -162,7 +162,7 @@ pub fn fold_module(ast: &mut ModuleAst, facts: &BoardFacts) -> Result<usize, Boa
 /// The local name `import board` binds, if the program imports it at all.
 fn imported_board_name(body: &[Stmt]) -> Option<String> {
     for stmt in body {
-        if let Stmt::Import { modules } = stmt {
+        if let StmtKind::Import { modules } = &stmt.kind {
             for (module, alias) in modules {
                 if module == "board" {
                     return Some(String::from(crate::ast::import_bound_name(module, alias)));
@@ -176,9 +176,9 @@ fn imported_board_name(body: &[Stmt]) -> Option<String> {
 /// Remove the now-resolved `import board`. Every fact it introduced is a literal by this point, so
 /// leaving it would ask a device with no filesystem to import a module it does not need.
 fn drop_board_import(body: &mut Vec<Stmt>) {
-    body.retain(|stmt| !matches!(stmt, Stmt::Import { modules } if modules.iter().all(|(m, _)| m == "board")));
+    body.retain(|stmt| !matches!(&stmt.kind, StmtKind::Import { modules } if modules.iter().all(|(m, _)| m == "board")));
     for stmt in body.iter_mut() {
-        if let Stmt::Import { modules } = stmt {
+        if let StmtKind::Import { modules } = &mut stmt.kind {
             modules.retain(|(m, _)| m != "board");
         }
     }
@@ -218,7 +218,7 @@ impl Folder<'_> {
 
     /// Walk an attribute/subscript chain down to its root, returning the fact it names and the
     /// spelling of the path (for diagnostics). `Ok(None)` means the chain is not rooted at the
-    /// board module and is none of our business.
+    /// board module, so the fold leaves it alone.
     fn walk_chain(&self, expr: &Expr) -> Result<Option<(FactValue, String)>, BoardFactError> {
         match expr {
             Expr::Name(name) if *name == self.root => {
@@ -404,30 +404,30 @@ impl Folder<'_> {
     /// `children` is: a new `Stmt` variant should stop this build, not silently become a place
     /// where `board.*` survives compilation.
     fn stmt(&mut self, stmt: &mut Stmt) -> Result<(), BoardFactError> {
-        match stmt {
-            Stmt::FuncDef(func) => {
+        match &mut stmt.kind {
+            StmtKind::FuncDef(func) => {
                 self.params(&mut func.params)?;
                 self.body(&mut func.body)
             }
-            Stmt::Return(value) => {
+            StmtKind::Return(value) => {
                 if let Some(value) = value {
                     self.expr(value)?;
                 }
                 Ok(())
             }
-            Stmt::Assign(Assign { value, .. }) => {
+            StmtKind::Assign(Assign { value, .. }) => {
                 if let Some(value) = value {
                     self.expr(value)?;
                 }
                 Ok(())
             }
-            Stmt::MultiAssign { targets, value } | Stmt::TupleAssign { targets, value, .. } => {
+            StmtKind::MultiAssign { targets, value } | StmtKind::TupleAssign { targets, value, .. } => {
                 for target in targets.iter_mut() {
                     self.target(target)?;
                 }
                 self.expr(value)
             }
-            Stmt::SetItem {
+            StmtKind::SetItem {
                 container,
                 index,
                 value,
@@ -437,23 +437,23 @@ impl Folder<'_> {
                 self.expr(index)?;
                 self.expr(value)
             }
-            Stmt::SetAttr { obj, value, .. } => {
+            StmtKind::SetAttr { obj, value, .. } => {
                 self.expr(obj)?;
                 self.expr(value)
             }
-            Stmt::Expr(value) => self.expr(value),
-            Stmt::Delete(values) => {
+            StmtKind::Expr(value) => self.expr(value),
+            StmtKind::Delete(values) => {
                 for value in values {
                     self.expr(value)?;
                 }
                 Ok(())
             }
-            Stmt::If { test, body, orelse } | Stmt::While { test, body, orelse } => {
+            StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
                 self.expr(test)?;
                 self.body(body)?;
                 self.body(orelse)
             }
-            Stmt::For {
+            StmtKind::For {
                 start,
                 stop,
                 body,
@@ -465,13 +465,13 @@ impl Folder<'_> {
                 self.body(body)?;
                 self.body(orelse)
             }
-            Stmt::ForIter {
+            StmtKind::ForIter {
                 iterable,
                 body,
                 orelse,
                 ..
             }
-            | Stmt::AsyncFor {
+            | StmtKind::AsyncFor {
                 iterable,
                 body,
                 orelse,
@@ -481,13 +481,13 @@ impl Folder<'_> {
                 self.body(body)?;
                 self.body(orelse)
             }
-            Stmt::Raise { exc, cause } => {
+            StmtKind::Raise { exc, cause } => {
                 for part in [exc, cause].into_iter().flatten() {
                     self.expr(part)?;
                 }
                 Ok(())
             }
-            Stmt::Try {
+            StmtKind::Try {
                 body,
                 handlers,
                 orelse,
@@ -503,30 +503,30 @@ impl Folder<'_> {
                 self.body(orelse)?;
                 self.body(finalbody)
             }
-            Stmt::With { context, body, .. } | Stmt::AsyncWith { context, body, .. } => {
+            StmtKind::With { context, body, .. } | StmtKind::AsyncWith { context, body, .. } => {
                 self.expr(context)?;
                 self.body(body)
             }
-            Stmt::ClassDef { bases, body, .. } => {
+            StmtKind::ClassDef { bases, body, .. } => {
                 for base in bases {
                     self.expr(base)?;
                 }
                 self.body(body)
             }
-            Stmt::Decorated { decorators, inner } => {
+            StmtKind::Decorated { decorators, inner } => {
                 for decorator in decorators {
                     self.expr(decorator)?;
                 }
                 self.stmt(inner)
             }
-            Stmt::Nonlocal(_)
-            | Stmt::Global(_)
-            | Stmt::Import { .. }
-            | Stmt::ImportFrom { .. }
-            | Stmt::ImportStar { .. }
-            | Stmt::Break
-            | Stmt::Continue
-            | Stmt::Pass => Ok(()),
+            StmtKind::Nonlocal(_)
+            | StmtKind::Global(_)
+            | StmtKind::Import { .. }
+            | StmtKind::ImportFrom { .. }
+            | StmtKind::ImportStar { .. }
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Pass => Ok(()),
         }
     }
 
@@ -552,6 +552,7 @@ impl Folder<'_> {
                 }
                 Ok(())
             }
+            AssignTarget::Starred(inner) => self.target(inner),
         }
     }
 
@@ -612,9 +613,9 @@ DEVICES = {
         let (ast, bound) = fold(source).expect("folds");
         assert_eq!(bound, 1, "exactly one fact should have been bound");
         for stmt in &ast.body {
-            if let Stmt::Assign(Assign {
+            if let StmtKind::Assign(Assign {
                 value: Some(value), ..
-            }) = stmt
+            }) = &stmt.kind
             {
                 return value.clone();
             }
@@ -669,17 +670,17 @@ DEVICES = {
     fn the_resolved_import_is_dropped() {
         let (ast, _) = fold("import board\nx = board.BOARD_MODEL\n").expect("folds");
         assert!(
-            !ast.body.iter().any(|s| matches!(s, Stmt::Import { .. })),
+            !ast.body.iter().any(|s| matches!(&s.kind, StmtKind::Import { .. })),
             "the import is fully resolved, so nothing should ask a device to perform it"
         );
     }
 
-    /// An import of something else survives, and its own names are none of our business.
+    /// An import of something else survives, and the fold leaves its names alone.
     #[test]
     fn an_unrelated_import_survives() {
         let (ast, _) = fold("import board\nimport math\nx = board.BOARD_MODEL\n").expect("folds");
         assert!(ast.body.iter().any(
-            |s| matches!(s, Stmt::Import { modules } if modules.iter().any(|(m, _)| m == "math"))
+            |s| matches!(&s.kind, StmtKind::Import { modules } if modules.iter().any(|(m, _)| m == "math"))
         ));
     }
 

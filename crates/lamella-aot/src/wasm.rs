@@ -2605,6 +2605,7 @@ mod tests {
         let vt = MirType::ValueType {
             handle: lamella_ir::TypeHandle(1),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let cint = |v: i64| Inst::ConstInt { ty: i32t, value: v };
         let scalar_store = |base, offset, value| Inst::FieldStore {
@@ -3298,6 +3299,7 @@ mod tests {
         let pt = MirType::ValueType {
             handle: lamella_ir::TypeHandle(1),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let fs = |base, offset, value| Inst::FieldStore {
             base,

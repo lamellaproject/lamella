@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-//! The code-point byte codec: ONE definition of the bytes our string tiers store.
+//! The code-point byte codec: ONE definition of the bytes the string tiers store.
 
 extern crate alloc;
 

@@ -29,6 +29,7 @@ lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 # when it has one) and drives that shared implementation rather than writing a second event loop --
 # which is what its own charter asks for, naming "a sibling language runtime's event loop".
 lamella-reactor = { path = "../lamella-reactor" }
+lamella-net-core = { path = "../lamella-net-core" }
 # The shared Unicode Character Database properties: str predicates (isalpha/isspace/...)
 # classify code points exactly as CPython, from one tree-shakeable table. The str predicates use
 # only the categories tier, so opt out of `normalization` (and `alloc` in the crate).

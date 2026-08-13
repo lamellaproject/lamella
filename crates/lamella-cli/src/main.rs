@@ -1,6 +1,9 @@
 //! The `lamella` command-line tool.
 
 use lamella_bsp_gen::fit::{Budget, BudgetSource, Fit, FitVerdict, fit};
+use lamella_bsp_gen::reconcile::{
+    Claim, ClaimStatus, Observation, Outcome, ReconcileVerdict, reconcile,
+};
 use lamella_bsp_gen::strata::{BoardTable, PartRow, Strata, parse};
 use std::process::ExitCode;
 
@@ -15,6 +18,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("boards") => list_boards(),
         Some("fit") => fit_command(&args[1..]),
+        Some("reconcile") => reconcile_command(&args[1..]),
         Some("--help" | "-h" | "help") | None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -31,8 +35,14 @@ const USAGE: &str = "\
 usage:
   lamella boards                                     every board this build knows
   lamella fit --board <id> --image-bytes <n>         does an image of <n> bytes fit?
+  lamella reconcile --board <id> [--read <name>=<v>] is the attached board the one assumed?
 
 `fit` needs no hardware: flash and RAM come from the board file and the part row.
+
+`reconcile` compares readings taken from an attached board against what that board declares it
+can be asked. It needs no hardware either: with no --read it reports what attaching the board
+WOULD settle, and what nothing declared can reach. Readings are <discriminator>=<value>, and a
+value may be decimal or 0x-prefixed.
 ";
 
 /// Prints every board id the catalogue carries, with the part it is built around.
@@ -95,6 +105,120 @@ fn fit_command(args: &[String]) -> ExitCode {
     }
 }
 
+/// `lamella reconcile`: compare readings from an attached board against what it declares.
+///
+/// The readings arrive on the command line rather than from a probe, which is deliberate. Taking
+/// them off the wire belongs to whatever drives the board; the COMPARISON is the part that has to
+/// be right, and separating them is what lets this be exercised, and answered, with nothing
+/// plugged in.
+fn reconcile_command(args: &[String]) -> ExitCode {
+    let mut board_id = None;
+    let mut observed = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--board" => {
+                index += 1;
+                board_id = args.get(index).cloned();
+            }
+            "--read" => {
+                index += 1;
+                let Some(pair) = args.get(index) else {
+                    eprintln!("lamella reconcile: --read wants <discriminator>=<value>");
+                    return ExitCode::FAILURE;
+                };
+                let Some((name, value)) = pair.split_once('=') else {
+                    eprintln!("lamella reconcile: {pair:?} is not <discriminator>=<value>");
+                    return ExitCode::FAILURE;
+                };
+                let parsed = match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+                    Some(hex) => i64::from_str_radix(hex, 16),
+                    None => value.parse::<i64>(),
+                };
+                let Ok(reading) = parsed else {
+                    eprintln!("lamella reconcile: reading {value:?} is not an integer");
+                    return ExitCode::FAILURE;
+                };
+                observed.push(Observation { discriminator: name.to_string(), reading });
+            }
+            other => {
+                eprintln!("lamella reconcile: unknown argument {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+        index += 1;
+    }
+    let Some(board_id) = board_id else {
+        eprintln!("usage: lamella reconcile --board <id> [--read <discriminator>=<value>]");
+        return ExitCode::FAILURE;
+    };
+    let Some(board) = load_board(&board_id) else {
+        eprintln!("lamella reconcile: no board {board_id:?}; try `lamella boards`");
+        return ExitCode::FAILURE;
+    };
+    let Some(part) = load_part(&board) else {
+        eprintln!("lamella reconcile: board {board_id:?} resolves to no part row in this build");
+        return ExitCode::FAILURE;
+    };
+
+    let verdict = reconcile(&board, &part, &[], &observed);
+    print!("{}", render_reconcile(&board_id, &verdict));
+    match verdict.outcome {
+        Outcome::Contradicted => ExitCode::FAILURE,
+        Outcome::Unconfirmed | Outcome::Confirmed => ExitCode::SUCCESS,
+    }
+}
+
+/// Renders a reconciliation for a person: the verdict, then every claim and where it stands, then
+/// the profile that was compared against, then the limits.
+fn render_reconcile(selected: &str, verdict: &ReconcileVerdict) -> String {
+    let mut out = String::new();
+    let name = if selected == verdict.board {
+        selected.to_string()
+    } else {
+        format!("{selected} (board id {:?})", verdict.board)
+    };
+    out.push_str(&format!("board {name} (part {})\n\n", verdict.part));
+    out.push_str(match verdict.outcome {
+        Outcome::Confirmed => "CONFIRMED -- every claim below was reached at the rung it needs\n",
+        Outcome::Unconfirmed => "NOT CONFIRMED -- nothing disagreed, and not every claim was reached\n",
+        Outcome::Contradicted => "CONTRADICTED -- this is not the board the image assumed\n",
+    });
+    out.push_str("\nclaims:\n");
+    for report in &verdict.profile {
+        let what = match &report.claim {
+            Claim::Part { part } => format!("part {part}"),
+            Claim::Region { name, bytes } => format!("region {name:?}, {bytes} B reachable"),
+            Claim::Device { name, address, part } => {
+                format!("module {name:?} ({part}) at 0x{address:02X}")
+            }
+        };
+        let stands = match &report.status {
+            ClaimStatus::Confirmed { by, rung } => format!("confirmed by {by:?} ({rung})"),
+            ClaimStatus::Contradicted { by, expected, read } => {
+                format!("CONTRADICTED by {by:?}: expected {expected}, read {read}")
+            }
+            ClaimStatus::Unconfirmed { why } => format!("not reached -- {why}"),
+        };
+        out.push_str(&format!("  {what}\n    {stands}\n"));
+    }
+    if !verdict.unplaced.is_empty() {
+        out.push_str("\nreadings this board cannot place:\n");
+        for line in &verdict.unplaced {
+            out.push_str(&format!("  - {line}\n"));
+        }
+    }
+    out.push_str("\nassuming:\n");
+    for line in &verdict.assumptions {
+        out.push_str(&format!("  - {line}\n"));
+    }
+    out.push_str("\nthis verdict does NOT answer:\n");
+    for line in &verdict.not_answered {
+        out.push_str(&format!("  - {line}\n"));
+    }
+    out
+}
+
 /// The board with `id`, parsed from the embedded catalogue.
 fn load_board(id: &str) -> Option<BoardTable> {
     let (_, text) = catalogue::BOARDS.iter().find(|(board, _)| *board == id)?;
@@ -129,6 +253,10 @@ fn load_part(board: &BoardTable) -> Option<PartRow> {
 
 /// Renders a verdict for a person: the answer, then the numbers, then what it assumed, then what it
 /// cannot answer.
+///
+/// **THE ASSUMPTIONS AND LIMITS ARE PRINTED, NOT LOGGED.** The failure this feature exists to
+/// prevent is somebody planning a product around memory nobody soldered; a verdict that computed
+/// correctly and buried its own preconditions would cause exactly that.
 fn render(selected: &str, verdict: &FitVerdict) -> String {
     let mut out = String::new();
     let name = if selected == verdict.board {
@@ -174,6 +302,14 @@ fn budget_line(budget: &Budget) -> String {
 mod tests {
     use super::*;
 
+    /// **A CENSUS, NOT AN EXAMPLE, AND IT IS WHAT FINDS THE NEXT SHAPE.** Every board in the
+    /// catalogue must resolve to a part row with a real RAM figure. Written after running the tool
+    /// by hand found that module-carrying boards resolved to an EMPTY part id -- a shape a
+    /// hand-picked Pico row passes straight over. A new board whose form this resolver cannot
+    /// follow now fails here rather than at a user's prompt.
+    ///
+    /// It reports EVERY failure before asserting: a census that panics on the first one answers
+    /// "is there a hole" when the question is "where are the holes".
     #[test]
     fn every_board_in_the_catalogue_resolves_to_a_part_row() {
         let mut unresolved = Vec::new();

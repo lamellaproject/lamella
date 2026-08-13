@@ -44,3 +44,19 @@ pub const MEMORY_REGION_COUNT: u32 = 1;
 pub const MEMORY_FLASH_KIND: &str = "flash";
 pub const MEMORY_FLASH_SIZE: u32 = 0x800000;
 pub const MEMORY_FLASH_OPTIONAL: u32 = 0;
+
+/// -- connectors: the sockets a removable module plugs into. The socket is board truth --
+/// it is on the schematic and identical on every unit -- and what is plugged into it is not,
+/// so no row here names a module. A socket brings out whole BUSES, each named by the binding
+/// role that serves it, and single LINES, each named by the standard's own name for that
+/// position and carrying the port wiring a driver needs to drive it. Which of a socket's
+/// protocols an attached module speaks is a property of the module, so a board that offers
+/// several states all of them and chooses none --
+pub const CONNECTOR_COUNT: u32 = 1;
+pub const CONNECTOR_QT_STANDARD: &str = "stemma-qt";
+pub const CONNECTOR_QT_SDA_PORT_BASE: u32 = 0xD0000000;
+pub const CONNECTOR_QT_SDA_PIN: u32 = 2;
+pub const CONNECTOR_QT_SDA_MASK: u32 = 0x4;
+pub const CONNECTOR_QT_SCL_PORT_BASE: u32 = 0xD0000000;
+pub const CONNECTOR_QT_SCL_PIN: u32 = 3;
+pub const CONNECTOR_QT_SCL_MASK: u32 = 0x8;

@@ -243,7 +243,7 @@ pub enum ResetInto {
 /// enable rises, and the strap is asserted at that instant.
 ///
 /// Established by driving each candidate against an ESP32-C6 development board and reading the part's
-/// own boot banner back, which names the mode it came up in (2026-07-29):
+/// own boot banner back, which names the mode it came up in:
 ///
 /// ```text
 ///   assert enable alone, release              rst:0x1 (POWERON),boot:0x2c (SPI_FAST_FLASH_BOOT)

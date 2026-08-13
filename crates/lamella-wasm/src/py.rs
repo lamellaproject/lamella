@@ -164,6 +164,10 @@ pub fn bundle_py_str(source: &str) -> Vec<u8> {
 /// engine that needed a clean parse would answer nothing exactly when asked. [`lamella_py_frontend::complete`]
 /// repairs the source before parsing and falls back to a token scan; **no input produces an error and
 /// the worst outcome is an empty list**. There is deliberately no failure envelope to interpret.
+///
+/// **The `kind` spelling is the FRONT END'S, not one invented here.**
+/// [`lamella_py_frontend::CompletionKind::as_str`] is the single definition of the wire word, so this
+/// cannot drift from the engine's own vocabulary the way a match arm transcribed into this file would.
 #[must_use]
 pub fn complete_py_str(source: &str, offset: usize) -> String {
     let mut json = String::from("{\"items\":[");
@@ -220,6 +224,7 @@ fn compile_error_result(error: &FrontendError) -> RunResult {
         FrontendError::Compile(_) => 0,
         FrontendError::BoardFact(_) => 0,
         FrontendError::InModule { .. } => 0,
+        FrontendError::Capability(e) => e.line,
     };
     RunResult {
         stdout: String::new(),

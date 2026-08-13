@@ -56,6 +56,8 @@ PLANS = {
 DEVICES = {
     "lsm303agr": {"kind": "i2c-device", "role": "internal-i2c", "address": 0x19},
     "lsm303agr-mag": {"kind": "i2c-device", "role": "internal-i2c", "address": 0x1E},
+    "interface-mgmt": {"kind": "i2c-device", "role": "internal-i2c", "address": 0x70},
+    "interface-storage": {"kind": "i2c-device", "role": "internal-i2c", "address": 0x72},
     "display-row1": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 21, "mask": 0x200000, "active_low": False},
     "display-row2": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 22, "mask": 0x400000, "active_low": False},
     "display-row3": {"kind": "gpio-out", "port_base": 0x50000000, "pin": 15, "mask": 0x8000, "active_low": False},

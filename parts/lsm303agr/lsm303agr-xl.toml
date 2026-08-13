@@ -1,0 +1,160 @@
+# PART: the ACCELEROMETER half of an ST LSM303AGR.
+#
+# One of two independent bus residents in one package. It cannot be reached by addressing the
+# magnetometer and it shares no register address with it.
+
+[table]
+kind = "device"
+family = "lsm303agr"
+part = "lsm303agr-xl"
+base = "lsm303agr"
+sources = [
+    "ST LSM303AGR datasheet DocID027765 Rev 11: register address map ch 8 table 26 (the 0x00 to 0x3F range), WHO_AM_I_A ch 8.4 table 30, the accelerometer slave address and SAD + read/write patterns ch 6.1 table 24.",
+]
+notes = [
+    "Board truth names this half `lsm303agr` where this table names it `lsm303agr-xl`, because a board row names a RESIDENT on a bus and a part table names a device type. The magnetometer half is spelled the same way in both.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
+#
+# WHAT THIS TABLE DELIBERATELY DOES NOT STATE, so a reader can tell a fact from a gap: the output
+# data rates and their codes, the full-scale ranges and the sensitivity each implies, the low-power
+# and high-resolution mode encodings, the FIFO, the click and activity detection registers, the
+# temperature sensor, and the self-test. All are in the datasheet and none is transcribed.
+#
+# Identified, and no further: a physical part has answered the identity register below against a
+# negative control. Nothing beneath it has been read from silicon -- no axis has been sampled, and
+# the resolution this table declines to describe remains undescribed.
+
+[sourcing]
+facts = "primary"
+validation = "identified"
+evidence = "A physical part answered the identity register on a Raspberry Pi Pico 2, over I2C0 at 100 kHz, on a breakout reached through a four-wire cable: register 0x0F read 0x33 at address 0x19, the single value this table accepts at the single address it states, repeated across five consecutive passes with 0 faulted of 112 addresses walked in each. THE NEGATIVE CONTROL RAN AT THE SAME ADDRESS ON THE SAME REGISTER: with the module unplugged, the identical read ABORTED in four consecutive passes, during which nothing answered anywhere on the bus and 0 of 112 addresses were faulted -- so the byte came from a part rather than from the state of an idle wire. A SECOND CONTROL CAME FREE AND IT TESTS THIS FAMILY'S WHOLE MODEL: the other half of the same package was checked in the same passes at ITS address and ITS register, 0x4F at 0x1E, and answered its own value and not this one. Two addresses, two registers, two values, one package -- so the claim that this package is two bus residents is measured rather than argued. THE READING ALSO SETTLED WHICH VARIANT THE BREAKOUT CARRIES: an earlier walk of this same module recorded only that something answered at 0x19 and 0x1E, which narrowed it to an LSM303-class part and no further. EVERY NUMBER IN THE CHECK -- the address, the register and the accepted value -- was taken from this table's own emitted artifact by a bench program that includes it, so what was tested is the row that ships and not a copy of it."
+
+# --- identity ------------------------------------------------------------------------------------
+#
+# The register map calls this a "Dummy register" and gives its reset value as 00110011. It is the
+# only readable byte that distinguishes this half from anything else at its address.
+#
+# A TRAP THE VENDOR'S OWN TABLES SET, and it is worth naming because the two numbers are IDENTICAL
+# rather than merely similar: this part's 7-bit address 0011001b composed with the read bit is
+# 00110011, which the datasheet prints as 33h -- the SAME BYTE as the identity value below. One is a
+# bus address with a direction bit appended and the other is the contents of a register. Nothing
+# connects them, and a reader who saw 0x33 twice could easily believe something did.
+
+[identity]
+reg = 0x0F
+width = 8
+values = [0x33]
+notes = "WHO_AM_I_A. The magnetometer half of the same package answers 0x40 at register 0x4F, so the two halves are told apart by different registers at different addresses rather than by different values in one."
+
+# --- address: FIXED, with no strap -----------------------------------------------------------------
+#
+# This part states no address-selection pin at all. Where a BMx280 offers an SDO strap and a
+# tca9548a three, this address is a factory setting and cannot be moved -- which means two of these
+# on one bus collide with no configuration available to separate them.
+
+[address]
+bus = "i2c"
+base = 0x19
+notes = "The datasheet states the accelerometer sensor slave address is 0011001b, described as the default factory setting, and describes no pin that alters it. The composed bytes 0x33 for a read and 0x32 for a write are that address with the direction bit appended and are NOT addresses in their own right."
+
+# --- registers -------------------------------------------------------------------------------------
+#
+# `reg` is an OPERAND written on the wire, never an offset added to an instance base.
+
+[registers.who_am_i_a]
+reg = 0x0F
+width = 8
+access = "read-only"
+fields = { who_am_i = [0, 8] }
+
+[registers.status_reg_aux_a]
+reg = 0x07
+width = 8
+access = "read-only"
+notes = "Auxiliary status, covering the temperature channel."
+
+[registers.out_temp_a]
+reg = 0x0C
+width = 16
+access = "read-only"
+fields = { out_temp_l = [0, 8], out_temp_h = [8, 8] }
+notes = "Two registers at 0x0C and 0x0D, low byte first. Reading both in one transfer needs the auto-increment bit the family base describes."
+
+[registers.temp_cfg_reg_a]
+reg = 0x1F
+width = 8
+access = "read-write"
+
+[registers.ctrl_reg1_a]
+reg = 0x20
+width = 8
+access = "read-write"
+notes = "Reset value 00000111, which is the only control register in this half whose reset state is not zero: the three axis-enable bits come up SET. The output data rate field comes up at zero, which is power-down, so a part is enabled on its axes and taking no measurements until a rate is written."
+
+[registers.ctrl_reg2_a]
+reg = 0x21
+width = 8
+access = "read-write"
+
+[registers.ctrl_reg3_a]
+reg = 0x22
+width = 8
+access = "read-write"
+
+[registers.ctrl_reg4_a]
+reg = 0x23
+width = 8
+access = "read-write"
+
+[registers.ctrl_reg5_a]
+reg = 0x24
+width = 8
+access = "read-write"
+
+[registers.ctrl_reg6_a]
+reg = 0x25
+width = 8
+access = "read-write"
+
+[registers.status_reg_a]
+reg = 0x27
+width = 8
+access = "read-only"
+notes = "Data-ready and overrun flags for the acceleration outputs."
+
+[registers.out_x_a]
+reg = 0x28
+width = 16
+access = "read-only"
+fields = { out_x_l = [0, 8], out_x_h = [8, 8] }
+notes = "Low byte first at 0x28 and 0x29. The six output bytes are contiguous from 0x28 to 0x2D, so one burst covers all three axes -- with the auto-increment bit set."
+
+[registers.out_y_a]
+reg = 0x2A
+width = 16
+access = "read-only"
+fields = { out_y_l = [0, 8], out_y_h = [8, 8] }
+
+[registers.out_z_a]
+reg = 0x2C
+width = 16
+access = "read-only"
+fields = { out_z_l = [0, 8], out_z_h = [8, 8] }
+
+[registers.fifo_ctrl_reg_a]
+reg = 0x2E
+width = 8
+access = "read-write"
+
+[registers.fifo_src_reg_a]
+reg = 0x2F
+width = 8
+access = "read-only"
+
+[measurement]
+burst_length = 6
+resolution_bits = "8, 10 or 12 depending on the power mode, which this table does not describe"

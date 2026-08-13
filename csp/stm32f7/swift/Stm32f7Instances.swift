@@ -43,6 +43,10 @@ public enum Stm32f7Instances {
     public static let GPIOH_RCC_EN_OFF: UInt32 = 48
     public static let GPIOH_RCC_EN_BIT: UInt32 = 7
     public static let GPIOH_RCC_EN_MASK: UInt32 = 0x80
+    public static let GPIOI_BASE: UInt32 = 0x40022000
+    public static let GPIOI_RCC_EN_OFF: UInt32 = 48
+    public static let GPIOI_RCC_EN_BIT: UInt32 = 8
+    public static let GPIOI_RCC_EN_MASK: UInt32 = 0x100
     public static let RCC_BASE: UInt32 = 0x40023800
     public static let I2C1_BASE: UInt32 = 0x40005400
     public static let I2C1_RCC_EN_OFF: UInt32 = 64

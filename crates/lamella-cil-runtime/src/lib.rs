@@ -16,7 +16,7 @@ pub mod intrinsics;
 pub mod memory;
 pub mod module;
 pub mod mount;
-pub mod net;
+pub use lamella_net_core as net;
 pub mod object;
 pub use lamella_reactor as reactor;
 pub mod serial;

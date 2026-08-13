@@ -1,0 +1,21 @@
+[package]
+name = "lamella-mdns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Multicast DNS and DNS-based service discovery, so a board can be found on a network without anybody knowing the address it was given. Implemented from RFC 1035, 6762 and 6763; no socket of its own -- a datagram goes in and a datagram may come out, which is what makes the whole of it testable without one."
+
+# Nothing. The wire format is bytes and the responder is a decision over them, so this depends on
+# no socket seam and no protocol crate: a caller that has a datagram can use it, whatever put the
+# datagram in its hand.
+[dependencies]
+
+[dev-dependencies]
+# The discovery test asserts that the port a board ANNOUNCES is the port the protocol is served on.
+# Two numbers that must agree, checked against each other rather than both written down here.
+lamella-wire = { path = "../lamella-wire" }
+
+[lints]
+workspace = true

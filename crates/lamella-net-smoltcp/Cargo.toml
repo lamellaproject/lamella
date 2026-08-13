@@ -5,10 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "DEVICE networking backend for the interpreter's NetBackend seam: smoltcp (pure-Rust no_std TCP/IP) over any smoltcp phy::Device (a board's Ethernet MAC driver). The device twin of lamella-net-host."
+description = "DEVICE networking backend for the shared NetBackend seam: smoltcp (pure-Rust no_std TCP/IP) over any smoltcp phy::Device (a board's Ethernet MAC driver). The device twin of lamella-net-host."
 
 [dependencies]
-lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+# The seam alone. A backend is not a language runtime's dependant: it implements a leaf trait, and
+# every runtime that binds that leaf gets this backend without either side knowing about the other.
+lamella-net-core = { path = "../lamella-net-core" }
 smoltcp = { version = "0.12", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",

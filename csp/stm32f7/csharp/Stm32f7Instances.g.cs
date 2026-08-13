@@ -41,6 +41,10 @@ namespace Lamella.Generated
         public const uint GPIOH_RCC_EN_OFF = 48;
         public const uint GPIOH_RCC_EN_BIT = 7;
         public const uint GPIOH_RCC_EN_MASK = 0x80;
+        public const uint GPIOI_BASE = 0x40022000;
+        public const uint GPIOI_RCC_EN_OFF = 48;
+        public const uint GPIOI_RCC_EN_BIT = 8;
+        public const uint GPIOI_RCC_EN_MASK = 0x100;
         public const uint RCC_BASE = 0x40023800;
         public const uint I2C1_BASE = 0x40005400;
         public const uint I2C1_RCC_EN_OFF = 64;

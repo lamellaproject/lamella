@@ -67,6 +67,10 @@ pub mod cmd {
     pub const SEND_IF_COND: u8 = 8;
     /// SEND_CSD -- the card-specific data register, which carries the capacity.
     pub const SEND_CSD: u8 = 9;
+    /// SWITCH_FUNC -- queries and selects the card's optional functions, of which the one that
+    /// matters here is the bus speed. Command class 10; a card whose CSD omits that class does not
+    /// have it. Answers R1 and then a 64-byte status as a data block, in BOTH modes.
+    pub const SWITCH_FUNC: u8 = 6;
     /// SET_BLOCKLEN -- fixes the transfer block length (standard-capacity cards only).
     pub const SET_BLOCKLEN: u8 = 16;
     /// READ_SINGLE_BLOCK.
@@ -189,6 +193,10 @@ impl WriteRejection {
     }
 }
 
+/// Bytes in a command frame. Named so a caller batching a frame into one bus transfer sizes its
+/// buffer from the frame rather than from a literal that could drift away from it.
+pub const COMMAND_FRAME_LEN: usize = 6;
+
 /// Builds the 6-byte command frame for `index` and `arg`, CRC included.
 ///
 /// The CRC is computed rather than tabulated for the two commands that need one, because a driver
@@ -221,23 +229,116 @@ pub fn crc7(bytes: &[u8]) -> u8 {
     crc >> 1
 }
 
-/// The sector count a CSD register describes, for both layouts.
+/// Encoding and decoding for [`cmd::SWITCH_FUNC`] -- the card's optional functions, six groups of
+/// sixteen, of which group 1 is the bus speed.
 ///
-/// `csd` is the 16 bytes as read from the card. The version lives in the top two bits of byte 0:
-/// `0b00` is the v1 layout (an exponent-and-multiplier encoding) and `0b01` is the v2 layout (a
-/// plain count of 512 KB units). Anything else is a layout this driver does not know.
-pub fn csd_sector_count(csd: &[u8; 16]) -> BlockResult<u64> {
-    match csd[0] >> 6 {
-        0b00 => {
-            let c_size =
-                (u64::from(csd[6] & 0x03) << 10) | (u64::from(csd[7]) << 2) | (u64::from(csd[8]) >> 6);
-            let c_size_mult = (u64::from(csd[9] & 0x03) << 1) | (u64::from(csd[10]) >> 7);
-            let read_bl_len = u64::from(csd[5] & 0x0F);
-            if read_bl_len < 9 {
-                return Err(BlockError::Io);
-            }
-            Ok((c_size + 1) << (c_size_mult + 2 + read_bl_len - 9))
+/// **The CSD's `TRAN_SPEED` is the ceiling IN FORCE, not the ceiling AVAILABLE.** A card that
+/// supports High Speed still reports the default-speed 25 MHz there until this command switches
+/// it, at which point the same field reads 50 MHz. So a host that reads `TRAN_SPEED` and stops has
+/// learned what the card is doing, not what it can do -- and the difference is a factor of two on
+/// the wire.
+pub mod switch {
+    /// The 512-bit function status a card returns to [`cmd::SWITCH_FUNC`](super::cmd::SWITCH_FUNC),
+    /// in either mode.
+    pub const STATUS_LEN: usize = 64;
+
+    /// Group 1 -- access mode, which is the bus speed. The other five groups are command system,
+    /// driver strength, power limit and two reserved.
+    pub const GROUP_ACCESS_MODE: u8 = 1;
+    /// Group 1 function 1 -- High Speed (SDR25 in the later naming), whose ceiling is 50 MHz
+    /// against default speed's 25.
+    pub const FUNCTION_HIGH_SPEED: u8 = 1;
+    /// The clock a card permits once [`FUNCTION_HIGH_SPEED`] is selected. Request it; a bus clamps
+    /// to what its own divisor can produce.
+    pub const HIGH_SPEED_CLOCK_HZ: u32 = 50_000_000;
+    /// The nibble a card writes into a selection result when it did NOT switch -- "no influence",
+    /// which is also what a host writes to leave a group alone.
+    pub const NO_INFLUENCE: u8 = 0xF;
+
+    /// The command argument. `set` chooses between checking (`false`, mode 0) and switching
+    /// (`true`, mode 1); every group other than `group` is left at [`NO_INFLUENCE`].
+    ///
+    /// Mode 0 and mode 1 return the same status and differ only in whether the card ACTS on it. A
+    /// card that does not offer a function answers mode 1 with [`NO_INFLUENCE`] in the result
+    /// rather than with an error, so a switch whose result nobody reads looks exactly like one that
+    /// worked.
+    #[must_use]
+    pub fn arg(set: bool, group: u8, function: u8) -> u32 {
+        let mut groups = 0x00FF_FFFFu32;
+        if (1..=6).contains(&group) {
+            let shift = 4 * u32::from(group - 1);
+            groups = (groups & !(0xF << shift)) | (u32::from(function & 0xF) << shift);
         }
+        groups | (u32::from(set) << 31)
+    }
+
+    /// Whether `status` says the card OFFERS `function` in `group`.
+    ///
+    /// Group N's support bitmap is bits `[400 + 16(N-1) + 15 : 400 + 16(N-1)]`, and the status
+    /// arrives most-significant bit first, so group 1 lands in bytes 12 and 13 and each later group
+    /// two bytes earlier.
+    #[must_use]
+    pub fn supports(status: &[u8; STATUS_LEN], group: u8, function: u8) -> bool {
+        if !(1..=6).contains(&group) || function > 15 {
+            return false;
+        }
+        let high = 12 - 2 * usize::from(group - 1);
+        let bitmap = (u16::from(status[high]) << 8) | u16::from(status[high + 1]);
+        bitmap & (1 << function) != 0
+    }
+
+    /// The function `group` is CURRENTLY set to, as the card reports it -- [`NO_INFLUENCE`] when a
+    /// switch was refused.
+    ///
+    /// The six result nibbles occupy bits 399:376, i.e. bytes 14 to 16, two groups per byte with
+    /// the odd-numbered group in the low nibble.
+    #[must_use]
+    pub fn selected(status: &[u8; STATUS_LEN], group: u8) -> u8 {
+        if !(1..=6).contains(&group) {
+            return NO_INFLUENCE;
+        }
+        let index = group - 1;
+        let byte = status[16 - usize::from(index / 2)];
+        if index % 2 == 0 { byte & 0xF } else { byte >> 4 }
+    }
+
+    /// The maximum current the card draws, in milliamperes -- bits 511:496, the first two bytes.
+    ///
+    /// Worth reading before switching on a bus whose supply is marginal: High Speed raises it, and
+    /// a card browned out mid-transfer reports as data corruption rather than as a power fault.
+    #[must_use]
+    pub fn max_current_ma(status: &[u8; STATUS_LEN]) -> u16 {
+        (u16::from(status[0]) << 8) | u16::from(status[1])
+    }
+}
+
+/// The sector count a CSD register describes.
+///
+/// `csd` is the 16 bytes as read from the card, and `is_mmc` says which family wrote them --
+/// **which is not optional, because the same `CSD_STRUCTURE` value means different things on the
+/// two families.** The field is the top two bits of byte 0:
+///
+/// | `CSD_STRUCTURE` | SD                          | MMC                          |
+/// |-----------------|-----------------------------|------------------------------|
+/// | `0b00`          | v1.0, exponent encoding     | v1.0, exponent encoding      |
+/// | `0b01`          | v2.0, **512 KB unit count** | v1.1, **exponent encoding**  |
+/// | `0b10`          | not defined                 | v1.2, exponent encoding      |
+///
+/// So `0b01` selects a completely different arithmetic depending on the family, and a decoder that
+/// dispatched on the field alone would read an MMC card's capacity with the high-capacity SD
+/// formula and return a number with no relation to the card. Every MMC layout uses the exponent
+/// encoding; only SD ever uses the unit count.
+///
+/// A card whose structure is not in that table is REFUSED rather than guessed at.
+pub fn csd_sector_count(csd: &[u8; 16], is_mmc: bool) -> BlockResult<u64> {
+    if is_mmc {
+        return match csd[0] >> 6 {
+            0b00 | 0b01 | 0b10 => csd_exponent_sector_count(csd),
+            _ => Err(BlockError::Io),
+        };
+    }
+    match csd[0] >> 6 {
+        0b00 => csd_exponent_sector_count(csd),
         0b01 => {
             let c_size =
                 (u64::from(csd[7] & 0x3F) << 16) | (u64::from(csd[8]) << 8) | u64::from(csd[9]);
@@ -245,6 +346,27 @@ pub fn csd_sector_count(csd: &[u8; 16]) -> BlockResult<u64> {
         }
         _ => Err(BlockError::Io),
     }
+}
+
+/// The exponent-and-multiplier encoding, shared by SD's v1 layout and by every MMC layout:
+/// capacity = `(C_SIZE + 1) * 2^(C_SIZE_MULT + 2) * 2^READ_BL_LEN` bytes. Divided by the 512-byte
+/// sector this seam presents, which is why the shift subtracts 9.
+///
+/// The fields sit at identical bit positions in both families, which is why one function serves
+/// both -- but that is a fact worth stating rather than leaving to be noticed, because the
+/// SELECTOR above them differs even where the arithmetic does not.
+fn csd_exponent_sector_count(csd: &[u8; 16]) -> BlockResult<u64> {
+    let c_size =
+        (u64::from(csd[6] & 0x03) << 10) | (u64::from(csd[7]) << 2) | (u64::from(csd[8]) >> 6);
+    let c_size_mult = (u64::from(csd[9] & 0x03) << 1) | (u64::from(csd[10]) >> 7);
+    let read_bl_len = u64::from(csd[5] & 0x0F);
+    if read_bl_len < 9 {
+        return Err(BlockError::Io);
+    }
+    if c_size == 0xFFF {
+        return Err(BlockError::Io);
+    }
+    Ok((c_size + 1) << (c_size_mult + 2 + read_bl_len - 9))
 }
 
 #[cfg(test)]
@@ -291,7 +413,7 @@ mod tests {
         csd[7] = ((c_size >> 16) & 0x3F) as u8;
         csd[8] = ((c_size >> 8) & 0xFF) as u8;
         csd[9] = (c_size & 0xFF) as u8;
-        assert_eq!(csd_sector_count(&csd), Ok(8192 * 1024));
+        assert_eq!(csd_sector_count(&csd, false), Ok(8192 * 1024));
         assert_eq!(8192u64 * 1024 * 512, 4 * 1024 * 1024 * 1024);
     }
 
@@ -307,7 +429,7 @@ mod tests {
         let c_size_mult: u32 = 5;
         csd[9] = ((c_size_mult >> 1) & 0x03) as u8;
         csd[10] = ((c_size_mult & 1) << 7) as u8;
-        assert_eq!(csd_sector_count(&csd), Ok(3752 * 128));
+        assert_eq!(csd_sector_count(&csd, false), Ok(3752 * 128));
     }
 
     #[test]
@@ -315,13 +437,59 @@ mod tests {
         let mut csd = [0u8; 16];
         csd[0] = 0x00;
         csd[5] = 4;
-        assert_eq!(csd_sector_count(&csd), Err(BlockError::Io));
+        assert_eq!(csd_sector_count(&csd, false), Err(BlockError::Io));
     }
 
     #[test]
     fn an_unknown_csd_version_is_refused() {
         let mut csd = [0u8; 16];
         csd[0] = 0xC0;
-        assert_eq!(csd_sector_count(&csd), Err(BlockError::Io));
+        assert_eq!(csd_sector_count(&csd, false), Err(BlockError::Io));
+    }
+
+    const MMC_128MB_CSD: [u8; 16] = [
+        0x90, 0x26, 0x01, 0x2a, 0x0f, 0x59, 0x00, 0xf4, 0xf6, 0xdb, 0x1f, 0xff, 0x92, 0x40, 0x40,
+        0x2f,
+    ];
+
+    #[test]
+    fn an_mmc_csd_structure_2_decodes_with_the_exponent_encoding() {
+        assert_eq!(csd_sector_count(&MMC_128MB_CSD, true), Ok(250_880));
+        assert_eq!(250_880u64 * 512, 128_450_560);
+    }
+
+    #[test]
+    fn the_same_register_read_as_sd_is_refused_rather_than_misdecoded() {
+        assert_eq!(csd_sector_count(&MMC_128MB_CSD, false), Err(BlockError::Io));
+    }
+
+    #[test]
+    fn structure_1_means_different_arithmetic_on_the_two_families() {
+        let mut csd = [0u8; 16];
+        csd[0] = 0x40;
+        csd[5] = 9;
+        csd[7] = 0xF4;
+        csd[8] = 0xF6;
+        csd[9] = 0xDB;
+        csd[10] = 0x1F;
+        let as_sd = csd_sector_count(&csd, false).unwrap();
+        let as_mmc = csd_sector_count(&csd, true).unwrap();
+        assert_ne!(
+            as_sd, as_mmc,
+            "if these agree the family argument is doing nothing and the bug is back"
+        );
+        assert_eq!(as_sd, 3_554_373_632);
+        assert_eq!(as_mmc, 250_880);
+    }
+
+    #[test]
+    fn a_high_capacity_mmc_is_refused_by_its_sentinel_not_given_a_wrong_size() {
+        let mut csd = [0u8; 16];
+        csd[0] = 0x80;
+        csd[5] = 9;
+        csd[6] = 0x03;
+        csd[7] = 0xFF;
+        csd[8] = 0xC0;
+        assert_eq!(csd_sector_count(&csd, true), Err(BlockError::Io));
     }
 }

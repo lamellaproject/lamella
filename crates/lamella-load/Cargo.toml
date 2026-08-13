@@ -14,8 +14,7 @@ lamella-token = { path = "../lamella-token" }
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
 # The closed generic instantiation set and the canonical spelling that names each one. Optional
 # because it is the `generics` capability's cost: a profile that refuses generics outright should
-# not link a closure walk. THE SAME crate the AOT tier consumes -- one collector, one spelling, and
-# the spelling is a v1-frozen wire identity that must not have a second implementation.
+# not link a closure walk. THE SAME crate the AOT tier consumes -- one collector, one spelling.
 lamella-generics = { path = "../lamella-generics", optional = true }
 [features]
 # Mirror lamella-cil-runtime's BCL surface tiers + capability knobs, so a minimal loader build
@@ -27,6 +26,9 @@ default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transce
 # program naming `Pair<int,string>` runs instead of being refused. OFF turns the whole pass into the
 # refusal that preceded it -- `ProfileViolation::UnloweredGeneric` still names every call site, so a
 # build without this capability REFUSES a generic program rather than mis-running one.
+#
+# It is a capability rather than an always-on because it links the closure walk and the canonical
+# speller, and a profile with no use for generics should not carry them.
 generics = ["dep:lamella-generics"]
 bcl = ["lamella-cil-runtime/bcl"]
 NETMFv4_4 = ["bcl", "lamella-cil-runtime/NETMFv4_4"]
@@ -90,7 +92,15 @@ corlib-lazy = ["flash-image"]
 # The FAT backend (with the mkfs formatter) -- so a test can install a real RAM-disk StorageProvider
 # (MemoryBlockDevice + format + FatFs) and prove the mount-provider seam end to end over a real fs.
 lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }
-lamella-aot = { path = "../lamella-aot", default-features = false }
+# The acceptance instrument builds the monomorphizer's instantiation-set parameter with the REAL
+# collector rather than a second one. It used to reach it through a `lamella-aot` dev-dependency,
+# with a comment saying the line goes away when the collector is extracted to a leaf both tiers can
+# consume. IT WAS EXTRACTED: `lamella_aot::generics` is now literally `pub use lamella_generics`,
+# so the edge to the AOT backend was buying a re-export and pulling a code generator behind it.
+#
+# Listed here as well as in `[dependencies]` because there it is OPTIONAL (the `generics`
+# capability) and a test must compile on a build that does not select it.
+lamella-generics = { path = "../lamella-generics" }
 
 [lints]
 workspace = true

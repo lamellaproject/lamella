@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn columns_count_utf16_code_units() {
-        let source = "a = \"😀\"; b";
+        let source = "a = \"\u{1F600}\"; b";
         let map = LineMap::new(source);
         let b = source.find('b').unwrap() as u32;
         assert_eq!(map.position(source, b), (1, 11));

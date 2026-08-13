@@ -22,7 +22,11 @@ namespace System.Threading
         }
 
         public Timer(TimerCallback callback, object state, TimeSpan dueTime, TimeSpan period)
-            : this(callback, state, (int)dueTime.TotalMilliseconds, (int)period.TotalMilliseconds)
+            : this(
+                callback,
+                state,
+                (int)(dueTime.Ticks / TimeSpan.TicksPerMillisecond),
+                (int)(period.Ticks / TimeSpan.TicksPerMillisecond))
         {
         }
 
@@ -53,7 +57,9 @@ namespace System.Threading
 
         public bool Change(TimeSpan dueTime, TimeSpan period)
         {
-            return Change((int)dueTime.TotalMilliseconds, (int)period.TotalMilliseconds);
+            return Change(
+                (int)(dueTime.Ticks / TimeSpan.TicksPerMillisecond),
+                (int)(period.Ticks / TimeSpan.TicksPerMillisecond));
         }
 
         public void Dispose()

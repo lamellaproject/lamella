@@ -1,7 +1,8 @@
 //! Positional completion (the IntelliSense engine) for Python, clause-agnostic so the in-browser
 //! IDE and an editor extension drive the same logic rather than each growing its own.
 
-use crate::ast::{Expr, FuncDef, ModuleAst, ParamDef, Stmt};
+use crate::ast::{Expr, FuncDef, ModuleAst, ParamDef, Stmt, StmtKind};
+use crate::profile::{Capability, Profile};
 use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -89,6 +90,211 @@ const KEYWORDS: &[&str] = &[
     "with", "yield",
 ];
 
+/// One built-in global: its name, the signature shown beside it, whether it is a type, and the
+/// [`Capability`] an image must provide for it to work at all.
+struct BuiltinName {
+    label: &'static str,
+    signature: &'static str,
+    is_type: bool,
+    needs: Option<Capability>,
+}
+
+/// The built-in globals this runtime resolves an unbound name to.
+///
+/// **Deliberately NOT "Python's built-ins".** It is the set `lamella-py-runtime`'s `builtin_id`
+/// answers for -- the names a `LoadGlobal` actually falls back to -- with its own signatures, so the
+/// editor describes THIS interpreter rather than CPython. Offering a name CPython has and this
+/// runtime does not is the exact lie this engine's second rule forbids, and the list is checked
+/// against the interpreter by a test in the crate that can see both (this one cannot).
+///
+/// `is_type` says the name constructs a value of its own type here, which is what decides the icon.
+/// It is FALSE for `enumerate`/`filter`/`map`/`reversed`/`zip` -- types in CPython, eager list
+/// producers in this runtime -- because the editor previews what runs.
+///
+/// The compiler-internal `__match_class__` is absent: it has a `builtin_id` entry because the match
+/// desugar emits calls to it, and it is not a name anybody writes.
+const BUILTINS: &[BuiltinName] = &[
+    BuiltinName { label: "abs", signature: "abs(x)", is_type: false, needs: None },
+    BuiltinName { label: "all", signature: "all(iterable)", is_type: false, needs: None },
+    BuiltinName { label: "any", signature: "any(iterable)", is_type: false, needs: None },
+    BuiltinName { label: "ascii", signature: "ascii(obj)", is_type: false, needs: None },
+    BuiltinName { label: "bin", signature: "bin(i)", is_type: false, needs: None },
+    BuiltinName { label: "bool", signature: "bool([x])", is_type: true, needs: None },
+    BuiltinName {
+        label: "bytearray",
+        signature: "bytearray([source[, encoding]])",
+        is_type: true,
+        needs: None,
+    },
+    BuiltinName {
+        label: "bytes",
+        signature: "bytes([source[, encoding]])",
+        is_type: true,
+        needs: None,
+    },
+    BuiltinName { label: "callable", signature: "callable(x)", is_type: false, needs: None },
+    BuiltinName { label: "chr", signature: "chr(i)", is_type: false, needs: None },
+    BuiltinName {
+        label: "classmethod",
+        signature: "classmethod(func)",
+        is_type: true,
+        needs: None,
+    },
+    BuiltinName {
+        label: "complex",
+        signature: "complex([real[, imag]])",
+        is_type: true,
+        needs: Some(Capability::Complex),
+    },
+    BuiltinName { label: "delattr", signature: "delattr(obj, name)", is_type: false, needs: None },
+    BuiltinName { label: "dict", signature: "dict([pairs])", is_type: true, needs: None },
+    BuiltinName {
+        label: "dir",
+        signature: "dir([obj])",
+        is_type: false,
+        needs: Some(Capability::Introspection),
+    },
+    BuiltinName { label: "divmod", signature: "divmod(a, b)", is_type: false, needs: None },
+    BuiltinName {
+        label: "enumerate",
+        signature: "enumerate(iterable[, start])",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName {
+        label: "filter",
+        signature: "filter(func_or_None, iterable)",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName {
+        label: "float",
+        signature: "float([x])",
+        is_type: true,
+        needs: Some(Capability::Float),
+    },
+    BuiltinName { label: "format", signature: "format(value[, spec])", is_type: false, needs: None },
+    BuiltinName {
+        label: "frozenset",
+        signature: "frozenset([iterable])",
+        is_type: true,
+        needs: None,
+    },
+    BuiltinName {
+        label: "getattr",
+        signature: "getattr(obj, name[, default])",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName { label: "globals", signature: "globals()", is_type: false, needs: None },
+    BuiltinName { label: "hasattr", signature: "hasattr(obj, name)", is_type: false, needs: None },
+    BuiltinName { label: "hash", signature: "hash(x)", is_type: false, needs: None },
+    BuiltinName { label: "hex", signature: "hex(i)", is_type: false, needs: None },
+    BuiltinName { label: "id", signature: "id(x)", is_type: false, needs: None },
+    BuiltinName { label: "int", signature: "int([x])", is_type: true, needs: None },
+    BuiltinName {
+        label: "isinstance",
+        signature: "isinstance(x, classinfo)",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName {
+        label: "issubclass",
+        signature: "issubclass(cls, classinfo)",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName { label: "iter", signature: "iter(x)", is_type: false, needs: None },
+    BuiltinName { label: "len", signature: "len(s)", is_type: false, needs: None },
+    BuiltinName { label: "list", signature: "list([iterable])", is_type: true, needs: None },
+    BuiltinName { label: "locals", signature: "locals()", is_type: false, needs: None },
+    BuiltinName {
+        label: "map",
+        signature: "map(func, *iterables)",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName { label: "max", signature: "max(a, b, ...)", is_type: false, needs: None },
+    BuiltinName { label: "memoryview", signature: "memoryview(obj)", is_type: true, needs: None },
+    BuiltinName { label: "min", signature: "min(a, b, ...)", is_type: false, needs: None },
+    BuiltinName {
+        label: "next",
+        signature: "next(iterator[, default])",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName { label: "object", signature: "object()", is_type: true, needs: None },
+    BuiltinName { label: "oct", signature: "oct(i)", is_type: false, needs: None },
+    BuiltinName { label: "open", signature: "open(path, mode='r')", is_type: false, needs: None },
+    BuiltinName { label: "ord", signature: "ord(c)", is_type: false, needs: None },
+    BuiltinName { label: "pow", signature: "pow(base, exp[, mod])", is_type: false, needs: None },
+    BuiltinName { label: "print", signature: "print(*args)", is_type: false, needs: None },
+    BuiltinName {
+        label: "property",
+        signature: "property(fget[, fset[, fdel]])",
+        is_type: true,
+        needs: None,
+    },
+    BuiltinName {
+        label: "range",
+        signature: "range([start,] stop[, step])",
+        is_type: true,
+        needs: None,
+    },
+    BuiltinName { label: "repr", signature: "repr(x)", is_type: false, needs: None },
+    BuiltinName { label: "reversed", signature: "reversed(seq)", is_type: false, needs: None },
+    BuiltinName { label: "round", signature: "round(x[, ndigits])", is_type: false, needs: None },
+    BuiltinName { label: "set", signature: "set([iterable])", is_type: true, needs: None },
+    BuiltinName {
+        label: "setattr",
+        signature: "setattr(obj, name, value)",
+        is_type: false,
+        needs: None,
+    },
+    BuiltinName { label: "slice", signature: "slice([start,] stop[, step])", is_type: true, needs: None },
+    BuiltinName { label: "sleep_ms", signature: "sleep_ms(ms)", is_type: false, needs: None },
+    BuiltinName { label: "sorted", signature: "sorted(iterable)", is_type: false, needs: None },
+    BuiltinName {
+        label: "staticmethod",
+        signature: "staticmethod(func)",
+        is_type: true,
+        needs: None,
+    },
+    BuiltinName { label: "str", signature: "str(x)", is_type: true, needs: None },
+    BuiltinName { label: "sum", signature: "sum(iterable[, start])", is_type: false, needs: None },
+    BuiltinName { label: "tuple", signature: "tuple([iterable])", is_type: true, needs: None },
+    BuiltinName { label: "type", signature: "type(x)", is_type: true, needs: None },
+    BuiltinName { label: "vars", signature: "vars(obj)", is_type: false, needs: None },
+    BuiltinName { label: "zip", signature: "zip(*iterables)", is_type: false, needs: None },
+];
+
+/// The built-in names offered under `profile`, in table order.
+///
+/// Public because the check that keeps this list honest cannot live here: this crate does not depend
+/// on `lamella-py-runtime`, so only a consumer that sees both can compare the offered names with the
+/// interpreter's own. A list nothing compares is a list that drifts.
+#[must_use]
+pub fn builtin_names(profile: Profile) -> Vec<&'static str> {
+    BUILTINS
+        .iter()
+        .filter(|b| b.needs.is_none_or(|c| profile.supports(c)))
+        .map(|b| b.label)
+        .collect()
+}
+
+/// The [`Capability`] built-in `name` needs, `None` if it needs none, and `None` too for a name that
+/// is not a built-in at all.
+///
+/// The two `None`s are not worth separating for the callers this has: an editor explaining why a
+/// name is missing has already been told it is missing, and a gate checking the list already knows
+/// which names are built-ins. What matters is that the ANSWER lives here, beside the list it gates,
+/// rather than being restated as a word list wherever the question comes up -- a list of one is
+/// still a list, and the second entry is the one nobody adds.
+#[must_use]
+pub fn builtin_capability(name: &str) -> Option<Capability> {
+    BUILTINS.iter().find(|b| b.label == name).and_then(|b| b.needs)
+}
+
 /// Completions for the caret at byte `offset` in `source`.
 ///
 /// After `self.` inside a method, or `Name.` where `Name` is a class defined in this file, the
@@ -101,16 +307,35 @@ const KEYWORDS: &[&str] = &[
 ///
 /// Never fails. Unparseable source yields the best list still derivable, and in the worst case an
 /// empty one.
+///
+/// Offers the built-ins of an image that provides every capability. An editor previewing a
+/// knob-limited tier wants [`complete_for_profile`].
 #[must_use]
 pub fn complete(source: &str, offset: usize) -> Vec<CompletionItem> {
+    complete_for_profile(source, offset, Profile::FULL)
+}
+
+/// [`complete`] for an image whose capability [`Profile`] is `profile`: a built-in the image does
+/// not carry is not offered.
+///
+/// This is the editor half of the promise the compiler makes in
+/// [`crate::compile_str_for_profile`], and it must be given the SAME value -- an editor filtered by
+/// one profile while the build runs another is worse than an unfiltered one, because it looks
+/// authoritative.
+///
+/// It filters the SURFACE, not the syntax. A float LITERAL still completes and still parses on a
+/// no-float tier; what tells the developer is the compile error at that line. Completion cannot
+/// carry that half, and a list quietly missing `float` would not explain itself.
+#[must_use]
+pub fn complete_for_profile(source: &str, offset: usize, profile: Profile) -> Vec<CompletionItem> {
     let caret = Caret::at(source, offset);
     let module = parse_repaired(source, &caret);
 
     let mut items = match (&caret.receiver, &module) {
         (Some(receiver), Some(module)) => member_completions(module, receiver, caret.offset, source),
         (Some(_), None) => Vec::new(),
-        (None, Some(module)) => scope_completions(module, caret.offset, source),
-        (None, None) => fallback_completions(source),
+        (None, Some(module)) => scope_completions(module, caret.offset, source, profile),
+        (None, None) => fallback_completions(source, profile),
     };
 
     if !caret.prefix.is_empty() {
@@ -219,7 +444,7 @@ fn member_completions(
 fn collect_class_members(body: &[Stmt], items: &mut Vec<CompletionItem>) {
     for stmt in body {
         match undecorated(stmt) {
-            Stmt::FuncDef(func) => {
+            StmtKind::FuncDef(func) => {
                 items.push(CompletionItem::new(
                     &func.name,
                     CompletionKind::Method,
@@ -227,14 +452,14 @@ fn collect_class_members(body: &[Stmt], items: &mut Vec<CompletionItem>) {
                 ));
                 collect_self_assignments(&func.body, items);
             }
-            Stmt::Assign(assign) => {
+            StmtKind::Assign(assign) => {
                 items.push(CompletionItem::new(
                     &assign.target,
                     CompletionKind::Field,
                     "",
                 ));
             }
-            Stmt::ClassDef { name, .. } => {
+            StmtKind::ClassDef { name, .. } => {
                 items.push(CompletionItem::new(name, CompletionKind::Class, ""));
             }
             _ => {}
@@ -246,20 +471,25 @@ fn collect_class_members(body: &[Stmt], items: &mut Vec<CompletionItem>) {
 /// (an attribute set inside an `if` is no less an attribute).
 fn collect_self_assignments(body: &[Stmt], items: &mut Vec<CompletionItem>) {
     for stmt in body {
-        if let Stmt::SetAttr { obj, attr, .. } = stmt {
+        if let StmtKind::SetAttr { obj, attr, .. } = &stmt.kind {
             if matches!(obj, Expr::Name(n) if n == "self") {
                 items.push(CompletionItem::new(attr, CompletionKind::Field, ""));
             }
         }
-        for block in child_blocks(stmt) {
+        for block in child_blocks(&stmt.kind) {
             collect_self_assignments(block, items);
         }
     }
 }
 
 /// The names visible at the caret: the enclosing function's parameters and locals, then the
-/// module's own top-level bindings, then the keywords.
-fn scope_completions(module: &ModuleAst, offset: usize, source: &str) -> Vec<CompletionItem> {
+/// module's own top-level bindings, then the keywords and the image's built-ins.
+fn scope_completions(
+    module: &ModuleAst,
+    offset: usize,
+    source: &str,
+    profile: Profile,
+) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     if let Some(func) = enclosing_function(&module.body, offset, source) {
         for param in &func.params {
@@ -272,10 +502,23 @@ fn scope_completions(module: &ModuleAst, offset: usize, source: &str) -> Vec<Com
         collect_bindings(&func.body, &mut items);
     }
     collect_bindings(&module.body, &mut items);
+    push_keywords_and_builtins(&mut items, profile);
+    items
+}
+
+/// The names that do not depend on the file at all: the keywords the lexer accepts, and the
+/// built-ins the target image carries.
+fn push_keywords_and_builtins(items: &mut Vec<CompletionItem>, profile: Profile) {
     for keyword in KEYWORDS {
         items.push(CompletionItem::new(keyword, CompletionKind::Keyword, ""));
     }
-    items
+    for builtin in BUILTINS {
+        if builtin.needs.is_some_and(|c| !profile.supports(c)) {
+            continue;
+        }
+        let kind = if builtin.is_type { CompletionKind::Class } else { CompletionKind::Function };
+        items.push(CompletionItem::new(builtin.label, kind, builtin.signature));
+    }
 }
 
 /// The names a statement list binds, descending into nested blocks but NOT into nested function or
@@ -283,24 +526,24 @@ fn scope_completions(module: &ModuleAst, offset: usize, source: &str) -> Vec<Com
 fn collect_bindings(body: &[Stmt], items: &mut Vec<CompletionItem>) {
     for stmt in body {
         match undecorated(stmt) {
-            Stmt::FuncDef(func) => items.push(CompletionItem::new(
+            StmtKind::FuncDef(func) => items.push(CompletionItem::new(
                 &func.name,
                 CompletionKind::Function,
                 &signature(func),
             )),
-            Stmt::ClassDef { name, .. } => {
+            StmtKind::ClassDef { name, .. } => {
                 items.push(CompletionItem::new(name, CompletionKind::Class, ""));
             }
-            Stmt::Assign(assign) => {
+            StmtKind::Assign(assign) => {
                 items.push(CompletionItem::new(&assign.target, CompletionKind::Local, ""));
             }
-            Stmt::Import { modules } => {
+            StmtKind::Import { modules } => {
                 for (module, alias) in modules {
                     let bound = crate::ast::import_bound_name(module, alias);
                     items.push(CompletionItem::new(bound, CompletionKind::Module, module));
                 }
             }
-            Stmt::ImportFrom { module, names } => {
+            StmtKind::ImportFrom { module, names } => {
                 for (name, bound) in names {
                     let detail = if name == bound {
                         format!("from {module}")
@@ -310,18 +553,18 @@ fn collect_bindings(body: &[Stmt], items: &mut Vec<CompletionItem>) {
                     items.push(CompletionItem::new(bound, CompletionKind::Local, &detail));
                 }
             }
-            Stmt::For { target, .. } | Stmt::ForIter { target, .. } | Stmt::AsyncFor { target, .. } => {
+            StmtKind::For { target, .. } | StmtKind::ForIter { target, .. } | StmtKind::AsyncFor { target, .. } => {
                 items.push(CompletionItem::new(target, CompletionKind::Local, ""));
             }
-            Stmt::With { optional_name, .. } | Stmt::AsyncWith { optional_name, .. } => {
+            StmtKind::With { optional_name, .. } | StmtKind::AsyncWith { optional_name, .. } => {
                 if let Some(name) = optional_name {
                     items.push(CompletionItem::new(name, CompletionKind::Local, ""));
                 }
             }
             _ => {}
         }
-        if !matches!(undecorated(stmt), Stmt::FuncDef(_) | Stmt::ClassDef { .. }) {
-            for block in child_blocks(stmt) {
+        if !matches!(undecorated(stmt), StmtKind::FuncDef(_) | StmtKind::ClassDef { .. }) {
+            for block in child_blocks(&stmt.kind) {
                 collect_bindings(block, items);
             }
         }
@@ -329,16 +572,16 @@ fn collect_bindings(body: &[Stmt], items: &mut Vec<CompletionItem>) {
 }
 
 /// The statement lists nested directly inside `stmt`.
-fn child_blocks(stmt: &Stmt) -> Vec<&[Stmt]> {
-    match stmt {
-        Stmt::If { body, orelse, .. } | Stmt::While { body, orelse, .. } => {
+fn child_blocks(kind: &StmtKind) -> Vec<&[Stmt]> {
+    match kind {
+        StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
             alloc::vec![body.as_slice(), orelse.as_slice()]
         }
-        Stmt::For { body, orelse, .. }
-        | Stmt::ForIter { body, orelse, .. }
-        | Stmt::AsyncFor { body, orelse, .. } => alloc::vec![body.as_slice(), orelse.as_slice()],
-        Stmt::With { body, .. } | Stmt::AsyncWith { body, .. } => alloc::vec![body.as_slice()],
-        Stmt::Try {
+        StmtKind::For { body, orelse, .. }
+        | StmtKind::ForIter { body, orelse, .. }
+        | StmtKind::AsyncFor { body, orelse, .. } => alloc::vec![body.as_slice(), orelse.as_slice()],
+        StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => alloc::vec![body.as_slice()],
+        StmtKind::Try {
             body,
             handlers,
             orelse,
@@ -353,9 +596,9 @@ fn child_blocks(stmt: &Stmt) -> Vec<&[Stmt]> {
 }
 
 /// A decorated definition's inner statement, else the statement itself.
-fn undecorated(stmt: &Stmt) -> &Stmt {
-    match stmt {
-        Stmt::Decorated { inner, .. } => inner,
+fn undecorated(stmt: &Stmt) -> &StmtKind {
+    match &stmt.kind {
+        StmtKind::Decorated { inner, .. } => &inner.kind,
         other => other,
     }
 }
@@ -380,10 +623,10 @@ fn class_body<'a>(module: &'a ModuleAst, name: &str) -> Option<&'a [Stmt]> {
     fn search<'a>(body: &'a [Stmt], name: &str) -> Option<&'a [Stmt]> {
         for stmt in body {
             match undecorated(stmt) {
-                Stmt::ClassDef { name: found, body, .. } if found == name => {
+                StmtKind::ClassDef { name: found, body, .. } if found == name => {
                     return Some(body.as_slice())
                 }
-                Stmt::FuncDef(func) => {
+                StmtKind::FuncDef(func) => {
                     if let Some(found) = search(&func.body, name) {
                         return Some(found);
                     }
@@ -415,7 +658,7 @@ fn enclosing_function<'a>(body: &'a [Stmt], offset: usize, source: &str) -> Opti
     fn find<'a>(body: &'a [Stmt], name: &str) -> Option<&'a FuncDef> {
         for stmt in body {
             match undecorated(stmt) {
-                Stmt::FuncDef(func) => {
+                StmtKind::FuncDef(func) => {
                     if func.name == name {
                         return Some(func);
                     }
@@ -423,7 +666,7 @@ fn enclosing_function<'a>(body: &'a [Stmt], offset: usize, source: &str) -> Opti
                         return Some(found);
                     }
                 }
-                Stmt::ClassDef { body, .. } => {
+                StmtKind::ClassDef { body, .. } => {
                     if let Some(found) = find(body, name) {
                         return Some(found);
                     }
@@ -484,13 +727,12 @@ fn indent_of(line: &str) -> usize {
 /// The names a file defines, scanned from the token stream when the source will not parse at all.
 ///
 /// Deliberately shallow: it offers what the file declares with no scope analysis, because at this
-/// point the alternative is an empty list. The keywords are always available, since they do not
-/// depend on the file being well formed.
-fn fallback_completions(source: &str) -> Vec<CompletionItem> {
-    let mut items: Vec<CompletionItem> = KEYWORDS
-        .iter()
-        .map(|k| CompletionItem::new(k, CompletionKind::Keyword, ""))
-        .collect();
+/// point the alternative is an empty list. The keywords and built-ins are always available, since
+/// neither depends on the file being well formed -- and the profile still gates the built-ins here,
+/// because a file that does not parse is exactly when a developer is still typing.
+fn fallback_completions(source: &str, profile: Profile) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = Vec::new();
+    push_keywords_and_builtins(&mut items, profile);
     for line in source.lines() {
         let trimmed = line.trim_start();
         let rest = trimmed.strip_prefix("async ").unwrap_or(trimmed);
@@ -536,10 +778,11 @@ mod tests {
     #[test]
     fn a_partial_name_offers_the_definitions_of_the_file() {
         let items = at("def alpha():\n    pass\n\ndef beta():\n    pass\n\nal|\n");
-        assert_eq!(labels(&items), vec!["alpha"], "filtered by the typed prefix");
+        assert_eq!(labels(&items), vec!["all", "alpha"], "filtered by the typed prefix");
         assert_eq!(kind_of(&items, "alpha"), Some(CompletionKind::Function));
-        assert_eq!(items[0].insert_text, "alpha(");
-        assert_eq!(items[0].detail, "def alpha()");
+        let alpha = items.iter().find(|i| i.label == "alpha").expect("the file's own def");
+        assert_eq!(alpha.insert_text, "alpha(");
+        assert_eq!(alpha.detail, "def alpha()");
     }
 
     #[test]
@@ -656,5 +899,67 @@ mod tests {
             1,
             "a name bound twice appears once"
         );
+    }
+
+    /// Complete at the caret marked `|` in `marked`, for an image with `profile`.
+    fn at_profile(marked: &str, profile: Profile) -> Vec<CompletionItem> {
+        let offset = marked.find('|').expect("the test source marks a caret with |");
+        let source = marked.replacen('|', "", 1);
+        complete_for_profile(&source, offset, profile)
+    }
+
+    #[test]
+    fn the_builtins_are_offered_with_the_runtime_s_own_signatures() {
+        let items = at("pri|\n");
+        assert_eq!(labels(&items), vec!["print"]);
+        assert_eq!(kind_of(&items, "print"), Some(CompletionKind::Function));
+        assert_eq!(items[0].detail, "print(*args)");
+        assert_eq!(items[0].insert_text, "print(");
+        assert_eq!(kind_of(&at("dic|\n"), "dict"), Some(CompletionKind::Class));
+        assert!(!labels(&at("__|\n")).contains(&"__match_class__"));
+    }
+
+    #[test]
+    fn a_disabled_capability_removes_its_builtin_from_the_list() {
+        let no_float = Profile::FULL.without(Capability::Float);
+        assert!(labels(&at_profile("flo|\n", Profile::FULL)).contains(&"float"));
+        assert!(
+            !labels(&at_profile("flo|\n", no_float)).contains(&"float"),
+            "a no-float image has no float()"
+        );
+
+        assert!(!labels(&at_profile("comp|\n", no_float)).contains(&"complex"));
+        assert!(labels(&at_profile("comp|\n", Profile::FULL)).contains(&"complex"));
+
+        let no_dir = Profile::FULL.without(Capability::Introspection);
+        assert!(labels(&at_profile("di|\n", Profile::FULL)).contains(&"dir"));
+        assert!(!labels(&at_profile("di|\n", no_dir)).contains(&"dir"));
+    }
+
+    #[test]
+    fn the_editor_and_the_compiler_read_the_same_profile() {
+        for profile in [Profile::FULL, Profile::FULL.without(Capability::Float), Profile::BARE] {
+            let offered = labels(&at_profile("flo|\n", profile)).contains(&"float");
+            let compiles = crate::compile_str_for_profile("m", "x = 1.5\n", profile).is_ok();
+            assert_eq!(
+                offered, compiles,
+                "the editor and the compiler disagree about float on {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_that_will_not_parse_still_gates_its_builtins() {
+        let broken = "def f(:\n    flo|\n";
+        assert!(labels(&at_profile(broken, Profile::FULL)).contains(&"float"));
+        assert!(!labels(&at_profile(broken, Profile::FULL.without(Capability::Float)))
+            .contains(&"float"));
+    }
+
+    #[test]
+    fn a_file_s_own_names_are_never_gated() {
+        let source = "def float(x):\n    return x\n\nflo|\n";
+        let items = at_profile(source, Profile::FULL.without(Capability::Float));
+        assert_eq!(kind_of(&items, "float"), Some(CompletionKind::Function));
     }
 }

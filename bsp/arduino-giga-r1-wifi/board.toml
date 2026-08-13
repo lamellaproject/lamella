@@ -1,5 +1,33 @@
 # BOARD binding: the Arduino GIGA R1 WiFi, an STM32H747XIH6 on Arduino's ABX00063 in the Mega form
 # factor.
+#
+# THIS BOARD HAS NO ON-BOARD DEBUGGER AND NO USB-SERIAL BRIDGE, AND BOTH ABSENCES ARE DELIBERATE
+# rather than unrecorded. The user manual's component table names every populated integrated circuit
+# -- the microcontroller, the SDRAM, the flash, the secure element, the wireless module and two buck
+# converters -- and none of them is a debug probe or a serial bridge. What the board offers instead
+# is a six-pin JTAG header with no probe fitted, and a USB-C connector wired to the microcontroller's
+# OWN device controller. So the carrier below is `native-usb`, and it names neither a baud nor an
+# operating point, because a rate is a property of a wire that has one and this wire does not.
+#
+# THE FOUR HEADER SERIAL PORTS ARE A SECOND CARRIER THAT IS NOT DECLARED HERE. The pinout gives
+# Serial0 through Serial3 as PA9/PB7, PD5/PD6, PH13/PI9 and PG14/PC7, and each is a real path to a
+# host through an EXTERNAL dongle. Binding one would need its own operating point and its own
+# divisor, and the choice of which is not a fact this document settles, so no uart binding is
+# stated and none is implied.
+#
+# THE USER BUTTON IS THE BOOT0 BUTTON, WHICH IS A HARDER FACT THAN IT LOOKS. The schematic runs
+# ONE net to both the microcontroller's PC13 ball and its BOOT0 ball, so a program may read the
+# button freely at run time, but a unit powered up with it held enters the system bootloader
+# instead of the application. The device row below states the pin a program reads; it cannot state
+# what the same pin does to a reset, and nothing here should be read as saying the button is free
+# of consequence at power-on.
+#
+# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the 16 Mbytes of QSPI NOR flash and the
+# 8 Mbytes of SDRAM (both fitted, both belonging to the external-memory stratum, and the SDRAM is
+# the one a summary of this board is most likely to miss), the wireless module and its antenna
+# connector, the secure element, the camera and display connectors, the audio jack and its two
+# converter outputs, the USB 2.0 type A host connector, the 16 MHz oscillator and the 32.768 kHz
+# crystal, and the power LED, which no pin drives.
 
 [table]
 kind = "board"
@@ -16,6 +44,11 @@ sources = [
     "Arduino GIGA R1 WiFi schematics (ABX00063 V1.6), sheet STM32H747.SchDoc: R4, 100 kohm, holds the BOOT0/PC13 net to ground, and that net reaches the microcontroller at ball E8 (BOOT0) and at ball E3 (PC13). The same sheet gives PA0_C ball T1, PA1_C ball T2, PC2_C ball R1 and PC3_C ball R2, beside PA0 at N5, PA1 at N4, PC2 at M3 and PC3 at M4.",
 ]
 notes = [
+    "THE RGB LED IS ONE COMPONENT AND IT IS DESCRIBED HERE AS THREE, WHICH IS THE MODEL'S LIMIT RATHER THAN THE BOARD'S SHAPE. DL2 is a single part with one common anode and three cathodes, and three independent output rows say nothing about their sharing a package, a supply or a duty budget. A program that drives all three at once is driving one component through three descriptions, and the file cannot say so.",
+    "THE ANALOG HEADER PINS A8 THROUGH A11 REACH PADS THIS FILE CANNOT NAME, and the board is what makes the distinction unmissable: its analog header carries A7 = PA0 and A11 = PA0_C as two separate header pins, A5 = PC2 beside A8 = PC2_C, and A4 = PC3 beside A9 = PC3_C. Those are different balls of the same package -- N5 against T1, M3 against R1, M4 against R2 -- and the part's own datasheet says outright that a Pxy_C pad and its Pxy pad are two separate pads. A pin name in this model is a port letter and an index, so the four have no name to be given, and writing the unsuffixed name for one of them would claim a pin the header already reaches at a different position. They are therefore absent from the part's pin list, not marked unavailable in it.",
+    "THE USER MANUAL AND THE PINOUT DISAGREE ABOUT A8 THROUGH A11 AND THE PART'S DATASHEET SETTLES IT. The manual's analog pinout table describes all twelve analog pins identically, as 'Analog input N /GPIO'; the pinout drawing carries a boxed warning that the last four are analog only with no GPIO peripherals. The datasheet's pin table gives those four pads the pin type ANA where every neighbouring row reads I/O, so the drawing is right and the table is wrong, and no row here is derived from that table.",
+    "THE VENDOR'S OWN WEB SUMMARY OF THIS BOARD OMITS THE SDRAM, AND THE DOCUMENTS DO NOT. The 8 Mbytes are stated four times over -- in the manual's features list, in its onboard-memories section, in its front-view component table as U3, and on the schematic as an AS4C4M16SA-6BIN -- so the fitted part is not in doubt and no third-party source is needed to establish it. It is left unmodelled here for the same reason the other external memory is: a region belongs to the external-memory stratum and needs its controller brought up first.",
+    "NO OPERATING POINT IS STATED, AND THAT IS A CONSEQUENCE OF THE CARRIER RATHER THAN AN OMISSION. A plan exists for divisors to derive from; with no uart binding there is nothing to derive, and the value that a native-USB wire actually constrains -- the 48 MHz the device controller needs -- is not a rate this schema carries or checks. Stating the part's reset clock here would describe an operating point nothing on the board holds it to.",
 ]
 
 # --- the carrier ------------------------------------------------------------------------------
@@ -30,6 +63,25 @@ kind = "native-usb"
 default = true
 
 # --- control lines ----------------------------------------------------------------------------
+#
+# ALL THREE LEDS SINK AND THE POLARITY IS READ FROM THE WIRING, NOT FROM A WORD. The component
+# table calls DL2 a common anode LED, which is a strong reading and not a diagram; the schematic
+# settles it directly by putting DL2's pin 4 on +3V3 and running each of the three cathodes through
+# its own 330 ohm resistor to a microcontroller pin. The pin is the driven end of the diode, so it
+# sinks, and a leg lights when its pin is driven LOW.
+#
+# AND THAT IS THE OPPOSITE OF THE OTHER STM32H7 CARRIER DESCRIBED FOR THIS FAMILY, whose three
+# user LEDs are on when the I/O is high and off when it is low, in its own manual's words. One
+# family, two carriers, opposite conventions on the pins a first program drives: a reader who
+# learned the rule from one gets the other wrong three times, and dark is exactly what a wrong
+# polarity and a missing wire look like alike. Polarity is a per-BOARD reading, never a per-family
+# or per-vendor one.
+#
+# THE OPENING WRITE IS ALSO NOT THE ONE A DRIVER WOULD EXPECT. Pins on this part come out of
+# reset in ANALOG mode rather than as inputs, so a program that sets or clears an output register
+# without first putting the pin in output mode drives nothing at all. That is a chip fact and it
+# lives on the gpio block table; it is repeated here because these four rows are the first thing
+# anyone drives on a new carrier.
 
 [[devices]]
 name = "led_red"

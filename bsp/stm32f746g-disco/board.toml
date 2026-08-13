@@ -102,6 +102,133 @@ function = "AF4"
 scl = { pin = "PB8" }
 sda = { pin = "PB9" }
 
+# --- the expansion socket -----------------------------------------------------------------------
+#
+# THE SOCKET IS BOARD TRUTH AND WHAT IS PLUGGED INTO IT IS NOT. Four connectors carry one standard
+# header between them, it is on the schematic, and it is identical on every unit -- so it is stated
+# here. Which shield is in it today is not a property of this board and appears nowhere below.
+#
+# A SOCKET IS NOT ONE PROTOCOL, WHICH IS THE WHOLE REASON THIS ROW HAS TWO KINDS OF LINE. The I2C
+# pair reaches the header as a bus a binding already serves, so it is named ONCE, by that role: the
+# role states the instance, the pins and the mux function, and restating them here would put one
+# wire in two places. Every other position is a single line, named for the hole a shield plugs into
+# and carrying the pin behind it. Which of them an attached module uses is a property of the module.
+#
+# WHAT THE POSITIONS BELOW DO *NOT* SAY. A position names a pin, never a peripheral: the manual
+# marks D0/D1 as USART6, D11/D12/D13 as SPI2 and eight positions as timer channels, and none of
+# those is bound here because this family places no usart6 or spi2 instance. A program reaching one
+# of these positions today drives it as a port pin. When those instances land, a serial or SPI row
+# joins this socket the way the I2C one already has, and the positions it covers leave the list
+# below -- one wire, one statement, in whichever form is the stronger.
+#
+# TWO SOCKETS THIS BOARD ALSO HAS ARE DELIBERATELY ABSENT. The I2C extension connector and the
+# camera connector carry the same bus on the same two pins, and both are this vendor's own headers
+# rather than a published standard. A connector row names a standard so that a module can be matched
+# to a socket, and there is no standard to name for either, so they stay in the prose above.
+#
+# THE SUPPLY IS THE ONE THING A SOCKET CANNOT SETTLE FOR WHAT PLUGS INTO IT. The header brings out
+# both a 3.3 V and a 5 V rail because the standard requires both, and section 7.3 cautions that this
+# part's I/O are 3.3 V where the standard's original are 5 V. An expansion board that carries a
+# jumper choosing its own logic rail therefore decides, from the far side of this socket, whether
+# what arrives on these pins is inside the part's rating. That is a property of the attached board
+# and no row here can state it.
+
+[[connectors]]
+name = "arduino"
+standard = "arduino-uno-v3"
+source = "UM1907 Rev 7 section 7.3: CN4, CN5, CN6 and CN7 are female connectors compatible with the ARDUINO standard and support ARDUINO Uno V3. Its Table 6 gives every position: A0 = PA0, A1 = PF10, A2 = PF9, A3 = PF8, A4 = PF7, A5 = PF6, D0 = PC7, D1 = PC6, D2 = PG6, D3 = PB4, D4 = PG7, D5 = PI0, D6 = PH6, D7 = PI3, D8 = PI2, D9 = PA15, D10 = PA8, D11 = PB15, D12 = PB14, D13 = PI1, D14 = PB9, D15 = PB8. Twenty of the twenty-two are stated a second time by that manual's per-ball I/O assignment table, which carries each as an ARDUINO position; it does not carry PB14 or PB15, and its silence is not a contradiction of the table that names them. Eight of the positions were also exercised on silicon before this table existed: a run with an expansion board fitted to these connectors drove D11, D12 and D13 as an SPI bus at PB15, PB14 and PI1, walked D10, D9 and D6 as candidate chip selects at PA8, PA15 and PH6, and clocked A4 and A5 as a software-driven bus at PF7 and PF6. The part it reached answered a JEDEC identity on 100 of 100 trials, against a control that had to fail first, and it answered through D10 -- so PA8 is a measured pin rather than a table reading, and all eight agree with the manual."
+
+# The I2C pair, named once by the role that serves it. This is the pair a shield finds at D14/D15
+# and NOT at A4/A5 -- see the solder-bridge paragraph above, which is what makes that the board's
+# answer rather than the standard's.
+[[connectors.arduino.buses]]
+signal = "i2c"
+role = "header-i2c"
+
+# The analog positions. All six are ADC3 channels on this board, which is what the pair of solder
+# bridges on each of A4 and A5 settles in favour of.
+[[connectors.arduino.pins]]
+signal = "a0"
+pin = "PA0"
+
+[[connectors.arduino.pins]]
+signal = "a1"
+pin = "PF10"
+
+[[connectors.arduino.pins]]
+signal = "a2"
+pin = "PF9"
+
+[[connectors.arduino.pins]]
+signal = "a3"
+pin = "PF8"
+
+[[connectors.arduino.pins]]
+signal = "a4"
+pin = "PF7"
+
+[[connectors.arduino.pins]]
+signal = "a5"
+pin = "PF6"
+
+# The digital positions, D0 through D13. D14 and D15 are absent because the bus above brings them
+# out; a shield's SDA and SCL reach this board through that role.
+[[connectors.arduino.pins]]
+signal = "d0"
+pin = "PC7"
+
+[[connectors.arduino.pins]]
+signal = "d1"
+pin = "PC6"
+
+[[connectors.arduino.pins]]
+signal = "d2"
+pin = "PG6"
+
+[[connectors.arduino.pins]]
+signal = "d3"
+pin = "PB4"
+
+[[connectors.arduino.pins]]
+signal = "d4"
+pin = "PG7"
+
+[[connectors.arduino.pins]]
+signal = "d5"
+pin = "PI0"
+
+[[connectors.arduino.pins]]
+signal = "d6"
+pin = "PH6"
+
+[[connectors.arduino.pins]]
+signal = "d7"
+pin = "PI3"
+
+[[connectors.arduino.pins]]
+signal = "d8"
+pin = "PI2"
+
+[[connectors.arduino.pins]]
+signal = "d9"
+pin = "PA15"
+
+[[connectors.arduino.pins]]
+signal = "d10"
+pin = "PA8"
+
+[[connectors.arduino.pins]]
+signal = "d11"
+pin = "PB15"
+
+[[connectors.arduino.pins]]
+signal = "d12"
+pin = "PB14"
+
+[[connectors.arduino.pins]]
+signal = "d13"
+pin = "PI1"
+
 # --- external memory -----------------------------------------------------------------------
 #
 # THIS BOARD HAS MEMORY OUTSIDE THE CHIP, and it is two regions rather than one.
@@ -211,7 +338,7 @@ data_lines = 1
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
-source = "100 of 100 cold bring-ups at a 16 MHz interface clock, where the part answered 6 -- its datasheet's own figure -- and read back 100 of 100 at that. Both counts are observations of this part; the count is not a constant of it."
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, where the part answered 6. Measured again on 2026-07-29 by the same firmware at the same clock, walking every count in the range rather than every second one, it answered 8 -- its datasheet's own figure -- and read back 100 of 100 at that. Both counts are observations of this part; the count is not a constant of it."
 
 [[memory.qspi.reads]]
 name = "quad_output_read"
@@ -222,6 +349,7 @@ data_lines = 4
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, data on four lines and the address still on one, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 8 and read back 100 of 100 at that."
 
 [[memory.qspi.reads]]
 name = "quad_io_read"
@@ -232,6 +360,7 @@ data_lines = 4
 clock_hz = 16000000
 dummy = 6
 dummy_datasheet = 8
+source = "100 of 100 cold bring-ups at a 16 MHz interface clock, address and data both on four lines, where the part answered 6. Measured again on 2026-07-29 at the same clock it answered 10 -- the figure associated with this part's full-rate quad I/O -- and read back 100 of 100 at that. The largest gap of the four, on the fastest configuration."
 
 [memory.sdram.device]
 part = "MT48LC4M32B2B5-6A"  # the fitted device, named by the board schematic. What it IS -- a
@@ -281,6 +410,44 @@ refresh_rows = 4096          # ...across 4096 of them. THE COUNT IS NOT HERE: it
 refresh_burst = 8
 settle_us = 100
 source = "All 8 accessible Mbytes swept word by word, then 100 cold bring-ups out of 100, each ending in a read after a wait of 300 ms -- several times the 64 ms the device is specified to hold for, which is the only check that proves refresh is running rather than that the memory has not decayed yet. The negative control drove the bank's select line as a plain output held high and failed 5 times out of 5. The settling delay and the auto-refresh burst are the reference manual's TYPICAL figures rather than the fitted device's own. The part is named above now, so what stands between these two figures and the device's own is its datasheet; both are values where longer and more are safe, so the typicals are the conservative choice until then."
+
+# --- discriminators ----------------------------------------------------------------------------
+#
+# WHAT THIS BOARD CAN BE ASKED, so an image built for it can be told at attach time whether the
+# board in front of it is the board it assumed. The chip's identity register cannot answer that:
+# both regions above are soldered OUTSIDE the die, so this board with nothing fitted and this
+# board fully populated answer the same identity.
+#
+# EACH ROW STATES THE CLAIM IT REACHES, and the rung a successful read of its kind establishes.
+# The rungs are the ones a part table's `[sourcing] validation` already uses -- `identified` (it
+# answered its identity register) and `exercised` (it produced measurements a driver decoded).
+#
+# A REGION'S ACCESSIBLE SIZE IS REACHABLE ONLY AT `exercised`, and the sdram region above is why:
+# the fitted part is 16 Mbytes and this board wires 8 of them. An identity read describes the
+# DEVICE, so it is right about the part and wrong about the memory. That region also has no
+# identity to read at all -- an SDRAM carries no such register -- so `identified` is not merely
+# weaker there, it is unavailable.
+#
+# THE QSPI IS DELIBERATELY LEFT SHORT OF ITS CLAIM. Its identity is a real discriminator and it is
+# stated below, but an identity is not an accessible size, and no NON-DESTRUCTIVE read of this
+# region has been stated that would establish one. A reconciliation therefore reports that region
+# unreached rather than counting the identity as if it settled the size.
+
+[[discriminators]]
+name = "qspi-jedec"
+confirms = "memory:qspi"
+reads = "the fitted quad-SPI NOR's JEDEC identity, over the region's single-line `read` configuration -- the one command with no dummy phase, so it needs no count established first"
+validation = "identified"
+expect = 0x20BA18
+source = "The identity this board's fitted N25Q128A13EF840E answers, recorded in the [memory.qspi.device] record above and read off the wire rather than transcribed. A device that is absent, unpowered or unselected answers no identity."
+
+[[discriminators]]
+name = "sdram-sweep"
+confirms = "memory:sdram"
+reads = "with the fmc controller configured, a write-then-read sweep of the region, answering the number of bytes that read back what was written"
+validation = "exercised"
+expect = 0x800000
+source = "UM1907 Rev 7 section 6.13: 8 Mbytes of the fitted 128-Mbit device are accessible, which is the figure the region's `size` states. What a sweep answers is the ACCESSIBLE size and not the device's own, which is the distinction an identity read cannot make on this board."
 
 [[plans]]
 name = "hsi-16mhz"

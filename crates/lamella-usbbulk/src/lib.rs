@@ -37,6 +37,56 @@ impl std::error::Error for Error {}
 /// A USB bulk operation result.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Whether a device's reported identity satisfies a requested serial.
+///
+/// A SUBSTRING test, and the direction is the whole point: `wanted` must appear in `actual`, never
+/// the reverse. Windows names a device by an instance id that CONTAINS its serial among other
+/// fields, so an equality test would reject the very device asked for -- while the reverse test
+/// would accept a board whose serial is merely a prefix of the one asked for, which is a different
+/// board. Case-insensitive because the same serial reaches us in either case depending on which
+/// layer reported it.
+pub(crate) fn serial_matches(wanted: &str, actual: &str) -> bool {
+    actual.to_ascii_uppercase().contains(&wanted.to_ascii_uppercase())
+}
+
+/// Whether one candidate device is eligible for this open -- the single decision every backend
+/// makes, so that they make it the same way.
+///
+/// `reported` NONE with a serial requested is a NO: a device that does not say who it is cannot be
+/// the device you named, and a missing string is not a wildcard.
+///
+/// `wanted` NONE is a YES for everything. Choosing among several unnamed candidates belongs to the
+/// layer that knows what the caller asked for, which is where an ambiguous unnamed open is refused.
+///
+pub(crate) fn candidate_satisfies(wanted: Option<&str>, reported: Option<&str>) -> bool {
+    match wanted {
+        None => true,
+        Some(wanted) => reported.is_some_and(|actual| serial_matches(wanted, actual)),
+    }
+}
+
+/// Picks the first eligible candidate, or REFUSES -- never falls back to a device that was not asked
+/// for.
+///
+/// The refusal is the contract: a request that names no attached device fails, rather than returning
+/// one that was not asked for.
+///
+/// A backend whose candidates are not values -- a live handle that must be released, or a device that
+/// will not report its serial until it is opened -- calls [`candidate_satisfies`] in its own loop
+/// instead and fails closed by running out of candidates.
+///
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn select_requested<T>(
+    candidates: impl IntoIterator<Item = T>,
+    wanted: Option<&str>,
+    serial_of: impl Fn(&T) -> Option<&str>,
+) -> Result<T> {
+    candidates
+        .into_iter()
+        .find(|c| candidate_satisfies(wanted, serial_of(c)))
+        .ok_or(Error::NotFound)
+}
+
 /// A bulk USB device discovered by [`enumerate`].
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -200,3 +250,84 @@ mod imp;
 mod imp;
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 compile_error!("lamella-usbbulk supports macOS, Linux, and Windows");
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, Result, candidate_satisfies, select_requested, serial_matches};
+
+
+    /// Candidates are (serial, tag); the tag stands for whatever the platform hands back.
+    fn pick<'a>(candidates: &[(Option<&'a str>, &'a str)], wanted: Option<&str>) -> Result<&'a str> {
+        select_requested(candidates.iter().copied(), wanted, |(serial, _)| *serial)
+            .map(|(_, tag)| tag)
+    }
+
+    #[test]
+    fn a_serial_matching_nothing_refuses_rather_than_taking_another_device() {
+        let bench = [(Some("AAAA1111"), "board-a"), (Some("BBBB2222"), "board-b")];
+        assert!(matches!(pick(&bench, Some("CCCC3333")), Err(Error::NotFound)));
+    }
+
+    #[test]
+    /// The ordinary case, and it must not depend on position: either board is reachable by name.
+    fn a_serial_picks_its_own_board_from_several_of_one_vendor_and_product() {
+        let bench = [
+            (Some("AAAA1111"), "board-a"),
+            (Some("BBBB2222"), "board-b"),
+            (Some("CCCC3333"), "board-c"),
+        ];
+        assert_eq!(pick(&bench, Some("BBBB2222")).unwrap(), "board-b");
+        assert_eq!(pick(&bench, Some("CCCC3333")).unwrap(), "board-c");
+        assert_eq!(pick(&bench, Some("AAAA1111")).unwrap(), "board-a");
+    }
+
+    #[test]
+    /// No serial requested keeps taking the first candidate. Refusing here would break every
+    /// single-probe caller, and deciding between unnamed candidates belongs to the layer that knows
+    /// what was asked for.
+    fn no_serial_requested_takes_the_first_candidate() {
+        let bench = [(Some("AAAA1111"), "board-a"), (Some("BBBB2222"), "board-b")];
+        assert_eq!(pick(&bench, None).unwrap(), "board-a");
+        assert!(matches!(pick(&[], None), Err(Error::NotFound)));
+    }
+
+    #[test]
+    /// A device reporting no serial cannot satisfy a request for one -- it must be skipped rather
+    /// than treated as a wildcard. It stays eligible when nothing was asked for.
+    fn a_device_with_no_serial_satisfies_no_request_but_is_still_openable_unnamed() {
+        let bench = [(None, "unnamed"), (Some("AAAA1111"), "board-a")];
+        assert_eq!(pick(&bench, Some("AAAA1111")).unwrap(), "board-a");
+        assert!(matches!(pick(&[(None, "unnamed")], Some("AAAA1111")), Err(Error::NotFound)));
+        assert_eq!(pick(&bench, None).unwrap(), "unnamed");
+    }
+
+    #[test]
+    fn the_substring_match_runs_one_way_only() {
+        assert!(serial_matches("EEEE5555FFFF6666", "USB\\VID_39E9&PID_0001\\EEEE5555FFFF6666"));
+        assert!(serial_matches("eeee5555ffff6666", "USB\\VID_39E9&PID_0001\\EEEE5555FFFF6666"));
+        assert!(!serial_matches("EEEE5555FFFF6666", "EEEE5555"));
+        assert!(!serial_matches("AAAA1111", "BBBB2222"));
+    }
+
+    #[test]
+    fn the_candidate_decision_stands_alone_for_a_backend_that_cannot_hand_over_values() {
+        assert!(candidate_satisfies(None, None));
+        assert!(candidate_satisfies(None, Some("AAAA1111")));
+        assert!(candidate_satisfies(Some("AAAA1111"), Some("AAAA1111")));
+        assert!(!candidate_satisfies(Some("AAAA1111"), Some("BBBB2222")));
+        assert!(!candidate_satisfies(Some("AAAA1111"), None));
+    }
+
+    #[test]
+    /// Many boards sharing one vendor and product id, with the requested one enumerating last. A
+    /// first-match search answers `board-a` for every one of these.
+    fn the_requested_board_is_found_however_late_it_enumerates() {
+        let bench: Vec<(Option<&str>, &str)> = (0..9)
+            .map(|i| match i {
+                8 => (Some("9999AAAA8888BBBB"), "the-one-asked-for"),
+                _ => (Some("0000000000000000"), "another-lane's-board"),
+            })
+            .collect();
+        assert_eq!(pick(&bench, Some("9999AAAA8888BBBB")).unwrap(), "the-one-asked-for");
+    }
+}

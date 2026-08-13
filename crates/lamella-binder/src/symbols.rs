@@ -113,6 +113,12 @@ pub struct PropertySymbol {
     /// Whether this declaration provides a `set` accessor.
     pub has_setter: bool,
     /// Whether the property is `required` (C# 11); see [`FieldSymbol::is_required`].
+    ///
+    /// **An imported property's answer comes from the Property TABLE, not from its accessors.**
+    /// The reference reader synthesizes a property from its `get_`/`set_` methods, and
+    /// `RequiredMemberAttribute` sits on the property row -- so a walk over accessors can never
+    /// find it, and would answer `false` for every imported required property without looking like
+    /// it had missed anything.
     pub is_required: bool,
 }
 
@@ -207,13 +213,50 @@ pub struct MethodSymbol {
     /// Whether this constructor carries `[System.Diagnostics.CodeAnalysis.SetsRequiredMembers]`:
     /// it promises to set every `required` member of its type, so an object creation through it
     /// needs no object initializer and draws no `CS9035`.
+    ///
+    /// **MEASURED: this is the ONLY thing that grants the exemption.** Assigning the member in
+    /// an ordinary constructor body does not -- `class C { public required int P; public C() { P = 1; } }`
+    /// still draws CS9035 at `new C()`. The rule is metadata rather than definite assignment,
+    /// which is exactly what lets it hold across an assembly boundary where no body is available
+    /// to inspect. Meaningless on a non-constructor and always `false` there.
     pub sets_required_members: bool,
     /// The names of the method's OWN type parameters, in declaration order -- `["T"]` for
     /// `T Id<T>(T x)`. Empty for every ordinary method, which is every C# 1.0 method.
+    ///
+    /// **THESE ARE THE METHOD'S, NEVER THE DECLARING TYPE'S.** The distinction is the one
+    /// metadata spells `!!0` against `!0`: inside `class Box<T> { U Map<U>(U u) }` the type
+    /// contributes `T` and this list holds only `U`. Merging them would make `Map` look
+    /// two-parameter and let `Map<int, string>(x)` resolve.
+    ///
+    /// **Unlike [`TypeInfo::type_parameters`], this IS load-bearing for resolution rather than
+    /// only for diagnostics.** A type's arity is already mangled into its name
+    /// ([`metadata_type_name`]); a method's is not part of its name at all -- `M()` and `M<T>()`
+    /// are separate overloads distinguished only by this count -- so ECMA-334 14.5.5.1 selects
+    /// candidates by comparing it against the call site's type-argument count.
     pub type_parameters: Vec<Box<str>>,
+    /// The constraints on each of this method's OWN type parameters (25.7), in the same order.
+    ///
+    /// **May be SHORTER than `type_parameters`, unlike the type-level pair**, and
+    /// [`MethodSymbol::constraints_on`] is what makes that safe. A method reaches this model from
+    /// two directions -- collected from source, where the clauses are known, and rebuilt in a
+    /// dozen synthetic sites that have no syntax to read -- so requiring the lengths to match would
+    /// make every synthetic site state a fact it does not have. An absent entry means "nothing
+    /// known", which is the same under-report `is_sealed` takes, and it errs toward accepting.
+    pub type_parameter_constraints: Vec<TypeParameterConstraints>,
 }
 
 impl MethodSymbol {
+    /// The constraints on this method's type parameter at `index`, or `None` when there is no such
+    /// parameter or nothing was recorded for it. See the field for why absence is legal here and
+    /// is not on [`TypeInfo`].
+    #[must_use]
+    pub fn constraints_on(&self, index: usize) -> Option<&TypeParameterConstraints> {
+        if index >= self.type_parameters.len() {
+            return None;
+        }
+        self.type_parameter_constraints.get(index)
+    }
+
     /// The declared name of parameter `index`, or `None` when this method carries no parameter
     /// facts.
     ///
@@ -245,6 +288,18 @@ impl MethodSymbol {
     /// `None` when the argument count does not match the declared parameter count -- the same
     /// refusal-never-partial-substitution rule [`TypeInfo::instantiate`] follows, and for the same
     /// reason: a signature left half-substituted reads as ordinary and means something else.
+    ///
+    /// **THIS IS WHAT MAKES A GENERIC CALL TYPE-CHECK AT ALL, AND ITS ABSENCE IS SILENT.**
+    /// ECMA-334 14.5.5.1: *"the parameters of a generic method are considered AFTER substituting
+    /// the type arguments"*. Bind `Id<string>(1)` against the OPEN method and the argument is
+    /// checked against `T`, which accepts anything -- the call compiles, resolves to the open
+    /// method with `!!0` never substituted, and is wrong. Substituted, the same call is the CS1503
+    /// csc reports. **The difference between correct and catastrophically wrong here produces no
+    /// diagnostic on the failing side, so it can only be caught by a test that asserts the
+    /// REJECTION.**
+    ///
+    /// Substitution is BY NAME, the binder's model throughout -- see [`substitute`], whose doc
+    /// explains why that is the same rule metadata's numbering expresses from the other side.
     #[must_use]
     pub fn instantiate(&self, arguments: &[TypeSymbol]) -> Option<MethodSymbol> {
         if arguments.len() != self.type_parameters.len() {
@@ -287,6 +342,15 @@ pub struct TypeInfo {
     pub methods: Vec<MethodSymbol>,
     /// Names of members this build read the type's metadata for but could NOT decode, so they are
     /// absent from `methods` above.
+    ///
+    /// **THE POINT IS TO STOP A REFUSAL ARRIVING AS AN ABSENCE.** A signature the decoder declines
+    /// -- today, any generic one -- yields `None`, and a consumer that skipped it would report the
+    /// member as not existing. That is a false statement about someone else's assembly: the member
+    /// is there and we cannot read it. Recording the name lets the failing lookup say which of the
+    /// two it is.
+    ///
+    /// **IT DELIBERATELY DOES NOT MAKE THE TYPE UNUSABLE.** The
+    /// refusal has to fire on USE of a specific member and stay silent otherwise.
     pub undecodable_members: Vec<Box<str>>,
     /// The type's field-like events (17.7), in addition to their backing delegate field in
     /// `fields`. Drives `+=`/`-=` routing through the accessors and `CS0070`.
@@ -318,12 +382,84 @@ pub struct TypeInfo {
     pub is_abstract: bool,
     /// The names of the type's declared type parameters, in declaration order -- `["T"]` for
     /// `Box<T>`. Empty for every non-generic type, which is every C# 1.0 type.
+    ///
+    /// This is for DIAGNOSTICS, not for identity: arity is already part of the type's `name`
+    /// ([`metadata_type_name`]), so nothing resolves through this list. It exists because csc names
+    /// the candidate by its parameters -- *Using the generic type 'Box<T>' requires 1 type
+    /// arguments* -- and a message that printed the arity instead would be a different message.
     pub type_parameters: Vec<Box<str>>,
+    /// The constraints on each declared type parameter (25.7), in the same order and ALWAYS the
+    /// same length as `type_parameters` -- a parameter with no `where` clause gets an empty entry
+    /// rather than a missing one.
+    ///
+    /// **Length equality is an invariant, not a coincidence, and [`TypeInfo::constraints_on`] is
+    /// how it is read** so that a desynchronized pair cannot silently index the wrong parameter.
+    /// Two parallel vectors are a shape that drifts when a new case lands in one of them; keeping
+    /// the read behind an accessor is what makes a drift a `None` rather than a wrong answer.
+    ///
+    /// Unlike `type_parameters` this IS load-bearing: it decides whether `Box<int>` is legal, and
+    /// it is what the `GenericParam` flag word and the `GenericParamConstraint` rows are built from.
+    pub type_parameter_constraints: Vec<TypeParameterConstraints>,
+}
+
+/// The resolved constraints on ONE type parameter (ECMA-334 4th ed 25.7).
+///
+/// **The three flag constraints and the named ones are separate fields because metadata separates
+/// them**: `class`/`struct`/`new()` are bits in the `GenericParam` flag word (II.23.1.7) while a
+/// named class, interface or type parameter is a `GenericParamConstraint` ROW (II.22.21). Modeling
+/// all four as a list of "constraints" would put the encoding decision at every read site.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypeParameterConstraints {
+    /// `where T : class` -- the argument must be a reference type. Metadata `0x0004`.
+    pub reference_type: bool,
+    /// `where T : struct` -- the argument must be a non-nullable value type. Metadata `0x0008`.
+    ///
+    /// **This IMPLIES the default-constructor bit in metadata but NOT in this model.** II.10.1.7
+    /// requires an emitter that sets `0x0008` to set `0x0010` with it, because every value type has
+    /// a parameterless constructor; the source, however, may not write both (CS0451). Keeping the
+    /// source fact here and applying the implication at emission is what lets the check and the
+    /// encoding disagree honestly rather than one of them being wrong.
+    pub value_type: bool,
+    /// `where T : new()` -- the argument must have a public parameterless constructor. Metadata
+    /// `0x0010`.
+    pub default_constructor: bool,
+    /// The named class, interface and type-parameter constraints, in source order. Each becomes one
+    /// `GenericParamConstraint` row.
+    pub types: Vec<TypeSymbol>,
+}
+
+impl TypeParameterConstraints {
+    /// Whether nothing was written -- the state of every parameter with no `where` clause, and of
+    /// every type parameter in a C# 1.0 compilation.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.reference_type
+            && !self.value_type
+            && !self.default_constructor
+            && self.types.is_empty()
+    }
+
+    /// Whether the argument is required to have an accessible parameterless constructor -- written
+    /// `new()`, or implied by `struct`. This is the test `new T()` (CS0304) asks.
+    #[must_use]
+    pub fn requires_default_constructor(&self) -> bool {
+        self.default_constructor || self.value_type
+    }
 }
 
 /// A type's METADATA name: the declared name with its generic arity mangled in, per ECMA-335
 /// II.10.7.2 (`Box<T>` is `` Box`1 ``). An arity of 0 is the name unchanged, so every ordinary type
 /// is untouched.
+///
+/// **THIS IS AN IDENTITY RULE, NOT A DISPLAY ONE.** Arity is PART of a generic type's name --
+/// `Box`, `Box<T>` and `Box<T,U>` are three unrelated types that may all be declared in one
+/// namespace, and only the mangled spelling tells them apart. A model keyed by the bare name
+/// collapses them, which is why a wrong arity used to resolve to whichever one was collected.
+///
+/// It is the ONE spelling: a definition read from a reference assembly already arrives mangled, and
+/// this function is what makes a definition read from SOURCE arrive the same way, so the two sources
+/// meet in one key space. It is NOT the instantiation spelling -- naming `Box<int>` is
+/// `lamella_aot::generics::TypeArg::spell`'s job and must never be re-implemented here.
 #[must_use]
 pub fn metadata_type_name(name: &str, arity: usize) -> String {
     if arity == 0 {
@@ -333,8 +469,104 @@ pub fn metadata_type_name(name: &str, arity: usize) -> String {
     }
 }
 
+/// The generic arity mangled into a metadata type name: 1 for `` List`1 ``, 0 for `List`.
+///
+/// Only a NUMERIC tail is an arity -- `` Box`Extra `` is an ordinary type whose name happens to
+/// contain a backtick, and reading it as one would silently renumber it. Same rule
+/// [`crate::resolve::TypeTable::candidates`] applies searching the other way.
+#[must_use]
+pub fn mangled_arity(name: &str) -> usize {
+    match name.rsplit_once('`') {
+        Some((_, tail)) => tail.parse().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// [`metadata_type_name`] undone: `` Box`1 `` -> `Box`, and any other name unchanged.
+///
+/// **THE TWO SPELLINGS ARE NOT INTERCHANGEABLE AND THE COMPILER CANNOT TELL THEM APART.**
+/// [`TypeSymbol::Instantiation`]'s `definition` holds the last part UNMANGLED -- every consumer
+/// (`open_field`, `open_method`, [`definition_symbol`]) mangles the arity back in from the argument
+/// count -- while a [`TypeInfo`]'s `name` holds it MANGLED, because that is the model's key. Both
+/// are `Box<str>`, so handing one where the other is wanted type-checks and asks the model for
+/// `` Box`1`1 ``, a name nothing declares: the lookup misses, the caller falls through to a path
+/// that erases the instantiation, and no diagnostic is produced.
+///
+/// Only a NUMERIC tail is an arity, for [`mangled_arity`]'s reason. Applies to ONE part: a nested
+/// definition's ENCLOSING parts stay mangled, which is what lets [`definition_metadata_name`]
+/// recover how many parameters the last part introduces on its own.
+#[must_use]
+pub fn unmangled_type_name(name: &str) -> Box<str> {
+    match name.rsplit_once('`') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+            Box::from(head)
+        }
+        _ => Box::from(name),
+    }
+}
+
+/// A generic DEFINITION's metadata name: its last part with the arity **it itself declares**
+/// mangled in, given the whole instantiation's argument count.
+///
+/// **A NESTED TYPE'S ARITY IS NOT ITS INSTANTIATION'S ARGUMENT COUNT, AND THAT IS THE ONE CASE
+/// [`metadata_type_name`] CANNOT BE ASKED DIRECTLY.** `List<T>.Enumerator` is spelled
+/// `` List`1/Enumerator `` in metadata -- **`Enumerator`, with no suffix**, because a nested type's
+/// mangled name carries only the parameters it introduces (II.10.7.2) while the enclosing type's
+/// are supplied by the `GenericInst` wrapped around it. So `List<int>.Enumerator` is one type
+/// ARGUMENT over a definition of arity ZERO, and mangling that argument count into the last part
+/// asks for `` Enumerator`1 `` -- a name no assembly declares. Measured: it then resolved by simple
+/// name to `` System.Diagnostics.Activity.Enumerator`1 `` out of a diagnostics package, and the
+/// image threw `TypeLoadException` on load.
+///
+/// The arity the enclosing types already account for is read back off the definition's own
+/// preceding parts, which carry it: a nested type is keyed with its enclosing type's FULL NAME
+/// standing in for the namespace ([`crate::reference`] and `declaration.rs` both do this), so
+/// `` ["System","Collections","Generic","List`1","Enumerator"] `` says 1 of the 1 argument belongs
+/// to `` List`1 ``. A namespace segment never carries a backtick, so summing over every preceding
+/// part is the same answer as summing over the enclosing types alone.
+///
+/// **THE RULE HAD TEN IMPLEMENTATIONS AND THE NESTED CASE WOULD HAVE LANDED IN ONE.** Every
+/// consumer of an instantiation re-mangles its definition from the argument count -- the model's
+/// four lookups, the emitter's token key, the arity refusal, the constraint check. They call this
+/// instead, because a rule with several homes gains a new case in a subset of them and the subset
+/// is usually empty.
+#[must_use]
+pub fn definition_metadata_name(definition: &[Box<str>], arguments: usize) -> String {
+    let Some((name, enclosing)) = definition.split_last() else {
+        return String::new();
+    };
+    let inherited: usize = enclosing.iter().map(|part| mangled_arity(part)).sum();
+    metadata_type_name(name, arguments.saturating_sub(inherited))
+}
+
+/// An instantiation's generic DEFINITION as the plain named symbol every token table and model
+/// holds it under -- the definition's parts with [`definition_metadata_name`] applied to the last.
+///
+/// This is the spelling both a source-collected and a reference-read definition arrive with, so it
+/// is the one key space the two meet in.
+#[must_use]
+pub fn definition_symbol(definition: &[Box<str>], arguments: usize) -> TypeSymbol {
+    let mut parts: Vec<Box<str>> = definition.to_vec();
+    if let Some(last) = parts.last_mut() {
+        *last = definition_metadata_name(definition, arguments).into();
+    }
+    TypeSymbol::Named(parts.into())
+}
+
 /// `ty` with every type parameter named in `bindings` replaced by its argument, recursing through
 /// every position a parameter can hide in.
+///
+/// **SUBSTITUTION IS BY NAME HERE, AND THAT IS THE BINDER'S MODEL RATHER THAN A SHORTCUT.** A
+/// metadata signature numbers its parameters (`!0`, and `lamella_aot::generics::TypeArg` matches
+/// that model because it decodes signatures), but the binder never sees a number: `T` inside
+/// `class Box<T>` is an ordinary [`TypeSymbol::Named`] that resolves because
+/// `Binder::enter_type_parameters` put `T` in scope for the length of the declaration. Substituting
+/// by name is therefore the SAME rule from the other side, and it lands on C#'s own scoping rule --
+/// a type parameter hides any type of that name (ECMA-334 1st ed 10.8) -- so a member written
+/// against an outer type called `T` is one the language already says means the parameter.
+///
+/// **A name NOT in `bindings` is left alone**, which is what keeps an ordinary type whose name
+/// happens to be short from being rewritten.
 fn substitute(ty: &TypeSymbol, bindings: &BTreeMap<&str, &TypeSymbol>) -> TypeSymbol {
     match ty {
         TypeSymbol::Named(parts) => match parts.split_first() {
@@ -386,14 +618,42 @@ impl TypeInfo {
             is_sealed: false,
             is_abstract: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         }
+    }
+
+    /// The constraints on the type parameter at `index`, or `None` if there is no such parameter.
+    ///
+    /// **Reading through this rather than indexing `type_parameter_constraints` is what keeps a
+    /// length drift honest.** The two vectors are built together and are meant to stay the same
+    /// length; a build that added a parameter without its entry would, on a raw index, either panic
+    /// or silently read the NEXT parameter's constraints and enforce the wrong rule. Here it
+    /// answers `None`, which every caller already has to handle for a non-generic type.
+    #[must_use]
+    pub fn constraints_on(&self, index: usize) -> Option<&TypeParameterConstraints> {
+        if index >= self.type_parameters.len() {
+            return None;
+        }
+        self.type_parameter_constraints.get(index)
     }
 
     /// This generic DEFINITION closed over `arguments`: the same members, with every mention of a
     /// type parameter replaced by the corresponding argument, so `Box<int>.Get()` returns `int`
     /// where `Box<T>.Get()` returns `T`.
     ///
-    /// `None` when the argument count does not match the declared parameter count.
+    /// `None` when the argument count does not match the declared parameter count. **That is a
+    /// refusal, never a partial substitution**, and it is the same rule
+    /// `lamella_aot::generics::TypeArg::substitute` follows for a parameter number it cannot
+    /// close: a member left half-substituted is a signature that reads as ordinary and means
+    /// something else. `resolve_type` reports CS0305 before it gets here, so this is the structural
+    /// guard behind that diagnostic rather than a second one.
+    ///
+    /// **THE TYPE'S OWN `name` IS THE DEFINITION'S, DELIBERATELY.** Naming an instantiation is
+    /// the canonical spelling's job, `lamella_aot::generics::TypeArg::spell` is the only
+    /// implementation of it, and it is a frozen wire value -- a second spelling that agreed
+    /// today and diverged on the first nested argument would give a baker-lowered and a
+    /// device-instantiated `List<int>` different names, which is the cast hole the generics
+    /// identity rule exists to close. This carries the members and leaves the name alone.
     #[must_use]
     pub fn instantiate(&self, arguments: &[TypeSymbol]) -> Option<TypeInfo> {
         if arguments.len() != self.type_parameters.len() {
@@ -514,6 +774,12 @@ impl Model {
 
     /// The type a [`TypeSymbol`] refers to, if present. A predefined type resolves
     /// to its `System.<Name>` reference type; array and error types have none.
+    ///
+    /// **A [`Cow`] BECAUSE ONE ARM CANNOT BORROW.** Every other type is a row in this model and
+    /// is handed back by reference; an INSTANTIATION is not a row and its members are computed, so
+    /// it is the one answer this model has to own. Returning `&TypeInfo` was what forced the
+    /// instantiation arm to answer `None`, and `None` there is not "no members" -- it is a type
+    /// whose every member lookup silently fails.
     #[must_use]
     pub fn get_by_symbol(&self, ty: &TypeSymbol) -> Option<Cow<'_, TypeInfo>> {
         match ty {
@@ -530,8 +796,11 @@ impl Model {
                 definition,
                 arguments,
             } => {
-                let (namespace, name) = split_named(definition);
-                let definition = self.get(&namespace, &metadata_type_name(name, arguments.len()))?;
+                let (namespace, _) = split_named(definition);
+                let definition = self.get(
+                    &namespace,
+                    &definition_metadata_name(definition, arguments.len()),
+                )?;
                 Some(Cow::Owned(definition.instantiate(arguments)?))
             }
             TypeSymbol::Array { .. }
@@ -539,6 +808,147 @@ impl Model {
             | TypeSymbol::ByRef(_)
             | TypeSymbol::Error => None,
         }
+    }
+
+    /// The OPEN declaration behind a member reached through an INSTANTIATED generic type, with the
+    /// definition's type-parameter NAMES beside it: `(["T"], Box<T>.Get() -> T)` for a `Get()`
+    /// resolved on `Box<int>`.
+    ///
+    /// **THE OPEN SIGNATURE CANNOT BE RECOVERED FROM THE CLOSED ONE**, which is the same reason
+    /// `MethodInstantiation` exists one axis over: after substitution `Box<int>.Get()` reads
+    /// `int Get()`, indistinguishable from an ordinary `int Get()` on a non-generic type.
+    /// ECMA-335 4th ed II.23.2.1 wants the DEFINITION's signature on the `MemberRef`, so emission
+    /// has to be handed what substitution consumed.
+    ///
+    /// **THE MEMBER IS IDENTIFIED BY SUBSTITUTING, NOT BY POSITION.** `TypeInfo::instantiate`
+    /// clones member-for-member, so an index would work today and would break silently the first
+    /// time anything filters or reorders that list -- and a wrong-but-plausible open signature is
+    /// exactly the failure this whole area cannot see. Substituting each candidate and comparing
+    /// against the parameters overload resolution actually chose asks the question in the same
+    /// terms the answer was produced in.
+    ///
+    /// `None` for a non-instantiated type, for a definition not in the model, and for a member
+    /// that does not match -- emission then refuses rather than writing a `!n` it guessed.
+    #[must_use]
+    pub fn open_member(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> Option<(Vec<Box<str>>, MethodSymbol)> {
+        let TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } = declaring
+        else {
+            return None;
+        };
+        let (namespace, _) = split_named(definition);
+        let open = self.get(
+            &namespace,
+            &definition_metadata_name(definition, arguments.len()),
+        )?;
+        if open.type_parameters.len() != arguments.len() {
+            return None;
+        }
+        let bindings: BTreeMap<&str, &TypeSymbol> = open
+            .type_parameters
+            .iter()
+            .map(|parameter| &**parameter)
+            .zip(arguments.iter())
+            .collect();
+        let candidates = if name == ".ctor" {
+            &open.constructors
+        } else {
+            &open.methods
+        };
+        let member = candidates.iter().find(|candidate| {
+            &*candidate.name == name
+                && candidate.parameters.len() == parameters.len()
+                && candidate
+                    .parameters
+                    .iter()
+                    .zip(parameters)
+                    .all(|(open_ty, closed)| substitute(open_ty, &bindings) == *closed)
+        })?;
+        Some((open.type_parameters.clone(), member.clone()))
+    }
+
+    /// [`Model::open_member`] for a PROPERTY ACCESSOR, which is not in `methods` to be found.
+    ///
+    /// **A SOURCE-DECLARED PROPERTY CONTRIBUTES A `PropertySymbol` AND NO ACCESSOR METHODS**, so
+    /// `open_member` searching `methods` for `get_Item` finds nothing and answers `None` -- which
+    /// the caller reads as "not reached through an instantiation" and which silently drops back to
+    /// naming the definition's open accessor. The accessor signature is DERIVED here instead: a
+    /// getter takes nothing and returns the property's open type, a setter takes that type and
+    /// returns void.
+    ///
+    /// `want_setter` picks which. Returns the definition's type-parameter names beside the open
+    /// signature, exactly as [`Model::open_member`] does, so both feed one `TypeInstantiation`.
+    #[must_use]
+    pub fn open_property_accessor(
+        &self,
+        declaring: &TypeSymbol,
+        property: &str,
+        want_setter: bool,
+    ) -> Option<(Vec<Box<str>>, Vec<TypeSymbol>, TypeSymbol)> {
+        let TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } = declaring
+        else {
+            return None;
+        };
+        let (namespace, _) = split_named(definition);
+        let open = self.get(
+            &namespace,
+            &definition_metadata_name(definition, arguments.len()),
+        )?;
+        if open.type_parameters.len() != arguments.len() {
+            return None;
+        }
+        let declared = open.find_property(property)?;
+        let open_ty = declared.ty.clone();
+        Some(if want_setter {
+            (
+                open.type_parameters.clone(),
+                alloc::vec![open_ty],
+                TypeSymbol::Special(SpecialType::Void),
+            )
+        } else {
+            (open.type_parameters.clone(), Vec::new(), open_ty)
+        })
+    }
+
+    /// [`Model::open_member`] for a FIELD: the definition's type-parameter names and the field's
+    /// type BEFORE substitution, for a field reached through an instantiated generic type.
+    ///
+    /// A field has no overloads, so it is found by NAME alone -- there is nothing to disambiguate
+    /// and no substitute-and-compare step. `None` for a non-instantiated type, and for a
+    /// definition or field not in the model.
+    #[must_use]
+    pub fn open_field(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+    ) -> Option<(Vec<Box<str>>, TypeSymbol)> {
+        let TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } = declaring
+        else {
+            return None;
+        };
+        let (namespace, _) = split_named(definition);
+        let open = self.get(
+            &namespace,
+            &definition_metadata_name(definition, arguments.len()),
+        )?;
+        if open.type_parameters.len() != arguments.len() {
+            return None;
+        }
+        let field = open.find_field(name)?;
+        Some((open.type_parameters.clone(), field.ty.clone()))
     }
 
     /// Resolves each type's base *class* -- the first of its declared bases that is
@@ -793,9 +1203,58 @@ impl SignatureCanon {
             TypeSymbol::ByRef(inner) => {
                 TypeSymbol::ByRef(alloc::boxed::Box::new(self.canonicalize(inner)))
             }
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => {
+                let canonical_arguments: Vec<TypeSymbol> = arguments
+                    .iter()
+                    .map(|argument| self.canonicalize(argument))
+                    .collect();
+                TypeSymbol::Instantiation {
+                    definition: canonical_definition(definition, arguments.len(), |mangled| {
+                        self.map.get(mangled).cloned().flatten()
+                    }),
+                    arguments: canonical_arguments.into(),
+                }
+            }
             other => other.clone(),
         }
     }
+}
+
+/// An instantiation's DEFINITION rewritten to the qualified form `lookup` gives for its
+/// ARITY-MANGLED name (II.10.7.2), with the source spelling put back in the last part --
+/// `["Box"]` at arity 1 becomes `["App", "Box"]` when the model holds `App.Box`1`.
+///
+/// **THIS RULE HAS THREE CALLERS AND HAD BEEN WRITTEN IN NONE OF THEM.** A simple name is
+/// qualified in three places -- the use-site resolver, [`SignatureCanon::canonicalize`], and
+/// `Binder::canonicalize` -- each with its own lookup, and every one handled `Named`, arrays and
+/// pointers while falling through on an instantiation. The result was one spelling with three
+/// answers: `Box<int>` resolved in a local declaration, was silently left unqualified in a
+/// parameter, and had no members either way. The lookups genuinely differ (a prebuilt map, a model
+/// query); the RULE does not, so it lives here once.
+///
+/// The mangling is applied for the LOOKUP and undone for the RESULT, deliberately: every consumer
+/// of a definition re-mangles from the argument count (`Model::get_by_symbol`, the emitter's token
+/// keys), so returning the mangled form would mangle it twice and resolve to nothing.
+pub(crate) fn canonical_definition(
+    definition: &[Box<str>],
+    arity: usize,
+    lookup: impl Fn(&str) -> Option<TypeSymbol>,
+) -> Box<[Box<str>]> {
+    let [only] = definition else {
+        return definition.into();
+    };
+    let Some(TypeSymbol::Named(qualified)) = lookup(&definition_metadata_name(definition, arity))
+    else {
+        return definition.into();
+    };
+    let mut parts: Vec<Box<str>> = qualified.to_vec();
+    if let Some(last) = parts.last_mut() {
+        *last = only.clone();
+    }
+    parts.into()
 }
 
 /// Splits a type's dotted name parts into its namespace and simple name.
@@ -848,6 +1307,34 @@ mod tests {
     use super::*;
     use crate::special::SpecialType;
 
+    #[test]
+    fn a_definition_is_mangled_with_the_arity_it_declares_not_its_instantiation_s() {
+        let parts = |dotted: &str| -> Vec<Box<str>> { dotted.split('.').map(Box::from).collect() };
+        let table = [
+            ("System.Collections.Generic.List", 1, "List`1"),
+            ("System.Collections.Generic.Dictionary", 2, "Dictionary`2"),
+            ("System.Collections.Generic.List`1.Enumerator", 1, "Enumerator"),
+            ("N.Outer`1.Inner", 2, "Inner`1"),
+            ("N.A`1.B`2.C", 4, "C`1"),
+            ("N.Plain.Inner", 1, "Inner`1"),
+            ("N.Outer`2.Inner", 1, "Inner"),
+        ];
+        for (dotted, arguments, expected) in table {
+            assert_eq!(
+                definition_metadata_name(&parts(dotted), arguments),
+                expected,
+                "{dotted} instantiated with {arguments} argument(s)"
+            );
+        }
+        assert_eq!(mangled_arity("Box`Extra"), 0);
+        assert_eq!(mangled_arity("Box"), 0);
+        assert_eq!(mangled_arity("Box`3"), 3);
+        assert_eq!(
+            definition_metadata_name(&parts("N.Box`Extra.Inner"), 1),
+            "Inner`1"
+        );
+    }
+
     fn widget() -> TypeInfo {
         let mut info = TypeInfo::new("Shapes", "Widget", TypeKind::Class);
         info.fields.push(FieldSymbol {
@@ -876,6 +1363,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
@@ -893,6 +1381,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
@@ -910,6 +1399,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         });
         info
     }

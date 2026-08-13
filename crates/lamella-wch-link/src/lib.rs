@@ -59,6 +59,13 @@ impl std::error::Error for TransportError {}
 /// Open the device with `lamella_probe::open_bulk(WCH_VID, WCH_PID_RV, serial)` (it selects the
 /// class-0xFF interface's bulk OUT `0x01` / IN `0x81` pipes), then hand it to [`WchLink::new`]. Reads use
 /// a fixed one-second timeout, matching the probe's prompt command replies.
+///
+/// THE SERIAL IS WHAT SAYS WHICH PROBE. Every WCH-Link enumerates as the same `1a86:8010`, so the
+/// serial-less `lamella_usbbulk::Device::open(.., None)` takes whichever interface the OS hands
+/// over -- an order that changes with plug order and reboots -- and the caller cannot tell.
+/// `open_bulk` resolves it through the selection ladder instead: an explicit serial, then
+/// `LAMELLA_PROBE_SERIAL`, then the sole probe of that vid/pid, then a REFUSAL naming every
+/// candidate. A reader who copies the line above should get the one that refuses.
 #[cfg(feature = "usbbulk")]
 impl Transport for lamella_usbbulk::Device {
     fn write_packet(&mut self, data: &[u8]) -> Result<(), TransportError> {

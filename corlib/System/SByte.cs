@@ -6,7 +6,7 @@ namespace System
         public const sbyte MaxValue = 127;
         public const sbyte MinValue = -128;
 
-        public override string ToString() { return NumberFormatter.Format(this, 2, null); }
+        public override string ToString() { return NumberFormatter.Decimal(this, 0); }
 
         public string ToString(string format) { return NumberFormatter.Format(this, 2, format); }
 

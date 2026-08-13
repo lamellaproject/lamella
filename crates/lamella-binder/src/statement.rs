@@ -936,6 +936,7 @@ impl Binder {
                         is_static: true,
                         is_vararg: false,
                         instantiation: None,
+                        declaring_instantiation: None,
                     }),
                 },
                 ty: void_ty.clone(),

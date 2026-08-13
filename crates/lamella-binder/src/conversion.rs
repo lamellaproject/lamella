@@ -171,22 +171,21 @@ fn is_object(ty: &TypeSymbol) -> bool {
 /// Whether `ty` is a reference type (4.2) -- the test array covariance (13.1.4) applies to
 /// both element types: `object`/`string`, any array, or a class/interface/delegate; never a
 /// value type (numeric/bool/char/struct/enum) or pointer.
-fn is_reference_type(model: &Model, ty: &TypeSymbol) -> bool {
+pub(crate) fn is_reference_type(model: &Model, ty: &TypeSymbol) -> bool {
     match ty {
         TypeSymbol::Special(special) => {
             matches!(special, SpecialType::Object | SpecialType::String)
         }
         TypeSymbol::Array { .. } => true,
-        TypeSymbol::Named(_) => model.get_by_symbol(ty).is_some_and(|info| {
-            matches!(
-                info.kind,
-                TypeKind::Class | TypeKind::Interface | TypeKind::Delegate
-            )
-        }),
-        TypeSymbol::Instantiation { .. }
-        | TypeSymbol::Pointer(_)
-        | TypeSymbol::ByRef(_)
-        | TypeSymbol::Error => false,
+        TypeSymbol::Named(_) | TypeSymbol::Instantiation { .. } => {
+            model.get_by_symbol(ty).is_some_and(|info| {
+                matches!(
+                    info.kind,
+                    TypeKind::Class | TypeKind::Interface | TypeKind::Delegate
+                )
+            })
+        }
+        TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => false,
     }
 }
 
@@ -210,13 +209,23 @@ fn reference_conversion(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bo
         }
         return is_array_base_type(to);
     }
-    let mut stack: Vec<TypeSymbol> = match model.get_by_symbol(from) {
+    is_base_type_of(model, to, from)
+}
+
+/// Whether `base` is reachable from `derived` through the model's base list, transitively --
+/// a base class, or an interface `derived` implements (the model carries both in `bases`).
+///
+/// One walk with two callers on purpose: the implicit reference conversion (13.1.4) and the
+/// test in [`no_conversion_operator_can_exist`] ask the same question of the same graph, and
+/// two spellings of it would be free to drift apart.
+fn is_base_type_of(model: &Model, base: &TypeSymbol, derived: &TypeSymbol) -> bool {
+    let mut stack: Vec<TypeSymbol> = match model.get_by_symbol(derived) {
         Some(info) => info.bases.to_vec(),
         None => return false,
     };
     let mut seen: Vec<TypeSymbol> = Vec::new();
     while let Some(ty) = stack.pop() {
-        if &ty == to {
+        if &ty == base {
             return true;
         }
         if seen.contains(&ty) {
@@ -228,6 +237,37 @@ fn reference_conversion(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bo
         seen.push(ty);
     }
     false
+}
+
+/// Whether 17.9.3 forbids DECLARING a conversion operator between `from` and `to`, so no search
+/// for one may answer for this pair: either side is `object` or an interface-type, or one is a
+/// base type of the other. 17.9.3 gives the reason as well as the rule -- *"It is not possible to
+/// redefine a pre-defined conversion. Thus, conversion operators are not allowed to convert from
+/// or to `object` because implicit and explicit conversions already exist between `object` and
+/// all other types. Likewise, neither the source nor the target types of a conversion can be a
+/// base type of the other, since a conversion would then already exist"* -- and states the
+/// consequence for interfaces directly: *"no user-defined transformations occur when converting
+/// to an interface-type"*.
+///
+/// **This is deliberately NOT the general "a pre-defined conversion already exists" test**, which
+/// is 17.9.3's fourth declaration rule but would be wrong here: `int` -> `decimal` is a standard
+/// implicit NUMERIC conversion (13.1.2) that this compiler routes through `Decimal.op_Implicit`
+/// because CIL has no primitive form for it, so a guard covering every pre-defined conversion
+/// would silently drop every decimal conversion in the language. The reference cases above are
+/// the ones where the search can otherwise answer with an operator whose return type merely
+/// converts to the target -- and every type converts to `object`.
+#[must_use]
+pub fn no_conversion_operator_can_exist(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+) -> bool {
+    is_object(from)
+        || is_object(to)
+        || is_interface(model, from)
+        || is_interface(model, to)
+        || is_base_type_of(model, to, from)
+        || is_base_type_of(model, from, to)
 }
 
 /// Whether a standard implicit conversion exists from `from` to `to`, using no
@@ -293,6 +333,35 @@ mod tests {
         assert!(has_implicit_conversion(
             &t(SpecialType::String),
             &t(SpecialType::String)
+        ));
+    }
+
+    /// **THE DECIMAL ROW IS THE ONE THAT MATTERS.** `int` -> `decimal` is a standard implicit
+    /// numeric conversion that this compiler routes through `Decimal.op_Implicit`, so a guard
+    /// stated as "a pre-defined conversion already exists" rather than as 17.9.3's three reference
+    /// cases drops every decimal conversion in the language -- measured, not predicted.
+    #[test]
+    fn only_the_reference_cases_foreclose_a_conversion_operator() {
+        let model = Model::new();
+        assert!(no_conversion_operator_can_exist(
+            &model,
+            &t(SpecialType::String),
+            &t(SpecialType::Object)
+        ));
+        assert!(no_conversion_operator_can_exist(
+            &model,
+            &t(SpecialType::Object),
+            &t(SpecialType::String)
+        ));
+        assert!(!no_conversion_operator_can_exist(
+            &model,
+            &t(SpecialType::Int32),
+            &t(SpecialType::Decimal)
+        ));
+        assert!(!no_conversion_operator_can_exist(
+            &model,
+            &t(SpecialType::Decimal),
+            &t(SpecialType::Int32)
         ));
     }
 
@@ -393,5 +462,45 @@ mod tests {
         ));
         let named = TypeSymbol::Named(["Widget".into()].into());
         assert!(has_implicit_conversion(&named, &t(SpecialType::Object)));
+    }
+
+    #[test]
+    fn null_converts_to_an_instantiated_class_but_not_to_an_instantiated_struct() {
+        use crate::symbols::{Model, TypeInfo, TypeKind};
+
+        let mut model = Model::new();
+        let mut boxed = TypeInfo::new("", "Box`1", TypeKind::Class);
+        boxed.type_parameters = alloc::vec!["T".into()];
+        model.insert(boxed);
+        let mut val = TypeInfo::new("", "Val`1", TypeKind::Struct);
+        val.type_parameters = alloc::vec!["T".into()];
+        model.insert(val);
+
+        let null = t(SpecialType::Null);
+        let inst = |name: &str| TypeSymbol::Instantiation {
+            definition: [name.into()].into(),
+            arguments: [t(SpecialType::Int32)].into(),
+        };
+
+        assert!(
+            converts(&model, &null, &inst("Box")),
+            "an instantiated CLASS is a reference type, so `Box<int> b = null;` is legal"
+        );
+        assert!(
+            !converts(&model, &null, &inst("Val")),
+            "an instantiated STRUCT is a value type and holds no null"
+        );
+        assert!(!converts(&model, &null, &inst("Absent")));
+        assert!(
+            !converts(
+                &model,
+                &null,
+                &TypeSymbol::Instantiation {
+                    definition: ["Box".into()].into(),
+                    arguments: [t(SpecialType::Int32), t(SpecialType::Int32)].into(),
+                }
+            ),
+            "Box`2 is not Box`1"
+        );
     }
 }

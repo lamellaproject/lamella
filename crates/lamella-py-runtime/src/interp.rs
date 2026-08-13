@@ -1763,7 +1763,7 @@ pub fn run_module(
 pub fn run_bundle(bundle: Bundle, model: &mut ObjectModel) -> Result<Value, Trap> {
     let Bundle { entry, modules } = bundle;
     model.set_managed_modules(modules);
-    let entry_functions: Rc<[CodeObject]> = Rc::from(entry.functions);
+    let entry_functions: Rc<[CodeObject]> = Rc::from(entry.functions.into_bodies());
     model.set_entry_functions(Rc::clone(&entry_functions));
     run_module(&entry.body, &entry_functions, model)
 }
@@ -1983,9 +1983,10 @@ enum ImportHandback {
     /// The ordinary case: this IS the module the `import` named, so it goes on the importer's eval
     /// stack and the op is done.
     Push,
-    /// This was an ANCESTOR resolved on the way to a dotted name -- `a` while importing `a.b`. The
-    /// importer's [`Op::ImportName`] has more of the chain left to walk, so nothing is pushed and the
-    /// op RE-RUNS instead (its ip rewound), finding this one cached and moving to the next segment.
+    /// The finished body is an ANCESTOR resolved on the way to a dotted name -- `a` while importing
+    /// `a.b`. The importer's [`Op::ImportName`] has more of the chain left to walk, so nothing is
+    /// pushed and the op RE-RUNS instead (its ip rewound), finding this one cached and moving to the
+    /// next segment.
     ///
     /// Re-entering rather than recursing is what keeps a chain of any depth on one frame stack: each
     /// body is pushed by the driver as an ordinary frame, so the collector's safe point reaches every
@@ -1995,11 +1996,10 @@ enum ImportHandback {
 
 /// What a frame's caller receives INSTEAD of the value the frame returns.
 ///
-/// Both cases exist for the same reason: the code in question -- a module body, a class `__init__` --
-/// used to run on a nested driver loop, where the collector's safe point cannot see the frames beneath
-/// it and so must not fire. Running it on the caller's own stack is what fixes that, and then the
-/// caller's `Op::Call` still has to end up with the right value on its eval stack. This is that value,
-/// riding the frame that has to finish first.
+/// Both cases exist for the same reason: a module body and a class `__init__` run on the CALLER's own
+/// frame stack rather than on a nested driver loop of their own, so the collector's safe point reaches
+/// every frame beneath them. That leaves the caller's `Op::Call` still needing the right value on its
+/// eval stack, and this is that value, riding the frame that has to finish first.
 ///
 /// A frame has at most ONE of these -- a module body is not a `__init__` and vice versa -- which is why
 /// this is an enum rather than a field per case.
@@ -3194,6 +3194,11 @@ enum DelegateAction {
 /// step's `Returned` (a propagated raise returns `Err`). Anything else is advanced by one `next` for a
 /// send (a non-None send is a TypeError -- a plain iterator has no `send` -- and its return value is
 /// always `None`); a throw into a plain iterator raises the exception here.
+///
+/// **`resumable` is the CALLER's decision and the only thing the two ops differ in**, because what
+/// counts differs: `yield from` resumes a GENERATOR, `await` resumes a generator OR a COROUTINE. Asking
+/// it here would mean one predicate serving two rules, and the way that fails is `yield from coro`
+/// quietly working.
 fn advance_delegate(
     sub: Value,
     action: DelegateAction,
@@ -3827,7 +3832,8 @@ fn drive_frames(
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
                 model.set_current_module_global(name, value);
             }
-            Op::LoadAttr { name, cache } => {
+            Op::LoadAttr { site } => {
+                let [name, cache] = *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
                 let receiver = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
                 if let Some(value) = descriptor_read(receiver, attr, functions, model, depth)? {
@@ -4169,7 +4175,9 @@ fn drive_frames(
                     frame.push(function);
                 }
             }
-            Op::CallKw { argc, kwnames } => {
+            Op::CallKw { site } => {
+                let [argc, kwnames] =
+                    *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
                 let names = match code.consts.get(kwnames as usize) {
                     Some(Const::KwNames(names)) => names,
                     _ => return Err(Trap::Malformed),
@@ -4207,7 +4215,9 @@ fn drive_frames(
                     }
                 }
             }
-            Op::CallEx { kinds, kwnames } => {
+            Op::CallEx { site } => {
+                let [kinds, kwnames] =
+                    *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
                 let kinds = match code.consts.get(kinds as usize) {
                     Some(Const::ArgKinds(k)) => k.clone(),
                     _ => return Err(Trap::Malformed),
@@ -4434,7 +4444,9 @@ fn drive_frames(
                 }
                 frame.push(class);
             }
-            Op::SetAttr { name, cache: _ } => {
+            Op::SetAttr { site } => {
+                let [name, _cache] =
+                    *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
                 let object = frame.pop()?;
                 let value = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
@@ -4487,7 +4499,9 @@ fn drive_frames(
                     frame.push(element);
                 }
             }
-            Op::UnpackEx { before, after } => {
+            Op::UnpackEx { site } => {
+                let [before, after] =
+                    *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
                 let value = frame.pop()?;
                 let targets = model.unpack_ex(value, before as usize, after as usize)?;
                 for &target in targets.iter().rev() {
@@ -4676,6 +4690,11 @@ fn drive_frames(
 /// finalizer is sometimes the only safe answer; declining to MENTION it leaves "my `__del__` never
 /// ran" with no way to tell a runtime that skipped it from one that never had the feature. Every
 /// early return below records its reason on the model ([`ObjectModel::finalizer_skips`]).
+///
+/// **Between taking the object and pushing the frame it is held ONLY by Rust locals**, which is safe
+/// for the same reason every allocation path here is: nothing collects except at the safe point in
+/// [`drive_frames`], and this runs to completion before that loop reaches it again. Once the frame is
+/// pushed the object is `self` in its locals, which the collector traces.
 #[cfg(feature = "gc-collect")]
 fn push_next_finalizer(
     frames: &mut Vec<Frame>,
@@ -4807,6 +4826,23 @@ mod tests {
 
     /// Builds a code object from the minimal fields the interpreter reads,
     /// defaulting the typing fields the lowering (not the interpreter) consumes.
+    /// `code`, plus the side table the wide ops index. Only the tests that emit a `LoadAttr`,
+    /// `SetAttr`, `UnpackEx`, `CallKw` or `CallEx` need it; every other op carries its operand
+    /// inline.
+    fn code_w(
+        n_locals: usize,
+        n_args: usize,
+        consts: Vec<Const>,
+        names: Vec<String>,
+        cache_count: usize,
+        ops: Vec<Op>,
+        wide_operands: Vec<[u32; 2]>,
+    ) -> CodeObject {
+        let mut co = code(n_locals, n_args, consts, names, cache_count, ops);
+        co.wide_operands = wide_operands;
+        co
+    }
+
     fn code(
         n_locals: usize,
         n_args: usize,
@@ -4840,6 +4876,8 @@ mod tests {
             names: names.iter().collect(),
             ops,
             cache_count,
+            wide_operands: Vec::new(),
+            line_table: Vec::new(),
             exc_table: Vec::new(),
         }
     }
@@ -4996,8 +5034,8 @@ mod tests {
     #[test]
     fn instantiating_a_class_binds_a_defaulted_init() {
         use Op::*;
-        let init = code(2, 2, vec![Const::None], vec![String::from("val")], 1,
-            vec![LoadFast(1), LoadFast(0), SetAttr { name: 0, cache: 0 }, LoadConst(0), Return]);
+        let init = code_w(2, 2, vec![Const::None], vec![String::from("val")], 1,
+            vec![LoadFast(1), LoadFast(0), SetAttr { site: 0 }, LoadConst(0), Return], vec![[0, 0]]);
         let functions = [init];
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let f = |n: i32| Value::fixnum(n).unwrap();
@@ -5068,7 +5106,7 @@ mod tests {
     #[test]
     fn class_body_reads_a_name_it_just_bound() {
         use Op::*;
-        let entry = code(
+        let entry = code_w(
             1,
             0,
             vec![Const::Str("C".into()), Const::None, Const::Int(5), Const::Int(1)],
@@ -5087,9 +5125,10 @@ mod tests {
                 BuildClass,
                 StoreFast(0),
                 LoadFast(0),
-                LoadAttr { name: 1, cache: 0 },
+                LoadAttr { site: 0 },
                 Return,
             ],
+            vec![[1, 0]],
         );
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let result = run(&entry, &[], &[], &mut model).unwrap();
@@ -5099,7 +5138,7 @@ mod tests {
     #[test]
     fn class_body_name_read_falls_back_to_a_builtin() {
         use Op::*;
-        let entry = code(
+        let entry = code_w(
             1,
             0,
             vec![Const::Str("C".into()), Const::None],
@@ -5114,9 +5153,10 @@ mod tests {
                 BuildClass,
                 StoreFast(0),
                 LoadFast(0),
-                LoadAttr { name: 1, cache: 0 },
+                LoadAttr { site: 0 },
                 Return,
             ],
+            vec![[1, 0]],
         );
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let result = run(&entry, &[], &[], &mut model).unwrap();
@@ -5127,7 +5167,7 @@ mod tests {
     #[test]
     fn import_math_and_call_a_function() {
         use Op::*;
-        let entry = code(
+        let entry = code_w(
             1,
             0,
             vec![Const::Int(4)],
@@ -5137,11 +5177,12 @@ mod tests {
                 ImportName(0),
                 StoreFast(0),
                 LoadFast(0),
-                LoadAttr { name: 1, cache: 0 },
+                LoadAttr { site: 0 },
                 LoadConst(0),
                 Call(1),
                 Return,
             ],
+            vec![[1, 0]],
         );
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         let result = run(&entry, &[], &[], &mut model).unwrap();
@@ -5255,10 +5296,10 @@ mod tests {
         let mut sub = code(2, 2, Vec::new(), Vec::new(), 0,
             vec![LoadFast(0), LoadFast(1), Binary(BinOp::Sub), Return]);
         sub.name = String::from("sub");
-        let body = code(0, 0,
+        let body = code_w(0, 0,
             vec![Const::Int(10), Const::Int(3), Const::KwNames(vec![String::from("a1")])],
             vec![String::from("sub")], 0,
-            vec![LoadGlobal(0), LoadConst(0), LoadConst(1), CallKw { argc: 1, kwnames: 2 }, Return]);
+            vec![LoadGlobal(0), LoadConst(0), LoadConst(1), CallKw { site: 0 }, Return], vec![[1, 2]]);
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         let result = run(&body, core::slice::from_ref(&sub), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
@@ -5471,19 +5512,19 @@ mod tests {
     fn builtin_keyword_args_sorted_and_dict() {
         use Op::*;
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let sorted_rev = code(0, 0,
+        let sorted_rev = code_w(0, 0,
             vec![Const::Int(3), Const::Int(1), Const::Int(2),
                  Const::KwNames(vec![String::from("reverse")]), Const::Bool(true)],
             vec![String::from("sorted")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), LoadConst(2), BuildList(3),
-                 LoadConst(4), CallKw { argc: 1, kwnames: 3 }, Return]);
+                 LoadConst(4), CallKw { site: 0 }, Return], vec![[1, 3]]);
         let result = run(&sorted_rev, &[], &[], &mut model).unwrap();
         assert_eq!(model.repr(result), "[3, 2, 1]");
-        let dict_kw = code(0, 0,
+        let dict_kw = code_w(0, 0,
             vec![Const::Int(1), Const::Int(2),
                  Const::KwNames(vec![String::from("a"), String::from("b")])],
             vec![String::from("dict")], 0,
-            vec![LoadGlobal(0), LoadConst(0), LoadConst(1), CallKw { argc: 0, kwnames: 2 }, Return]);
+            vec![LoadGlobal(0), LoadConst(0), LoadConst(1), CallKw { site: 0 }, Return], vec![[0, 2]]);
         let d = run(&dict_kw, &[], &[], &mut model).unwrap();
         assert_eq!(model.repr(d), "{'a': 1, 'b': 2}");
     }
@@ -5798,7 +5839,7 @@ mod tests {
     #[test]
     fn reading_an_unbound_local_traps() {
         use Op::*;
-        let code = code(1, 0, Vec::new(), Vec::new(), 0, vec![LoadFast(0), Return]);
+        let code = code_w(1, 0, Vec::new(), Vec::new(), 0, vec![LoadFast(0), Return], vec![[0, 0]]);
         let mut model = no_objects();
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::UnboundLocal));
     }
@@ -5810,13 +5851,14 @@ mod tests {
         let obj = model
             .new_instance(0, &[Value::fixnum(7).unwrap(), Value::fixnum(9).unwrap()])
             .unwrap();
-        let code = code(
+        let code = code_w(
             1,
             1,
             Vec::new(),
             vec![String::from("x")],
             1,
-            vec![LoadFast(0), LoadAttr { name: 0, cache: 0 }, Return],
+            vec![LoadFast(0), LoadAttr { site: 0 }, Return],
+            vec![[0, 0]],
         );
         let result = run(&code, &[], &[obj], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
@@ -5838,7 +5880,7 @@ mod tests {
             PopJumpIfFalse(18),
             LoadFast(1),
             LoadFast(0),
-            LoadAttr { name: 0, cache: 0 },
+            LoadAttr { site: 0 },
             Binary(BinOp::Add),
             StoreFast(1),
             LoadFast(2),
@@ -5849,13 +5891,14 @@ mod tests {
             LoadFast(1),
             Return,
         ];
-        let code = code(
+        let code = code_w(
             3,
             1,
             vec![Const::Int(0), Const::Int(1), Const::Int(3)],
             vec![String::from("x")],
             1,
             ops,
+            vec![[0, 0]],
         );
         let result = run(&code, &[], &[obj], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(21));
@@ -6013,13 +6056,14 @@ mod tests {
     fn str_method_call_through_the_interpreter() {
         use Op::*;
         let mut model = ObjectModel::new(Vec::new(), 4096);
-        let prog = code(
+        let prog = code_w(
             0,
             0,
             vec![Const::Str("abc".into())],
             vec![String::from("upper")],
             1,
-            vec![LoadConst(0), LoadAttr { name: 0, cache: 0 }, Call(0), Return],
+            vec![LoadConst(0), LoadAttr { site: 0 }, Call(0), Return],
+            vec![[0, 0]],
         );
         let r = run(&prog, &[], &[], &mut model).unwrap();
         assert_eq!(model.str_bytes(r), Some("ABC".as_bytes()));
@@ -6029,7 +6073,7 @@ mod tests {
     fn str_slice_through_the_interpreter() {
         use Op::*;
         let mut model = ObjectModel::new(Vec::new(), 4096);
-        let prog = code(
+        let prog = code_w(
             0,
             0,
             vec![
@@ -6049,6 +6093,7 @@ mod tests {
                 Subscript { cache: 0 },
                 Return,
             ],
+            vec![[2, 0]],
         );
         let r = run(&prog, &[], &[], &mut model).unwrap();
         assert_eq!(model.str_bytes(r), Some("ell".as_bytes()));
@@ -6149,8 +6194,8 @@ mod tests {
     #[test]
     fn allocating_on_the_no_heap_tier_fails_loud() {
         use Op::*;
-        let code = code(0, 0, vec![Const::Str("x".into())], Vec::new(), 0,
-            vec![LoadConst(0), Return]);
+        let code = code_w(0, 0, vec![Const::Str("x".into())], Vec::new(), 0,
+            vec![LoadConst(0), Return], vec![[1, 0]]);
         let mut model = ObjectModel::new(Vec::new(), 0);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::OutOfMemory));
     }
@@ -6166,7 +6211,7 @@ mod tests {
         ops: Vec<Op>,
     ) -> CodeObject {
         let name_pool = names.iter().map(|s| String::from(*s)).collect();
-        let mut co = code(local_names.len(), 0, consts, name_pool, cache_count, ops);
+        let mut co = code_w(local_names.len(), 0, consts, name_pool, cache_count, ops, vec![[1, 0]]);
         co.name = String::from("<module>");
         co.local_names = local_names.iter().map(|s| String::from(*s)).collect();
         co
@@ -6175,13 +6220,13 @@ mod tests {
     /// A named member of a module's function table, with `n_args` params and an explicit `names` pool.
     fn named_fn(name: &str, n_args: usize, n_locals: usize, names: &[&str], ops: Vec<Op>) -> CodeObject {
         let name_pool = names.iter().map(|s| String::from(*s)).collect();
-        let mut co = code(n_locals, n_args, Vec::new(), name_pool, 0, ops);
+        let mut co = code_w(n_locals, n_args, Vec::new(), name_pool, 0, ops, vec![[1, 0]]);
         co.name = String::from(name);
         co
     }
 
     fn managed_module(name: &str, functions: Vec<CodeObject>, body: CodeObject) -> Module {
-        Module { name: String::from(name), functions, body }
+        Module { name: String::from(name), functions: functions.into(), body }
     }
 
     #[test]
@@ -6197,7 +6242,7 @@ mod tests {
             ImportName(0),
             StoreFast(0),
             LoadFast(0),
-            LoadAttr { name: 1, cache: 0 },
+            LoadAttr { site: 0 },
             Return,
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
@@ -6253,7 +6298,7 @@ mod tests {
             ImportName(0),
             StoreFast(0),
             LoadFast(0),
-            LoadAttr { name: 1, cache: 0 },
+            LoadAttr { site: 0 },
             Return,
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
@@ -6262,7 +6307,7 @@ mod tests {
         assert_eq!(result.as_fixnum(), Some(5));
     }
 
-    #[cfg(feature = "bundled-stdlib")]
+    #[cfg(all(feature = "bundled-stdlib", feature = "float"))]
     #[test]
     fn a_native_module_shadows_a_managed_one_of_the_same_name() {
         use Op::*;
@@ -6276,7 +6321,7 @@ mod tests {
             ImportName(0),
             StoreFast(0),
             LoadFast(0),
-            LoadAttr { name: 1, cache: 0 },
+            LoadAttr { site: 0 },
             Return,
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
@@ -6305,7 +6350,7 @@ mod tests {
             ImportName(0),
             StoreFast(0),
             LoadFast(0),
-            LoadAttr { name: 1, cache: 0 },
+            LoadAttr { site: 0 },
             Return,
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
@@ -6463,7 +6508,7 @@ mod tests {
                 Return,
             ]),
         );
-        let entry_body = module_body(&["X", "cb", "m"], vec![Const::Int(42)], &["cb", "m", "apply"], 1, vec![
+        let mut entry_body = module_body(&["X", "cb", "m"], vec![Const::Int(42)], &["cb", "m", "apply"], 1, vec![
             LoadConst(0),
             StoreFast(0),
             MakeFunction { func: 0, flags: 0 },
@@ -6471,11 +6516,12 @@ mod tests {
             ImportName(1),
             StoreFast(2),
             LoadFast(2),
-            LoadAttr { name: 2, cache: 0 },
+            LoadAttr { site: 0 },
             LoadFast(1),
             Call(1),
             Return,
         ]);
+        entry_body.wide_operands = vec![[2, 0]];
         let bundle = Bundle {
             entry: managed_module("__main__", vec![cb], entry_body),
             modules: vec![m],
@@ -6559,8 +6605,8 @@ mod tests {
     #[test]
     fn a_unary_op_type_error_raises_with_a_cpython_message() {
         use Op::*;
-        let code = code(0, 0, vec![Const::Str("a".into())], Vec::new(), 0,
-            vec![LoadConst(0), Unary(UnaryOp::Neg), Return]);
+        let code = code_w(0, 0, vec![Const::Str("a".into())], Vec::new(), 0,
+            vec![LoadConst(0), Unary(UnaryOp::Neg), Return], vec![[1, 0]]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending TypeError");
@@ -6571,8 +6617,8 @@ mod tests {
     #[test]
     fn a_missing_attribute_raises_attributeerror_with_a_cpython_message() {
         use Op::*;
-        let code = code(0, 0, vec![Const::Int(5)], vec![String::from("foo")], 1,
-            vec![LoadConst(0), LoadAttr { name: 0, cache: 0 }, Return]);
+        let code = code_w(0, 0, vec![Const::Int(5)], vec![String::from("foo")], 1,
+            vec![LoadConst(0), LoadAttr { site: 0 }, Return], vec![[0, 0]]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending AttributeError");
@@ -6686,7 +6732,7 @@ mod tests {
             ImportName(0),
             StoreFast(0),
             LoadFast(0),
-            LoadAttr { name: 1, cache: 0 },
+            LoadAttr { site: 0 },
             Call(0),
             Return,
         ]);

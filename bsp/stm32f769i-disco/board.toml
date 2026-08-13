@@ -1,4 +1,20 @@
 # BOARD binding: the 32F769IDISCOVERY (STM32F769I-DISCO), an STM32F769NI carrier.
+#
+# THIS BOARD'S LEDS SINK AND THE OTHER ST BOARDS HERE DRIVE, WHICH IS THE FACT IT CONTRIBUTES.
+# UM2033 states it in words -- "to light a LED, a zero low-logic state must be written in the
+# corresponding GPIO register" -- and that is the opposite of the two Nucleo-144 boards and the
+# F429 Discovery, where the pin sources current into the anode. Same vendor, same year, opposite
+# habit. Polarity is a per-BOARD reading and this board is the counter-example that proves it.
+#
+# THE USER BUTTON GOES THE OTHER WAY AND AGREES WITH THEM: "when the button is depressed the logic
+# state is 1, otherwise, the logic state is 0". So on this one board the LEDs are active low and
+# the button is active high, which is exactly the combination a reader who learned one rule gets
+# wrong twice.
+#
+# NOT MODELLED, AND NAMED SO THE OMISSION IS DELIBERATE: a 128-Mbit SDRAM on the FMC (used as
+# 4M x 32) and a 512-Mbit Quad-SPI NOR flash. Both are the external-memory stratum, which needs
+# the controller instances and block tables this family does not have yet -- the same shape the
+# stm32f7 family already carries for its own two memories.
 
 [table]
 kind = "board"
@@ -13,6 +29,7 @@ sources = [
     "UM2033 Rev 5 pin table: PA9 carries USART1_TX against the label VCP_TX, PA10 carries USART1_RX against VCP_RX, and PA0/WKUP carries the label B_USER.",
 ]
 notes = [
+    "UM2033 CONTRADICTS ITSELF ABOUT THE LED COLORS INSIDE ONE SECTION. Its prose says the four LEDs are 'LD1, LD2, LD3, and LD4 with respectively green, orange, red, and blue colors'; Table 4, eight lines below, gives LD1 RED, LD2 GREEN, LD3 GREEN and LD4 RED, and names no orange or blue LED at all. The assignment table is taken, because it is the table that also carries the port assignments this file depends on and because the same manual family has been wrong in its prose and right in its table before. No color reaches an artifact -- what the disagreement changes is which document a later reader should trust for the pins.",
     "LD3 and LD4 are deliberately not device rows. LD3 is the ARDUINO signal LED on PA12 rather than a user LED, and LD4 on PD4 indicates an OTG overcurrent condition -- neither is a general-purpose indicator a program should be told it owns.",
     "The user button is on PA0, which is also the part's wake-up pin. UM2033 describes B1 as usable 'as a digital input or as a wake-up alternate function' -- this row states the digital-input reading, which is the one a program polls; the wake-up path is a power-management fact nothing here models.",
 ]

@@ -1,5 +1,39 @@
 # PARTS table for the stm32u585 family. Pin lists are PARTIAL present-lists: they carry the pins the
 # boards reach, so a consumer must not read one as the package.
+#
+# WHY THIS FAMILY IS NAMED FOR A PART AND NOT FOR THE SERIES. A family owns ONE reference manual
+# AND one pin-function table, and for this vendor's U5 those two halves disagree. RM0456 is titled for
+# the STM32U5 SERIES and its introduction claims "complete information on how to use memory and
+# peripherals of the STM32U5 series microcontrollers" -- naming no products at all, which is the
+# same shape csp/ra4m1 met and resolved by reading the enumeration out of the DATASHEET instead.
+#
+# AND THE MANUAL DISAGREES WITH ITSELF, WHICH IS THE NEW PART. Its title is series-wide; its
+# CONTENT is per sub-group, in three separate places:
+#   * Table 6, the register boundary table, prints FOUR product columns -- STM32U535/545,
+#     STM32U575/585, STM32U59x/5Ax and STM32U5Fx/5Gx -- and a peripheral present in one is absent
+#     from another.
+#   * There are FOUR memory maps, not one: Figures 3, 4, 5 and 6, one per sub-group. Figure 5
+#     (U59x/5Ax) carries an SRAM5 that this part does not have.
+#   * Reset values differ by sub-group. RCC_AHB2ENR1 resets to 0x40000000 on U535/545 and to
+#     0xC0000000 here; GPIOx_MODER resets to 0xFFFFFFF0 for port G and 0x000000CF for port H on
+#     U535/545, against 0xFFFFFFFF for both here -- and those are the two ports this board uses.
+# So the manual's title cannot enumerate a family and its tables refuse to enumerate one uniformly.
+#
+# WHICH CONJUNCT GETS PRIORITY: the PIN-FUNCTION TABLE, which is the datasheet.
+# DS13086 is titled "STM32U585xx" and names U575 once in 350 pages. A family named `stm32u5` would
+# need four datasheets to fill one pins.toml honestly, and a pin map complete for one sub-group and
+# silently absent for three is worse than a narrow name. A later U575 joins only if ITS datasheet's
+# own product list says so -- checked, the way the F072 was checked against RM0091, never assumed
+# from the number.
+#
+# THE ORDER CODE DECIDES WHICH PINOUT TABLE APPLIES, AND GETTING IT WRONG IS INVISIBLE. DS13086
+# Table 27 prints TWO complete sets of package columns: the left set every one suffixed "SMPS" (the
+# dedicated SMPS step-down pinout, the `Q` option in the order code) and the right set without. So
+# there are two columns both headed UFBGA169 with different ball assignments, and only the order
+# code says which is yours. STM32U585AII6TR has NO `Q`, so every ball below is read from the
+# right-hand, non-SMPS column. Reading the other one states something TRUE about a real STM32U585 in
+# UFBGA169 and WRONG about this part -- a designator that is true of the SILICON and wrong about
+# the leg, which is equally invisible to a gate that only sees a part row.
 
 [table]
 kind = "parts"
@@ -10,6 +44,8 @@ sources = [
 ]
 notes = [
     "flash is the part's 2 Mbytes. DS13086 states it as two banks with read-while-write, of which 512 Kbytes are rated to 100 kcycles rather than the rest -- an endurance split this schema has no field for and which no consumer should infer from the single figure.",
+    "ram is 768 Kbytes and the vendor's own headline is 786, which is a DIFFERENT QUANTITY rather than a rounding. DS13086 section 3.5 composes the 786 out of FIVE separate SRAMs: SRAM1 192 K, SRAM2 64 K, SRAM3 512 K, SRAM4 16 K and a 2-Kbyte BKPSRAM. Only SRAM1/2/3 are contiguous -- RM0456 Figure 4 gives them one span, 0x20000000 to 0x200C0000 -- while SRAM4 sits alone at 0x28000000 and the BKPSRAM is not in the SRAM space at all, at 0x40036400 among the peripherals. So the figure a linker can believe is the contiguous span, and that is 768 Kbytes.",
+    "AND THE TWO NUMBERS LOOK THE SAME IN THE ONE PLACE SOMEONE WOULD CHECK. The contiguous span is 786,432 bytes, which is 768 KiB; the vendor's sum is 786 KiB, which is 804,864 bytes. Anyone sanity-checking a linker script's length against the datasheet's '786' finds apparent agreement and is wrong about which memory they have. Same class as the STM32H747's '1 MB RAM' being three blocks in three power domains.",
     "ECC is a CAPACITY setting on this part, not only an integrity one: DS13086's own feature line gives 786 Kbytes with ECC off against 722 with it on, and section 3.5 says that of SRAM3's 512 Kbytes, 256 support ECC while 192 are reachable without it. Nothing in this schema records which mode an image assumes, so the figure above is the ECC-OFF geometry and a consumer enabling ECC has less room than the row states.",
     "SRAM2 is retained in Standby and the BKPSRAM survives into VBAT, so the excluded blocks are not merely smaller -- they have retention the stated block does not. A consumer that needs persistence across Standby needs SRAM2 specifically and cannot get it from this row.",
 ]
@@ -23,4 +59,20 @@ pins = [
     "PG5-PG13",
     "PH10-PH15",
 ]
-source = "DS13086 Rev 10 section 7 ordering information decoding STM32U585AII6TR: A = 169 balls, I = 2 Mbytes flash memory, I = UFBGA (7 x 7 mm), 6 = industrial -40 to 85 C."
+# EVERY PIN BELOW WAS RESOLVED THROUGH ITS BALL AND ITS ALTERNATE FUNCTION, NEVER THROUGH A ROW
+# POSITION IN A DRAWING. A schematic symbol commonly places each ball designator on the wire stub,
+# ABOVE its pin-name baseline, so a pin label and the ball on its own line are not vertically centred
+# on each other and a text conversion groups every ball with the PREVIOUS pin. Read that way a whole
+# port block slides by one, and the slide is silent, because both the intended pin and its neighbour
+# are real pins of this part.
+#
+# THE ALTERNATE FUNCTION IS WHAT SETTLES IT, BEING INDEPENDENT OF EVERY LAYOUT QUESTION. LPUART1_CTS
+# is an alternate function of PG5 and NOT of PG4 -- DS13086 Table 27 gives PG4 only SPI1_MOSI,
+# FMC_A14 and SAI2_MCLK_B -- so a net carrying that signal on ball J9 can only be PG5.
+#
+# PG11 IS INSIDE THE STATED RANGE AND CARRIES NO BINDING, WHICH IS WHY THE RANGE HAS A HOLE IN IT.
+# It is SPI3_MOSI -- but not the BOOTLOADER's SPI3_MOSI, which AN2606 Rev 70 Table 217 places on
+# PB5. A design reaching the system bootloader over SPI3 therefore leaves PG11 open and takes MOSI
+# from PB5, which is also the pin a 3.3 V signal must use when PG[2:15] is powered from VDDIO2 at a
+# lower rail.
+source = "DS13086 Rev 10 section 7 ordering information decoding STM32U585AII6TR: A = 169 balls, I = 2 Mbytes flash memory, I = UFBGA (7 x 7 mm), 6 = industrial -40 to 85 C. There is no `Q`, so this is the STANDARD pinout and not the dedicated SMPS one, which is what selects the right half of Table 27's two package-column sets. `TR` is tape-and-reel packing and says nothing about the silicon, the same way the RA4M1's `#AA0` tail did not. The schematic's own symbol corroborates the package independently, reading STM32U585AII6TR_BGA169P. flash 0x200000 is that 2 Mbytes. ram 0xC0000 is the SRAM1/2/3 contiguous span RM0456 Rev 7 Figure 4 gives as 0x20000000-0x200C0000, which is 192 + 64 + 512 Kbytes and agrees exactly with DS13086 section 3.5's composition read from a different document. The core is DS13086's own words, an Arm Cortex-M33 with TrustZone, MPU, DSP and FPU. The pin list is PARTIAL rather than the package's 169 and every entry carries a UFBGA169 ball from Table 27's NON-SMPS column: PG5 J9, PG6 H10, PG7 G8, PG8 H9, PG9 A7, PG10 C7, PG12 E6, PG13 N10, PH10 C13, PH11 D9, PH12 B13, PH13 C12, PH14 C11, PH15 A13. PG11 (ball M10) lies inside the stated range but is UNCONNECTED on the board; it is present on the part and reached by nothing, so it is in the range as a package fact and carries no binding."

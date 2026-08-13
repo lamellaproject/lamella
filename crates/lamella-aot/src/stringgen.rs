@@ -275,6 +275,7 @@ fn write_int_mir() -> Function {
     let buf = MirType::ValueType {
         handle: lamella_ir::TypeHandle(0),
         size: WRITE_INT_BUF as u32,
+        refs: lamella_ir::RefWords::NONE,
     };
     Function {
         params: vec![i32t],

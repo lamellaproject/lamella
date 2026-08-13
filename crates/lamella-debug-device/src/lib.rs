@@ -13,6 +13,15 @@ use lamella_debug_backend::{
 /// Drives a Cortex-M target over ANY probe as a [`DebugBackend`]. The trait's inspection methods
 /// take `&self` (suited to the interpreter's in-memory state), so the probe sits behind a
 /// `RefCell` for the I/O those methods must perform.
+///
+/// **GENERIC OVER [`TargetAccess`], NOT OVER ONE PROBE'S PACKET TRANSPORT.** Holding a
+/// concrete `Dap<T>`, which pinned native debugging to CMSIS-DAP even though a probe-neutral
+/// abstraction already existed and `lamella_stlink::StLink` already implemented it. The whole
+/// surface used here is SEVEN methods -- `connect`, `read_word`, `read_core_reg`, `step`,
+/// `set_breakpoints`, `is_halted`, `halt` -- and every one is on `TargetAccess`, so the narrower
+/// bound bought nothing and cost every non-CMSIS-DAP probe. (`connect` is the one an earlier
+/// count of this list missed; `launch` calls it, so a reader checking the surface against the
+/// code would have found six where seven are reached.)
 pub struct DeviceBackend<A: TargetAccess> {
     probe: RefCell<A>,
     /// `(native offset, source line)` for the loaded method, ascending by offset.
@@ -210,7 +219,7 @@ impl<A: TargetAccess> DeviceBackend<A> {
 
     /// The current frame's return address, recovered by reading the saved LR off the stack -- so
     /// step-out works from a NON-LEAF frame, where the live LR is the frame's own internal return
-    /// (set by a call it already made), not its caller's. Our AOT prologue for a non-leaf method is
+    /// (set by a call it already made), not its caller's. The AOT prologue for a non-leaf method is
     /// `push {<callee-saved>, lr}` then an optional `sub sp, #frame`, so the saved LR is the topmost
     /// pushed word, at `sp + frame + 4*saved_count` (SP sits `frame` below the push through the
     /// body). Decodes those two Thumb instructions at the method's entry. Returns `None` if the

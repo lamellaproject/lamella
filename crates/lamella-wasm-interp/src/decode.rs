@@ -308,8 +308,12 @@ pub fn decode(bytes: &[u8]) -> Result<Module, DecodeError> {
 fn decode_types(r: &mut Reader<'_>, module: &mut Module) -> Result<(), DecodeError> {
     let count = r.count("types")?;
     for _ in 0..count {
-        if r.u8()? != 0x60 {
-            return Err(r.err(DecodeErrorKind::BadFlags("function type tag")));
+        match r.u8()? {
+            0x60 => {}
+            0x4E | 0x4F | 0x50 | 0x5E | 0x5F => {
+                return Err(r.err(DecodeErrorKind::UnsupportedFeature("garbage-collected types")))
+            }
+            _ => return Err(r.err(DecodeErrorKind::BadFlags("function type tag"))),
         }
         let mut ty = FuncType::default();
         for _ in 0..r.count("parameters")? {

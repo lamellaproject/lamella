@@ -1,0 +1,181 @@
+# PART FAMILY: Bosch BME68x environmental sensors -- the shared base of the BME680 and the BME688,
+# each of which measures temperature, pressure, humidity and gas.
+#
+# THIS FAMILY IS NOT A BMx280 AND MUST NOT BE READ AS ONE. It occupies the same two I2C addresses
+# and answers the same identity register, and there the resemblance stops: the control registers
+# live in a different part of the map, the data registers live in another, and a gas channel with a
+# heater exists here that has no counterpart there. Four parts across the two families therefore
+# reach the same two addresses through the same register, and only the value distinguishes them.
+#
+# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# deltas; the generator RESOLVES the base and emits a fully flattened table per part. Nothing
+# downstream ever reads an inherited value, because a value that is only ever inherited is pinned
+# in no emitted artifact and so cannot be checked for drift between languages.
+#
+# WHAT THE BASE DELIBERATELY DOES NOT HOLD, and why each is a member's own statement:
+#   - the identity VALUE, which is where a family base is expected to stop;
+#   - `ctrl_gas_1`, because the two members put the gas enable bit in DIFFERENT POSITIONS of the
+#     same register at the same address;
+#   - the mode encoding, because one member has an operating mode the other does not;
+#   - every data register, because one member holds one set of results and the other holds three.
+# A base drawn to cover those would be wrong for one member or the other, which is the check a
+# family of one member cannot run.
+
+[table]
+kind = "device-base"
+family = "bme68x"
+sources = [
+    "Bosch BST-BME680-DS001 rev 1.9 (February 2024): memory map ch 5.2 table 20, register descriptions ch 5.3, operation modes ch 3.1 table 10, interface ch 6 (I2C 6.2, SPI 6.3).",
+    "Bosch BST-BME688-DS000 rev 1.3 (February 2024): memory map ch 5.2 table 22, register descriptions ch 5.3, memory map page selection table 21, interface ch 6.",
+]
+notes = [
+    "Register width is 8 bits throughout; the interface reads and writes registers, and multi-byte quantities are read as a BURST from a starting register. Reserved registers must not be written, and no value is guaranteed when they are read.",
+    "The trimming parameters are read from the part at start-up and are per-device. They are NOT constants and must not be baked into a driver.",
+    "Every fact in this base was read in BOTH members' datasheets and found to agree. A fact present in only one of the two is stated by that member instead, which is what keeps the base honest about a family whose members share an identity value.",
+]
+
+# --- buses -------------------------------------------------------------------------------------
+#
+# The register MAP is shared by both buses; the ADDRESS TRANSFORM is not. Each bus therefore
+# states its own, as a named dispatch rather than an expression -- a part that declared only a bus
+# kind would produce an SPI path wrong by 0x80, and wrong only on writes.
+
+[buses.i2c]
+kind = "i2c"
+# The register address is written as-is on both paths; a read is a write of the register address
+# followed by a repeated start and the data phase.
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "The whole 0x00 to 0xFF range is directly addressable on this bus, so the memory-map paging that the SPI path needs does not apply here. Table 21 of the BME688 datasheet states that explicitly, listing the I2C row's page as not applicable."
+
+[buses.spi]
+kind = "spi"
+# SPI steals bit 7 of the register byte as the direction flag: 1 reads, 0 writes.
+register_read_transform = "set-bit7"
+register_write_transform = "clear-bit7"
+read_protocol = "single-chip-select-address-then-clock-data"
+modes = [0, 3]
+notes = "Only seven bits of the register address travel on this bus; the eighth carries the direction. The address byte and the data must ride ONE chip-select assertion. A SECOND HAZARD HAS NO COUNTERPART ON THE I2C PATH: because seven bits cannot reach 256 registers, the map is split into two pages selected by a bit in the status register, so an SPI driver must set the page before an access as well as the address."
+
+# --- address -----------------------------------------------------------------------------------
+#
+# The PART states a base address and which pin contributes which bit. Which way a strap is
+# actually tied is CARRIER or BOARD truth and is deliberately absent here -- a default would be a
+# guess that compiles.
+
+[address]
+bus = "i2c"
+base = 0x76
+notes = "The SDO pin cannot be left floating; a floating SDO leaves the address undefined. Both members' datasheets state, in the same words, that the SDO-high address is the same as the BMP280's -- so the vendor documents the overlap with its own other family rather than leaving it to be discovered."
+
+[[address.straps]]
+pin = "SDO"
+bit = 0
+low = 0x76
+high = 0x77
+
+# --- identity ----------------------------------------------------------------------------------
+#
+# Required of every part. A member states its own accepted values; the base states only where to
+# look.
+#
+# THE USUAL REASON FOR THAT SPLIT DOES NOT HOLD IN THIS FAMILY, and saying so is the point. In a
+# family whose members differ here, the base cannot know the value. In THIS family both members
+# answer the SAME value, so the register does not separate them at all: it narrows a reading to
+# this family and stops. Each member states the value anyway, so that the emitted tables show the
+# collision on their face rather than hiding it behind an inherited row.
+
+[identity]
+reg = 0xD0
+width = 8
+notes = "Verified before any other access. Reading it distinguishes this family from the BMx280 parts that share these two addresses, and does NOT distinguish this family's own members from each other."
+
+# --- registers ---------------------------------------------------------------------------------
+#
+# `reg` is an OPERAND written on the wire, NOT an offset added to an instance base. The distinction
+# is load-bearing: this tree's chip blocks use `offset` for base-relative addressing, and a device
+# register composed as `base + offset` would compile, emit, and be silently wrong.
+#
+# Only the registers both members place identically live here. `ctrl_gas_1` is at 0x71 on both and
+# is NOT among them.
+
+[registers.id]
+reg = 0xD0
+width = 8
+access = "read-only"
+fields = { chip_id = [0, 8] }
+
+[registers.reset]
+reg = 0xE0
+width = 8
+access = "write-only"
+fields = { reset = [0, 8] }
+notes = "Writing 0xB6 initiates a soft reset with the same effect as a power-on reset. The value stored in the register is 0x00."
+
+[registers.status]
+reg = 0x73
+width = 8
+access = "read-write"
+fields = { spi_mem_page = [4, 1] }
+notes = "Selects the memory map page on the SPI path only. The two datasheets DISAGREE about which page holds which addresses: the BME688's table 21 pairs the power-on default page with 0x80 to 0xFF, while the prose of the section above it pairs the default with 0x00 to 0x7F. The conflict is recorded rather than resolved, because nothing on the I2C path depends on it and no reading has been taken that would settle it."
+
+[registers.ctrl_hum]
+reg = 0x72
+width = 8
+access = "read-write"
+fields = { osrs_h = [0, 3], spi_3w_int_en = [6, 1] }
+notes = "Holds the humidity oversampling. The interrupt-enable bit applies to the 3-wire SPI configuration only."
+
+[registers.ctrl_meas]
+reg = 0x74
+width = 8
+access = "read-write"
+fields = { mode = [0, 2], osrs_p = [2, 3], osrs_t = [5, 3] }
+notes = "Holds the temperature and pressure oversampling and the power mode. All other control registers should be set before this one is written: while a mode change is pending, further writes to control registers are ignored."
+
+[registers.config]
+reg = 0x75
+width = 8
+access = "read-write"
+fields = { spi_3w_en = [0, 1], filter = [2, 3] }
+notes = "The filter applies to temperature and pressure and not to humidity or gas."
+
+[registers.ctrl_gas_0]
+reg = 0x70
+width = 8
+access = "read-write"
+fields = { heat_off = [3, 1] }
+notes = "Setting the bit turns off the current injected into the heater."
+
+# --- enumerations ------------------------------------------------------------------------------
+#
+# The mode encoding is NOT here. One member has three modes and the other has two, so a shared
+# table would offer one of them a mode its own datasheet does not describe.
+
+[enums.oversampling]
+skipped = 0
+x1 = 1
+x2 = 2
+x4 = 3
+x8 = 4
+x16 = 5
+notes = "Values 6 and 7 also select x16. A skipped channel sets its output registers to a fixed pattern rather than leaving a stale reading, which is why a driver must refuse the read rather than return it."
+
+[enums.filter]
+coeff_0 = 0
+coeff_1 = 1
+coeff_3 = 2
+coeff_7 = 3
+coeff_15 = 4
+coeff_31 = 5
+coeff_63 = 6
+coeff_127 = 7
+notes = "The member name states the filter COEFFICIENT and the value is the code written to the field, which are different numbers for every entry past the first two. A table that used the coefficient as the code would be wrong by a growing margin and would still compile."
+
+# The value a driver WRITES to `reset`, stated as data rather than only in that register's prose.
+# A driver reading the emission would otherwise still have to transcribe 0xB6 by hand, which is the
+# one transcription this tree exists to remove.
+[enums.reset_command]
+soft_reset = 0xB6
+notes = "A command set of exactly one member rather than a field with a range."

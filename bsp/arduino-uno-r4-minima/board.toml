@@ -1,5 +1,32 @@
 # BOARD binding: the Arduino UNO R4 Minima, an R7FA4M1AB3CFM on Arduino's ABX00080 in the UNO form
 # factor.
+#
+# THIS BOARD EXPOSES SWD DIRECTLY AND CARRIES NEITHER A DEBUGGER NOR A SERIAL BRIDGE, and all
+# three halves of that are read rather than assumed. The user manual's component table names every
+# populated part -- the microcontroller, a buck converter, the reset button, four LEDs, three diodes
+# and the connectors -- and none of them is a debug probe, a bridge or a radio. What the board
+# offers instead is a ten-pin SWD/JTAG connector, J2, whose pin 2 is SWDIO and pin 4 SWCLK, with no
+# probe fitted on the board side of it; and a USB-C connector wired to the microcontroller's OWN
+# device controller, which the schematic brings to P915 as USB_DM and P914 as USB_DP. So the carrier
+# below is `native-usb` and names neither a baud nor an operating point, because a rate is a
+# property of a wire that has one and this wire does not.
+#
+# THE SIBLING BOARD IN THIS PRODUCT LINE DEBUGS THROUGH A DIFFERENT PATH, WHICH IS WHY THE ABOVE
+# IS STATED FROM THIS BOARD'S OWN DOCUMENTS. The WiFi variant of the same UNO R4 carries a second
+# processor that acts as its debug and firmware-update bridge; this variant carries no such part at
+# all, so its SWD lines go straight to the connector. A debug path is a per-board reading and does
+# not transfer between two boards that share a microcontroller.
+#
+# THE ONLY BUTTON IS THE RESET BUTTON AND IT IS NOT A PIN A PROGRAM CAN READ. PB1 drives the
+# microcontroller's reset line, not a port pin, so there is no `gpio-in` row below and the absence
+# is deliberate. A row naming a pin for it would have to invent one.
+#
+# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the 8 KB of data flash the part carries
+# beside its code flash and SRAM; the power LED DL3, which no pin drives; the header serial pair on
+# D0 and D1, which reaches a host only through an external adapter and whose operating point no
+# document here settles; the ICSP header J1; the DC jack and its buck converter; and the two I2C
+# pull-up positions the schematic marks NOT MOUNTED, which are a fitted-population fact rather than
+# a wiring one.
 
 [table]
 kind = "board"
@@ -9,12 +36,16 @@ family = "ra4m1"
 part = "r7fa4m1ab3cfm"
 board_model = 34            # lamella_wire::board_model::ARDUINO_UNO_R4_MINIMA
 sources = [
-    "Arduino UNO R4 Minima user manual (SKU ABX00080), description: the board features a RA4M1 series microcontroller from Renesas (R7FA4M1AB3CFM#AA0), which embeds a 48 MHz Arm Cortex-M4 microprocessor, with 256 kB flash, 32 kB SRAM and 8 kB data memory (EEPROM); the operating voltage is 5 V",
+    "Arduino UNO R4 Minima user manual (SKU ABX00080, modified 06/08/2026), description: the board features a RA4M1 series microcontroller from Renesas (R7FA4M1AB3CFM#AA0), which embeds a 48 MHz Arm Cortex-M4 microprocessor, with 256 kB flash, 32 kB SRAM and 8 kB data memory (EEPROM); the operating voltage is 5 V",
     "Arduino UNO R4 Minima user manual (SKU ABX00080) section 4.1, the front-view component table: U1 is the R7FA4M1AB3CFM#AA0 microcontroller, U2 an ISL854102FRZ-T buck converter, PB1 the RESET button, J1 the ICSP header (SPI), J2 the SWD/JTAG connector, J3 a CX90B-16P USB-C connector, J4 the DC jack, DL1 the TX LED (serial transmit), DL2 the RX LED (serial receive), DL3 the power LED and DL4 the SCK LED (serial clock). Section 10.4 gives the SWD/JTAG connector's pinout as 1 +5V, 2 SWDIO, 3 GND, 4 SWCLK, 5 GND, 6 NC, 7 RX, 8 TX, 9 GND, 10 NC",
     "Arduino UNO R4 Minima full pinout (ABX00080, page 1 of 4, last update 27 Nov 2023): the microcontroller is drawn as an R7FA4M1AB3CFM; a table of LEDs gives P013 as the RX LED, P012 as the TX LED and P111 as LED_BUILTIN; the digital header column gives D13 as P111 with SPI function RSPCKB, and D0/RX and D1/TX as P301 and P302 with UART functions SCI_RXD2 and SCI_TXD2",
     "Arduino UNO R4 Minima schematics (ABX00080 V1.2, 23/08/2023), sheet TOP.SchDoc: U1 is designated R7FA4M1AB3CFM#AA0; DL1 and DL2 are KPT-1608YC yellow LEDs whose anodes are on a shared +5V rail and whose cathodes run through R14 and R15, each 330 ohm, to the nets P012 and P013; DL3 is an HSMG-C190 green LED from the same +5V rail through R16, 330 ohm, to ground; DL4 is a KPT-1608YC yellow LED whose anode is on the net P111_GPT3_A and whose cathode runs through R17, 330 ohm, to ground. Push-button PB1 connects to the RESET net. USB_D_N and USB_D_P reach the microcontroller at pin 18, P915/USB_DM, and pin 19, P914/USB_DP",
 ]
 notes = [
+    "THE THREE DRIVEN LEDS DO NOT SHARE A POLARITY, AND THE SPLIT IS INSIDE ONE BOARD RATHER THAN BETWEEN TWO. DL4, the one the pinout calls LED_BUILTIN, has its ANODE on the pin and its cathode to ground through a resistor, so its pin SOURCES and it lights when driven high. DL1 and DL2 hang the other way round: their anodes are on a shared +5V rail and their cathodes come back through resistors to the pins, so those pins SINK and each lights when driven LOW. A driver that learns the convention from the LED a first program blinks gets the other two exactly backwards, and dark is what a wrong polarity and a missing wire look like alike. Each row below carries its own reading of the schematic rather than a rule applied to all three.",
+    "THE TWO SINKING LEDS ARE PULLED TO THE 5 V RAIL WHILE THE PART IS NOT A 5 V PART, and the diode is what makes that safe rather than a tolerance the pin has. The part's own I/O table marks the port 0 pins as not 5 V tolerant, and the schematic puts a yellow LED between the rail and the pin, so the highest level the pin can be pulled to is the rail less the diode's forward drop. Nothing here should be read as saying these pins tolerate 5 V; what is stated is how they are wired.",
+    "THE BUILT-IN LED IS THE ONE THE COMPONENT TABLE CALLS THE SCK LED, and both names describe the same part. DL4 sits on the pin the digital header exposes as D13, which is also the SPI clock, so the component table names it for the bus and the pinout names it for the role a program uses it in. A reader matching the two documents by name alone finds four LEDs in one and three in the other.",
+    "NO OPERATING POINT IS STATED, AND THAT FOLLOWS FROM THE CARRIER RATHER THAN BEING AN OMISSION. A plan exists for divisors to derive from; with no uart binding there is nothing to derive, and the 48 MHz figure the manual gives is the core's rate rather than a rate this wire is held to.",
     "The part's pin names are written here with a separator the vendor's own spelling omits -- P111 as P1.11, P012 as P0.12, P013 as P0.13 -- because a pin name in this model is a port and an index and the undelimited form has no boundary to split on. The documents cited above all use the undelimited spelling.",
 ]
 
@@ -29,6 +60,12 @@ kind = "native-usb"
 default = true
 
 # --- control lines ----------------------------------------------------------------------------
+#
+# THE OPENING WRITE NEEDS NO CLOCK GATE OPENED FIRST, which is worth knowing before the first
+# thing anyone drives on this board. The part's I/O ports are absent from the list of modules its
+# module-stop function can stop, so a port answers out of reset. What a pin DOES need is its
+# direction bit: every pin comes out of reset as an input, so a program that writes an output level
+# without first setting the direction drives nothing.
 
 [[devices]]
 name = "led0"

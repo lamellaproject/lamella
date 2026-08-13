@@ -742,6 +742,50 @@ pub fn string_ctor_char_ptr_range(
     Err(Trap::Unsupported(Opcode::Newobj))
 }
 
+/// `System.String..ctor(char[])` -- an identity anchor like [`string_ctor_char_ptr`], routed by
+/// the interpreter's `newobj`.
+///
+/// The three SAFE String constructors the standard specifies are anchored the same way the two
+/// unsafe ones are, for one reason: a constructor cannot return an object other than the one being
+/// constructed, so a string built from its arguments has to be produced by the instruction rather
+/// than by a body. That is what the runtime does for these on every implementation.
+///
+/// # Errors
+/// Always [`Trap::Unsupported`] (see above).
+pub fn string_ctor_char_array(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Err(Trap::Unsupported(Opcode::Newobj))
+}
+
+/// `System.String..ctor(char[], int, int)` -- an identity anchor exactly like
+/// [`string_ctor_char_array`].
+///
+/// # Errors
+/// Always [`Trap::Unsupported`] (see above).
+pub fn string_ctor_char_array_range(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Err(Trap::Unsupported(Opcode::Newobj))
+}
+
+/// `System.String..ctor(char, int)` -- an identity anchor exactly like
+/// [`string_ctor_char_array`]: `count` repetitions of one code unit.
+///
+/// # Errors
+/// Always [`Trap::Unsupported`] (see above).
+pub fn string_ctor_char_repeat(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Err(Trap::Unsupported(Opcode::Newobj))
+}
+
 /// `System.String.Concat(string, string, string)`: join three strings into a new
 /// one (a null argument is the empty string).
 ///
@@ -764,7 +808,7 @@ pub fn string_concat3(
 /// `DateTime.UtcNow` (which wrap it in `new DateTime(ticks)`). The interpreter core is
 /// no_std and keeps no clock of its own -- the embedder sets the value via
 /// [`Vm::set_now_ticks`] (the host from `std::time`, a device from its RTC), defaulting
-/// to 0 (the epoch). For v1 there is no timezone, so `Now` and `UtcNow` report the same
+/// to 0 (the epoch). There is no timezone model, so `Now` and `UtcNow` report the same
 /// UTC-based ticks.
 ///
 /// # Errors
@@ -3782,15 +3826,15 @@ pub fn socket_local_port(
 }
 
 /// `Socket.CloseSocket(int handle)`: closes a socket or listener and releases its handle. Any
-/// receive timeout installed for the handle is dropped with it, so a recycled handle starts
-/// with the infinite default.
+/// timeouts installed for the handle are dropped with it, in every direction, so a recycled
+/// handle starts with the infinite default.
 pub fn socket_close(
     vm: &mut Vm,
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let handle = socket_arg(args, 0)?;
-    vm.set_recv_timeout(handle, 0);
+    vm.forget_socket_timeouts(handle);
     if let Some(backend) = vm.net_backend() {
         backend.close(handle);
     }

@@ -1,7 +1,7 @@
 //! Lowering a bound method body to a CIL instruction stream (ECMA-335 1st ed,
 //! Partition III).
 
-use crate::expr::{EmitError, emit_expression, emit_local, ldelem_opcode};
+use crate::expr::{EmitError, emit_expression, emit_local};
 use crate::frame::{Frame, Slot};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
@@ -129,7 +129,7 @@ impl Labels<'_> {
 
 /// The maximum evaluation-stack depth a straight-line/structured body reaches --
 /// the method's `.maxstack` (II.25.4.3). Computed by tracking the running depth
-/// from each instruction's net stack effect; our emitter keeps the stack balanced
+/// from each instruction's net stack effect; this emitter keeps the stack balanced
 /// at statement boundaries, so a single forward pass suffices.
 #[must_use]
 pub fn max_stack(code: &[Instruction]) -> u16 {
@@ -198,7 +198,7 @@ pub fn emit_method(
     parameters: &[Box<str>],
     body: &BoundStmt,
 ) -> Result<Vec<Instruction>, EmitError> {
-    let mut frame = Frame::build(parameters, &[], body, 0);
+    let mut frame = Frame::build(parameters, &[], &[], body, 0);
     Ok(lower(
         &mut frame,
         &Tokens::new(),
@@ -240,6 +240,7 @@ pub struct ConstructorPrologue {
 pub fn emit_body(
     parameters: &[Box<str>],
     byref_params: &[(Box<str>, TypeSymbol)],
+    type_parameters: &[Box<str>],
     body: &BoundStmt,
     tokens: &Tokens,
     arg_base: u16,
@@ -247,7 +248,7 @@ pub fn emit_body(
     prologue: Option<&ConstructorPrologue>,
     source: Option<&[u8]>,
 ) -> Result<EmittedBody, EmitError> {
-    let mut frame = Frame::build(parameters, byref_params, body, arg_base);
+    let mut frame = Frame::build(parameters, byref_params, type_parameters, body, arg_base);
     let lowered = lower(&mut frame, tokens, body, return_type, prologue, source)?;
     Ok(EmittedBody {
         code: lowered.0,
@@ -555,7 +556,7 @@ fn emit_statement(
                     if value_type_new {
                         let token =
                             tokens
-                                .type_token(&initializer.ty)
+                                .instruction_type_token(&initializer.ty)
                                 .ok_or(EmitError::Unsupported(
                                     "struct type has no token for initobj",
                                 ))?;
@@ -713,7 +714,7 @@ fn emit_statement(
                 if rank <= 1 {
                     out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
                     let element_token = tokens
-                        .type_token(element)
+                        .instruction_type_token(element)
                         .ok_or(EmitError::Unsupported("fixed element type has no token"))?;
                     out.push(Instruction::new(Opcode::Ldelema, Operand::Token(element_token)));
                 } else {
@@ -884,13 +885,13 @@ fn emit_statement(
                 || tokens.is_enum(element)
                 || matches!(&**element, TypeSymbol::Special(SpecialType::Decimal))
             {
-                let token = tokens.type_token(element).ok_or(EmitError::Unsupported(
+                let token = tokens.instruction_type_token(element).ok_or(EmitError::Unsupported(
                     "foreach element type has no token",
                 ))?;
                 out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
                 out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
             } else {
-                out.push(Instruction::simple(ldelem_opcode(element)?));
+                out.push(crate::expr::ldelem_instruction(element, tokens)?);
             }
             store_to(frame, name, out)?;
 
@@ -1022,7 +1023,7 @@ fn emit_try(
             .clone()
             .unwrap_or(TypeSymbol::Special(SpecialType::Object));
         let token = tokens
-            .type_token(&ty)
+            .instruction_type_token(&ty)
             .ok_or(EmitError::Unsupported("a catch clause's type has no token"))?;
         labels.handlers.push(EhClause {
             try_range,
@@ -1206,7 +1207,7 @@ fn emit_statement_expression(
             }
             if let BoundExprKind::RefValue { reference, target: referent } = &target.kind {
                 emit_expression(reference, frame, tokens, out)?;
-                let token = tokens.type_token(referent).ok_or(EmitError::Unsupported(
+                let token = tokens.instruction_type_token(referent).ok_or(EmitError::Unsupported(
                     "__refvalue type has no token",
                 ))?;
                 out.push(Instruction::new(Opcode::Refanyval, Operand::Token(token)));
@@ -1421,6 +1422,7 @@ pub(crate) fn emit_compound(
             declaring_type,
             setter_declaring_type,
             name,
+            ..
         } => {
             let is_static = matches!(receiver.kind, BoundExprKind::TypeReference(_));
             let value_type_receiver =
@@ -1499,7 +1501,7 @@ pub(crate) fn emit_compound(
             out.push(Instruction::new(Opcode::Stloc, Operand::Variable(index)));
             if tokens.is_struct(&target.ty) || tokens.is_enum(&target.ty) {
                 let token = tokens
-                    .type_token(&target.ty)
+                    .instruction_type_token(&target.ty)
                     .ok_or(EmitError::Unsupported("array element type has no token"))?;
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
@@ -1517,13 +1519,13 @@ pub(crate) fn emit_compound(
                 }
                 out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
             } else {
-                let load = crate::expr::ldelem_opcode(&target.ty)?;
-                let store = crate::expr::stelem_opcode(&target.ty)?;
+                let load = crate::expr::ldelem_instruction(&target.ty, tokens)?;
+                let store = crate::expr::stelem_instruction(&target.ty, tokens)?;
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
-                out.push(Instruction::simple(load));
+                out.push(load);
                 if leave == Leave::Old {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1533,7 +1535,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                out.push(Instruction::simple(store));
+                out.push(store);
             }
             if let Some(slot) = kept {
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
@@ -1769,7 +1771,7 @@ mod tests {
     fn emission_records_a_sequence_point_per_statement() {
         let body = parse_statement("{ int x = 1; return x; }").statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
-        let emitted = emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, None)
+        let emitted = emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, None)
             .expect("should lower");
 
         let offsets: Vec<u32> = emitted
@@ -1791,7 +1793,7 @@ mod tests {
         let block_span = body.span;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
         let emitted =
-            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
                 .expect("should lower");
 
         assert_eq!(emitted.code[0].opcode, Opcode::Nop);
@@ -1809,7 +1811,7 @@ mod tests {
         let body = parse_statement(source).statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
         let emitted =
-            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
                 .expect("should lower");
         let braced = |offset: u32| {
             emitted
@@ -1830,7 +1832,7 @@ mod tests {
         let body = parse_statement(source).statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
         let emitted =
-            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+            emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
                 .expect("should lower");
         let braced = |offset: u32| {
             emitted

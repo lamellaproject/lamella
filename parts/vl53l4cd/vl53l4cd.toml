@@ -1,0 +1,106 @@
+# PART: ST VL53L4CD, a time-of-flight ranging sensor.
+#
+# TWO THINGS HERE ARE UNLIKE EVERY OTHER PART IN THIS DIRECTORY, and both are stated rather than
+# worked around.
+#
+# ITS REGISTER INDEX IS SIXTEEN BITS. Every other part addressed here writes ONE byte before a read;
+# this one writes two, most significant first. A driver that sent a single byte would address a
+# different register and read a plausible value from it.
+#
+# AND ITS REGISTER MAP IS NOT PUBLISHED. The document states the identity registers and then says
+# outright that full register details are not exposed, directing a reader to the vendor's own
+# software driver instead. So this table can make the part FINDABLE and can go no further, and the
+# `[sourcing] facts` value below is true of what is here while being unavailable for the rest.
+
+[table]
+kind = "device"
+family = "vl53l4cd"
+part = "vl53l4cd"
+sources = [
+    "ST VL53L4CD datasheet DS13812 Rev 8 (July 2024): the identification registers and their values (the Model_ID and Module_Type table); the I2C device address ch 1.1 and the data-transfer protocol section; the statement that the I2C read/writes may be 8, 16 or 32-bit and that multibyte transfers are addressed in ascending order with MSB first; the statement that full register details are not exposed.",
+]
+notes = [
+    "A ranging sensor answers a question about the world rather than about itself, so nothing it reports can be checked against a constant the way an identity can. Its identity registers are the only self-describing thing it has, which is what makes them worth stating even with the rest of the map unavailable.",
+]
+
+# --- sourcing --------------------------------------------------------------------------------
+#
+# `primary` is honest for every row below -- each is read from this part's own datasheet -- and it
+# should not be read as a claim that the whole part is available from that document. The register
+# map is withheld by the vendor, so `primary` here describes the identity and the address and stops
+# where the document stops.
+#
+# `none`: a device acknowledged 0x29 on an I2C walk of this bench, which says something answered
+# that address rather than which part did. Nothing has read the identity registers.
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- identity ------------------------------------------------------------------------------------
+#
+# THE INDEX IS 0x010F AND THAT IS NOT A TYPO FOR 0x0F. It is a sixteen-bit register index, and the
+# LSM6DSOX in this same directory has its WHO_AM_I at the single byte 0x0F -- so the two parts'
+# identity registers look alike written down and are reached by different transfers entirely.
+
+[identity]
+reg = 0x010F
+width = 8
+values = [0xEB]
+notes = "DS13812 Rev 8 identification table: register Model_ID at index 0x010F reads 0xEB. The same table gives Module_Type at index 0x0110 reading 0xAA, which is a second self-describing byte rather than an alternative value of this one -- so it is a register below, not a member of this set."
+
+# --- address -------------------------------------------------------------------------------------
+#
+# THE DOCUMENT'S HEADLINE ADDRESS IS THE 8-BIT ONE, AND TRANSCRIBING IT IS WRONG BY A FACTOR OF TWO.
+# DS13812 states "Address: 0x52" and later "a default device address of 0x52", and its own protocol
+# section says why that is not the number a 7-bit address field wants: "The first byte contains the
+# device address (0x52) and also specifies the data direction" -- so 0x52 is the address SHIFTED UP
+# with the read/write bit appended. The 7-bit address is 0x29.
+#
+# THE SAME VENDOR USES THE OTHER CONVENTION IN THE SAME DIRECTORY. The LSM6DSOX datasheet gives
+# its address as 110101xb -- seven bits -- and puts the composed bytes in a separate table clearly
+# labelled as such. Two datasheets, one vendor, two conventions, and only one of them can be typed
+# into this field as printed.
+#
+# A part transcribed at 0x52 would be looked for at an address it never answers, and 0x52 is a legal
+# 7-bit address that something else may occupy -- so the failure is not a refusal, it is a wrong
+# device or a silence.
+
+[address]
+bus = "i2c"
+base = 0x29
+notes = "DS13812 Rev 8: the document states 0x52, which its own protocol section identifies as the first byte of a transfer -- the 7-bit address shifted up with the direction bit appended. 0x52 >> 1 = 0x29, and 0x29 is what a device of this type answered on an I2C walk of this bench. The address is reassignable in software rather than by a strap, so no strap is modelled; a board carrying several of these separates them by assigning addresses at run time, which makes the address a property of the last thing that configured it rather than of the part or the carrier."
+
+# --- the bus, and the transfer that is not like the others ------------------------------------------
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register16-then-repeated-start-read"
+notes = "DS13812 Rev 8: 'The I2C read/writes can be 8, 16 or 32-bit. Multibyte reads/writes are always addressed in ascending order with MSB first.' The register INDEX is two bytes and is written most significant first; the named protocol above carries that, since the index width is a property of the transfer rather than of any one register."
+
+# --- the two registers the document does expose ------------------------------------------------------
+
+[registers.model_id]
+reg = 0x010F
+width = 8
+access = "read"
+notes = "The identity register above. DS13812 Rev 8 gives its value as 0xEB."
+
+[registers.module_type]
+reg = 0x0110
+width = 8
+access = "read"
+notes = "DS13812 Rev 8 gives its value as 0xAA. A SECOND self-describing byte at the next index: reading both is a stronger check than reading either, because two constants at two indices cannot both be produced by an off-by-one in the index arithmetic that a single one might survive."
+
+# --- WHAT IS NOT HERE, AND WHY IT CANNOT BE ----------------------------------------------------------
+#
+# NO RANGING REGISTERS, NO MODE REGISTERS, NO TIMING BUDGET. The document declines to publish them:
+# it states that the customer must use the vendor's software driver and that, in consequence, full
+# register details are not exposed.
+#
+# THAT IS A SOURCING PROBLEM RATHER THAN A TRANSCRIPTION BACKLOG, and the difference matters to
+# whoever picks this up. The missing rows are not waiting to be read from a page nobody has turned
+# to -- they are not in the document at all, so filling them in would mean sourcing them from
+# somewhere this table's `facts = "primary"` does not cover.

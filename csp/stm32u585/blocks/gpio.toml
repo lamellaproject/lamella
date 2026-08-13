@@ -1,6 +1,29 @@
 # BLOCK layout: the STM32U585 GPIO port block -- the registers a control line drives and a binding
 # muxes through. PARTIAL: MODER fields are stated for the pins the boards claim and grow as more do.
 # Offsets are instance-base-relative; port instance bases live in ../instances.toml.
+#
+# THE RESET MODE IS ANALOG, NOT INPUT, AND IT FAILS SILENTLY. On the vendor's F0, F4 and F7 lines
+# MODER reads 00 -- input -- for a pin nobody has configured. The encoding here is the same four
+# values but the DEFAULT is the other end of it: RM0456 marks 11, analog mode, as the reset state
+# and gives the register's reset value as 0xFFFF FFFF for both ports this family places. So an
+# untouched pin is not a digital input reading whatever is on it -- its input buffer is off and IDR
+# reads zero forever. A driver carried across from one of those lines that reads a button without
+# writing MODER works there and reads a permanently unpressed button here.
+#
+# AND MODER'S RESET VALUE IS ONE OF THIS MANUAL'S SUB-GROUP SPLITS, ON EXACTLY THE TWO PORTS
+# THIS FAMILY USES. RM0456 gives port G 0xFFFF FFF0 and port H 0x0000 00CF on STM32U535/545, against
+# 0xFFFF FFFF for both on STM32U575/585. The value below is this family's. A family spanning the
+# series would have to state one of them and be wrong for half its members -- which is the concrete
+# reason ../parts.toml rules the family narrow.
+#
+# THREE REGISTERS HERE DO NOT EXIST ON csp/stm32h7, so its block file is not a template for this
+# one: BRR at 0x28 (a bit-reset register beside BSRR), HSLVR at 0x2C and SECCFGR at 0x30. Reading
+# the H7's layout across would place the first ten correctly and then simply lack the last three.
+#
+# PORT J EXISTS IN THE REGISTER SECTION'S SCOPE LINE BUT NOT ON THIS PART. Every section below is
+# headed "(x = A to J)", and RM0456's own MODER reset list gives port J a value only for
+# STM32U59x/5Ax/5Fx/5Gx. A scope line naming ports is a statement about the SERIES the manual
+# covers, not about the part -- the same distinction the family rule turns on.
 
 [table]
 kind = "block"
@@ -15,6 +38,8 @@ notes = [
     "WHICH AFR register a pin uses is decided by the pin number, not by the function: AFRL covers pins 0..7 and AFRH covers pins 8..15, each with 4 bits per pin counted from its OWN base. So pin 10's nibble is at bit 8 of AFRH, not at bit 40 of anything.",
     "OTYPER, IDR, ODR, BSRR and BRR carry ONE bit per pin rather than two, so their shift is the pin index itself and not twice it. A rule applied uniformly across these registers is wrong for exactly those.",
     "BSRR's low half SETS a pin and its high half CLEARS one, so either can be done with a single write and no read-modify-write. BRR at 0x28 is a second way to clear: its low half alone does what BSRR's high half does. Two registers reaching the same effect is worth knowing before someone reads a driver that uses one and a manual passage describing the other.",
+    "HSLVR at 0x2C is the per-port high-speed low-voltage control, and its whole-chip counterpart is IO_VDDIO2_HSLV, bit 30 of FLASH_OPTR, which RM0456 says may be set only with VDDIO2 below 2.7 V. Port G is powered from VDDIO2, so on a design that runs that rail low the availability of high-speed IO on those pins is a register-and-option-byte question rather than a peripheral limit. No field is stated below because none has been read.",
+    "SECCFGR at 0x30 exists only because this is a TrustZone part, and its reset value is stated per port -- 0x0000 FFFF for ports A to E, i.e. every pin secure out of reset. It matters only when TZEN is set; with TrustZone off it governs nothing. No field is stated below.",
     "The per-pin field rows below are PARTIAL and deliberately stay that way. A pin's span follows from its index by rule -- 2 bits at [2n], a nibble at [4n] within its own AFR half, one bit at [n] -- and that rule is what composes a binding's words at generation time, so a row per pin would be a second statement of the same arithmetic rather than a new fact.",
 ]
 

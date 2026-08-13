@@ -50,8 +50,27 @@ source = "hfclk"            # the TWI times itself from HFCLK and its FREQUENCY 
 # So the footprint is shared and the placed part is a MANUFACTURING fact, not a design guarantee
 # -- which is why the reference runtime DETECTS the sensor rather than assuming it. The ST part
 # answers as two bus residents (accelerometer 0x19, magnetometer 0x1E); the NXP part is a single
-# combined device and does not. A consumer that must be correct on any unit should probe
-# WHO_AM_I (LSM303AGR answers 0x33 at 0x0F, 0x40 at 0x4F) rather than trust these rows.
+# combined device and does not.
+#
+# A consumer that must be correct on any unit should probe an identity register rather than trust
+# these rows, and it must probe BOTH candidates and require EXACTLY ONE to match:
+#
+#   LSM303AGR   0x33 at register 0x0F (accelerometer, address 0x19)
+#               0x40 at register 0x4F (magnetometer, address 0x1E)
+#   FXOS8700CQ  0xC7 at register 0x0D (ONE device, and on THIS board at address 0x1F)
+#
+# THE TWO VARIANTS DO NOT COLLIDE ON THIS BOARD, and that is a property of the board rather than of
+# the parts. The NXP part selects among four addresses with two pins, and its 0,0 corner is 0x1E --
+# which is the ST magnetometer's address. This board straps it to 0x1F instead, so the two layouts
+# occupy disjoint addresses and a walk can tell them apart before any register is read. Where those
+# pins are tied is carrier truth, and it is stated here because the board's own vendor states it.
+#
+# THE IDENTITY REGISTERS ARE STILL ORDINARY DATA ON EACH OTHER'S PART, which is why the rule is to
+# read both and accept exactly one. Register 0x4F on the NXP part is its magnetometer Z-axis minimum
+# value -- MEASURED data that changes with the field the board is in -- so a probe that read 0x4F
+# and compared against 0x40 could match by chance if it ever reached that part. In the other
+# direction, 0x0D is in a range the ST magnetometer reserves and whose read value its datasheet does
+# not guarantee. Full facts in parts/lsm303agr and parts/fxos8700cq.
 #
 # They are kept because they are true of every unit measured here and a board must say what is on
 # its bus. For the sibling revision the same vendor page adds "To date, all V1.5 boards have been
@@ -71,6 +90,26 @@ kind = "i2c-device"         # what answers where is the schematic's to say, not 
 role = "internal-i2c"       # sensor driver's. Present only if the ST part is placed.
 address = 0x1E
 source = "micro:bit v2.0.0_S schematic (bus residents): the accelerometer answers at 0x19 (WHO_AM_I 0x33), the magnetometer at 0x1E (WHO_AM_I 0x40). PART NOT GUARANTEED BY REVISION -- tech.microbit.org/hardware/2-0-revision/ states the board has a shared footprint for the ST LSM303AGR and the NXP FXOS8700CQ, only one is ever placed, and the reference runtime detects which at run time"
+
+# THE INTERFACE CHIP IS ALSO A BUS RESIDENT, AND THE BOARD FILE DID NOT SAY SO UNTIL A WALK FOUND
+# IT. Two addresses answer on this bus besides the motion sensor, and both belong to the on-board
+# interface processor rather than to anything a program would call a sensor. They are stated for the
+# same reason the sensor rows are: what answers where is the board's to say, and a reader comparing
+# a reading against this file should not find two devices it does not mention.
+
+[[devices]]                 # the interface processor's management endpoint. It is a bus RESIDENT
+name = "interface-mgmt"     # and not a sensor: this is the target talking to the on-board
+kind = "i2c-device"         # interface chip, which is why no parts/ table describes it.
+role = "internal-i2c"
+address = 0x70
+source = "micro:bit Foundation I2C documentation, tech.microbit.org/hardware/i2c/ : the internal bus lists an interface management endpoint at 7-bit address 0x70, which that page also prints in its 8-bit write/read form as 0xE0/0xE1"
+
+[[devices]]                 # the interface processor's storage endpoint, a second address on
+name = "interface-storage"  # the same chip.
+kind = "i2c-device"
+role = "internal-i2c"
+address = 0x72
+source = "micro:bit Foundation I2C documentation, tech.microbit.org/hardware/i2c/ : the internal bus lists an interface storage endpoint at 7-bit address 0x72, printed there in its 8-bit form as 0xE4/0xE5"
 
 # The 5x5 display, as ten pin-wired device rows. It is a CHARLIEPLEXED-style scanned matrix:
 # a row line SOURCES current (drive high to light) and a column line SINKS it (drive low to

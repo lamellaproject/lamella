@@ -228,6 +228,9 @@ pub struct Heap {
     top: u32,
     /// The type-descriptor table; an object's header word indexes it.
     type_descs: Vec<TypeDesc>,
+    /// Bytes of capacity WITHHELD from [`Self::alloc`] -- see [`Self::arm_alloc_reserve`]. Zero
+    /// unless an embedder arms one, so a heap nobody asks allocates to the last byte as before.
+    alloc_reserve: u32,
     /// Which payload slots hold a WEAK reference, per type-descriptor id -- see
     /// [`Self::set_weak_offsets`]. Absent (the ordinary case) means the type has none, so a
     /// heap whose embedder never declares one carries an empty map and one lookup per survivor.
@@ -254,6 +257,7 @@ impl Heap {
             bytes,
             top: ALIGN,
             type_descs,
+            alloc_reserve: 0,
             #[cfg(feature = "gc-collect")]
             weak_offsets: alloc::collections::BTreeMap::new(),
         }
@@ -269,6 +273,13 @@ impl Heap {
     /// interpreter's heap already implements for `System.WeakReference`
     /// (`lamella_cil_runtime::object::Object::Weak`) -- this is the same semantics in the flat-byte
     /// heap, so one collector can serve every language that wants a weak reference.
+    ///
+    /// **A weak offset must appear in NEITHER [`TypeDesc::ref_offsets`] NOR
+    /// [`TypeDesc::tagged_offsets`]** -- the three lists are disjoint, for the same reason
+    /// [`StackMapEntry::pinned_offsets`] is disjoint from its strong siblings. A slot listed as
+    /// both would be marked (making the reference strong, silently) and then relocated twice, the
+    /// second lookup keyed by an address that is already the new one. Checked below in debug
+    /// builds, where the descriptor is at hand.
     #[cfg(feature = "gc-collect")]
     pub fn set_weak_offsets(&mut self, type_desc_id: u32, offsets: Vec<u32>) {
         debug_assert!(
@@ -307,17 +318,69 @@ impl Heap {
         &self.type_descs
     }
 
+    /// The bytes currently withheld from [`Self::alloc`] (zero when no reserve is armed).
+    #[must_use]
+    pub fn alloc_reserve(&self) -> u32 {
+        self.alloc_reserve
+    }
+
+    /// Withholds `bytes` of capacity from [`Self::alloc`], so that the heap reports itself full
+    /// while that much is still there. Returns whether it could: a reserve is armed only if the
+    /// free space above `top` can hold it, and an unaffordable one leaves the previous reserve
+    /// untouched rather than shrinking to fit.
+    ///
+    /// **This exists so that running out of memory can be SURVIVED and not merely reported.** An
+    /// allocator that hands out its last byte leaves a language runtime nothing to report the
+    /// exhaustion with, and nothing for the program's own handler afterwards -- so the recovery
+    /// path fails at exactly the moment it is needed, on a heap that was full a moment ago and is
+    /// still full now. What that path needs is bytes that were set aside BEFORE they were scarce,
+    /// which is a decision only the allocator can enforce, because it is the one refusing.
+    ///
+    /// The reserve is a cap on `alloc`, not a region: the withheld bytes are the last ones in the
+    /// backing store, wherever `top` happens to be, so arming and releasing cost nothing and move
+    /// nothing. A caller that arms one is buying a smaller heap for its program; the size of that
+    /// trade is [`Self::alloc_reserve`] and it is the caller's to choose.
+    ///
+    /// **Refusing while there is room is the whole point and it is visible**: [`Self::used`] and
+    /// [`Self::capacity`] keep reporting the true occupancy of the true store, so an occupancy
+    /// ratio computed from them reads a heap that never quite fills. A collection trigger built on
+    /// such a ratio should be armed to fire below `1 - reserve/capacity` (a refused allocation is
+    /// the unambiguous signal either way).
+    pub fn arm_alloc_reserve(&mut self, bytes: u32) -> bool {
+        if self.top.saturating_add(bytes) as usize > self.bytes.len() {
+            return false;
+        }
+        self.alloc_reserve = bytes;
+        true
+    }
+
+    /// Hands the withheld bytes back to [`Self::alloc`] and answers whether there were any.
+    ///
+    /// The counterpart of [`Self::arm_alloc_reserve`], and the moment it is called is the whole
+    /// design: the caller has decided that the exhaustion the reserve was kept for has now
+    /// happened, so the bytes are spent on getting the program through it. Nothing re-arms by
+    /// itself -- a reserve released and not armed again is simply a heap that allocates to its
+    /// last byte, which is where every heap without one starts.
+    pub fn release_alloc_reserve(&mut self) -> bool {
+        let had = self.alloc_reserve != 0;
+        self.alloc_reserve = 0;
+        had
+    }
+
     /// Allocates an object of type `type_desc_id`: writes the header word, reserves a
     /// zeroed, 4-aligned payload, bumps the pointer, and returns the *payload*
     /// address as a [`Ref`]. Returns `None` if `type_desc_id` is unknown or the heap
     /// is full (no collection is attempted here -- the caller drives [`Self::collect`]).
+    ///
+    /// "Full" means full up to any armed [`Self::arm_alloc_reserve`], which is what makes a
+    /// refusal something a caller can still act on.
     #[must_use]
     pub fn alloc(&mut self, type_desc_id: u32) -> Option<Ref> {
         let payload_size = self.type_descs.get(type_desc_id as usize)?.payload_size;
         let reserved = align_up(payload_size);
         let object_start = self.top;
         let next = object_start.checked_add(HEADER_SIZE)?.checked_add(reserved)?;
-        if next as usize > self.bytes.len() {
+        if next as usize > self.bytes.len() - self.alloc_reserve as usize {
             return None;
         }
         self.write_u32(object_start, type_desc_id);
@@ -431,6 +494,12 @@ impl Heap {
     ///
     /// [`Self::collect`] and [`Self::collect_with_pins`] are this with an interior that supplies
     /// nothing, so a caller that has no exterior references is unaffected and unchanged.
+    ///
+    /// **The condition a caller has to hold up**: while a payload sits in such a table with no live
+    /// object naming it yet -- the window every "take the slot, then allocate the object that names it"
+    /// constructor has -- its contents are reachable from nothing, and a collection there reclaims them.
+    /// **So a caller must not collect from inside its own allocation path**, which is the one place that
+    /// window is open.
     #[cfg(feature = "gc-collect")]
     pub fn collect_with_interior<R>(&mut self, enumerate_roots: R, interior: InteriorRefs<'_>)
     where
@@ -470,6 +539,25 @@ impl Heap {
     /// **The cost, stated rather than discovered: a finalizable object survives exactly one extra
     /// collection.** That is bounded -- it cannot be queued twice -- so a bounded live set of
     /// finalizable garbage still settles, which is what [`Self::collect`]'s callers are measured on.
+    ///
+    /// **THE CALLER MUST NOT RUN A FINALIZER FROM INSIDE THIS CALL, AND MUST NOT DROP THE RETURNED
+    /// LIST.** A finalizer is managed code that allocates, and the condition on
+    /// [`Self::collect_with_interior`] forbids collecting from an allocation path -- so this hands
+    /// back a QUEUE and never calls anything. Until the caller has run them, the queued objects are
+    /// reachable from nothing else and must be reported as ROOTS by `enumerate_roots`, or the next
+    /// collection reclaims an object whose finalizer has not run.
+    ///
+    /// ## Why a WEAK reference to a queued object is cleared anyway
+    ///
+    /// A queued object survives this collection, so it is in the forwarding map -- and every weak
+    /// reference to it is nevertheless CLEARED, permanently, including the ones its own finalizer can
+    /// see. That is not an implementation artefact; it is the observable behaviour, measured against
+    /// CPython 3.14.6: a `__del__` reading a weak reference to its own object reads `None`, and it
+    /// still reads `None` afterwards even when the finalizer resurrected the object.
+    ///
+    /// So clearing keys off the STRONG liveness set -- what the roots alone reached -- and not off the
+    /// survivor set. A collector that cleared "iff absent from the forwarding map" would get every
+    /// object without a finalizer right and this one silently wrong.
     #[cfg(feature = "gc-collect")]
     pub fn collect_with_finalization<R>(
         &mut self,
@@ -1052,6 +1140,30 @@ mod tests {
         let descs = vec![leaf()];
         let mut heap = Heap::new((ALIGN + HEADER_SIZE + 4) as usize, descs);
         assert!(heap.alloc(0).is_some());
+        assert!(heap.alloc(0).is_none());
+    }
+
+    #[test]
+    fn an_armed_reserve_is_refused_to_ordinary_allocation_and_handed_over_on_release() {
+        let object = HEADER_SIZE + 4;
+        let mut heap = Heap::new((ALIGN + 2 * object) as usize, vec![leaf()]);
+        assert!(heap.arm_alloc_reserve(object));
+        assert_eq!(heap.alloc_reserve(), object);
+        assert!(heap.alloc(0).is_some());
+        assert!(heap.alloc(0).is_none(), "the withheld bytes were handed to an ordinary allocation");
+        assert!(heap.release_alloc_reserve());
+        assert!(heap.alloc(0).is_some(), "the reserve was released and the allocation still failed");
+        assert!(!heap.release_alloc_reserve(), "a released reserve reported itself twice");
+    }
+
+    #[test]
+    fn a_reserve_the_free_space_cannot_hold_is_refused_and_leaves_the_armed_one_alone() {
+        let object = HEADER_SIZE + 4;
+        let mut heap = Heap::new((ALIGN + 2 * object) as usize, vec![leaf()]);
+        assert!(heap.arm_alloc_reserve(object));
+        let _ = heap.alloc(0).unwrap();
+        assert!(!heap.arm_alloc_reserve(2 * object), "a reserve larger than the free space was armed");
+        assert_eq!(heap.alloc_reserve(), object);
         assert!(heap.alloc(0).is_none());
     }
 

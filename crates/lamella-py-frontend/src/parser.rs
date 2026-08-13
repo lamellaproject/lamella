@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use crate::ast::{
     Assign, AssignTarget, BinOp, BoolOp, CallArg, CmpOp, CompClause, ExceptHandler, Expr, FuncDef,
-    Keyword, ModuleAst, ParamDef, Stmt, UnaryOp,
+    Keyword, ModuleAst, ParamDef, Stmt, StmtKind, UnaryOp,
 };
 use crate::lexer::{FStringPart, Tok, Token};
 use lamella_py_bytecode::PyStr;
@@ -320,13 +320,13 @@ fn sorted_bound_names(pattern: &MatchPattern) -> Vec<String> {
 
 /// The success body of a case, gated by its guard: `if guard: body else: rest` when there is a
 /// guard (a failing guard falls through to the remaining cases), else just `body`.
-fn guard_body(body: Vec<Stmt>, guard: &Option<Expr>, rest: &[Stmt]) -> Vec<Stmt> {
+fn guard_body(body: Vec<Stmt>, guard: &Option<Expr>, rest: &[Stmt], line: u32) -> Vec<Stmt> {
     match guard {
-        Some(g) => vec![Stmt::If {
+        Some(g) => vec![Stmt::new(line, StmtKind::If {
             test: g.clone(),
             body,
             orelse: rest.to_vec(),
-        }],
+        })],
         None => body,
     }
 }
@@ -339,21 +339,21 @@ fn guard_body(body: Vec<Stmt>, guard: &Option<Expr>, rest: &[Stmt]) -> Vec<Stmt>
 /// caller passes a cheap, re-evaluable expression (a temp name, or an index / attribute access) --
 /// a documented narrowing for a side-effecting `__getitem__` / `__getattribute__` (CPython evaluates
 /// each sub-access once).
-fn match_pattern(pattern: &MatchPattern, subject: &Expr) -> (Option<Expr>, Vec<Stmt>) {
+fn match_pattern(pattern: &MatchPattern, subject: &Expr, line: u32) -> (Option<Expr>, Vec<Stmt>) {
     match pattern {
         MatchPattern::Wildcard => (None, Vec::new()),
         MatchPattern::Capture(name) => (
             None,
-            vec![Stmt::Assign(Assign {
+            vec![Stmt::new(line, StmtKind::Assign(Assign {
                 target: name.clone(),
                 annotation: None,
                 value: Some(subject.clone()),
-            })],
+            }))],
         ),
         MatchPattern::Value(value) => (Some(eq(subject, value.clone())), Vec::new()),
         MatchPattern::Or(alts) => {
             let matched: Vec<(Option<Expr>, Vec<Stmt>)> =
-                alts.iter().map(|a| match_pattern(a, subject)).collect();
+                alts.iter().map(|a| match_pattern(a, subject, line)).collect();
             let mut iter = matched.iter();
             let mut test = iter.next().expect("an OR pattern has alternatives").0.clone();
             for (t, _) in iter {
@@ -366,32 +366,32 @@ fn match_pattern(pattern: &MatchPattern, subject: &Expr) -> (Option<Expr>, Vec<S
             for (t, b) in matched.iter().rev().skip(1) {
                 chain = match t {
                     None => b.clone(),
-                    Some(cond) => vec![Stmt::If {
+                    Some(cond) => vec![Stmt::new(line, StmtKind::If {
                         test: cond.clone(),
                         body: b.clone(),
                         orelse: chain,
-                    }],
+                    })],
                 };
             }
             (test, chain)
         }
-        MatchPattern::Sequence { elems, star } => match_sequence(subject, elems, *star),
+        MatchPattern::Sequence { elems, star } => match_sequence(line, subject, elems, *star),
         MatchPattern::Class {
             cls,
             positional,
             keywords,
             temp,
-        } => match_class(subject, cls, positional, keywords, temp),
+        } => match_class(line, subject, cls, positional, keywords, temp),
         MatchPattern::As { pattern, name } => {
-            let (test, mut binds) = match_pattern(pattern, subject);
-            binds.push(Stmt::Assign(Assign {
+            let (test, mut binds) = match_pattern(pattern, subject, line);
+            binds.push(Stmt::new(line, StmtKind::Assign(Assign {
                 target: name.clone(),
                 annotation: None,
                 value: Some(subject.clone()),
-            }));
+            })));
             (test, binds)
         }
-        MatchPattern::Mapping { items, rest } => match_mapping(subject, items, rest),
+        MatchPattern::Mapping { items, rest } => match_mapping(line, subject, items, rest),
     }
 }
 
@@ -405,6 +405,7 @@ const MAP_REST_VAL: &str = ".mapval";
 /// and the membership gates the `subject[key]` read), whose value matches the sub-pattern. `**rest`
 /// binds the remaining items as a new dict.
 fn match_mapping(
+    line: u32,
     subject: &Expr,
     items: &[(Expr, MatchPattern)],
     rest: &Option<String>,
@@ -424,7 +425,7 @@ fn match_mapping(
             value: Box::new(subject.clone()),
             index: Box::new(key.clone()),
         };
-        let (sub_test, sub_binds) = match_pattern(subpat, &access);
+        let (sub_test, sub_binds) = match_pattern(subpat, &access, line);
         if let Some(t) = sub_test {
             test = bool_and(test, t);
         }
@@ -454,11 +455,11 @@ fn match_mapping(
                 conditions,
             }],
         };
-        binds.push(Stmt::Assign(Assign {
+        binds.push(Stmt::new(line, StmtKind::Assign(Assign {
             target: name.clone(),
             annotation: None,
             value: Some(comp),
-        }));
+        })));
     }
     (Some(test), binds)
 }
@@ -466,6 +467,7 @@ fn match_mapping(
 /// The test + bindings for a sequence pattern against `subject` (see [`match_pattern`]): the subject
 /// is a `list`/`tuple` of the right length whose elements match the sub-patterns.
 fn match_sequence(
+    line: u32,
     subject: &Expr,
     elems: &[MatchPattern],
     star: Option<usize>,
@@ -490,14 +492,14 @@ fn match_sequence(
                     "list",
                     slice_from(subject, i, (post > 0).then(|| -(post as i64))),
                 );
-                binds.push(Stmt::Assign(Assign {
+                binds.push(Stmt::new(line, StmtKind::Assign(Assign {
                     target: name.clone(),
                     annotation: None,
                     value: Some(value),
-                }));
+                })));
             }
         } else {
-            let (sub_test, sub_binds) = match_pattern(elem, &seq_elem(subject, i, elems_len, star));
+            let (sub_test, sub_binds) = match_pattern(elem, &seq_elem(subject, i, elems_len, star), line);
             if let Some(t) = sub_test {
                 test = bool_and(test, t);
             }
@@ -514,6 +516,7 @@ fn match_sequence(
 /// `isinstance` test, honours the class's `__match_args__` (and the self-match rule for builtins like
 /// `int`), and returns `None` for a non-match -- each `p_i` against element `i`.
 fn match_class(
+    line: u32,
     subject: &Expr,
     cls: &Expr,
     positional: &[MatchPattern],
@@ -547,7 +550,7 @@ fn match_class(
         };
         let extracted = Expr::Name(t.clone());
         for (i, subpat) in positional.iter().enumerate() {
-            let (sub_test, sub_binds) = match_pattern(subpat, &index_at(&extracted, i));
+            let (sub_test, sub_binds) = match_pattern(subpat, &index_at(&extracted, i), line);
             if let Some(x) = sub_test {
                 cond = bool_and(cond, x);
             }
@@ -557,7 +560,7 @@ fn match_class(
     };
     for (attr, subpat) in keywords {
         test = bool_and(test, has_attr(subject, attr));
-        let (sub_test, sub_binds) = match_pattern(subpat, &attr_of(subject, attr));
+        let (sub_test, sub_binds) = match_pattern(subpat, &attr_of(subject, attr), line);
         if let Some(t) = sub_test {
             test = bool_and(test, t);
         }
@@ -568,21 +571,21 @@ fn match_class(
 
 /// The nested-if statement list for `cases`, over the subject temp `subj`. Each case tests its
 /// pattern (and guard); on failure control falls through to the remaining cases (the `orelse`).
-fn build_case_tree(cases: &[MatchCase], subj: &str) -> Vec<Stmt> {
+fn build_case_tree(cases: &[MatchCase], subj: &str, line: u32) -> Vec<Stmt> {
     let Some((first, rest_cases)) = cases.split_first() else {
         return Vec::new();
     };
-    let rest = build_case_tree(rest_cases, subj);
-    let (test, binds) = match_pattern(&first.pattern, &Expr::Name(String::from(subj)));
+    let rest = build_case_tree(rest_cases, subj, line);
+    let (test, binds) = match_pattern(&first.pattern, &Expr::Name(String::from(subj)), line);
     let mut success = binds;
-    success.extend(guard_body(first.body.clone(), &first.guard, &rest));
+    success.extend(guard_body(first.body.clone(), &first.guard, &rest, line));
     match test {
         None => success,
-        Some(t) => vec![Stmt::If {
+        Some(t) => vec![Stmt::new(line, StmtKind::If {
             test: t,
             body: success,
             orelse: rest,
-        }],
+        })],
     }
 }
 
@@ -627,6 +630,48 @@ fn build_set_display(elems: Vec<DisplayElem>) -> Expr {
 /// `Expr::Tuple`, so an ordinary `1, 2` / `(1, 2)` is unchanged.
 fn build_tuple_display(elems: Vec<DisplayElem>) -> Expr {
     build_spread_display(elems, Expr::Tuple, |e| call1("tuple", e), BinOp::Add)
+}
+
+/// Whether `target` has a `*` anywhere inside it.
+fn contains_star(target: &AssignTarget) -> bool {
+    match target {
+        AssignTarget::Starred(_) => true,
+        AssignTarget::Tuple(elems) => elems.iter().any(contains_star),
+        AssignTarget::Name(_) | AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {
+            false
+        }
+    }
+}
+
+/// At most one star per target SEQUENCE, checked at every depth.
+///
+/// The limit is per sequence and not per statement, which is CPython's rule asked rather than
+/// recalled: `[*a], [*b] = [1], [2]` and `(a, *b), *c = (1, 2), 3, 4` are both legal, because each
+/// star is the only one in its own sequence. `*a, *b` and `[*a, *b]` are not, because two stars in
+/// one sequence give no answer for which of them takes the surplus.
+fn check_one_star_per_sequence(targets: &[AssignTarget]) -> Result<(), &'static str> {
+    if targets
+        .iter()
+        .filter(|t| matches!(t, AssignTarget::Starred(_)))
+        .count()
+        > 1
+    {
+        return Err("only one starred target is allowed");
+    }
+    for target in targets {
+        match target {
+            AssignTarget::Tuple(elems) => check_one_star_per_sequence(elems)?,
+            AssignTarget::Starred(inner) => {
+                if let AssignTarget::Tuple(elems) = &**inner {
+                    check_one_star_per_sequence(elems)?;
+                }
+            }
+            AssignTarget::Name(_)
+            | AssignTarget::Subscript { .. }
+            | AssignTarget::Attribute { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn build_spread_display(
@@ -769,7 +814,17 @@ impl Parser {
         Ok(ModuleAst { body })
     }
 
+    /// The single entry point for a statement, and therefore the single place a source line is
+    /// stamped. Every sub-parser below returns a KIND; the line is taken from the token the
+    /// statement STARTS on, before any of them consume it, and a nested body recurses through here
+    /// so its own statements get their own lines.
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
+        let line = self.current_line();
+        let kind = self.parse_statement_kind()?;
+        Ok(Stmt::new(line, kind))
+    }
+
+    fn parse_statement_kind(&mut self) -> Result<StmtKind, ParseError> {
         match self.peek() {
             Tok::KwDef => self.parse_funcdef(),
             Tok::KwIf => self.parse_if(),
@@ -805,7 +860,7 @@ impl Parser {
     }
 
     /// `import module [as alias] (, module [as alias])*`, where a module name may be dotted.
-    fn parse_import(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_import(&mut self) -> Result<StmtKind, ParseError> {
         self.advance();
         let mut modules = Vec::new();
         loop {
@@ -821,12 +876,12 @@ impl Parser {
             }
         }
         self.expect_newline()?;
-        Ok(Stmt::Import { modules })
+        Ok(StmtKind::Import { modules })
     }
 
     /// `from module import name [as alias] (, name [as alias])*`, or `from module import *`. The
     /// module name may be dotted; a package-RELATIVE one (a leading dot) may not.
-    fn parse_from_import(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_from_import(&mut self) -> Result<StmtKind, ParseError> {
         self.advance();
         if self.at(&Tok::Dot) {
             return Err(self.error(
@@ -840,7 +895,7 @@ impl Parser {
         self.advance();
         if self.eat(&Tok::Star) {
             self.expect_newline()?;
-            return Ok(Stmt::ImportStar { module });
+            return Ok(StmtKind::ImportStar { module });
         }
         let mut names = Vec::new();
         loop {
@@ -856,7 +911,7 @@ impl Parser {
             }
         }
         self.expect_newline()?;
-        Ok(Stmt::ImportFrom { module, names })
+        Ok(StmtKind::ImportFrom { module, names })
     }
 
     /// Disambiguate the soft keyword `match`: it begins a match statement when the line has the shape
@@ -904,7 +959,8 @@ impl Parser {
     /// `match subject:` NEWLINE INDENT (`case` clause)+ DEDENT. The subject is bound to a temp once,
     /// then the cases become a nested if-tree over that temp (a failing guard falls to the next case);
     /// the whole thing is wrapped in `if True:` so it stays one statement (match adds no new scope).
-    fn parse_match(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_match(&mut self) -> Result<StmtKind, ParseError> {
+        let line = self.current_line();
         self.advance();
         let subject = self.parse_expr()?;
         self.expect(&Tok::Colon, "':' after the match subject")?;
@@ -919,13 +975,13 @@ impl Parser {
             return Err(self.error("a match statement needs at least one `case`"));
         }
         let temp = self.fresh_temp("match");
-        let mut body = vec![Stmt::Assign(Assign {
+        let mut body = vec![Stmt::new(line, StmtKind::Assign(Assign {
             target: temp.clone(),
             annotation: None,
             value: Some(subject),
-        })];
-        body.extend(build_case_tree(&cases, &temp));
-        Ok(Stmt::If {
+        }))];
+        body.extend(build_case_tree(&cases, &temp, line));
+        Ok(StmtKind::If {
             test: Expr::Bool(true),
             body,
             orelse: Vec::new(),
@@ -1189,7 +1245,8 @@ impl Parser {
 
     /// `('@' expr NEWLINE)+` then a `def` or `class`. Each decorator names a callable applied to the
     /// defined function/class; they wrap it bottom-up, so `@a` `@b` `def f` becomes `f = a(b(f))`.
-    fn parse_decorated(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_decorated(&mut self) -> Result<StmtKind, ParseError> {
+        let line = self.current_line();
         let mut decorators = Vec::new();
         while self.eat(&Tok::At) {
             decorators.push(self.parse_expr()?);
@@ -1201,15 +1258,15 @@ impl Parser {
             Tok::KwAsync if matches!(self.peek2(), Tok::KwDef) => self.parse_funcdef_body(true)?,
             _ => return Err(self.error("a decorator must be followed by a 'def' or 'class'")),
         };
-        Ok(Stmt::Decorated {
+        Ok(StmtKind::Decorated {
             decorators,
-            inner: Box::new(inner),
+            inner: Box::new(Stmt::new(line, inner)),
         })
     }
 
     /// A non-compound statement: `return`, an assignment, or an expression
     /// statement. Consumes the trailing [`Tok::Newline`].
-    fn parse_small_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_small_stmt(&mut self) -> Result<StmtKind, ParseError> {
         if self.at(&Tok::KwDel) {
             self.parse_del()
         } else if self.at(&Tok::KwAssert) {
@@ -1219,15 +1276,15 @@ impl Parser {
         } else if self.at(&Tok::KwBreak) {
             self.advance();
             self.expect_newline()?;
-            Ok(Stmt::Break)
+            Ok(StmtKind::Break)
         } else if self.at(&Tok::KwContinue) {
             self.advance();
             self.expect_newline()?;
-            Ok(Stmt::Continue)
+            Ok(StmtKind::Continue)
         } else if self.at(&Tok::KwPass) {
             self.advance();
             self.expect_newline()?;
-            Ok(Stmt::Pass)
+            Ok(StmtKind::Pass)
         } else if self.at(&Tok::KwRaise) {
             self.parse_raise()
         } else if matches!(self.peek(), Tok::Reserved(s) if s == "nonlocal") {
@@ -1241,30 +1298,30 @@ impl Parser {
 
     /// `nonlocal name (, name)*` -- a declaration; it binds the listed names to an enclosing
     /// function's cells (the compiler validates each has such a binding). Emits no code itself.
-    fn parse_nonlocal(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_nonlocal(&mut self) -> Result<StmtKind, ParseError> {
         self.advance();
         let mut names = vec![self.expect_name()?];
         while self.eat(&Tok::Comma) {
             names.push(self.expect_name()?);
         }
         self.expect_newline()?;
-        Ok(Stmt::Nonlocal(names))
+        Ok(StmtKind::Nonlocal(names))
     }
 
     /// `global name (, name)*` -- a declaration; it binds the listed names to the module globals, so
     /// this function's reads resolve the global and its assignments store to the module namespace.
     /// Emits no code itself.
-    fn parse_global(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_global(&mut self) -> Result<StmtKind, ParseError> {
         self.advance();
         let mut names = vec![self.expect_name()?];
         while self.eat(&Tok::Comma) {
             names.push(self.expect_name()?);
         }
         self.expect_newline()?;
-        Ok(Stmt::Global(names))
+        Ok(StmtKind::Global(names))
     }
 
-    fn parse_raise(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_raise(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwRaise, "'raise'")?;
         let exc = if self.at(&Tok::Newline) {
             None
@@ -1281,7 +1338,7 @@ impl Parser {
             None
         };
         self.expect_newline()?;
-        Ok(Stmt::Raise { exc, cause })
+        Ok(StmtKind::Raise { exc, cause })
     }
 
     /// `del target (, target)* NEWLINE` -- unbind each target. A bare name is supported; a subscript
@@ -1289,7 +1346,7 @@ impl Parser {
     /// The parser is at another `=` after `first = second` -- a CHAINED assignment
     /// `first = second = ... = value`. Collect the remaining targets and the final value into a
     /// MultiAssign; each target may be a name, a subscript, or an attribute.
-    fn finish_chain(&mut self, first: Expr, second: Expr, line: u32) -> Result<Stmt, ParseError> {
+    fn finish_chain(&mut self, first: Expr, second: Expr, line: u32) -> Result<StmtKind, ParseError> {
         let mut target_exprs = vec![first, second];
         let value;
         loop {
@@ -1307,13 +1364,14 @@ impl Parser {
             .into_iter()
             .map(|e| self.assign_target(e, line))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Stmt::MultiAssign { targets, value })
+        Ok(StmtKind::MultiAssign { targets, value })
     }
 
     /// `assert test [, msg] NEWLINE` -- desugars to `if not test: raise AssertionError[(msg)]`,
     /// reusing the existing If + Not + Raise. (The runtime must provide `AssertionError` as a
     /// built-in exception for the raised call to resolve; the desugar is inert until it does.)
-    fn parse_assert(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_assert(&mut self) -> Result<StmtKind, ParseError> {
+        let line = self.current_line();
         self.expect(&Tok::KwAssert, "'assert'")?;
         let test = self.parse_expr()?;
         let exc = if self.eat(&Tok::Comma) {
@@ -1327,19 +1385,22 @@ impl Parser {
             Expr::Name(String::from("AssertionError"))
         };
         self.expect_newline()?;
-        Ok(Stmt::If {
+        Ok(StmtKind::If {
             test: Expr::Not {
                 operand: Box::new(test),
             },
-            body: vec![Stmt::Raise {
-                exc: Some(exc),
-                cause: None,
-            }],
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Raise {
+                    exc: Some(exc),
+                    cause: None,
+                },
+            )],
             orelse: Vec::new(),
         })
     }
 
-    fn parse_del(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_del(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwDel, "'del'")?;
         let mut targets = vec![self.parse_expr()?];
         while self.eat(&Tok::Comma) {
@@ -1349,10 +1410,10 @@ impl Parser {
             targets.push(self.parse_expr()?);
         }
         self.expect_newline()?;
-        Ok(Stmt::Delete(targets))
+        Ok(StmtKind::Delete(targets))
     }
 
-    fn parse_return(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_return(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwReturn, "'return'")?;
         let value = if self.at(&Tok::Newline) {
             None
@@ -1360,14 +1421,127 @@ impl Parser {
             Some(self.parse_rhs_value()?)
         };
         self.expect_newline()?;
-        Ok(Stmt::Return(value))
+        Ok(StmtKind::Return(value))
     }
 
     /// `assignment_stmt`, `annotated_assignment_stmt`, or `expression_stmt`. The
     /// statement is parsed as an expression first; a following `:` or `=` then
     /// reinterprets it as an (annotated) assignment, restricted to a bare name
     /// as the target.
-    fn parse_assign_or_expr(&mut self) -> Result<Stmt, ParseError> {
+    /// A simple statement that begins with an expression: an assignment of any form, or a bare
+    /// expression statement.
+    ///
+    /// Two passes, and the second exists because a `*` inside a display is desugared before the
+    /// statement's shape is known. `[*a]` becomes a concatenation the moment its `]` is read -- the
+    /// parser has no way to know an `=` is coming -- so the expression-first pass is handed a CALL
+    /// and truthfully reports that a call is not a target. Re-reading the left side as a TARGET is
+    /// the only thing that can recover it: inverting the desugaring instead would be a guess about
+    /// which `list(a)` came from a `[*a]`.
+    ///
+    /// The second pass runs ONLY after the first has failed and only when it finds a star, so a
+    /// program that parses today takes the identical path, and a program that fails for some other
+    /// reason keeps the first pass's diagnostic rather than a worse one from a speculative re-read.
+    fn parse_assign_or_expr(&mut self) -> Result<StmtKind, ParseError> {
+        let start = self.pos;
+        let first_pass = self.parse_expr_first_statement();
+        let Err(original) = first_pass else {
+            return first_pass;
+        };
+        self.pos = start;
+        match self.parse_starred_target_assign() {
+            Ok(Some(stmt)) => return Ok(stmt),
+            Err(committed) => return Err(committed),
+            Ok(None) => {}
+        }
+        self.pos = start;
+        Err(original)
+    }
+
+    /// The left side of an `=` read as a TARGET LIST, for the starred forms the expression grammar
+    /// cannot represent. `Ok(None)` means this is not one of them and the caller's first diagnostic
+    /// stands.
+    fn parse_starred_target_assign(&mut self) -> Result<Option<StmtKind>, ParseError> {
+        let line = self.current_line();
+        let Ok((first, bracketed)) = self.parse_target() else {
+            return Ok(None);
+        };
+        let mut targets = vec![first];
+        let mut saw_comma = false;
+        while self.eat(&Tok::Comma) {
+            saw_comma = true;
+            if matches!(self.peek(), Tok::Assign | Tok::Newline | Tok::Semicolon | Tok::Eof) {
+                break;
+            }
+            let Ok((next, _)) = self.parse_target() else {
+                return Ok(None);
+            };
+            targets.push(next);
+        }
+        if !self.eat(&Tok::Assign) {
+            return Ok(None);
+        }
+        if !targets.iter().any(contains_star) {
+            return Ok(None);
+        }
+        if !saw_comma && !bracketed && matches!(targets.as_slice(), [AssignTarget::Starred(_)]) {
+            return Err(self.error("starred assignment target must be in a list or tuple"));
+        }
+        if !saw_comma && bracketed && targets.len() == 1 {
+            targets = match targets.remove(0) {
+                AssignTarget::Tuple(inner) => inner,
+                other => vec![other],
+            };
+        }
+        let value = self.parse_rhs_value()?;
+        if self.at(&Tok::Assign) {
+            return Err(self.error("a starred target in a chained assignment is out of the subset"));
+        }
+        self.expect_newline()?;
+        check_one_star_per_sequence(&targets).map_err(|message| ParseError {
+            line,
+            message: String::from(message),
+        })?;
+        Ok(Some(StmtKind::TupleAssign { targets, value }))
+    }
+
+    /// One assignment target, with the flag saying whether it was written as a bracketed group --
+    /// which only the statement's outermost level cares about, to decide whether to flatten it.
+    fn parse_target(&mut self) -> Result<(AssignTarget, bool), ParseError> {
+        let line = self.current_line();
+        if self.eat(&Tok::Star) {
+            let (inner, _) = self.parse_target()?;
+            return Ok((AssignTarget::Starred(Box::new(inner)), false));
+        }
+        let close = match self.peek() {
+            Tok::LParen => Tok::RParen,
+            Tok::LBracket => Tok::RBracket,
+            _ => {
+                let expr = self.parse_expr()?;
+                return Ok((self.assign_target(expr, line)?, false));
+            }
+        };
+        self.advance();
+        let mut elems = Vec::new();
+        let mut saw_comma = false;
+        while !self.at(&close) {
+            elems.push(self.parse_target()?.0);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+            saw_comma = true;
+        }
+        self.expect(&close, if close == Tok::RParen { "')'" } else { "']'" })?;
+        if close == Tok::RParen && elems.len() == 1 && !saw_comma {
+            let only = elems.remove(0);
+            if matches!(only, AssignTarget::Starred(_)) {
+                return Err(self.error("can't use a starred expression here"));
+            }
+            return Ok((only, false));
+        }
+        Ok((AssignTarget::Tuple(elems), true))
+    }
+
+    fn parse_expr_first_statement(&mut self) -> Result<StmtKind, ParseError> {
         let target_line = self.current_line();
         if self.at(&Tok::Star) {
             self.advance();
@@ -1384,14 +1558,14 @@ impl Parser {
                     if matches!(&*index, Expr::Slice { .. }) {
                         return Err(self.error("augmented slice assignment is out of the subset"));
                     }
-                    Ok(Stmt::SetItem {
+                    Ok(StmtKind::SetItem {
                         container: *container,
                         index: *index,
                         value,
                         op: Some(op),
                     })
                 }
-                Expr::Attribute { value: obj, attr } => Ok(Stmt::SetAttr {
+                Expr::Attribute { value: obj, attr } => Ok(StmtKind::SetAttr {
                     obj: *obj,
                     attr,
                     value,
@@ -1399,7 +1573,7 @@ impl Parser {
                 }),
                 other => {
                     let target = self.target_name(other, target_line)?;
-                    Ok(Stmt::Assign(Assign {
+                    Ok(StmtKind::Assign(Assign {
                         target: target.clone(),
                         annotation: None,
                         value: Some(Expr::InplaceBinary {
@@ -1422,7 +1596,7 @@ impl Parser {
                     None
                 };
                 self.expect_newline()?;
-                Ok(Stmt::Assign(Assign {
+                Ok(StmtKind::Assign(Assign {
                     target,
                     annotation,
                     value,
@@ -1438,7 +1612,7 @@ impl Parser {
                 let Expr::Attribute { value, attr } = expr else {
                     unreachable!("guarded to an attribute")
                 };
-                Ok(Stmt::SetAttr {
+                Ok(StmtKind::SetAttr {
                     obj: *value,
                     attr,
                     value: rhs,
@@ -1455,7 +1629,7 @@ impl Parser {
                 let Expr::Subscript { value, index } = expr else {
                     unreachable!("guarded to a subscript")
                 };
-                Ok(Stmt::SetItem {
+                Ok(StmtKind::SetItem {
                     container: *value,
                     index: *index,
                     value: rhs,
@@ -1472,11 +1646,7 @@ impl Parser {
                 let AssignTarget::Tuple(targets) = self.assign_target(expr, target_line)? else {
                     unreachable!("a tuple/list expression converts to a Tuple target")
                 };
-                Ok(Stmt::TupleAssign {
-                    targets,
-                    star: None,
-                    value,
-                })
+                Ok(StmtKind::TupleAssign { targets, value })
             }
             Tok::Assign => {
                 self.advance();
@@ -1486,7 +1656,7 @@ impl Parser {
                 }
                 self.expect_newline()?;
                 let target = self.target_name(expr, target_line)?;
-                Ok(Stmt::Assign(Assign {
+                Ok(StmtKind::Assign(Assign {
                     target,
                     annotation: None,
                     value: Some(value),
@@ -1495,7 +1665,7 @@ impl Parser {
             Tok::Comma => self.finish_tuple_or_expr_stmt(vec![DisplayElem::Plain(expr)], target_line),
             _ => {
                 self.expect_newline()?;
-                Ok(Stmt::Expr(expr))
+                Ok(StmtKind::Expr(expr))
             }
         }
     }
@@ -1533,7 +1703,7 @@ impl Parser {
         &mut self,
         mut elems: Vec<DisplayElem>,
         line: u32,
-    ) -> Result<Stmt, ParseError> {
+    ) -> Result<StmtKind, ParseError> {
         let mut saw_comma = false;
         while self.eat(&Tok::Comma) {
             saw_comma = true;
@@ -1546,40 +1716,51 @@ impl Parser {
             elems.push(self.parse_display_elem()?);
         }
         if self.eat(&Tok::Assign) {
-            let mut star = None;
-            let mut inners: Vec<Expr> = Vec::with_capacity(elems.len());
-            for (i, e) in elems.into_iter().enumerate() {
+            if !saw_comma && matches!(elems.as_slice(), [DisplayElem::Star(_)]) {
+                return Err(self.error("starred assignment target must be in a list or tuple"));
+            }
+            let mut star_seen = false;
+            let mut inners: Vec<(Expr, bool)> = Vec::with_capacity(elems.len());
+            for e in elems {
                 match e {
-                    DisplayElem::Plain(x) => inners.push(x),
+                    DisplayElem::Plain(x) => inners.push((x, false)),
                     DisplayElem::Star(x) => {
-                        if star.is_some() {
+                        if star_seen {
                             return Err(self.error("only one starred target is allowed"));
                         }
-                        star = Some(i);
-                        inners.push(x);
+                        star_seen = true;
+                        inners.push((x, true));
                     }
                 }
             }
             let value = self.parse_rhs_value()?;
             if self.at(&Tok::Assign) {
-                if star.is_some() {
+                if star_seen {
                     return Err(self
                         .error("a starred target in a chained assignment is out of the subset"));
                 }
-                return self.finish_chain(Expr::Tuple(inners), value, line);
+                let plain = inners.into_iter().map(|(e, _)| e).collect();
+                return self.finish_chain(Expr::Tuple(plain), value, line);
             }
             self.expect_newline()?;
             let targets = inners
                 .into_iter()
-                .map(|e| self.assign_target(e, line))
+                .map(|(e, starred)| {
+                    let target = self.assign_target(e, line)?;
+                    Ok(if starred {
+                        AssignTarget::Starred(Box::new(target))
+                    } else {
+                        target
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Stmt::TupleAssign { targets, star, value })
+            Ok(StmtKind::TupleAssign { targets, value })
         } else {
             if !saw_comma && matches!(elems.as_slice(), [DisplayElem::Star(_)]) {
                 return Err(self.error("can't use a starred expression here"));
             }
             self.expect_newline()?;
-            Ok(Stmt::Expr(build_tuple_display(elems)))
+            Ok(StmtKind::Expr(build_tuple_display(elems)))
         }
     }
 
@@ -1612,12 +1793,6 @@ impl Parser {
             }
             Expr::Attribute { value, attr } => Ok(AssignTarget::Attribute { obj: *value, attr }),
             Expr::Tuple(elems) | Expr::List(elems) => {
-                if elems.is_empty() {
-                    return Err(ParseError {
-                        line,
-                        message: String::from("an empty () / [] is not an assignment target"),
-                    });
-                }
                 let targets = elems
                     .into_iter()
                     .map(|e| self.assign_target(e, line))
@@ -1634,26 +1809,27 @@ impl Parser {
         }
     }
 
-    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_if(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwIf, "'if'")?;
         let test = self.parse_expr()?;
         self.expect(&Tok::Colon, "':'")?;
         let body = self.parse_suite()?;
         let orelse = self.parse_elif_else()?;
-        Ok(Stmt::If { test, body, orelse })
+        Ok(StmtKind::If { test, body, orelse })
     }
 
     /// The `("elif" ...)* ["else" ...]` tail of an `if`. An `elif` is desugared
     /// into a nested `if` in the enclosing clause's `orelse`, which keeps the AST
     /// to a single conditional node shape.
     fn parse_elif_else(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        let line = self.current_line();
         if self.at(&Tok::KwElif) {
             self.advance();
             let test = self.parse_expr()?;
             self.expect(&Tok::Colon, "':'")?;
             let body = self.parse_suite()?;
             let orelse = self.parse_elif_else()?;
-            Ok(vec![Stmt::If { test, body, orelse }])
+            Ok(vec![Stmt::new(line, StmtKind::If { test, body, orelse })])
         } else if self.eat(&Tok::KwElse) {
             self.expect(&Tok::Colon, "':'")?;
             self.parse_suite()
@@ -1662,7 +1838,7 @@ impl Parser {
         }
     }
 
-    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_for(&mut self) -> Result<StmtKind, ParseError> {
         self.parse_for_body(false)
     }
 
@@ -1671,20 +1847,26 @@ impl Parser {
     /// desugar) is shared; only two things differ for `async for`, and both are correctness rather
     /// than convenience: the counted `range(...)` fast path is SKIPPED, because it would compile a
     /// sync loop for a header CPython rejects at runtime for having no `__aiter__`, and the result
-    /// is an [`Stmt::AsyncFor`], which lowers to the async iterator protocol.
-    fn parse_for_body(&mut self, is_async: bool) -> Result<Stmt, ParseError> {
+    /// is an [`StmtKind::AsyncFor`], which lowers to the async iterator protocol.
+    fn parse_for_body(&mut self, is_async: bool) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwFor, "'for'")?;
         let line = self.current_line();
         let mut targets = Vec::new();
-        let mut star: Option<usize> = None;
+        let mut star_seen = false;
         loop {
-            if self.eat(&Tok::Star) {
-                if star.is_some() {
+            let starred = self.eat(&Tok::Star);
+            if starred {
+                if star_seen {
                     return Err(self.error("a for-loop target may have at most one starred name"));
                 }
-                star = Some(targets.len());
+                star_seen = true;
             }
-            targets.push(self.for_target(line)?);
+            let target = self.for_target(line)?;
+            targets.push(if starred {
+                AssignTarget::Starred(Box::new(target))
+            } else {
+                target
+            });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -1698,38 +1880,40 @@ impl Parser {
         let mut body = self.parse_suite()?;
         let orelse = self.parse_loop_else()?;
 
-        if star.is_none() {
+        if !star_seen {
             if let [AssignTarget::Name(name)] = targets.as_slice() {
                 let target = name.clone();
                 if !is_async && is_range_call(&iter) {
                     if let Ok((start, stop, step)) = self.range_bounds(iter.clone()) {
-                        return Ok(Stmt::For { target, start, stop, step, body, orelse });
+                        return Ok(StmtKind::For { target, start, stop, step, body, orelse });
                     }
                 }
                 return Ok(if is_async {
-                    Stmt::AsyncFor { target, iterable: iter, body, orelse }
+                    StmtKind::AsyncFor { target, iterable: iter, body, orelse }
                 } else {
-                    Stmt::ForIter { target, iterable: iter, body, orelse }
+                    StmtKind::ForIter { target, iterable: iter, body, orelse }
                 });
             }
         }
 
-        let (unpack_targets, unpack_star) = match targets.as_slice() {
-            [AssignTarget::Tuple(inner)] if star.is_none() => (inner.clone(), None),
-            _ => (targets, star),
+        let unpack_targets = match targets.as_slice() {
+            [AssignTarget::Tuple(inner)] if !star_seen => inner.clone(),
+            _ => targets,
         };
         let tmp = String::from(".unpack");
         let mut new_body = Vec::with_capacity(body.len() + 1);
-        new_body.push(Stmt::TupleAssign {
-            targets: unpack_targets,
-            star: unpack_star,
-            value: Expr::Name(tmp.clone()),
-        });
+        new_body.push(Stmt::new(
+            line,
+            StmtKind::TupleAssign {
+                targets: unpack_targets,
+                value: Expr::Name(tmp.clone()),
+            },
+        ));
         new_body.append(&mut body);
         Ok(if is_async {
-            Stmt::AsyncFor { target: tmp, iterable: iter, body: new_body, orelse }
+            StmtKind::AsyncFor { target: tmp, iterable: iter, body: new_body, orelse }
         } else {
-            Stmt::ForIter { target: tmp, iterable: iter, body: new_body, orelse }
+            StmtKind::ForIter { target: tmp, iterable: iter, body: new_body, orelse }
         })
     }
 
@@ -1741,13 +1925,15 @@ impl Parser {
         let target = self.assign_target(expr, line)?;
         match target {
             AssignTarget::Name(_) | AssignTarget::Tuple(_) => Ok(target),
-            AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {
+            AssignTarget::Starred(_)
+            | AssignTarget::Subscript { .. }
+            | AssignTarget::Attribute { .. } => {
                 Err(self.error("a for-loop target must be a name or a tuple of names"))
             }
         }
     }
 
-    fn parse_try(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_try(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwTry, "'try'")?;
         self.expect(&Tok::Colon, "':' after 'try'")?;
         let body = self.parse_suite()?;
@@ -1801,7 +1987,7 @@ impl Parser {
         if !orelse.is_empty() && handlers.is_empty() {
             return Err(self.error("'try ... else' needs an 'except' clause"));
         }
-        Ok(Stmt::Try {
+        Ok(StmtKind::Try {
             body,
             handlers,
             orelse,
@@ -1809,7 +1995,7 @@ impl Parser {
         })
     }
 
-    fn parse_classdef(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_classdef(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwClass, "'class'")?;
         let name = self.expect_name()?;
         let mut keywords: Vec<(String, Expr)> = Vec::new();
@@ -1841,22 +2027,27 @@ impl Parser {
             Vec::new()
         };
         self.expect(&Tok::Colon, "':' after the class header")?;
-        let body = self.parse_suite()?;
+        let outer = self.func_ctx;
+        self.func_ctx = None;
+        let body = self.parse_suite();
+        self.func_ctx = outer;
+        let body = body?;
         for stmt in &body {
-            if !matches!(
-                stmt,
-                Stmt::FuncDef(_)
-                    | Stmt::Assign(_)
-                    | Stmt::Pass
-                    | Stmt::Decorated { .. }
-                    | Stmt::Expr(Expr::Str(_))
-            ) {
+            if matches!(stmt.kind, StmtKind::Delete(_)) {
                 return Err(self.error(
-                    "a class body supports only methods, attribute assignments, and a docstring in this subset",
+                    "`del` in a class body is not supported in this subset (unbinding a class \
+                     member needs a delete-by-name op the bytecode does not have)",
+                ));
+            }
+            if matches!(stmt.kind, StmtKind::ClassDef { .. }) {
+                return Err(self.error(
+                    "a class nested directly in a class body is not supported in this subset (a \
+                     frame carries one class-body namespace, so the inner class would replace the \
+                     outer one); define it at module level and assign it in the body instead",
                 ));
             }
         }
-        Ok(Stmt::ClassDef {
+        Ok(StmtKind::ClassDef {
             name,
             bases,
             keywords,
@@ -1905,25 +2096,26 @@ impl Parser {
         ))
     }
 
-    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_while(&mut self) -> Result<StmtKind, ParseError> {
         self.expect(&Tok::KwWhile, "'while'")?;
         let test = self.parse_expr()?;
         self.expect(&Tok::Colon, "':'")?;
         let body = self.parse_suite()?;
         let orelse = self.parse_loop_else()?;
-        Ok(Stmt::While { test, body, orelse })
+        Ok(StmtKind::While { test, body, orelse })
     }
 
     /// `with context ["as" name] ":" suite` -- a single context manager. Multiple managers in
     /// one `with` (`with a, b:`) are unsupported.
-    fn parse_with(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_with(&mut self) -> Result<StmtKind, ParseError> {
         self.parse_with_body(false)
     }
 
     /// `["async"] "with" items ":" suite` -- the `async` already consumed by the caller. Item
     /// parsing (including the PEP 617 parenthesized list) and the left-to-right nesting are shared;
     /// an `async with` differs only in the node it builds, which awaits `__aenter__`/`__aexit__`.
-    fn parse_with_body(&mut self, is_async: bool) -> Result<Stmt, ParseError> {
+    fn parse_with_body(&mut self, is_async: bool) -> Result<StmtKind, ParseError> {
+        let line = self.current_line();
         self.expect(&Tok::KwWith, "'with'")?;
         let items = if self.at(&Tok::LParen) {
             let saved = self.pos;
@@ -1942,15 +2134,16 @@ impl Parser {
         let mut current = body;
         for (context, optional_name) in items.into_iter().rev() {
             current = vec![if is_async {
-                Stmt::AsyncWith { context, optional_name, body: current }
+                Stmt::new(line, StmtKind::AsyncWith { context, optional_name, body: current })
             } else {
-                Stmt::With { context, optional_name, body: current }
+                Stmt::new(line, StmtKind::With { context, optional_name, body: current })
             }];
         }
         Ok(current
             .into_iter()
             .next()
-            .expect("at least one context manager was parsed"))
+            .expect("at least one context manager was parsed")
+            .kind)
     }
 
     /// One `with` item: a context-manager expression and an optional `as name` target.
@@ -2011,6 +2204,7 @@ impl Parser {
     /// `suite: stmt_list NEWLINE | NEWLINE INDENT statement+ DEDENT`. The
     /// single-line form holds one simple statement (no `;`-separated list).
     fn parse_suite(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        let line = self.current_line();
         if self.eat(&Tok::Newline) {
             self.expect(&Tok::Indent, "an indented block")?;
             let mut body = Vec::new();
@@ -2020,15 +2214,16 @@ impl Parser {
             self.expect(&Tok::Dedent, "a dedent ending the block")?;
             Ok(body)
         } else {
-            let mut stmts = vec![self.parse_small_stmt()?];
+            let mut stmts = vec![Stmt::new(line, self.parse_small_stmt()?)];
             while !self.line_ended {
-                stmts.push(self.parse_small_stmt()?);
+                let at = self.current_line();
+                stmts.push(Stmt::new(at, self.parse_small_stmt()?));
             }
             Ok(stmts)
         }
     }
 
-    fn parse_funcdef(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_funcdef(&mut self) -> Result<StmtKind, ParseError> {
         self.parse_funcdef_body(false)
     }
 
@@ -2036,7 +2231,7 @@ impl Parser {
     /// `def`) already checked by the caller but not consumed. The body parses with `func_ctx` set to
     /// this function's own async-ness and RESTORED afterwards, so the flag never leaks outward to a
     /// sibling statement or inward past a nested `def`.
-    fn parse_funcdef_body(&mut self, is_async: bool) -> Result<Stmt, ParseError> {
+    fn parse_funcdef_body(&mut self, is_async: bool) -> Result<StmtKind, ParseError> {
         if is_async {
             self.expect(&Tok::KwAsync, "'async'")?;
         }
@@ -2055,7 +2250,7 @@ impl Parser {
         self.func_ctx = Some(is_async);
         let body = self.parse_suite();
         self.func_ctx = outer;
-        Ok(Stmt::FuncDef(FuncDef {
+        Ok(StmtKind::FuncDef(FuncDef {
             name,
             params,
             ret,
@@ -2066,7 +2261,7 @@ impl Parser {
 
     /// A statement opening with `async`: `async def`, `async for`, or `async with`. Nothing else
     /// follows `async` in Python -- there is no `async lambda` and no `async class`.
-    fn parse_async_statement(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_async_statement(&mut self) -> Result<StmtKind, ParseError> {
         match self.peek2() {
             Tok::KwDef => self.parse_funcdef_body(true),
             Tok::KwFor => {
@@ -2243,6 +2438,14 @@ impl Parser {
         {
             return Err(self.error("named keyword-only parameter required after `*`"));
         }
+        for (index, param) in params.iter().enumerate() {
+            if params[..index].iter().any(|earlier| earlier.name == param.name) {
+                return Err(self.error(format!(
+                    "duplicate argument '{}' in function definition",
+                    param.name
+                )));
+            }
+        }
         Ok(params)
     }
 
@@ -2284,6 +2487,14 @@ impl Parser {
     fn parse_yield(&mut self) -> Result<Expr, ParseError> {
         self.expect(&Tok::KwYield, "'yield'")?;
         let in_async = self.func_ctx == Some(true);
+        if self.func_ctx.is_none() {
+            let what = if matches!(self.peek(), Tok::Reserved(s) if s == "from") {
+                "yield from"
+            } else {
+                "yield"
+            };
+            return Err(self.error(format!("'{what}' outside function")));
+        }
         if matches!(self.peek(), Tok::Reserved(s) if s == "from") {
             if in_async {
                 return Err(self.error("'yield from' inside async function"));
@@ -3382,12 +3593,52 @@ mod tests {
         parse_src(source).expect("parses")
     }
 
+    /// Every statement carries the line it BEGAN on, and nested bodies carry their own.
+    ///
+    /// Without this the line field is plumbing nothing checks -- it would compile, round-trip and
+    /// look finished while every statement reported the same number. That is the shape this lane has
+    /// already paid for three times: a field faithfully carried and never verified.
+    #[test]
+    fn every_statement_carries_the_line_it_began_on() {
+        let m = parse_ok("x = 1
+def f(a):
+    if a:
+        return 1
+    return 2
+y = 2
+");
+        assert_eq!(m.body.len(), 3);
+        assert_eq!(m.body[0].line, 1, "the first assignment");
+        assert_eq!(m.body[1].line, 2, "the def, at its `def` line and not its body's");
+        assert_eq!(m.body[2].line, 6, "the assignment after the def");
+
+        let StmtKind::FuncDef(f) = &m.body[1].kind else { panic!("a def") };
+        assert_eq!(f.body[0].line, 3, "the `if` inside the def");
+        assert_eq!(f.body[1].line, 5, "the `return` after the `if` block");
+
+        let StmtKind::If { body, .. } = &f.body[0].kind else { panic!("an if") };
+        assert_eq!(body[0].line, 4, "a statement nested two blocks deep");
+    }
+
+    /// A compound statement takes the line of its HEADER, not of the first statement in its body --
+    /// which is what a traceback frame for the compound itself should name.
+    #[test]
+    fn a_multiline_header_is_attributed_to_its_first_line() {
+        let m = parse_ok("f(
+    1,
+    2)
+z = 0
+");
+        assert_eq!(m.body[0].line, 1, "the expression statement starts where `f` does");
+        assert_eq!(m.body[1].line, 4);
+    }
+
     #[test]
     fn attribute_access_is_an_expression_statement() {
         let module = parse_ok("obj.x\n");
         assert_eq!(
-            module.body,
-            vec![Stmt::Expr(Expr::Attribute {
+            module.body.iter().map(|s| &s.kind).collect::<Vec<_>>(),
+            vec![&StmtKind::Expr(Expr::Attribute {
                 value: Box::new(Expr::Name("obj".into())),
                 attr: "x".into(),
             })]
@@ -3397,10 +3648,10 @@ mod tests {
     #[test]
     fn return_of_a_bare_tuple() {
         let module = parse_ok("def f():\n    return a, b\n");
-        let Stmt::FuncDef(f) = &module.body[0] else { panic!("a def") };
+        let StmtKind::FuncDef(f) = &module.body[0].kind else { panic!("a def") };
         assert_eq!(
-            f.body,
-            vec![Stmt::Return(Some(Expr::Tuple(vec![
+            f.body.iter().map(|s| &s.kind).collect::<Vec<_>>(),
+            vec![&StmtKind::Return(Some(Expr::Tuple(vec![
                 Expr::Name("a".into()),
                 Expr::Name("b".into()),
             ])))]
@@ -3411,16 +3662,16 @@ mod tests {
     fn assign_a_bare_tuple_value() {
         let module = parse_ok("x = a, b\ns = 7,\n");
         assert_eq!(
-            module.body[0],
-            Stmt::Assign(Assign {
+            module.body[0].kind,
+            StmtKind::Assign(Assign {
                 target: "x".into(),
                 annotation: None,
                 value: Some(Expr::Tuple(vec![Expr::Name("a".into()), Expr::Name("b".into())])),
             })
         );
         assert_eq!(
-            module.body[1],
-            Stmt::Assign(Assign {
+            module.body[1].kind,
+            StmtKind::Assign(Assign {
                 target: "s".into(),
                 annotation: None,
                 value: Some(Expr::Tuple(vec![Expr::Int(7)])),
@@ -3431,7 +3682,7 @@ mod tests {
     #[test]
     fn chained_assign_with_a_bare_tuple_value() {
         let module = parse_ok("a = b = 1, 2\n");
-        let Stmt::MultiAssign { targets, value } = &module.body[0] else {
+        let StmtKind::MultiAssign { targets, value } = &module.body[0].kind else {
             panic!("a multi-assign")
         };
         assert_eq!(targets.len(), 2);
@@ -3446,7 +3697,7 @@ mod tests {
             "[x, y] = p, q = 1, 2\n",
         ] {
             let module = parse_ok(src);
-            let Stmt::MultiAssign { targets, value } = &module.body[0] else {
+            let StmtKind::MultiAssign { targets, value } = &module.body[0].kind else {
                 panic!("a multi-assign: {src:?}")
             };
             assert_eq!(targets.len(), 2, "{src:?}");
@@ -3454,9 +3705,9 @@ mod tests {
             assert!(matches!(&targets[1], AssignTarget::Tuple(t) if t.len() == 2), "{src:?}");
             assert_eq!(*value, Expr::Tuple(vec![Expr::Int(1), Expr::Int(2)]), "{src:?}");
         }
-        assert!(matches!(&parse_ok("m = n, o = 1, 2\n").body[0], Stmt::MultiAssign { targets, .. }
+        assert!(matches!(&parse_ok("m = n, o = 1, 2\n").body[0].kind, StmtKind::MultiAssign { targets, .. }
             if matches!(&targets[0], AssignTarget::Name(_)) && matches!(&targets[1], AssignTarget::Tuple(_))));
-        assert!(matches!(&parse_ok("a, b = c = 1, 2\n").body[0], Stmt::MultiAssign { targets, .. }
+        assert!(matches!(&parse_ok("a, b = c = 1, 2\n").body[0].kind, StmtKind::MultiAssign { targets, .. }
             if matches!(&targets[0], AssignTarget::Tuple(_)) && matches!(&targets[1], AssignTarget::Name(_))));
         assert!(parse_src("*a, b = c, d = 1, 2, 3\n").is_err());
     }
@@ -3464,7 +3715,7 @@ mod tests {
     #[test]
     fn for_over_a_bare_tuple_iterable() {
         let module = parse_ok("for x in 1, 2, 3:\n    pass\n");
-        let Stmt::ForIter { target, iterable, .. } = &module.body[0] else {
+        let StmtKind::ForIter { target, iterable, .. } = &module.body[0].kind else {
             panic!("a general for-iter")
         };
         assert_eq!(target, "x");
@@ -3475,15 +3726,15 @@ mod tests {
     fn semicolon_separated_simple_statements() {
         let module = parse_ok("a = 1; b = 2; print(a)\n");
         assert_eq!(module.body.len(), 3);
-        assert!(matches!(&module.body[0], Stmt::Assign(a) if a.target == "a"));
-        assert!(matches!(&module.body[1], Stmt::Assign(a) if a.target == "b"));
-        assert!(matches!(&module.body[2], Stmt::Expr(_)));
+        assert!(matches!(&module.body[0].kind, StmtKind::Assign(a) if a.target == "a"));
+        assert!(matches!(&module.body[1].kind, StmtKind::Assign(a) if a.target == "b"));
+        assert!(matches!(&module.body[2].kind, StmtKind::Expr(_)));
     }
 
     #[test]
     fn inline_suite_holds_all_semicolon_statements() {
         let module = parse_ok("if x: a = 1; b = 2\nc = 3\n");
-        let Stmt::If { body, .. } = &module.body[0] else { panic!("an if") };
+        let StmtKind::If { body, .. } = &module.body[0].kind else { panic!("an if") };
         assert_eq!(body.len(), 2, "both inline statements are in the if body");
         assert_eq!(module.body.len(), 2, "the if, then `c = 3` -- b did not leak out");
     }
@@ -3491,9 +3742,9 @@ mod tests {
     #[test]
     fn for_with_a_nested_tuple_target() {
         let module = parse_ok("for i, (a, b) in items:\n    pass\n");
-        let Stmt::ForIter { target, body, .. } = &module.body[0] else { panic!("a for-iter") };
+        let StmtKind::ForIter { target, body, .. } = &module.body[0].kind else { panic!("a for-iter") };
         assert_eq!(target, ".unpack");
-        let Stmt::TupleAssign { targets, .. } = &body[0] else { panic!("an unpack at body start") };
+        let StmtKind::TupleAssign { targets, .. } = &body[0].kind else { panic!("an unpack at body start") };
         assert_eq!(targets.len(), 2);
         assert!(matches!(&targets[0], AssignTarget::Name(n) if n == "i"));
         assert!(matches!(&targets[1], AssignTarget::Tuple(inner) if inner.len() == 2));
@@ -3503,8 +3754,8 @@ mod tests {
     fn annotated_assignment_with_value() {
         let module = parse_ok("a: int = 0\n");
         assert_eq!(
-            module.body,
-            vec![Stmt::Assign(Assign {
+            module.body.iter().map(|s| &s.kind).collect::<Vec<_>>(),
+            vec![&StmtKind::Assign(Assign {
                 target: "a".into(),
                 annotation: Some(Expr::Name("int".into())),
                 value: Some(Expr::Int(0)),
@@ -3515,7 +3766,7 @@ mod tests {
     #[test]
     fn bare_annotation_has_no_value() {
         let module = parse_ok("a: int\n");
-        let Stmt::Assign(assign) = &module.body[0] else {
+        let StmtKind::Assign(assign) = &module.body[0].kind else {
             panic!("expected an assignment");
         };
         assert_eq!(assign.value, None);
@@ -3525,7 +3776,7 @@ mod tests {
     #[test]
     fn augmented_assignment_desugars_to_an_inplace_binary_assign() {
         let module = parse_ok("x += 5\n");
-        let Stmt::Assign(assign) = &module.body[0] else {
+        let StmtKind::Assign(assign) = &module.body[0].kind else {
             panic!("expected an assignment");
         };
         assert_eq!(assign.target, "x");
@@ -3554,7 +3805,7 @@ mod tests {
             ("x >>= 1\n", BinOp::RShift),
         ] {
             let module = parse_ok(src);
-            let Stmt::Assign(assign) = &module.body[0] else {
+            let StmtKind::Assign(assign) = &module.body[0].kind else {
                 panic!("expected an assignment for {src:?}");
             };
             let Some(Expr::InplaceBinary { op, .. }) = &assign.value else {
@@ -3567,7 +3818,7 @@ mod tests {
     #[test]
     fn boolean_precedence_is_or_below_and_below_not() {
         let module = parse_ok("a or b and c\n");
-        let Stmt::Expr(Expr::BoolBinary { op, rhs, .. }) = &module.body[0] else {
+        let StmtKind::Expr(Expr::BoolBinary { op, rhs, .. }) = &module.body[0].kind else {
             panic!("expected a top-level boolean expression");
         };
         assert_eq!(*op, BoolOp::Or);
@@ -3583,7 +3834,7 @@ mod tests {
     #[test]
     fn not_binds_below_a_comparison() {
         let module = parse_ok("not a < b\n");
-        let Stmt::Expr(Expr::Not { operand }) = &module.body[0] else {
+        let StmtKind::Expr(Expr::Not { operand }) = &module.body[0].kind else {
             panic!("expected a top-level `not`");
         };
         assert!(matches!(**operand, Expr::Compare { .. }));
@@ -3592,7 +3843,7 @@ mod tests {
     #[test]
     fn conditional_expression_is_right_associative() {
         let module = parse_ok("a if p else b if q else c\n");
-        let Stmt::Expr(Expr::Conditional { orelse, .. }) = &module.body[0] else {
+        let StmtKind::Expr(Expr::Conditional { orelse, .. }) = &module.body[0].kind else {
             panic!("expected a conditional expression");
         };
         assert!(matches!(**orelse, Expr::Conditional { .. }));
@@ -3601,9 +3852,9 @@ mod tests {
     #[test]
     fn for_over_range_extracts_its_bounds() {
         let module = parse_ok("for i in range(5):\n    x = i\n");
-        let Stmt::For {
+        let StmtKind::For {
             target, start, stop, ..
-        } = &module.body[0]
+        } = &module.body[0].kind
         else {
             panic!("expected a for statement");
         };
@@ -3611,7 +3862,7 @@ mod tests {
         assert_eq!(*start, Expr::Int(0));
         assert_eq!(*stop, Expr::Int(5));
         let two = parse_ok("for i in range(2, 9):\n    x = i\n");
-        let Stmt::For { start, stop, .. } = &two.body[0] else {
+        let StmtKind::For { start, stop, .. } = &two.body[0].kind else {
             panic!("expected a for statement");
         };
         assert_eq!(*start, Expr::Int(2));
@@ -3621,29 +3872,29 @@ mod tests {
     #[test]
     fn for_dispatches_range_vs_general_iterable() {
         assert!(matches!(
-            parse_ok("for x in range(3):\n    y = x\n").body[0],
-            Stmt::For { .. }
+            parse_ok("for x in range(3):\n    y = x\n").body[0].kind,
+            StmtKind::For { .. }
         ));
         assert!(matches!(
-            parse_ok("for x in stuff:\n    y = x\n").body[0],
-            Stmt::ForIter { .. }
+            parse_ok("for x in stuff:\n    y = x\n").body[0].kind,
+            StmtKind::ForIter { .. }
         ));
     }
 
     #[test]
     fn pass_parses_to_a_no_op() {
-        assert!(matches!(parse_ok("pass\n").body[0], Stmt::Pass));
+        assert!(matches!(parse_ok("pass\n").body[0].kind, StmtKind::Pass));
     }
 
     #[test]
     fn loops_take_an_optional_else_clause() {
         let with = parse_ok("for i in range(3):\n    pass\nelse:\n    pass\n");
-        let Stmt::For { orelse, .. } = &with.body[0] else {
+        let StmtKind::For { orelse, .. } = &with.body[0].kind else {
             panic!("expected a for loop");
         };
         assert_eq!(orelse.len(), 1);
         let without = parse_ok("while x:\n    pass\n");
-        let Stmt::While { orelse, .. } = &without.body[0] else {
+        let StmtKind::While { orelse, .. } = &without.body[0].kind else {
             panic!("expected a while loop");
         };
         assert!(orelse.is_empty());
@@ -3652,7 +3903,7 @@ mod tests {
     #[test]
     fn fstring_desugars_to_format_and_concat() {
         let single = parse_ok("f\"{x}\"\n");
-        let Stmt::Expr(Expr::Call { func, args, .. }) = &single.body[0] else {
+        let StmtKind::Expr(Expr::Call { func, args, .. }) = &single.body[0].kind else {
             panic!("expected \"{{}}\".format(x)");
         };
         let Expr::Attribute { value, attr } = &**func else {
@@ -3661,22 +3912,22 @@ mod tests {
         assert!(matches!(&**value, Expr::Str(s) if s == "{}"));
         assert_eq!(attr, "format");
         assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
-        assert!(matches!(parse_ok("f\"plain\"\n").body[0], Stmt::Expr(Expr::Str(_))));
+        assert!(matches!(parse_ok("f\"plain\"\n").body[0].kind, StmtKind::Expr(Expr::Str(_))));
         let braces = parse_ok("f\"{{x}}\"\n");
-        let Stmt::Expr(Expr::Str(s)) = &braces.body[0] else {
+        let StmtKind::Expr(Expr::Str(s)) = &braces.body[0].kind else {
             panic!("expected literal braces");
         };
         assert_eq!(s, "{x}");
         assert!(matches!(
-            parse_ok("f\"a{x}\"\n").body[0],
-            Stmt::Expr(Expr::Binary { .. })
+            parse_ok("f\"a{x}\"\n").body[0].kind,
+            StmtKind::Expr(Expr::Binary { .. })
         ));
     }
 
     #[test]
     fn fstring_debug_field_desugars_with_prefix_and_repr() {
         let m = parse_ok("f\"{x=}\"\n");
-        let Stmt::Expr(Expr::Binary { op: BinOp::Add, lhs, rhs }) = &m.body[0] else {
+        let StmtKind::Expr(Expr::Binary { op: BinOp::Add, lhs, rhs }) = &m.body[0].kind else {
             panic!("expected a prefix + value concatenation");
         };
         assert!(matches!(&**lhs, Expr::Str(s) if s == "x="));
@@ -3686,18 +3937,18 @@ mod tests {
         assert!(matches!(&**func, Expr::Name(n) if n == "repr"));
         assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
         let spaced = parse_ok("f\"{ x = }\"\n");
-        let Stmt::Expr(Expr::Binary { lhs, .. }) = &spaced.body[0] else {
+        let StmtKind::Expr(Expr::Binary { lhs, .. }) = &spaced.body[0].kind else {
             panic!("expected a prefix + value concatenation");
         };
         assert!(matches!(&**lhs, Expr::Str(s) if s == " x = "));
         let spec = parse_ok("f\"{x=:d}\"\n");
-        let Stmt::Expr(Expr::Binary { rhs, .. }) = &spec.body[0] else {
+        let StmtKind::Expr(Expr::Binary { rhs, .. }) = &spec.body[0].kind else {
             panic!("expected a prefix + value concatenation");
         };
         assert!(matches!(&**rhs, Expr::Call { func, .. }
             if matches!(&**func, Expr::Attribute { attr, .. } if attr == "format")));
         let cmp = parse_ok("f\"{a == b}\"\n");
-        let Stmt::Expr(Expr::Call { func, args, .. }) = &cmp.body[0] else {
+        let StmtKind::Expr(Expr::Call { func, args, .. }) = &cmp.body[0].kind else {
             panic!("expected \"{{}}\".format(a == b)");
         };
         assert!(matches!(&**func, Expr::Attribute { attr, .. } if attr == "format"));
@@ -3707,7 +3958,7 @@ mod tests {
     #[test]
     fn fstring_nested_spec_builds_a_dynamic_template() {
         let m = parse_ok("f\"{x:{w}}\"\n");
-        let Stmt::Expr(Expr::Call { func, args, .. }) = &m.body[0] else {
+        let StmtKind::Expr(Expr::Call { func, args, .. }) = &m.body[0].kind else {
             panic!("expected a .format(...) call");
         };
         let Expr::Attribute { value, attr } = &**func else {
@@ -3717,7 +3968,7 @@ mod tests {
         assert!(matches!(&**value, Expr::Binary { op: BinOp::Add, .. }));
         assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
         let plain = parse_ok("f\"{x:.2f}\"\n");
-        let Stmt::Expr(Expr::Call { func, .. }) = &plain.body[0] else {
+        let StmtKind::Expr(Expr::Call { func, .. }) = &plain.body[0].kind else {
             panic!("expected a .format(...) call");
         };
         let Expr::Attribute { value, .. } = &**func else {
@@ -3728,34 +3979,34 @@ mod tests {
 
     #[test]
     fn tuple_and_dict_displays_parse() {
-        assert!(matches!(parse_ok("(a, b)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 2));
-        assert!(matches!(parse_ok("(a,)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 1));
-        assert!(matches!(parse_ok("()\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.is_empty()));
-        assert!(matches!(parse_ok("(a)\n").body[0], Stmt::Expr(Expr::Name(_))));
-        assert!(matches!(parse_ok("{1: 2, 3: 4}\n").body[0], Stmt::Expr(Expr::Dict(ref p)) if p.len() == 2));
-        assert!(matches!(parse_ok("{}\n").body[0], Stmt::Expr(Expr::Dict(ref p)) if p.is_empty()));
-        assert!(matches!(parse_ok("{1, 2}\n").body[0], Stmt::Expr(Expr::Set(_))));
-        assert!(matches!(parse_ok("{}\n").body[0], Stmt::Expr(Expr::Dict(_))));
+        assert!(matches!(parse_ok("(a, b)\n").body[0].kind, StmtKind::Expr(Expr::Tuple(ref v)) if v.len() == 2));
+        assert!(matches!(parse_ok("(a,)\n").body[0].kind, StmtKind::Expr(Expr::Tuple(ref v)) if v.len() == 1));
+        assert!(matches!(parse_ok("()\n").body[0].kind, StmtKind::Expr(Expr::Tuple(ref v)) if v.is_empty()));
+        assert!(matches!(parse_ok("(a)\n").body[0].kind, StmtKind::Expr(Expr::Name(_))));
+        assert!(matches!(parse_ok("{1: 2, 3: 4}\n").body[0].kind, StmtKind::Expr(Expr::Dict(ref p)) if p.len() == 2));
+        assert!(matches!(parse_ok("{}\n").body[0].kind, StmtKind::Expr(Expr::Dict(ref p)) if p.is_empty()));
+        assert!(matches!(parse_ok("{1, 2}\n").body[0].kind, StmtKind::Expr(Expr::Set(_))));
+        assert!(matches!(parse_ok("{}\n").body[0].kind, StmtKind::Expr(Expr::Dict(_))));
     }
 
     #[test]
     fn star_in_tuple_display_desugars_to_concat() {
         assert!(matches!(
-            parse_ok("x = 1, *b, 2\n").body[0],
-            Stmt::Assign(Assign { value: Some(Expr::Binary { op: BinOp::Add, .. }), .. })
+            parse_ok("x = 1, *b, 2\n").body[0].kind,
+            StmtKind::Assign(Assign { value: Some(Expr::Binary { op: BinOp::Add, .. }), .. })
         ));
         assert!(matches!(
-            parse_ok("(1, *b, 2)\n").body[0],
-            Stmt::Expr(Expr::Binary { op: BinOp::Add, .. })
+            parse_ok("(1, *b, 2)\n").body[0].kind,
+            StmtKind::Expr(Expr::Binary { op: BinOp::Add, .. })
         ));
-        assert!(matches!(parse_ok("(*b,)\n").body[0], Stmt::Expr(Expr::Call { .. })));
+        assert!(matches!(parse_ok("(*b,)\n").body[0].kind, StmtKind::Expr(Expr::Call { .. })));
         assert!(matches!(
-            parse_ok("x = *b,\n").body[0],
-            Stmt::Assign(Assign { value: Some(Expr::Call { .. }), .. })
+            parse_ok("x = *b,\n").body[0].kind,
+            StmtKind::Assign(Assign { value: Some(Expr::Call { .. }), .. })
         ));
-        assert!(matches!(parse_ok("(1, 2)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 2));
-        assert!(matches!(parse_ok("y = 1, 2, 3\n").body[0],
-            Stmt::Assign(Assign { value: Some(Expr::Tuple(ref v)), .. }) if v.len() == 3));
+        assert!(matches!(parse_ok("(1, 2)\n").body[0].kind, StmtKind::Expr(Expr::Tuple(ref v)) if v.len() == 2));
+        assert!(matches!(parse_ok("y = 1, 2, 3\n").body[0].kind,
+            StmtKind::Assign(Assign { value: Some(Expr::Tuple(ref v)), .. }) if v.len() == 3));
         assert!(parse_src("z = *b\n").is_err());
         assert!(parse_src("(*b)\n").is_err());
     }
@@ -3763,134 +4014,160 @@ mod tests {
     #[test]
     fn bare_tuple_expression_statement() {
         assert!(matches!(
-            parse_ok("a, b\n").body[0],
-            Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 2
+            parse_ok("a, b\n").body[0].kind,
+            StmtKind::Expr(Expr::Tuple(ref v)) if v.len() == 2
         ));
         assert!(matches!(
-            parse_ok("1, 2, 3\n").body[0],
-            Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 3
+            parse_ok("1, 2, 3\n").body[0].kind,
+            StmtKind::Expr(Expr::Tuple(ref v)) if v.len() == 3
         ));
         assert!(matches!(
-            parse_ok("a,\n").body[0],
-            Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 1
+            parse_ok("a,\n").body[0].kind,
+            StmtKind::Expr(Expr::Tuple(ref v)) if v.len() == 1
         ));
-        assert!(matches!(parse_ok("a, *b\n").body[0], Stmt::Expr(Expr::Binary { .. })));
-        assert!(matches!(parse_ok("*b, a\n").body[0], Stmt::Expr(Expr::Binary { .. })));
-        assert!(matches!(parse_ok("a, b = p\n").body[0], Stmt::TupleAssign { .. }));
-        assert!(matches!(parse_ok("*a, b = p\n").body[0], Stmt::TupleAssign { .. }));
+        assert!(matches!(parse_ok("a, *b\n").body[0].kind, StmtKind::Expr(Expr::Binary { .. })));
+        assert!(matches!(parse_ok("*b, a\n").body[0].kind, StmtKind::Expr(Expr::Binary { .. })));
+        assert!(matches!(parse_ok("a, b = p\n").body[0].kind, StmtKind::TupleAssign { .. }));
+        assert!(matches!(parse_ok("*a, b = p\n").body[0].kind, StmtKind::TupleAssign { .. }));
         assert!(parse_src("*b\n").is_err());
     }
 
     #[test]
     fn matmul_operator_parses_as_infix_binary() {
         assert!(matches!(
-            parse_ok("a @ b\n").body[0],
-            Stmt::Expr(Expr::Binary { op: BinOp::MatMul, .. })
+            parse_ok("a @ b\n").body[0].kind,
+            StmtKind::Expr(Expr::Binary { op: BinOp::MatMul, .. })
         ));
-        let Stmt::Expr(Expr::Binary { op: BinOp::Add, lhs, .. }) = &parse_ok("a @ b + c\n").body[0]
+        let StmtKind::Expr(Expr::Binary { op: BinOp::Add, lhs, .. }) = &parse_ok("a @ b + c\n").body[0].kind
         else {
             panic!("expected (a @ b) + c");
         };
         assert!(matches!(&**lhs, Expr::Binary { op: BinOp::MatMul, .. }));
         assert!(matches!(
-            parse_ok("a @= b\n").body[0],
-            Stmt::Assign(Assign { value: Some(Expr::InplaceBinary { op: BinOp::MatMul, .. }), .. })
+            parse_ok("a @= b\n").body[0].kind,
+            StmtKind::Assign(Assign { value: Some(Expr::InplaceBinary { op: BinOp::MatMul, .. }), .. })
         ));
         assert!(matches!(
-            parse_ok("@d\ndef f():\n    pass\n").body[0],
-            Stmt::Decorated { .. }
+            parse_ok("@d\ndef f():\n    pass\n").body[0].kind,
+            StmtKind::Decorated { .. }
         ));
     }
 
     #[test]
     fn tuple_unpacking_parses() {
         assert!(matches!(
-            parse_ok("a, b = p\n").body[0],
-            Stmt::TupleAssign { .. }
+            parse_ok("a, b = p\n").body[0].kind,
+            StmtKind::TupleAssign { .. }
         ));
         let m = parse_ok("a, b = 1, 2\n");
-        let Stmt::TupleAssign { targets, star, value } = &m.body[0] else {
+        let StmtKind::TupleAssign { targets, value } = &m.body[0].kind else {
             panic!("expected a tuple assignment");
         };
-        let names: Vec<&str> = targets
-            .iter()
-            .map(|t| match t {
-                AssignTarget::Name(n) => n.as_str(),
-                _ => panic!("expected a name target"),
-            })
-            .collect();
-        assert_eq!(names, ["a", "b"]);
-        assert_eq!(*star, None);
+        assert_eq!(target_list_spelling(targets), "a, b");
         assert!(matches!(value, Expr::Tuple(_)));
         let f = parse_ok("for k, v in d:\n    pass\n");
-        let Stmt::ForIter { body, .. } = &f.body[0] else {
+        let StmtKind::ForIter { body, .. } = &f.body[0].kind else {
             panic!("expected a for-iter");
         };
-        assert!(matches!(body[0], Stmt::TupleAssign { .. }));
+        assert!(matches!(body[0].kind, StmtKind::TupleAssign { .. }));
         assert!(matches!(
-            parse_ok("for x in d:\n    pass\n").body[0],
-            Stmt::ForIter { .. }
+            parse_ok("for x in d:\n    pass\n").body[0].kind,
+            StmtKind::ForIter { .. }
         ));
         assert!(matches!(
-            &parse_ok("a, = x\n").body[0],
-            Stmt::TupleAssign { targets, star: None, .. } if targets.len() == 1
+            &parse_ok("a, = x\n").body[0].kind,
+            StmtKind::TupleAssign { targets, .. } if targets.len() == 1
         ));
+    }
+
+    /// A target as it was written, so a nested or starred shape can be asserted as text rather than
+    /// as a pattern that has to be re-read to be understood.
+    fn target_spelling(target: &AssignTarget) -> String {
+        match target {
+            AssignTarget::Name(name) => name.clone(),
+            AssignTarget::Starred(inner) => format!("*{}", target_spelling(inner)),
+            AssignTarget::Tuple(elems) => format!("({})", target_list_spelling(elems)),
+            AssignTarget::Subscript { .. } => String::from("<subscript>"),
+            AssignTarget::Attribute { .. } => String::from("<attribute>"),
+        }
+    }
+
+    fn target_list_spelling(targets: &[AssignTarget]) -> String {
+        let parts: Vec<String> = targets.iter().map(target_spelling).collect();
+        parts.join(", ")
     }
 
     #[test]
     fn starred_unpacking_parses() {
         let cases = [
-            ("a, *b = seq\n", vec!["a", "b"], Some(1)),
-            ("a, *b, c = seq\n", vec!["a", "b", "c"], Some(1)),
-            ("*a, b = seq\n", vec!["a", "b"], Some(0)),
-            ("*a, = seq\n", vec!["a"], Some(0)),
+            ("a, *b = seq\n", "a, *b"),
+            ("a, *b, c = seq\n", "a, *b, c"),
+            ("*a, b = seq\n", "*a, b"),
+            ("*a, = seq\n", "*a"),
+            ("[*a] = seq\n", "*a"),
+            ("(*a,) = seq\n", "*a"),
+            ("[*a, b] = seq\n", "*a, b"),
+            ("[*a], b = seq\n", "(*a), b"),
+            ("(a, *b), c = seq\n", "(a, *b), c"),
+            ("(a, *b), *c = seq\n", "(a, *b), *c"),
+            ("[*a], [*b] = seq\n", "(*a), (*b)"),
+            ("[[*a]] = seq\n", "(*a)"),
+            ("[*a.x] = seq\n", "*<attribute>"),
+            ("[*a[0]] = seq\n", "*<subscript>"),
         ];
-        for (src, want_targets, want_star) in cases {
+        for (src, want) in cases {
             let m = parse_ok(src);
-            let Stmt::TupleAssign { targets, star, .. } = &m.body[0] else {
+            let StmtKind::TupleAssign { targets, .. } = &m.body[0].kind else {
                 panic!("expected a starred assignment for {src:?}");
             };
-            let names: Vec<&str> = targets
-                .iter()
-                .map(|t| match t {
-                    AssignTarget::Name(n) => n.as_str(),
-                    _ => panic!("expected a name target"),
-                })
-                .collect();
-            assert_eq!(names, want_targets);
-            assert_eq!(*star, want_star);
+            assert_eq!(target_list_spelling(targets), want, "for {src:?}");
         }
-        assert!(parse_src("a, *b, *c = seq\n").is_err());
+
+        for src in ["a, *b, *c = seq\n", "*a, *b = seq\n", "[*a, *b] = seq\n"] {
+            assert!(parse_src(src).is_err(), "expected a refusal for {src:?}");
+        }
+        assert!(parse_src("(*a) = seq\n").is_err());
+        assert!(parse_src("*a = seq\n").is_err());
+        for src in ["[] = []\n", "() = ()\n", "[*a, []] = seq\n", "a, [] = 1, []\n"] {
+            assert!(parse_src(src).is_ok(), "expected an accept for {src:?}");
+        }
+
+        let m = parse_ok("[*a] = x; b = 1\n");
+        assert_eq!(m.body.len(), 2);
+        assert!(matches!(&m.body[0].kind, StmtKind::TupleAssign { .. }));
+
+        let err = parse_src("f() = 1\n").unwrap_err();
+        assert!(err.message.contains("bare name"), "got {:?}", err.message);
     }
 
     #[test]
     fn tuple_targets_allow_subscript_and_attribute() {
         let m = parse_ok("a, xs[1], o.x = 1, 2, 3\n");
-        let Stmt::TupleAssign { targets, .. } = &m.body[0] else {
+        let StmtKind::TupleAssign { targets, .. } = &m.body[0].kind else {
             panic!("expected a tuple assignment");
         };
         assert!(matches!(targets[0], AssignTarget::Name(_)));
         assert!(matches!(targets[1], AssignTarget::Subscript { .. }));
         assert!(matches!(targets[2], AssignTarget::Attribute { .. }));
         let n = parse_ok("a, (b, c) = x\n");
-        let Stmt::TupleAssign { targets, .. } = &n.body[0] else {
+        let StmtKind::TupleAssign { targets, .. } = &n.body[0].kind else {
             panic!("expected a tuple assignment");
         };
         assert!(matches!(targets[1], AssignTarget::Tuple(_)));
-        assert!(matches!(parse_ok("a, xs[1:2] = p\n").body[0], Stmt::TupleAssign { .. }));
+        assert!(matches!(parse_ok("a, xs[1:2] = p\n").body[0].kind, StmtKind::TupleAssign { .. }));
     }
 
     #[test]
     fn nested_and_parenthesized_tuple_targets() {
         let m = parse_ok("(a, b) = pair\n");
-        let Stmt::TupleAssign { targets, .. } = &m.body[0] else {
+        let StmtKind::TupleAssign { targets, .. } = &m.body[0].kind else {
             panic!("expected a tuple assignment");
         };
         assert_eq!(targets.len(), 2);
         assert!(matches!(targets[0], AssignTarget::Name(_)));
 
         let m2 = parse_ok("a, (b, c) = row\n");
-        let Stmt::TupleAssign { targets, .. } = &m2.body[0] else {
+        let StmtKind::TupleAssign { targets, .. } = &m2.body[0].kind else {
             panic!("expected a tuple assignment");
         };
         let AssignTarget::Tuple(inner) = &targets[1] else {
@@ -3898,35 +4175,38 @@ mod tests {
         };
         assert_eq!(inner.len(), 2);
 
-        assert!(matches!(parse_ok("[a, b] = pair\n").body[0], Stmt::TupleAssign { .. }));
-        assert!(parse_src("() = x\n").is_err());
+        assert!(matches!(parse_ok("[a, b] = pair\n").body[0].kind, StmtKind::TupleAssign { .. }));
+        assert!(matches!(
+            &parse_ok("() = x\n").body[0].kind,
+            StmtKind::TupleAssign { targets, .. } if targets.is_empty()
+        ));
     }
 
     #[test]
     fn exponentiation_precedence_and_associativity() {
         let m = parse_ok("x = 2 ** 3 ** 2\n");
-        let Stmt::Assign(a) = &m.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(a) = &m.body[0].kind else { panic!("expected an assignment") };
         let Some(Expr::Binary { op: BinOp::Pow, rhs, .. }) = &a.value else {
             panic!("expected a Pow");
         };
         assert!(matches!(**rhs, Expr::Binary { op: BinOp::Pow, .. }));
 
         let m2 = parse_ok("y = 2 * 3 ** 2\n");
-        let Stmt::Assign(a2) = &m2.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(a2) = &m2.body[0].kind else { panic!("expected an assignment") };
         let Some(Expr::Binary { op: BinOp::Mul, rhs, .. }) = &a2.value else {
             panic!("expected a Mul");
         };
         assert!(matches!(**rhs, Expr::Binary { op: BinOp::Pow, .. }));
 
         let m3 = parse_ok("z = -2 ** 2\n");
-        let Stmt::Assign(a3) = &m3.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(a3) = &m3.body[0].kind else { panic!("expected an assignment") };
         let Some(Expr::Unary { op: UnaryOp::Neg, operand }) = &a3.value else {
             panic!("expected a unary neg");
         };
         assert!(matches!(**operand, Expr::Binary { op: BinOp::Pow, .. }));
 
         let m4 = parse_ok("w = 2 ** -1\n");
-        let Stmt::Assign(a4) = &m4.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(a4) = &m4.body[0].kind else { panic!("expected an assignment") };
         let Some(Expr::Binary { op: BinOp::Pow, rhs, .. }) = &a4.value else {
             panic!("expected a Pow");
         };
@@ -3936,7 +4216,7 @@ mod tests {
     #[test]
     fn walrus_parses_and_requires_a_name_target() {
         let m = parse_ok("y = (x := 5)\n");
-        let Stmt::Assign(a) = &m.body[0] else {
+        let StmtKind::Assign(a) = &m.body[0].kind else {
             panic!("expected an assignment");
         };
         let Some(Expr::Walrus { target, .. }) = &a.value else {
@@ -3949,38 +4229,38 @@ mod tests {
 
     #[test]
     fn del_parses_names_and_a_target_list() {
-        assert!(matches!(&parse_ok("del x\n").body[0], Stmt::Delete(ts) if ts.len() == 1));
-        assert!(matches!(&parse_ok("del a, b, c\n").body[0], Stmt::Delete(ts) if ts.len() == 3));
-        assert!(matches!(parse_ok("del xs[0]\n").body[0], Stmt::Delete(_)));
+        assert!(matches!(&parse_ok("del x\n").body[0].kind, StmtKind::Delete(ts) if ts.len() == 1));
+        assert!(matches!(&parse_ok("del a, b, c\n").body[0].kind, StmtKind::Delete(ts) if ts.len() == 3));
+        assert!(matches!(parse_ok("del xs[0]\n").body[0].kind, StmtKind::Delete(_)));
     }
 
     #[test]
     fn assert_desugars_to_a_conditional_raise() {
         let m = parse_ok("assert x > 0\n");
-        let Stmt::If { test, body, orelse } = &m.body[0] else {
+        let StmtKind::If { test, body, orelse } = &m.body[0].kind else {
             panic!("expected the assert desugar (an if)");
         };
         assert!(matches!(test, Expr::Not { .. }));
         assert!(orelse.is_empty());
         assert_eq!(body.len(), 1);
-        assert!(matches!(&body[0], Stmt::Raise { exc: Some(_), .. }));
+        assert!(matches!(&body[0].kind, StmtKind::Raise { exc: Some(_), .. }));
         let m2 = parse_ok("assert ok, \"nope\"\n");
-        let Stmt::If { body, .. } = &m2.body[0] else {
+        let StmtKind::If { body, .. } = &m2.body[0].kind else {
             panic!("expected the assert desugar");
         };
-        assert!(matches!(&body[0], Stmt::Raise { exc: Some(Expr::Call { .. }), .. }));
+        assert!(matches!(&body[0].kind, StmtKind::Raise { exc: Some(Expr::Call { .. }), .. }));
     }
 
     #[test]
     fn is_and_is_not_parse_as_identity_comparisons() {
         let m = parse_ok("r = a is None\n");
-        let Stmt::Assign(asn) = &m.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(asn) = &m.body[0].kind else { panic!("expected an assignment") };
         assert!(matches!(
             asn.value,
             Some(Expr::Compare { op: CmpOp::Is, .. })
         ));
         let m2 = parse_ok("r = a is not b\n");
-        let Stmt::Assign(asn2) = &m2.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(asn2) = &m2.body[0].kind else { panic!("expected an assignment") };
         assert!(matches!(
             asn2.value,
             Some(Expr::Compare { op: CmpOp::IsNot, .. })
@@ -3990,7 +4270,7 @@ mod tests {
     #[test]
     fn star_call_args_build_a_callex() {
         let m = parse_ok("r = f(a, *b, k=1, **c)\n");
-        let Stmt::Assign(asn) = &m.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(asn) = &m.body[0].kind else { panic!("expected an assignment") };
         let Some(Expr::CallEx { args, .. }) = &asn.value else {
             panic!("expected a CallEx");
         };
@@ -3999,40 +4279,40 @@ mod tests {
         assert!(matches!(args[2], CallArg::Keyword(_, _)));
         assert!(matches!(args[3], CallArg::DoubleStar(_)));
         let plain = parse_ok("r = f(a, k=1)\n");
-        let Stmt::Assign(asn2) = &plain.body[0] else { panic!("expected an assignment") };
+        let StmtKind::Assign(asn2) = &plain.body[0].kind else { panic!("expected an assignment") };
         assert!(matches!(asn2.value, Some(Expr::Call { .. })));
     }
 
     #[test]
     fn decorators_wrap_a_def_or_class() {
         let m = parse_ok("@deco\ndef f():\n    return 1\n");
-        let Stmt::Decorated { decorators, inner } = &m.body[0] else {
+        let StmtKind::Decorated { decorators, inner } = &m.body[0].kind else {
             panic!("expected a decorated def");
         };
         assert_eq!(decorators.len(), 1);
-        assert!(matches!(&**inner, Stmt::FuncDef(_)));
+        assert!(matches!(&inner.kind, StmtKind::FuncDef(_)));
         let m2 = parse_ok("@a\n@b\ndef g():\n    return 2\n");
-        let Stmt::Decorated { decorators, .. } = &m2.body[0] else {
+        let StmtKind::Decorated { decorators, .. } = &m2.body[0].kind else {
             panic!("expected a decorated def");
         };
         assert_eq!(decorators.len(), 2);
         assert!(matches!(
-            parse_ok("@d\nclass C:\n    pass\n").body[0],
-            Stmt::Decorated { .. }
+            parse_ok("@d\nclass C:\n    pass\n").body[0].kind,
+            StmtKind::Decorated { .. }
         ));
     }
 
     #[test]
     fn match_statement_desugars_and_disambiguates() {
-        let is_match = |src: &str| matches!(&parse_ok(src).body[0], Stmt::If { test: Expr::Bool(true), .. });
+        let is_match = |src: &str| matches!(&parse_ok(src).body[0].kind, StmtKind::If { test: Expr::Bool(true), .. });
         assert!(is_match("match x:\n    case 1:\n        y = 2\n    case _:\n        y = 3\n"));
         for subj in ["[1, 2]", "(1, 2)", "{1: 2}", "-5", "True", "None", "x[1:2]"] {
             let src = format!("match {subj}:\n    case _:\n        y = 1\n");
             assert!(is_match(&src), "should be a match statement: {src:?}");
         }
-        assert!(matches!(parse_ok("match = 5\n").body[0], Stmt::Assign(_)));
-        assert!(matches!(parse_ok("match(x)\n").body[0], Stmt::Expr(_)));
-        assert!(matches!(parse_ok("y = match + 1\n").body[0], Stmt::Assign(_)));
+        assert!(matches!(parse_ok("match = 5\n").body[0].kind, StmtKind::Assign(_)));
+        assert!(matches!(parse_ok("match(x)\n").body[0].kind, StmtKind::Expr(_)));
+        assert!(matches!(parse_ok("y = match + 1\n").body[0].kind, StmtKind::Assign(_)));
         assert!(!is_match("match[0] = 5\n"));
         assert!(!is_match("match.attr\n"));
     }
@@ -4108,8 +4388,8 @@ mod tests {
             assert!(parse_src(src).is_ok(), "should parse: {src:?}");
         }
         assert!(matches!(
-            &parse_ok("match v:\n    case [a] as p:\n        y = 1\n").body[0],
-            Stmt::If { .. }
+            &parse_ok("match v:\n    case [a] as p:\n        y = 1\n").body[0].kind,
+            StmtKind::If { .. }
         ));
         assert!(parse_src("match v:\n    case [x] as _:\n        pass\n").is_err());
     }
@@ -4167,8 +4447,8 @@ mod tests {
     #[test]
     fn star_displays_desugar_but_plain_displays_do_not() {
         let value = |src: &str| -> Option<Expr> {
-            match &parse_ok(src).body[0] {
-                Stmt::Assign(a) => a.value.clone(),
+            match &parse_ok(src).body[0].kind {
+                StmtKind::Assign(a) => a.value.clone(),
                 other => panic!("expected an assignment, got {other:?}"),
             }
         };
@@ -4183,23 +4463,23 @@ mod tests {
     #[test]
     fn comprehensions_parse() {
         assert!(matches!(
-            parse_ok("[x for x in r]\n").body[0],
-            Stmt::Expr(Expr::ListComp { .. })
+            parse_ok("[x for x in r]\n").body[0].kind,
+            StmtKind::Expr(Expr::ListComp { .. })
         ));
         let m = parse_ok("[x for a in xs if a for x in a]\n");
-        let Stmt::Expr(Expr::ListComp { clauses, .. }) = &m.body[0] else {
+        let StmtKind::Expr(Expr::ListComp { clauses, .. }) = &m.body[0].kind else {
             panic!("expected a list comprehension");
         };
         assert_eq!(clauses.len(), 2);
         assert_eq!(clauses[0].conditions.len(), 1);
         let d = parse_ok("{k: v for k, v in items}\n");
-        let Stmt::Expr(Expr::DictComp { clauses, .. }) = &d.body[0] else {
+        let StmtKind::Expr(Expr::DictComp { clauses, .. }) = &d.body[0].kind else {
             panic!("expected a dict comprehension");
         };
         assert_eq!(clauses[0].targets, ["k", "v"]);
         fn comp_targets(src: &str) -> Vec<String> {
             let m = parse_ok(src);
-            let Stmt::Expr(Expr::ListComp { clauses, .. }) = &m.body[0] else {
+            let StmtKind::Expr(Expr::ListComp { clauses, .. }) = &m.body[0].kind else {
                 panic!("expected a list comprehension");
             };
             clauses[0].targets.clone()
@@ -4209,29 +4489,29 @@ mod tests {
         assert_eq!(comp_targets("[a for (a,) in xs]\n"), ["a"]);
         assert_eq!(comp_targets("[a for (a, b, c) in xs]\n"), ["a", "b", "c"]);
         assert!(matches!(
-            parse_ok("{k: v for k in r}\n").body[0],
-            Stmt::Expr(Expr::DictComp { .. })
+            parse_ok("{k: v for k in r}\n").body[0].kind,
+            StmtKind::Expr(Expr::DictComp { .. })
         ));
-        assert!(matches!(parse_ok("[1, 2, 3]\n").body[0], Stmt::Expr(Expr::List(_))));
-        assert!(matches!(parse_ok("{1: 2}\n").body[0], Stmt::Expr(Expr::Dict(_))));
+        assert!(matches!(parse_ok("[1, 2, 3]\n").body[0].kind, StmtKind::Expr(Expr::List(_))));
+        assert!(matches!(parse_ok("{1: 2}\n").body[0].kind, StmtKind::Expr(Expr::Dict(_))));
         assert!(matches!(
-            parse_ok("{x for x in r}\n").body[0],
-            Stmt::Expr(Expr::SetComp { .. })
+            parse_ok("{x for x in r}\n").body[0].kind,
+            StmtKind::Expr(Expr::SetComp { .. })
         ));
     }
 
     #[test]
     fn list_display_parses() {
         let m = parse_ok("[a, b, c]\n");
-        let Stmt::Expr(Expr::List(items)) = &m.body[0] else {
+        let StmtKind::Expr(Expr::List(items)) = &m.body[0].kind else {
             panic!("expected a list display");
         };
         assert_eq!(items.len(), 3);
-        assert!(matches!(parse_ok("[]\n").body[0], Stmt::Expr(Expr::List(ref v)) if v.is_empty()));
-        assert!(matches!(parse_ok("[1, 2,]\n").body[0], Stmt::Expr(Expr::List(ref v)) if v.len() == 2));
+        assert!(matches!(parse_ok("[]\n").body[0].kind, StmtKind::Expr(Expr::List(ref v)) if v.is_empty()));
+        assert!(matches!(parse_ok("[1, 2,]\n").body[0].kind, StmtKind::Expr(Expr::List(ref v)) if v.len() == 2));
         assert!(matches!(
-            parse_ok("[a, b][0]\n").body[0],
-            Stmt::Expr(Expr::Subscript { .. })
+            parse_ok("[a, b][0]\n").body[0].kind,
+            StmtKind::Expr(Expr::Subscript { .. })
         ));
     }
 
@@ -4239,7 +4519,7 @@ mod tests {
     fn slice_parses_with_optional_parts() {
         let sub_index = |src| {
             let m = parse_ok(src);
-            let Stmt::Expr(Expr::Subscript { index, .. }) = m.body.into_iter().next().unwrap()
+            let StmtKind::Expr(Expr::Subscript { index, .. }) = m.body.into_iter().next().unwrap().kind
             else {
                 panic!("expected a subscript");
             };
@@ -4275,64 +4555,100 @@ mod tests {
     #[test]
     fn class_def_parses() {
         let m = parse_ok("class C(Base):\n    k = 1\n    def m(self):\n        return self.k\n");
-        let Stmt::ClassDef { name, bases, body, .. } = &m.body[0] else {
+        let StmtKind::ClassDef { name, bases, body, .. } = &m.body[0].kind else {
             panic!("expected a class def");
         };
         assert_eq!(name, "C");
         assert_eq!(bases.len(), 1);
         assert_eq!(body.len(), 2);
         assert!(matches!(
-            &parse_ok("class D:\n    pass\n").body[0],
-            Stmt::ClassDef { bases, .. } if bases.is_empty()
+            &parse_ok("class D:\n    pass\n").body[0].kind,
+            StmtKind::ClassDef { bases, .. } if bases.is_empty()
         ));
         assert!(matches!(
-            &parse_ok("class E(A, B, C):\n    pass\n").body[0],
-            Stmt::ClassDef { bases, .. } if bases.len() == 3
+            &parse_ok("class E(A, B, C):\n    pass\n").body[0].kind,
+            StmtKind::ClassDef { bases, .. } if bases.len() == 3
         ));
         assert!(parse_src("class F(metaclass=M):\n    pass\n").is_err());
-        assert!(matches!(parse_ok("obj.x = 5\n").body[0], Stmt::SetAttr { .. }));
+        assert!(matches!(parse_ok("obj.x = 5\n").body[0].kind, StmtKind::SetAttr { .. }));
     }
 
     #[test]
     fn a_class_body_takes_a_docstring() {
         let m = parse_ok("class C:\n    \"\"\"doc\"\"\"\n    def m(self):\n        return 1\n");
-        let Stmt::ClassDef { body, .. } = &m.body[0] else {
+        let StmtKind::ClassDef { body, .. } = &m.body[0].kind else {
             panic!("expected a class def");
         };
         assert_eq!(body.len(), 2);
-        assert!(matches!(&body[0], Stmt::Expr(Expr::Str(s)) if s == "doc"));
-        assert!(matches!(&parse_ok("class D:\n    \"doc\"\n").body[0], Stmt::ClassDef { body, .. } if body.len() == 1));
-        assert!(parse_src("class E:\n    print(1)\n    def m(self):\n        return 1\n").is_err());
-        assert!(parse_src("class F:\n    x + 1\n").is_err());
+        assert!(matches!(&body[0].kind, StmtKind::Expr(Expr::Str(s)) if s == "doc"));
+        assert!(matches!(&parse_ok("class D:\n    \"doc\"\n").body[0].kind, StmtKind::ClassDef { body, .. } if body.len() == 1));
+        assert!(parse_src("class E:\n    print(1)\n    def m(self):\n        return 1\n").is_ok());
+        assert!(parse_src("class F:\n    x + 1\n").is_ok());
+    }
+
+    /// A class body takes ordinary statements, because it IS an ordinary code object whose stores
+    /// bind members. None of these is exotic Python.
+    #[test]
+    fn a_class_body_takes_ordinary_statements() {
+        for source in [
+            "class C:\n    a, b = 1, 2\n",
+            "class C:\n    a = b = 1\n",
+            "class C:\n    if True:\n        x = 1\n",
+            "class C:\n    n = 0\n    while n < 1:\n        n = 1\n",
+            "class C:\n    t = 0\n    for k in range(2):\n        t = k\n",
+            "class C:\n    try:\n        x = 1\n    except Exception:\n        x = 2\n",
+        ] {
+            assert!(parse_src(source).is_ok(), "should parse: {source:?}");
+        }
+    }
+
+    /// The two forms still refused, and each refusal NAMES a missing mechanism rather than a taste.
+    ///
+    /// A nested class COMPILES correctly and cannot RUN: a frame carries one class-body namespace,
+    /// so the inner `SetupClassNamespace` replaces the outer one and the outer `BuildClass` then
+    /// finds none. Refusing it is the honest answer until the interpreter can nest them -- a program
+    /// that compiles and dies at run time is worse than one refused where the refusal can say why.
+    #[test]
+    fn a_class_body_refuses_only_what_has_no_mechanism() {
+        let nested = parse_src("class O:\n    class I:\n        x = 1\n").expect_err("refused");
+        assert!(
+            format!("{nested}").contains("class-body namespace"),
+            "the refusal must name the mechanism, got: {nested}"
+        );
+        let deleted = parse_src("class C:\n    x = 1\n    del x\n").expect_err("refused");
+        assert!(
+            format!("{deleted}").contains("delete-by-name"),
+            "the refusal must name the mechanism, got: {deleted}"
+        );
     }
 
     #[test]
     fn try_except_and_raise_parse() {
         assert!(matches!(
-            parse_ok("raise E\n").body[0],
-            Stmt::Raise {
+            parse_ok("raise E\n").body[0].kind,
+            StmtKind::Raise {
                 exc: Some(_),
                 cause: None
             }
         ));
         assert!(matches!(
-            parse_ok("raise\n").body[0],
-            Stmt::Raise {
+            parse_ok("raise\n").body[0].kind,
+            StmtKind::Raise {
                 exc: None,
                 cause: None
             }
         ));
         assert!(matches!(
-            parse_ok("raise E from C\n").body[0],
-            Stmt::Raise {
+            parse_ok("raise E from C\n").body[0].kind,
+            StmtKind::Raise {
                 exc: Some(_),
                 cause: Some(_)
             }
         ));
         let src = "try:\n    x = 1\nexcept E as e:\n    x = 2\nexcept:\n    x = 3\nelse:\n    x = 4\n";
-        let Stmt::Try {
+        let StmtKind::Try {
             handlers, orelse, ..
-        } = &parse_ok(src).body[0]
+        } = &parse_ok(src).body[0].kind
         else {
             panic!("expected a try statement");
         };
@@ -4347,12 +4663,12 @@ mod tests {
     #[test]
     fn membership_parses_at_the_comparison_level() {
         assert!(matches!(
-            parse_ok("x in c\n").body[0],
-            Stmt::Expr(Expr::Compare { op: CmpOp::In, .. })
+            parse_ok("x in c\n").body[0].kind,
+            StmtKind::Expr(Expr::Compare { op: CmpOp::In, .. })
         ));
         assert!(matches!(
-            parse_ok("x not in c\n").body[0],
-            Stmt::Expr(Expr::Compare {
+            parse_ok("x not in c\n").body[0].kind,
+            StmtKind::Expr(Expr::Compare {
                 op: CmpOp::NotIn,
                 ..
             })
@@ -4361,21 +4677,21 @@ mod tests {
 
     #[test]
     fn subscript_assignment_is_setitem() {
-        assert!(matches!(parse_ok("c[i] = v\n").body[0], Stmt::SetItem { .. }));
-        assert!(matches!(parse_ok("c[1:2] = v\n").body[0], Stmt::SetItem { .. }));
-        assert!(matches!(parse_ok("a = v\n").body[0], Stmt::Assign(_)));
+        assert!(matches!(parse_ok("c[i] = v\n").body[0].kind, StmtKind::SetItem { .. }));
+        assert!(matches!(parse_ok("c[1:2] = v\n").body[0].kind, StmtKind::SetItem { .. }));
+        assert!(matches!(parse_ok("a = v\n").body[0].kind, StmtKind::Assign(_)));
     }
 
     #[test]
     fn subscript_parses_left_associative() {
         let module = parse_ok("s[i]\n");
-        let Stmt::Expr(Expr::Subscript { value, index }) = &module.body[0] else {
+        let StmtKind::Expr(Expr::Subscript { value, index }) = &module.body[0].kind else {
             panic!("expected a subscript");
         };
         assert!(matches!(&**value, Expr::Name(n) if n == "s"));
         assert!(matches!(&**index, Expr::Name(n) if n == "i"));
         let chained = parse_ok("m[i][j]\n");
-        let Stmt::Expr(Expr::Subscript { value, .. }) = &chained.body[0] else {
+        let StmtKind::Expr(Expr::Subscript { value, .. }) = &chained.body[0].kind else {
             panic!("expected a subscript");
         };
         assert!(matches!(&**value, Expr::Subscript { .. }));
@@ -4384,13 +4700,13 @@ mod tests {
     #[test]
     fn comma_subscript_is_a_tuple_index() {
         let module = parse_ok("d[1, 2]\n");
-        let Stmt::Expr(Expr::Subscript { index, .. }) = &module.body[0] else {
+        let StmtKind::Expr(Expr::Subscript { index, .. }) = &module.body[0].kind else {
             panic!("expected a subscript");
         };
         let Expr::Tuple(items) = &**index else { panic!("a tuple index") };
         assert_eq!(items.len(), 2);
         let one = parse_ok("d[1,]\n");
-        let Stmt::Expr(Expr::Subscript { index, .. }) = &one.body[0] else {
+        let StmtKind::Expr(Expr::Subscript { index, .. }) = &one.body[0].kind else {
             panic!("expected a subscript");
         };
         assert!(matches!(&**index, Expr::Tuple(items) if items.len() == 1));
@@ -4399,8 +4715,8 @@ mod tests {
     #[test]
     fn ellipsis_parses_to_the_ellipsis_name() {
         assert_eq!(
-            parse_ok("...\n").body[0],
-            Stmt::Expr(Expr::Name("Ellipsis".into()))
+            parse_ok("...\n").body[0].kind,
+            StmtKind::Expr(Expr::Name("Ellipsis".into()))
         );
         assert!(parse_src("def f():\n    ...\n").is_ok());
         assert!(parse_src("x = [..., 1]\n").is_ok());
@@ -4408,14 +4724,14 @@ mod tests {
 
     #[test]
     fn adjacent_string_literals_concatenate() {
-        assert_eq!(parse_ok("\"ab\" \"cd\"\n").body[0], Stmt::Expr(Expr::Str("abcd".into())));
+        assert_eq!(parse_ok("\"ab\" \"cd\"\n").body[0].kind, StmtKind::Expr(Expr::Str("abcd".into())));
         assert!(matches!(
-            parse_ok("\"ab\" + \"cd\"\n").body[0],
-            Stmt::Expr(Expr::Binary { .. })
+            parse_ok("\"ab\" + \"cd\"\n").body[0].kind,
+            StmtKind::Expr(Expr::Binary { .. })
         ));
         assert_eq!(
-            parse_ok("b\"ab\" b\"cd\"\n").body[0],
-            Stmt::Expr(Expr::Bytes(b"abcd".to_vec()))
+            parse_ok("b\"ab\" b\"cd\"\n").body[0].kind,
+            StmtKind::Expr(Expr::Bytes(b"abcd".to_vec()))
         );
         assert!(parse_src("b\"a\" \"b\"\n").is_err());
     }
@@ -4423,7 +4739,7 @@ mod tests {
     #[test]
     fn multiple_assignment_collects_targets() {
         let module = parse_ok("a = b = c = 0\n");
-        let Stmt::MultiAssign { targets, value } = &module.body[0] else {
+        let StmtKind::MultiAssign { targets, value } = &module.body[0].kind else {
             panic!("expected a multiple assignment");
         };
         let names: Vec<&str> = targets
@@ -4435,9 +4751,9 @@ mod tests {
             .collect();
         assert_eq!(names, ["a", "b", "c"]);
         assert_eq!(*value, Expr::Int(0));
-        assert!(matches!(parse_ok("a = 0\n").body[0], Stmt::Assign(_)));
+        assert!(matches!(parse_ok("a = 0\n").body[0].kind, StmtKind::Assign(_)));
         let m2 = parse_ok("xs[0] = obj.x = b = 5\n");
-        let Stmt::MultiAssign { targets, .. } = &m2.body[0] else {
+        let StmtKind::MultiAssign { targets, .. } = &m2.body[0].kind else {
             panic!("expected a multiple assignment");
         };
         assert_eq!(targets.len(), 3);
@@ -4449,43 +4765,43 @@ mod tests {
     #[test]
     fn chained_comparison_desugars_to_and() {
         let module = parse_ok("a < b < c\n");
-        let Stmt::Expr(Expr::BoolBinary { op, lhs, rhs }) = &module.body[0] else {
+        let StmtKind::Expr(Expr::BoolBinary { op, lhs, rhs }) = &module.body[0].kind else {
             panic!("expected a boolean expression");
         };
         assert_eq!(*op, BoolOp::And);
         assert!(matches!(**lhs, Expr::Compare { .. }));
         assert!(matches!(**rhs, Expr::Compare { .. }));
         let single = parse_ok("a < b\n");
-        assert!(matches!(single.body[0], Stmt::Expr(Expr::Compare { .. })));
+        assert!(matches!(single.body[0].kind, StmtKind::Expr(Expr::Compare { .. })));
     }
 
     #[test]
     fn break_and_continue_parse() {
         let module = parse_ok("while x:\n    break\n    continue\n");
-        let Stmt::While { body, .. } = &module.body[0] else {
+        let StmtKind::While { body, .. } = &module.body[0].kind else {
             panic!("expected a while");
         };
-        assert!(matches!(body[0], Stmt::Break));
-        assert!(matches!(body[1], Stmt::Continue));
+        assert!(matches!(body[0].kind, StmtKind::Break));
+        assert!(matches!(body[1].kind, StmtKind::Continue));
     }
 
     #[test]
     fn range_with_a_literal_step_is_counted_else_iterates_the_value() {
         let module = parse_ok("for i in range(0, 10, 2):\n    x = i\n");
-        let Stmt::For { step, .. } = &module.body[0] else {
+        let StmtKind::For { step, .. } = &module.body[0].kind else {
             panic!("expected a counted for");
         };
         assert_eq!(*step, 2);
         let var_step = parse_ok("for i in range(0, 10, n):\n    x = i\n");
-        assert!(matches!(var_step.body[0], Stmt::ForIter { .. }));
+        assert!(matches!(var_step.body[0].kind, StmtKind::ForIter { .. }));
         let zero_step = parse_ok("for i in range(0, 10, 0):\n    x = i\n");
-        assert!(matches!(zero_step.body[0], Stmt::ForIter { .. }));
+        assert!(matches!(zero_step.body[0].kind, StmtKind::ForIter { .. }));
     }
 
     #[test]
     fn precedence_matches_the_reference() {
         let module = parse_ok("1 + 2 * 3\n");
-        let Stmt::Expr(Expr::Binary { op, rhs, .. }) = &module.body[0] else {
+        let StmtKind::Expr(Expr::Binary { op, rhs, .. }) = &module.body[0].kind else {
             panic!("expected a binary expression at the top");
         };
         assert_eq!(*op, BinOp::Add);
@@ -4501,7 +4817,7 @@ mod tests {
     #[test]
     fn unary_minus_folds_into_a_literal() {
         let module = parse_ok("x = -3\n");
-        let Stmt::Assign(assign) = &module.body[0] else {
+        let StmtKind::Assign(assign) = &module.body[0].kind else {
             panic!("expected an assignment");
         };
         assert_eq!(assign.value, Some(Expr::Int(-3)));
@@ -4518,7 +4834,7 @@ def fib(n: int) -> int:
     return a
 ";
         let module = parse_ok(src);
-        let Stmt::FuncDef(func) = &module.body[0] else {
+        let StmtKind::FuncDef(func) = &module.body[0].kind else {
             panic!("expected a function definition");
         };
         assert_eq!(func.name, "fib");
@@ -4526,8 +4842,8 @@ def fib(n: int) -> int:
         assert_eq!(func.params[0].name, "n");
         assert_eq!(func.params[0].annotation, Some(Expr::Name("int".into())));
         assert_eq!(func.ret, Some(Expr::Name("int".into())));
-        assert!(matches!(func.body.last(), Some(Stmt::Return(Some(_)))));
-        assert!(func.body.iter().any(|s| matches!(s, Stmt::While { .. })));
+        assert!(matches!(func.body.last().map(|s| &s.kind), Some(StmtKind::Return(Some(_)))));
+        assert!(func.body.iter().any(|s| matches!(&s.kind, StmtKind::While { .. })));
     }
 
     #[test]
@@ -4541,20 +4857,20 @@ else:
     x = 3
 ";
         let module = parse_ok(src);
-        let Stmt::If { orelse, .. } = &module.body[0] else {
+        let StmtKind::If { orelse, .. } = &module.body[0].kind else {
             panic!("expected an if");
         };
         assert_eq!(orelse.len(), 1);
-        assert!(matches!(orelse[0], Stmt::If { .. }));
+        assert!(matches!(orelse[0].kind, StmtKind::If { .. }));
     }
 
     #[test]
     fn single_line_suite() {
         let module = parse_ok("def f(): return 1\n");
-        let Stmt::FuncDef(func) = &module.body[0] else {
+        let StmtKind::FuncDef(func) = &module.body[0].kind else {
             panic!("expected a function definition");
         };
-        assert_eq!(func.body, vec![Stmt::Return(Some(Expr::Int(1)))]);
+        assert_eq!(func.body.iter().map(|s| &s.kind).collect::<Vec<_>>(), vec![&StmtKind::Return(Some(Expr::Int(1)))]);
     }
 
     #[test]
@@ -4569,23 +4885,23 @@ else:
     #[test]
     fn import_star_parses() {
         let m = parse_ok("from math import *\n");
-        assert_eq!(m.body, vec![Stmt::ImportStar { module: "math".into() }]);
+        assert_eq!(m.body.iter().map(|s| &s.kind).collect::<Vec<_>>(), vec![&StmtKind::ImportStar { module: "math".into() }]);
     }
 
     #[test]
     fn import_statements_parse() {
         assert!(matches!(
-            &parse_ok("import math\n").body[0],
-            Stmt::Import { modules } if modules == &[(String::from("math"), None)]
+            &parse_ok("import math\n").body[0].kind,
+            StmtKind::Import { modules } if modules == &[(String::from("math"), None)]
         ));
         assert!(matches!(
-            &parse_ok("import math as m\n").body[0],
-            Stmt::Import { modules }
+            &parse_ok("import math as m\n").body[0].kind,
+            StmtKind::Import { modules }
                 if modules == &[(String::from("math"), Some(String::from("m")))]
         ));
         assert!(matches!(
-            &parse_ok("import a.b.c\n").body[0],
-            Stmt::Import { modules } if modules == &[(String::from("a.b.c"), None)]
+            &parse_ok("import a.b.c\n").body[0].kind,
+            StmtKind::Import { modules } if modules == &[(String::from("a.b.c"), None)]
         ));
         assert_eq!(crate::ast::import_bound_name("a.b.c", &None), "a");
         assert_eq!(
@@ -4593,13 +4909,13 @@ else:
             "x"
         );
         assert!(matches!(
-            &parse_ok("from math import sqrt\n").body[0],
-            Stmt::ImportFrom { module, names }
+            &parse_ok("from math import sqrt\n").body[0].kind,
+            StmtKind::ImportFrom { module, names }
                 if module == "math" && names == &[("sqrt".into(), "sqrt".into())]
         ));
         assert!(matches!(
-            &parse_ok("from math import pi, sqrt as s\n").body[0],
-            Stmt::ImportFrom { module, names }
+            &parse_ok("from math import pi, sqrt as s\n").body[0].kind,
+            StmtKind::ImportFrom { module, names }
                 if module == "math"
                     && names == &[("pi".into(), "pi".into()), ("sqrt".into(), "s".into())]
         ));
@@ -4608,27 +4924,27 @@ else:
     #[test]
     fn augmented_subscript_and_attribute_targets_parse() {
         assert!(matches!(
-            parse_ok("c[i] += 5\n").body[0],
-            Stmt::SetItem { op: Some(_), .. }
+            parse_ok("c[i] += 5\n").body[0].kind,
+            StmtKind::SetItem { op: Some(_), .. }
         ));
         assert!(matches!(
-            parse_ok("obj.x *= 2\n").body[0],
-            Stmt::SetAttr { op: Some(_), .. }
+            parse_ok("obj.x *= 2\n").body[0].kind,
+            StmtKind::SetAttr { op: Some(_), .. }
         ));
         assert!(matches!(
-            parse_ok("c[i] = v\n").body[0],
-            Stmt::SetItem { op: None, .. }
+            parse_ok("c[i] = v\n").body[0].kind,
+            StmtKind::SetItem { op: None, .. }
         ));
         assert!(matches!(
-            parse_ok("obj.x = v\n").body[0],
-            Stmt::SetAttr { op: None, .. }
+            parse_ok("obj.x = v\n").body[0].kind,
+            StmtKind::SetAttr { op: None, .. }
         ));
     }
 
     #[test]
     fn generator_expressions_parse() {
         let m = parse_ok("total = sum(x for x in xs)\n");
-        let Stmt::Assign(a) = &m.body[0] else {
+        let StmtKind::Assign(a) = &m.body[0].kind else {
             panic!("expected an assignment");
         };
         let Some(Expr::Call { args, .. }) = &a.value else {
@@ -4636,7 +4952,7 @@ else:
         };
         assert!(matches!(args[0], Expr::GeneratorExp { .. }));
         let m2 = parse_ok("g = (x * 2 for x in xs)\n");
-        let Stmt::Assign(a2) = &m2.body[0] else {
+        let StmtKind::Assign(a2) = &m2.body[0].kind else {
             panic!("expected an assignment");
         };
         assert!(matches!(a2.value, Some(Expr::GeneratorExp { .. })));
@@ -4646,7 +4962,7 @@ else:
     #[test]
     fn default_parameter_values_parse() {
         let m = parse_ok("def f(a, b=1, c=2):\n    return a\n");
-        let Stmt::FuncDef(func) = &m.body[0] else {
+        let StmtKind::FuncDef(func) = &m.body[0].kind else {
             panic!("expected a function definition");
         };
         assert_eq!(func.params.len(), 3);
@@ -4654,7 +4970,7 @@ else:
         assert_eq!(func.params[1].default, Some(Expr::Int(1)));
         assert_eq!(func.params[2].default, Some(Expr::Int(2)));
         let ann = parse_ok("def g(n: int = 5):\n    return n\n");
-        let Stmt::FuncDef(func) = &ann.body[0] else {
+        let StmtKind::FuncDef(func) = &ann.body[0].kind else {
             panic!("expected a function definition");
         };
         assert_eq!(func.params[0].annotation, Some(Expr::Name("int".into())));
@@ -4664,7 +4980,7 @@ else:
     #[test]
     fn keyword_arguments_parse() {
         let m = parse_ok("f(1, x=2, y=3)\n");
-        let Stmt::Expr(Expr::Call { args, keywords, .. }) = &m.body[0] else {
+        let StmtKind::Expr(Expr::Call { args, keywords, .. }) = &m.body[0].kind else {
             panic!("expected a call");
         };
         assert_eq!(args.as_slice(), &[Expr::Int(1)]);
@@ -4674,7 +4990,7 @@ else:
         assert_eq!(keywords[1].name, "y");
         assert_eq!(keywords[1].value, Expr::Int(3));
         let cmp = parse_ok("f(x == 1)\n");
-        let Stmt::Expr(Expr::Call { args, keywords, .. }) = &cmp.body[0] else {
+        let StmtKind::Expr(Expr::Call { args, keywords, .. }) = &cmp.body[0].kind else {
             panic!("expected a call");
         };
         assert!(keywords.is_empty());
@@ -4691,7 +5007,7 @@ else:
     #[test]
     fn lambda_expressions_parse() {
         let m = parse_ok("f = lambda x: x + 1\n");
-        let Stmt::Assign(a) = &m.body[0] else {
+        let StmtKind::Assign(a) = &m.body[0].kind else {
             panic!("expected an assignment");
         };
         let Some(Expr::Lambda { params, body }) = &a.value else {
@@ -4701,7 +5017,7 @@ else:
         assert_eq!(params[0].name, "x");
         assert!(matches!(**body, Expr::Binary { .. }));
         let z = parse_ok("g = lambda: 0\n");
-        let Stmt::Assign(a) = &z.body[0] else {
+        let StmtKind::Assign(a) = &z.body[0].kind else {
             panic!("expected an assignment");
         };
         let Some(Expr::Lambda { params, body }) = &a.value else {
@@ -4710,7 +5026,7 @@ else:
         assert!(params.is_empty());
         assert_eq!(**body, Expr::Int(0));
         let d = parse_ok("h = lambda a, n=2: a + n\n");
-        let Stmt::Assign(a) = &d.body[0] else {
+        let StmtKind::Assign(a) = &d.body[0].kind else {
             panic!("expected an assignment");
         };
         let Some(Expr::Lambda { params, .. }) = &a.value else {
@@ -4724,7 +5040,7 @@ else:
     #[test]
     fn lambda_body_is_a_single_expression() {
         let m = parse_ok("f(lambda: x, 1)\n");
-        let Stmt::Expr(Expr::Call { args, .. }) = &m.body[0] else {
+        let StmtKind::Expr(Expr::Call { args, .. }) = &m.body[0].kind else {
             panic!("expected a call");
         };
         assert_eq!(args.len(), 2);
@@ -4735,23 +5051,23 @@ else:
     #[test]
     fn yield_expressions_parse() {
         let m = parse_ok("def g():\n    yield x\n");
-        let Stmt::FuncDef(func) = &m.body[0] else {
+        let StmtKind::FuncDef(func) = &m.body[0].kind else {
             panic!("expected a function");
         };
-        let Stmt::Expr(Expr::Yield(Some(v))) = &func.body[0] else {
+        let StmtKind::Expr(Expr::Yield(Some(v))) = &func.body[0].kind else {
             panic!("expected a yield expression");
         };
         assert_eq!(**v, Expr::Name("x".into()));
         let bare = parse_ok("def g():\n    yield\n");
-        let Stmt::FuncDef(func) = &bare.body[0] else {
+        let StmtKind::FuncDef(func) = &bare.body[0].kind else {
             panic!("expected a function");
         };
-        assert!(matches!(func.body[0], Stmt::Expr(Expr::Yield(None))));
+        assert!(matches!(func.body[0].kind, StmtKind::Expr(Expr::Yield(None))));
         let rv = parse_ok("def g():\n    x = yield\n");
-        let Stmt::FuncDef(func) = &rv.body[0] else {
+        let StmtKind::FuncDef(func) = &rv.body[0].kind else {
             panic!("expected a function");
         };
-        let Stmt::Assign(a) = &func.body[0] else {
+        let StmtKind::Assign(a) = &func.body[0].kind else {
             panic!("expected an assignment");
         };
         assert!(matches!(a.value, Some(Expr::Yield(None))));
@@ -4760,46 +5076,46 @@ else:
     #[test]
     fn yield_of_a_bare_tuple() {
         let m = parse_ok("def g():\n    yield a, b\n");
-        let Stmt::FuncDef(func) = &m.body[0] else {
+        let StmtKind::FuncDef(func) = &m.body[0].kind else {
             panic!("expected a function");
         };
-        let Stmt::Expr(Expr::Yield(Some(v))) = &func.body[0] else {
+        let StmtKind::Expr(Expr::Yield(Some(v))) = &func.body[0].kind else {
             panic!("expected a yield expression");
         };
         assert!(matches!(&**v, Expr::Tuple(elems) if elems.len() == 2));
         let one = parse_ok("def g():\n    yield a,\n");
-        let Stmt::FuncDef(func) = &one.body[0] else {
+        let StmtKind::FuncDef(func) = &one.body[0].kind else {
             panic!("expected a function");
         };
-        let Stmt::Expr(Expr::Yield(Some(v))) = &func.body[0] else {
+        let StmtKind::Expr(Expr::Yield(Some(v))) = &func.body[0].kind else {
             panic!("expected a yield expression");
         };
         assert!(matches!(&**v, Expr::Tuple(elems) if elems.len() == 1));
         let spread = parse_ok("def g():\n    yield a, *b\n");
-        let Stmt::FuncDef(func) = &spread.body[0] else {
+        let StmtKind::FuncDef(func) = &spread.body[0].kind else {
             panic!("expected a function");
         };
         assert!(matches!(
-            func.body[0],
-            Stmt::Expr(Expr::Yield(Some(ref v))) if matches!(**v, Expr::Binary { .. })
+            func.body[0].kind,
+            StmtKind::Expr(Expr::Yield(Some(ref v))) if matches!(**v, Expr::Binary { .. })
         ));
     }
 
     #[test]
     fn yield_from_parses() {
         let m = parse_ok("def g():\n    yield from xs\n");
-        let Stmt::FuncDef(func) = &m.body[0] else {
+        let StmtKind::FuncDef(func) = &m.body[0].kind else {
             panic!("expected a function");
         };
-        let Stmt::Expr(Expr::YieldFrom(v)) = &func.body[0] else {
+        let StmtKind::Expr(Expr::YieldFrom(v)) = &func.body[0].kind else {
             panic!("expected a yield-from expression");
         };
         assert_eq!(**v, Expr::Name("xs".into()));
         let rv = parse_ok("def g():\n    x = yield from g2()\n");
-        let Stmt::FuncDef(func) = &rv.body[0] else {
+        let StmtKind::FuncDef(func) = &rv.body[0].kind else {
             panic!("expected a function");
         };
-        let Stmt::Assign(a) = &func.body[0] else {
+        let StmtKind::Assign(a) = &func.body[0].kind else {
             panic!("expected an assignment");
         };
         assert!(matches!(a.value, Some(Expr::YieldFrom(_))));
@@ -4808,7 +5124,7 @@ else:
     #[test]
     fn keyword_only_params_parse() {
         let m = parse_ok("def f(a, *, b):\n    return b\n");
-        let Stmt::FuncDef(func) = &m.body[0] else {
+        let StmtKind::FuncDef(func) = &m.body[0].kind else {
             panic!("expected a function");
         };
         assert_eq!(func.params.len(), 2);
@@ -4819,7 +5135,7 @@ else:
     #[test]
     fn kwonly_defaults_parse_and_a_dangling_star_is_gated() {
         let module = parse_ok("def f(a, *, b=1):\n    return b\n");
-        let Stmt::FuncDef(f) = &module.body[0] else { panic!("a def") };
+        let StmtKind::FuncDef(f) = &module.body[0].kind else { panic!("a def") };
         let b = f.params.iter().find(|p| p.name == "b").expect("param b");
         assert!(b.keyword_only && b.default.is_some(), "b is keyword-only with a default");
         assert!(parse_src("def f(a, *):\n    return a\n").is_err());
@@ -4828,7 +5144,7 @@ else:
     #[test]
     fn lambda_takes_the_full_parameter_grammar() {
         let module = parse_ok("f = lambda a, b=1, *args, c, d=4, **kw: a\n");
-        let Stmt::Assign(assign) = &module.body[0] else { panic!("an assignment") };
+        let StmtKind::Assign(assign) = &module.body[0].kind else { panic!("an assignment") };
         let Some(Expr::Lambda { params, .. }) = &assign.value else { panic!("a lambda value") };
         assert!(params.iter().any(|p| p.is_vararg && p.name == "args"));
         assert!(params.iter().any(|p| p.is_varkwarg && p.name == "kw"));
@@ -4840,7 +5156,7 @@ else:
     #[test]
     fn positional_only_marker_sets_the_flag() {
         let module = parse_ok("def f(a, b, /, c):\n    return a\n");
-        let Stmt::FuncDef(f) = &module.body[0] else { panic!("a def") };
+        let StmtKind::FuncDef(f) = &module.body[0].kind else { panic!("a def") };
         assert_eq!(f.params.len(), 3);
         assert!(f.params[0].positional_only && f.params[1].positional_only);
         assert!(!f.params[2].positional_only);
@@ -4851,7 +5167,7 @@ else:
     #[test]
     fn varargs_parses() {
         let m = parse_ok("def f(a, *args):\n    return a\n");
-        let Stmt::FuncDef(func) = &m.body[0] else {
+        let StmtKind::FuncDef(func) = &m.body[0].kind else {
             panic!("expected a function");
         };
         assert_eq!(func.params.len(), 2);
@@ -4859,7 +5175,7 @@ else:
         assert!(func.params[1].is_vararg);
         assert!(!func.params[1].keyword_only);
         let m2 = parse_ok("def f(a, *args, b):\n    return b\n");
-        let Stmt::FuncDef(func) = &m2.body[0] else {
+        let StmtKind::FuncDef(func) = &m2.body[0].kind else {
             panic!("expected a function");
         };
         assert!(func.params[1].is_vararg);
@@ -4869,20 +5185,20 @@ else:
     #[test]
     fn varkwargs_parse() {
         let m = parse_ok("def f(a, **kw):\n    return a\n");
-        let Stmt::FuncDef(func) = &m.body[0] else {
+        let StmtKind::FuncDef(func) = &m.body[0].kind else {
             panic!("expected a function");
         };
         assert_eq!(func.params.len(), 2);
         assert!(func.params[1].is_varkwarg);
         assert!(parse_src("def f(**kw, a):\n    return a\n").is_err());
-        assert!(matches!(parse_ok("x = 2 ** 3\n").body[0], Stmt::Assign(_)));
+        assert!(matches!(parse_ok("x = 2 ** 3\n").body[0].kind, StmtKind::Assign(_)));
     }
 
     #[test]
     #[allow(clippy::approx_constant)]
     fn float_literals_and_true_division_parse() {
         let m = parse_ok("x = 3.14\n");
-        let Stmt::Assign(a) = &m.body[0] else {
+        let StmtKind::Assign(a) = &m.body[0].kind else {
             panic!("expected an assignment");
         };
         let Some(Expr::Float(bits)) = &a.value else {
@@ -4890,7 +5206,7 @@ else:
         };
         assert_eq!(f64::from_bits(*bits), 3.14);
         let m2 = parse_ok("y = a / b\n");
-        let Stmt::Assign(a2) = &m2.body[0] else {
+        let StmtKind::Assign(a2) = &m2.body[0].kind else {
             panic!("expected an assignment");
         };
         assert!(matches!(
@@ -4900,24 +5216,24 @@ else:
                 ..
             })
         ));
-        assert!(matches!(parse_ok("w = 1.5e-3\n").body[0], Stmt::Assign(_)));
+        assert!(matches!(parse_ok("w = 1.5e-3\n").body[0].kind, StmtKind::Assign(_)));
     }
 
     #[test]
     fn with_statement_parses() {
         let m = parse_ok("with ctx() as x:\n    print(x)\n");
-        let Stmt::With {
+        let StmtKind::With {
             optional_name,
             body,
             ..
-        } = &m.body[0]
+        } = &m.body[0].kind
         else {
             panic!("expected a with statement");
         };
         assert_eq!(optional_name.as_deref(), Some("x"));
         assert_eq!(body.len(), 1);
         let m2 = parse_ok("with ctx():\n    pass\n");
-        let Stmt::With { optional_name, .. } = &m2.body[0] else {
+        let StmtKind::With { optional_name, .. } = &m2.body[0].kind else {
             panic!("expected a with statement");
         };
         assert!(optional_name.is_none());
@@ -4929,9 +5245,9 @@ else:
         assert!(parse_src("with (a(), b()):\n    pass\n").is_ok());
         assert!(parse_src("with (a() as x,):\n    pass\n").is_ok());
         let m = parse_ok("with (a() as x, b() as y):\n    pass\n");
-        let Stmt::With { optional_name, body, .. } = &m.body[0] else { panic!("a with") };
+        let StmtKind::With { optional_name, body, .. } = &m.body[0].kind else { panic!("a with") };
         assert_eq!(optional_name.as_deref(), Some("x"));
-        assert!(matches!(&body[0], Stmt::With { .. }), "the second manager nests inside");
+        assert!(matches!(&body[0].kind, StmtKind::With { .. }), "the second manager nests inside");
         assert!(parse_src("with (a or b) as x:\n    pass\n").is_ok());
         assert!(parse_src("with (a() if c else b()) as x:\n    pass\n").is_ok());
     }
@@ -4939,10 +5255,10 @@ else:
     #[test]
     fn multiple_context_managers_nest() {
         let module = parse_ok("with a() as x, b() as y:\n    pass\n");
-        let Stmt::With { optional_name, body, .. } = &module.body[0] else { panic!("a with") };
+        let StmtKind::With { optional_name, body, .. } = &module.body[0].kind else { panic!("a with") };
         assert_eq!(optional_name.as_deref(), Some("x"));
         assert_eq!(body.len(), 1, "the inner with is the outer's whole body");
-        let Stmt::With { optional_name: inner, .. } = &body[0] else { panic!("a nested with") };
+        let StmtKind::With { optional_name: inner, .. } = &body[0].kind else { panic!("a nested with") };
         assert_eq!(inner.as_deref(), Some("y"));
     }
 }

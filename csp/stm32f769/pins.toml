@@ -4,6 +4,12 @@
 #
 # THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
 # its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
+#
+# ON THIS PART THE AF7 COLUMN HEADER IS NOT THE SIBLING FAMILY'S. Here it reads
+# SPI2/I2S2/SPI3/I2S3/USART1/2/3/UART5/DFSDM1/SPDIF, where the STM32F7's reads
+# SPI2/3/USART1/2/3/UART5/SPDIFRX -- the same number carrying a different set. The two agree about
+# USART1, which is the only cell this map claims, and they were read separately rather than one
+# being taken as evidence for the other.
 
 [table]
 kind = "pins"

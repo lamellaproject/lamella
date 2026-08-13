@@ -1,7 +1,7 @@
 //! A tree-of-frames CIL interpreter over a hand-built method body.
 
 #[cfg(feature = "bcl")]
-use crate::module::IntrinsicFn;
+use crate::intrinsic_registry::intrinsic_id;
 use crate::module::{CastElem, CastPrim, MethodId, MethodKind, Module, TypeId, asm_key};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
@@ -132,7 +132,9 @@ pub struct Vm {
     /// even if the socket never readies, the re-polled op returns WouldBlock again, and the
     /// MANAGED receive loop decides expiry (throws its `SocketException`) -- the runtime only
     /// bounds the park. Entries are dropped on close so a recycled handle cannot inherit one.
-    recv_timeouts: BTreeMap<u32, u32>,
+    /// Per-socket timeouts, from the SHARED seam rather than a table of this crate's own:
+    /// a second language binding that seam gets the same behavior instead of inventing it.
+    socket_timeouts: crate::net::timeout::Timeouts,
     /// The cooperative green-thread scheduler's signal channel: a threading intrinsic
     /// (`Thread.Start` / `Join` / `Yield`) sets this to request a scheduler action; the top-level
     /// scheduler loop takes it the moment the running thread next pauses. `None` between requests.
@@ -476,7 +478,7 @@ impl Vm {
 
     /// Queue `thread` for a TIMED acquire of `obj`'s lock -- the blocking half of
     /// `Monitor.TryEnter(object, int)`. Returns `true` if it was queued (so the caller parks);
-    /// `false` if the lock turned out to be takeable and is now HELD (so the caller must not park).
+    /// `false` if the lock proves takeable and is now HELD (so the caller must not park).
     ///
     /// The second case is defensive rather than expected: the managed side tries first and only
     /// calls this on contention, and nothing runs between the two on a cooperative scheduler. But a
@@ -974,10 +976,9 @@ impl Vm {
     /// bounded by that deadline, so a silent peer cannot park the thread forever.
     pub fn request_block_on_io(&mut self, socket: u32, interest: crate::net::Interest) {
         let deadline = match interest {
-            crate::net::Interest::Read => self.recv_timeouts.get(&socket).map(|&millis| {
-                self.now_millis()
-                    .map_or(0, |now| now.saturating_add(u64::from(millis)))
-            }),
+            crate::net::Interest::Read => {
+                self.socket_timeouts.deadline(socket, interest, self.now_millis())
+            }
             crate::net::Interest::Write => None,
         };
         self.thread_op = Some(ThreadOp::BlockOnIo { socket, interest, deadline });
@@ -989,11 +990,13 @@ impl Vm {
     /// receive op re-polls, still sees WouldBlock, and the managed receive loop owns the expiry
     /// decision. Send-side parks are unaffected.
     pub fn set_recv_timeout(&mut self, handle: u32, millis: u32) {
-        if millis == 0 {
-            self.recv_timeouts.remove(&handle);
-        } else {
-            self.recv_timeouts.insert(handle, millis);
-        }
+        self.socket_timeouts.set(handle, crate::net::Interest::Read, millis);
+    }
+
+    /// Drop everything remembered about a socket handle, which a close must do: a backend may hand
+    /// the same number out again, and a timeout outliving its socket becomes an unrelated socket's.
+    pub fn forget_socket_timeouts(&mut self, handle: u32) {
+        self.socket_timeouts.forget(handle);
     }
 
     /// The reactor's poll: block until a watched socket is ready or `timeout_ms` elapses, returning
@@ -1174,7 +1177,7 @@ impl Vm {
     /// Sets the current wall time, as 100-nanosecond ticks since the .NET epoch
     /// (0001-01-01 00:00:00), ANCHORING it to the current monotonic reading so the clock then
     /// advances with elapsed time. The embedder supplies this -- the host from `std::time`, a
-    /// device from its RTC, or a synced `SystemClock` (SNTP/NTS). For v1 these are all UTC-based
+    /// device from its RTC, or a synced `SystemClock` (SNTP/NTS). All of these are UTC-based
     /// (no timezone), so `Now` and `UtcNow` report the same value.
     pub fn set_now_ticks(&mut self, ticks: i64) {
         self.wall_anchor = Some((self.now_millis().unwrap_or(0), ticks));
@@ -2085,7 +2088,7 @@ pub enum Ran {
 /// It exists because a device that DEPLOYS a program must be able to take it back. The firmware
 /// pumps its carrier in this callback anyway; letting the same call say "stop" is what makes a
 /// deployed run interruptible without the firmware having to drive the interpreter itself -- which
-/// is what it used to do, stepping a bare [`Session`] in bursts, and a bare session runs no
+/// is what stepping a bare [`Session`] in bursts amounts to, and a bare session runs no
 /// scheduler at all: every thread operation the program raised (`Sleep`, `Start`, `Join`, a
 /// contended `Monitor`) was left on the [`Vm`] and silently dropped.
 ///
@@ -3610,15 +3613,29 @@ fn read_enum_value(frame: &Frame, frame_index: usize, vm: &Vm, location: Locatio
     }
 }
 
+/// The registry ids the recognizers below test against.
+///
+/// `const` rather than a call in each arm, so the FNV of the name is evaluated by language rule
+/// instead of by the optimizer's goodwill: these run on the `newobj` / `callvirt` path, and hashing
+/// a name per instruction is not a cost worth leaving to chance.
+#[cfg(feature = "bcl")]
+mod intrinsic_ids {
+    use super::intrinsic_id;
+
+    pub(super) const OBJECT_TO_STRING: u32 = intrinsic_id("object_to_string");
+    pub(super) const INTERLOCKED_COMPARE_EXCHANGE: u32 = intrinsic_id("interlocked_compare_exchange");
+    pub(super) const STRING_CTOR_CHAR_PTR: u32 = intrinsic_id("string_ctor_char_ptr");
+    pub(super) const STRING_CTOR_CHAR_PTR_RANGE: u32 = intrinsic_id("string_ctor_char_ptr_range");
+    pub(super) const STRING_CTOR_CHAR_ARRAY: u32 = intrinsic_id("string_ctor_char_array");
+    pub(super) const STRING_CTOR_CHAR_ARRAY_RANGE: u32 = intrinsic_id("string_ctor_char_array_range");
+    pub(super) const STRING_CTOR_CHAR_REPEAT: u32 = intrinsic_id("string_ctor_char_repeat");
+}
+
 /// Whether `method` is the `Object.ToString` intrinsic, so a `constrained.` Enum.ToString
 /// can be rendered as the constant name rather than the boxed value's text.
 #[cfg(feature = "bcl")]
 fn is_object_to_string(module: &Module, method: MethodId) -> bool {
-    matches!(
-        module.method_kind(method),
-        Some(MethodKind::Intrinsic(func))
-            if core::ptr::fn_addr_eq(func, crate::intrinsics::object_to_string as IntrinsicFn)
-    )
+    module.intrinsic_id(method) == Some(intrinsic_ids::OBJECT_TO_STRING)
 }
 
 /// Whether `method` is the `Interlocked.CompareExchange` intrinsic, so its first argument is
@@ -3626,14 +3643,7 @@ fn is_object_to_string(module: &Module, method: MethodId) -> bool {
 /// an ordinary intrinsic's by-ref argument. Always `false` without the `bcl` intrinsics.
 #[cfg(feature = "bcl")]
 fn is_compare_exchange(module: &Module, method: MethodId) -> bool {
-    matches!(
-        module.method_kind(method),
-        Some(MethodKind::Intrinsic(func))
-            if core::ptr::fn_addr_eq(
-                func,
-                crate::intrinsics::interlocked_compare_exchange as IntrinsicFn,
-            )
-    )
+    module.intrinsic_id(method) == Some(intrinsic_ids::INTERLOCKED_COMPARE_EXCHANGE)
 }
 
 #[cfg(not(feature = "bcl"))]
@@ -3645,26 +3655,101 @@ fn is_compare_exchange(_module: &Module, _method: MethodId) -> bool {
 /// terminator-scanning `String(char*)`, `Some(true)` for `String(char*, int, int)`. The
 /// two intrinsics are identity anchors -- the loader binds them so `newobj` resolves, and
 /// the interpreter routes both through [`Flow::NewString`] (which can reach a cross-frame
-/// stackalloc buffer the intrinsic ABI cannot).
+/// stackalloc buffer the intrinsic ABI cannot). Always `None` without the `bcl` intrinsics, where
+/// no String constructor is bound to one.
+#[cfg(feature = "bcl")]
 fn string_pointer_ctor_form(module: &Module, method: MethodId) -> Option<bool> {
-    match module.method_kind(method) {
-        Some(MethodKind::Intrinsic(func)) => {
-            if core::ptr::fn_addr_eq(
-                func,
-                crate::intrinsics::string_ctor_char_ptr as crate::module::IntrinsicFn,
-            ) {
-                Some(false)
-            } else if core::ptr::fn_addr_eq(
-                func,
-                crate::intrinsics::string_ctor_char_ptr_range as crate::module::IntrinsicFn,
-            ) {
-                Some(true)
-            } else {
-                None
-            }
-        }
+    match module.intrinsic_id(method)? {
+        intrinsic_ids::STRING_CTOR_CHAR_PTR => Some(false),
+        intrinsic_ids::STRING_CTOR_CHAR_PTR_RANGE => Some(true),
         _ => None,
     }
+}
+
+#[cfg(not(feature = "bcl"))]
+fn string_pointer_ctor_form(_module: &Module, _method: MethodId) -> Option<bool> {
+    None
+}
+
+/// Which of the three SAFE String constructors `method` is bound to, if any.
+///
+/// Separate from [`string_pointer_ctor_form`] because these need nothing the pointer forms need: an
+/// array reference and an integer are ordinary values, reachable where `newobj` is handled, so
+/// there is no cross-frame buffer to chase and no [`Flow`] to route through. They are anchors for
+/// the other half of the same reason -- a constructor cannot hand back an object other than the one
+/// under construction, and a string built from arguments has to be produced by the instruction.
+#[cfg(feature = "bcl")]
+fn string_value_ctor_form(module: &Module, method: MethodId) -> Option<StringValueCtor> {
+    match module.intrinsic_id(method)? {
+        intrinsic_ids::STRING_CTOR_CHAR_ARRAY => Some(StringValueCtor::WholeArray),
+        intrinsic_ids::STRING_CTOR_CHAR_ARRAY_RANGE => Some(StringValueCtor::ArrayRange),
+        intrinsic_ids::STRING_CTOR_CHAR_REPEAT => Some(StringValueCtor::Repeat),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "bcl"))]
+fn string_value_ctor_form(_module: &Module, _method: MethodId) -> Option<StringValueCtor> {
+    None
+}
+
+/// The three SAFE String constructors, by the shape of their arguments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringValueCtor {
+    /// `String(char[])` -- every code unit of the array.
+    WholeArray,
+    /// `String(char[], int, int)` -- a range of it.
+    ArrayRange,
+    /// `String(char, int)` -- one code unit, repeated.
+    Repeat,
+}
+
+/// Build the string one of the three SAFE String constructors names, from its popped arguments.
+///
+/// Every out-of-range case is a REFUSAL rather than a clamp. A `String(chars, start, length)` whose
+/// range runs past the array is a caller mistake, and answering it with a shorter string hands back
+/// something well formed and wrong -- the far end has no way to tell it from a string that was
+/// always that length, which is the same reasoning the frame codec refuses an over-long payload on.
+fn build_string_value(
+    vm: &mut Vm,
+    args: &[Value],
+    form: StringValueCtor,
+) -> Result<crate::object::ObjectRef, Trap> {
+    let units = match form {
+        StringValueCtor::Repeat => {
+            let unit = match args.first() {
+                Some(&Value::Int32(unit)) => unit as u16,
+                _ => return Err(Trap::TypeMismatch(Opcode::Newobj)),
+            };
+            let count = ctor_int_arg(args, 1)?;
+            let count = usize::try_from(count).map_err(|_| Trap::ArgumentOutOfRange(1))?;
+            alloc::vec![unit; count]
+        }
+        StringValueCtor::WholeArray | StringValueCtor::ArrayRange => {
+            let reference = match args.first() {
+                Some(&Value::Object(reference)) => reference,
+                Some(&Value::Null) => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Newobj)),
+            };
+            if vm.heap().array_element_type(reference).is_none() {
+                return Err(Trap::TypeMismatch(Opcode::Newobj));
+            }
+            let (start, length) = match form {
+                StringValueCtor::ArrayRange => {
+                    let start = usize::try_from(ctor_int_arg(args, 1)?)
+                        .map_err(|_| Trap::ArgumentOutOfRange(1))?;
+                    let length = usize::try_from(ctor_int_arg(args, 2)?)
+                        .map_err(|_| Trap::ArgumentOutOfRange(2))?;
+                    (start, length)
+                }
+                _ => (0, vm.heap().array_len(reference).unwrap_or(0)),
+            };
+            vm.heap()
+                .array_utf16_units(reference, start, length)
+                .ok_or(Trap::ArgumentOutOfRange(2))?
+        }
+    };
+    Ok(vm.heap_mut().alloc_string(&units)?)
 }
 
 /// The `int32` at `slot` of a popped constructor argument list.
@@ -4799,6 +4884,18 @@ fn step(
                     length,
                 });
             }
+            if let Some(form) = string_value_ctor_form(module, ctor) {
+                let arity = match form {
+                    StringValueCtor::WholeArray => 1,
+                    StringValueCtor::ArrayRange => 3,
+                    StringValueCtor::Repeat => 2,
+                };
+                let args = take_args_pooled(frame, vm, arity)?;
+                let built = build_string_value(vm, &args, form);
+                vm.frame_pool.give_values(args);
+                frame.stack.push(Value::Object(built?));
+                return Ok(Flow::Next);
+            }
             let is_intrinsic =
                 matches!(module.method_kind(ctor), Some(MethodKind::Intrinsic(_)));
             let (type_id, defaults) = if is_intrinsic {
@@ -5145,9 +5242,13 @@ fn step(
         }
 
         Opcode::Box => {
-            check_alloc_budget(vm)?;
             let token = token_operand(instruction)?;
             let value = frame.pop()?;
+            if matches!(value, Value::Null | Value::Object(_)) {
+                frame.stack.push(value);
+                return Ok(Flow::Next);
+            }
+            check_alloc_budget(vm)?;
             let reference = vm.heap_mut().alloc_boxed(asm_key(asm, token.0), value);
             frame.stack.push(Value::Object(reference));
         }
@@ -5873,11 +5974,12 @@ fn pointer_offset(value: &Value) -> Option<i64> {
 ///
 /// `add.ovf.un`/`sub.ovf.un` read both operands as unsigned native ints and throw when the
 /// result "cannot be represented in the result type" (III.3.2, III.3.65). On a flat address
-/// space that means the ADDRESS carried out of the pointer width. Our pointers have no address:
-/// they are a `Location` plus a byte offset within ONE allocation, which is the model III.1.5
+/// space that means the ADDRESS carried out of the pointer width. A pointer here has no address:
+/// it is a `Location` plus a byte offset within ONE allocation, which is the model III.1.5
 /// prescribes -- it defines pointer arithmetic only within a single array and leaves every other
 /// use unspecified, precisely because a moving memory manager makes absolute addresses and
-/// inter-object distances unstable. Our GC is moving-capable, so an address would be a fiction.
+/// inter-object distances unstable. This collector is moving-capable, so an address would be a
+/// fiction.
 ///
 /// So a pointer's unsigned native value here IS its byte offset, and its representable range is
 /// its allocation's offset space -- `[0, 2^32)`, the target's pointer width (`TargetLayout::ilp32`,
@@ -7194,7 +7296,7 @@ mod tests {
     }
 
     /// The unset clock READS FORWARD, and a device is the whole reason: no serve firmware in this
-    /// tree sets a wall clock, so this is the arm every board actually takes. It used to be a
+    /// tree sets a wall clock, so this is the arm every board actually takes. A
     /// constant, which made `DateTime.UtcNow` unable to measure a duration on ANY board -- while
     /// `Environment.TickCount`, one accessor away on the SAME seam, advanced normally.
     ///
@@ -7390,8 +7492,8 @@ mod tests {
     }
 
     /// The unencodable-unit fault names `EncoderFallbackException` AND `ArgumentException`, which
-    /// is the whole reason that type was the right pick: a `catch (ArgumentException)` written
-    /// against desktop .NET fires on it without naming a type that framework's author never wrote.
+    /// is why that pairing matters: a `catch (ArgumentException)` written against desktop .NET
+    /// fires on it without naming a type that framework's author never wrote.
     #[test]
     fn the_encoder_fallback_fault_is_also_an_argument_exception() {
         let (_, chain) = fault_exception(&Trap::EncoderFallback {
@@ -7636,6 +7738,39 @@ mod tests {
             binary_numeric(Opcode::AddOvf, stack_pointer_at(1), all_ones).unwrap_err(),
             Trap::TypeMismatch(Opcode::AddOvf)
         ));
+    }
+
+    /// The five String-constructor anchors are five distinct identities under the scheme the
+    /// recognizers actually use.
+    ///
+    /// The anchors have byte-identical bodies on purpose -- each is a name for the interpreter to
+    /// route on and has no behavior of its own -- so a release build is free to merge them onto ONE
+    /// address, and it does. While the recognizers compared function pointers, every one of them
+    /// answered for whichever anchor was tested first: `new string(chars)` took the `String(char*)`
+    /// path and trapped `TypeMismatch(Newobj)`, in release only, with the debug build green.
+    ///
+    /// This asserts the ids and not the addresses. Whether a given build merges identical functions
+    /// is the optimizer's business and may change; the property this runtime needs is that the
+    /// anchors stay distinguishable regardless.
+    #[cfg(feature = "bcl")]
+    #[test]
+    fn the_five_string_ctor_anchors_are_five_distinct_ids() {
+        let anchors = [
+            "string_ctor_char_ptr",
+            "string_ctor_char_ptr_range",
+            "string_ctor_char_array",
+            "string_ctor_char_array_range",
+            "string_ctor_char_repeat",
+        ];
+        for (index, left) in anchors.iter().enumerate() {
+            for right in anchors.iter().skip(index + 1) {
+                assert_ne!(
+                    intrinsic_id(left),
+                    intrinsic_id(right),
+                    "String ctor anchors {left} and {right} share a registry id"
+                );
+            }
+        }
     }
 
     #[test]

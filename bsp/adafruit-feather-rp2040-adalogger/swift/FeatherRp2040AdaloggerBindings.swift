@@ -52,4 +52,20 @@ public enum FeatherRp2040AdaloggerBindings {
     public static let MEMORY_FLASH_KIND: StaticString = "flash"
     public static let MEMORY_FLASH_SIZE: UInt32 = 0x800000
     public static let MEMORY_FLASH_OPTIONAL: UInt32 = 0
+
+    // -- connectors: the sockets a removable module plugs into. The socket is board truth --
+    // it is on the schematic and identical on every unit -- and what is plugged into it is not,
+    // so no row here names a module. A socket brings out whole BUSES, each named by the binding
+    // role that serves it, and single LINES, each named by the standard's own name for that
+    // position and carrying the port wiring a driver needs to drive it. Which of a socket's
+    // protocols an attached module speaks is a property of the module, so a board that offers
+    // several states all of them and chooses none --
+    public static let CONNECTOR_COUNT: UInt32 = 1
+    public static let CONNECTOR_QT_STANDARD: StaticString = "stemma-qt"
+    public static let CONNECTOR_QT_SDA_PORT_BASE: UInt32 = 0xD0000000
+    public static let CONNECTOR_QT_SDA_PIN: UInt32 = 2
+    public static let CONNECTOR_QT_SDA_MASK: UInt32 = 0x4
+    public static let CONNECTOR_QT_SCL_PORT_BASE: UInt32 = 0xD0000000
+    public static let CONNECTOR_QT_SCL_PIN: UInt32 = 3
+    public static let CONNECTOR_QT_SCL_MASK: UInt32 = 0x8
 }

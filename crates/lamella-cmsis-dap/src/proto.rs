@@ -38,6 +38,13 @@ pub const DAP_ERROR: u8 = 0xFF;
 pub const CONNECT_FAILED: u8 = 0x00;
 
 /// Whether the byte AFTER the echoed command id is a status byte ([`DAP_OK`] / [`DAP_ERROR`]).
+///
+/// **IT IS NOT A STATUS FOR EVERY COMMAND, AND CHECKING IT BLINDLY WOULD BREAK THE ONES IT IS
+/// NOT.** The reply layouts differ per command and the byte in that position carries whatever
+/// each one puts there -- `DAP_Info` a LENGTH, `DAP_Connect` the PORT it selected, `DAP_Transfer`
+/// and `DAP_TransferBlock` a transfer COUNT, `DAP_SWJ_Pins` the pin INPUT levels. A blanket
+/// "byte 1 must be zero" rejects a perfectly good `DAP_Info` the moment it returns any data at
+/// all, so the distinction has to be per command, from the documented layout of each.
 pub fn has_status_byte(command: u8) -> bool {
     matches!(
         command,

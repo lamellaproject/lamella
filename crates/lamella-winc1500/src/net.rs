@@ -7,7 +7,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
-use lamella_cil_runtime::net::{Interest, NetBackend, NetResult, SocketHandle};
+use lamella_net_core::{Interest, NetBackend, NetResult, SocketHandle};
 
 use crate::WincControl;
 use crate::hif::{self, HifError, HifEvent, ModuleBus};

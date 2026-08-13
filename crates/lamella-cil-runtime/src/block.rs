@@ -103,9 +103,9 @@ pub trait BlockDevice: core::fmt::Debug {
 
     /// Forces any buffered writes onto the medium and waits for it to report itself idle.
     ///
-    /// Load-bearing rather than a courtesy: removable media are removed, and a file system that
-    /// has updated a directory entry needs to know the sectors actually landed before it reports
-    /// the file written. A driver that never buffers implements this as waiting for the medium to
+    /// Load-bearing rather than a courtesy: removable media are removed, and a file system writing
+    /// a directory entry needs to know the sectors reach the medium before it reports the file
+    /// written. A driver that never buffers implements this as waiting for the medium to
     /// finish its current program cycle -- never as an unconditional `Ok`.
     fn flush(&mut self) -> BlockResult<()>;
 }

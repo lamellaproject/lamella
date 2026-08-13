@@ -131,6 +131,7 @@ fn local_corlib_candidates() -> Vec<PathBuf> {
         }
     }
     candidates.push(PathBuf::from("corlib.dll"));
+    candidates.push(PathBuf::from("managed").join("corlib.dll"));
     candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures/corlib.dll"),
     );
@@ -378,6 +379,15 @@ impl IncrementalSession {
     /// [`ReplSession::new`] discovers it -- `LAMELLA_CORLIB`, else a `corlib.dll` beside the
     /// executable, else `LAMELLA_REF_DIR`. The zero-configuration constructor an interactive
     /// front end needs.
+    ///
+    /// The single-reference case -- the normal one, a Lamella `corlib.dll` -- takes the RESIDENT
+    /// corlib path, so managed corlib members a submission names resolve by name. A multi-reference
+    /// set (`LAMELLA_REF_DIR`) type-checks against all of them with none resident, which is
+    /// [`IncrementalSession::open_compiler`]'s existing behaviour and its existing limits.
+    ///
+    /// # Errors
+    /// Returns `Err` when no reference assemblies can be discovered, or for any reason
+    /// [`IncrementalSession::open_compiler_with_corlib`] does.
     pub fn open_compiler_discovered() -> Result<IncrementalSession, String> {
         let tools = Toolchain::discover()?;
         match tools.references.split_first() {
@@ -597,6 +607,16 @@ impl IncrementalSession {
 
     /// The console output written since the last call -- what `Console.WriteLine` produced, as
     /// opposed to the VALUE display the `submit_*` methods return.
+    ///
+    /// **THE TWO ARE DIFFERENT THINGS AND A FRONT END NEEDS BOTH.** `submit_source` returns
+    /// only the submission's rendered return value, so a front end that printed just that shows
+    /// NOTHING for `Console.WriteLine("hi");` -- the statement returns void. Tier 1's `submit`
+    /// returned console output and no display, which is the opposite half; a binary switching
+    /// between the tiers silently loses whichever half it does not ask for.
+    ///
+    /// **DRAINING IS WHY THIS TAKES `&mut`.** One [`Vm`] lives for the whole session, so its
+    /// output buffer ACCUMULATES; returning all of it would reprint every earlier submission's
+    /// output every time. This returns only what is new and advances the watermark.
     pub fn take_console_output(&mut self) -> String {
         let output = self.vm.output();
         let fresh = output.get(self.console_watermark..).unwrap_or(&[]);

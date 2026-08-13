@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use lamella_py_bytecode::CodeObject;
 
+use lamella_net_core::{Interest, NetBackend, NetResult, SocketHandle};
 use crate::bigint::BigInt;
 use crate::object::ObjectModel;
 use crate::trap::Trap;
@@ -103,6 +104,48 @@ enum StdlibFn {
     ReactorBlockPoint,
     /// `_reactor.now_ms()` -- the monotonic clock in the same unit deadlines are given in.
     ReactorNowMs,
+    /// `_time.clock_is_set()` -- whether an embedder anchored this runtime's wall clock.
+    TimeClockIsSet,
+    /// `_socket.resolve(host)` -- the host's addresses as a list of `bytes` (4 = IPv4, 16 = IPv6).
+    SocketResolve,
+    /// `_socket.tcp_connect(addr, port)` -- connect, blocking until the connection completes.
+    SocketTcpConnect,
+    /// `_socket.tcp_listen(addr, port, backlog)` -- a bound, listening socket.
+    SocketTcpListen,
+    /// `_socket.accept(listener)` -- the next connection, blocking until one arrives.
+    SocketAccept,
+    /// `_socket.recv(socket, max)` -- up to `max` bytes; empty means the peer closed cleanly.
+    SocketRecv,
+    /// `_socket.send(socket, data)` -- the count actually written, which may be short.
+    SocketSend,
+    /// `_socket.close(socket)` -- release the handle.
+    SocketClose,
+    /// `_socket.local_port(socket)` -- the bound port, or `None`.
+    SocketLocalPort,
+    /// `_socket.udp_bind(addr, port)` -- a bound datagram socket.
+    SocketUdpBind,
+    /// `_socket.udp_send_to(socket, data, addr, port)` -- the count written.
+    SocketUdpSendTo,
+    /// `_socket.udp_recv_from(socket, max)` -- `(data, addr, port)`, blocking until one arrives.
+    SocketUdpRecvFrom,
+    /// `_socket.set_timeout(socket, seconds_or_none)` -- CPython's tri-state, translated in ONE
+    /// place: `None` blocks indefinitely, `0` means never wait, a positive value is a deadline.
+    SocketSetTimeout,
+    /// `_socket.get_timeout(socket)` -- `None`, `0.0`, or the timeout in seconds.
+    SocketGetTimeout,
+    /// NOT A FUNCTION. One past the last real variant, so the coverage guard below can count them
+    /// without naming which one is last.
+    ///
+    /// **A sentinel rather than the final variant named by hand, because naming it by hand is the
+    /// very defect the guard exists to catch, one level up.** A hand-written end goes stale on the
+    /// next append in exactly the way an un-tabled variant does: the check written to notice a
+    /// missing table row measures against the old end instead, and reports a coverage mismatch
+    /// pointing at the wrong side of the comparison. A sentinel moves by itself.
+    ///
+    /// `from_id` has no row for it, so it can never be produced from an id; its `python_name` is
+    /// empty, which the guard separately refuses for anything the table does return.
+    #[doc(hidden)]
+    Count,
 }
 
 impl StdlibFn {
@@ -169,6 +212,20 @@ impl StdlibFn {
             50 => ReactorUnpark,
             51 => ReactorBlockPoint,
             52 => ReactorNowMs,
+            53 => TimeClockIsSet,
+            54 => SocketResolve,
+            55 => SocketTcpConnect,
+            56 => SocketTcpListen,
+            57 => SocketAccept,
+            58 => SocketRecv,
+            59 => SocketSend,
+            60 => SocketClose,
+            61 => SocketLocalPort,
+            62 => SocketUdpBind,
+            63 => SocketUdpSendTo,
+            64 => SocketUdpRecvFrom,
+            65 => SocketSetTimeout,
+            66 => SocketGetTimeout,
             _ => return None,
         })
     }
@@ -217,6 +274,21 @@ impl StdlibFn {
             TimeTimeNs => "time_ns",
             TimeMonotonicNs => "monotonic_ns",
             TimeSleepNs => "sleep_ns",
+            TimeClockIsSet => "clock_is_set",
+            SocketResolve => "resolve",
+            SocketTcpConnect => "tcp_connect",
+            SocketTcpListen => "tcp_listen",
+            SocketAccept => "accept",
+            SocketRecv => "recv",
+            SocketSend => "send",
+            SocketClose => "close",
+            SocketLocalPort => "local_port",
+            SocketUdpBind => "udp_bind",
+            SocketUdpSendTo => "udp_send_to",
+            SocketUdpRecvFrom => "udp_recv_from",
+            SocketSetTimeout => "set_timeout",
+            SocketGetTimeout => "get_timeout",
+            Count => "",
             StructPackFloat => "pack_float",
             StructUnpackFloat => "unpack_float",
             FsListdir => "listdir",
@@ -396,6 +468,7 @@ pub fn build_module(name: &str, model: &mut ObjectModel) -> Option<Result<Value,
         "_struct" => Some(build_struct_seam_module(model)),
         "weakref" => Some(build_weakref_module(model)),
         "_reactor" => Some(build_reactor_module(model)),
+        "_socket" => Some(build_socket_module(model)),
         _ => None,
     }
 }
@@ -460,7 +533,220 @@ fn build_struct_seam_module(model: &mut ObjectModel) -> Result<Value, Trap> {
 fn build_time_module(model: &mut ObjectModel) -> Result<Value, Trap> {
     use StdlibFn::*;
     let mut entries: Vec<(Value, Value)> = Vec::new();
-    for f in [TimeTimeNs, TimeMonotonicNs, TimeSleepNs] {
+    for f in [TimeTimeNs, TimeMonotonicNs, TimeSleepNs, TimeClockIsSet] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+/// The waiter id a SYNCHRONOUS socket call parks under.
+///
+/// A blocking `recv` has no green-thread id of its own -- it is the interpreter's own stack sitting
+/// in a native call -- so it needs one id that cannot collide with an event loop's. The loop numbers
+/// its tasks from zero upward, so the top of the space is the one region it will not reach.
+///
+/// **A synchronous socket op inside a running event loop still stalls that loop**, exactly as it does
+/// in CPython, and this id does not pretend otherwise: `asyncio` gets its concurrency from awaiting,
+/// not from this layer quietly making a blocking call not block.
+const SYNC_SOCKET_WAITER: u32 = u32::MAX;
+
+/// The waiter id a TIMED socket operation parks its deadline under, beside the socket park above.
+///
+/// **Two parks rather than one, because the reactor's wait reasons are exclusive.** A park is either
+/// `Io(socket)` or `Sleep(deadline)`, and parking one id twice REPLACES it -- so a single waiter
+/// cannot say "wake me when this socket is ready OR when this instant passes", which is exactly what
+/// a socket timeout is. Parking a second id on the deadline makes the reactor compute its poll
+/// timeout from it, so the one block point returns on whichever happens first and nothing polls in a
+/// loop to notice.
+const SYNC_TIMEOUT_WAITER: u32 = u32::MAX - 1;
+
+/// The refusal for a program that reaches for a socket on a host with no backend installed.
+fn no_network(model: &mut ObjectModel) -> Trap {
+    let message = "this runtime has no network backend installed, so it cannot open a socket";
+    model.raise_named_exception("OSError", message)
+}
+
+/// The refusal for a backend that reported a genuine failure, naming the operation.
+fn net_error(model: &mut ObjectModel, op: &str) -> Trap {
+    let message = alloc::format!("socket {op} failed");
+    model.raise_named_exception("OSError", &message)
+}
+
+/// What a NON-BLOCKING socket raises when the operation cannot complete right now.
+///
+/// **`BlockingIOError`, and it is not interchangeable with the timeout below.** It means *normal,
+/// retry* -- the select-loop idiom a program opts into by setting the socket non-blocking -- where
+/// a timeout means *the peer was too slow*. Both subclass `OSError`, so a program catching that
+/// catches either; one catching `BlockingIOError` specifically will NOT catch a `TimeoutError`, and
+/// a retry loop written against the first would spin forever on the second.
+fn would_block_error(model: &mut ObjectModel, op: &str) -> Trap {
+    let message = alloc::format!("socket {op} would block on a non-blocking socket");
+    model.raise_named_exception("BlockingIOError", &message)
+}
+
+/// What a socket with a deadline raises when the deadline passes first.
+fn timed_out_error(model: &mut ObjectModel, op: &str) -> Trap {
+    let message = alloc::format!("socket {op} timed out");
+    model.raise_named_exception("TimeoutError", &message)
+}
+
+/// An address argument: 4 bytes for IPv4 or 16 for IPv6, in network order.
+fn addr_arg(model: &ObjectModel, value: Value) -> Result<Vec<u8>, Trap> {
+    match model.bytes_value(value) {
+        Some(bytes) if bytes.len() == 4 || bytes.len() == 16 => Ok(bytes.to_vec()),
+        _ => Err(Trap::TypeError),
+    }
+}
+
+/// A port argument. Out of range is a TypeError rather than a silent truncation, because a port
+/// quietly wrapping to a different one connects to the wrong service and reports nothing.
+fn port_arg(model: &ObjectModel, value: Value) -> Result<u16, Trap> {
+    u16::try_from(model.as_i128(value).unwrap_or(-1)).map_err(|_| Trap::TypeError)
+}
+
+/// A socket-handle argument.
+fn handle_arg(model: &ObjectModel, value: Value) -> Result<SocketHandle, Trap> {
+    u32::try_from(model.as_i128(value).unwrap_or(-1)).map_err(|_| Trap::TypeError)
+}
+
+/// A socket handle as a Python int.
+fn handle_value(handle: SocketHandle) -> Value {
+    Value::fixnum(i32::try_from(handle).unwrap_or(0)).unwrap_or(Value::NONE)
+}
+
+/// The seconds a `settimeout()` argument names. CPython's is a float, so any number is one.
+#[cfg(feature = "float")]
+fn timeout_seconds_arg(model: &ObjectModel, value: Value) -> Result<f64, Trap> {
+    model.as_f64(value).ok_or(Trap::TypeError)
+}
+
+/// [`timeout_seconds_arg`] on the NO-FLOAT tier, where a timeout can only be a WHOLE number of
+/// seconds -- and refusing the whole call would be the wrong reading of that.
+///
+/// A timeout is not a float capability. What needs a float is sub-second precision, and the three
+/// things a device without one actually reaches for -- `settimeout(None)` to block, `settimeout(0)`
+/// for non-blocking, `settimeout(n)` for a wait of n seconds -- need none. `settimeout(0.5)` cannot
+/// be WRITTEN on this tier in the first place: the literal refuses where every float does, at
+/// `new_float`, which is the tier's one choke point. So there is no float here to reject, and
+/// reading the argument as an integer is not a degraded version of the float path -- it is the
+/// entire range of values the tier can express.
+#[cfg(not(feature = "float"))]
+fn timeout_seconds_arg(model: &ObjectModel, value: Value) -> Result<f64, Trap> {
+    model.as_i128(value).map(|whole| whole as f64).ok_or(Trap::TypeError)
+}
+
+/// One non-blocking attempt: `Ready(v)` -> `Some(v)`, `Error` -> `None`, `WouldBlock` -> `None`.
+///
+/// For the operations that CANNOT block (`tcp_listen`, `udp_bind`, and the first half of a connect),
+/// so the caller does not have to spell out a park path that cannot be reached.
+fn net_call<T>(
+    model: &mut ObjectModel,
+    op: impl FnOnce(&mut (dyn NetBackend + 'static)) -> NetResult<T>,
+) -> Result<Option<T>, Trap> {
+    let Some(backend) = model.net_backend() else { return Err(no_network(model)) };
+    Ok(match op(backend) {
+        NetResult::Ready(value) => Some(value),
+        NetResult::WouldBlock | NetResult::Error => None,
+    })
+}
+
+/// **Where the non-blocking seam below meets the blocking surface above.**
+///
+/// Retries `op` until it completes, and on `WouldBlock` registers `socket` for `interest` and goes
+/// into the SHARED block point -- the same one a sleep uses. So a blocking `recv` is a park on the
+/// one reactor rather than a spin, and a device sleeps through a slow peer instead of burning the
+/// core on it.
+///
+/// **The deregister after the wake is the reactor's rule, not an optimization.** A handle left in
+/// the poll set with nobody parked on it wakes the next block immediately and forever; the next op
+/// that parks re-arms it. `block_point` does that for the ids it wakes, which is why the park is
+/// removed here on every exit path rather than only the successful one.
+fn net_block<T>(
+    model: &mut ObjectModel,
+    socket: SocketHandle,
+    interest: Interest,
+    op_name: &str,
+    mut op: impl FnMut(&mut (dyn NetBackend + 'static)) -> NetResult<T>,
+) -> Result<T, Trap> {
+    let deadline = model.socket_deadline(socket, interest);
+    loop {
+        let outcome = {
+            let Some(backend) = model.net_backend() else { return Err(no_network(model)) };
+            op(backend)
+        };
+        match outcome {
+            NetResult::Ready(value) => {
+                unpark_all(model);
+                return Ok(value);
+            }
+            NetResult::Error => {
+                unpark_all(model);
+                return Err(net_error(model, op_name));
+            }
+            NetResult::WouldBlock => {
+                if model.socket_is_nonblocking(socket) {
+                    return Err(would_block_error(model, op_name));
+                }
+                if let Some(backend) = model.net_backend() {
+                    backend.register(socket, interest);
+                }
+                model.park_waiter_on_socket(SYNC_SOCKET_WAITER, socket);
+                if let Some(deadline) = deadline {
+                    model.park_waiter(SYNC_TIMEOUT_WAITER, deadline);
+                }
+                if model.reactor_block_point().is_none() {
+                    unpark_all(model);
+                    return Err(net_error(model, op_name));
+                }
+                if deadline.is_some_and(|deadline| model.reactor_now_millis() >= deadline) {
+                    let Some(backend) = model.net_backend() else { return Err(no_network(model)) };
+                    let last = op(backend);
+                    unpark_all(model);
+                    return match last {
+                        NetResult::Ready(value) => Ok(value),
+                        NetResult::Error => Err(net_error(model, op_name)),
+                        NetResult::WouldBlock => Err(timed_out_error(model, op_name)),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Drops both parks a timed socket operation may hold.
+///
+/// **Both, on EVERY exit path, and the reactor's rule is why.** A handle left in the poll set with
+/// nobody parked on it wakes the next block immediately and forever; a stale timer deadline wakes it
+/// spuriously in the same way. The next operation that parks re-arms whatever it needs.
+fn unpark_all(model: &mut ObjectModel) {
+    model.unpark_waiter(SYNC_SOCKET_WAITER);
+    model.unpark_waiter(SYNC_TIMEOUT_WAITER);
+}
+
+/// Builds `_socket`: the raw socket seam. `socket.py` builds CPython's surface (the `socket` object,
+/// `makefile`, the address tuples, the constants) on top of it in Python, exactly as CPython puts
+/// `socket.py` over `_socket` -- so this side stays the smallest thing that must be native, which is
+/// reaching the embedder's [`lamella_net_core::NetBackend`].
+fn build_socket_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    use StdlibFn::*;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in [
+        SocketResolve,
+        SocketTcpConnect,
+        SocketTcpListen,
+        SocketAccept,
+        SocketRecv,
+        SocketSend,
+        SocketClose,
+        SocketLocalPort,
+        SocketUdpBind,
+        SocketUdpSendTo,
+        SocketUdpRecvFrom,
+        SocketSetTimeout,
+        SocketGetTimeout,
+    ] {
         let key = model.new_str(f.python_name())?;
         entries.push((key, Value::builtin_ref(f.id())));
     }
@@ -612,16 +898,158 @@ pub fn call_stdlib(
 ) -> Result<Value, Trap> {
     use StdlibFn::*;
     match StdlibFn::from_id(id).ok_or(Trap::Malformed)? {
+        Count => Err(Trap::Malformed),
         TimeTimeNs | TimeMonotonicNs => {
             if !args.is_empty() {
                 return Err(Trap::TypeError);
             }
             let nanos = if StdlibFn::from_id(id) == Some(TimeTimeNs) {
-                model.now_ns()?
+                model.now_ns()
             } else {
                 model.monotonic_ns()?
             };
             model.new_bigint(BigInt::from_i128(i128::from(nanos)))
+        }
+        TimeClockIsSet => {
+            if !args.is_empty() {
+                return Err(Trap::TypeError);
+            }
+            Ok(Value::from_bool(model.clock_is_set()))
+        }
+        SocketResolve => {
+            let [host] = args else { return Err(Trap::TypeError) };
+            let host = String::from(model.str_text(*host)?);
+            let Some(backend) = model.net_backend() else { return Err(no_network(model)) };
+            let found = backend.resolve(&host);
+            let mut addrs = Vec::with_capacity(found.len());
+            for addr in found {
+                addrs.push(model.new_bytes(addr)?);
+            }
+            model.new_list(addrs)
+        }
+        SocketTcpConnect => {
+            let [addr, port] = args else { return Err(Trap::TypeError) };
+            let (addr, port) = (addr_arg(model, *addr)?, port_arg(model, *port)?);
+            let socket = match net_call(model, |b| b.tcp_connect(&addr, port))? {
+                Some(handle) => handle,
+                None => return Err(net_error(model, "connect")),
+            };
+            net_block(model, socket, Interest::Write, "connect", |b| b.connect_check(socket))?;
+            Ok(Value::fixnum(i32::try_from(socket).unwrap_or(0)).unwrap_or(Value::NONE))
+        }
+        SocketTcpListen => {
+            let [addr, port, backlog] = args else { return Err(Trap::TypeError) };
+            let (addr, port) = (addr_arg(model, *addr)?, port_arg(model, *port)?);
+            let backlog = i32::try_from(model.as_i128(*backlog).unwrap_or(5)).unwrap_or(5);
+            match net_call(model, |b| b.tcp_listen(&addr, port, backlog))? {
+                Some(handle) => Ok(handle_value(handle)),
+                None => Err(net_error(model, "listen")),
+            }
+        }
+        SocketAccept => {
+            let [listener] = args else { return Err(Trap::TypeError) };
+            let listener = handle_arg(model, *listener)?;
+            let accepted =
+                net_block(model, listener, Interest::Read, "accept", |b| b.accept(listener))?;
+            Ok(handle_value(accepted))
+        }
+        SocketRecv => {
+            let [socket, max] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            let max = usize::try_from(model.as_i128(*max).unwrap_or(0)).unwrap_or(0);
+            let mut buf = alloc::vec![0u8; max];
+            let read = net_block(model, socket, Interest::Read, "recv", |b| b.recv(socket, &mut buf))?;
+            buf.truncate(read.min(max));
+            model.new_bytes(buf)
+        }
+        SocketSend => {
+            let [socket, data] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            let Some(data) = model.bytes_value(*data).map(<[u8]>::to_vec) else {
+                return Err(Trap::TypeError);
+            };
+            let sent = net_block(model, socket, Interest::Write, "send", |b| b.send(socket, &data))?;
+            Ok(Value::fixnum(i32::try_from(sent).unwrap_or(i32::MAX)).unwrap_or(Value::NONE))
+        }
+        SocketClose => {
+            let [socket] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            if let Some(backend) = model.net_backend() {
+                backend.close(socket);
+            }
+            model.forget_socket(socket);
+            Ok(Value::NONE)
+        }
+        SocketLocalPort => {
+            let [socket] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            let Some(backend) = model.net_backend() else { return Err(no_network(model)) };
+            match backend.local_port(socket) {
+                Some(port) => Ok(Value::fixnum(i32::from(port)).unwrap_or(Value::NONE)),
+                None => Ok(Value::NONE),
+            }
+        }
+        SocketUdpBind => {
+            let [addr, port] = args else { return Err(Trap::TypeError) };
+            let (addr, port) = (addr_arg(model, *addr)?, port_arg(model, *port)?);
+            match net_call(model, |b| b.udp_bind(&addr, port))? {
+                Some(handle) => Ok(handle_value(handle)),
+                None => Err(net_error(model, "bind")),
+            }
+        }
+        SocketUdpSendTo => {
+            let [socket, data, addr, port] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            let Some(data) = model.bytes_value(*data).map(<[u8]>::to_vec) else {
+                return Err(Trap::TypeError);
+            };
+            let (addr, port) = (addr_arg(model, *addr)?, port_arg(model, *port)?);
+            let sent = net_block(model, socket, Interest::Write, "sendto", |b| {
+                b.udp_send_to(socket, &data, &addr, port)
+            })?;
+            Ok(Value::fixnum(i32::try_from(sent).unwrap_or(i32::MAX)).unwrap_or(Value::NONE))
+        }
+        SocketUdpRecvFrom => {
+            let [socket, max] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            let max = usize::try_from(model.as_i128(*max).unwrap_or(0)).unwrap_or(0);
+            let mut buf = alloc::vec![0u8; max];
+            let mut sender = [0u8; 16];
+            let (read, addr_len, port) = net_block(model, socket, Interest::Read, "recvfrom", |b| {
+                b.udp_recv_from(socket, &mut buf, &mut sender)
+            })?;
+            buf.truncate(read.min(max));
+            let data = model.new_bytes(buf)?;
+            let addr = model.new_bytes(sender[..addr_len.min(16)].to_vec())?;
+            let port = Value::fixnum(i32::from(port)).unwrap_or(Value::NONE);
+            model.new_tuple(alloc::vec![data, addr, port])
+        }
+        SocketSetTimeout => {
+            let [socket, seconds] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            let seconds = if *seconds == Value::NONE {
+                None
+            } else {
+                let value = timeout_seconds_arg(model, *seconds)?;
+                if value < 0.0 {
+                    return Err(model.raise_named_exception("ValueError", "timeout value out of range"));
+                }
+                Some(value)
+            };
+            if seconds.is_some_and(|value| value > 0.0) && !model.has_monotonic_clock() {
+                let message = "this board has no monotonic clock, so a socket timeout could never expire";
+                return Err(model.raise_named_exception("OSError", message));
+            }
+            model.set_socket_timeout(socket, seconds);
+            Ok(Value::NONE)
+        }
+        SocketGetTimeout => {
+            let [socket] = args else { return Err(Trap::TypeError) };
+            let socket = handle_arg(model, *socket)?;
+            match model.socket_timeout(socket) {
+                Some(seconds) => model.new_float(seconds),
+                None => Ok(Value::NONE),
+            }
         }
         #[cfg(not(feature = "float"))]
         StructPackFloat => Err(Trap::FloatUnavailable),
@@ -1324,6 +1752,36 @@ fn type_name(model: &ObjectModel, value: Value) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The id mapping is written TWICE -- [`StdlibFn::id`] derives it from declaration order, and
+    /// [`StdlibFn::from_id`] is a hand-written table -- and nothing but this holds them together.
+    ///
+    /// **Appending a variant and not the table is silent**, because the two directions are used at
+    /// different moments: the module builder hands out `id()`, so the function is bound and
+    /// reachable and looks present, and only a CALL reaches `from_id` and answers `Malformed`. A
+    /// gate that never calls a given function cannot tell. That is not hypothetical -- it is what
+    /// `clock_is_set` did on the pass that added it.
+    #[test]
+    fn every_stdlib_id_round_trips_and_the_table_covers_every_variant() {
+        let mut accepted = 0u32;
+        while let Some(f) = StdlibFn::from_id(STDLIB_BASE + accepted) {
+            assert_eq!(
+                f.id(),
+                STDLIB_BASE + accepted,
+                "from_id({accepted}) answers {f:?}, whose own id is {}",
+                f.id() - STDLIB_BASE
+            );
+            assert!(!f.python_name().is_empty(), "{f:?} has no Python name");
+            accepted += 1;
+        }
+
+        let declared = StdlibFn::Count as u32;
+        assert_eq!(
+            accepted, declared,
+            "from_id covers {accepted} ids but {declared} variants are declared -- a variant was \
+             appended without its table row, so calling it answers Malformed"
+        );
+    }
+
     fn model() -> ObjectModel {
         ObjectModel::new(Vec::new(), 64 * 1024)
     }
@@ -1332,7 +1790,9 @@ mod tests {
         Value::fixnum(n).unwrap()
     }
 
-    /// Calls math function `f` with real `args`, returning the result's f64.
+    /// Calls math function `f` with real `args`, returning the result's f64. Only the float tier has
+    /// an `as_f64` to read the answer back with, and only its rows call this.
+    #[cfg(feature = "float")]
     fn call_f(f: StdlibFn, args: &[f64], model: &mut ObjectModel) -> f64 {
         let vals: Vec<Value> = args.iter().map(|&a| model.new_float(a).unwrap()).collect();
         let r = call_stdlib(f.id(), &vals, &[], model, 0).unwrap();

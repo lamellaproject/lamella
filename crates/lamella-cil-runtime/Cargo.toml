@@ -12,6 +12,10 @@ lamella-cil = { path = "../lamella-cil" }
 # The shared block point. A leaf crate rather than a module here, so a sibling language runtime can
 # park on the SAME reactor without depending on this interpreter.
 lamella-reactor = { path = "../lamella-reactor" }
+# The shared socket seam, re-exported as this crate's `net` module. A leaf for the same reason as
+# the reactor, and with a second consequence: a BACKEND (smoltcp, a Wi-Fi module, the host) now
+# implements the trait without depending on this interpreter either.
+lamella-net-core = { path = "../lamella-net-core" }
 # The shared code-point byte codec. A leaf like the reactor: the WTF-8 BYTE form is a format a
 # sibling language runtime writes too, and one definition is the only way two writers stay identical.
 lamella-wtf8 = { path = "../lamella-wtf8" }

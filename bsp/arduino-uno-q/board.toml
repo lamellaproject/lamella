@@ -1,6 +1,49 @@
 # BOARD binding: the Arduino UNO Q, an STM32U585AII6TR on Arduino's ABX00162/ABX00173 in the UNO
 # form factor -- a microcontroller sharing one board with a Qualcomm Dragonwing QRB2210 application
 # processor that runs Debian Linux.
+#
+# THIS BOARD STATES NO CARRIER, AND THAT IS THE WHOLE FINDING RATHER THAN A GAP. Every other
+# board here reaches a host through a wire this schema can name: an on-board debugger, a bare SWD
+# header, or the microcontroller's own USB. This one reaches a host through NONE of them.
+#   * The microcontroller's own USB does not reach the connector. The USB-C is the application
+#     processor's, and what the host sees when the board is plugged in is that processor's Linux
+#     gadget -- VID_2341&PID_0078, an ADB interface beside a CDC serial -- with nothing from the
+#     microcontroller at all.
+#   * Its LPUART1 lands on the application processor (PG5 to PG8, schematic sheet 9), not on a
+#     bridge with a host identity to state.
+#   * There is no debug connector. The manual documents none, and the schematic level-shifts
+#     MCU_JTAG_SWDIO, MCU_JTAG_SWCLK, MCU_NRST and MCU_BOOT0 from 3.3 V to 1.8 V (sheet 7, TXS0101
+#     and TXS0104) straight into the application processor's GPIO (sheet 9).
+# So the application processor IS the microcontroller's debugger, which is a FOURTH debug kind
+# beside an on-board debugger chip, a bare SWD header and a native-USB bootloader. A carrier row
+# would have to name a wire, and stating one here would invent the wire. The Giga precedent is
+# refusing to invent a rate for a wire that has none; this is the same refusal one level up.
+#
+# FOUR RGB LEDS ARE POPULATED AND ONLY TWO ARE THIS BOARD'S TO BIND, because the OTHER TWO
+# BELONG TO A DIFFERENT PROCESSOR. RGB LEDs 1 and 2 in the schematic's naming (D27301, D27302) are
+# driven by the application processor and surface under Linux as /sys/class/leds/ entries -- red:user,
+# green:user, blue:user, red:panic, green:wlan, blue:bt, which the board confirms. Their identifiers
+# are gpiochip line numbers, a KERNEL-BUILD property rather than a board fact, so they are not ours
+# to state and no row below names them. What this file binds is the two the microcontroller drives.
+#
+# AND AN 8 x 13 MONOCHROME LED MATRIX IS MICROCONTROLLER-DRIVEN AND CANNOT BE MODELLED HERE.
+# `[[devices]]` has two shapes -- pin-wired, or bus-wired with a role and an address -- and this is
+# neither. The 104 pixels are CHARLIEPLEXED across ELEVEN pins: the schematic draws a triangular
+# diode array growing by two per row, the nets run LED_MATRIX_0 to LED_MATRIX_10 each through its
+# own 22 ohm resistor, and LED_MATRIX_11 is marked "not use". Eleven tri-stated pins give 11 x 10 =
+# 110 addressable LEDs, which is how 104 pixels are reached; row-and-column scanning across eleven
+# pins reaches at most 30. So a pixel here is an ORDERED PAIR OF PINS, not the intersection of a row
+# and a column, and the micro:bit's display-row/display-col rows -- the one matrix precedent in this
+# tree -- describe a scan this board does not perform. The sheet's own numbered 1..104 grid is the
+# LOGICAL 8 x 13 the manual describes; the triangular array is the ELECTRICAL truth, and they are
+# different things. This is the FOURTH KIND `[[devices]]` stops at, and it is stated rather than bent.
+#
+# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the LED matrix above; the two
+# application-processor RGB LEDs above; the power LED D27201, which no pin drives and which sits on
+# PWR_3P3V through a 330 ohm resistor; the LPUART1 and SPI3 links to the application processor,
+# which have no instance rows yet because their clock gates have not been read; the 2 GB or 4 GB of
+# LPDDR4X and the 16 GB or 32 GB of eMMC, both of which belong to the application processor and
+# neither of which the microcontroller can reach; and the Qwiic, JDIGITAL, JANALOG and JSPI headers.
 
 [table]
 kind = "board"
@@ -10,13 +53,23 @@ family = "stm32u585"
 part = "stm32u585ai"
 board_model = 36            # lamella_wire::board_model::ARDUINO_UNO_Q
 sources = [
-    "Arduino UNO Q user manual (SKU ABX00162-ABX00173), description and section 6: UNO Q combines the Qualcomm Dragonwing QRB2210 microprocessor, a quad-core Arm Cortex-A53 running Debian Linux, with the STMicroelectronics STM32U585 microcontroller, an Arm Cortex-M33 running Arduino Core on Zephyr OS; section 6.2 gives the microcontroller a 3.3 V I/O domain and the LED matrix, and section 7 states that the two processors communicate through Arduino Bridge, an RPC layer that accommodates multiple physical transports (USB CDC, UART, or SPI)",
+    "Arduino UNO Q user manual (SKU ABX00162-ABX00173, modified 06/08/2026), description and section 6: UNO Q combines the Qualcomm Dragonwing QRB2210 microprocessor, a quad-core Arm Cortex-A53 running Debian Linux, with the STMicroelectronics STM32U585 microcontroller, an Arm Cortex-M33 running Arduino Core on Zephyr OS; section 6.2 gives the microcontroller a 3.3 V I/O domain and the LED matrix, and section 7 states that the two processors communicate through Arduino Bridge, an RPC layer that accommodates multiple physical transports (USB CDC, UART, or SPI)",
     "Arduino UNO Q user manual (SKU ABX00162-ABX00173): the RGB LED section gives RGB LED 3 (D27401) as LED3_R PH10, LED3_G PH11, LED3_B PH12 and RGB LED 4 (D27402) as LED4_R PH13, LED4_G PH14, LED4_B PH15, and states that the RGB LEDs are active-low, meaning they turn on when driven to logic 0",
     "Arduino UNO Q schematics (ABX00162), sheet 19: the microcontroller symbol is designated STM32U585AII6TR_BGA169P, and its port H pins PH10 to PH15 carry the nets MCU_LED1_RED, MCU_LED1_GRN, MCU_LED1_BLU, MCU_LED2_RED, MCU_LED2_GRN and MCU_LED2_BLU, with PH4 to PH9 marked unconnected",
     "Arduino UNO Q schematics (ABX00162), sheet 21 (title LED): D27401 and D27402 are LTST-C28NBEGK-SN RED_BLU_GRN_LED4P parts whose common pin is on PWR_3P3V and whose three cathodes each run through a resistor -- R2729/R2731/R2730 for MCU_LED1 and R2732/R2734/R2733 for MCU_LED2, values 1.1K, 1.1K and 820 ohm -- to the microcontroller nets; the same sheet carries the Charlieplexed LED matrix and the always-on power LED D27201",
     "Arduino UNO Q schematics (ABX00162), sheets 7 and 9: MCU_JTAG_SWDIO, MCU_JTAG_SWCLK, MCU_BOOT0 and MCU_NRST are level-shifted from 3.3 V to 1.8 V by TXS0101/TXS0104 parts and land on the QRB2210's GPIO_25, GPIO_26, GPIO_37 and GPIO_38 respectively; the SPI3 and LPUART1 links land on GPIO_14/15/16/17/70 and GPIO_6/7/71/80",
 ]
 notes = [
+    "THE TWO DOCUMENTS DISAGREE ABOUT THE LEDS' ORDINALS AND AGREE ABOUT THEIR PINS, so the rows below are named for the schematic net and the manual's name is recorded beside it. The manual calls them RGB LED 3 and RGB LED 4; the schematic calls the same two parts MCU_LED1 and MCU_LED2. The same swap appears on the application processor's pair -- the manual's RGB LED 1 is the schematic's SoC_LED2 and vice versa -- so it is a consistent difference of numbering between the two documents rather than an error in one place. A reader matching them by ordinal alone pairs the wrong LEDs.",
+    "THE ACTIVE-LOW CLAIM IS THE MANUAL'S PROSE AND IT IS STATED HERE FROM THE SCHEMATIC AS WELL, because this board exposes no debug connector and its microcontroller reaches no probe, so a wrong polarity could not be caught by measuring it. Sheet 21 settles the question independently of the words: the LED's common pin is on PWR_3P3V and each cathode returns through a resistor to a microcontroller pin, so the pin is the driven end below the diode, it SINKS, and a leg lights when driven LOW. Prose and wiring agree, so the polarity rests on two readings rather than one.",
+    "THE PART COMES OUT OF RESET WITH ITS PINS IN ANALOG MODE, not as inputs, so a program that writes an output level without first writing MODER drives nothing. That is a family fact rather than a board one -- see csp/stm32u585/blocks/gpio.toml -- but it is the first thing anything on this board must do and the failure is silent.",
+    "PORT H NEEDS ITS CLOCK GATE OPENED FIRST. GPIOHEN is bit 7 of RCC_AHB2ENR1 at offset 0x08C, and until it is set a write to the port is dropped and a read returns the OLD value rather than zero -- which is the shape that condemned a correct row on a sibling family, so a check written as 'a gated read returns 0' must not be used to test this.",
+    "THE TABLE WAS BUILT FROM DOCUMENTS AND HAS SINCE BEEN CORROBORATED AGAINST THE LIVE PART, which is worth recording because the two are not the same kind of evidence and the second arrived later. Reading the microcontroller's own registers while the vendor's firmware ran on it: GPIOG_MODER = 0xF2EAABFF puts PG5 to PG10 and PG12 in alternate-function mode, PG13 in input mode, and leaves PG11 at its analog reset -- which is exactly the used set stated here, including the hole. GPIOG_AFRH = 0x00060668 gives PG8 the nibble 8 and PG9, PG10 and PG12 the nibble 6, i.e. AF8 for the LPUART1 signal and AF6 for the three SPI3 ones -- the same numbers the datasheet's alternate-function tables gave, written by firmware that read neither this file nor those tables. GPIOH_MODER = 0xFE6FFFFF has PH10 and PH12 in alternate-function mode and PH11 as an output, with PH13 to PH15 untouched, so the first RGB LED is driven and the second is not.",
+    "WHAT THE LIVE READING DOES *NOT* ESTABLISH, stated so the corroboration is not read as more than it is. It confirms WHICH PINS are used and which alternate functions they carry; it says nothing about which LED leg is which colour, and nothing about polarity. Those two rest on the schematic alone, and this board offers no way to measure them.",
+    "THE FIRMWARE OBSERVED DRIVES TWO LED PINS THROUGH A TIMER RATHER THAN AS PLAIN OUTPUTS -- PH10 and PH12 read as alternate-function, and their alternate-function lists carry TIM5 channels. That is a firmware choice and not a board fact: the rows below state what each pin is WIRED to, and a pin wired to an LED can be driven by the port or by a timer. A consumer must not read `gpio-out` as a claim that no other peripheral can reach the pin.",
+    "TRUSTZONE IS OFF ON THIS BOARD, MEASURED RATHER THAN ASSUMED: FLASH_OPTR reads 0x1FEFF8AA, which is the production value the reference manual states, so TZEN (bit 31) is 0 and RDP is 0xAA -- level 0, readout protection not active. The chip strata state nonsecure base addresses and are correct either way, but on this board the nonsecure alias is the only one that is live.",
+    "HIGH-SPEED LOW-VOLTAGE IO IS OFF, AT BOTH LEVELS, AND IT BEARS ON HOW FAST THE LINKS CAN RUN. FLASH_OPTR bit 30, IO_VDDIO2_HSLV, is 0, and GPIOG_HSLVR and GPIOH_HSLVR both read 0x00000000. The reference manual permits that mode only with VDDIO2 below 2.7 V, which is this board's condition -- so it is available and not taken. Whatever ceiling the SPI3 and LPUART1 peripherals have, the pins carrying them are presently in their standard-speed configuration.",
+    "NO OPERATING POINT IS STATED, AND THAT FOLLOWS FROM THERE BEING NO CARRIER. With no uart binding there is nothing for a divisor to derive from, and the two links this board does carry -- LPUART1 and SPI3 to the application processor -- have their rate set by the far end rather than by anything this file could hold.",
     "The two SKUs, ABX00162 (2 GB / 16 GB) and ABX00173 (4 GB / 32 GB), differ only in the application processor's LPDDR4X and eMMC. Neither is reachable from the microcontroller, so the microcontroller-side board truth is identical across both and one board file covers them.",
 ]
 
@@ -28,6 +81,12 @@ notes = [
 # kind this schema can name would be a wire this board does not have.
 
 # --- control lines ----------------------------------------------------------------------------
+#
+# EACH ROW BELOW CARRIES ITS OWN BALL, AND THAT IS NOT CEREMONY. The schematic draws each ball
+# designator on the wire stub ABOVE its pin-name baseline, so a text conversion pairs every ball
+# with the PREVIOUS pin and a whole port block reads one row low -- which is how the port G block
+# was misread twice before the join caught it. Every pin below was resolved schematic net -> BALL ->
+# DS13086 Table 27, using the NON-SMPS UFBGA169 column because the order code carries no `Q`.
 
 [[devices]]
 name = "led1_red"
@@ -69,4 +128,4 @@ name = "led2_blue"
 kind = "gpio-out"
 pin = "PH15"
 active = "low"
-source = "Schematic sheet 19 puts MCU_LED2_BLU on PH15, ball A13, and DS13086 Rev 10 Table 27 gives PH15 the ball A13 in the non-SMPS UFBGA169 column. Sheet 21 draws this leg's cathode through R2733, 820 ohm, back to the net. The pin sinks. The manual names it LED4_B."
+source = "Schematic sheet 19 puts MCU_LED2_BLU on PH15, ball A13, and DS13086 Rev 10 Table 27 gives PH15 the ball A13 in the non-SMPS UFBGA169 column. Sheet 21 draws this leg's cathode through R2733, 820 ohm, back to the net. The pin sinks. The manual names it LED4_B. PH15 is the last pin of the port and the last of the six: the schematic marks PH4 to PH9 unconnected, so the driven block is exactly PH10 to PH15 and nothing lies beyond it."

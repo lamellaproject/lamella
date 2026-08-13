@@ -39,10 +39,19 @@ serde_json = { version = "1", optional = true }
 # The serial (USB-CDC / UART) transport. Default ON for a host build; a wasm32 build turns it off
 # (--no-default-features) and supplies its own Transport (a Worker / in-process channel).
 default = ["serial", "repl-host"]
-serial = ["dep:serialport"]
+serial = ["dep:serialport", "carrier"]
 # The native-USB (driverless WinUSB) carrier (UsbTransport), for a board with a native USB device
 # peripheral. Host-only; coexists with serial (a host build can drive either).
-usb = ["dep:lamella-usbbulk"]
+usb = ["dep:lamella-usbbulk", "carrier"]
+# The TCP carrier (TcpTransport): a board reached across a network instead of down a cable, either
+# because it serves Lamella Link on its own network interface or because a relay daemon on a
+# companion processor serves it on the board's behalf. std only -- no new dependency.
+tcp = ["carrier"]
+# "at least one carrier is present". Cargo's `required-features` is an AND, so a tool that works
+# over ANY carrier cannot say so directly -- gating it on `serial` would hide it from a build that
+# has only the network one, which is the whole point of having moved the dispatch out of the tools.
+# Each carrier enables this, and the tools that go through `open_target` require it instead.
+carrier = []
 # The host REPL front-end: the interactive engine + the in-process `LcscCompiler` compile seam, and
 # the host REPL integration test over them (#[ignore]'d -- it needs the .NET reference assemblies
 # present). A wasm build leaves this off (the browser compiles in-process via lamella-wasm), keeping

@@ -1,6 +1,25 @@
 # PIN map: pin x function -> (instance, signal) for the STM32U585.
 # PARTIAL, evidence-only. Function ids are the ST alternate-function numbers (AF0..AF15) that the
 # AFRL/AFRH nibbles select.
+#
+# THE ALTERNATE-FUNCTION TABLE IS SPLIT ACROSS TWO TABLES AND READING ONE ALONE GIVES A FALSE
+# NEGATIVE. DS13086 prints AF0 to AF7 as Table 28 and AF8 to AF15 as Table 29, nine pages apart,
+# each with the same Port column and the same pin rows. A signal absent from one is not absent from
+# the part -- it is in the other. The two peripherals below fall on opposite sides of that split:
+# SPI3 is AF6 and lives in Table 28, LPUART1 is AF8 and lives in Table 29. A reader who found the
+# SPI3 rows in Table 28 and stopped would conclude this part routes no LPUART1 to port G at all.
+#
+# AND A CELL MEANS NOTHING WITHOUT ITS COLUMN HEADER, which is the only thing that says which AF
+# NUMBER a signal belongs to. Both tables are read as printed rather than converted: the AF6 header
+# reads I2C3/MDF1/OCTOSPIM_P2/SPI3 and the AF8 header reads LPUART1/SDMMC1/UART4/5, and those
+# headers are what turn a signal name into the nibble a driver writes.
+#
+# THE BALL IS THE JOIN KEY AND A ROW POSITION IS NOT. A schematic symbol commonly draws each ball
+# designator on the wire stub ABOVE its pin-name baseline, so a text conversion pairs every ball
+# with the PREVIOUS pin and a whole port block reads one row low. The check that catches it is the
+# alternate function itself: LPUART1_CTS is a function of PG5 and not of PG4, so a net carrying that
+# signal on ball J9 can only be PG5. Naming the function is therefore not bookkeeping -- it is the
+# only part of a pin row that can be checked against a drawing.
 
 [table]
 kind = "pins"
@@ -11,16 +30,22 @@ sources = [
 ]
 notes = [
     "The six RGB LED legs this family's board drives are general-purpose outputs on PH10 to PH15, and a pin driven by its own port has no peripheral function to select. They carry no row here, and the absence is deliberate rather than pending.",
+    "A PIN COMES OUT OF RESET IN ANALOG MODE ON THIS PART, so selecting an alternate function is TWO writes and not one: MODER must be set to 10 (alternate-function mode) as well as the AFR nibble being set to the number below. Setting the nibble alone leaves the pin's input buffer off and drives nothing.",
+    "WHICH AFR REGISTER HOLDS THE NIBBLE IS DECIDED BY THE PIN NUMBER AND NOT BY THE FUNCTION. AFRL covers pins 0..7 and AFRH covers pins 8..15, each counting from its own base -- so PG5's nibble is at bit 20 of AFRL while PG9's is at bit 4 of AFRH. The rows below span that boundary: the LPUART1 group sits in AFRL for PG5 to PG7 and in AFRH for PG8, and the SPI3 group is entirely in AFRH.",
+    "PG11's AF6 is SPI3_MOSI and it carries no row, because a pin map here is evidence-only and no board reaches that pin. That is not a statement that the part lacks the function -- Table 28 gives it plainly. A board wanting SPI3's MOSI on port G would add the row; a board wanting the SYSTEM BOOTLOADER's SPI3 must not, because AN2606 Rev 70 Table 217 places that one on PB5 instead.",
+    "SPI3_RDY IS A REAL SIGNAL OF THIS PART, WHICH IS WORTH SAYING BECAUSE IT LOOKS LIKE A CONVENTION. A board carrying a 'ready' line beside an SPI bus is usually implementing a software handshake on a spare GPIO; here Table 28 gives PG13 the alternate function SPI3_RDY under the SPI3 header, so the line is part of the peripheral rather than beside it.",
 ]
 
 # --- LPUART1: a link to a companion processor, AF8 ---------------------------------------------
+#
+# AF8 IS IN TABLE 29, NOT TABLE 28. See the note at the top of this file.
 
 [[pins]]
 pin = "PG5"
 function = "AF8"
 instance = "lpuart1"
 signal = "cts"
-source = "DS13086 Rev 10 Table 29, AF8 column (headed LPUART1/SDMMC1/UART4/5): PG5's cell is LPUART1_CTS."
+source = "DS13086 Rev 10 Table 29, AF8 column (headed LPUART1/SDMMC1/UART4/5): PG5's cell is LPUART1_CTS. This row is the one that settles the whole port G block: PG4's AF8 cell is empty and its Table 27 function list carries no LPUART at all, so a net named for LPUART1_CTS cannot be PG4 however a drawing pairs its ball."
 
 [[pins]]
 pin = "PG6"
@@ -41,9 +66,15 @@ pin = "PG8"
 function = "AF8"
 instance = "lpuart1"
 signal = "rx"
-source = "DS13086 Rev 10 Table 29, AF8 column: PG8's cell is LPUART1_RX."
+source = "DS13086 Rev 10 Table 29, AF8 column: PG8's cell is LPUART1_RX. PG8 is the first pin of this group whose nibble lives in AFRH rather than AFRL -- the other three are in AFRL -- so a driver configuring the four together writes two registers."
 
 # --- SPI3: a second link to a companion processor, AF6 -----------------------------------------
+#
+# AF6 IS IN TABLE 28. The three signals marked `(boot)` in Table 27's function list are these
+# same pins, which is a fact about the ROM bootloader rather than about the mux: AN2606 Rev 70
+# Table 217 gives the system-memory bootloader SPI3_SCK on PG9, SPI3_MISO on PG10, SPI3_NSS on
+# PG12 and SPI3_MOSI on PB5. Nothing below should be read as configuring that path -- the
+# bootloader configures its own pins, and these rows are for an application using the peripheral.
 
 [[pins]]
 pin = "PG9"
@@ -64,11 +95,11 @@ pin = "PG12"
 function = "AF6"
 instance = "spi3"
 signal = "nss"
-source = "DS13086 Rev 10 Table 28, AF6 column: PG12's cell is SPI3_NSS. Table 27 lists it as SPI3_NSS(boot)."
+source = "DS13086 Rev 10 Table 28, AF6 column: PG12's cell is SPI3_NSS. Table 27 lists it as SPI3_NSS(boot). PG11 lies between this row and the one above and is deliberately absent: its AF6 is SPI3_MOSI, which no board here reaches."
 
 [[pins]]
 pin = "PG13"
 function = "AF6"
 instance = "spi3"
 signal = "rdy"
-source = "DS13086 Rev 10 Table 28, AF6 column: PG13's cell is SPI3_RDY -- a signal of the peripheral itself, under the SPI3 header, and not a general-purpose pin pressed into a handshake."
+source = "DS13086 Rev 10 Table 28, AF6 column: PG13's cell is SPI3_RDY -- a signal of the peripheral itself, under the SPI3 header, and not a general-purpose pin pressed into a handshake. Unlike the three above it carries no (boot) marking in Table 27, because the ROM bootloader's SPI3 configuration uses four pins and this is not one of them."

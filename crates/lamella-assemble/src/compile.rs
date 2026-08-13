@@ -28,6 +28,7 @@ use lamella_syntax::ast::{
     AssignmentOperator, AttributeArgument, AttributeSection, CompilationUnit, ConstructorInitializer,
     ConstructorInitializerKind, DelegateDecl, EnumDecl, Expr, ExprKind, Literal, Member, Modifier,
     NamespaceMember, Parameter, ParameterModifier, QualifiedName, Stmt, StmtKind, TypeDecl, TypeKind,
+    TypeParameter,
     TypeRef, UsingDirective, UsingKind, VariableDeclarator, explicit_interface_member_name,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
@@ -44,6 +45,15 @@ const PUBLIC_CLASS: u32 = 0x0000_0001;
 const PUBLIC_STRUCT: u32 = 0x0000_0001 | 0x0000_0008 | 0x0000_0100;
 const TYPE_ABSTRACT: u32 = 0x0000_0080;
 const TYPE_SEALED: u32 = 0x0000_0100;
+/// `beforefieldinit` (II.23.1.15): the type initializer may run at any point AT OR BEFORE the first
+/// static field access, rather than precisely at it.
+///
+/// **ITS ABSENCE IS A DEMAND, NOT A DEFAULT.** A type without this flag requires PRECISE timing, so
+/// emitting it for nothing -- which this compiler did for every type it ever produced -- says every
+/// type in the image needs a first-access check. Measured on corlib: 100% of type-initializer
+/// trigger sites need a runtime check when the flag is omitted, against 4% under csc's on the same
+/// sources. The flag is most of a lazy initializer's cost, decided before the mechanism is written.
+const TYPE_BEFORE_FIELD_INIT: u32 = 0x0010_0000;
 
 /// The Nested* visibility bits (II.23.1.15) for a nested type, from its declared accessibility.
 /// A nested type is PRIVATE by default (10.5.1); the explicit `private` lands here too.
@@ -69,7 +79,8 @@ const METHOD_NEWSLOT: u16 = 0x0100;
 const METHOD_PINVOKE_IMPL: u16 = 0x2000;
 const METHOD_FINAL: u16 = 0x0020;
 const METHOD_ABSTRACT: u16 = 0x0400;
-const INTERFACE_FLAGS: u32 = 0x0000_0001 | 0x0000_0020 | 0x0000_0080;
+const INTERFACE_FLAGS: u32 =
+    0x0000_0001 | 0x0000_0020 | 0x0000_0080 | TYPE_BEFORE_FIELD_INIT;
 const IFACE_METHOD_FLAGS: u16 =
     METHOD_PUBLIC | METHOD_VIRTUAL | METHOD_ABSTRACT | METHOD_NEWSLOT | METHOD_HIDEBYSIG;
 const DELEGATE_TYPE_FLAGS: u32 = 0x0000_0001 | 0x0000_0100;
@@ -374,10 +385,13 @@ pub fn compile_sources_with(
     let mut any_error = false;
     for (per_unit, unit_diagnostics) in diagnostics
         .iter_mut()
-        .zip(lamella_binder::bind_compilation_units_with_references_and_options(
+        .zip(lamella_binder::bind_compilation_units_with_options(
             &units,
             references,
-            unsafe_option_missing,
+            lamella_binder::BindOptions {
+                unsafe_option_missing,
+                language_version,
+            },
         ))
     {
         let bound: Vec<Diagnostic> =
@@ -488,7 +502,7 @@ fn build_image(
         }
         image.set_content_id(&content);
     }
-    register_external_assemblies(binder.model(), &mut image);
+    register_external_type_scopes(binder.model(), &mut image);
     register_assembly_identities(references, &mut image);
     let object =
         declared_system_type(&tokens, "Object").unwrap_or_else(|| image.object_type());
@@ -738,8 +752,8 @@ fn assembly_culture_from_attribute(attribute: &lamella_syntax::ast::Attribute) -
 
 /// Parses an assembly version string: 1..=4 dot-separated `u16` parts, missing trailing parts
 /// padding with 0 (`"1.0"` -> `(1, 0, 0, 0)`). Returns `None` on more than four parts, an empty
-/// string, a non-`u16` part, or the csc wildcard form (`"1.0.*"`) -- we emit byte-deterministic
-/// assemblies, and the wildcard's auto-generated build/revision are not.
+/// string, a non-`u16` part, or the csc wildcard form (`"1.0.*"`) -- this compiler emits
+/// byte-deterministic assemblies, and the wildcard's auto-generated build/revision are not.
 fn parse_assembly_version(text: &str) -> Option<(u16, u16, u16, u16)> {
     let mut parts = [0u16; 4];
     let mut seen = 0usize;
@@ -830,6 +844,7 @@ fn emit_one_attribute(
             is_static: false,
             is_vararg: false,
             instantiation: None,
+            declaring_instantiation: None,
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
@@ -1289,6 +1304,7 @@ pub(crate) fn build_bootstrap_delta(
     let emitted = emit_body(
         &[],
         &[],
+        &[],
         &empty,
         &tokens,
         1,
@@ -1369,6 +1385,7 @@ pub(crate) fn build_submission_delta(
     let parameter_names = [Box::<str>::from("s")];
     let emitted = emit_body(
         &parameter_names,
+        &[],
         &[],
         bound,
         &tokens,
@@ -1519,6 +1536,78 @@ fn emit_namespace(
     Ok(())
 }
 
+/// Emits one declaration's `GenericParam` rows (II.22.20) WITH their constraint flag word, plus a
+/// `GenericParamConstraint` row (II.22.21) for each named constraint.
+///
+/// **ONE IMPLEMENTATION FOR EVERY DECLARATION SITE** -- a class, an interface, and a generic method.
+/// All three previously called `add_generic_param` with a hard-coded `0` flags word, which is
+/// exactly the shape where a fourth site arrives without constraints and nothing looks wrong. The
+/// constraints come from `lamella_binder::constraints_by_parameter`, the SAME function the binder
+/// checks against, so the metadata and the diagnostics cannot disagree about what the source wrote.
+///
+/// **THE FLAG BITS AND THE ROWS ARE DIFFERENT ENCODINGS AND BOTH ARE NEEDED.** `class`/`struct`/
+/// `new()` are bits `0x001C` of the flag word; a named class, interface or type parameter is a ROW.
+/// A parameter with only `where T : class` therefore produces no row at all.
+///
+/// **`struct` IMPLIES THE DEFAULT-CONSTRUCTOR BIT HERE, THOUGH NOT IN THE SOURCE.** II.10.1.7
+/// requires an emitter that sets `0x0008` to set `0x0010` with it -- every value type has a
+/// parameterless constructor. C# forbids WRITING both (CS0451), so the model keeps the source fact
+/// and the implication is applied at this boundary rather than in the checker.
+/// A `System.<name>` token: this module's own `TypeDef` when it declares the type (a corlib
+/// self-build does), else a `TypeRef`. The same two-step every other external reference takes, so a
+/// corlib build names `System.ValueType` by definition rather than referencing itself.
+fn system_type_token(image: &mut ImageBuilder, tokens: &Tokens, name: &str) -> Token {
+    let symbol = named_symbol("System", name);
+    tokens
+        .type_token(&symbol)
+        .unwrap_or_else(|| image.type_ref("System", name))
+}
+
+fn emit_generic_parameters(
+    image: &mut ImageBuilder,
+    tokens: &Tokens,
+    owner: Token,
+    names: &[Box<str>],
+    clauses: &[lamella_syntax::ast::TypeParameterConstraintClause],
+) {
+    if names.is_empty() {
+        return;
+    }
+    let constraints = lamella_binder::constraints_by_parameter(names, clauses);
+    for (number, parameter) in names.iter().enumerate() {
+        let written = constraints.get(number);
+        let mut flags = 0u16;
+        if let Some(written) = written {
+            if written.reference_type {
+                flags |= 0x0004;
+            }
+            if written.value_type {
+                flags |= 0x0008 | 0x0010;
+            }
+            if written.default_constructor {
+                flags |= 0x0010;
+            }
+        }
+        let param_token = image.add_generic_param(owner, number as u16, flags, parameter);
+        let Some(written) = written else {
+            continue;
+        };
+        if written.value_type {
+            let value_type = system_type_token(image, tokens, "ValueType");
+            image.add_generic_param_constraint(param_token, value_type);
+        }
+        for constraint in &written.types {
+            let token = tokens.type_token(constraint).or_else(|| {
+                split_type_name(constraint)
+                    .map(|(namespace, name)| image.type_ref(&namespace, &name))
+            });
+            if let Some(token) = token {
+                image.add_generic_param_constraint(param_token, token);
+            }
+        }
+    }
+}
+
 /// Emits an interface as a `TypeDef` with no base, no constructor, and abstract
 /// methods (II.22.37 semantics). Implementing classes get an `InterfaceImpl` row.
 fn emit_interface(
@@ -1531,9 +1620,13 @@ fn emit_interface(
     let nil = Token::new(TYPE_DEF, 0);
     let type_token = image.add_type(namespace, &declared_type_name(declaration), nil, INTERFACE_FLAGS);
     let enclosing = declared_type_symbol(namespace, declaration);
-    for (number, parameter) in declaration.type_parameters.iter().enumerate() {
-        image.add_generic_param(type_token, number as u16, 0, &parameter.name);
-    }
+    emit_generic_parameters(
+        image,
+        tokens,
+        type_token,
+        &declaration.type_parameters.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        &declaration.constraints,
+    );
     let own = declared_type_symbol(namespace, declaration);
     let direct: Vec<TypeSymbol> = binder
         .model()
@@ -1563,10 +1656,16 @@ fn emit_interface(
         if let Member::Method {
             return_type,
             name,
+            type_parameters,
             parameters,
             ..
         } = member
         {
+            if !type_parameters.is_empty() {
+                return Err(crate::EmitError::Unsupported(
+                    "a generic method declared on an interface",
+                ));
+            }
             let parameter_sigs: Vec<TypeSig> = parameters
                 .iter()
                 .map(|parameter| member_type_sig(tokens, &enclosing, &parameter_symbol(parameter)))
@@ -1702,9 +1801,9 @@ fn emit_delegate(
     namespace: &str,
     declaration: &DelegateDecl,
 ) -> Result<(), crate::EmitError> {
-    mint_signature_type(binder, &bind_type(&declaration.return_type), image, tokens);
+    mint_signature_type(binder, &bind_type(&declaration.return_type), &[], image, tokens);
     for parameter in &declaration.parameters {
-        mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+        mint_signature_type(binder, &bind_type(&parameter.ty), &[], image, tokens);
     }
     let base = system_base(image, tokens, "MulticastDelegate");
     image.add_type(namespace, &declaration.name, base, DELEGATE_TYPE_FLAGS);
@@ -1899,6 +1998,24 @@ fn base_class_ctor(image: &mut ImageBuilder, tokens: &Tokens, base_class: &TypeS
     object_base_ctor(image, tokens)
 }
 
+/// Emits one type, with its own type parameters IN SCOPE for the whole emission.
+///
+/// **THE EMITTER RE-BINDS EVERY METHOD BODY, AND IT WAS DOING SO IN A DIFFERENT SCOPE FROM THE
+/// DIAGNOSTIC PASS.** `lamella_binder::program::bind_type_bodies` wraps body binding in
+/// `enter_type_parameters`, so `T` resolves there and no diagnostic is produced; this stage binds
+/// the same bodies again through `Binder::bind_method` and had never entered that scope, so `T`
+/// resolved to the ERROR type here and only here.
+///
+/// **THE TWO HALVES FAILED IN DIFFERENT PHASES, WHICH IS WHY IT LOOKED LIKE AN EMIT BUG.** A local
+/// `T x;` inside `class Box<T>` bound clean and then failed with *"the error type has no
+/// signature"* -- and an emit-time diagnostic reaches no one, so nothing said `T` had gone
+/// unresolved. Measured: a program with BOTH `Nope y;` and `T x;` reports CS0246 for `Nope` alone,
+/// which is what proves `T` resolves in the binder and not here.
+///
+/// **THE WRAPPER EXISTS SO THE SCOPE ALWAYS CLOSES.** The body has `?` early returns, and
+/// `unshadow` with nothing displaced REMOVES the name -- so a leaked scope would delete a real type
+/// called `T` for the rest of the compilation. Same shape, and same reason, as the binder's own
+/// `bind_type_bodies` / `bind_type_bodies_inner` split.
 #[allow(clippy::too_many_arguments)]
 fn emit_type(
     image: &mut ImageBuilder,
@@ -1910,10 +2027,48 @@ fn emit_type(
     declaration: &TypeDecl,
     debug: Option<&DebugContext>,
 ) -> Result<(), crate::EmitError> {
+    let entered =
+        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let emitted = emit_type_inner(
+        image,
+        binder,
+        object,
+        tokens,
+        entry_point,
+        namespace,
+        declaration,
+        debug,
+    );
+    binder.exit_type_parameters(entered);
+    emitted
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_type_inner(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    object: Token,
+    tokens: &mut Tokens,
+    entry_point: &mut Option<Token>,
+    namespace: &str,
+    declaration: &TypeDecl,
+    debug: Option<&DebugContext>,
+) -> Result<(), crate::EmitError> {
     let is_struct = declaration.kind == TypeKind::Struct;
     let enclosing = declared_type_symbol(namespace, declaration);
+    let own_parameters: Vec<Box<str>> = declaration
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect();
+    for index in 0..own_parameters.len() as u32 {
+        if tokens.var_spec(index).is_none() {
+            let spec = image.type_spec(&type_signature(&TypeSig::Var(index)));
+            tokens.insert_var_spec(index, spec);
+        }
+    }
     if matches!(declaration.kind, TypeKind::Interface) {
-        mint_member_signature_types(binder, &declaration.members, image, tokens);
+        mint_member_signature_types(binder, &declaration.members, &own_parameters, image, tokens);
         return emit_interface(image, binder, tokens, namespace, declaration);
     }
     let (base_class, nested_in): (Option<TypeSymbol>, Option<Box<str>>) = {
@@ -1957,17 +2112,30 @@ fn emit_type(
     if declaration.modifiers.contains(&Modifier::Static) {
         flags |= TYPE_ABSTRACT | TYPE_SEALED;
     }
-    let type_token = image.add_type(metadata_namespace, &declared_type_name(declaration), base, flags);
-    for (number, parameter) in declaration.type_parameters.iter().enumerate() {
-        image.add_generic_param(type_token, number as u16, 0, &parameter.name);
+    let declares_static_constructor = declaration.members.iter().any(|member| {
+        matches!(
+            member,
+            Member::Constructor { modifiers, .. } if modifiers.contains(&Modifier::Static)
+        )
+    });
+    if !declares_static_constructor {
+        flags |= TYPE_BEFORE_FIELD_INIT;
     }
+    let type_token = image.add_type(metadata_namespace, &declared_type_name(declaration), base, flags);
+    emit_generic_parameters(
+        image,
+        tokens,
+        type_token,
+        &declaration.type_parameters.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        &declaration.constraints,
+    );
     if let Some(enclosing_full) = &nested_in {
         if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
             image.add_nested_class(type_token, enclosing_token);
         }
     }
     emit_attributes(image, binder, tokens, &enclosing, type_token, &declaration.attributes);
-    mint_member_signature_types(binder, &declaration.members, image, tokens);
+    mint_member_signature_types(binder, &declaration.members, &own_parameters, image, tokens);
     let direct_interfaces: Vec<TypeSymbol> = binder
         .model()
         .get_by_symbol(&enclosing)
@@ -1983,12 +2151,14 @@ fn emit_type(
         collect_interface_closure(binder.model(), interface, &mut interfaces);
     }
     let mut interface_tokens: Vec<Token> = Vec::new();
+    let saved_scope = tokens.enter_body_scope(&[], &own_parameters);
     for interface in &interfaces {
         mint_named_type_token(interface, image, tokens);
-        if let Some(token) = tokens.type_token(interface) {
+        if let Some(token) = tokens.instruction_type_token(interface) {
             interface_tokens.push(token);
         }
     }
+    tokens.restore_body_scope(saved_scope);
     for interface in interface_tokens {
         image.add_interface_impl(type_token, interface);
     }
@@ -2071,6 +2241,8 @@ fn emit_type(
             binder,
             tokens,
             &enclosing,
+            &[],
+            &[],
             ".cctor",
             &TypeSymbol::Special(SpecialType::Void),
             &[],
@@ -2089,6 +2261,8 @@ fn emit_type(
                 modifiers,
                 return_type,
                 name,
+                type_parameters,
+                constraints,
                 parameters,
                 is_vararg,
                 body: Some(body),
@@ -2104,6 +2278,8 @@ fn emit_type(
                     modifiers,
                     name,
                     return_type,
+                    type_parameters,
+                    constraints,
                     parameters,
                     *is_vararg,
                     body,
@@ -2123,6 +2299,7 @@ fn emit_type(
                 modifiers,
                 return_type,
                 name,
+                type_parameters,
                 parameters,
                 body: None,
                 attributes,
@@ -2136,6 +2313,7 @@ fn emit_type(
                 modifiers,
                 return_type,
                 name,
+                type_parameters,
                 parameters,
                 body: None,
                 attributes,
@@ -2164,6 +2342,8 @@ fn emit_type(
                     modifiers,
                     operator.method_name(parameters.len()),
                     return_type,
+                    &[],
+                    &[],
                     parameters,
                     false,
                     body,
@@ -2189,6 +2369,8 @@ fn emit_type(
                     modifiers,
                     direction.method_name(),
                     target,
+                    &[],
+                    &[],
                     parameters,
                     false,
                     body,
@@ -2422,6 +2604,8 @@ fn emit_event(
         binder,
         tokens,
         enclosing,
+        &[],
+        &[],
         &accessor_name("add_", name),
         &void,
         &params,
@@ -2438,6 +2622,8 @@ fn emit_event(
         binder,
         tokens,
         enclosing,
+        &[],
+        &[],
         &accessor_name("remove_", name),
         &void,
         &params,
@@ -2509,12 +2695,13 @@ fn emit_custom_event(
         let accessor = accessor_name(prefix, name);
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let token = emit_method_body(
-            image, binder, tokens, enclosing, &method_name, &void, &params, &[], body, is_static,
+            image, binder, tokens, enclosing, &[], &[], &method_name, &void, &params, &[], body, is_static,
             false, flags, None, debug,
         )?;
         if let Some(interface) = explicit_interface {
             emit_explicit_interface_impl(
                 image,
+                binder,
                 tokens,
                 enclosing,
                 interface,
@@ -2595,6 +2782,23 @@ fn emit_abstract_method(
     Ok(image.add_abstract_method(name, &signature, flags))
 }
 
+/// Emits one method, with its OWN type parameters in scope for the whole emission.
+///
+/// **THE SAME DEFECT AS [`emit_type`]'s, ONE NUMBERING SPACE OVER, AND THAT FUNCTION'S DOC COMMENT
+/// DESCRIBES IT.** The emitter re-binds every body through `Binder::bind_method`; `emit_type` opens
+/// the DECLARING TYPE's parameter scope around that, so a `T x;` inside `class Box<T>` resolves.
+/// A method's own `T` had no such scope, so `Box<T> x;` inside `static int M<T>()` resolved to the
+/// ERROR type HERE and nowhere else -- the diagnostic pass binds the same body inside
+/// `enter_type_parameters` and reports nothing, and an emit-time diagnostic reaches no one, so the
+/// only evidence was *"the error type has no signature"* three steps downstream.
+///
+/// **MEASURED AS A POSITION TABLE, WHICH IS WHAT SHOWED IT WAS ONE CELL OF FOUR.** A `Box<T>`
+/// PARAMETER of a generic method compiled, a `Box<T>` LOCAL inside a generic TYPE compiled, a
+/// `Box<int>` local inside a generic method compiled -- only the method's own parameter in a LOCAL
+/// failed. Any single example would have declared the area broken or fine.
+///
+/// A WRAPPER, so the scope is closed on every exit rather than the last: the body below returns
+/// through several `?`s, and a leaked scope would resolve the NEXT method's `T` against this one's.
 #[allow(clippy::too_many_arguments)]
 fn emit_one_method(
     image: &mut ImageBuilder,
@@ -2604,12 +2808,57 @@ fn emit_one_method(
     modifiers: &[Modifier],
     name: &str,
     return_type: &TypeRef,
+    type_parameters: &[TypeParameter],
+    constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     parameters: &[Parameter],
     is_vararg: bool,
     body: &Stmt,
     explicit_interface: Option<&TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
+    let entered = binder.enter_type_parameters(type_parameters, constraints);
+    let emitted = emit_one_method_in_scope(
+        image,
+        binder,
+        enclosing,
+        tokens,
+        modifiers,
+        name,
+        return_type,
+        type_parameters,
+        constraints,
+        parameters,
+        is_vararg,
+        body,
+        explicit_interface,
+        debug,
+    );
+    binder.exit_type_parameters(entered);
+    emitted
+}
+
+/// [`emit_one_method`] with the method's own type parameters already in scope. Never called
+/// directly -- the wrapper is what guarantees they are withdrawn again.
+#[allow(clippy::too_many_arguments)]
+fn emit_one_method_in_scope(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    tokens: &mut Tokens,
+    modifiers: &[Modifier],
+    name: &str,
+    return_type: &TypeRef,
+    type_parameters: &[TypeParameter],
+    constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
+    parameters: &[Parameter],
+    is_vararg: bool,
+    body: &Stmt,
+    explicit_interface: Option<&TypeRef>,
+    debug: Option<&DebugContext>,
+) -> Result<Token, crate::EmitError> {
+    let method_type_parameters: Vec<Box<str>> =
+        type_parameters.iter().map(|p| p.name.clone()).collect();
+    let method_constraints = constraints;
     let return_symbol = bind_type(return_type);
     let params: Vec<(Box<str>, TypeSymbol)> = parameters
         .iter()
@@ -2625,6 +2874,8 @@ fn emit_one_method(
             binder,
             tokens,
             enclosing,
+            &[],
+            &[],
             &method_name,
             &return_symbol,
             &params,
@@ -2639,6 +2890,7 @@ fn emit_one_method(
         let signature_params: Vec<TypeSymbol> = parameters.iter().map(parameter_symbol).collect();
         emit_explicit_interface_impl(
             image,
+            binder,
             tokens,
             enclosing,
             interface,
@@ -2675,6 +2927,8 @@ fn emit_one_method(
         binder,
         tokens,
         enclosing,
+        &method_type_parameters,
+        method_constraints,
         name,
         &return_symbol,
         &params,
@@ -2692,9 +2946,18 @@ fn emit_one_method(
 /// links `body` (the class's own private `MethodDef`) to the interface method it
 /// overrides. The interface method is a this-module `MethodDef` when the interface is
 /// declared here, otherwise a minted `MemberRef` to the BCL interface method.
+///
+/// **THE QUALIFIER IS RESOLVED BEFORE IT BECOMES A `TypeRef`, WHICH IS THE WHOLE OF ITS
+/// CORRECTNESS.** A written name is not a type: `IEnumerator IEnumerable.GetEnumerator()` names
+/// `System.Collections.IEnumerable` through a `using`, and taking the spelling as written mints a
+/// `TypeRef` with an EMPTY namespace scoped to mscorlib. That image is well-formed, links, and
+/// throws `TypeLoadException: Could not load type 'IEnumerable'` on the first use of the type --
+/// while the same program written fully qualified runs. `mint_signature_type` states the same rule
+/// for signatures and resolves through the binder; this is that rule's other home.
 #[allow(clippy::too_many_arguments)]
 fn emit_explicit_interface_impl(
     image: &mut ImageBuilder,
+    binder: &Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     interface: &TypeRef,
@@ -2708,7 +2971,7 @@ fn emit_explicit_interface_impl(
         .ok_or(crate::EmitError::Unsupported(
             "an explicit interface impl on a type with no metadata token",
         ))?;
-    let interface_symbol = bind_type(interface);
+    let interface_symbol = binder.resolve_type(&bind_type(interface));
     let declaration = match tokens.method(&interface_symbol, member, parameter_types) {
         Some(token) => token,
         None => {
@@ -2924,6 +3187,8 @@ fn emit_constructor(
         binder,
         tokens,
         enclosing,
+        &[],
+        &[],
         ".ctor",
         &TypeSymbol::Special(SpecialType::Void),
         &params,
@@ -2959,6 +3224,8 @@ fn emit_destructor(
         image,
         tokens,
         enclosing,
+        &[],
+        &[],
         "Finalize",
         &void,
         &[],
@@ -3009,6 +3276,7 @@ fn base_finalizer_reference(
         is_static: false,
         is_vararg: false,
         instantiation: None,
+        declaring_instantiation: None,
     }
 }
 
@@ -3059,6 +3327,8 @@ fn emit_method_body(
     binder: &mut Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
+    method_type_parameters: &[Box<str>],
+    method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol)],
@@ -3086,6 +3356,8 @@ fn emit_method_body(
         image,
         tokens,
         enclosing,
+        method_type_parameters,
+        method_constraints,
         name,
         return_symbol,
         params,
@@ -3102,11 +3374,69 @@ fn emit_method_body(
 /// Lowers an already-bound method body to CIL and adds the `MethodDef`, returning its
 /// token. Split from [`emit_method_body`] so a destructor can wrap its bound body in the
 /// `try`/`finally` that chains to the base finalizer (17.12) before lowering.
+///
+/// **THIS IS A WRAPPER SO THE BODY'S GENERIC SCOPE IS RESTORED ON EVERY EXIT, NOT ON THE LAST
+/// ONE.** [`emit_bound_body_in_scope`] leaves through a dozen `?`s; a restore written at its
+/// bottom would run on one path of twelve, and every path after a refused method would then lower
+/// its own `T` against this method's parameter list. Same repair as the constraint check that was
+/// written at the bottom of a resolver with six exits -- rename the body, make the public name the
+/// wrapper, and "every exit" becomes true by construction rather than by inspection.
 #[allow(clippy::too_many_arguments)]
 fn emit_bound_body(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
+    method_type_parameters: &[Box<str>],
+    method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
+    name: &str,
+    return_symbol: &TypeSymbol,
+    params: &[(Box<str>, TypeSymbol)],
+    byref_flags: &[bool],
+    bound: &BoundStmt,
+    is_static: bool,
+    is_vararg: bool,
+    flags: u16,
+    prologue: Option<&ConstructorPrologue>,
+    debug: Option<&DebugContext>,
+) -> Result<Token, crate::EmitError> {
+    for index in 0..method_type_parameters.len() as u32 {
+        if tokens.mvar_spec(index).is_none() {
+            let spec = image.type_spec(&type_signature(&TypeSig::MVar(index)));
+            tokens.insert_mvar_spec(index, spec);
+        }
+    }
+    let declaring_parameters = tokens.type_parameters(enclosing).to_vec();
+    let saved = tokens.enter_body_scope(method_type_parameters, &declaring_parameters);
+    let emitted = emit_bound_body_in_scope(
+        image,
+        tokens,
+        &declaring_parameters,
+        method_type_parameters,
+        method_constraints,
+        name,
+        return_symbol,
+        params,
+        byref_flags,
+        bound,
+        is_static,
+        is_vararg,
+        flags,
+        prologue,
+        debug,
+    );
+    tokens.restore_body_scope(saved);
+    emitted
+}
+
+/// [`emit_bound_body`] with the body's generic scope already open on `tokens`. Never called
+/// directly -- the wrapper is what guarantees the scope is closed again.
+#[allow(clippy::too_many_arguments)]
+fn emit_bound_body_in_scope(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    declaring_parameters: &[Box<str>],
+    method_type_parameters: &[Box<str>],
+    method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol)],
@@ -3125,6 +3455,10 @@ fn emit_bound_body(
         }
     }
 
+    let scope = GenericScope {
+        method: method_type_parameters,
+        declaring: declaring_parameters,
+    };
     let arg_base = u16::from(!is_static);
     let parameter_names: Vec<Box<str>> = params.iter().map(|(name, _)| name.clone()).collect();
     let byref_params: Vec<(Box<str>, TypeSymbol)> = params
@@ -3144,6 +3478,7 @@ fn emit_bound_body(
     } = emit_body(
         &parameter_names,
         &byref_params,
+        scope.declaring,
         bound,
         tokens,
         arg_base,
@@ -3159,7 +3494,7 @@ fn emit_bound_body(
             .iter()
             .enumerate()
             .map(|(slot, ty)| {
-                let sig = member_type_sig(tokens, enclosing, ty)?;
+                let sig = open_type_sig(tokens, ty, scope)?;
                 Ok(if pinned_slots.contains(&(slot as u16)) {
                     TypeSig::Pinned(Box::new(sig))
                 } else {
@@ -3202,7 +3537,7 @@ fn emit_bound_body(
         .iter()
         .enumerate()
         .map(|(index, (_, ty))| {
-            let sig = member_type_sig(tokens, enclosing, ty)?;
+            let sig = open_type_sig(tokens, ty, scope)?;
             Ok(if byref_flags.get(index).copied().unwrap_or(false) {
                 TypeSig::ByRef(Box::new(sig))
             } else {
@@ -3210,13 +3545,17 @@ fn emit_bound_body(
             })
         })
         .collect::<Result<_, _>>()?;
+    let return_sig = open_type_sig(tokens, return_symbol, scope)?;
     let signature = if is_vararg {
-        vararg_method_signature(!is_static, &parameter_sigs, &member_type_sig(tokens, enclosing, return_symbol)?)
+        vararg_method_signature(!is_static, &parameter_sigs, &return_sig)
+    } else if method_type_parameters.is_empty() {
+        method_signature(!is_static, &parameter_sigs, &return_sig)
     } else {
-        method_signature(
+        generic_method_signature(
             !is_static,
+            method_type_parameters.len() as u32,
             &parameter_sigs,
-            &member_type_sig(tokens, enclosing, return_symbol)?,
+            &return_sig,
         )
     };
     let method = image.add_method(
@@ -3227,6 +3566,7 @@ fn emit_bound_body(
         IL_MANAGED,
         &parameter_names,
     );
+    emit_generic_parameters(image, tokens, method, method_type_parameters, method_constraints);
     if let Some(debug) = method_debug {
         image.set_method_debug(method, debug);
     }
@@ -3337,12 +3677,13 @@ fn emit_property(
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let token = if let Some(body) = &getter.body {
             let token = emit_method_body(
-                image, binder, tokens, enclosing, &method_name, &property_ty, &[], &[], body,
+                image, binder, tokens, enclosing, &[], &[], &method_name, &property_ty, &[], &[], body,
                 is_static, false, flags, None, debug,
             )?;
             if let Some(interface) = explicit_interface {
                 emit_explicit_interface_impl(
-                    image, tokens, enclosing, interface, &accessor, &[], &property_ty, token,
+                    image, binder, tokens, enclosing, interface, &accessor, &[], &property_ty,
+                    token,
                 )?;
             }
             Some(token)
@@ -3372,12 +3713,13 @@ fn emit_property(
         let params = [(Box::from("value"), property_ty.clone())];
         let token = if let Some(body) = &setter.body {
             let token = emit_method_body(
-                image, binder, tokens, enclosing, &method_name, &void, &params, &[], body,
+                image, binder, tokens, enclosing, &[], &[], &method_name, &void, &params, &[], body,
                 is_static, false, flags, None, debug,
             )?;
             if let Some(interface) = explicit_interface {
                 emit_explicit_interface_impl(
                     image,
+                    binder,
                     tokens,
                     enclosing,
                     interface,
@@ -3488,7 +3830,7 @@ fn emit_indexer(
         );
         let token = if let Some(body) = &getter.body {
             Some(emit_method_body(
-                image, binder, tokens, enclosing, &getter_name, &element_ty, &index_params, &[],
+                image, binder, tokens, enclosing, &[], &[], &getter_name, &element_ty, &index_params, &[],
                 body, false, false, flags, None, debug,
             )?)
         } else if is_abstract {
@@ -3513,7 +3855,7 @@ fn emit_indexer(
         );
         let token = if let Some(body) = &setter.body {
             Some(emit_method_body(
-                image, binder, tokens, enclosing, &setter_name, &void, &params, &[],
+                image, binder, tokens, enclosing, &[], &[], &setter_name, &void, &params, &[],
                 body, false, false, flags, None, debug,
             )?)
         } else if is_abstract {
@@ -3590,6 +3932,7 @@ fn emit_default_member_attribute(
             is_static: false,
             is_vararg: false,
             instantiation: None,
+            declaring_instantiation: None,
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
@@ -3605,13 +3948,24 @@ fn emit_default_member_attribute(
 /// The message csc puts in a required-members constructor guard, byte for byte. Measured from a
 /// csc-built assembly, not transcribed from documentation: a guard whose text drifts is still a
 /// guard, but it stops being the SAME guard, and the point of matching csc is that a consumer
-/// cannot tell our output from its.
+/// cannot tell this compiler's output from its.
 const REQUIRED_MEMBERS_OBSOLETE_MESSAGE: &str =
     "Constructors of types with required members are not supported in this version of your compiler.";
 
 /// Mints the `MemberRef` for an attribute constructor the PROGRAM never names -- the compiler
 /// synthesizes these -- and returns its token. `None` when the type or constructor cannot be
 /// resolved, which is the same lenient posture [`emit_attributes`] takes.
+///
+/// **OWED, AND LENIENCY IS THE WRONG POSTURE HERE, unlike for a user-written attribute.** A
+/// user-written attribute that does not resolve was already reported by the binder; these are
+/// synthesized, so nothing reports them. Against a reference set with no
+/// `RequiredMemberAttribute` this silently emits an assembly whose required members are NOT
+/// MARKED -- a consumer then reads them as ordinary and constructs the type with them unset,
+/// which is the exact failure the feature exists to prevent, arrived at silently. csc's answer is
+/// **CS0656 "missing compiler required member"**, and matching it belongs in the BINDER (which has
+/// a diagnostic sink; emission does not): when a type declares a required member, require the
+/// attribute to resolve. Not built here rather than built badly, and written down rather than
+/// left to be discovered.
 fn synthesized_attribute_ctor(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
@@ -3629,6 +3983,7 @@ fn synthesized_attribute_ctor(
             is_static: false,
             is_vararg: false,
             instantiation: None,
+            declaring_instantiation: None,
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
@@ -3657,6 +4012,13 @@ fn emit_required_member_marker(image: &mut ImageBuilder, tokens: &mut Tokens, ta
 /// The pair csc puts on every constructor of a type with required members that is not itself
 /// `[SetsRequiredMembers]`: `[Obsolete(<message>, error: true)]` and
 /// `[CompilerFeatureRequired("RequiredMembers")]`.
+///
+/// **TWO ATTRIBUTES BECAUSE THEY GUARD AGAINST TWO DIFFERENT CONSUMERS, and emitting only one
+/// leaves a real hole.** A compiler that knows the feature keys off `CompilerFeatureRequired` and
+/// suppresses the obsolete diagnostic; a compiler too old to know EITHER attribute still refuses
+/// the constructor, because `Obsolete` with `error: true` has been a hard error since .NET 1.0.
+/// Drop the `Obsolete` half and a down-level consumer silently constructs an object with unset
+/// required members -- which is the entire failure the feature exists to prevent.
 fn emit_required_members_constructor_guard(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
@@ -4178,6 +4540,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
         BoundExprKind::PropertyAccess {
             receiver,
             declaring_type,
+            getter_instantiation,
             name,
             ..
         } => {
@@ -4190,6 +4553,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
                 is_vararg: false,
                 instantiation: None,
+                declaring_instantiation: getter_instantiation.clone(),
             };
             if tokens
                 .method(&getter.declaring_type, &getter.name, &getter.parameters)
@@ -4226,6 +4590,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     is_static: false,
                     is_vararg: false,
                     instantiation: None,
+                    declaring_instantiation: None,
                 };
                 if tokens
                     .method(&getter.declaring_type, &getter.name, &getter.parameters)
@@ -4262,6 +4627,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             if let BoundExprKind::PropertyAccess {
                 receiver,
                 setter_declaring_type,
+                setter_instantiation,
                 name,
                 ..
             } = &target.kind
@@ -4274,6 +4640,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
                     is_vararg: false,
                     instantiation: None,
+                    declaring_instantiation: setter_instantiation.clone(),
                 };
                 if tokens
                     .method(&setter.declaring_type, &setter.name, &setter.parameters)
@@ -4363,6 +4730,7 @@ fn get_type_from_handle_reference() -> lamella_binder::MethodReference {
         is_static: true,
         is_vararg: false,
         instantiation: None,
+        declaring_instantiation: None,
     }
 }
 
@@ -4377,6 +4745,7 @@ pub(crate) fn offset_to_string_data_reference() -> lamella_binder::MethodReferen
         is_static: true,
         is_vararg: false,
         instantiation: None,
+        declaring_instantiation: None,
     }
 }
 
@@ -4398,6 +4767,7 @@ fn string_concat_reference(both_strings: bool) -> lamella_binder::MethodReferenc
         is_static: true,
         is_vararg: false,
         instantiation: None,
+        declaring_instantiation: None,
     }
 }
 
@@ -4413,6 +4783,7 @@ fn string_equality_reference() -> lamella_binder::MethodReference {
         is_static: true,
         is_vararg: false,
         instantiation: None,
+        declaring_instantiation: None,
     }
 }
 
@@ -4421,6 +4792,10 @@ fn mint_member_ref(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
 ) {
+    if let Some(declaring) = method.declaring_instantiation.as_deref() {
+        mint_instantiated_member_ref(method, declaring, image, tokens);
+        return;
+    }
     let Some((namespace, name)) = split_type_name(&method.declaring_type) else {
         return;
     };
@@ -4455,6 +4830,80 @@ fn mint_member_ref(
         &method.declaring_type,
         &crate::tokens::conversion_key_name(&method.name, &method.return_type),
         &key_params,
+        member,
+    );
+}
+
+/// Mints the `MemberRef` naming a member of an INSTANTIATED generic type -- the `.ctor` of
+/// `new Box<int>(41)`, the `Get()` of `b.Get()` -- as ECMA-335 4th ed II.23.2.1 requires:
+///
+/// - the PARENT is a `TypeSpec` (II.23.2.14) whose blob is the `GENERICINST` of the definition
+///   over this site's type arguments, so the `<int>` is part of the row rather than lost;
+/// - the SIGNATURE is the DEFINITION's, spelling `!n` wherever the declaring type's parameters
+///   appear -- `instance void .ctor(!0)`, not the substituted `instance void .ctor(int32)`.
+///
+/// **NEITHER HALF IS RECOVERABLE FROM THE BOUND CALL ALONE, AND BOTH FAIL SILENTLY.** The
+/// substituted signature reads as an ordinary non-generic one, so a `MemberRef` built from it
+/// decodes cleanly and describes a method that does not exist; a `TypeRef` parent naming
+/// `` Box`1 `` decodes cleanly too and names the open definition. `TypeInstantiation` exists to
+/// carry the missing half, exactly as `MethodInstantiation` does one axis over.
+///
+/// **THE PARENT'S ARGUMENTS ARE CLOSED TYPES AND ARE ENCODED IN AN EMPTY SCOPE, DELIBERATELY.**
+/// `Box<int>`'s `<int>` is a type; a `Box<T>` written INSIDE a generic type would need the
+/// enclosing type's parameters, which is a different list from the declaring type's and is not in
+/// reach here. Encoding it in the declaring scope would silently number it against the wrong list,
+/// so that case refuses instead.
+///
+/// Recorded under the SUBSTITUTED parameter key, because that is what the call site holds and what
+/// `emit_call`/`emit_object_creation` look up -- a row minted under any other key is a row nothing
+/// finds, which refuses the call rather than emitting it.
+fn mint_instantiated_member_ref(
+    method: &lamella_binder::MethodReference,
+    declaring: &lamella_binder::TypeInstantiation,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = &method.declaring_type
+    else {
+        return;
+    };
+    let Some(parent) = mint_type_spec(&method.declaring_type, definition, arguments, image, tokens)
+    else {
+        return;
+    };
+    for ty in declaring
+        .parameters
+        .iter()
+        .chain(core::iter::once(&declaring.return_type))
+    {
+        if !mentions_type_parameter(ty, &declaring.type_parameters) {
+            mint_named_type_token(ty, image, tokens);
+        }
+    }
+    let scope = GenericScope {
+        method: &[],
+        declaring: &declaring.type_parameters,
+    };
+    let parameter_sigs: Result<Vec<TypeSig>, _> = declaring
+        .parameters
+        .iter()
+        .map(|ty| open_type_sig(tokens, ty, scope))
+        .collect();
+    let (Ok(parameter_sigs), Ok(return_sig)) = (
+        parameter_sigs,
+        open_type_sig(tokens, &declaring.return_type, scope),
+    ) else {
+        return;
+    };
+    let signature = method_signature(!method.is_static, &parameter_sigs, &return_sig);
+    let member = image.member_ref(parent, &method.name, &signature);
+    tokens.insert_method(
+        &method.declaring_type,
+        &crate::tokens::conversion_key_name(&method.name, &method.return_type),
+        &method.parameters,
         member,
     );
 }
@@ -4520,6 +4969,16 @@ fn mint_vararg_site_ref(
 ///
 /// 1. the `MemberRef` naming the generic DEFINITION, whose signature is still open (`!!0`), and
 /// 2. the `MethodSpec` (II.22.29) that closes it over the type arguments THIS site named.
+///
+/// **BOTH ROWS ARE REQUIRED AND NEITHER IS SUFFICIENT.** The definition alone is what a call
+/// emitted against the open method names -- it binds, and `!!0` is never substituted. The
+/// instantiation alone has nothing to instantiate. `emit_call` looks up only the site key, so a
+/// site this function declines to mint is REFUSED rather than quietly emitted against the
+/// definition (see the lookup there).
+///
+/// One row per distinct (definition, type arguments) shape: two sites naming `Id<int>` share a
+/// row, and `Id<int>` and `Id<string>` never do. II.24.2.6 does not require `MethodSpec` to be
+/// sorted or deduplicated, so this is a size choice rather than a correctness rule.
 fn mint_generic_call_site(
     method: &lamella_binder::MethodReference,
     instantiation: &lamella_binder::MethodInstantiation,
@@ -4540,10 +4999,11 @@ fn mint_generic_call_site(
     for argument in &instantiation.arguments {
         mint_named_type_token(argument, image, tokens);
     }
+    let scope = body_scope(tokens);
     let arguments: Result<Vec<TypeSig>, _> = instantiation
         .arguments
         .iter()
-        .map(|ty| type_sig(tokens, ty))
+        .map(|ty| open_type_sig(tokens, ty, scope))
         .collect();
     let Ok(arguments) = arguments else {
         return;
@@ -4556,6 +5016,18 @@ fn mint_generic_call_site(
 /// GENERIC calling convention, its `GenParamCount`, and `!!n` wherever the open signature mentions
 /// one of the method's own type parameters. Recorded under the definition's OPEN parameter key, so
 /// several sites over one method mint it once.
+///
+/// **A METHOD DECLARED IN THIS MODULE IS REFUSED HERE, ON PURPOSE.** The token pre-pass writes
+/// every `MethodDef` with an ordinary DEFAULT signature and emits no `GenericParam` rows, because
+/// `Feature::Generics` refuses a generic DECLARATION and there has never been one to write. Taking
+/// that token would put a `MethodSpec` over a method whose own signature says it is not generic --
+/// metadata that contradicts itself, and `generic_method_signature`'s doc records what that
+/// produces (csc answers CS0308 at a call site that otherwise compiles). Refusing costs a refused
+/// call, which is what the declaration gate already answers with anyway.
+///
+/// **Its precondition is that no `MethodDef` this module writes carries a GENERIC signature.** A
+/// build that writes them -- with their `GenericParam` rows -- makes this guard wrong, and removing
+/// it belongs to that change.
 fn mint_generic_definition_ref(
     method: &lamella_binder::MethodReference,
     instantiation: &lamella_binder::MethodInstantiation,
@@ -4565,7 +5037,11 @@ fn mint_generic_definition_ref(
     if let Some(token) = tokens.type_token(&method.declaring_type)
         && token.table() == TYPE_DEF
     {
-        return None;
+        return tokens.method(
+            &method.declaring_type,
+            &method.name,
+            &instantiation.parameters,
+        );
     }
     if method.is_vararg {
         return None;
@@ -4576,6 +5052,15 @@ fn mint_generic_definition_ref(
         &instantiation.parameters,
     ) {
         return Some(token);
+    }
+    if let Some(declaring) = method.declaring_instantiation.as_deref() {
+        return mint_instantiated_generic_definition_ref(
+            method,
+            instantiation,
+            declaring,
+            image,
+            tokens,
+        );
     }
     let (namespace, name) = split_type_name(&method.declaring_type)?;
     mint_named_type_token(&method.declaring_type, image, tokens);
@@ -4616,6 +5101,86 @@ fn mint_generic_definition_ref(
     Some(member)
 }
 
+/// The `MemberRef` naming a generic METHOD declared on an INSTANTIATED generic type -- the
+/// `Second<TM>` of a `Holder<int>` -- whose parent is the declaring instantiation's `TypeSpec` and
+/// whose signature is the DEFINITION's, open over BOTH numbering spaces at once.
+///
+/// **THIS IS THE ONE SIGNATURE IN THE EMITTER WHERE `!n` AND `!!n` ARE BOTH LIVE**, and the two
+/// sibling paths each carry exactly one of them: [`mint_instantiated_member_ref`] writes `!n` with
+/// an empty method list, and the external arm of [`mint_generic_definition_ref`] writes `!!n`
+/// through [`method_scope`], whose declaring half is empty *because* it was written when the only
+/// generic call this stage emitted was on a non-generic type. Neither could name
+/// `Box<TOuter> M<TMethod>(Box<TMethod>)`, and the failure is silent in the direction that matters:
+/// a scope missing one list does not refuse, it numbers that space's names against the other list
+/// or falls through to a class lookup -- a signature that decodes cleanly and names a different
+/// type (`GenericScope`'s own doc gives csc's bytes for exactly this shape).
+///
+/// **THE OPEN SIGNATURE COMES FROM THE DECLARING INSTANTIATION, NOT FROM THE METHOD ONE.**
+/// `MethodInstantiation::parameters` is open over the METHOD's parameters and already CLOSED over
+/// the type's -- it is what the call site resolved against -- so writing it here would put `int`
+/// where II.23.2.1 requires `!0`, on a `MemberRef` whose parent already carries that `int`. The
+/// arguments would then be applied twice by any reader that substitutes.
+fn mint_instantiated_generic_definition_ref(
+    method: &lamella_binder::MethodReference,
+    instantiation: &lamella_binder::MethodInstantiation,
+    declaring: &lamella_binder::TypeInstantiation,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) -> Option<Token> {
+    let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = &method.declaring_type
+    else {
+        return None;
+    };
+    let parent = mint_type_spec(&method.declaring_type, definition, arguments, image, tokens)?;
+    let scope = GenericScope {
+        method: &instantiation.type_parameters,
+        declaring: &declaring.type_parameters,
+    };
+    let open_names: Vec<Box<str>> = declaring
+        .type_parameters
+        .iter()
+        .chain(instantiation.type_parameters.iter())
+        .cloned()
+        .collect();
+    for ty in declaring
+        .parameters
+        .iter()
+        .chain(core::iter::once(&declaring.return_type))
+    {
+        if !mentions_type_parameter(ty, &open_names) {
+            mint_named_type_token(ty, image, tokens);
+        }
+    }
+    let parameter_sigs: Result<Vec<TypeSig>, _> = declaring
+        .parameters
+        .iter()
+        .map(|ty| open_type_sig(tokens, ty, scope))
+        .collect();
+    let (Ok(parameter_sigs), Ok(return_sig)) = (
+        parameter_sigs,
+        open_type_sig(tokens, &declaring.return_type, scope),
+    ) else {
+        return None;
+    };
+    let signature = generic_method_signature(
+        !method.is_static,
+        instantiation.type_parameters.len() as u32,
+        &parameter_sigs,
+        &return_sig,
+    );
+    let member = image.member_ref(parent, &method.name, &signature);
+    tokens.insert_method(
+        &method.declaring_type,
+        &method.name,
+        &instantiation.parameters,
+        member,
+    );
+    Some(member)
+}
+
 /// Mints a `MemberRef` (a FieldRef) for a field on a type outside this module -- the
 /// persistent REPL `__Repl` (a session variable) or a BCL field -- so emission can name
 /// it. Mirrors [`mint_member_ref`]: the declaring type and the field's own type are
@@ -4624,12 +5189,205 @@ fn mint_generic_definition_ref(
 /// is reused as the member's parent. A no-op if the declaring type or the field type
 /// cannot be tokenized.
 fn mint_field_ref(field: &FieldReference, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    if let Some(declaring) = field.declaring_instantiation.as_deref() {
+        mint_instantiated_field_ref(field, declaring, image, tokens);
+        return;
+    }
     mint_named_type_token(&field.declaring_type, image, tokens);
     mint_named_type_token(&field.ty, image, tokens);
     let Some(parent) = tokens.type_token(&field.declaring_type) else {
         return;
     };
     let Ok(field_sig) = type_sig(tokens, &field.ty) else {
+        return;
+    };
+    let signature = field_signature(&field_sig);
+    let member = image.member_ref(parent, &field.name, &signature);
+    tokens.insert_field(&field.declaring_type, &field.name, member);
+}
+
+/// Whether `ty` must be named by a `TypeSpec` rather than by an ordinary type token: it IS, or it
+/// structurally CONTAINS, a constructed generic type or a body type parameter.
+///
+/// **The question is about the leaf, not the wrapper.** `Box<T>[]`, `Box<int>[][]` and `T[]` all
+/// need a spec; `int[]` does not, and keeping it out is what stops this from moving every
+/// array-typed instruction operand in the corpus.
+pub(crate) fn requires_type_spec(tokens: &Tokens, ty: &TypeSymbol) -> bool {
+    match ty {
+        TypeSymbol::Instantiation { .. } => true,
+        TypeSymbol::Array { element, .. }
+        | TypeSymbol::Pointer(element)
+        | TypeSymbol::ByRef(element) => requires_type_spec(tokens, element),
+        TypeSymbol::Named(_) => tokens.body_type_parameter(ty).is_some(),
+        _ => false,
+    }
+}
+
+/// Mints the `TypeSpec` row for a COMPOSITE over a constructed type or a type parameter --
+/// `Box<T>[]` -- together with the ordinary rows its blob refers to.
+///
+/// **The element's own tokens are minted FIRST and that is load-bearing.** The outer blob encodes
+/// the element inline, and a `Box<T>[]` whose `` Box`1 `` has no `TypeRef` row encodes a token
+/// nothing resolves -- metadata that writes cleanly and fails at load.
+fn mint_composite_type_spec(
+    ty: &TypeSymbol,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) -> Option<Token> {
+    match ty {
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => return mint_type_spec(ty, definition, arguments, image, tokens),
+        TypeSymbol::Array { element, .. }
+        | TypeSymbol::Pointer(element)
+        | TypeSymbol::ByRef(element) => {
+            if tokens.body_type_parameter(element).is_none() {
+                mint_composite_type_spec(element, image, tokens);
+            }
+        }
+        _ => {}
+    }
+    let blob = instantiation_blob(tokens, ty)?;
+    if let Some(existing) = tokens.type_spec_for(&blob) {
+        return Some(existing);
+    }
+    let token = image.type_spec(&blob);
+    tokens.insert_type_spec_for(&blob, token);
+    Some(token)
+}
+
+/// The `TypeSpec` row (II.23.2.14) naming a constructed generic type, minted once and shared by
+/// every member named through it -- the parent both `mint_instantiated_member_ref` and
+/// `mint_instantiated_field_ref` attach to.
+///
+/// The definition's own token and each argument's must exist before the `GENERICINST` blob can name
+/// them, which is why the minting happens here rather than at the call sites.
+///
+/// **THE ARGUMENTS ARE ENCODED IN THE SCOPE OF THE BODY BEING WALKED, WHICH IS A POSITION AND NOT
+/// A NAME.** `Box<int>`'s `<int>` is a closed type and encodes the same anywhere; a `Box<T>` is
+/// `Box<!!0>` inside `T Unwrap<T>(Box<T>)` and `Box<!0>` inside a `class Outer<T>`, and the two are
+/// different rows. The scope arrives ambiently on `tokens` ([`Tokens::body_scope`]) rather than as
+/// a parameter, because this function is one of about twenty the minting walk reaches, and a policy
+/// handed to twenty sites is a policy that arrives at some of them.
+///
+/// **A NAME-BASED GUARD -- refuse to mint a bare untokenized name -- IS NOT THE FIX**, and it is
+/// worth saying so because it is the obvious one. It breaks a `T[]` local inside a generic type
+/// (whose `T` encodes as `!0` and needs no token) and a REPL session's global-namespace type;
+/// narrowing it to "not one of the DECLARING type's parameters" fails differently, because the
+/// method's `T` and `` Box`1 ``'s `T` are DIFFERENT parameters with the SAME NAME, so a name test
+/// encodes `Box<!0>` -- a second silent wrong answer in place of the first. **Only the POSITION
+/// separates them.**
+fn mint_type_spec(
+    instantiation: &TypeSymbol,
+    definition: &[Box<str>],
+    arguments: &[TypeSymbol],
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) -> Option<Token> {
+    mint_named_type_token(&definition_symbol(definition, arguments.len()), image, tokens);
+    for argument in arguments {
+        mint_named_type_token(argument, image, tokens);
+    }
+    let blob = instantiation_blob(tokens, instantiation)?;
+    if let Some(existing) = tokens.type_spec_for(&blob) {
+        return Some(existing);
+    }
+    let token = image.type_spec(&blob);
+    tokens.insert_type_spec_for(&blob, token);
+    Some(token)
+}
+
+/// The `TypeSpec` signature bytes naming a constructed generic type in the scope of the body being
+/// emitted -- the one encoder both [`mint_type_spec`] and [`instantiation_spec`] key through.
+///
+/// **THE MINT AND THE LOOK-UP MUST ENCODE IDENTICALLY OR THE MAP IS WRITE-ONLY**, and they are two
+/// functions in two modules that run in two different walks. Sharing the encoder is what makes
+/// "same type, same key" true by construction rather than by two sites agreeing; a lookup that
+/// encoded in an empty scope would simply miss every open row and refuse, which reads as an
+/// unimplemented feature rather than as a mismatch.
+fn instantiation_blob(tokens: &Tokens, instantiation: &TypeSymbol) -> Option<Vec<u8>> {
+    let signature = open_type_sig(tokens, instantiation, body_scope(tokens)).ok()?;
+    Some(type_signature(&signature))
+}
+
+/// The `TypeSpec` row naming a constructed generic type where an INSTRUCTION operand needs a token
+/// -- `newarr Box<!!0>`, `castclass Box<!0>`, `isinst`, `ldtoken`. The read half of
+/// [`mint_type_spec`], which the minting walk has already run for the same body.
+///
+/// **AN INSTANTIATION HAS NO ORDINARY TOKEN AND MUST NOT BE GIVEN ONE.** [`Tokens::type_token`]
+/// keys by a type's `Display`, and `Box<T>` written against a method's `T` and against its
+/// declaring type's `T` are ONE display string and TWO rows (`Box<!!0>` and `Box<!0>`). Answering
+/// an instruction from that map hands one of them the other's token -- metadata that decodes
+/// cleanly and names a different type. So the answer comes from the blob-keyed map or not at all.
+///
+/// **AND A COMPOSITE OVER ONE IS THE SAME QUESTION.** Answering `Box<T>` here while `Box<T>[]`
+/// reaches this map through nothing refuses `typeof(Box<T>[])` and `((Box<T>[])o).Length` while
+/// the element type they are built from works. The shape
+/// asked for is not "an instantiation" but "a type that cannot be named by an ordinary token",
+/// which is what [`requires_type_spec`] decides.
+///
+/// A CLOSED array like `int[]` deliberately does NOT come here. It has an ordinary token today,
+/// and routing it through the spec map would move the row for every array-typed operand in every
+/// program -- a far wider change than the defect, and one whose blast radius is the whole corpus
+/// rather than generic code.
+///
+/// Returns `None` for every other shape, so [`Tokens::instruction_type_token`] can chain it.
+pub(crate) fn structural_type_spec(tokens: &Tokens, ty: &TypeSymbol) -> Option<Token> {
+    if !requires_type_spec(tokens, ty) {
+        return None;
+    }
+    tokens.type_spec_for(&instantiation_blob(tokens, ty)?)
+}
+
+/// The generic scope of the body being emitted, as [`GenericScope`] -- the one place the ambient
+/// pair on `tokens` is turned into the scope a signature is written in, so no site can consult one
+/// half of it.
+fn body_scope(tokens: &Tokens) -> GenericScope<'_> {
+    let (method, declaring) = tokens.body_scope();
+    GenericScope { method, declaring }
+}
+
+/// Mints the `MemberRef` naming a FIELD of an INSTANTIATED generic type -- `Counter<int>.Total` --
+/// with a `TypeSpec` parent carrying the arguments and the DEFINITION's field signature
+/// (ECMA-335 4th ed II.23.2.1, and II.9.7 for why the parent decides storage).
+///
+/// **THIS ONE CORRUPTS DATA RATHER THAN METADATA, WHICH IS WHAT MAKES IT THE WORST OF THEM.**
+/// A static field gets one copy PER INSTANTIATION. With the parent erased, `Counter<int>.Total` and
+/// `Counter<string>.Total` name the definition's single `FieldDef` and share one cell: measured on
+/// the interpreter tier as a program answering 503503 where 10507 is correct, with ZERO violations
+/// reported -- because an erased use site is indistinguishable from non-generic code, so every
+/// protection built for generics keys on a `TypeSpec` that is not there.
+///
+/// **A FIELD WHOSE TYPE NEVER MENTIONS `T` IS THE DANGEROUS CASE, NOT THE EASY ONE.**
+/// `Counter<T> { static int Total; }` has a signature that is byte-identical open and closed, so
+/// nothing in the SIGNATURE can tell you whether the instantiation was carried. Only the parent row
+/// says, which is exactly why the defect ran silently.
+fn mint_instantiated_field_ref(
+    field: &FieldReference,
+    declaring: &lamella_binder::FieldInstantiation,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = &field.declaring_type
+    else {
+        return;
+    };
+    let Some(parent) = mint_type_spec(&field.declaring_type, definition, arguments, image, tokens)
+    else {
+        return;
+    };
+    if !mentions_type_parameter(&declaring.ty, &declaring.type_parameters) {
+        mint_named_type_token(&declaring.ty, image, tokens);
+    }
+    let scope = GenericScope {
+        method: &[],
+        declaring: &declaring.type_parameters,
+    };
+    let Ok(field_sig) = open_type_sig(tokens, &declaring.ty, scope) else {
         return;
     };
     let signature = field_signature(&field_sig);
@@ -4685,8 +5443,15 @@ fn mint_array_members(array_ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &
 }
 
 fn mint_type_token(image: &mut ImageBuilder, tokens: &mut Tokens, ty: &TypeSymbol) {
+    if tokens.body_type_parameter(ty).is_some() {
+        return;
+    }
     let canonical = tokens.canonical(ty);
     let ty = &canonical;
+    if requires_type_spec(tokens, ty) {
+        mint_composite_type_spec(ty, image, tokens);
+        return;
+    }
     if tokens.type_token(ty).is_some() {
         return;
     }
@@ -4714,18 +5479,7 @@ fn mint_type_token(image: &mut ImageBuilder, tokens: &mut Tokens, ty: &TypeSymbo
             mint_type_token(image, tokens, element);
             None
         }
-        TypeSymbol::Instantiation {
-            definition,
-            arguments,
-        } => {
-            mint_type_token(image, tokens, &definition_symbol(definition, arguments.len()));
-            for argument in arguments {
-                mint_type_token(image, tokens, argument);
-            }
-            type_sig(tokens, ty)
-                .ok()
-                .map(|sig| image.type_spec(&type_signature(&sig)))
-        }
+        TypeSymbol::Instantiation { .. } => None,
         TypeSymbol::Error => None,
     };
     if let Some(token) = reference {
@@ -4756,16 +5510,17 @@ fn system_type_name(special: SpecialType) -> Option<(&'static str, &'static str)
     })
 }
 
-/// Mints + records a `TypeRef` for a named type used in a signature -- a BCL reference
-/// type (StringBuilder, ArrayList, ...) or any named type not yet tokenized -- so
-/// `type_sig` can encode it (a `Class`, or `ValueType` for a value type). A no-op for a
-/// predefined type, an array, the error type, or a type already tokenized (a this-module
-/// `TypeDef` or a previously minted ref).
-/// Records every external type's defining assembly in the image, so a non-CoreLib BCL type's
-/// `TypeRef` is scoped to its real assembly (System.Diagnostics for Trace) rather than to
-/// mscorlib (which resolves only what CoreLib defines or forwards).
-fn register_external_assemblies(model: &Model, image: &mut ImageBuilder) {
-    let entries: Vec<(String, Box<str>)> = model
+/// Records where every external type LIVES, so the `TypeRef` the writer mints for it names the
+/// right place: the assembly that defines it (System.Diagnostics for Trace, not mscorlib, which
+/// resolves only what CoreLib defines or forwards), and -- for a nested type -- the type it is
+/// nested in.
+///
+/// **BOTH FACTS ARE THE SAME WALK AND ARE RECORDED IN THE SAME PASS.** The enclosing name sits on
+/// the same `TypeInfo` as the assembly name, and the writer needs it for exactly the same reason:
+/// a `TypeRef` written without it resolves to something else or to nothing. Splitting them would
+/// mean two walks of every model type that must agree on the key they record under.
+fn register_external_type_scopes(model: &Model, image: &mut ImageBuilder) {
+    let entries: Vec<(String, Box<str>, Option<Box<str>>)> = model
         .type_keys()
         .filter_map(|(namespace, name)| {
             let info = model.get_by_symbol(&named_symbol(namespace, name))?;
@@ -4775,18 +5530,21 @@ fn register_external_assemblies(model: &Model, image: &mut ImageBuilder) {
             } else {
                 alloc::format!("{namespace}.{name}")
             };
-            Some((qualified, assembly))
+            Some((qualified, assembly, info.enclosing.clone()))
         })
         .collect();
-    for (qualified, assembly) in entries {
+    for (qualified, assembly, enclosing) in entries {
         image.set_type_assembly(&qualified, &assembly);
+        if let Some(enclosing) = enclosing {
+            image.set_type_enclosing(&qualified, &enclosing);
+        }
     }
 }
 
 /// Records each reference assembly's real identity (name -> version + full public key) in the
-/// image, so an `AssemblyRef` we emit for it carries that identity rather than a
+/// image, so an `AssemblyRef` emitted for it carries that identity rather than a
 /// `Version=4.0.0.0, PublicKeyToken=null` default. Without this, csc consuming an lcsc-built
-/// library alongside the same reference pack rejects it -- our `System.Runtime` reference names a
+/// library alongside the same reference pack rejects it -- the `System.Runtime` reference names a
 /// phantom assembly whose identity matches nothing it has (CS0012). The reference pack is the
 /// single source of truth: we forward exactly what it declares.
 fn register_assembly_identities(references: &[Assembly], image: &mut ImageBuilder) {
@@ -4832,6 +5590,13 @@ fn mark_external_value_types(model: &Model, tokens: &mut Tokens) {
 }
 
 fn mint_named_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    if tokens.body_type_parameter(ty).is_some() {
+        return;
+    }
+    if matches!(ty, TypeSymbol::Instantiation { .. }) {
+        mint_type_token(image, tokens, ty);
+        return;
+    }
     if let TypeSymbol::Array { element, .. }
     | TypeSymbol::Pointer(element)
     | TypeSymbol::ByRef(element) = ty
@@ -4857,12 +5622,59 @@ fn mint_named_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut
 /// the SYNTACTIC key, so `type_sig` (which keys on `bind_type`) finds it. A this-module type
 /// already has its TypeDef (the guard skips it); primitives/arrays/pointers `type_sig` builds
 /// directly.
+/// The type-parameter names in scope for a signature: the declaring type's and, for a method, its
+/// own. A slice of slices so the two numbering spaces stay separate lists and neither has to be
+/// copied to be searched together.
+type ParameterScope<'a> = &'a [&'a [Box<str>]];
+
+/// Whether `ty` IS one of the type parameters in scope -- a single-part name matching one of them.
+///
+/// **THE LEAF, NOT THE COMPOSITE, AND THAT DISTINCTION IS THE WHOLE OF IT.** `IEnumerator<T>`
+/// MENTIONS `T` and is not itself a parameter: its definition is an ordinary imported type that
+/// needs a `TypeRef` like any other, and only the argument is a position. Asking "does this
+/// composite mention a parameter" and skipping the whole thing is what refused every generic class
+/// implementing an imported generic interface -- the shape of every collection.
+fn is_type_parameter(ty: &TypeSymbol, scope: ParameterScope<'_>) -> bool {
+    let TypeSymbol::Named(parts) = ty else {
+        return false;
+    };
+    matches!(&parts[..], [only] if scope.iter().any(|names| names.iter().any(|name| name == only)))
+}
+
 fn mint_signature_type(
     binder: &Binder,
     syntactic: &TypeSymbol,
+    scope: ParameterScope<'_>,
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
 ) {
+    if let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = syntactic
+    {
+        let named = definition_symbol(definition, arguments.len());
+        if tokens.type_token(&named).is_none()
+            && let Some((namespace, name)) = split_type_name(&binder.resolve_type(&named))
+        {
+            let token = image.type_ref(&namespace, &name);
+            tokens.insert_type(&named, token);
+        }
+        for argument in arguments {
+            mint_signature_type(binder, argument, scope, image, tokens);
+        }
+        return;
+    }
+    if let TypeSymbol::Array { element, .. }
+    | TypeSymbol::Pointer(element)
+    | TypeSymbol::ByRef(element) = syntactic
+    {
+        mint_signature_type(binder, element, scope, image, tokens);
+        return;
+    }
+    if is_type_parameter(syntactic, scope) {
+        return;
+    }
     let needs_ref = matches!(
         syntactic,
         TypeSymbol::Named(_) | TypeSymbol::Special(SpecialType::Decimal)
@@ -4880,54 +5692,89 @@ fn mint_signature_type(
 /// parameter/return, property, event, operator, indexer types), so `type_sig` finds them
 /// even when a type appears only in a signature and not in any body (which `mint_references`
 /// would otherwise be the only thing to catch).
+///
+/// **`declaring_parameters` ARE SKIPPED, AND THE COST OF NOT SKIPPING THEM IS NOT BLOAT.** A `T`
+/// is a POSITION, not a type: minting its token asks for a `TypeRef` to a type named `T` that no
+/// assembly declares, and a `class Box<T> { T item; T Get(); }` emitted one. It is unreferenced --
+/// every signature that mentions `T` encodes `!0` through the declaring scope, which matches by
+/// NAME before it would ever consult a token -- so the rows decoded correctly and the assembly
+/// merely carried a dangling reference csc never emits.
+///
+/// **The hazard is that it makes a REFUSAL stop refusing.** `type_sig` has no case for a bare `T`
+/// and falls through to the named-type lookup, which is exactly the safety net a signature written
+/// in the WRONG scope relies on. With a token registered under `T`, that lookup SUCCEEDS and
+/// encodes `Class(TypeRef T)` instead. The row that is junk in one place is a silent wrong answer
+/// in another -- measured as a `TypeSpec` for `Box<T>` naming a class called `T`.
+///
+/// **A METHOD'S OWN PARAMETERS COUNT TOO, AND THAT IS THE HALF THAT WAS MISSING.** The skip list
+/// was the DECLARING type's alone, so `static T Unwrap<T>(Box<T> b)` on a NON-generic class had an
+/// empty list, mentioned no declaring parameter, and minted the `T` this rule exists to refuse.
+/// A skip list that names one of two numbering spaces is a skip list for programs that use one.
 fn mint_member_signature_types(
     binder: &Binder,
     members: &[Member],
+    declaring_parameters: &[Box<str>],
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
 ) {
+    let mint = |syntactic: &TypeSymbol,
+                own: &[Box<str>],
+                image: &mut ImageBuilder,
+                tokens: &mut Tokens| {
+        mint_signature_type(binder, syntactic, &[declaring_parameters, own], image, tokens);
+    };
     for member in members {
         match member {
             Member::Field { ty, .. }
             | Member::Property { ty, .. }
             | Member::EventField { ty, .. }
             | Member::Event { ty, .. } => {
-                mint_signature_type(binder, &bind_type(ty), image, tokens);
+                mint(&bind_type(ty), &[], image, tokens);
             }
             Member::Indexer {
                 ty, parameters, ..
             } => {
-                mint_signature_type(binder, &bind_type(ty), image, tokens);
+                mint(&bind_type(ty), &[], image, tokens);
                 for parameter in parameters {
-                    mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens);
                 }
             }
             Member::Method {
                 return_type,
+                type_parameters,
                 parameters,
                 ..
+            } => {
+                let own: Vec<Box<str>> = type_parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect();
+                mint(&bind_type(return_type), &own, image, tokens);
+                for parameter in parameters {
+                    mint(&bind_type(&parameter.ty), &own, image, tokens);
+                }
             }
-            | Member::Operator {
+            Member::Operator {
                 return_type,
                 parameters,
                 ..
             } => {
-                mint_signature_type(binder, &bind_type(return_type), image, tokens);
+                mint(&bind_type(return_type), &[], image, tokens);
                 for parameter in parameters {
-                    mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens);
                 }
             }
             Member::ConversionOperator {
                 target, parameters, ..
             } => {
-                mint_signature_type(binder, &bind_type(target), image, tokens);
+                mint(&bind_type(target), &[], image, tokens);
                 for parameter in parameters {
-                    mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens);
                 }
             }
             Member::Constructor { parameters, .. } => {
                 for parameter in parameters {
-                    mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+                    mint(&bind_type(&parameter.ty), &[], image, tokens);
                 }
             }
             _ => {}
@@ -5019,6 +5866,7 @@ fn emit_decimal_constant_attribute(
         is_static: false,
         is_vararg: false,
         instantiation: None,
+        declaring_instantiation: None,
     };
     mint_member_ref(&reference, image, tokens);
     let Some(ctor) = tokens.method(&attr_ty, ".ctor", &params) else {
@@ -5279,15 +6127,12 @@ fn declares_instance_constructor(declaration: &TypeDecl) -> bool {
 
 /// Maps a bound type to its signature form. A named type resolves to the `Class`
 /// of its `TypeDef` token; array types come later.
-/// The generic DEFINITION `definition` of `arity` parameters, as the plain named symbol the token
-/// table holds it under: its last part carries the arity mangled in (ECMA-335 II.10.7.2), because
-/// that is the one spelling both a source-collected and a reference-read definition arrive with.
+/// The generic DEFINITION `definition` instantiated with `arity` arguments, as the plain named
+/// symbol the token table holds it under. One line, and it stays as a name here because that name
+/// is what the three emission sites below read; the rule itself lives in the binder beside the
+/// model lookups that have to agree with it.
 fn definition_symbol(definition: &[Box<str>], arity: usize) -> TypeSymbol {
-    let mut parts: Vec<Box<str>> = definition.to_vec();
-    if let Some(last) = parts.last_mut() {
-        *last = lamella_binder::metadata_type_name(last, arity).into();
-    }
-    TypeSymbol::Named(parts.into())
+    lamella_binder::definition_symbol(definition, arity)
 }
 
 fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitError> {
@@ -5386,6 +6231,11 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
 
 /// The type parameters in scope where a signature is written: the METHOD's own, and the DECLARING
 /// TYPE's. Both are live at once inside a generic method of a generic type.
+///
+/// **THEY ARE SEPARATE NUMBERING SPACES AND `!0` IS NOT `!!0`.** `class Holder<TOuter>` with a
+/// `TOuter Echo<TMethod>(TMethod)` encodes as `!0 Echo<!!0>(!!0)` -- csc's own bytes for exactly
+/// that method are `30 01 01 13 00 1e 00`, a `VAR 0` return beside an `MVAR 0` parameter. Encoding
+/// one as the other yields a signature that decodes without error and names a different type.
 #[derive(Clone, Copy, Default)]
 struct GenericScope<'a> {
     /// The enclosing METHOD's own parameters -- `!!n` ([`TypeSig::MVar`]). Empty for an ordinary
@@ -5398,6 +6248,22 @@ struct GenericScope<'a> {
 /// [`type_sig`] for a signature that is still OPEN over the parameters in `scope`: a mention of one
 /// encodes as `!!n` or `!n` at its declaration position, everything else lowers exactly as a closed
 /// type does.
+///
+/// **`!n` IS A POSITION, NOT A TOKEN.** The binder substitutes by NAME
+/// (`MethodSymbol::instantiate`), metadata numbers instead, and this is the one place the two meet
+/// -- so an index comes from a declaration order and from nothing else.
+///
+/// **The METHOD's parameters are consulted first**, so a method parameter shadows a type
+/// parameter of the same name. C# forbids that spelling outright (CS0693), so the precedence only
+/// ever settles a program that is already being refused; making it explicit keeps the two lists
+/// from silently depending on iteration order.
+///
+/// Names are matched BEFORE canonicalization, so a type parameter shadows a real type of the same
+/// name here. **That rule is stated once, on `lamella_binder::resolve::TypeTable::shadow`**, and
+/// this site applies it rather than restating it: the binder's `enter_type_parameters` is its other
+/// use site, scoping the name while a declaration is bound, and this one decides which index the
+/// same name encodes as. Two sites, one rule -- if they disagree, a program binds against one type
+/// and emits the other, which no diagnostic can catch.
 fn open_type_sig(
     tokens: &Tokens,
     ty: &TypeSymbol,
@@ -5454,6 +6320,14 @@ fn open_type_sig(
 }
 
 /// The scope for a generic method's own OPEN signature, as a call site instantiates it.
+///
+/// The DECLARING half is empty because this scope belongs to the EXTERNAL arm of
+/// `mint_generic_definition_ref`, whose parent is a `TypeRef` to a non-generic type: there is no
+/// `!n` to name, and a non-empty list here would number a same-spelled method parameter against
+/// the wrong space. **It is not a statement that a generic method on a generic type is out of
+/// reach** -- that shape is `mint_instantiated_generic_definition_ref`, which parents on a
+/// `TypeSpec` and passes both lists. The distinction is worth stating because an empty list reads
+/// as "there is no such case" rather than as "this arm cannot reach it".
 fn method_scope(instantiation: &lamella_binder::MethodInstantiation) -> GenericScope<'_> {
     GenericScope {
         method: &instantiation.type_parameters,
@@ -5610,6 +6484,7 @@ fn collect_tokens(
                         Member::Method {
                             modifiers,
                             name,
+                            type_parameters,
                             parameters,
                             is_vararg,
                             body,
@@ -5941,6 +6816,14 @@ fn type_symbol_from_dotted(full: &str) -> TypeSymbol {
 
 /// The METADATA name of a declared type: `` Box`1 `` for `class Box<T>` (ECMA-335 II.10.7.2),
 /// and the name unchanged for every non-generic declaration.
+///
+/// **THE ASSEMBLER AND THE BINDER'S MODEL MUST AGREE ON THIS OR THEY NAME DIFFERENT TYPES.**
+/// `declaration.rs` already mangles a source-declared generic type when it collects it, and a
+/// definition read from a reference assembly arrives mangled -- so those two meet in one key
+/// space and the assembler was the odd one out. Emitting the BARE name puts a `TypeDef` called
+/// `Box` in the image while every lookup (`type_sig`'s `definition_of`, the model's
+/// `get_by_symbol`) asks for `` Box`1 ``, and the miss is silent: the base class and the enclosing
+/// type simply come back `None`.
 fn declared_type_name(declaration: &TypeDecl) -> String {
     lamella_binder::metadata_type_name(&declaration.name, declaration.type_parameters.len())
 }
@@ -5977,7 +6860,71 @@ mod tests {
     use super::*;
     use lamella_syntax::parser::parse_compilation_unit;
 
+    /// The WRITER's nested `TypeRef` and the READER's nesting walk are one rule seen from two
+    /// sides, and this is the only place both are in scope -- so it is the only place they can be
+    /// shown to agree.
+    ///
+    /// **THE TWO HALVES ARE NOT THE SAME CODE AND ONE OF THEM IS REACHED BY NOTHING ELSE WE RUN.**
+    /// `token_type_symbol` walks a `TypeDef`'s `NestedClass` row and a `TypeRef`'s
+    /// `ResolutionScope` chain, and the whole `foreach`-over-`List<T>` population reaches only the
+    /// first: a reference assembly names its OWN nested types by `TypeDef`. The `TypeRef` arm is
+    /// what a nested type in a THIRD assembly takes -- including one we emitted ourselves -- and
+    /// with it disabled every generics-parity row stays green. Round-tripping an image through
+    /// both is what asks it a question it can get wrong.
+    ///
+    /// A flat control rides along: a top-level reference must still decode by its own namespace,
+    /// so a walk that fired on everything would be caught here rather than by its absence.
+    #[test]
+    fn a_nested_type_ref_this_writer_emits_decodes_back_under_its_enclosing_type() {
+        use lamella_pe::{ImageBuilder, TypeSig, method_signature};
+
+        let mut image = ImageBuilder::new("test.dll", "test");
+        image.set_type_assembly("N.Outer`1", "Other");
+        image.set_type_assembly("N.Outer`1.Inner", "Other");
+        image.set_type_enclosing("N.Outer`1.Inner", "N.Outer`1");
+        let inner = image.type_ref("N.Outer`1", "Inner");
+        let flat = image.type_ref("N", "Plain");
+
+        let object = image.object_type();
+        image.add_type("App", "Holder", object, 0x0000_0001);
+        let signature = method_signature(
+            false,
+            &[TypeSig::Class(inner), TypeSig::Class(flat)],
+            &TypeSig::Void,
+        );
+        image.add_method("M", &signature, &[0x2A], 0x0006 | 0x0010, 0x0000, &[]);
+        let pe = image.finish(Token::new(0, 0), true);
+
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+        let mut model = Model::new();
+        lamella_binder::load_assembly(&mut model, &assembly);
+        let holder = model.get("App", "Holder").expect("the emitted type");
+        let method = holder
+            .methods
+            .iter()
+            .find(|m| &*m.name == "M")
+            .expect("the emitted method");
+
+        assert_eq!(
+            method.parameters[0],
+            TypeSymbol::Named(["N".into(), "Outer`1".into(), "Inner".into()].into()),
+            "a nested TypeRef is named by its enclosing type, not by its own empty namespace"
+        );
+        assert_eq!(
+            method.parameters[1],
+            TypeSymbol::Named(["N".into(), "Plain".into()].into()),
+            "and a top-level TypeRef still reads its own namespace"
+        );
+    }
+
     /// A constructed generic type lowers to `GENERICINST` over its DEFINITION's token.
+    ///
+    /// **THE DEFINITION IS FOUND BY ITS ARITY-MANGLED NAME, AND THAT IS THE JOIN THIS TEST
+    /// EXISTS FOR.** The token table is keyed by a type's `Display`; a generic definition is
+    /// recorded as `` Box`1 `` (II.10.7.2) because that is the one spelling both a source-collected
+    /// and a reference-read definition arrive with. A lowering that looked up the BARE `Box` finds
+    /// nothing here -- and the negative row below is what says so, because a build where the table
+    /// happened to hold both spellings would pass the positive case either way.
     #[test]
     fn a_constructed_generic_lowers_to_genericinst_over_the_mangled_definition() {
         let mangled = TypeSymbol::Named(["App".into(), "Box`1".into()].into());
@@ -6027,6 +6974,19 @@ mod tests {
 
     /// An instantiation gets a `TypeSpec` minted from its `GENERICINST` signature -- the token
     /// `ldelema`/`ldobj` need for a generic STRUCT array.
+    ///
+    /// **THE SEPARATION IS THE CLAIM, NOT THE MINTING.** A `TypeSpec` is keyed by its signature
+    /// BYTES, so `Box<int>` and `Box<string>` must come back as DIFFERENT tokens. That is exactly
+    /// what a Display-keyed or definition-folded scheme would get wrong, and getting it wrong is
+    /// the cast hole: one token for two types means an `isinst` that answers for the wrong one and
+    /// a static field that exists twice. A test that only checked "a token appeared" would pass
+    /// against every broken version of this.
+    ///
+    /// **IT ASKS THROUGH `instruction_type_token`, AND THAT IS THE POINT RATHER THAN A DETAIL.**
+    /// `type_token` is the DISPLAY-keyed map and an instantiation is deliberately absent from it:
+    /// `Box<T>` written against a method's `T` and against its declaring type's `T` render the same
+    /// string and are two rows. The row below asserts that absence, so a change that "fixed" a
+    /// lookup by putting instantiations back under their display string fails here.
     #[test]
     fn each_instantiation_mints_its_own_typespec() {
         let mut image = ImageBuilder::new("test.dll", "test");
@@ -6045,8 +7005,12 @@ mod tests {
         mint_type_token(&mut image, &mut tokens, &int);
         mint_type_token(&mut image, &mut tokens, &string);
 
-        let int_token = tokens.type_token(&int).expect("Box<int> is minted");
-        let string_token = tokens.type_token(&string).expect("Box<string> is minted");
+        let int_token = tokens
+            .instruction_type_token(&int)
+            .expect("Box<int> is minted");
+        let string_token = tokens
+            .instruction_type_token(&string)
+            .expect("Box<string> is minted");
         assert_eq!(int_token.table(), lamella_metadata::tables::table::TYPE_SPEC);
         assert_eq!(string_token.table(), lamella_metadata::tables::table::TYPE_SPEC);
         assert_ne!(
@@ -6056,10 +7020,70 @@ mod tests {
         assert_ne!(int_token, definition_token);
         assert_ne!(string_token, definition_token);
 
+        assert!(
+            tokens.type_token(&int).is_none(),
+            "an instantiation's token belongs to the blob-keyed map alone"
+        );
+
         mint_type_token(&mut image, &mut tokens, &int);
-        assert_eq!(tokens.type_token(&int), Some(int_token));
+        assert_eq!(tokens.instruction_type_token(&int), Some(int_token));
     }
 
+    /// **ONE SYMBOL, TWO SCOPES, TWO ROWS -- AND THE MINT AND THE LOOK-UP MUST AGREE ON WHICH.**
+    /// `Box<T>` inside `T Unwrap<T>(...)` is `Box<!!0>`; the same `Box<T>` inside a `class Holder<T>`
+    /// is `Box<!0>`. Both render `Box<T>`, so the two are told apart by the ambient body scope and
+    /// by nothing else.
+    ///
+    /// This is the pair `each_instantiation_mints_its_own_typespec` cannot supply: there the two
+    /// types differ in their ARGUMENTS, which a display key separates too. Here they are one symbol,
+    /// which only the blob separates.
+    ///
+    /// **The `is_none` rows are the ones that fail on a scope-blind LOOK-UP.** A lookup that
+    /// encoded in an empty scope would answer `None` for both and the `assert_ne!` alone would still
+    /// pass on `(Some, Some)` never being reached -- so each token is asserted present first.
+    #[test]
+    fn one_symbol_in_two_scopes_is_two_typespec_rows() {
+        let mut image = ImageBuilder::new("test.dll", "test");
+        let mut tokens = Tokens::new();
+        let definition = TypeSymbol::Named(["App".into(), "Box`1".into()].into());
+        tokens.insert_type(&definition, image.type_ref("App", "Box`1"));
+
+        let boxed_t = TypeSymbol::Instantiation {
+            definition: ["App".into(), "Box".into()].into(),
+            arguments: [TypeSymbol::Named(["T".into()].into())].into(),
+        };
+
+        let saved = tokens.enter_body_scope(&["T".into()], &[]);
+        mint_type_token(&mut image, &mut tokens, &boxed_t);
+        let as_mvar = tokens
+            .instruction_type_token(&boxed_t)
+            .expect("Box<!!0> is minted and found in the method scope");
+        tokens.restore_body_scope(saved);
+
+        let saved = tokens.enter_body_scope(&[], &["T".into()]);
+        mint_type_token(&mut image, &mut tokens, &boxed_t);
+        let as_var = tokens
+            .instruction_type_token(&boxed_t)
+            .expect("Box<!0> is minted and found in the declaring scope");
+        tokens.restore_body_scope(saved);
+
+        assert_ne!(
+            as_mvar, as_var,
+            "Box<!!0> and Box<!0> are different types and must not share a TypeSpec"
+        );
+
+        assert!(
+            tokens.instruction_type_token(&boxed_t).is_none(),
+            "Box<T> outside any generic scope names no type"
+        );
+    }
+
+    /// **VALUE-NESS FOLLOWS THE DEFINITION, TOKENS DO NOT -- AND THE SECOND HALF IS WHY THIS
+    /// TEST HAS A NEGATIVE ROW.** `Pair<int>` is a value type exactly when `` Pair`1 `` is one, so
+    /// the PREDICATE resolves through the definition; but `Box<int>` and `Box<string>` are
+    /// different types, so the TOKEN must not. A change that made `type_token` follow the
+    /// definition too would pass every positive assertion here and fold two types onto one token --
+    /// the cast hole `generics-identity-and-sharing` s2 names.
     #[test]
     fn value_ness_follows_the_definition_but_a_token_does_not() {
         let definition = TypeSymbol::Named(["App".into(), "Pair`1".into()].into());
@@ -6094,6 +7118,12 @@ mod tests {
     const NESTED_FIXTURE: &str = "generic-params.dll";
 
     /// A csc-built reference assembly from `lamella-metadata`'s fixture directory, read at RUN time.
+    ///
+    /// **A MISSING FIXTURE SKIPS ONLY WHERE SKIPPING IS RIGHT.** If the fixture DIRECTORY exists
+    /// and the file does not, that is a real breakage and this panics; only when the directory
+    /// itself is gone does it return `None`. Without that split, deleting a fixture would turn
+    /// every row below green.
+    ///
     fn reference_fixture(name: &str) -> Option<Vec<u8>> {
         let directory = format!(
             "{}/../lamella-metadata/tests/fixtures",
@@ -6117,6 +7147,10 @@ mod tests {
     }
 
     /// `expression` parsed inside a `Main` under C# 2 and bound against `reference`.
+    ///
+    /// The DIALECT is load-bearing in the parser, not only in the binder: under the default C# 1.0
+    /// the parser skips a type-argument list, so `Id<int>(1)` arrives as a chain of comparisons and
+    /// every row below would measure a different program.
     fn bound_expression_against(reference: &[u8], expression: &str) -> BoundExpr {
         let source = format!("class C {{ static void Main() {{ {expression}; }} }}\n");
         let options = LexOptions {
@@ -6167,6 +7201,12 @@ mod tests {
         }
     }
 
+    /// **THE ROW THE EMIT STAGE EXISTS FOR, AND ITS EVIDENCE IS THE SEPARATION.** A generic call
+    /// must name its own `MethodSpec`, never the definition's token -- because emitting the
+    /// definition still produces a call that BINDS, to the open method, with `!!0` unsubstituted.
+    /// That outcome throws no error and writes valid metadata, so nothing but this assertion
+    /// distinguishes it. `lamella-pe`'s `ImageBuilder::method_spec` doc records the same trap from
+    /// the writer's side.
     #[test]
     fn a_generic_call_names_its_own_method_spec_and_not_the_definition() {
         let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
@@ -6192,6 +7232,12 @@ mod tests {
 
     /// Two instantiations of one definition are two rows over one `MemberRef`, and the arguments
     /// survive the blob round trip.
+    ///
+    /// **THE `assert_ne!` IS THE LOAD-BEARING LINE.** An implementation that interned the row
+    /// by (declaring type, name) -- the shape every other member in this table uses -- gives both
+    /// sites one token and one argument, and passes every "a MethodSpec appeared" assertion
+    /// perfectly. It is the same collapse a shared `TypeSpec` would be, reached through the method
+    /// table instead of the type one.
     #[test]
     fn two_instantiations_of_one_method_are_two_rows_over_one_member_ref() {
         let Some(int_call) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
@@ -6232,6 +7278,11 @@ mod tests {
         );
     }
 
+    /// **TWO TYPE PARAMETERS, IN ORDER -- AT ARITY ONE EVERY NUMBERING SCHEME AGREES.** `!!0` is
+    /// a POSITION, and the row above cannot tell a correct one from a hardcoded zero, from the
+    /// declaring type's numbering, or from a reversed list. `T Two<T,U>(T,U)` separates all four in
+    /// the signature AND in the instantiation blob, which are numbered from opposite ends of the
+    /// same fact.
     #[test]
     fn a_second_type_parameter_is_numbered_by_its_own_position() {
         let Some(expr) = bound_expression("Fixture.Util.Two<int, string>(1, \"x\")") else { return };
@@ -6263,6 +7314,12 @@ mod tests {
         );
     }
 
+    /// **A GENERIC CALL WITH NO `MethodSpec` IS REFUSED, NEVER EMITTED AGAINST THE DEFINITION.**
+    /// This is the control for the fallback that would otherwise be the natural thing to write --
+    /// "look up the site, else the definition" -- and that fallback is not a degradation, it is the
+    /// silent wrong program: the call binds to the open method and `!!0` is never substituted. The
+    /// definition IS minted here and is a perfectly good token, so an emitter willing to use it
+    /// would succeed and this row is what says it must not.
     #[test]
     fn a_generic_call_without_its_row_refuses_rather_than_naming_the_definition() {
         let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
@@ -6288,8 +7345,21 @@ mod tests {
         );
     }
 
+    /// **A GENERIC CALL WHOSE DEFINITION HAS NO METHOD TOKEN IS REFUSED**, even when its declaring
+    /// type is a this-module `TypeDef`.
+    ///
+    /// **A THIS-MODULE DECLARING TYPE IS NOT ITSELF A REFUSAL.** `MethodSpec.Method` is a
+    /// `MethodDefOrRef` (II.22.29), so a generic method this module declares is named by its own
+    /// `MethodDef` -- its signature carries the GENERIC convention and its `GenericParam` rows, so
+    /// the spec and the definition agree. What this row measures is the REMAINING refusal: the
+    /// definition's token has to EXIST, and here only the TYPE is registered.
+    ///
+    /// The positive half -- a this-module generic call that DOES mint -- is not expressible in this
+    /// synthetic setup, because it needs the real pre-pass to have written the `MethodDef`. It is
+    /// covered end to end instead: `lcsc /langversion:ISO-2` compiles `Id<string>("ok")` against a
+    /// this-module `static T Id<T>(T x)`.
     #[test]
-    fn a_this_module_generic_definition_is_refused_rather_than_wrongly_instantiated() {
+    fn a_generic_call_with_no_definition_token_is_refused_rather_than_wrongly_instantiated() {
         let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
         let mut image = ImageBuilder::new("test.dll", "test");
         let mut tokens = Tokens::new();
@@ -6304,8 +7374,22 @@ mod tests {
         );
     }
 
+    /// **AN *IMPORTED* GENERIC METHOD ON A GENERIC TYPE IS STILL REFUSED, AND THE REASON MOVED.**
+    /// The emitter could already write this shape for a THIS-MODULE declaration
+    /// (`a_generic_method_on_a_generic_type_declared_here`); what blocked the IMPORTED spelling was
+    /// one layer earlier and was not a generics-emission gap at all. `reference::sigtype_to_symbol`
+    /// decoded `ELEMENT_TYPE_MVAR` to its declared NAME and had no arm for `ELEMENT_TYPE_VAR`, so
+    /// `Fixture.Holder<TOuter>.Echo<TMethod>(TMethod) -> TOuter` arrived with
+    /// `parameters: [Named(["TMethod"])]` and `return_type: Error` -- one rule, two numbering
+    /// spaces, the case in one of them.
+    ///
+    /// **BOTH HALVES ARE ASSERTED HERE BECAUSE ONLY THE PAIR SEPARATES THE TWO SPACES.** A decode
+    /// that answered every numbered parameter from the METHOD's list would give this signature
+    /// `[Named(["TMethod"])]` and `Named(["TMethod"])` -- one right and one wrong, and the parameter
+    /// row alone cannot tell. `TOuter` in the return is what says `!0` was numbered against the
+    /// DECLARING type's list.
     #[test]
-    fn a_generic_method_on_a_generic_type_is_refused_rather_than_named_wrongly() {
+    fn an_imported_generic_method_on_a_generic_type_decodes_both_numbering_spaces() {
         let Some(reference) = reference_fixture(NESTED_FIXTURE) else { return };
         let expr = bound_expression_against(
             &reference,
@@ -6316,22 +7400,203 @@ mod tests {
         };
         assert!(
             method.instantiation.is_some(),
-            "the call site's type arguments are recorded even here"
+            "the call site's own type argument is recorded"
         );
-        assert!(
-            matches!(method.declaring_type, TypeSymbol::Instantiation { .. }),
-            "the declaring type is the INSTANTIATION, which is what has no TypeRef"
+        let declaring = method
+            .declaring_instantiation
+            .as_deref()
+            .expect("the DECLARING type's open form is recovered, or the `!n` half has no owner");
+        assert_eq!(
+            declaring.type_parameters,
+            [Box::<str>::from("TOuter")],
+            "the declaring type's parameter NAMES are what `!0` is numbered against"
+        );
+        assert_eq!(
+            declaring.parameters,
+            [TypeSymbol::Named([Box::from("TMethod")].into())],
+            "MVAR 0 decodes to the METHOD's declared name"
+        );
+        assert_eq!(
+            declaring.return_type,
+            TypeSymbol::Named([Box::from("TOuter")].into()),
+            "VAR 0 decodes to the DECLARING TYPE's declared name, not the method's and not Error"
         );
 
         let mut image = ImageBuilder::new("test.dll", "test");
         let mut tokens = Tokens::new();
+        let spec = emitted_call_token(&expr, &mut image, &mut tokens)
+            .expect("an imported generic method on a generic type emits");
+        assert_eq!(spec.table(), lamella_metadata::tables::table::METHOD_SPEC);
+        let built = image.finish(Token::new(0, 0), true);
+        let assembly = Assembly::read(&built).expect("the image parses");
+        let definition = assembly
+            .method_spec_method(spec)
+            .expect("a MethodSpec names the method it instantiates");
+        let member = assembly
+            .member_ref(definition.row())
+            .expect("the MemberRef row is readable");
+        assert_eq!(
+            member.parent().table(),
+            TYPE_SPEC,
+            "the parent is the instantiation's TypeSpec, so `<int>` is not lost"
+        );
+        assert_eq!(
+            member.signature_blob(),
+            &[0x30, 0x01, 0x01, 0x13, 0x00, 0x1e, 0x00],
+            "GENERIC | HAS_THIS, GenParamCount 1, 1 parameter, VAR 0 return, MVAR 0 parameter"
+        );
+    }
+
+    /// **A GENERIC METHOD ON A GENERIC *TYPE* HAS BOTH NUMBERING SPACES LIVE IN ONE SIGNATURE**,
+    /// and this is the smallest program that does. csc's own bytes for `Echo` are
+    /// `30 01 01 13 00 1e 00`: the GENERIC convention, `GenParamCount` 1, one parameter, a `!0`
+    /// (VAR 0) return beside an `!!0` (MVAR 0) parameter.
+    ///
+    /// **THE SIGNATURE BYTES ARE THE ASSERTION, BECAUSE EVERY WRONG ANSWER DECODES CLEANLY.** A
+    /// `TypeRef` parent naming `` Holder`1 `` loses the `<int>`; `!!0` written where `!0` was meant
+    /// names a different type; and under a `Holder<int>` whose argument is `int`, a run cannot tell
+    /// the two apart at all when only one of them appears. `0x13` and `0x1E` are one byte apart.
+    #[test]
+    fn a_generic_method_on_a_generic_type_declared_here_names_both_numbering_spaces() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Holder<TOuter> {
+                     public TOuter Echo<TMethod>(TMethod m) { return default(TOuter); }
+                 }
+                 public class Program {
+                     public static int Main() { return new Holder<int>().Echo<string>(\"x\"); }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let echo = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Holder`1"))
+            .expect("Holder`1 is in the image")
+            .methods()
+            .find(|m| m.name() == Some("Echo"))
+            .expect("Holder`1 declares Echo");
+        assert_eq!(
+            echo.signature_blob(),
+            &[0x30, 0x01, 0x01, 0x13, 0x00, 0x1e, 0x00],
+            "GENERIC | HAS_THIS, GenParamCount 1, 1 parameter, VAR 0 return, MVAR 0 parameter"
+        );
+
+        let members = member_refs_of(&assembly);
+        let echo_ref = members
+            .iter()
+            .find(|(_, name, _)| name == "Echo")
+            .expect("the call site mints a MemberRef for Echo");
+        assert_eq!(
+            echo_ref.0, TYPE_SPEC,
+            "the parent is the instantiation's TypeSpec, so `<int>` is not lost: {members:?}"
+        );
+        assert_eq!(
+            echo_ref.2,
+            [0x30, 0x01, 0x01, 0x13, 0x00, 0x1e, 0x00],
+            "II.23.2.1 wants the DEFINITION's signature -- `!0`, never the substituted int32"
+        );
+    }
+
+    /// **FOUR INSTRUCTIONS NAME A CONSTRUCTED GENERIC TYPE, AND THEY ASK ONE QUESTION.**
+    /// `newarr`, `castclass`, `isinst` and `ldtoken` all ask `instruction_type_token` for
+    /// an operand. Let an instantiation reach that question through no arm and each
+    /// refused with a message about its own opcode and the single missing case read as four
+    /// unrelated unimplemented features.
+    ///
+    /// **THE TABLE IS THE INSTRUMENT, NOT ANY ROW OF IT.** A fix written at one opcode passes that
+    /// opcode's row and leaves the others exactly as they were, which is the shape
+    /// `a-rule-with-several-implementations-gains-a-new-case-in-none-of-them` records. Each row
+    /// asserts the BLOB, because a `castclass` naming the DEFINITION accepts every instantiation --
+    /// which decodes cleanly and answers wrongly.
+    ///
+    /// **`ldtoken` IS THE FOURTH OPCODE AND IT IS NOT IN THIS TABLE**, because `typeof` lowers to
+    /// a call of `System.Type::GetTypeFromHandle` and this helper compiles against no references at
+    /// all. It is covered where a corlib exists: the generics-position probe compiles AND RUNS
+    /// `typeof(Box<T>).FullName` against csc, which is the row that reads the type ARGUMENT back
+    /// (`.Name` is `` Box`1 `` for every instantiation and cannot see it).
+    #[test]
+    fn every_instruction_naming_a_constructed_generic_gets_its_typespec() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> { public T Value; }
+                 public class Program {
+                     public static int Array<T>() { Box<T>[] a = new Box<T>[3]; a[0] = null; return 0; }
+                     public static T Cast<T>(object o) { return ((Box<T>)o).Value; }
+                     public static bool Test<T>(object o) { return o is Box<T>; }
+                     public static int Main() { return 0; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let program = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Program"))
+            .expect("Program is in the image");
+        let boxed = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Box`1"))
+            .expect("Box`1 is in the image");
+        let wanted = lamella_metadata::SigType::GenericInst {
+            definition: alloc::boxed::Box::new(lamella_metadata::SigType::Class(boxed.token())),
+            arguments: alloc::vec![lamella_metadata::SigType::MVar(0)],
+        };
+
+        for (method_name, opcode) in [
+            ("Array", lamella_cil::Opcode::Newarr),
+            ("Cast", lamella_cil::Opcode::Castclass),
+            ("Test", lamella_cil::Opcode::Isinst),
+        ] {
+            let operand = program
+                .methods()
+                .find(|m| m.name() == Some(method_name))
+                .unwrap_or_else(|| panic!("Program declares {method_name}"))
+                .body()
+                .unwrap_or_else(|| panic!("{method_name} has a body"))
+                .code
+                .iter()
+                .find_map(|instruction| match (instruction.opcode, &instruction.operand) {
+                    (found, lamella_cil::Operand::Token(token)) if found == opcode => Some(*token),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{method_name} lowers through {opcode:?}"));
+            assert_eq!(
+                operand.table(),
+                TYPE_SPEC,
+                "{opcode:?} names a TypeSpec; a TypeRef here is the phantom `T` again"
+            );
+            assert_eq!(
+                assembly.type_spec_signature(operand),
+                Some(wanted.clone()),
+                "{opcode:?} in {method_name} must name `Box<!!0>`, not the definition and not `Box<!0>`"
+            );
+        }
+
+        let refs: Vec<String> = assembly
+            .type_refs()
+            .filter_map(|r| r.name())
+            .map(|n| String::from(n.name))
+            .collect();
         assert!(
-            emitted_call_token(&expr, &mut image, &mut tokens).is_err(),
-            "a member of an instantiated generic type is refused, not emitted against a TypeRef"
+            !refs.iter().any(|name| name == "T"),
+            "no TypeRef is minted for the type parameter: {refs:?}"
         );
     }
 
     /// Compiles `source` to an image AS IF the generics gate were already lifted.
+    ///
+    /// **THIS DOES NOT SUBVERT THE EMIT-TRUST BARRIER, IT STATES ITS PRECONDITION.** The barrier
+    /// exists so a half-built feature cannot reach emit, and `Feature::Generics` is exactly such a
+    /// feature -- so a generic declaration draws `LAM0001` and `compile_source` returns no image.
+    /// The assertion below is the substitute: **the unit is bound FOR REAL and every diagnostic it
+    /// draws must be that one gate.** A generic declaration that also drew CS0246, or a cascade, or
+    /// anything else fails here rather than being emitted -- which is more than a clean bind proves,
+    /// because a clean bind cannot happen at all yet.
+    ///
+    /// It is also the only configuration in which the declaration stage can be observed, and it
+    /// disappears the day the gate lifts: this helper should then become an ordinary
+    /// `compile_source` call, and the test that still passes is the one that was measuring the
+    /// right thing.
     fn image_of_gated_source(source: &str) -> Vec<u8> {
         let options = LexOptions {
             version: LanguageVersion::CSharp2,
@@ -6365,6 +7630,251 @@ mod tests {
         image
     }
 
+    /// A property reached through TWO different instantiations names TWO different accessors.
+    ///
+    /// **THE ASSERTION IS THAT THE TOKENS DIFFER, AND NOTHING WEAKER WOULD HAVE CAUGHT THIS.**
+    /// Emitting `callvirt` at the SAME open `get_Item` MethodDef for both compiles, runs, and
+    /// returns `!0` unsubstituted from one shared method. Every
+    /// "does it compile" row was green against that, which is why the queue recorded the case as
+    /// "refused rather than named wrongly": the refusal path existed but was unreachable, because
+    /// with the declaring type erased the token lookup SUCCEEDED against the definition.
+    ///
+    /// A single instantiation cannot see it either -- one call to one method looks correct however
+    /// the token was chosen. Two are the instrument.
+    #[test]
+    fn a_property_on_two_instantiations_names_two_accessors() {
+        let image = image_of_gated_source(
+            "public class B<T> { private T f; \
+             public T Item { get { return f; } set { f = value; } } }\n\
+             public class C { public static void M(B<int> bi, B<string> bs) { \
+             int x = bi.Item; bi.Item = x; string s = bs.Item; bs.Item = s; } }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let calls: alloc::vec::Vec<lamella_token::Token> = assembly
+            .type_defs()
+            .filter(|t| t.name().is_some_and(|n| n.name == "C"))
+            .flat_map(|t| t.methods().collect::<alloc::vec::Vec<_>>())
+            .filter_map(|m| m.body())
+            .flat_map(|body| {
+                body.code
+                    .iter()
+                    .filter_map(|instruction| match instruction.operand {
+                        lamella_cil::Operand::Token(token) => Some(token),
+                        _ => None,
+                    })
+                    .collect::<alloc::vec::Vec<_>>()
+            })
+            .collect();
+        let member_refs: alloc::collections::BTreeSet<u32> =
+            calls.iter().filter(|t| t.table() == 0x0A).map(|t| t.row()).collect();
+        assert!(
+            member_refs.len() >= 4,
+            "each instantiation's getter and setter needs its OWN MemberRef; got {member_refs:?} \
+             from {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|t| t.table() == 0x06),
+            "no accessor may be called at the definition's own MethodDef -- that is the erased \
+             form, identical for every instantiation: {calls:?}"
+        );
+    }
+
+    /// [`image_of_gated_source`] with a csc-built REFERENCE assembly behind it, so an IMPORTED
+    /// generic definition is in scope.
+    ///
+    /// **A SEPARATE HARNESS BECAUSE A SAME-MODULE GENERIC CANNOT EXERCISE THE PATH UNDER TEST.**
+    /// A this-module `Box`1` already has a `TypeDef` in the token table, so `type_sig` finds it and
+    /// no minting is needed -- which is exactly why the imported case went unnoticed. The reference
+    /// is what makes the definition need a `TypeRef` that something has to mint.
+    /// `None` when the fixture is unavailable -- see [`reference_fixture`], whose note explains why
+    /// `include_bytes!` is the one thing this must not do.
+    fn image_of_source_against_generic_fixture(source: &str) -> Option<Vec<u8>> {
+        let fixture = reference_fixture(NESTED_FIXTURE)?;
+        Some(image_of_source_against(&fixture, source))
+    }
+
+    /// [`image_of_source_against_generic_fixture`] for any reference assembly.
+    ///
+    /// Taken as a parameter rather than copied per fixture: the generic-METHOD rows below need
+    /// `generic-methods.dll` where the rows above need `generic-params.dll`, and a second copy of
+    /// this body is a second place for the bind settings to drift from.
+    fn image_of_source_against(fixture: &[u8], source: &str) -> Vec<u8> {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(source, options);
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "the source must PARSE cleanly under C# 2: {:?}",
+            parsed.diagnostics
+        );
+        let units = alloc::vec![parsed.unit];
+        let references = alloc::vec![Assembly::read(fixture).expect("the fixture parses")];
+        for diagnostic in lamella_binder::bind_compilation_unit_with_dialect(
+            &units[0],
+            &references,
+            false,
+            LanguageVersion::CSharp2,
+        ) {
+            assert!(
+                diagnostic.severity() != Severity::Error,
+                "the bind must produce no ERROR: {}",
+                diagnostic.kind
+            );
+        }
+        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+            .expect("the barrier is minted from the assertion above");
+        let (image, _) = build_image(&program, "test.dll", "test", None, false, false)
+            .expect("an imported generic in a signature emits");
+        image
+    }
+
+    /// An IMPORTED generic definition used in every signature position a type can occupy.
+    ///
+    /// **THE POSITIONS ARE THE TEST, AND ONE OF THEM FOUND A SECOND MISSING SITE.** Minting is
+    /// spread over eighteen `mint_*` functions; adding the instantiation case to
+    /// `mint_signature_type` fixed the field, the parameter and the return, and an UNUSED LOCAL
+    /// still refused -- a local's declared type comes through `mint_named_type_token` instead, and
+    /// a local that was USED had been minted by the expression path so it passed either way.
+    /// One construct, three minting entries, and the case had landed in a subset of them.
+    ///
+    /// Each row is a whole compilation that must EMIT, so a refusal anywhere in the pipeline fails
+    /// it. `build_image` returning is the assertion.
+    #[test]
+    fn an_imported_generic_emits_in_every_signature_position() {
+        for (label, source) in [
+            ("field", "class C { Fixture.Box<Fixture.Plain> f; }"),
+            (
+                "parameter",
+                "class C { void M(Fixture.Box<Fixture.Plain> p) { } }",
+            ),
+            (
+                "return",
+                "class C { Fixture.Box<Fixture.Plain> M() { return null; } }",
+            ),
+            (
+                "UNUSED local -- the row that found the second site",
+                "class C { void M() { Fixture.Box<Fixture.Plain> x = null; } }",
+            ),
+            (
+                "used local",
+                "class C { Fixture.Box<Fixture.Plain> M() { \
+                 Fixture.Box<Fixture.Plain> x = null; return x; } }",
+            ),
+            ("array", "class C { Fixture.Box<Fixture.Plain>[] a; }"),
+            (
+                "array local",
+                "class C { void M() { Fixture.Box<Fixture.Plain>[] a = null; } }",
+            ),
+            (
+                "two arguments",
+                "class C { Fixture.Pair<Fixture.Plain, Fixture.Plain> p; }",
+            ),
+            (
+                "nested argument",
+                "class C { Fixture.Box<Fixture.Box<Fixture.Plain>> n; }",
+            ),
+            (
+                "ref parameter",
+                "class C { void M(ref Fixture.Box<Fixture.Plain> p) { } }",
+            ),
+        ] {
+            let Some(image) = image_of_source_against_generic_fixture(source) else {
+                return;
+            };
+            assert!(!image.is_empty(), "{label} must emit: {source}");
+        }
+    }
+
+    /// A generic call whose TYPE ARGUMENT is itself a type parameter -- `Util.Id<T>()` written
+    /// inside a generic body -- and the closed spelling beside it as the control.
+    ///
+    /// **THE OPEN ROW IS THE FIRST GENERIC CALL IN THIS TREE WHOSE ARGUMENT IS NOT A CLOSED TYPE.**
+    /// Every other call site passes something that names itself, so the argument encoder was never
+    /// asked a question it could not answer: it refused `T` as an unresolvable named type, dropped
+    /// the `MethodSpec`, and the whole call refused with "a generic call whose instantiation could
+    /// not be minted". The closed row passed throughout and is why nothing noticed.
+    ///
+    /// **THE BLOB IS THE ASSERTION, NOT THE EMIT.** A `MethodSpec` carrying the wrong argument
+    /// emits perfectly -- and an argument silently encoded as a TypeRef to a type named `T` is the
+    /// shape that compiles clean and throws `TypeLoadException` on entry, which no "it emitted"
+    /// check can see. `Var(0)` is the declaring type's first parameter, by position.
+    #[test]
+    fn a_generic_call_can_pass_a_type_parameter_as_its_argument() {
+        let Some(fixture) = reference_fixture(GENERIC_FIXTURE) else {
+            return;
+        };
+        let measured: Vec<(&str, Vec<Vec<lamella_metadata::SigType>>)> = [
+            (
+                "OPEN -- the argument is the declaring type's parameter",
+                "class Box<T> { public T Pass(T value) { return Fixture.Util.Id<T>(value); } }",
+            ),
+            (
+                "CONTROL -- closed, and it passed before the open row existed",
+                "class C { public int Pass(int value) { return Fixture.Util.Id<int>(value); } }",
+            ),
+        ]
+        .into_iter()
+        .map(|(label, source)| {
+            let image = image_of_source_against(&fixture, source);
+            let assembly = lamella_metadata::Assembly::read(&image)
+                .unwrap_or_else(|_| panic!("{label}: the emitted image parses"));
+            let rows = assembly
+                .tables()
+                .row_count(lamella_metadata::tables::table::METHOD_SPEC);
+            let specs = (1..=rows)
+                .filter_map(|row| {
+                    assembly.method_spec_instantiation(Token::new(
+                        lamella_metadata::tables::table::METHOD_SPEC,
+                        row,
+                    ))
+                })
+                .collect();
+            (label, specs)
+        })
+        .collect();
+
+        let expected: Vec<(&str, Vec<Vec<lamella_metadata::SigType>>)> = alloc::vec![
+            (
+                "OPEN -- the argument is the declaring type's parameter",
+                alloc::vec![alloc::vec![lamella_metadata::SigType::Var(0)]],
+            ),
+            (
+                "CONTROL -- closed, and it passed before the open row existed",
+                alloc::vec![alloc::vec![lamella_metadata::SigType::I4]],
+            ),
+        ];
+        assert_eq!(
+            measured, expected,
+            "each row emits exactly one MethodSpec carrying exactly its own argument"
+        );
+    }
+
+    /// The CONTROL for the row above: an imported NON-generic in the same positions. It passed
+    /// before the fix and must still pass, so a change that broke ordinary imported types would
+    /// fail here rather than hiding behind the generic rows going green.
+    #[test]
+    fn an_imported_non_generic_still_emits_in_the_same_positions() {
+        for source in [
+            "class C { Fixture.Plain f; }",
+            "class C { void M(Fixture.Plain p) { } }",
+            "class C { void M() { Fixture.Plain x = null; } }",
+            "class C { Fixture.Plain[] a; }",
+        ] {
+            let Some(image) = image_of_source_against_generic_fixture(source) else {
+                return;
+            };
+            assert!(!image.is_empty(), "the control must emit: {source}");
+        }
+    }
+
+    /// **A SOURCE-DECLARED GENERIC TYPE IS NAMED `` Box`1 `` IN METADATA AND CARRIES ITS
+    /// `GenericParam` ROWS.** Both halves are load-bearing and they fail in different places: the
+    /// arity-mangled NAME is the single key space the binder's model, a reference-assembly reader
+    /// and `type_sig`'s definition lookup all meet in -- emit `Box` and every one of them misses,
+    /// silently, returning `None` for the base class and the enclosing type. The ROWS are what give
+    /// the parameters names at all, so a consumer decoding `!0` has nothing to call it.
     #[test]
     fn a_declared_generic_type_is_mangled_and_carries_its_parameter_rows() {
         let image = image_of_gated_source("namespace App { public class Box<T> { } }\n");
@@ -6388,6 +7898,155 @@ mod tests {
         );
     }
 
+    /// The constraint FLAG WORD (II.23.1.7), read back per parameter, with an UNCONSTRAINED
+    /// parameter beside every constrained one.
+    ///
+    /// **THE UNCONSTRAINED ROW IS THE INSTRUMENT.** A writer that set a fixed flag word on every
+    /// parameter satisfies every positive assertion here; only the `Plain<T>` row separates that
+    /// from a writer that reads what the source said. Every expected value was measured from csc on
+    /// the same source, not derived from the flag table.
+    #[test]
+    fn a_type_parameters_constraint_flags_are_emitted_and_match_csc() {
+        let image = image_of_gated_source(
+            "public interface IFoo { }\n\
+             public class RefC<T> where T : class { }\n\
+             public class ValC<T> where T : struct { }\n\
+             public class NewC<T> where T : new() { }\n\
+             public class IfaceC<T> where T : IFoo { }\n\
+             public class Plain<T> { }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let flags: alloc::collections::BTreeMap<&str, u32> = assembly
+            .type_defs()
+            .filter_map(|t| {
+                let name = t.name()?.name;
+                let row = t.token().row();
+                let flags = assembly
+                    .generic_params()
+                    .find(|&(_, _, owner, _)| owner == row << 1)
+                    .map(|(_, flags, _, _)| flags)?;
+                Some((name, flags))
+            })
+            .collect();
+
+        assert_eq!(flags.get("RefC`1"), Some(&0x0004), "class");
+        assert_eq!(flags.get("ValC`1"), Some(&0x0018), "struct implies new()");
+        assert_eq!(flags.get("NewC`1"), Some(&0x0010), "new()");
+        assert_eq!(flags.get("IfaceC`1"), Some(&0x0000), "an interface constraint is not a flag");
+        assert_eq!(flags.get("Plain`1"), Some(&0x0000), "the control: nothing written, nothing set");
+    }
+
+    /// A named constraint becomes a `GenericParamConstraint` ROW owned by the right parameter.
+    ///
+    /// **THE LOAD-BEARING ASSERTION IS THE OWNER, NOT THE COUNT.** `GenericParam` is
+    /// required-sorted and the finalizer reorders it, while `GenericParamConstraint.Owner` is a ROW
+    /// index into it -- so an emitter that sorts without remapping produces the RIGHT NUMBER of
+    /// perfectly valid rows attached to the WRONG parameters. Nothing structural detects that.
+    ///
+    /// **THE FIXTURE PUTS A GENERIC METHOD INSIDE A GENERIC TYPE, AND THAT IS THE ENTIRE POINT
+    /// OF THE ROW.** An earlier version used two sibling generic types and was GREEN against the
+    /// unremapped sort -- because their rows were already in owner order, so the sort was a no-op
+    /// and there was nothing to repoint. Owner is a `TypeOrMethodDef` coded index (`TypeDef` = row
+    /// << 1, `MethodDef` = row << 1 | 1), so a method's parameter sorts BEFORE its declaring type's
+    /// even though it is emitted after -- which is the only cheap way to make emission order differ
+    /// from key order. Red-proved by restoring the plain sort: this row fails, and it did NOT fail
+    /// before the fixture changed.
+    #[test]
+    fn a_named_constraint_is_a_row_owned_by_the_parameter_that_declared_it() {
+        let image = image_of_gated_source(
+            "public interface IFoo { }\n\
+             public class Bas { }\n\
+             public class Outer<T> where T : Bas { public void M<U>() where U : IFoo { } }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let params: alloc::vec::Vec<(u32, u32, u32, Option<&str>)> =
+            assembly.generic_params().collect();
+        let rows = assembly
+            .tables()
+            .row_count(lamella_metadata::tables::table::GENERIC_PARAM_CONSTRAINT);
+        assert_eq!(rows, 2, "one row per NAMED constraint, and none for the parameters' flags");
+
+        let mut pairs: alloc::vec::Vec<(&str, alloc::string::String)> = alloc::vec::Vec::new();
+        for index in 1..=rows {
+            let row = assembly
+                .tables()
+                .row(lamella_metadata::tables::table::GENERIC_PARAM_CONSTRAINT, index)
+                .expect("the row is present");
+            let owner = params
+                .get(row.raw(0).saturating_sub(1) as usize)
+                .and_then(|&(_, _, _, name)| name)
+                .expect("the owner names a real GenericParam row");
+            let coded = row.raw(1);
+            let (tag, target) = (coded & 3, coded >> 2);
+            let name = if tag == 0 {
+                assembly
+                    .type_defs()
+                    .find(|t| t.token().row() == target)
+                    .and_then(|t| t.name().map(|n| n.name))
+                    .unwrap_or("<unknown TypeDef>")
+            } else {
+                "<external>"
+            };
+            pairs.push((owner, alloc::string::String::from(name)));
+        }
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [
+                ("T", alloc::string::String::from("Bas")),
+                ("U", alloc::string::String::from("IFoo")),
+            ],
+            "each constraint must be attached to the parameter that DECLARED it -- a swap here is \
+             a valid assembly stating the wrong constraints"
+        );
+    }
+
+    /// The constraints survive a ROUND TRIP: emitted here, read back through the same reader
+    /// `reference.rs` uses when it loads a referenced assembly.
+    ///
+    /// **THIS IS A CLOSED LOOP AND SAYS SO.** Both halves are ours, so it proves the writer and the
+    /// reader AGREE -- not that either matches ECMA-335. The independent check is the csc
+    /// differential run by hand: for one source csc emitted the same nine flag words
+    /// byte for byte and the same six constraint rows, which is what established that `where T :
+    /// struct` carries a `System.ValueType` row as well as its flag. A row here that asserted
+    /// conformance rather than agreement would be the fixture-builds-its-own-input shape.
+    #[test]
+    fn emitted_constraints_read_back_through_the_reference_reader() {
+        let image = image_of_gated_source(
+            "public interface IFoo { }\n\
+             public class Con<T, U> where T : class, IFoo where U : struct { }\n",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let by_parameter = assembly.generic_param_constraints();
+
+        let con = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name.starts_with("Con")))
+            .expect("the type is in the image");
+        let owner = con.token().row() << 1;
+
+        let (t_flags, t_types) = by_parameter.get(&(owner, 0)).expect("T's entry");
+        assert_eq!(*t_flags & 0x001C, 0x0004, "T is `class` and nothing else");
+        assert_eq!(t_types.len(), 1, "T's named constraint is one row (IFoo)");
+
+        let (u_flags, u_types) = by_parameter.get(&(owner, 1)).expect("U's entry");
+        assert_eq!(
+            *u_flags & 0x001C,
+            0x0018,
+            "U is `struct`, which carries the constructor bit with it (II.10.1.7)"
+        );
+        assert_eq!(u_types.len(), 1, "the struct flag is accompanied by its ValueType row");
+    }
+
+    /// **TWO PARAMETERS, AND THE ASSERTION READS THE `Number` COLUMN RATHER THAN THE ORDER THE
+    /// NAMES COME BACK IN.** That distinction is the whole test, and it is not theoretical: an
+    /// earlier version of this row asserted the NAMES through `type_parameter_names` and **stayed
+    /// green against a writer that numbered every parameter zero** -- the names arrive in row order,
+    /// so the column that actually maps `!0` to `TKey` and `!1` to `TValue` was never looked at.
+    /// A consumer resolving `!1` against that image finds nothing.
+    ///
+    /// And a non-generic sibling is beside them, because a change that put a row on EVERY type
+    /// passes every positive assertion here.
     #[test]
     fn parameter_rows_are_numbered_by_position_and_only_generic_types_get_them() {
         let image = image_of_gated_source(
@@ -6418,6 +8077,14 @@ mod tests {
         );
     }
 
+    /// **A MEMBER THAT NAMES ITS TYPE'S PARAMETER ENCODES `!0`, AND THE ALTERNATIVE IS NOT A
+    /// WORSE SIGNATURE BUT NO SIGNATURE AT ALL.** `type_sig` has no case for a bare `T`: it falls
+    /// through to the named-type lookup, finds nothing, and refuses -- so before this, a generic
+    /// type with any member mentioning `T` could not be emitted even with the gate lifted.
+    ///
+    /// Asserted on the SIGNATURE BYTES because that is where the distinction lives. `0x13` is
+    /// `ELEMENT_TYPE_VAR` and `0x1E` is `ELEMENT_TYPE_MVAR` (II.23.1.16) -- one byte apart, both
+    /// decode cleanly, and they name different types.
     #[test]
     fn a_member_naming_its_types_parameter_encodes_var_not_mvar() {
         let image = image_of_gated_source(
@@ -6448,6 +8115,867 @@ mod tests {
         );
     }
 
+    /// **A DECLARED GENERIC METHOD CARRIES THE GENERIC CONVENTION, ITS `GenParamCount`, AND ROWS
+    /// THE `MethodDef` OWNS -- AND THE THREE MUST AGREE.** II.23.2.1 is explicit that the SIGNATURE
+    /// is what makes a method generic; `GenericParam` rows without the convention are metadata that
+    /// contradicts itself, and csc answers CS0308 at a call site against such a method. The
+    /// signature bytes are asserted directly because that is where the disagreement would live.
+    ///
+    /// `T Id<T>(T x)`, static: `0x10` GENERIC, `0x01` GenParamCount, `0x01` ParamCount,
+    /// `1E 00` return `!!0`, `1E 00` parameter `!!0`.
+    #[test]
+    fn a_declared_generic_method_is_generic_in_its_signature_and_owns_its_rows() {
+        let image = image_of_gated_source(
+            "namespace App { public class Util { public static T Id<T>(T x) { return x; } } }
+",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let util = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Util"))
+            .expect("Util is in the image");
+        let id = util
+            .methods()
+            .find(|m| m.name() == Some("Id"))
+            .expect("Util declares Id");
+
+        assert_eq!(
+            id.signature_blob(),
+            &[0x10, 0x01, 0x01, 0x1E, 0x00, 0x1E, 0x00],
+            "a declared `T Id<T>(T)` is GENERIC over one parameter, spelled with `!!0`"
+        );
+
+        let rows: Vec<(u32, u32, Option<&str>)> = assembly
+            .generic_params()
+            .map(|(number, _flags, owner, name)| (number, owner, name))
+            .collect();
+        assert_eq!(
+            rows,
+            [((0), (id.token().row() << 1) | 1, Some("T"))],
+            "one row, numbered 0, owned by the MethodDef"
+        );
+
+        assert!(
+            assembly.type_parameter_names().is_empty(),
+            "a non-generic type owns no parameter, even when its method declares one"
+        );
+    }
+
+    /// The `TypeSpec` table's index (II.22.39), as a `MemberRef` parent token's table byte.
+    const TYPE_SPEC: u8 = lamella_metadata::tables::table::TYPE_SPEC;
+
+    /// Every `MemberRef` in `image` as `(parent table, name, signature blob)`.
+    fn member_refs_of(assembly: &Assembly<'_>) -> Vec<(u8, String, Vec<u8>)> {
+        assembly
+            .member_refs()
+            .map(|member| {
+                (
+                    member.parent().table(),
+                    String::from(member.name().unwrap_or_default()),
+                    member.signature_blob().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// **A MEMBER OF AN INSTANTIATED GENERIC TYPE IS NAMED BY A `MemberRef` WHOSE PARENT IS A
+    /// `TypeSpec` CARRYING THE ARGUMENTS (II.23.2.1), AND EVERY WRONG ANSWER HERE DECODES
+    /// CLEANLY.** Measured before this landed, on exactly this source: `Box<int>.Echo(41)` emitted
+    /// a `MemberRef` parented on a `TypeRef` to this module's OWN `` Box`1 `` -- the `<int>` gone,
+    /// the signature substituted -- and `b.Get()` emitted `callvirt` straight at the open
+    /// `MethodDef`. Both compiled, exited 0, and produced IL instruction-for-instruction identical
+    /// to the non-generic control's.
+    ///
+    /// **THE SIGNATURE IS ASSERTED AGAINST THE DEFINITION'S OWN `MethodDef` BLOB RATHER THAN
+    /// AGAINST A LITERAL, AND THAT IS THE POINT OF THE ROW.** II.23.2.1 requires the `MemberRef` to
+    /// carry the DEFINITION's signature -- `!0`, not the substituted `int32` -- so the definition
+    /// already holds an independent copy of the right answer, written by the declaration path
+    /// rather than by the minting path under test. A literal would be a second transcription of my
+    /// own reading; this is two producers agreeing.
+    ///
+    /// The three shapes are here together because they took three different routes to the same
+    /// defect: the ctor was REFUSED outright, the instance call named the open `MethodDef`, and the
+    /// static call minted a wrong `MemberRef`. One fix, three symptoms, so one test.
+    #[test]
+    fn a_member_of_an_instantiated_generic_type_is_named_through_a_type_spec() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> {
+                     private T item;
+                     public Box(T value) { item = value; }
+                     public T Get() { return item; }
+                     public static T Echo(T value) { return value; }
+                 }
+                 public class Program {
+                     public static int Main() {
+                         App.Box<int> b = new App.Box<int>(41);
+                         return App.Box<int>.Echo(b.Get());
+                     }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let boxed = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Box`1"))
+            .expect("Box`1 is in the image");
+        let definition_sig = |name: &str| {
+            boxed
+                .methods()
+                .find(|m| m.name() == Some(name))
+                .unwrap_or_else(|| panic!("Box`1 declares {name}"))
+                .signature_blob()
+                .to_vec()
+        };
+
+        let members = member_refs_of(&assembly);
+        for name in [".ctor", "Get", "Echo"] {
+            let found = members
+                .iter()
+                .find(|(parent, member, _)| *parent == TYPE_SPEC && member == name)
+                .unwrap_or_else(|| {
+                    panic!("`{name}` on Box<int> is named through a TypeSpec, got {members:?}")
+                });
+            assert_eq!(
+                found.2,
+                definition_sig(name),
+                "`{name}`'s MemberRef carries the DEFINITION's signature, byte for byte"
+            );
+        }
+
+        let parent = assembly
+            .member_refs()
+            .find(|member| member.name() == Some(".ctor") && member.parent().table() == TYPE_SPEC)
+            .expect("the constructor is TypeSpec-parented")
+            .parent();
+        let spec = assembly
+            .type_spec_signature(parent)
+            .expect("the parent TypeSpec's blob decodes");
+        assert_eq!(
+            spec,
+            lamella_metadata::SigType::GenericInst {
+                definition: alloc::boxed::Box::new(lamella_metadata::SigType::Class(
+                    boxed.token()
+                )),
+                arguments: alloc::vec![lamella_metadata::SigType::I4],
+            },
+            "the parent is `Box`1<int32>` over this module's OWN TypeDef, not a TypeRef to it"
+        );
+    }
+
+    /// **THE ROW WHERE ERASURE CORRUPTS DATA RATHER THAN METADATA.** ECMA-335 II.9.7 gives each
+    /// instantiation of a generic type its own copy of each static field. With the use site erased,
+    /// `Counter<int>.Total` and `Counter<string>.Total` both named the definition's single
+    /// `FieldDef` and shared ONE cell -- measured on the interpreter tier as a program answering
+    /// 503503 where 10507 is correct, **with zero violations reported**, because an erased use site
+    /// is indistinguishable from non-generic code and so is never refused.
+    ///
+    /// **THE ASSERTION IS THAT THE TWO PARENTS DIFFER, WHICH IS THE PROPERTY STORAGE FOLLOWS.**
+    /// Asserting each field merely HAS a `TypeSpec` parent would pass a writer that gave both the
+    /// same one -- and that writer shares the cell exactly as the old one did, while looking
+    /// correct in every other respect.
+    ///
+    /// `Total` is declared `int`, so its signature is byte-identical open and closed. Nothing
+    /// about the SIGNATURE distinguishes the right answer from the wrong one here; only the parent
+    /// row does. That is why the defect ran silently, and why a signature-only assertion is not a
+    /// substitute for this one.
+    ///
+    /// **THERE ARE THREE PARENTS AND NOT TWO, AND THE THIRD IS THE ONE `Add`'S OWN BODY USES.**
+    /// `Total = Total + n` inside `Counter<T>` names the type over its OWN parameter,
+    /// `` Counter<!0> `` -- a definition reached in its own body is still an instantiation.
+    /// Measured against csc on this exact program: three `MemberRef`s named `Total`, parented by
+    /// `` Counter<!0> ``, `Counter<int>` and `Counter<string>`.
+    ///
+    /// **THE NON-GENERIC SIBLING IS STILL THE CONTROL, AND IT IS NOW ASSERTED BY NAME.** `Plain`
+    /// is a this-module type whose static field the token pre-pass already registered, so it must
+    /// mint no `MemberRef` at all. A count alone can no longer say so -- three is now the right
+    /// answer for two different reasons -- so the parents are checked against `Plain`'s own row
+    /// instead.
+    #[test]
+    fn a_static_field_of_two_instantiations_names_two_distinct_parents() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Counter<T> {
+                     public static int Total = 7;
+                     public static void Add(int n) { Total = Total + n; }
+                 }
+                 public class Plain { public static int Total = 7; }
+                 public class Program {
+                     public static int Main() {
+                         App.Counter<int>.Add(3);
+                         App.Counter<string>.Add(500);
+                         return App.Counter<int>.Total * 1000 + App.Counter<string>.Total + Plain.Total;
+                     }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let totals: Vec<Token> = assembly
+            .member_refs()
+            .filter(|member| member.is_field() && member.name() == Some("Total"))
+            .map(|member| member.parent())
+            .collect();
+        assert!(
+            totals.iter().all(|parent| parent.table() == TYPE_SPEC),
+            "a static field of an instantiated type is named through a TypeSpec, and the \
+             non-generic sibling is not named by a MemberRef at all: {totals:?}"
+        );
+        let argument_of = |parent: Token| match assembly.type_spec_signature(parent) {
+            Some(lamella_metadata::SigType::GenericInst { arguments, .. }) => arguments,
+            other => panic!("the parent is a GenericInst, got {other:?}"),
+        };
+        let mut arguments: Vec<Vec<lamella_metadata::SigType>> =
+            totals.iter().map(|parent| argument_of(*parent)).collect();
+        arguments.sort_by_key(|argument| alloc::format!("{argument:?}"));
+        assert_eq!(
+            arguments,
+            alloc::vec![
+                alloc::vec![lamella_metadata::SigType::I4],
+                alloc::vec![lamella_metadata::SigType::String],
+                alloc::vec![lamella_metadata::SigType::Var(0)],
+            ],
+            "csc emits three: Counter<!0> for the in-body access, then Counter<int> and \
+             Counter<string> for the two use sites"
+        );
+    }
+
+    /// **`typeof(Box<>)` NAMES THE DEFINITION'S OWN ROW AND `typeof(Box<int>)` NAMES A `TypeSpec`,
+    /// AND THE ASSERTION IS THAT THEY DIFFER.** ECMA-334 4th ed 14.5.11: an `unbound-type-name`
+    /// *resolves to the unbound generic type associated with the resulting constructed type*, and
+    /// 25.5 adds that its `System.Type` *is not the same as* an instantiation's -- so an emitter
+    /// that answered one row for both would make the probe's `open == closed` TRUE, which is the
+    /// program's own refusal condition.
+    ///
+    /// **MEASURED AGAINST csc BEFORE THIS WAS WRITTEN, with `System.Reflection.Metadata` over csc's
+    /// own output**: `typeof(List<>)` is `ldtoken` of the **TypeRef** `` List`1 ``,
+    /// `typeof(Dictionary<,>)` of `` Dictionary`2 ``, and `typeof(List<int>)` beside them of a
+    /// `TypeSpec`. lcsc now emits the same three shapes. The unbound form names no `TypeSpec` at
+    /// all, which is the half a `TypeSpec`-vs-`TypeSpec` comparison could not have caught.
+    ///
+    /// Declared in this module rather than imported, so the definition's row is a `TypeDef` and the
+    /// test needs no reference assembly; against a referenced `List<T>` the same path yields the
+    /// `TypeRef` csc emits, and `generics-parity`'s `typeof-open-generic-type` row is that case.
+    ///
+    /// The locals are `object` rather than `System.Type` for the helper's reason and not for
+    /// style: this compiles against NO references, so naming `System.Type` in source is a CS0246
+    /// and the helper admits no diagnostic but the generics gate. `ldtoken` is emitted from the
+    /// operand either way, which is the whole of what this reads.
+    #[test]
+    fn an_unbound_generic_typeof_names_the_definition_and_a_constructed_one_names_a_type_spec() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> { }
+                 public class Pair<T, U> { }
+                 public class Program {
+                     public static int Main() {
+                         object open = typeof(App.Box<>);
+                         object closed = typeof(App.Box<int>);
+                         object two = typeof(App.Pair<,>);
+                         return (open == closed || open == two) ? 1 : 42;
+                     }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let main = assembly
+            .find_type("App", "Program")
+            .expect("the Program type")
+            .methods()
+            .find(|method| method.name() == Some("Main"))
+            .expect("the Main method");
+        let body = main.body().expect("Main has a method body");
+        let reflected: Vec<Token> = body
+            .code
+            .iter()
+            .filter(|instruction| instruction.opcode == lamella_cil::Opcode::Ldtoken)
+            .filter_map(|instruction| match instruction.operand {
+                lamella_cil::Operand::Token(token) => Some(token),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reflected.len(), 3, "three typeof operands: {reflected:?}");
+        assert_eq!(
+            reflected
+                .iter()
+                .map(|token| token.table())
+                .collect::<Vec<u8>>(),
+            alloc::vec![TYPE_DEF, TYPE_SPEC, TYPE_DEF],
+            "the unbound forms name their definition's row and the constructed one a TypeSpec: \
+             {reflected:?}"
+        );
+        assert_ne!(
+            reflected[0], reflected[2],
+            "Box<> and Pair<,> are two definitions, not one: {reflected:?}"
+        );
+        let named = |token: Token| {
+            assembly
+                .type_defs()
+                .find(|ty| ty.token() == token)
+                .and_then(|ty| ty.name().map(|name| alloc::format!("{}", name.name)))
+        };
+        assert_eq!(named(reflected[0]).as_deref(), Some("Box`1"));
+        assert_eq!(named(reflected[2]).as_deref(), Some("Pair`2"));
+    }
+
+    /// **`beforefieldinit`'s ABSENCE IS A DEMAND, NOT A DEFAULT.** A type without the flag requires
+    /// PRECISE initializer timing (II.10.5.3.3); with it, the initializer may run at or before
+    /// first static field access. Omitting it for nothing says every type in the image needs a
+    /// first-access check.
+    ///
+    /// Measured on the class library: **100% of trigger sites need a runtime check when the flag
+    /// is omitted, against 4% under csc's on the same sources.** The flag is most of a lazy
+    /// initializer's cost, decided before the mechanism is written.
+    ///
+    /// **THE RULE IS csc's, MEASURED ACROSS EVERY TYPE KIND RATHER THAN RECALLED -- AND TWO ROWS
+    /// ARE NOT WHAT "unless it declares a static constructor" PREDICTS.** An enum and a delegate
+    /// never carry it, which reasoning from the C# rule alone would have got wrong for two whole
+    /// type kinds.
+    ///
+    /// The `StaticFieldInit` row is the one that decides the implementation: it HAS a `.cctor`
+    /// (synthesized for its initializers) and KEEPS the flag. Keying off the presence of a `.cctor`
+    /// would clear it for nearly every type that has one -- the exact outcome this change exists to
+    /// stop. Only an explicitly DECLARED `static C()` is the request for precise timing.
+    #[test]
+    fn before_field_init_matches_csc_for_every_type_kind() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class NoStatics { public int Y; }
+                 public class StaticFieldInit { public static int X = 5; }
+                 public class ExplicitCctor { public static int X; static ExplicitCctor() { X = 5; } }
+                 public struct PlainStruct { public int X; }
+                 public enum Color { A, B }
+                 public interface IThing { void M(); }
+                 public delegate void D();
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let flagged = |name: &str| -> bool {
+            let type_def = assembly
+                .type_defs()
+                .find(|t| t.name().is_some_and(|n| n.name == name))
+                .unwrap_or_else(|| panic!("{name} is in the image"));
+            (type_def.flags() & TYPE_BEFORE_FIELD_INIT) != 0
+        };
+        assert!(flagged("NoStatics"), "a class with no statics carries it");
+        assert!(
+            flagged("StaticFieldInit"),
+            "static field initializers get a .cctor and KEEP the flag -- they are not a request \
+             for precise timing"
+        );
+        assert!(
+            !flagged("ExplicitCctor"),
+            "an explicitly declared `static C()` IS the request, and is the only thing that is"
+        );
+        assert!(flagged("PlainStruct"), "a struct carries it");
+        assert!(flagged("IThing"), "an interface carries it");
+        assert!(!flagged("Color"), "an enum never carries it, measured from csc");
+        assert!(!flagged("D"), "a delegate never carries it, measured from csc");
+    }
+
+    /// **`default(T)` IS THE ONLY SPELLING OF A TYPE PARAMETER'S ZERO, AND ITS VALUE CANNOT BE
+    /// DECIDED WHERE IT IS WRITTEN.** `T` may close over a reference type, where the answer is
+    /// `null`, or a struct, where it is an all-zero value -- and one `default(T)` is both, per
+    /// instantiation. So it lowers to the single form correct for either: `initobj` over a token
+    /// naming `!0`, resolved against the instantiation in hand.
+    ///
+    /// **ASSERTED ON THE `TypeSpec` BLOB, NOT ON THE OPCODE.** That an `initobj` is emitted says
+    /// nothing about WHICH type it initializes, and every wrong answer here decodes cleanly -- a
+    /// `TypeRef` to an invented type called `T` (which nothing mints, precisely so this lookup
+    /// cannot find one), or `!1` where `!0` was meant.
+    ///
+    /// csc emits the identical token for the identical source -- `initobj` over `TypeSpec` row 1 --
+    /// measured against it rather than assumed.
+    #[test]
+    fn default_of_a_type_parameter_initobjs_over_a_var_type_spec() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> { public T Zero() { return default(T); } }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let boxed = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Box`1"))
+            .expect("Box`1 is in the image");
+        let zero = boxed
+            .methods()
+            .find(|m| m.name() == Some("Zero"))
+            .expect("Box`1 declares Zero");
+        let token = zero
+            .body()
+            .expect("Zero has a body")
+            .code
+            .iter()
+            .find_map(|instruction| match (instruction.opcode, &instruction.operand) {
+                (lamella_cil::Opcode::Initobj, lamella_cil::Operand::Token(token)) => Some(*token),
+                _ => None,
+            })
+            .expect("default(T) lowers through initobj");
+        assert_eq!(
+            token.table(),
+            TYPE_SPEC,
+            "a bare `T` is named by a TypeSpec -- it deliberately has no TypeRef of its own"
+        );
+        assert_eq!(
+            assembly.type_spec_signature(token),
+            Some(lamella_metadata::SigType::Var(0)),
+            "the blob is `!0`; `!1` or a class ref would decode just as cleanly and mean otherwise"
+        );
+        assert_eq!(
+            zero.local_variables().first(),
+            Some(&lamella_metadata::SigType::Var(0))
+        );
+    }
+
+    /// The three non-generic shapes, because **`default` is not a generics feature** -- it is a
+    /// C# 2.0 operator that applies to every type, and it was missing for every type (measured:
+    /// `default(int)` and `default(string)` failed at the PARSER exactly as `default(T)` did). Each
+    /// lowers differently, so an implementation covering one would still compile the others wrongly.
+    #[test]
+    fn default_of_an_ordinary_type_lowers_by_what_the_type_is() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public struct Pt { public int X; }
+                 public class C {
+                     public int Zi() { return default(int); }
+                     public string Zs() { return default(string); }
+                     public Pt Zp() { return default(Pt); }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let holder = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "C"))
+            .expect("C is in the image");
+        let opcodes = |name: &str| -> Vec<lamella_cil::Opcode> {
+            holder
+                .methods()
+                .find(|m| m.name() == Some(name))
+                .unwrap_or_else(|| panic!("C declares {name}"))
+                .body()
+                .expect("the method has a body")
+                .code
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .collect()
+        };
+        assert!(opcodes("Zi").contains(&lamella_cil::Opcode::LdcI4));
+        assert!(
+            opcodes("Zs").contains(&lamella_cil::Opcode::Ldnull),
+            "a reference type's default is the null reference"
+        );
+        assert!(
+            opcodes("Zp").contains(&lamella_cil::Opcode::Initobj),
+            "a struct's default is its all-zero value through initobj"
+        );
+        assert!(
+            !opcodes("Zp").contains(&lamella_cil::Opcode::Ldnull),
+            "a struct's default is not a null reference"
+        );
+    }
+
+    /// **THE EMITTER RE-BINDS EVERY BODY, AND IT WAS DOING SO WITHOUT THE TYPE'S PARAMETERS IN
+    /// SCOPE.** A local `T x;` inside `class Box<T>` bound CLEAN -- the diagnostic pass wraps body
+    /// binding in `enter_type_parameters` -- and then failed at emit with *"the error type has no
+    /// signature"*, because this stage binds the same body a second time and had never entered that
+    /// scope. `T` resolved in one phase and became the ERROR type in the other.
+    ///
+    /// **NOTHING REPORTED IT, BY DESIGN.** An emit-time diagnostic reaches no one (the constructor
+    /// chain says so in as many words), so the CS0246 raised here was discarded and the only
+    /// evidence was a signature refusal three steps downstream. What proved where it lived: a
+    /// program with BOTH `Nope y;` and `T x;` reports CS0246 for `Nope` ALONE.
+    ///
+    /// **`new T[1]` WAS THE SAME DEFECT WEARING A DIFFERENT MESSAGE** -- *"array creation of a
+    /// non-array type"* -- because `T[]` had become an array of the error type. Two symptoms with
+    /// different names, one cause, and neither name pointed at it.
+    ///
+    /// **ASSERTED ON THE EMITTED LOCAL SIGNATURE, WHICH IS THE PHASE THAT WAS BROKEN.** A binder
+    /// test cannot see this: binding was already correct. The slot must decode as `!0`
+    /// (`ELEMENT_TYPE_VAR 0`), not as a class ref and not as the error type.
+    #[test]
+    fn a_local_of_the_types_own_parameter_emits_as_var_zero() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> {
+                     public T Keep(T v) { T x = v; return x; }
+                     public T[] Make() { T[] a = new T[1]; return a; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let boxed = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Box`1"))
+            .expect("Box`1 is in the image");
+        let locals_of = |name: &str| {
+            boxed
+                .methods()
+                .find(|m| m.name() == Some(name))
+                .unwrap_or_else(|| panic!("Box`1 declares {name}"))
+                .local_variables()
+        };
+        assert_eq!(
+            locals_of("Keep").first(),
+            Some(&lamella_metadata::SigType::Var(0)),
+            "a local of the declaring type's own parameter is `!0`"
+        );
+        assert!(
+            locals_of("Make")
+                .iter()
+                .any(|ty| matches!(ty, lamella_metadata::SigType::SzArray(element)
+                    if **element == lamella_metadata::SigType::Var(0))),
+            "an array of the type's own parameter is `!0[]`: {:?}",
+            locals_of("Make")
+        );
+    }
+
+    /// **`Box<T>` IS TWO ROWS AND ONE SYMBOL.** Encode a constructed type whose argument is a type
+    /// parameter in an EMPTY scope and its `<T>` falls through to a named-type lookup, finding the
+    /// phantom `TypeRef` the walk has just minted:
+    /// `T Unwrap<T>(Box<T> b) { return b.Value; }` compiled CLEAN and threw `TypeLoadException:
+    /// Could not load type 'T'` on entry. Seven programs did, over both numbering spaces.
+    ///
+    /// **THE TABLE IS OVER POSITIONS AND SPACES, NOT AN EXAMPLE.** The same spelling `Box<T>` is
+    /// `Box<!0>` in a member of `` Holder`1 `` and `Box<!!0>` in a generic method, and the binder
+    /// substitutes by NAME so both display alike. One image must carry BOTH rows: a `type_specs`
+    /// map keyed by the display string answered the second with the first's token, which is
+    /// metadata that decodes cleanly and names the other thing.
+    ///
+    /// **`Var(0)` ALONE IS THE THIRD ROW AND IT IS THE ONE WITH NO INSTANTIATION IN IT.**
+    /// `TOuter[] a = new TOuter[3];` needs a token for `newarr`, and a bare parameter has none by
+    /// design -- so that program threw too, from a `newarr` naming a class called `TOuter`. It is
+    /// in this table because a fixture built only from constructed types cannot express it.
+    #[test]
+    fn a_constructed_type_over_a_parameter_encodes_its_position_in_both_spaces() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> { public T Value; }
+                 public class Holder<TOuter> {
+                     public TOuter Same(Box<TOuter> b) { return b.Value; }
+                     public int Count() { TOuter[] a = new TOuter[3]; return a == null ? 0 : 3; }
+                 }
+                 public class Program {
+                     public static T Unwrap<T>(Box<T> b) { return b.Value; }
+                     public static int Main() { return 0; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let boxed = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Box`1"))
+            .expect("Box`1 is in the image");
+        let specs: Vec<lamella_metadata::SigType> = (1..64)
+            .filter_map(|row| assembly.type_spec_signature(Token::new(TYPE_SPEC, row)))
+            .collect();
+        let over = |argument: lamella_metadata::SigType| lamella_metadata::SigType::GenericInst {
+            definition: alloc::boxed::Box::new(lamella_metadata::SigType::Class(boxed.token())),
+            arguments: alloc::vec![argument],
+        };
+        for (what, wanted) in [
+            ("Box<!0>, the declaring type's parameter", over(lamella_metadata::SigType::Var(0))),
+            ("Box<!!0>, the method's own parameter", over(lamella_metadata::SigType::MVar(0))),
+        ] {
+            assert!(
+                specs.contains(&wanted),
+                "{what} is a TypeSpec row of its own; the table holds {specs:?}"
+            );
+        }
+
+        let count = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Holder`1"))
+            .expect("Holder`1 is in the image")
+            .methods()
+            .find(|m| m.name() == Some("Count"))
+            .expect("Holder`1 declares Count");
+        let element = count
+            .body()
+            .expect("Count has a body")
+            .code
+            .iter()
+            .find_map(|instruction| match (instruction.opcode, &instruction.operand) {
+                (lamella_cil::Opcode::Newarr, lamella_cil::Operand::Token(token)) => Some(*token),
+                _ => None,
+            })
+            .expect("`new TOuter[3]` lowers through newarr");
+        assert_eq!(
+            element.table(),
+            TYPE_SPEC,
+            "`newarr` over a type parameter names a TypeSpec; a TypeRef here is the phantom `T`"
+        );
+        assert_eq!(
+            assembly.type_spec_signature(element),
+            Some(lamella_metadata::SigType::Var(0)),
+            "the element blob is `!0` -- the position, not a class of that name"
+        );
+        let refs: Vec<String> = assembly
+            .type_refs()
+            .filter_map(|r| r.name())
+            .map(|n| String::from(n.name))
+            .collect();
+        assert!(
+            !refs.iter().any(|name| name == "T" || name == "TOuter"),
+            "no TypeRef is minted for either type parameter: {refs:?}"
+        );
+    }
+
+    /// **THE EMITTER RE-BINDS EVERY BODY, SO BOTH PARAMETER SCOPES HAVE TO BE OPEN AROUND IT.**
+    /// `emit_type` opens the declaring type's; a method's OWN `T` needs its own, or a LOCAL whose
+    /// type names it resolves to the ERROR type HERE AND NOWHERE ELSE -- the diagnostic pass binds
+    /// the same body inside `enter_type_parameters` and reports nothing, and an emit-time
+    /// diagnostic reaches no one.
+    ///
+    /// **ONLY ONE OF THE FOUR CELLS EXERCISES THE METHOD SCOPE**, which is why any single example
+    /// would declare the area fine or the feature absent:
+    ///
+    ///     Box<T> local  in a generic METHOD    the method scope, and the only cell that needs it
+    ///     Box<T> local  in a generic TYPE      the DECLARING scope
+    ///     Box<int> local in a generic METHOD   closed, needs no scope
+    ///     Box<T> parameter of a generic method a signature, not a body
+    ///
+    /// The last three are controls and none is optional: without them a fix that entered the wrong
+    /// scope, or that entered one and leaked it into the next method, passes the first row alone.
+    #[test]
+    fn a_local_naming_the_methods_own_type_parameter_resolves_at_emit() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> { public T Value; }
+                 public class Holder<TOuter> {
+                     public int InType() { Box<TOuter> x = null; return x == null ? 1 : 0; }
+                 }
+                 public class Program {
+                     public static int InMethod<T>() { Box<T> x = null; return x == null ? 2 : 0; }
+                     public static int Closed<T>() { Box<int> x = null; return x == null ? 3 : 0; }
+                     public static int Parameter<T>(Box<T> b) { return b == null ? 4 : 0; }
+                     public static int Main() { return 0; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let program = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Program"))
+            .expect("Program is in the image");
+        for name in ["InMethod", "Closed", "Parameter"] {
+            assert!(
+                program
+                    .methods()
+                    .find(|m| m.name() == Some(name))
+                    .and_then(|m| m.body())
+                    .is_some(),
+                "`{name}` emitted a body"
+            );
+        }
+    }
+
+    /// **`T[]`'s ELEMENT ACCESS TAKES THE TOKEN-CARRYING `stelem`/`ldelem`, NOT `stelem.ref`.**
+    /// `T[]` is `int[]` under one instantiation and `string[]` under another, so no width-specific
+    /// opcode picked at compile time is right for both. `Count<int>` storing through `stelem.ref`
+    /// writes an integer where a reference is expected and faults at the next READ rather than at
+    /// the store, which is why this is asserted on the emitted opcode and not on a run.
+    #[test]
+    fn an_array_of_a_type_parameter_stores_through_the_token_form() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Program {
+                     public static int Fill<T>(T seed) { T[] a = new T[4]; a[0] = seed; return 5; }
+                     public static int Main() { return 0; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let fill = assembly
+            .type_defs()
+            .find(|t| t.name().is_some_and(|n| n.name == "Program"))
+            .expect("Program is in the image")
+            .methods()
+            .find(|m| m.name() == Some("Fill"))
+            .expect("Program declares Fill");
+        let body = fill.body().expect("Fill has a body");
+        assert!(
+            !body
+                .code
+                .iter()
+                .any(|instruction| instruction.opcode == lamella_cil::Opcode::StelemRef),
+            "a `T` element is not stored with `stelem.ref`: {:?}",
+            body.code
+        );
+        let store = body
+            .code
+            .iter()
+            .find_map(|instruction| match (instruction.opcode, &instruction.operand) {
+                (lamella_cil::Opcode::Stelem, lamella_cil::Operand::Token(token)) => Some(*token),
+                _ => None,
+            })
+            .expect("`a[0] = seed` lowers through the token-carrying `stelem`");
+        assert_eq!(
+            assembly.type_spec_signature(store),
+            Some(lamella_metadata::SigType::MVar(0)),
+            "the element blob is `!!0` -- the METHOD's parameter, not the declaring type's `!0`"
+        );
+    }
+
+    /// **A TYPE PARAMETER IS A POSITION, NOT A TYPE, AND ASKING FOR ITS TOKEN INVENTED ONE.** A
+    /// `class Box<T> { T item; T Get(); }` emitted a `TypeRef` with an empty namespace named `T` --
+    /// a reference to a type no assembly declares, which csc never writes.
+    ///
+    /// **THE ROW WAS UNREFERENCED, AND THAT IS WHY IT SURVIVED.** Every signature mentioning `T`
+    /// encodes `!0` through the declaring scope, which matches by NAME before it would consult a
+    /// token, so the emitted assembly decoded correctly and nothing was visibly wrong. The reason
+    /// it matters is elsewhere: `type_sig` refuses a bare `T` by failing its named-type lookup, and
+    /// that refusal is what stops a signature written in the WRONG scope from being numbered
+    /// against the wrong parameter list. A registered `T` turns that refusal into
+    /// `Class(TypeRef T)`.
+    ///
+    /// The CONTROL is the second half and it is not optional: an EXTERNAL type mentioned only in a
+    /// signature must STILL be minted, in the SAME compilation and through the same function. A
+    /// change that skipped every signature type would remove the phantom and break every external
+    /// type a member names -- and would pass an absence-only assertion perfectly. It needs a real
+    /// reference assembly, which is why this compiles against the fixture rather than using
+    /// `image_of_gated_source` (which passes none, so nothing external exists to mint).
+    #[test]
+    fn a_type_parameter_gets_no_type_ref_but_a_real_signature_type_still_does() {
+        let Some(reference) = reference_fixture(NESTED_FIXTURE) else {
+            return;
+        };
+        let reference = Assembly::read(&reference).expect("the fixture parses");
+        let compilation = compile_source_with(
+            "namespace App {
+                 public class Box<T> {
+                     private T item;
+                     public Box(T value) { item = value; }
+                     public T Get() { return item; }
+                     public Fixture.Plain Only() { return null; }
+                 }
+             }\n",
+            "test.cs",
+            "test",
+            "test",
+            core::slice::from_ref(&reference),
+            false,
+            LexOptions {
+                version: LanguageVersion::CSharp2,
+                ..LexOptions::default()
+            },
+        );
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "the source compiles clean: {:?}",
+            compilation.diagnostics
+        );
+        let image = compilation.image.expect("an image is emitted");
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let refs: Vec<(String, String)> = assembly
+            .type_refs()
+            .filter_map(|r| r.name())
+            .map(|n| (String::from(n.namespace), String::from(n.name)))
+            .collect();
+        assert!(
+            !refs.iter().any(|(_, name)| name == "T"),
+            "no TypeRef is minted for the type parameter `T`: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|(_, name)| name == "Plain"),
+            "an external type named only in a signature is still minted: {refs:?}"
+        );
+    }
+
+    /// **THE SPELLING EVERY REAL PROGRAM USES FOR ITS OWN TYPES, AND IT DID NOT RESOLVE.** A
+    /// `Box<int>` written inside the namespace that declares `` Box`1 `` was CS0246: an
+    /// instantiation's definition was looked up by its dotted name EXACTLY, never through the
+    /// in-scope search a plain name gets, and the model keys a generic type by its ARITY-MANGLED
+    /// name -- so searching those scopes for `Box` would have found nothing either.
+    ///
+    /// **THE CONTROLS ARE BOTH HALVES AND NEITHER IS OPTIONAL.** The non-generic `Plain` proves the
+    /// enclosing-namespace search works at all, so its absence for the generic is not a shared
+    /// cause; the QUALIFIED `App.Box<int>` proves the type is in the model and the arity is right,
+    /// so the failure is the unqualified lookup and nothing else. Without them a missing type and a
+    /// missing lookup are the same CS0246.
+    #[test]
+    fn an_unqualified_generic_name_resolves_in_its_own_namespace() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> { private T item; public Box(T v) { item = v; } public T Get() { return item; } }
+                 public class Plain { private int item; public Plain(int v) { item = v; } public int Get() { return item; } }
+                 public class Program {
+                     static int Unqualified(Box<int> b) { return b.Get(); }
+                     static int Qualified(App.Box<int> b) { return b.Get(); }
+                     static int Control(Plain p) { return p.Get(); }
+                     public static int Main() { return 0; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        assert!(
+            assembly
+                .type_defs()
+                .any(|t| t.name().is_some_and(|n| n.name == "Box`1")),
+            "the generic type the three signatures name is in the image"
+        );
+    }
+
+    /// The control, and it is what makes the row above mean something: a member of a NON-generic
+    /// type in the very same image still takes a `TypeRef`/`TypeDef` parent and mints no
+    /// `TypeSpec` at all. A change that parented EVERY `MemberRef` on a `TypeSpec` would pass
+    /// every assertion above.
+    #[test]
+    fn a_member_of_a_non_generic_type_takes_no_type_spec_parent() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Plain {
+                     private int item;
+                     public Plain(int value) { item = value; }
+                     public int Get() { return item; }
+                 }
+                 public class Program {
+                     public static int Main() { return new Plain(41).Get(); }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let members = member_refs_of(&assembly);
+        assert!(
+            members.iter().all(|(parent, ..)| *parent != TYPE_SPEC),
+            "no member of a non-generic type is parented on a TypeSpec: {members:?}"
+        );
+    }
+
+    /// **THE HALF A "SIMPLIFICATION" WOULD TAKE AWAY.** The substituted signature is right there on
+    /// the bound reference and it is the obvious thing to write; `instance void .ctor(int32)`
+    /// decodes cleanly, describes a method `` Box`1 `` does not declare, and nothing downstream
+    /// says so. This asserts the parameter is `ELEMENT_TYPE_VAR 0` (`0x13 0x00`) and NOT
+    /// `ELEMENT_TYPE_I4` (`0x08`), on the bytes, because that is where the two differ.
+    #[test]
+    fn an_instantiated_members_signature_is_open_not_substituted() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public class Box<T> {
+                     private T item;
+                     public Box(T value) { item = value; }
+                     public T Get() { return item; }
+                 }
+                 public class Program {
+                     public static int Main() { object o = new App.Box<int>(41); return o == null ? 1 : 0; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let ctor = member_refs_of(&assembly)
+            .into_iter()
+            .find(|(parent, name, _)| *parent == TYPE_SPEC && name == ".ctor")
+            .expect("the constructor of Box<int> is minted");
+        assert_eq!(
+            ctor.2,
+            &[0x20, 0x01, 0x01, 0x13, 0x00],
+            "the parameter is `!0`; `0x08` there would be the substituted `int32`"
+        );
+    }
+
+    /// The ordinary path is unchanged: a NON-generic call still names a plain `MemberRef` and
+    /// mints no `MethodSpec` at all. Without this the branch above could have swallowed every call
+    /// in the language and the generic rows would still pass.
     #[test]
     fn a_non_generic_call_still_names_a_member_ref() {
         let Some(expr) = bound_expression("Fixture.Util.Plain(1)") else { return };
@@ -6884,6 +9412,210 @@ mod tests {
         assert!(
             derived.interfaces().any(|token| token == base.token()),
             "IDerived must carry an InterfaceImpl row naming IBase"
+        );
+    }
+
+    /// An explicit implementation's QUALIFIER is a written name and must be resolved before it
+    /// becomes a `TypeRef` -- `int IThing.Get()` under `using N;` overrides `N.IThing::Get`.
+    ///
+    /// **THE INTERFACE MUST BE IMPORTED, WHICH IS THE WHOLE REASON THIS TEST COMPILES A REFERENCE
+    /// FIRST.** Written against a this-module interface the same program is green either way: an
+    /// in-module qualifier finds a tokenized `MethodDef` and never reaches the `MemberRef` arm
+    /// where the defect lives. The first version of this test did exactly that, passed, and
+    /// stayed passing when the fix was reverted -- proving nothing, the same way the resolver test
+    /// that used a GLOBAL-namespace definition never exercised the scope search.
+    ///
+    /// **AND THE ASSERTION IS THE `TypeRef`'s NAMESPACE, BECAUSE "IT EMITTED" CANNOT SEE THE
+    /// FAILURE THAT MATTERS.** Taking the spelling as written mints a `TypeRef` with an EMPTY
+    /// namespace: well-formed metadata that assembles, links and verifies, and then throws
+    /// `TypeLoadException: Could not load type 'IEnumerable'` on the first use of the type, at run
+    /// time, in a program that names no generics at all.
+    /// A signature type that MENTIONS a type parameter still mints everything in it that is not
+    /// one -- the skip belongs to the leaf, not to the composite that contains it.
+    ///
+    /// **THE TABLE IS THE INSTRUMENT, BECAUSE EITHER HALF ALONE LOOKS LIKE THE WHOLE RULE.**
+    /// Skipping the composite passes every row where the parameter is the WHOLE type (`T`, `T[]`)
+    /// and refuses every row where it is merely an argument; minting the composite passes those
+    /// and puts a `TypeRef` to a type called `T` in the assembly, which is worse than a refusal
+    /// because `type_sig`'s named-type fall-through then SUCCEEDS for a signature written in the
+    /// wrong scope. So the rows are paired: what must be minted, and what must not.
+    #[test]
+    fn a_signature_mentioning_a_type_parameter_still_mints_the_types_that_are_not_one() {
+        let at_csharp2 = |source: &str, module: &str, name: &str, refs: &[Assembly]| {
+            let options = LexOptions {
+                version: LanguageVersion::CSharp2,
+                ..LexOptions::default()
+            };
+            let parsed = parse_compilation_unit_with(source, options);
+            assert!(
+                parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            compile(&parsed.unit, module, name, refs, None, false, false, false, LanguageVersion::CSharp2)
+        };
+        let built = at_csharp2(
+            "namespace N { public interface IThing<T> { T Get(); } public class Plain { } }",
+            "n.dll",
+            "N",
+            &[],
+        );
+        let library = built.image.unwrap_or_else(|| {
+            panic!(
+                "the reference assembly: diagnostics {:?}, emit {:?}",
+                built.diagnostics, built.emit_error
+            )
+        });
+        let reference = Assembly::read(&library).expect("the reader parses the reference");
+
+        let type_refs = |source: &str| {
+            let result = at_csharp2(source, "c.dll", "C", &[reference.clone()]);
+            assert!(result.diagnostics.is_empty(), "{source}: {:?}", result.diagnostics);
+            let image = result.image.expect("an image for: {source}");
+            let assembly = Assembly::read(&image).expect("the reader parses the image");
+            let mut names: Vec<String> = assembly
+                .type_refs()
+                .filter_map(|row| row.name())
+                .map(|name| String::from(name.name))
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+
+        let open = type_refs("using N; class Bag<T> { public IThing<T> Get() { return null; } }");
+        assert!(
+            open.iter().any(|name| name == "IThing`1"),
+            "an open instantiation must still reference its definition, got {open:?}"
+        );
+        assert!(
+            !open.iter().any(|name| name == "T"),
+            "a type parameter must never become a TypeRef, got {open:?}"
+        );
+
+        let closed = type_refs("using N; class Bag { public IThing<Plain> Get() { return null; } }");
+        assert!(
+            closed.iter().any(|name| name == "IThing`1"),
+            "a closed instantiation references its definition, got {closed:?}"
+        );
+        let bare = type_refs("using N; class Bag<T> { public T Get() { return default(T); } }");
+        assert!(
+            !bare.iter().any(|name| name == "T"),
+            "a bare type parameter mints nothing, got {bare:?}"
+        );
+        let array = type_refs("using N; class Bag<T> { public T[] Get() { return null; } }");
+        assert!(
+            !array.iter().any(|name| name == "T"),
+            "an array OF a type parameter mints nothing either, got {array:?}"
+        );
+    }
+
+    /// A class implementing a CONSTRUCTED interface declares it, and declares it at the type
+    /// parameter it was written with.
+    ///
+    /// **BOTH HALVES SHIP A LOADABLE IMAGE THAT CANNOT DISPATCH, WHICH IS WHY THE ASSERTIONS ARE
+    /// ON THE METADATA AND NOT ON A RUN.** `InterfaceImpl` took its token from `type_token`, which
+    /// by design never holds an instantiation (those are keyed by signature blob), so
+    /// `if let Some(token)` dropped every generic interface and the type declared only the
+    /// non-generic ones it inherits. And the minting walk tests a type parameter against the BODY
+    /// scope, which no method has entered while a type header is being emitted, so `T` became a
+    /// `TypeRef` to a class nobody declares and the row encoded `IEnumerable`1<class T>`. Either
+    /// one assembles, links and verifies; the first call through the interface then fails to
+    /// resolve at run time, which no compile-only check can see.
+    #[test]
+    fn a_constructed_interface_is_declared_as_a_type_spec_at_its_own_parameter() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(
+            "interface IBox<T> { T Get(); } \
+             class Bag<T> : IBox<T> { public T Get() { return default(T); } }",
+            options,
+        );
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "{:?}",
+            parsed.diagnostics
+        );
+        let result = compile(
+            &parsed.unit, "c.dll", "C", &[], None, false, false, false, LanguageVersion::CSharp2,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+
+        assert!(
+            !assembly
+                .type_refs()
+                .filter_map(|row| row.name())
+                .any(|name| name.name == "T"),
+            "a type parameter must never become a TypeRef"
+        );
+
+        let bag = assembly.find_type("", "Bag`1").expect("the Bag`1 type");
+        let interfaces: Vec<Token> = bag.interfaces().collect();
+        assert_eq!(interfaces.len(), 1, "Bag`1 declares exactly IBox<T>");
+        assert_eq!(
+            interfaces[0].table(),
+            0x1b,
+            "a constructed interface is declared through a TypeSpec, got {:?}",
+            interfaces[0]
+        );
+        let signature = assembly
+            .type_spec_signature(interfaces[0])
+            .expect("the InterfaceImpl's TypeSpec decodes");
+        let lamella_metadata::SigType::GenericInst { arguments, .. } = signature else {
+            panic!("the InterfaceImpl names a constructed type, got {signature:?}");
+        };
+        assert!(
+            matches!(arguments.as_slice(), [lamella_metadata::SigType::Var(0)]),
+            "IBox<T> at the class's own parameter encodes !0, got {arguments:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_implementation_overrides_the_resolved_interface_not_the_written_name() {
+        let library = parse_compilation_unit("namespace N { public interface IThing { int Get(); } }").unit;
+        let library = compile_unit(&library, "n.dll", "N")
+            .image
+            .expect("the reference assembly");
+        let reference = Assembly::read(&library).expect("the reader parses the reference");
+
+        let qualifier_type_ref = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let result = compile_unit_with_references(&unit, "c.dll", "C", &[reference.clone()]);
+            assert!(result.diagnostics.is_empty(), "{source}: {:?}", result.diagnostics);
+            let image = result.image.expect("an image");
+            let assembly = Assembly::read(&image).expect("the reader parses the image");
+            let class = assembly.find_type("", "C").expect("the C type");
+            let impls: Vec<(Token, Token)> = class.method_impls().collect();
+            assert_eq!(impls.len(), 1, "one MethodImpl for: {source}");
+            let member = assembly
+                .member_ref(impls[0].1.row())
+                .expect("the declaration is a MemberRef into the reference");
+            let parent = assembly
+                .type_ref(member.parent().row())
+                .expect("the MemberRef's parent TypeRef");
+            let name = parent.name().expect("the TypeRef's name");
+            (String::from(name.namespace), String::from(name.name))
+        };
+
+        let through_using = qualifier_type_ref(
+            "using N; class C : N.IThing { int IThing.Get() { return 1; } }",
+        );
+        let qualified = qualifier_type_ref(
+            "using N; class C : N.IThing { int N.IThing.Get() { return 1; } }",
+        );
+        assert_eq!(
+            through_using,
+            (String::from("N"), String::from("IThing")),
+            "an unqualified qualifier must resolve to N.IThing, not to a TypeRef in no namespace"
+        );
+        assert_eq!(
+            qualified,
+            (String::from("N"), String::from("IThing")),
+            "the fully-qualified control"
         );
     }
 
@@ -7440,6 +10172,110 @@ mod tests {
     }
 
     #[test]
+    fn a_driver_option_reaches_a_two_file_compilation_exactly_as_it_reaches_a_one_file_one() {
+        struct Row {
+            /// The feature, and the version that introduced it.
+            feature: &'static str,
+            /// A program using it, as two independent top-level declarations. No BCL member
+            /// appears: this compilation has NO references, and a row needing corlib would fail in
+            /// BOTH spreads and agree its way to green while saying nothing about the option.
+            first: &'static str,
+            second: &'static str,
+            /// A dialect that permits it, and one that does not. Per row rather than fixed, so the
+            /// table proves the SELECTED version arrives -- not merely that something above C# 1 does.
+            admits: LanguageVersion,
+            refuses: LanguageVersion,
+        }
+        let rows = [
+            Row {
+                feature: "generics",
+                first: "class G { public static T Id<T>(T x) { return x; } }",
+                second: "class P { static int Main() { return G.Id<int>(1); } }",
+                admits: LanguageVersion::CSharp2,
+                refuses: LanguageVersion::CSharp1,
+            },
+            Row {
+                feature: "the default operator",
+                first: "class D { public static int Zero() { return default(int); } }",
+                second: "class P { static int Main() { return D.Zero(); } }",
+                admits: LanguageVersion::CSharp2,
+                refuses: LanguageVersion::CSharp1,
+            },
+            Row {
+                feature: "static classes",
+                first: "static class S { public static int One() { return 1; } }",
+                second: "class P { static int Main() { return S.One(); } }",
+                admits: LanguageVersion::CSharp2,
+                refuses: LanguageVersion::CSharp1,
+            },
+            Row {
+                feature: "binary literals",
+                first: "class B { public static int Five() { return 0b101; } }",
+                second: "class P { static int Main() { return B.Five(); } }",
+                admits: LanguageVersion::CSharp7,
+                refuses: LanguageVersion::CSharp2,
+            },
+        ];
+        let codes = |diagnostics: &[Diagnostic]| -> Vec<u16> {
+            let mut codes: Vec<u16> = diagnostics
+                .iter()
+                .filter(|d| d.is_error())
+                .map(|d| d.code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+        for Row {
+            feature,
+            first,
+            second,
+            admits,
+            refuses,
+        } in rows
+        {
+            for (version, admitted) in [
+                (admits, true),
+                (refuses, false),
+            ] {
+                let options = LexOptions {
+                    version,
+                    ..LexOptions::default()
+                };
+                let joined = alloc::format!("{first}\n{second}\n");
+                let one = compile_source_with(
+                    &joined,
+                    "both.cs",
+                    "p.dll",
+                    "p",
+                    &[],
+                    false,
+                    options.clone(),
+                );
+                let two = compile_sources_with(
+                    &[(first, "a.cs"), (second, "b.cs")],
+                    "p.dll",
+                    "p",
+                    &[],
+                    false,
+                    options,
+                );
+                let two_codes = codes(&two.diagnostics.concat());
+                assert_eq!(
+                    codes(&one.diagnostics),
+                    two_codes,
+                    "{feature} at {version:?}: one file and two files must agree"
+                );
+                assert_eq!(
+                    two_codes.is_empty(),
+                    admitted,
+                    "{feature} at {version:?}: two files should be {}",
+                    if admitted { "admitted" } else { "refused" }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn multi_document_pdb_attributes_each_method_to_its_own_file() {
         let a = "class A { static int Alpha() { int ax = 1; return ax; } }";
         let b = "class B { static int Beta() { int bx = 2; return bx; } }";
@@ -7950,6 +10786,83 @@ mod tests {
             result.image.is_some(),
             "the call must resolve and emit (emit_error: {:?})",
             result.emit_error
+        );
+    }
+
+    /// **A CONVERSION WHOSE TARGET IS REACHED BY A PREDEFINED REFERENCE CONVERSION MUST NOT CALL A
+    /// CONVERSION OPERATOR**, because 17.9.3 forbids declaring one for such a pair -- to or from
+    /// `object` or an interface-type, or between a type and its base type -- *"since a conversion
+    /// would then already exist"*.
+    ///
+    /// The selection step accepts an operator whose return type merely CONVERTS to the target, and
+    /// every type converts to `object`, so without the guard each of the first three rows here
+    /// binds `op_Implicit` and calls it. **Against the real BCL that is an emit refusal, and
+    /// `(object)aString` was nine of the C# differential's nine failures; from source it is worse
+    /// than a refusal -- `(Base)d` returned an `Other`, so a virtual call through `b` answered from
+    /// the wrong object with no diagnostic anywhere.**
+    ///
+    /// **`ToOther` IS THE INSTRUMENT, NOT A COURTESY ROW.** `(Other)t` is the case where the
+    /// operator genuinely applies; a build whose search returned nothing at all satisfies every
+    /// other assertion in this test. Only the row that must CONTAIN a call separates the fix from
+    /// the sledgehammer.
+    #[test]
+    fn a_reference_conversion_never_calls_a_conversion_operator() {
+        let result = compile_source(
+            "interface IThing { }\n\
+             class Base { }\n\
+             class Other : Base, IThing { }\n\
+             class Thing { public static implicit operator Other(Thing t) { return null; } }\n\
+             class Derived : Base { public static implicit operator Other(Derived d) { return null; } }\n\
+             class Impl : IThing { public static implicit operator Other(Impl i) { return null; } }\n\
+             class Program {\n\
+                 static object ToObject(Thing t) { return (object)t; }\n\
+                 static Base ToBase(Derived d) { return (Base)d; }\n\
+                 static IThing ToInterface(Impl i) { return (IThing)i; }\n\
+                 static Other ToOther(Thing t) { return (Other)t; }\n\
+                 static int Main() { return 0; }\n\
+             }\n",
+            "app.cs",
+            "app.dll",
+            "app",
+            &[],
+            false,
+        );
+        assert!(
+            result.diagnostics.iter().all(|d| !d.is_error()),
+            "the source must compile: {:?}",
+            result.diagnostics
+        );
+        let image = result
+            .image
+            .unwrap_or_else(|| panic!("the program must emit (emit_error: {:?})", result.emit_error));
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+
+        let calls = |name: &str| {
+            let method = assembly
+                .type_defs()
+                .find(|t| t.name().is_some_and(|n| n.name == "Program"))
+                .expect("Program is in the image")
+                .methods()
+                .find(|m| m.name() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is in the image"));
+            method
+                .body()
+                .unwrap_or_else(|| panic!("{name} has a body"))
+                .code
+                .iter()
+                .any(|instruction| instruction.opcode == lamella_cil::Opcode::Call)
+        };
+
+        assert!(!calls("ToObject"), "(object)t must box, not call op_Implicit");
+        assert!(!calls("ToBase"), "(Base)d must upcast, not call op_Implicit");
+        assert!(
+            !calls("ToInterface"),
+            "(IThing)i must be a reference conversion, not a call: 17.9.3 exists so that \
+             \"no user-defined transformations occur when converting to an interface-type\""
+        );
+        assert!(
+            calls("ToOther"),
+            "the control row: (Other)t IS the operator's own conversion and must still call it"
         );
     }
 

@@ -37,6 +37,18 @@ pub enum Trap {
     Unsupported,
     /// A float was needed and this build has none -- the `float` capability is compiled out
     /// (the no-float tier, for parts too small to carry soft float at all).
+    ///
+    /// **Its own variant rather than [`Trap::Unsupported`] or [`Trap::TypeError`], and the
+    /// reason is what the other two would tell the person reading the failure.** `TypeError`
+    /// says the OPERANDS are wrong, which is false and sends its author to fix working code;
+    /// `Unsupported` renders as the bare word "Unsupported" on a device serve, which names
+    /// nothing. This one exists so the refusal can say that FLOAT IS ABSENT FROM THIS BUILD --
+    /// a capability answer, which is what it is.
+    ///
+    /// Reached through `ObjectModel::new_float`, the one choke point every float-producing path
+    /// passes -- so paths nobody enumerated refuse too, rather than silently yielding a wrong
+    /// number. In Python that matters more than it looks: `1 / 3` is a float with no float
+    /// literal in it, and `x ** n` is a float exactly when `n` is negative.
     FloatUnavailable,
     /// An integer result overflowed the fixnum range. Python's `int` has an unlimited
     /// range (data model, Numbers); the interpreter traps the overflow rather than

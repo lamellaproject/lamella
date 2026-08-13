@@ -129,6 +129,7 @@ INSTANCES = {
     "gpiof": {"block": "gpio", "base": 0x40021400, "rcc_en_off": 0x30, "rcc_en_bit": 0x5},
     "gpiog": {"block": "gpio", "base": 0x40021800, "rcc_en_off": 0x30, "rcc_en_bit": 0x6},
     "gpioh": {"block": "gpio", "base": 0x40021C00, "rcc_en_off": 0x30, "rcc_en_bit": 0x7},
+    "gpioi": {"block": "gpio", "base": 0x40022000, "rcc_en_off": 0x30, "rcc_en_bit": 0x8},
     "rcc": {"block": "rcc", "base": 0x40023800},
     "i2c1": {"block": "i2c", "base": 0x40005400, "rcc_en_off": 0x40, "rcc_en_bit": 0x15},
     "i2c3": {"block": "i2c", "base": 0x40005C00, "rcc_en_off": 0x40, "rcc_en_bit": 0x17},
@@ -152,4 +153,26 @@ DEVICES = {
 MEMORY = {
     "qspi": {"kind": "flash", "base": 0x90000000, "size": 0x1000000, "controller": "quadspi", "optional": True, "device": {"device_id": 0x20BA18, "address_bits": 24, "fsize": 23, "dcr": 0x170100, "read_configurations": 4, "dummy_min": 0, "dummy_max": 31, "read_instruction": 0x3, "read_ccr_phases": 0x1002503, "read_prescaler_hsi_16mhz": 1, "read_clock_hz_hsi_16mhz": 8000000, "read_dummy_hsi_16mhz": 0, "fast_read_instruction": 0xB, "fast_read_ccr_phases": 0x100250B, "fast_read_prescaler_hsi_16mhz": 0, "fast_read_clock_hz_hsi_16mhz": 16000000, "fast_read_dummy_hsi_16mhz": 6, "fast_read_dummy_datasheet": 8, "quad_output_read_instruction": 0x6B, "quad_output_read_ccr_phases": 0x300256B, "quad_output_read_prescaler_hsi_16mhz": 0, "quad_output_read_clock_hz_hsi_16mhz": 16000000, "quad_output_read_dummy_hsi_16mhz": 6, "quad_output_read_dummy_datasheet": 8, "quad_io_read_instruction": 0xEB, "quad_io_read_ccr_phases": 0x3002DEB, "quad_io_read_prescaler_hsi_16mhz": 0, "quad_io_read_clock_hz_hsi_16mhz": 16000000, "quad_io_read_dummy_hsi_16mhz": 6, "quad_io_read_dummy_datasheet": 8}},
     "sdram": {"kind": "ram", "base": 0xC0000000, "size": 0x800000, "device_size": 0x1000000, "controller": "fmc", "optional": True, "device": {"bank": 1, "sdcr1": 0x1954, "sdcmr_clock_enable": 0x11, "sdcmr_precharge_all": 0x12, "sdcmr_auto_refresh": 0xF3, "sdcmr_load_mode": 0x44014, "settle_us": 100, "sdclk_hz_hsi_16mhz": 8000000, "refresh_count_hsi_16mhz": 105, "sdrtr_hsi_16mhz": 0xD2, "sdtr1_hsi_16mhz": 0x1126361}},
+}
+
+# What an attached board can be asked, to confirm it is the board an image was built
+# for. A chip identity register cannot answer this alone: the parts that separate one board
+# from its sibling are soldered outside the die, so a bare board answers the same identity as
+# a populated one. Each row names the CLAIM it reaches -- "part", or "memory:<region>" -- and
+# the rung a successful read of its kind establishes. A region's ACCESSIBLE size is reachable
+# only at "exercised": an identity read reports the fitted device, and a board may wire less
+# of a device than it holds.
+DISCRIMINATORS = {
+    "qspi-jedec": {"confirms": "memory:qspi", "validation": "identified", "expect": 0x20BA18, "reads": "the fitted quad-SPI NOR's JEDEC identity, over the region's single-line `read` configuration -- the one command with no dummy phase, so it needs no count established first"},
+    "sdram-sweep": {"confirms": "memory:sdram", "validation": "exercised", "expect": 0x800000, "reads": "with the fmc controller configured, a write-then-read sweep of the region, answering the number of bytes that read back what was written"},
+}
+
+# The sockets a removable module plugs into. The socket is board truth -- it is on the
+# schematic and identical on every unit -- and what is plugged into it is not, so no entry here
+# names a module. "buses" holds the roles a socket brings out whole; "pins" holds the single
+# lines, each under the standard's own name for that position. Which of a socket's protocols an
+# attached module speaks is a property of the module, so a board that offers several states all
+# of them and chooses none.
+CONNECTORS = {
+    "arduino": {"standard": "arduino-uno-v3", "buses": {"i2c": "header-i2c"}, "pins": {"a0": {"port_base": 0x40020000, "pin": 0, "mask": 0x1}, "a1": {"port_base": 0x40021400, "pin": 10, "mask": 0x400}, "a2": {"port_base": 0x40021400, "pin": 9, "mask": 0x200}, "a3": {"port_base": 0x40021400, "pin": 8, "mask": 0x100}, "a4": {"port_base": 0x40021400, "pin": 7, "mask": 0x80}, "a5": {"port_base": 0x40021400, "pin": 6, "mask": 0x40}, "d0": {"port_base": 0x40020800, "pin": 7, "mask": 0x80}, "d1": {"port_base": 0x40020800, "pin": 6, "mask": 0x40}, "d2": {"port_base": 0x40021800, "pin": 6, "mask": 0x40}, "d3": {"port_base": 0x40020400, "pin": 4, "mask": 0x10}, "d4": {"port_base": 0x40021800, "pin": 7, "mask": 0x80}, "d5": {"port_base": 0x40022000, "pin": 0, "mask": 0x1}, "d6": {"port_base": 0x40021C00, "pin": 6, "mask": 0x40}, "d7": {"port_base": 0x40022000, "pin": 3, "mask": 0x8}, "d8": {"port_base": 0x40022000, "pin": 2, "mask": 0x4}, "d9": {"port_base": 0x40020000, "pin": 15, "mask": 0x8000}, "d10": {"port_base": 0x40020000, "pin": 8, "mask": 0x100}, "d11": {"port_base": 0x40020400, "pin": 15, "mask": 0x8000}, "d12": {"port_base": 0x40020400, "pin": 14, "mask": 0x4000}, "d13": {"port_base": 0x40022000, "pin": 1, "mask": 0x2}}},
 }

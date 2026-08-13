@@ -1,0 +1,147 @@
+# PART: NXP (Freescale) MAG3110, a three-axis 16-bit magnetometer.
+#
+#
+# ITS IDENTITY REGISTER IS NOT WHERE ITS SIBLINGS PUT THEIRS. The MMA8653FC and the FXOS8700CQ both
+# answer WHO_AM_I at 0x0D; this part answers at 0x07. Same vendor, different register -- which is
+# worth stating because a probe written for one of them finds nothing here, and a probe that assumed
+# a vendor convention would read this part's Z-axis data instead.
+
+[table]
+kind = "device"
+family = "mag3110"
+part = "mag3110"
+sources = [
+    "NXP MAG3110 data sheet: register map ch 5.1 table, WHO_AM_I ch 5.2.1, I2C slave address and the read/write sequences ch 4.6, ordering information table (the 0x0E device address).",
+]
+notes = [
+    "16-bit output, MSB first, two registers per axis running from 0x01 to 0x06 -- a full-width signed value rather than the left-justified packing its accelerometer sibling uses.",
+    "Most configuration registers may only be modified while the part is in standby, which the data sheet states against the register map rather than in the description of each register.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own data sheet.
+#
+# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates and oversampling codes, the
+# operating and standby mode encodings, the automatic magnetic reset behavior, the raw-versus-
+# corrected data selection, the die temperature scaling, and the user offset arithmetic. All are in
+# the data sheet and none is transcribed.
+#
+# Validation is `none`. A micro:bit v1.3 was walked and something answered at this address, but an
+# address is not an identity and nothing has yet read the register below.
+
+[sourcing]
+facts = "primary"
+validation = "identified"
+evidence = "A physical part answered the identity register on a micro:bit v1.3B, over the nRF51's TWI0 at 100 kHz on the board's internal bus: register 0x07 read 0xC4 at address 0x0E, the single value this table accepts at the single address it states, repeated across eight consecutive passes with 0 faulted of 112 addresses walked in each. THE NEGATIVE CONTROL RAN IN TWO PARTS. First, on that same bus in those same passes, reads of other parts' identity registers at addresses where nothing was fitted ABORTED every time, so this bus reports an absence as an abort rather than as a byte. Second, the identical read of the identical register at the identical address, 0x07 at 0x0E, was run on a micro:bit v2 -- a board that does not fit this part -- and ABORTED across ten consecutive passes; that arm is on a different controller of the same family, which is stated because it is what makes it a second arm rather than a repetition of the first. THE REGISTER IS THE POINT OF THIS ONE: two other parts from this vendor in this catalogue answer their identity at 0x0D, and this part answers at 0x07 while holding writable offset configuration at 0x0D -- so an instrument that assumed a vendor convention would have read this part's user Z offset and compared it against a device id. It was asked at its own register and answered. EVERY NUMBER IN THE CHECK -- the address, the register and the accepted value -- was taken from this table's own emitted artifact by a bench program that includes it."
+
+# --- identity ------------------------------------------------------------------------------------
+
+[identity]
+reg = 0x07
+width = 8
+values = [0xC4]
+notes = "Device ID Number, reset value 0xC4. NOT at 0x0D, where two other parts from this vendor in this catalogue answer theirs -- on this part 0x0D is the high byte of the user Z offset, which is writable configuration rather than an identity."
+
+# --- address: FIXED, and a SIBLING PART TAKES THE NEXT ONE ------------------------------------------
+#
+# One address with no selection pin. The data sheet names a related part, the FXMS3110CD, which is
+# assigned 0x0F instead -- so the neighbouring address belongs to a different device rather than to
+# a strapped variant of this one. That is stated because it is the opposite of a strap: nothing on
+# a board moves this part to 0x0F, and something answering there is not this part.
+
+[address]
+bus = "i2c"
+base = 0x0E
+notes = "The data sheet gives the 7-bit slave address as 0x0E, calling it standard, and states in the same sentence that the FXMS3110CD is assigned 0x0F. No pin is described that alters this part's address."
+
+# --- buses -----------------------------------------------------------------------------------------
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "A read sends the register address in a write phase, then a repeated start turns the transfer around, which is the sequence the data sheet describes for reading a previously selected register."
+
+# --- registers ---------------------------------------------------------------------------------
+
+[registers.dr_status]
+reg = 0x00
+width = 8
+access = "read-only"
+notes = "Data-ready status for the three axes."
+
+[registers.out_x]
+reg = 0x01
+width = 16
+access = "read-only"
+fields = { out_x_lsb = [0, 8], out_x_msb = [8, 8] }
+notes = "MSB first, a full 16-bit signed measurement. Unlike the accelerometer on the same board, nothing is left justified and no bits are discarded."
+
+[registers.out_y]
+reg = 0x03
+width = 16
+access = "read-only"
+fields = { out_y_lsb = [0, 8], out_y_msb = [8, 8] }
+
+[registers.out_z]
+reg = 0x05
+width = 16
+access = "read-only"
+fields = { out_z_lsb = [0, 8], out_z_msb = [8, 8] }
+
+[registers.who_am_i]
+reg = 0x07
+width = 8
+access = "read-only"
+fields = { who_am_i = [0, 8] }
+
+[registers.sysmod]
+reg = 0x08
+width = 8
+access = "read-only"
+notes = "The current system mode."
+
+# The hard-iron offsets the user writes, six bytes from 0x09, high byte first per axis. They are
+# NOT a factory calibration: the data sheet says so explicitly, which is the opposite of the
+# boot-loaded calibration other parts in this catalogue warn against overwriting.
+[registers.off_x]
+reg = 0x09
+width = 16
+access = "read-write"
+fields = { off_x_lsb = [0, 8], off_x_msb = [8, 8] }
+
+[registers.off_y]
+reg = 0x0B
+width = 16
+access = "read-write"
+fields = { off_y_lsb = [0, 8], off_y_msb = [8, 8] }
+
+[registers.off_z]
+reg = 0x0D
+width = 16
+access = "read-write"
+fields = { off_z_lsb = [0, 8], off_z_msb = [8, 8] }
+
+[registers.die_temp]
+reg = 0x0F
+width = 8
+access = "read-only"
+notes = "Die temperature, a signed 8-bit value in degrees Celsius."
+
+[registers.ctrl_reg1]
+reg = 0x10
+width = 8
+access = "read-write"
+notes = "Operating mode, output rate and oversampling. Modifiable only in standby, except for two bit fields the data sheet excepts by name."
+
+[registers.ctrl_reg2]
+reg = 0x11
+width = 8
+access = "read-write"
+notes = "Operating modes, including the automatic magnetic reset and the raw-versus-corrected data selection. Modifiable only in standby."
+
+[measurement]
+burst_length = 6
+resolution_bits = "16, as three signed axes"

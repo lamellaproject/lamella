@@ -1,4 +1,23 @@
 # BOARD binding: the NUCLEO-H755ZI-Q, an STM32H755ZIT6 on ST's MB1363 Nucleo-144 reference board.
+#
+# THE PART UNDER THIS BOARD HAS TWO PROCESSORS AND THE BOARD FILE IS EXACTLY AS BIG AS IT
+# WOULD BE WITH ONE, which is a result rather than an oversight. Everything below -- the LED pins,
+# the virtual COM port's two cells, the operating point, the clock-enable routing -- is true of the
+# board whichever core is running, because the two cores share one pin map, one peripheral set and
+# one memory map. What is NOT board truth is which core an image is built for, and `board_model`
+# does not move for it: a NUCLEO-H755ZI-Q is one physical thing whatever is executing on it. The
+# core an image selected is a property of the image.
+#
+# THE MANUAL IS WRITTEN FOR THREE BOARDS AND ONE OF THEM IS A DIFFERENT PART LINE. UM2408 covers
+# NUCLEO-H745ZI-Q, NUCLEO-H755ZI-Q and NUCLEO-H7A3ZI-Q on the one MB1363 reference board, and the
+# third carries an STM32H7A3ZIT6Q, which RM0399 does not describe at all. Several of its rows are
+# therefore conditional on which board is in front of you, and the ones this file uses were taken
+# from the columns naming this board or from rows that name no board.
+#
+# NOT MODELLED, AND NAMED SO THE OMISSION IS DELIBERATE: the Ethernet PHY (this board and the
+# H745ZI-Q have one and the H7A3ZI-Q does not), the USB OTG connector, the ST Zio and ST morpho
+# expansion headers, the 25 MHz HSE crystal and the 32.768 kHz LSE crystal. The two crystals are
+# the ones worth naming twice, because the operating point below deliberately uses neither.
 
 [table]
 kind = "board"
@@ -14,8 +33,11 @@ sources = [
     "UM2408 Rev 6 section 7.7 (push-buttons): B1 user, the blue button, is connected to the I/O PC13 by default with tamper support, SB82 ON and SB81 OFF; if not, it is connected to PA0 with wake-up support, SB81 ON and SB82 OFF. B2 reset, the black button, is connected to NRST.",
 ]
 notes = [
+    "THE USER BUTTON IS DELIBERATELY NOT A DEVICE ROW, AND THE REASON IS THAT UM2408 NEVER STATES ITS LEVEL. Section 7.7 gives the pin and the bridges and stops; the manual carries no schematic, and its pin-assignment and solder-bridge tables say nothing about a pull or a switch's far side. A gpio-in row has to state `active`, and every value it could take would be this file inventing one. Other ST Nucleo boards put a user button on PC13 and read it HIGH when pressed, which is a reason to expect the same and not evidence about this board. What would settle it is the MB1363 schematic or a measurement on the board; without either, the omission is the honest row. THREE separate guards stand between a reader and a half-repair, which was measured rather than assumed: the row itself needs `active`, PC13 has to join the part's present-list before a control pin may name it, and port C needs an instance row before a group base can be resolved for it. Each refuses with its own sentence, so the repair cannot be done by halves.",
+    "UM2408 MARKS NO DEFAULT FOR THE LED1 BRIDGE PAIR AND ITS OWN CONVENTION SAYS IT WOULD. Table 16's footnote states that the default SBx state is shown in bold, and on the page carrying SB54/SB65 nothing is bold at all -- while two blocks earlier, on the ST-LINK USART rows, the ON/ON/OFF/OFF state IS bold. So the manual has a way of saying which state a board ships in, uses it for the virtual COM port, and does not use it for this LED. This file describes the SB54 ON / SB65 OFF wiring, which is the one section 7.6 names first and the one that leaves the Arduino D13 pin PA5 free; a unit wired the other way has its green LED on PA5 and nothing here would say so. One blink settles it.",
     "LD2 and LD3 are gated by fitted resistors rather than by solder bridges -- R74 and R75 -- and Table 16's only alternative for each is 'not connected', so there is no second wiring for them to be in. R75 is the one with a consequence: the Caution in section 7.6 says LD3 cannot be used if Zio D65 is used, because PB14 is Zio D65, so a shield claiming that pin and this LED row cannot both be right.",
     "The debugger is an STLINK-V3E rather than the ST-LINK/V2-1 the vendor's earlier Nucleo and Discovery boards carry, and it re-enumerates as a virtual COM port, a mass storage device and a debug port. The carrier below is still the `stlink-vcp` kind, because what that kind records is the PATH the console takes through the board, and the path is the same.",
+    "NO DOCUMENT HERE STATES THE VIRTUAL COM PORT'S RATE. UM2033 states one for the F769 Discovery in words; UM2408 states none for any of its three boards, so the 115200 below is the conventional host rate this file adopts rather than a fact read out of a manual. What IS derived rather than adopted is the divisor: it follows from that rate and the operating point, and it moves if either does.",
 ]
 
 # --- the carrier -----------------------------------------------------------------------------
@@ -41,6 +63,20 @@ rx = { pin = "PD9" }
 # families beside it, not a slower one. The Cortex-M7 reaches 480 MHz through the PLLs and every
 # route there is a configuration a program performs, so a plan naming the internal oscillator
 # holds on every unit whatever the board's two crystals are populated with.
+#
+# AND THE NUMBER IS 64 MHz, WHICH IS FOUR TIMES THE FIGURE THAT WOULD BE CARRIED ACROSS FROM THE
+# F7 OR L4 LINES. Two things could each have made it smaller and neither does: RCC_CR's HSIDIV
+# resets to 00, division by 1, giving hsi_ck = 64 MHz rather than the 8, 16 or 32 MHz its other
+# codes select; and every prescaler between there and this instance resets undivided -- RCC_CFGR's
+# SW selects the HSI, RCC_D1CFGR's D1CPRE and HPRE are both 0xxx, and RCC_D2CFGR's D2PPRE1 is 0xx.
+# A reader who assumed a divider was in the way -- which it is on smaller parts from the same
+# vendor -- would compute a divisor four times too small and get a channel that transmits nothing
+# legible.
+#
+# WHICH CLOCK USART3 ACTUALLY COUNTS IS A SELECTION, and its reset selection is the one below:
+# RCC_D2CCIP2R's USART234578SEL chooses the kernel clock for USART2/3 and the APB1 UARTs, and 000,
+# its reset value, selects rcc_pclk1. The generator checks pclk_hz against the source rate rather
+# than trusting the pair.
 
 [[plans]]
 name = "hsi-64mhz"
@@ -57,6 +93,12 @@ pclk_hz = 64000000          # rcc_pclk1, where USART3 sits. Equal to the HSI und
 # agrees with this vendor's other Nucleo-144 boards and is the OPPOSITE of its own F769 Discovery,
 # whose manual says a zero low-logic state must be written to light a LED -- same vendor, same
 # range of years, opposite habit. Polarity is a per-BOARD reading, never a per-vendor one.
+#
+# AND ON THIS PART THE OPENING WRITE IS NOT THE ONE A DRIVER WOULD EXPECT ANYWAY: GPIO pins come
+# out of reset in ANALOG mode rather than as inputs, so a program that sets ODR without first
+# putting the pin in output mode drives nothing at all and the LED stays dark. That is a chip fact
+# and it lives on the gpio block table; it is repeated here because this is the file whose three
+# rows are the first thing anyone drives.
 
 [[devices]]
 name = "led0"

@@ -8,7 +8,7 @@ use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
     Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo,
-    TypeKind, metadata_type_name,
+    TypeKind, TypeParameterConstraints, metadata_type_name,
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use lamella_syntax::ast::{
     AttributeArgument, AttributeSection, BinaryOperator, CompilationUnit, Expr, ExprKind, Literal,
     Member, Modifier, NamespaceMember, QualifiedName, TypeDecl, TypeKind as SyntaxTypeKind,
-    UnaryOperator, explicit_interface_member_name,
+    TypeParameterConstraint as SyntaxConstraint, UnaryOperator, explicit_interface_member_name,
 };
 
 /// Builds the [`Model`] of every type and member declared in `unit`.
@@ -111,6 +111,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 conditional: Vec::new(),
                 sets_required_members: false,
                 type_parameters: Vec::new(),
+                type_parameter_constraints: Vec::new(),
             });
             model.insert(info);
         }
@@ -748,6 +749,41 @@ pub(crate) fn is_constant_form(expr: &Expr) -> bool {
     }
 }
 
+/// Matches `where` clauses to the type parameters they name, returning ONE entry per declared
+/// parameter in declaration order -- the invariant [`TypeInfo::constraints_on`] reads through.
+///
+/// **A clause that names no declared parameter is DROPPED here, not reported here.** `where Q : T`
+/// on a `Box<T>` is CS0699, and this function runs during model collection, where a diagnostic has
+/// nowhere to go and no span budget; the check that reports it looks at the same clause list from
+/// the binding pass. Dropping is the safe half of that split: an unmatched clause constrains
+/// nothing, so nothing is enforced against a parameter that does not exist.
+///
+/// **A parameter named by TWO clauses takes the union.** The language forbids it (CS0409) and the
+/// binding pass reports it; taking the union rather than the first means the reported program is
+/// still checked against everything it wrote, so a diagnostic and a silent relaxation never
+/// disagree.
+pub fn constraints_by_parameter(
+    parameters: &[Box<str>],
+    clauses: &[lamella_syntax::ast::TypeParameterConstraintClause],
+) -> Vec<TypeParameterConstraints> {
+    let mut result = alloc::vec![TypeParameterConstraints::default(); parameters.len()];
+    for clause in clauses {
+        let Some(index) = parameters.iter().position(|name| **name == *clause.parameter) else {
+            continue;
+        };
+        let slot = &mut result[index];
+        for constraint in &clause.constraints {
+            match constraint {
+                SyntaxConstraint::ReferenceType(_) => slot.reference_type = true,
+                SyntaxConstraint::ValueType(_) => slot.value_type = true,
+                SyntaxConstraint::DefaultConstructor(_) => slot.default_constructor = true,
+                SyntaxConstraint::Type(reference) => slot.types.push(bind_type(reference)),
+            }
+        }
+    }
+    result
+}
+
 /// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
 /// methods.
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
@@ -761,6 +797,8 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
         .iter()
         .map(|parameter| parameter.name.clone())
         .collect();
+    info.type_parameter_constraints =
+        constraints_by_parameter(&info.type_parameters, &declaration.constraints);
     info.accessibility = accessibility_of(&declaration.modifiers);
     info.is_sealed = declaration.modifiers.iter().any(|m| matches!(m, Modifier::Sealed))
         || matches!(declaration.kind, SyntaxTypeKind::Struct);
@@ -870,6 +908,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 return_type,
                 name,
                 type_parameters,
+                constraints,
                 parameters,
                 is_vararg,
                 explicit_interface,
@@ -900,6 +939,13 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     .iter()
                     .map(|parameter| parameter.name.clone())
                     .collect(),
+                type_parameter_constraints: constraints_by_parameter(
+                    &type_parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect::<Vec<_>>(),
+                    constraints,
+                ),
             }),
             Member::Operator {
                 return_type,
@@ -922,6 +968,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 conditional: Vec::new(),
                 sets_required_members: false,
                 type_parameters: Vec::new(),
+                type_parameter_constraints: Vec::new(),
             }),
             Member::ConversionOperator {
                 direction,
@@ -944,6 +991,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 conditional: Vec::new(),
                 sets_required_members: false,
                 type_parameters: Vec::new(),
+                type_parameter_constraints: Vec::new(),
             }),
             Member::Property {
                 modifiers,
@@ -997,6 +1045,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         conditional: Vec::new(),
                         sets_required_members: false,
                         type_parameters: Vec::new(),
+                        type_parameter_constraints: Vec::new(),
                     });
                 }
                 if setter.is_some() {
@@ -1023,6 +1072,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         conditional: Vec::new(),
                         sets_required_members: false,
                         type_parameters: Vec::new(),
+                        type_parameter_constraints: Vec::new(),
                     });
                 }
             }
@@ -1079,6 +1129,7 @@ fn constructor(
         conditional: Vec::new(),
         sets_required_members: false,
         type_parameters: Vec::new(),
+        type_parameter_constraints: Vec::new(),
     }
 }
 
@@ -1227,6 +1278,13 @@ mod tests {
 
     /// ECMA-335 II.10.7.2: a generic type's metadata name carries its arity, so a definition
     /// collected from SOURCE must be keyed the same way one read from a reference assembly is.
+    ///
+    /// **THE SECOND HALF IS THE POINT, AND THE FIRST HALF ALONE WOULD PASS WITHOUT IT.** Keying
+    /// by the bare name does not merely spell the key differently -- it COLLAPSES three unrelated
+    /// types that C# lets one namespace declare together. `insert` replaces on a repeated key, so
+    /// under the bare spelling `Box`, `Box<T>` and `Box<T,U>` are one row and the last one collected
+    /// wins; the wrong arity then resolves to whichever survived. Asserting all three coexist is
+    /// what measures the collapse rather than the spelling.
     #[test]
     fn a_generic_definition_is_collected_under_its_arity_mangled_name() {
         let unit = parse_at_v2(
@@ -1249,7 +1307,10 @@ mod tests {
     }
 
     /// A generic type ENCLOSING a nested one is keyed by its mangled name, so the nested type's
-    /// own key must be built from the mangled enclosing name too.
+    /// own key must be built from the mangled enclosing name too. Measured separately because
+    /// nesting builds the key through a different path (`qualified_type_name` over the enclosing
+    /// declaration) -- one that would keep the bare spelling even after `type_info` was fixed, and
+    /// would leave the nested type reachable under a name its enclosing type no longer has.
     #[test]
     fn a_type_nested_in_a_generic_one_is_keyed_under_the_mangled_enclosing_name() {
         let unit = parse_at_v2("namespace N { public class Outer<T> { public class Inner { } } }");
@@ -1268,6 +1329,16 @@ mod tests {
         );
     }
 
+    /// **THE SEAM, AND IT NEEDS ITS OWN INSTRUMENT.** `resolve.rs` proves CS0305 against a table
+    /// built BY HAND, and `collect_into` proves the mangled key against the model -- and both pass
+    /// for a build where the two never meet. What joins them is `Model::type_table`, which has to
+    /// carry the mangled name AND the declared parameter names through; a version that dropped the
+    /// names would leave every hand-built test green and print `Box<>` to every real programmer.
+    ///
+    /// It stops at the table on purpose: declaring a generic type draws the declaration-phase
+    /// LAM0001, and a declaration-phase error withholds body binding entirely (csc does the same),
+    /// so a test that put `Box<int,int>` in a METHOD BODY would measure the phase order and report
+    /// nothing about this.
     #[test]
     fn a_source_declared_generic_reaches_cs0305_through_the_real_type_table() {
         use crate::diagnostic::Diagnostic;
@@ -1303,6 +1374,11 @@ mod tests {
 
     /// `Box<int>` has the members `Box<T>` declares, with `T` replaced -- driven from SOURCE
     /// through the real model, because that is the join `get_by_symbol` now has to make.
+    ///
+    /// **EVERY CLAIM IS MADE TWICE, AT `int` AND AT `string`, AND THE SECOND IS WHAT MAKES THE
+    /// FIRST MEAN ANYTHING.** A substitution that always answered `int`, one that answered the
+    /// FIRST argument whatever the position, and one that left `T` alone all pass an `int`-only
+    /// test in some position; only asking two instantiations for the same member separates them.
     #[test]
     fn an_instantiation_has_the_definitions_members_with_t_substituted() {
         use crate::special::SpecialType;

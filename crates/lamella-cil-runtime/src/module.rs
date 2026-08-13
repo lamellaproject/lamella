@@ -241,7 +241,7 @@ struct TypeInfo {
     sig_methods: BTreeMap<u32, MethodId>,
     /// The type's NON-virtual instance methods (own + inherited), keyed by the same interned id.
     /// Consulted only when a `callvirt`'s static target is absent because its declaring type is in
-    /// no loaded assembly -- e.g. a corlib base type our NETMF-surface corlib omits (modern .NET
+    /// no loaded assembly -- e.g. a corlib base type the NETMF-surface corlib omits (modern .NET
     /// declares `ManualResetEvent.Set` on `EventWaitHandle`) -- so the call binds to the runtime
     /// type's own method by signature.
     sig_methods_nonvirtual: BTreeMap<u32, MethodId>,
@@ -1600,7 +1600,7 @@ pub enum ProfileViolation {
     /// there as a multi-dimensional array constructor and drops every other name. A generic
     /// instantiation is now also a `TypeSpec` parent, so `Box<int>::.ctor` was recorded as a rank-1
     /// md-array ctor and `Box<int>::Tag()` was dropped without a word. **Both silences have one
-    /// root**: a parent kind that used to mean one thing now means two.
+    /// root**: one parent kind now means two different things.
     ///
     /// The consequence is the failure this whole check exists to prevent -- measured, not supposed:
     /// a generic program baked clean, and on the device the `newobj` constructed something as an
@@ -1656,8 +1656,8 @@ impl core::fmt::Display for ProfileViolation {
                 write!(
                     f,
                     " reaches token 0x{token:08X} through a generic instantiation that bake-time \
-                     lowering did not replace, so the deployed image would call a type it does not \
-                     contain"
+                     lowering did not replace, so the deployed image would call a type or method it \
+                     does not contain"
                 )
             }
         }
@@ -1817,6 +1817,16 @@ pub fn verified_image_checksum(image: &[u8]) -> Option<u64> {
 }
 
 /// The baked-image format version, and the magic that guards it.
+///
+/// The version field exists so a FUTURE runtime can recognise an OLDER image, and that clock
+/// starts at the first PUBLIC release: a format version only means anything across a boundary a
+/// consumer can observe.
+///
+/// **THE MAGIC MOVES WITH THE NUMBER, AND THAT IS NOT OPTIONAL.** After a reset, "version 1"
+/// means something DIFFERENT from the historical v1, so a surviving genuine-v1 artifact would
+/// present `version == 1`, be accepted, and misparse -- the exact failure the field exists to
+/// prevent. Prefer structural impossibility to a probabilistic "the checksum would probably
+/// reject it": an artifact that cannot be mistaken needs no argument about how many exist.
 const BAKED_IMAGE_VERSION: u32 = 1;
 
 /// The image magic. See [`BAKED_IMAGE_VERSION`] for why it moved with the reset.
@@ -1824,6 +1834,13 @@ const BAKED_IMAGE_MAGIC: &[u8; 4] = b"LML1";
 
 
 /// Header word 0: how many `u64` words the header holds, INCLUDING this one.
+///
+/// **THIS IS THE WORD THAT MAKES THE FORMAT ADDITIVE.** A reader computes the directory offset
+/// from the count the IMAGE declares, not from a constant it was compiled with -- so an image
+/// written by a LATER toolchain with more header words is still readable by THIS runtime, which
+/// reads the words it knows and skips the rest. Without it, every new header field moves the
+/// directory and every older device rejects the result -- a version split arrived at by accident,
+/// and one a fielded fleet pays for rather than the toolchain that caused it.
 const HEADER_WORD_COUNT_INDEX: usize = 0;
 
 /// Header word 1: the feature bits this image REQUIRES of the runtime. See [`SUPPORTED_FEATURES`].
@@ -1843,6 +1860,12 @@ const HEADER_ARENA_LEN_INDEX: usize = HEADER_PAYLOAD_BASE + 17;
 const HEADER_CHECKSUM_INDEX: usize = HEADER_PAYLOAD_BASE + 18;
 
 /// Reserved words, which a reader validates are ZERO.
+///
+/// **THE ZERO-CHECK IS NOT THE EXTENSION MECHANISM -- it is the check on the extension
+/// mechanism.** A future field uses a reserved slot AND sets a bit in
+/// [`HEADER_REQUIRED_FEATURES_INDEX`]; an older runtime then refuses BY NAME. The zero-check is
+/// what catches the mistake of writing the slot and FORGETTING the bit, which would otherwise be
+/// read as "field absent" and silently misinterpreted.
 const HEADER_RESERVED_BASE: usize = HEADER_PAYLOAD_BASE + HEADER_PAYLOAD_WORDS;
 /// How many reserved words this build writes and validates.
 const HEADER_RESERVED_WORDS: usize = 3;
@@ -2258,6 +2281,26 @@ impl Module {
                 arg_count,
             },
         )
+    }
+
+    /// Replaces the body of an already-added managed method, keeping its [`MethodId`].
+    ///
+    /// It exists for one caller and one reason: bake-time monomorphization emits a body whose
+    /// tokens are rewritten to name OTHER instantiations' members, so a body cannot be built until
+    /// the members it names have ids -- while those members are themselves instantiation bodies.
+    /// The identity and the content have to be separable, exactly as [`add_type`](Self::add_type)
+    /// already separates them one level up, or the pass can only lower a set that happens to be
+    /// orderable. Every id is claimed first, then every body is written.
+    ///
+    /// A method id that names no method, or names one that is not managed, is left alone: the
+    /// caller has nothing to fix up in that case and a silent insert would invent a method.
+    pub fn set_managed_body(&mut self, id: MethodId, raw_il: RawCil, arg_count: u16) {
+        if let Some(slot @ Method::Managed { .. }) = self.methods.get_mut(id as usize) {
+            *slot = Method::Managed {
+                body: ManagedBody::from_raw(raw_il),
+                arg_count,
+            };
+        }
     }
 
     /// Adds a managed method from an already-DECODED body, pre-populating the lazy cache -- a
@@ -3342,6 +3385,37 @@ impl Module {
         match self.methods.get(id as usize)? {
             Method::Managed { .. } => Some(MethodKind::Managed),
             Method::Intrinsic { func, .. } => Some(MethodKind::Intrinsic(*func)),
+        }
+    }
+
+    /// The stable registry id of the intrinsic `method` is bound to, or `None` if it is managed.
+    ///
+    /// This is the identity to test a bound intrinsic AGAINST, and [`Module::method_kind`]'s
+    /// function pointer is not. An id is derived from the intrinsic's NAME at bind time, so two
+    /// intrinsics stay distinguishable however their bodies compile; comparing the pointers does
+    /// not, because a build may merge identical code onto one address. Several intrinsics are
+    /// deliberately identical -- an identity anchor whose behavior the interpreter supplies has
+    /// nothing in its body to differ by -- so for exactly the ones worth telling apart, the
+    /// pointers are the least reliable.
+    #[must_use]
+    pub(crate) fn intrinsic_id(&self, method: MethodId) -> Option<u32> {
+        #[cfg(feature = "code-in-place")]
+        if let Some(baked) = &self.baked {
+            let (kind, ..) = self.baked_record(method)?;
+            if kind == 0 {
+                return None;
+            }
+            let index = if baked.hints_valid {
+                let (_, _, _, hint, ..) = self.baked_record(method)?;
+                hint as u16
+            } else {
+                *baked.intrinsic_index.get(method as usize)?
+            };
+            return crate::intrinsic_registry::id_at(index);
+        }
+        match self.methods.get(method as usize)? {
+            Method::Managed { .. } => None,
+            Method::Intrinsic { id, .. } => Some(*id),
         }
     }
 
@@ -5516,20 +5590,39 @@ impl Module {
         self.md_array_ctors.insert(asm_key(asm, token.0), rank);
     }
 
-    /// Record that `token` reaches a member through a GENERIC INSTANTIATION that nothing has
-    /// lowered. Called from the loader, at the one place that still knows what kind of `TypeSpec`
-    /// the member's parent is.
+    /// Record that `token` reaches through a GENERIC INSTANTIATION that nothing has lowered.
+    ///
+    /// **TWO AXES USE THIS ONE MARK, AND THEY REACH IT FOR DIFFERENT REASONS.** A `MemberRef`
+    /// through a `TypeSpec` parent is marked because it BINDS TO THE WRONG THING if left alone --
+    /// before generics that parent could only be an array, so a `.ctor` under one is filed as a
+    /// multi-dimensional array constructor and every other name is dropped. A `MethodSpec` is
+    /// marked because it would otherwise refuse as an ordinary `UnresolvedCall`, which is the same
+    /// violation a call to a MISSING METHOD produces: the program stays safe, but the refusal stops
+    /// naming the generic call as the reason. Both are called from the loader, at the one place
+    /// that still knows which kind of token it is holding.
     pub fn mark_unlowered_generic(&mut self, asm: u8, token: Token) {
         self.unlowered_generics.insert(asm_key(asm, token.0));
     }
 
     /// Withdraw the mark above, because `token` HAS now been lowered: a monomorphizer created the
     /// instantiation's own type identity and bound this token to a member of it.
+    ///
+    /// **THIS IS THE ONE CALL THAT CAN RE-OPEN THE SILENT BAKE, SO IT IS ONLY EVER CORRECT
+    /// AFTER THE BINDING EXISTS.** The mark is what stands between a generic program and an image
+    /// that runs and is wrong; clearing it on a token whose lowering was partial, refused, or
+    /// merely attempted puts the program back in exactly the state the refusal was built for --
+    /// and unlike the original defect, it would be a state somebody chose. The monomorphizer
+    /// clears per token, after the bind, and leaves every token it refused marked.
     pub fn clear_unlowered_generic(&mut self, asm: u8, token: Token) {
         self.unlowered_generics.remove(&asm_key(asm, token.0));
     }
 
     /// Whether `token` reaches through an unlowered generic instantiation.
+    ///
+    /// This asks the RECORD, not a resolver, and that is the whole point. A resolver answers
+    /// "did this bind", and an unlowered instantiation binds to the wrong thing (an md-array ctor)
+    /// or to nothing that a caller can distinguish from ordinary interface dispatch. A gate built
+    /// on `call_target` would pass its own output.
     #[must_use]
     pub fn is_unlowered_generic(&self, asm: u8, token: Token) -> bool {
         self.unlowered_generics.contains(&asm_key(asm, token.0))

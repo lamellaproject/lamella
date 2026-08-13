@@ -13,6 +13,10 @@ pub enum TypeSymbol {
     Named(Box<[Box<str>]>),
     /// A constructed generic type -- one instantiation of a generic definition, `List<int>`
     /// (ECMA-334 4th ed 25.5; ECMA-335 4th ed II.23.2.12 `GENERICINST`).
+    ///
+    /// `arguments` is never empty, and the arity is part of the identity (25.5.1): `Box` and
+    /// `Box<T>` are different types, which is why the metadata spells the definition with a
+    /// backtick arity. An empty argument list would make them one.
     Instantiation {
         /// The generic definition's dotted name, as [`TypeSymbol::Named`] carries one.
         definition: Box<[Box<str>]>,
@@ -87,6 +91,17 @@ impl TypeSymbol {
 }
 
 /// Renders a type as C# SOURCE would spell it, for a diagnostic.
+///
+/// **THIS IS NOT THE CANONICAL INSTANTIATION SPELLING AND MUST NEVER BECOME IT.** An
+/// instantiation has two strings and they are deliberately different
+/// (the generics identity rule): the IDENTITY, which is
+/// `` System.Collections.Generic.List`1[System.Int32] `` and exists to be unique, deterministic and
+/// frozen; and the DISPLAY name, `List<int>`, which exists to match what the programmer wrote.
+/// One string serving both forces a choice between a correctness key nobody may prettify and a
+/// device carrying bracketed identities in its name table. `Display` is the second of the two.
+///
+/// The identity's rule is `lamella_aot::generics::TypeArg::spell`, and when the binder needs to
+/// produce one it takes it from there rather than growing a second implementation here.
 impl fmt::Display for TypeSymbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

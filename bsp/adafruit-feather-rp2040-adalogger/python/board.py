@@ -73,3 +73,13 @@ DEVICES = {
 MEMORY = {
     "flash": {"kind": "flash", "size": 0x800000, "optional": False},
 }
+
+# The sockets a removable module plugs into. The socket is board truth -- it is on the
+# schematic and identical on every unit -- and what is plugged into it is not, so no entry here
+# names a module. "buses" holds the roles a socket brings out whole; "pins" holds the single
+# lines, each under the standard's own name for that position. Which of a socket's protocols an
+# attached module speaks is a property of the module, so a board that offers several states all
+# of them and chooses none.
+CONNECTORS = {
+    "qt": {"standard": "stemma-qt", "buses": {}, "pins": {"sda": {"port_base": 0xD0000000, "pin": 2, "mask": 0x4}, "scl": {"port_base": 0xD0000000, "pin": 3, "mask": 0x8}}},
+}

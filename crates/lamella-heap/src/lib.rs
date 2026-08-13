@@ -48,7 +48,11 @@ const fn class_size(index: usize) -> usize {
 /// `None` when `size` exceeds every class.
 ///
 /// Inverted in CLOSED FORM rather than by scanning [`class_size`], and the reason is interrupt
-/// latency rather than throughput.
+/// latency rather than throughput. On ARMv6-M this crate's lock is an interrupt-disable critical
+/// section (see [`LockedHeap`]), the scan ran a call per class inside it, and 44 of those held
+/// interrupts off for longer than a UART byte time on an 8 MHz part -- which is a LOST BYTE on the
+/// receive path, measured on the NUCLEO-F091RC. It is the arithmetic inverse of the schedule above
+/// and nothing else, held to that by `the_closed_form_agrees_with_the_schedule_over_the_whole_range`.
 const fn class_for(size: usize) -> Option<usize> {
     if size <= MIN_BLOCK {
         Some(0)
@@ -127,6 +131,13 @@ pub struct Heap {
     frontier: *mut u8,
     /// Per-class free-list heads (null when the class has no reusable block).
     classes: [*mut FreeNode; CLASS_COUNT],
+    /// Bytes the region has handed out and not taken back -- see [`Heap::live`].
+    ///
+    /// Maintained HERE rather than by a counting wrapper around the allocator, and on a CAS-less
+    /// target that is the difference between possible and not: a wrapper's counter is read-modify-
+    /// written outside any lock, and ARMv6-M has no atomic read-modify-write at all. Inside these
+    /// methods the caller already holds the exclusion, so a plain `usize` needs none of its own.
+    live: usize,
 }
 
 impl Heap {
@@ -137,6 +148,7 @@ impl Heap {
             end: core::ptr::null_mut(),
             frontier: core::ptr::null_mut(),
             classes: [core::ptr::null_mut(); CLASS_COUNT],
+            live: 0,
         }
     }
 
@@ -151,6 +163,7 @@ impl Heap {
         self.end = unsafe { base.add(size) };
         self.frontier = base;
         self.classes = [core::ptr::null_mut(); CLASS_COUNT];
+        self.live = 0;
     }
 
     /// Allocates for a prepared `request`, or null on exhaustion. A class hit pops its free
@@ -165,10 +178,15 @@ impl Heap {
             let head = self.classes[class];
             if !head.is_null() {
                 self.classes[class] = unsafe { (*head).next };
+                self.live += request.carve_size;
                 return head.cast();
             }
         }
-        self.carve(request.carve_size, request.align)
+        let carved = self.carve(request.carve_size, request.align);
+        if !carved.is_null() {
+            self.live += request.carve_size;
+        }
+        carved
     }
 
     /// Carves `size` bytes from the bump frontier, advanced to `align`, or null if it would
@@ -199,6 +217,7 @@ impl Heap {
             let node = ptr.cast::<FreeNode>();
             unsafe { (*node).next = self.classes[class] };
             self.classes[class] = node;
+            self.live = self.live.saturating_sub(request.carve_size);
         }
     }
 
@@ -215,6 +234,25 @@ impl Heap {
     #[must_use]
     fn carved(&self) -> usize {
         self.frontier as usize - self.base as usize
+    }
+
+    /// Bytes handed out and not yet returned: what a collector's pressure probe has to ask.
+    ///
+    /// A DIFFERENT question from [`Heap::carved`], and the reason the two exist side by side is
+    /// that the high-water never falls -- so a trigger reading it finds itself over threshold
+    /// forever however much a collection reclaims, and keeps raising its own bar until the region
+    /// runs out. It is also a different question from [`Heap::frontier_free`], which cannot see
+    /// the free lists at all.
+    ///
+    /// It counts BLOCK sizes, not requested sizes: a 20-byte request occupies a 32-byte class, and
+    /// the 12 bytes of internal fragmentation are just as unavailable to the next caller as the 20
+    /// asked for. A count of requested sizes under-reports by exactly that rounding.
+    ///
+    /// Constant time, which is a requirement rather than a nicety wherever a safe point reads it
+    /// before every operation -- unlike [`Heap::free_list_bytes`], which walks every class list.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        self.live
     }
 
     /// Bytes sitting on the per-class free lists: already reclaimed and reusable, but invisible
@@ -257,7 +295,10 @@ unsafe impl Send for Heap {}
 /// Where the target has atomic compare-and-swap the lock is a plain spin (uncontended on the
 /// single-core serve). **ARMv6-M -- Cortex-M0 and M0+ -- has atomic load/store but NO CAS**, so
 /// `compare_exchange_weak` does not exist there and this crate did not compile for `thumbv6m` at
-/// all.
+/// all. That is not a small gap in practice: it put the micro:bit v1, the RP2040, and both SAMD21
+/// boards on the bump arena, whose `dealloc` is an empty body -- so the collector on those parts
+/// ran, reclaimed, and released every dead object's payload onto the floor. A bounded live set
+/// still exhausted the arena, which is exactly the property [the GC bar] forbids.
 ///
 /// On a CAS-less target the lock is therefore an interrupt-disable critical section instead. On a
 /// single-core MCU that is not a workaround, it is the stronger primitive: a spin lock on one core
@@ -274,6 +315,12 @@ pub struct LockedHeap {
     /// number that must never risk the lock (an alloc-error panic fires with the lock
     /// already released, but a panic from elsewhere could hold it).
     carved: core::sync::atomic::AtomicUsize,
+    /// A lock-free mirror of [`Heap::live`], refreshed after each allocation and each free.
+    ///
+    /// Read WITHOUT the lock, for the same reason as `carved` and one more: a collector's arena
+    /// probe reads it at every safe point, before every operation, so it must not be able to
+    /// contend with the allocation it is about to authorize.
+    live: core::sync::atomic::AtomicUsize,
 }
 
 impl LockedHeap {
@@ -285,6 +332,7 @@ impl LockedHeap {
             locked: AtomicBool::new(false),
             heap: UnsafeCell::new(Heap::empty()),
             carved: core::sync::atomic::AtomicUsize::new(0),
+            live: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -314,6 +362,14 @@ impl LockedHeap {
     /// Runs `body` holding the lock (the critical-section arm -- ARMv6-M, which has no CAS).
     ///
     /// Interrupts off IS the exclusion, so there is no flag to set and nothing to spin on.
+    ///
+    /// WHAT THE CALLER MUST DO: everything derivable from the `Layout` is computed BEFORE this is
+    /// called (see [`Request`]), so `body` is only the pointer moves that need serializing. That
+    /// is a caller obligation, not a property of this function, and it was not always met -- an
+    /// earlier version passed the `Layout` through and searched the class table in here, holding
+    /// interrupts off across a call per class. On an 8 MHz Cortex-M0 that exceeded a 115200 byte
+    /// time from ~1 KiB upward, and the receive path LOST A BYTE. "O(1) allocation" was true of
+    /// the free-list work and said nothing about the search that chose the list.
     #[cfg(not(target_has_atomic = "8"))]
     fn with<T>(&self, body: impl FnOnce(&mut Heap) -> T) -> T {
         critical_section(|| body(unsafe { &mut *self.heap.get() }))
@@ -330,6 +386,19 @@ impl LockedHeap {
     #[must_use]
     pub fn carved_lockfree(&self) -> usize {
         self.carved.load(Ordering::Relaxed)
+    }
+
+    /// Bytes handed out and not yet returned (see [`Heap::live`]), read LOCK-FREE.
+    ///
+    /// **This is the figure an arena probe wants**, and having it here rather than in a counting
+    /// wrapper around the global allocator is not tidiness. A wrapper has to read-modify-write its
+    /// own counter outside this lock, and **ARMv6-M has no atomic read-modify-write** -- so on
+    /// Cortex-M0/M0+ such a wrapper either does not compile or needs a second interrupt-disable
+    /// critical section of its own, beside the one this crate already takes for the same region.
+    /// Maintained inside [`Heap`], the count needs no synchronization it does not already have.
+    #[must_use]
+    pub fn live_lockfree(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// Bytes on the per-class free lists (takes the lock). See [`Heap::free_list_bytes`] --
@@ -374,15 +443,21 @@ compile_error!(
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let request = Request::of(layout);
-        let (ptr, carved) = self.with(|heap| (heap.alloc(&request), heap.carved()));
+        let (ptr, carved, live) =
+            self.with(|heap| (heap.alloc(&request), heap.carved(), heap.live()));
         self.carved.store(carved, Ordering::Relaxed);
+        self.live.store(live, Ordering::Relaxed);
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if let Some(ptr) = NonNull::new(ptr) {
             let request = Request::of(layout);
-            self.with(|heap| unsafe { heap.dealloc(ptr.as_ptr(), &request) });
+            let live = self.with(|heap| {
+                unsafe { heap.dealloc(ptr.as_ptr(), &request) };
+                heap.live()
+            });
+            self.live.store(live, Ordering::Relaxed);
         }
     }
 }
@@ -577,6 +652,68 @@ mod tests {
         assert!(!p.is_null());
         unsafe { h.dealloc(p, l) };
         assert_eq!(h.free_list_bytes(), class_size(class_for(17).unwrap()));
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn live_falls_when_a_block_is_freed_and_the_high_water_does_not() {
+        let (h, region, layout) = heap(64 * 1024);
+        let l = Layout::from_size_align(48, 8).unwrap();
+        assert_eq!(h.live_lockfree(), 0, "a fresh region has nothing live");
+        let p = unsafe { h.alloc(l) };
+        assert!(!p.is_null());
+        let carved_after_alloc = h.carved_lockfree();
+        assert_eq!(h.live_lockfree(), 48, "the 48-byte class block is live");
+        unsafe { h.dealloc(p, l) };
+        assert_eq!(h.live_lockfree(), 0, "freeing it returns the bytes to the count");
+        assert_eq!(
+            h.carved_lockfree(),
+            carved_after_alloc,
+            "and the high-water does NOT fall -- that is the whole distinction"
+        );
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn live_counts_the_block_and_not_the_request() {
+        let (h, region, layout) = heap(64 * 1024);
+        let l = Layout::from_size_align(20, 8).unwrap();
+        let p = unsafe { h.alloc(l) };
+        assert!(!p.is_null());
+        assert_eq!(h.live_lockfree(), class_size(class_for(20).unwrap()));
+        assert_eq!(h.live_lockfree(), 32, "and that class is 32, not the 20 requested");
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn live_does_not_fall_for_a_block_the_allocator_cannot_reclaim() {
+        let (h, region, layout) = heap(256 * 1024);
+        let huge = Layout::from_size_align(64 * 1024, 8).unwrap();
+        let p = unsafe { h.alloc(huge) };
+        assert!(!p.is_null());
+        assert_eq!(h.live_lockfree(), 64 * 1024);
+        unsafe { h.dealloc(p, huge) };
+        assert_eq!(
+            h.live_lockfree(),
+            64 * 1024,
+            "an unreclaimable block stays counted, because it stays consumed"
+        );
+        assert_eq!(h.free_list_bytes(), 0, "and it really is on no free list");
+        free_region(region, layout);
+    }
+
+    #[test]
+    fn live_is_flat_across_churn_where_the_high_water_is_also_flat() {
+        let (h, region, layout) = heap(64 * 1024);
+        let l = Layout::from_size_align(48, 8).unwrap();
+        let held = unsafe { h.alloc(l) };
+        assert!(!held.is_null());
+        let live_with_one = h.live_lockfree();
+        for _ in 0..10_000 {
+            let p = unsafe { h.alloc(l) };
+            unsafe { h.dealloc(p, l) };
+        }
+        assert_eq!(h.live_lockfree(), live_with_one, "churn leaves one block live");
         free_region(region, layout);
     }
 }

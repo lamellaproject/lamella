@@ -1,7 +1,9 @@
 //! The SPI-mode initialization ladder: bring a card up, and in doing so decide WHAT it is.
 
 use crate::{
-    cmd, command_frame, csd_sector_count, r1, token, SdSpiBus, ACMD41_HCS, INIT_CLOCK_HZ_MAX,
+    cmd, command_frame, csd_sector_count, r1, switch, token, SdSpiBus, ACMD41_HCS,
+    COMMAND_FRAME_LEN,
+    INIT_CLOCK_HZ_MAX,
     OCR_CCS, POWER_UP_SETTLE_MS, SEND_IF_COND_ARG, SEND_IF_COND_CHECK_PATTERN,
 };
 #[cfg(feature = "write")]
@@ -250,10 +252,10 @@ impl<B: SdSpiBus> SdCard<B> {
     /// [`release`](Self::release).
     fn command(&mut self, index: u8, arg: u32) -> Result<Option<u8>, InitError<B::Error>> {
         self.bus.set_chip_select(true);
-        self.xfer_byte(0xFF)?;
-        for &byte in &command_frame(index, arg) {
-            self.xfer_byte(byte)?;
-        }
+        let mut tx = [0xFFu8; 1 + COMMAND_FRAME_LEN];
+        tx[1..].copy_from_slice(&command_frame(index, arg));
+        let mut rx = [0u8; 1 + COMMAND_FRAME_LEN];
+        self.bus.transfer(&tx, &mut rx).map_err(InitError::Bus)?;
         self.read_r1()
     }
 
@@ -326,10 +328,10 @@ impl<B: SdSpiBus> SdCard<B> {
     /// Sends a command and returns its R1, leaving chip-select asserted for the data phase.
     fn io_command(&mut self, index: u8, arg: u32) -> BlockResult<u8> {
         self.bus.set_chip_select(true);
-        self.io_byte(0xFF)?;
-        for &byte in &command_frame(index, arg) {
-            self.io_byte(byte)?;
-        }
+        let mut tx = [0xFFu8; 1 + COMMAND_FRAME_LEN];
+        tx[1..].copy_from_slice(&command_frame(index, arg));
+        let mut rx = [0u8; 1 + COMMAND_FRAME_LEN];
+        self.bus.transfer(&tx, &mut rx).map_err(|_| BlockError::Io)?;
         for _ in 0..10 {
             let byte = self.io_byte(0xFF)?;
             if byte & 0x80 == 0 {
@@ -358,12 +360,22 @@ impl<B: SdSpiBus> SdCard<B> {
 
     /// Waits for the start-block token, then reads `buf` plus the two trailing CRC bytes (CRC is
     /// off in SPI mode by default, so it is read and discarded).
+    ///
+    /// THE PAYLOAD MOVES IN ONE CALL, and that is a throughput decision rather than a tidiness one.
+    /// A per-byte loop hands the bus one byte at a time, 512 times per sector, so every per-call cost
+    /// -- the call itself, the slice bounds, the trait dispatch, and any setup the board's
+    /// implementation does -- is paid 512 times instead of once, and no bus implementation can
+    /// pipeline a transfer it is given one byte at a time. The token search stays byte-at-a-time
+    /// because its length is not known in advance: the card decides when to answer.
     fn read_data_block(&mut self, buf: &mut [u8]) -> BlockResult<()> {
         for _ in 0..DATA_TOKEN_TRIES {
             let byte = self.io_byte(0xFF)?;
             if byte == token::START_BLOCK {
-                for slot in buf.iter_mut() {
-                    *slot = self.io_byte(0xFF)?;
+                const IDLE: [u8; SECTOR_SIZE] = [0xFF; SECTOR_SIZE];
+                for chunk in buf.chunks_mut(SECTOR_SIZE) {
+                    self.bus
+                        .transfer(&IDLE[..chunk.len()], chunk)
+                        .map_err(|_| BlockError::Io)?;
                 }
                 self.io_byte(0xFF)?;
                 self.io_byte(0xFF)?;
@@ -381,8 +393,12 @@ impl<B: SdSpiBus> SdCard<B> {
     #[cfg(feature = "write")]
     fn write_data_block(&mut self, start_token: u8, buf: &[u8]) -> BlockResult<()> {
         self.io_byte(start_token)?;
-        for &byte in buf {
-            self.io_byte(byte)?;
+        const CHUNK: usize = 64;
+        let mut sink = [0u8; CHUNK];
+        for chunk in buf.chunks(CHUNK) {
+            self.bus
+                .transfer(chunk, &mut sink[..chunk.len()])
+                .map_err(|_| BlockError::Io)?;
         }
         self.io_byte(0xFF)?;
         self.io_byte(0xFF)?;
@@ -399,6 +415,98 @@ impl<B: SdSpiBus> SdCard<B> {
             None => Err(BlockError::Io),
         }
     }
+
+    /// Runs `CMD6` and returns the 64-byte function status, or `None` if the card REFUSED the
+    /// command -- which is what a card without command class 10 does, and is not an error.
+    ///
+    /// `set` picks the mode: `false` asks what the card offers and changes nothing, `true` selects
+    /// the function. Both modes answer with the same status block.
+    fn switch_func(
+        &mut self,
+        set: bool,
+        group: u8,
+        function: u8,
+    ) -> BlockResult<Option<[u8; switch::STATUS_LEN]>> {
+        let response = self.io_command(cmd::SWITCH_FUNC, switch::arg(set, group, function))?;
+        if response != 0 {
+            self.io_release()?;
+            return Ok(None);
+        }
+        let mut status = [0u8; switch::STATUS_LEN];
+        self.read_data_block(&mut status)?;
+        self.io_release()?;
+        Ok(Some(status))
+    }
+
+    /// Asks what the card offers in `group` without changing anything (`CMD6` mode 0). `None` means
+    /// the card does not implement the command at all.
+    ///
+    /// Decode with [`switch::supports`] and [`switch::selected`].
+    pub fn query_function(
+        &mut self,
+        group: u8,
+        function: u8,
+    ) -> BlockResult<Option<[u8; switch::STATUS_LEN]>> {
+        self.switch_func(false, group, function)
+    }
+
+    /// Selects `function` in `group` (`CMD6` mode 1) and returns the resulting status. `None` means
+    /// the card refused the command.
+    ///
+    /// A card that does not offer the function answers this SUCCESSFULLY, writing
+    /// [`switch::NO_INFLUENCE`] into the group's result nibble rather than reporting an error. Read
+    /// the result back with [`switch::selected`]: nothing else distinguishes a switch that happened
+    /// from one that did not.
+    pub fn switch_function(
+        &mut self,
+        group: u8,
+        function: u8,
+    ) -> BlockResult<Option<[u8; switch::STATUS_LEN]>> {
+        self.switch_func(true, group, function)
+    }
+
+    /// Puts the card into High Speed and raises the requested bus clock to match, returning whether
+    /// it happened.
+    ///
+    /// **This is the only way past the CSD's `TRAN_SPEED`.** That field reports the ceiling in
+    /// force -- 25 MHz on a default-speed card and on a High Speed card that has not been asked --
+    /// so a host that reads it and stops is capped at half the rate the card would take. After a
+    /// successful switch the same field reads 50 MHz.
+    ///
+    /// Two ways to answer `false` and neither is a fault: the card has no `CMD6` at all, or it
+    /// accepted the command and declined to switch.
+    ///
+    /// The result nibble is the only gate on the outcome, and reading it is not optional. Mode 1
+    /// against an unsupported function is legal and harmless: the card answers OK, writes
+    /// [`switch::NO_INFLUENCE`] and stays where it was. A driver that took the OK for the answer
+    /// would raise the bus to 50 MHz against a card whose ceiling is 25, and that surfaces later as
+    /// corrupt data on a link that looks in specification.
+    ///
+    /// No query is sent first. [`query_function`](Self::query_function) reports what the card
+    /// OFFERS, which is worth reading for diagnosis and is a different fact from what it granted,
+    /// but it cannot change the outcome and this does not run it.
+    ///
+    /// The bus CLAMPS the requested rate to what its divisor can produce, so this asks for the
+    /// card's new ceiling rather than naming a frequency: what a board actually drives is the
+    /// board's to decide and the card's to bound.
+    ///
+    /// One thing the specification allows and this does not model: a switch may take up to 100 ms,
+    /// reported through the status block's busy fields, and nothing here waits for that. A card
+    /// slower than the eight release clocks would fail its next command rather than corrupt
+    /// anything.
+    pub fn try_high_speed(&mut self) -> BlockResult<bool> {
+        const GROUP: u8 = switch::GROUP_ACCESS_MODE;
+        const FUNCTION: u8 = switch::FUNCTION_HIGH_SPEED;
+
+        let switched = match self.switch_function(GROUP, FUNCTION)? {
+            Some(status) => switch::selected(&status, GROUP) == FUNCTION,
+            None => return Ok(false),
+        };
+        if switched {
+            self.bus.set_clock_hz(switch::HIGH_SPEED_CLOCK_HZ);
+        }
+        Ok(switched)
+    }
 }
 
 impl<B: SdSpiBus> BlockDevice for SdCard<B> {
@@ -414,7 +522,7 @@ impl<B: SdSpiBus> BlockDevice for SdCard<B> {
         let mut csd = [0u8; 16];
         self.read_data_block(&mut csd)?;
         self.io_release()?;
-        let count = csd_sector_count(&csd)?;
+        let count = csd_sector_count(&csd, self.card_type.is_mmc())?;
         self.cached_sector_count = Some(count);
         Ok(count)
     }
@@ -492,6 +600,73 @@ mod tests {
         assert_eq!(card.card_type(), CardType::Sdhc);
         assert!(card.card_type().block_addressed());
         assert!(!card.card_type().is_mmc());
+    }
+
+    /// THE ACCEPT COLUMN: a card that offers High Speed is switched, and the clock request follows.
+    ///
+    /// Both halves are asserted because they are separate claims and only one of them is the
+    /// point. The card's own `access_mode` says the switch STUCK -- the sim reports it from state a
+    /// mode-1 command moved, not from the reply it just sent -- and the requested rate says the
+    /// host acted on it. A driver that switched and left the bus at 25 MHz would pass the first and
+    /// deliver nothing.
+    #[test]
+    fn high_speed_is_switched_and_the_bus_rate_follows_it() {
+        let mut card = SdCard::init(SimCard::new(CardType::Sdhc)).unwrap();
+        assert!(card.try_high_speed().unwrap(), "a card offering High Speed must be switched");
+
+        let bus = card.release_bus();
+        assert_eq!(bus.access_mode(), 1, "the CARD is in High Speed, not just the host's belief");
+        assert_eq!(bus.requested_clock_hz(), switch::HIGH_SPEED_CLOCK_HZ);
+    }
+
+    /// THE REJECT COLUMN, AND IT IS THE ONE THAT MATTERS: a card that implements `CMD6` and does
+    /// NOT offer High Speed must be left at its default rate.
+    ///
+    /// **This is the case a wrong driver passes silently.** Mode 1 against an unsupported function
+    /// is legal and the card answers OK; only the result nibble says it declined. A driver that
+    /// switched without querying, or queried without reading the answer, would raise the bus to
+    /// 50 MHz against a card whose ceiling is 25 -- and the failure would appear later as corrupt
+    /// data on a link everyone believed was in spec.
+    #[test]
+    fn a_card_that_declines_high_speed_is_left_at_its_default_rate() {
+        let mut card = SdCard::init(SimCard::without_high_speed(CardType::Sdhc)).unwrap();
+
+        assert!(!card.try_high_speed().unwrap(), "an unsupported function must not report success");
+
+        let bus = card.release_bus();
+        assert_eq!(bus.access_mode(), 0, "the card must still be in default speed");
+        assert_eq!(
+            bus.requested_clock_hz(),
+            25_000_000,
+            "the bus must NOT have been asked for a rate the card does not permit"
+        );
+    }
+
+    /// A card with no `CMD6` at all -- an MMC here, and equally any SD card whose CSD omits command
+    /// class 10 -- is not an error. It is a card without the feature.
+    #[test]
+    fn a_card_that_refuses_the_command_outright_is_not_a_failure() {
+        let mut card = SdCard::init(SimCard::new(CardType::Mmc)).unwrap();
+        assert_eq!(card.try_high_speed(), Ok(false));
+        assert_eq!(card.release_bus().requested_clock_hz(), 25_000_000);
+    }
+
+    /// The query changes nothing. Asking is the safe operation, which is what makes "query before
+    /// switch" a rule with no cost.
+    #[test]
+    fn querying_the_function_does_not_select_it() {
+        let mut card = SdCard::init(SimCard::new(CardType::Sdhc)).unwrap();
+        let status = card
+            .query_function(switch::GROUP_ACCESS_MODE, switch::FUNCTION_HIGH_SPEED)
+            .unwrap()
+            .expect("an SD card implements CMD6");
+
+        assert!(switch::supports(&status, switch::GROUP_ACCESS_MODE, switch::FUNCTION_HIGH_SPEED));
+        assert_eq!(
+            card.release_bus().access_mode(),
+            0,
+            "mode 0 reports what the card WOULD grant and must not grant it"
+        );
     }
 
     #[test]

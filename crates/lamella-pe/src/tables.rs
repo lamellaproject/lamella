@@ -123,6 +123,83 @@ impl TableStream {
         self.sorted |= 1u64 << table;
     }
 
+    /// Sorts `table` by the coded index in `column`, then rewrites every `Index(table, _)` column
+    /// in `dependents` so a row reference that pointed at a row still points at that same row.
+    ///
+    /// **THIS EXISTS BECAUSE THE PLAIN SORT IS UNSAFE THE MOMENT ANOTHER TABLE INDEXES THIS ONE BY
+    /// ROW.** [`TableStream::sort_by_coded_column`] says so in its own doc, and `GenericParam` is
+    /// exactly that case: `GenericParamConstraint.Owner` (II.22.21) is a ROW index into
+    /// `GenericParam`, so reordering the parameters underneath it silently repoints every
+    /// constraint at a different type parameter. Nothing about the resulting assembly is malformed
+    /// -- it declares real constraints on the wrong parameters, which is a WRONG ANSWER rather than
+    /// a corrupt file, and no structural check would see it.
+    ///
+    /// The permutation is computed before the move so the old-to-new map is exact; a rewrite that
+    /// recomputed positions afterwards would have to assume the sort was stable in a particular way.
+    pub fn sort_by_coded_column_remapping(&mut self, table: u8, column: usize, dependents: &[u8]) {
+        let Some(rows) = self.rows.get(&table) else {
+            self.sorted |= 1u64 << table;
+            return;
+        };
+        let mut order: Vec<(u64, usize)> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let key = match row.get(column) {
+                    Some(Column::Coded(kind, token)) => kind.encode(*token),
+                    _ => 0,
+                };
+                (u64::from(key), index)
+            })
+            .collect();
+        order.sort_by_key(|&(key, index)| (key, index));
+
+        let mut moved_to = alloc::vec![0u32; order.len() + 1];
+        for (new_index, &(_, old_index)) in order.iter().enumerate() {
+            moved_to[old_index + 1] = (new_index + 1) as u32;
+        }
+
+        let rows = self.rows.get_mut(&table).expect("checked above");
+        let mut sorted_rows: Vec<Vec<Column>> = Vec::with_capacity(rows.len());
+        for &(_, old_index) in &order {
+            sorted_rows.push(core::mem::take(&mut rows[old_index]));
+        }
+        *rows = sorted_rows;
+        self.sorted |= 1u64 << table;
+
+        for &dependent in dependents {
+            let Some(dependent_rows) = self.rows.get_mut(&dependent) else {
+                continue;
+            };
+            for row in dependent_rows.iter_mut() {
+                for cell in row.iter_mut() {
+                    if let Column::Index(indexed_table, row_index) = cell
+                        && *indexed_table == table
+                    {
+                        let old = *row_index as usize;
+                        if let Some(&new) = moved_to.get(old)
+                            && new != 0
+                        {
+                            *row_index = new;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sorts `table` by the 1-based row index in `column` (an `Index` column), marking it sorted.
+    /// For `GenericParamConstraint`, whose key is its `Owner` row index rather than a coded one.
+    pub fn sort_by_index_column(&mut self, table: u8, column: usize) {
+        if let Some(rows) = self.rows.get_mut(&table) {
+            rows.sort_by_key(|row| match row.get(column) {
+                Some(Column::Index(_, row_index)) => *row_index,
+                _ => 0,
+            });
+        }
+        self.sorted |= 1u64 << table;
+    }
+
     /// The number of rows in `table`.
     #[must_use]
     pub fn row_count(&self, table: u8) -> u32 {

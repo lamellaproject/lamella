@@ -29,12 +29,21 @@ notes = [
 # power figures, timing, and the measurement-duration table a non-blocking driver would need.
 # Treat those as absent rather than defaulted.
 #
-# Unvalidated: no physical BMP280 has been made to answer any of it.
+# Identified, and no further: a physical part has answered the identity register below against a
+# negative control, and nothing beneath it has been read from silicon.
+#
+# THE READING BEARS ON THE SOURCING AS WELL AS ON THE VALIDATION, which is unusual enough to say
+# plainly. Both facts the check used -- the register and the set of values it accepts -- are
+# DERIVED ones, taken from a compatibility section rather than from this part's own datasheet, and
+# both held on a device. That is the first evidence this family's secondary derivation is sound. It
+# does not make the facts primary: what a physical part corroborates is the two sentences it was
+# asked about, not the rest of the section they came from.
 
 [sourcing]
 facts = "secondary"
 derived_from = "bme280"
-validation = "none"
+validation = "identified"
+evidence = "A physical part answered the identity register on a Raspberry Pi Pico 2, over I2C0 at 100 kHz, on a STEMMA QT breakout reached through a four-wire cable: register 0xD0 read 0x58 at address 0x77, the SDO-high strap this family states, repeated across consecutive passes with 0 faulted of 112 addresses walked each time. THE NEGATIVE CONTROL RAN IN THE SAME PASSES: the identical read of the identical register at 0x76, where no part was present, ABORTED every time. AND THE VALUE IS THE THIRD OF THE THREE THIS TABLE ACCEPTS, NOT THE FIRST, which is the whole reason the accepted values are a set: the instrument that took this reading compared against the first value alone until the day before it was run, and against that check this genuine part would have been reported as not a BMP280 and read as no part at all. A SECOND CONTROL CAME FREE, because the sibling in this family shares this address and this register: the same read was scored against the BME280's accepted 0x60 and did not match, and a BME280 measured on the same rig at the same address answered 0x60 and matched none of the three here. So the identity separates the two members in BOTH directions rather than merely being present in one. EVERY NUMBER IN THE CHECK -- the strap addresses, the register, and all three accepted values -- was taken from this table's own emitted artifact by a bench program that includes it, so what was tested is the row that ships and not a copy of it."
 
 # --- identity: THREE accepted values, not one ----------------------------------------------------
 #

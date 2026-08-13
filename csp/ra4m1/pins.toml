@@ -1,5 +1,17 @@
 # PIN map: pin x function -> (instance, signal) for the RA4M1.
 # PARTIAL, evidence-only.
+#
+# THIS MAP IS EMPTY, AND AN EMPTY MAP IS A STATEMENT. Every pin the family's boards drive is a
+# general-purpose output driven by the port block itself, and a pin driven by its own port has no
+# peripheral function to select: there is no signal to name and no instance to route it to. A row
+# asserting one would claim a mux setting no board asks for.
+#
+# WHAT A ROW WOULD HAVE TO CARRY WHEN ONE ARRIVES, since this part selects a function differently
+# from parts whose pins carry a numbered alternate function. A function here is chosen by the
+# PSEL[4:0] field of the pin's own PmnPFS register, one register per pin, with the PMR bit deciding
+# whether the pin is general I/O at all -- rather than by a shared per-port register holding a
+# nibble for each pin. So a function id in this family is a PSEL code, and the register it is
+# written to is selected by the pin instead of by the port.
 
 [table]
 kind = "pins"

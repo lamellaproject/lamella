@@ -5,6 +5,11 @@
 #
 # This part gates its GPIO ports from AHB1 and USART1 from APB2 -- two different banks, which is
 # exactly why the offset is data rather than a per-family constant.
+#
+# ELEVEN PORTS, A THROUGH K, AND THE HIGH ONES ARE NOT DECORATION. The port this board's user
+# LEDs sit on is J, whose enable bit is 9 -- so a driver that derived a port's enable bit from a
+# letter's position in a shorter alphabet would be right for A through H and wrong here, silently,
+# on the only two pins a first program blinks.
 
 [table]
 kind = "instances"

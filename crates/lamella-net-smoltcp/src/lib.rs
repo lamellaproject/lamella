@@ -15,7 +15,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_cil_runtime::net::{
+use lamella_net_core::{
     IfaceKind, Interest, InterfaceInfo, NetBackend, NetResult, OperStatus, SocketHandle,
 };
 use smoltcp::iface::{Config, Interface, SocketHandle as SmolHandle, SocketSet};

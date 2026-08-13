@@ -9,6 +9,17 @@ pub mod cil;
 pub mod debugmap;
 pub mod dwarf;
 /// The closed generic instantiation set and the canonical spelling that names each instantiation.
+///
+/// **EXTRACTED TO ITS OWN LEAF CRATE, BECAUSE BOTH TIERS MONOMORPHIZE.** The interpreter's baker
+/// needs the same closed set and the same canonical name this tier does, and it cannot depend on
+/// `lamella-aot` without pulling the whole backend into the runtime's tree. The alternatives were a
+/// second COLLECTOR (a second walker over one format) or a second SPELLING of a wire value the two
+/// tiers must agree on byte for byte, and a second
+/// spelling does not fail loudly: two implementations agreeing on
+/// `` Pair`2[System.Int32,System.String] `` and diverging on the first NESTED or ARRAY argument is a
+/// type that exists twice -- a cast that fails and a static field with two copies.
+///
+/// Re-exported here so every existing `generics::` path in this crate is unchanged.
 pub use lamella_generics as generics;
 pub mod resolver;
 pub mod target;

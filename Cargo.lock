@@ -352,6 +352,7 @@ name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-net-core",
  "lamella-reactor",
  "lamella-token",
  "lamella-wtf8",
@@ -442,6 +443,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-dap-probe"
+version = "0.0.0"
+dependencies = [
+ "lamella-debug-backend",
+ "lamella-probe-core",
+]
+
+[[package]]
 name = "lamella-debug-backend"
 version = "0.0.0"
 
@@ -523,17 +532,29 @@ name = "lamella-ir"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-js-bytecode"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-js-frontend"
+version = "0.0.0"
+dependencies = [
+ "lamella-js-bytecode",
+ "libm",
+]
+
+[[package]]
 name = "lamella-link"
 version = "0.0.0"
 dependencies = [
  "lamella-elf",
+ "lamella-ir",
 ]
 
 [[package]]
 name = "lamella-load"
 version = "0.0.0"
 dependencies = [
- "lamella-aot",
  "lamella-cil",
  "lamella-cil-runtime",
  "lamella-fs-fat",
@@ -566,6 +587,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-mdns"
+version = "0.0.0"
+dependencies = [
+ "lamella-wire",
+]
+
+[[package]]
 name = "lamella-metadata"
 version = "0.0.0"
 dependencies = [
@@ -578,10 +606,14 @@ name = "lamella-mmio"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-net-core"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-net-smoltcp"
 version = "0.0.0"
 dependencies = [
- "lamella-cil-runtime",
+ "lamella-net-core",
  "smoltcp",
 ]
 
@@ -631,6 +663,7 @@ name = "lamella-py-runtime"
 version = "0.0.0"
 dependencies = [
  "lamella-gc",
+ "lamella-net-core",
  "lamella-py-bytecode",
  "lamella-py-frontend",
  "lamella-reactor",
@@ -800,9 +833,9 @@ dependencies = [
 name = "lamella-winc1500"
 version = "0.0.0"
 dependencies = [
- "lamella-cil-runtime",
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
+ "lamella-net-core",
  "lamella-probe-core",
  "lamella-usbhid",
 ]
@@ -825,6 +858,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+]
+
+[[package]]
+name = "lamella-wire-net"
+version = "0.0.0"
+dependencies = [
+ "lamella-net-core",
+ "lamella-wire",
 ]
 
 [[package]]

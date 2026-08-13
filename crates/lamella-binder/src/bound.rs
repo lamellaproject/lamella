@@ -2,13 +2,14 @@
 //! clause 14).
 
 use crate::bind::bind_type;
-use crate::conversion::{can_cast, converts};
+use crate::conversion::{can_cast, converts, no_conversion_operator_can_exist};
 use crate::diagnostic::{Diagnostic, DiagnosticKind, GenericMember};
-use crate::resolve::{TypeTable, resolve_type};
+use crate::infer::{infer_expanded_type_arguments, infer_method_type_arguments};
+use crate::resolve::{Shadowed, TypeTable, resolve_type};
 use crate::special::SpecialType;
 use crate::symbols::{
     Accessibility, EventSymbol, MethodSymbol, Model, ParameterMode, PropertySymbol, TypeInfo,
-    TypeKind,
+    TypeKind, unmangled_type_name,
 };
 use crate::types::TypeSymbol;
 use lamella_syntax::version::{Feature, LanguageVersion};
@@ -19,8 +20,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
     AssignmentOperator, BinaryOperator, Expr, ExprKind, Initializer, Literal, MemberInitializer,
-    MemberInitializerValue, PostfixOperator, TypeParameter, TypeRef, TypeTestOperation,
-    UnaryOperator,
+    MemberInitializerValue, PostfixOperator, TypeParameter, TypeParameterConstraintClause, TypeRef,
+    TypeRefKind, TypeTestOperation, UnaryOperator,
 };
 use lamella_syntax::span::Span;
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
@@ -175,6 +176,33 @@ pub struct FieldReference {
     /// The compile-time constant value of a `const` field or enum member, so emission folds
     /// the access to a constant load (not an `ldsfld`). `None` for an ordinary field.
     pub constant: Option<Literal>,
+    /// The DECLARING TYPE's open form, when this field was named through an instantiated generic
+    /// type -- `None` for a field of an ordinary type. See [`FieldInstantiation`].
+    pub declaring_instantiation: Option<Box<FieldInstantiation>>,
+}
+
+/// The open form of the type a FIELD was named through -- the `Counter<T>` behind a
+/// `Counter<int>` -- so emission can write the `MemberRef` ECMA-335 4th ed II.23.2.1 requires: a
+/// parent `TypeSpec` carrying the arguments, and the DEFINITION's field signature.
+///
+/// **THE STATIC CASE IS WHY THIS IS DATA CORRUPTION AND NOT A METADATA NICETY.** II.9.7 gives each
+/// instantiation of a generic type its OWN copy of each static field. Name the definition's
+/// `FieldDef` instead and `Counter<int>.Total` and `Counter<string>.Total` become one cell -- the
+/// program runs, reports nothing, and answers with the two counts added together.
+///
+/// The sibling of [`TypeInstantiation`], separate because a field has a TYPE where a method has a
+/// parameter list and a return: folding a field into that shape would leave `parameters` always
+/// empty and a field's type living in a member called `return_type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldInstantiation {
+    /// The declaring TYPE's own type parameter names, in declaration order. A name's POSITION is
+    /// the `n` of the `!n` its signature spells it with (II.23.1.16).
+    pub type_parameters: Vec<Box<str>>,
+    /// The field's type BEFORE substitution -- `T` for `Box<T>.item`, and plainly `int` for a
+    /// `Counter<T>.Total` that never mentions `T`. **The second case is not the trivial one:** its
+    /// signature is identical open and closed, so nothing about the SIGNATURE reveals whether the
+    /// instantiation was carried, and only the parent row does.
+    pub ty: TypeSymbol,
 }
 
 /// The method an invocation resolved to, recorded so emission can name it with a
@@ -198,12 +226,67 @@ pub struct MethodReference {
     pub is_vararg: bool,
     /// The generic instantiation this call site named, when it named one -- `None` for an
     /// ordinary call, which is every C# 1.0 call. See [`MethodInstantiation`].
+    ///
+    /// **Everything else on this reference is the SUBSTITUTED signature**, which is what
+    /// overload resolution and conversion ran against; this is the only field that still knows
+    /// the call was generic at all.
     pub instantiation: Option<Box<MethodInstantiation>>,
+    /// The DECLARING TYPE's open form, when this member was named through an instantiated generic
+    /// type -- `None` for a member of an ordinary type. See [`TypeInstantiation`].
+    ///
+    /// Independent of [`Self::instantiation`], and both can be set at once:
+    /// `Holder<int>.Echo<string>` is a generic method on a generic type, and its signature spells
+    /// `!0` and `!!0` from two separate numbering spaces.
+    pub declaring_instantiation: Option<Box<TypeInstantiation>>,
+}
+
+/// The open form of the type a member was named through -- the `Box<T>` behind a `Box<int>` -- so
+/// emission can write the `MemberRef` that ECMA-335 4th ed II.23.2.1 requires for a member of an
+/// instantiated generic type: a parent `TypeSpec` carrying the arguments, and the DEFINITION's
+/// signature with `!n` where the declaring type's parameters appear.
+///
+/// **THIS IS [`MethodInstantiation`]'s ARGUMENT ONE AXIS OVER, AND IT IS NOT INTERCHANGEABLE WITH
+/// IT.** That type exists because a generic METHOD's open signature cannot be recovered from the
+/// closed one; the same is true of a generic TYPE's, and neither carries the other's names. A
+/// `new Box<int>(41)` has no generic method anywhere in it, so `instantiation` is `None` and the
+/// only record that `!0` was ever involved is this.
+///
+/// The ARGUMENTS are deliberately absent: they are already on the
+/// [`TypeSymbol::Instantiation`] in [`MethodReference::declaring_type`], and a second copy is a
+/// second thing to keep in step.
+///
+/// **A WRONG `!n` IS SILENT, EXACTLY AS A WRONG `!!n` IS.** `!0` written where the substituted type
+/// was meant produces a signature that decodes cleanly and names a different type; so does a
+/// parent that names the definition instead of the instantiation, which is what this compiler
+/// emitted before this type existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeInstantiation {
+    /// The declaring TYPE's own type parameter names, in declaration order -- `["T"]` for
+    /// `Box<T>`, never the method's. A name's POSITION here is the `n` of the `!n` a metadata
+    /// signature spells it with (II.23.1.16), because the binder substitutes BY NAME and metadata
+    /// numbers instead.
+    pub type_parameters: Vec<Box<str>>,
+    /// The member's parameter types BEFORE substitution -- `[T]` for `Box<T>.Box(T value)`.
+    pub parameters: Vec<TypeSymbol>,
+    /// The member's return type before substitution -- `T` for `Box<T>.Get()`.
+    pub return_type: TypeSymbol,
 }
 
 /// The generic instantiation a call site named -- the `<int>` of `Id<int>(x)` -- carried beside
 /// the substituted signature in [`MethodReference`] so emission can mint the `MethodSpec` row
 /// (ECMA-335 4th ed II.22.29) that such a call must name instead of the definition's own token.
+///
+/// **THE OPEN SIGNATURE CANNOT BE RECOVERED FROM THE CLOSED ONE, WHICH IS THE WHOLE REASON
+/// THIS TYPE EXISTS.** After substitution `Id<int>` reads `int Id(int)`, indistinguishable from an
+/// ordinary `int Plain(int)` -- nothing in it records that the parameter was `T`. Emission needs
+/// the OPEN form to write the definition's `!!0` signature and the ARGUMENTS to write the
+/// instantiation blob, and neither half is derivable from the other.
+///
+/// **Getting either half wrong is silent.** A `MethodSpec` whose parent is right and whose
+/// arguments are wrong binds the call to a different instantiation; a call emitted against the
+/// definition's token binds to the OPEN method with `!!0` never substituted. Both produce metadata
+/// that decodes cleanly (`lamella-pe`'s `module.rs` `method_spec` doc says the same from the
+/// writer's side), so neither announces itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodInstantiation {
     /// The type arguments named at the call site, in order -- `[int]` for `Id<int>(x)`. Never
@@ -218,6 +301,153 @@ pub struct MethodInstantiation {
     pub parameters: Vec<TypeSymbol>,
     /// The definition's return type before substitution.
     pub return_type: TypeSymbol,
+}
+
+/// What a CLOSED candidate was closed FROM: its open definition, and the type arguments that closed
+/// it -- whether those were written at the call site or inferred by 25.6.4.
+///
+/// **NOTHING ELSE CAN SUPPLY IT, BECAUSE SUBSTITUTION IS NOT INVERTIBLE.** After `Id<int>` is built,
+/// its parameter list is `(int)` and no amount of looking at it recovers `(T)` or the `int` that
+/// replaced `T` -- and both are needed to mint the `MethodSpec` row the call emits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedFrom {
+    /// The generic method as declared, with its own type parameters still open.
+    definition: MethodSymbol,
+    /// The type arguments, in the definition's declaration order. Never empty.
+    arguments: Vec<TypeSymbol>,
+}
+
+/// The candidates a call will be resolved against, plus what each was closed from.
+///
+/// `candidates` and `origins` are PARALLEL, index for index; `origins[i]` is `None` exactly when
+/// `candidates[i]` is an ordinary non-generic method. Keeping them parallel rather than pairing
+/// them into one list is what lets `candidates` be handed to the existing overload resolution
+/// unchanged -- it knows nothing about generics and should not have to.
+#[derive(Debug, Default)]
+struct CandidateSet {
+    /// Every candidate, CLOSED. Overload resolution sees real types throughout.
+    candidates: Vec<MethodSymbol>,
+    /// Parallel to `candidates`.
+    origins: Vec<Option<ClosedFrom>>,
+    /// Generic methods at this call's argument count for which type inference FAILED. Not an
+    /// error on its own -- the caller reports `CS0411` only when nothing else can be said about
+    /// the call, which is the boundary csc draws (measured: a same-arity non-generic candidate's
+    /// `CS1503` is reported INSTEAD).
+    uninferable: Vec<MethodSymbol>,
+}
+
+impl CandidateSet {
+    /// Applies the half of ECMA-334 4th ed **14.4.2.2** that only the OPEN signatures can settle:
+    /// *"In case the expanded parameter types ... are identical, the following tie-breaking rules
+    /// are applied ... by comparing the given uninstantiated and unexpanded parameter types."*
+    ///
+    /// **WITHOUT THIS, ADDING INFERENCE BREAKS PROGRAMS THAT COMPILED BEFORE IT.** `M(1)` against
+    /// `void M(int)` beside `void M<T>(T)` bound to the non-generic only because the generic one
+    /// was dropped for want of inference. Inferred, the two close to the SAME signature `(int)`,
+    /// neither converts better than the other, and the call becomes CS0121 -- a working program
+    /// turned ambiguous by a feature that was supposed to accept more. Rule 1 settles it: *"If one
+    /// of MP and MQ is non-generic, but the other is generic, then the non-generic is better."*
+    ///
+    /// Dropping here rather than ranking inside `is_better` is deliberate, and it is safe for one
+    /// reason worth stating: applicability depends only on the parameter list and the `params` /
+    /// vararg shape, so two candidates identical in all three are applicable in exactly the same
+    /// situations. Dropping one can therefore never lose a call that would otherwise resolve, and
+    /// it keeps `candidates` free of EQUAL entries -- which `instantiation_of` needs, because two
+    /// equal candidates are indistinguishable to it once a winner has been cloned out.
+    fn apply_identical_signature_tie_break(&mut self) {
+        let mut beaten: Vec<bool> = alloc::vec![false; self.candidates.len()];
+        for left in 0..self.candidates.len() {
+            for right in 0..self.candidates.len() {
+                if left == right || beaten[left] || beaten[right] {
+                    continue;
+                }
+                if !Self::same_call_shape(&self.candidates[left], &self.candidates[right]) {
+                    continue;
+                }
+                if Self::beats(
+                    self.origins[left].as_ref(),
+                    self.origins[right].as_ref(),
+                ) {
+                    beaten[right] = true;
+                }
+            }
+        }
+        let mut keep = beaten.iter().map(|beaten| !beaten);
+        self.candidates.retain(|_| keep.next() == Some(true));
+        let mut keep = beaten.iter().map(|beaten| !beaten);
+        self.origins.retain(|_| keep.next() == Some(true));
+    }
+
+    /// Whether two candidates are applicable in exactly the same situations: the same parameter
+    /// types AND the same trailing-argument shape. `params` and vararg are part of it because
+    /// `M(int[])` and `M(params int[])` accept different call sites despite one parameter list.
+    fn same_call_shape(left: &MethodSymbol, right: &MethodSymbol) -> bool {
+        left.parameters == right.parameters
+            && left.is_params == right.is_params
+            && left.is_vararg == right.is_vararg
+    }
+
+    /// Whether `left` wins 14.4.2.2's tie-break over `right`. `None` is a non-generic candidate.
+    fn beats(left: Option<&ClosedFrom>, right: Option<&ClosedFrom>) -> bool {
+        match (left, right) {
+            (None, Some(_)) => true,
+            (Some(_), None) | (None, None) => false,
+            (Some(left), Some(right)) => {
+                more_specific(&left.definition.parameters, &right.definition.parameters)
+            }
+        }
+    }
+}
+
+/// Whether parameter list `left` is MORE SPECIFIC than `right` (14.4.2.2): *"each given parameter
+/// RX is not less specific than SX, and at least one given parameter RX is more specific than SX.
+/// A type parameter is less specific than a non-type parameter. Recursively, a constructed type is
+/// more specific than another constructed type (with the same number of type arguments) if at least
+/// one type argument is more specific and no type argument is less specific ... An array type is
+/// more specific than another array type (with the same number of dimensions) if the element type
+/// of the first is more specific."*
+fn more_specific(left: &[TypeSymbol], right: &[TypeSymbol]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| !type_more_specific(right, left))
+        && left
+            .iter()
+            .zip(right)
+            .any(|(left, right)| type_more_specific(left, right))
+}
+
+/// The per-type half of [`more_specific`].
+fn type_more_specific(left: &TypeSymbol, right: &TypeSymbol) -> bool {
+    let is_parameter = |ty: &TypeSymbol| matches!(ty, TypeSymbol::Named(parts) if parts.len() == 1);
+    match (left, right) {
+        (
+            TypeSymbol::Array {
+                element: left,
+                rank: left_rank,
+            },
+            TypeSymbol::Array {
+                element: right,
+                rank: right_rank,
+            },
+        ) if left_rank == right_rank => type_more_specific(left, right),
+        (
+            TypeSymbol::Instantiation {
+                definition: left_definition,
+                arguments: left_arguments,
+            },
+            TypeSymbol::Instantiation {
+                definition: right_definition,
+                arguments: right_arguments,
+            },
+        ) if left_definition == right_definition
+            && left_arguments.len() == right_arguments.len() =>
+        {
+            more_specific(left_arguments, right_arguments)
+        }
+        _ => !is_parameter(left) && is_parameter(right),
+    }
 }
 
 /// A user-defined `++`/`--` whose operand or result type differs from the variable's (14.14.2): the
@@ -291,6 +521,20 @@ pub enum BoundExprKind {
         declaring_type: TypeSymbol,
         /// The type that declares the `set_` accessor.
         setter_declaring_type: TypeSymbol,
+        /// The `get_` accessor's OPEN signature, when the property was named through an
+        /// instantiated generic type -- `None` for a property of an ordinary type.
+        ///
+        /// **WITHOUT THIS THE ACCESSOR IS NAMED BY THE DEFINITION'S OWN TOKEN**, which is a
+        /// `callvirt` at the open `get_Item` returning `!0` unsubstituted -- and identical for
+        /// every instantiation, so `B<int>.Item` and `B<string>.Item` call one method. The
+        /// substituted signature on this node is what overload resolution ran against; this is the
+        /// only field that still knows the property was reached through a constructed type. Same
+        /// role [`MethodReference::declaring_instantiation`] plays for a call.
+        getter_instantiation: Option<Box<TypeInstantiation>>,
+        /// The `set_` accessor's open signature. SEPARATE from the getter's, because a partially
+        /// overridden property declares its two accessors on DIFFERENT types (14.5.4) and so may
+        /// reach them through different instantiations.
+        setter_instantiation: Option<Box<TypeInstantiation>>,
         /// The property name.
         name: Box<str>,
     },
@@ -446,6 +690,14 @@ pub enum BoundExprKind {
     TypeOf(TypeSymbol),
     /// A `sizeof(T)` (III.4.25): the byte size of `T` as an `int`.
     SizeOf(TypeSymbol),
+    /// A `default(T)` expression: the target type's zero. Emission chooses the form from the
+    /// type -- `ldnull`, a zero literal, or `initobj` into a temporary.
+    ///
+    /// **The TYPE is carried rather than a folded value, because the value depends on a fact the
+    /// binder does not always have.** For a TYPE PARAMETER the answer is `null` at a reference
+    /// instantiation and an all-zero struct at a value one, and the same `default(T)` is both.
+    /// Folding it here would pick one before `T` is known.
+    DefaultValue(TypeSymbol),
     /// A `__makeref(variable)` (csc typed-reference operator): its type is
     /// `System.TypedReference`. Emits the operand's address then `mkrefany <operand type>`.
     MakeRef(Box<BoundExpr>),
@@ -547,6 +799,15 @@ pub struct Binder {
     /// place rather than at each construct.
     language_version: LanguageVersion,
     scopes: Vec<BTreeMap<String, TypeSymbol>>,
+    /// The type parameters currently in scope, innermost last, each with the constraints its
+    /// declaration wrote. Pushed by [`Binder::enter_type_parameters`] and popped by
+    /// [`Binder::exit_type_parameters`], so it tracks the SAME scope the type table does.
+    ///
+    /// **A type parameter is not a row in the model** -- it is a shadowing entry in the type table
+    /// and nothing more ([`Binder::enter_type_parameters`] explains why it is not its own
+    /// `TypeSymbol` variant). So "is this name a type parameter, and what was promised about it"
+    /// is a question nothing else in the binder could answer, which is what CS0304 needs.
+    type_parameters_in_scope: Vec<(Box<str>, crate::symbols::TypeParameterConstraints)>,
     world: TypeTable,
     model: Model,
     current_type: Option<TypeSymbol>,
@@ -647,8 +908,14 @@ pub struct Binder {
 /// One candidate for the unused-field warnings (CS0414 / CS0169 / CS0649).
 #[derive(Debug)]
 struct PrivateField {
-    /// The declaring type's dotted name.
+    /// The declaring type's dotted name, as a lookup KEY -- it must match the key every field
+    /// read and write is recorded under, so it keeps the metadata spelling.
     declaring: Box<str>,
+    /// The declaring type's name as a DIAGNOSTIC READS IT, which is not the key: a generic type is
+    /// keyed `` Box`1 `` and spelled `Box<T>`. Two jobs that were one string until a generic type
+    /// could declare a field, at which point every message about one quoted a name that appears
+    /// nowhere in the source it is describing.
+    declaring_display: Box<str>,
     /// The field's name.
     name: Box<str>,
     /// The declarator's own byte range -- where the warning is reported.
@@ -679,6 +946,8 @@ struct PrivateField {
 
 /// Whether an assembly other than this one could ASSIGN a field of `access` declared in `declaring`
 /// -- the condition CS0649 is withheld under.
+///
+/// **Measured against csc `/langversion:ISO-1`, one compilation per row**:
 ///
 /// | field | enclosing type | csc |
 /// |---|---|---|
@@ -791,21 +1060,117 @@ impl Binder {
     /// (`bound.rs` 67, `program.rs` 35) that would ABSORB it silently rather than failing to
     /// compile. Under bake-time lowering a parameter becomes a concrete type anyway; what the
     /// binder needs is for `T` to resolve, not for it to be a new kind of thing.
-    pub(crate) fn enter_type_parameters(&mut self, parameters: &[TypeParameter]) -> Vec<Box<str>> {
-        let mut added = Vec::new();
-        for parameter in parameters {
-            if !self.world.contains("", &parameter.name) {
-                self.world.insert("", &parameter.name);
-                added.push(parameter.name.clone());
-            }
+    ///
+    /// **THE PARAMETER SHADOWS A REAL TYPE OF THE SAME NAME**, and the displaced entry is carried
+    /// in the returned scope so [`Binder::exit_type_parameters`] can put it back. The rule itself
+    /// is stated once, on [`TypeTable::shadow`]; this is its use site, not a second copy of it.
+    ///
+    /// the parameter inside the declaration, so `class T {} class Box<T> { T Value; }` gave
+    /// `Value` the CLASS. That is not a message difference -- it binds a different type, and every
+    /// signature built from it is wrong. `shadow`/`unshadow` gets both halves.
+    /// **PUBLIC BECAUSE THE EMITTER RE-BINDS BODIES AND MUST DO IT IN THE SAME SCOPE.**
+    /// `lamella-assemble`'s `emit_type` binds every method body a second time; without entering
+    /// this scope there, `T` resolved in the diagnostic pass and became the ERROR type at emit --
+    /// two phases, two answers, and the emit-side diagnostic reaches no one.
+    ///
+    /// **`clauses` IS A REQUIRED ARGUMENT AND NOT AN OPTION, WHICH IS THE POINT.** A caller that
+    /// entered a scope without them would leave every parameter looking unconstrained, and the
+    /// CS0304 check reads exactly that -- so `new T()` under a written `where T : new()` would be
+    /// refused. Making it a parameter means the four call sites had to supply it rather than
+    /// acquire it later; an empty slice is the honest answer where there is no syntax to read.
+    pub fn enter_type_parameters(
+        &mut self,
+        parameters: &[TypeParameter],
+        clauses: &[TypeParameterConstraintClause],
+    ) -> Vec<(Box<str>, Shadowed)> {
+        let names: Vec<Box<str>> = parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect();
+        let constraints = crate::declaration::constraints_by_parameter(&names, clauses);
+        let entered: Vec<(Box<str>, Shadowed)> = parameters
+            .iter()
+            .map(|parameter| {
+                let displaced = self.world.shadow("", &parameter.name);
+                (parameter.name.clone(), displaced)
+            })
+            .collect();
+        for (name, constraint) in names.into_iter().zip(constraints) {
+            self.type_parameters_in_scope.push((name, constraint));
         }
-        added
+        entered
     }
 
-    /// Withdraws the names [`Binder::enter_type_parameters`] added.
-    pub(crate) fn exit_type_parameters(&mut self, added: &[Box<str>]) {
-        for name in added {
-            self.world.remove("", name);
+    /// The constraints written for the in-scope type parameter named `name`, innermost first, or
+    /// `None` if no such parameter is in scope.
+    ///
+    /// Searched from the END so a method's `T` shadows its type's `T` -- the same direction
+    /// [`Binder::exit_type_parameters`] unwinds in, and for the same reason.
+    #[must_use]
+    pub(crate) fn type_parameter_in_scope(
+        &self,
+        name: &str,
+    ) -> Option<&crate::symbols::TypeParameterConstraints> {
+        self.type_parameters_in_scope
+            .iter()
+            .rev()
+            .find(|(parameter, _)| &**parameter == name)
+            .map(|(_, constraints)| constraints)
+    }
+
+    /// The type a member lookup on `ty` actually searches: `System.Array` for an array, a TYPE
+    /// PARAMETER's effective base class for a bare parameter, and `ty` itself otherwise.
+    ///
+    /// **A BARE TYPE PARAMETER IS NOT A TYPE THE MODEL HOLDS, SO A LOOKUP THAT STARTS AT IT FINDS
+    /// NOTHING AND THE CALL IS REFUSED.** `t.ToString()` on an unconstrained `T` and `a.Legs()`
+    /// under `where T : Animal` are the same failure: `type_info_of` has no entry for `T`, the
+    /// chain walk visits nothing, and emission reports *a call that did not resolve*. The members
+    /// a parameter offers are those of its EFFECTIVE BASE CLASS (25.7) -- `System.Object` when
+    /// nothing is written, `System.ValueType` under `where T : struct`, and the named class when
+    /// there is one.
+    ///
+    /// **IT IS A METHOD RATHER THAN A FREE FUNCTION BECAUSE THE ANSWER NEEDS THE SCOPE**, and it
+    /// replaced a free `member_lookup_type` at TEN call sites for that reason: a rule with ten
+    /// implementations gains a new case in none of them, and this case had to reach every walk that
+    /// resolves a member -- methods, fields, properties, events, extension lookup and the accessor
+    /// declarers -- or a constrained call would work in one position and refuse in the next.
+    ///
+    /// **INTERFACE CONSTRAINTS ARE NOT SEARCHED: `where T : IFoo` then `t.Foo()` is refused.** Only
+    /// the effective base class is consulted, so a member reached through an interface constraint
+    /// is a known gap rather than a silent wrong answer.
+    #[must_use]
+    pub(crate) fn lookup_type_of(&self, ty: &TypeSymbol) -> TypeSymbol {
+        let TypeSymbol::Named(parts) = ty else {
+            return member_lookup_type(ty);
+        };
+        let [only] = &parts[..] else {
+            return member_lookup_type(ty);
+        };
+        let Some(constraints) = self.type_parameter_in_scope(only) else {
+            return member_lookup_type(ty);
+        };
+        let named_class = constraints.types.iter().find(|constraint| {
+            self.type_info_of(constraint)
+                .is_some_and(|info| info.kind != TypeKind::Interface)
+        });
+        match named_class {
+            Some(class) => class.clone(),
+            None if constraints.value_type => type_symbol_in("System", "ValueType"),
+            None => type_symbol_in("System", "Object"),
+        }
+    }
+
+    /// Closes the scope [`Binder::enter_type_parameters`] opened, restoring whatever each parameter
+    /// displaced.
+    ///
+    /// **In reverse**, so that two parameters spelled the same way -- illegal C# (CS0692), but the
+    /// binder still has to unwind a program it is refusing -- restore to the entry that was there
+    /// before the FIRST of them, rather than to the one the first displaced.
+    pub fn exit_type_parameters(&mut self, entered: Vec<(Box<str>, Shadowed)>) {
+        let remaining = self.type_parameters_in_scope.len().saturating_sub(entered.len());
+        self.type_parameters_in_scope.truncate(remaining);
+        for (name, displaced) in entered.into_iter().rev() {
+            self.world.unshadow("", &name, displaced);
         }
     }
 
@@ -837,6 +1202,10 @@ impl Binder {
     /// [`resolve_named_type`](Self::resolve_named_type) does: `List<int>[]` reaches this twice,
     /// once as the array and once as its element, and only the second fires. A caller that does not
     /// recurse wants [`gate_generic_use_including_elements`](Self::gate_generic_use_including_elements).
+    ///
+    /// Neither form looks inside an instantiation's ARGUMENTS. `List<List<int>>` is ONE reference
+    /// the programmer wrote and draws ONE refusal; reporting per level would make a nested type
+    /// noisier than a flat one for no added information.
     pub(crate) fn gate_generic_use(&mut self, ty: &TypeSymbol, span: Span) {
         if matches!(ty, TypeSymbol::Instantiation { .. }) {
             self.gate_feature(Feature::Generics, span);
@@ -845,6 +1214,13 @@ impl Binder {
 
     /// [`gate_generic_use`](Self::gate_generic_use) for a caller that does NOT recurse into element
     /// types, so it walks them itself.
+    ///
+    /// **THIS EXISTS BECAUSE A POSITION CAN BE UNGATED WITHOUT BEING UNBOUND, AND ONE IS.** A
+    /// delegate's return and parameter types are never resolved by the binder -- `delegate Missing
+    /// D();` draws no `CS0246` at all, which is a pre-existing under-report, separate from generics
+    /// and not fixed here (`bind_namespace_body`'s member loop has the same deliberate omission for
+    /// an event's type, and for the same cascade reason). The feature gate must still be total, so
+    /// that position gates through here rather than through resolution.
     pub(crate) fn gate_generic_use_including_elements(&mut self, ty: &TypeSymbol, span: Span) {
         match ty {
             TypeSymbol::Array { element, .. }
@@ -898,6 +1274,44 @@ impl Binder {
         }
     }
 
+    /// A declaring type's name as a DIAGNOSTIC should render it: `Box<T>`, not `` Box`1 ``.
+    ///
+    /// The metadata spelling is right for a lookup key and wrong in a message -- it names a type
+    /// the programmer did not write, using a character C# has no meaning for. csc quotes
+    /// `Box<T>.item`, so a message quoting `` Box`1.item `` diverges on the one part of the
+    /// diagnostic a reader searches their own source for.
+    ///
+    /// A type with no parameters renders exactly as before, so no non-generic message moves.
+    fn declaring_display_name(&self, declaring: &TypeSymbol) -> Box<str> {
+        let Some(key) = crate::flow::field_type_key(declaring) else {
+            return Box::from("");
+        };
+        let parameters = self
+            .model
+            .get_by_symbol(declaring)
+            .map(|info| info.type_parameters.clone())
+            .unwrap_or_default();
+        if parameters.is_empty() {
+            return key;
+        }
+        let (prefix, last) = match key.rfind('.') {
+            Some(dot) => (&key[..=dot], &key[dot + 1..]),
+            None => ("", &key[..]),
+        };
+        let bare = crate::symbols::unmangled_type_name(last);
+        let mut rendered = String::from(prefix);
+        rendered.push_str(&bare);
+        rendered.push('<');
+        for (index, parameter) in parameters.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            rendered.push_str(parameter);
+        }
+        rendered.push('>');
+        rendered.into()
+    }
+
     /// Records a private, non-const field (its declaring type, name, declarator span, and CS0169
     /// eligibility) as a candidate for the unused-field warnings, judged in the final pass.
     pub(crate) fn record_private_field(
@@ -912,9 +1326,11 @@ impl Binder {
     ) {
         let assignable_from_outside =
             assignable_from_outside_assembly(&self.model, declaring, access);
+        let declaring_display = self.declaring_display_name(declaring);
         if let Some(declaring) = crate::flow::field_type_key(declaring) {
             self.private_fields.push(PrivateField {
                 declaring,
+                declaring_display,
                 name: name.into(),
                 span,
                 shared_prefix,
@@ -974,6 +1390,7 @@ impl Binder {
             }
             let PrivateField {
                 declaring,
+                declaring_display,
                 name,
                 span,
                 eligible_never_used,
@@ -990,15 +1407,15 @@ impl Binder {
             let written = self.field_writes.contains(&key);
             let kind = if is_private && written && !read {
                 Some(DiagnosticKind::UnusedField {
-                    field: format!("{declaring}.{name}").into(),
+                    field: format!("{declaring_display}.{name}").into(),
                 })
             } else if is_private && eligible_never_used && !written && !read {
                 Some(DiagnosticKind::FieldNeverUsed {
-                    field: format!("{declaring}.{name}").into(),
+                    field: format!("{declaring_display}.{name}").into(),
                 })
             } else if eligible_never_used && !written && !assignable_from_outside {
                 Some(DiagnosticKind::FieldNeverAssigned {
-                    field: format!("{declaring}.{name}").into(),
+                    field: format!("{declaring_display}.{name}").into(),
                     default: default_value,
                 })
             } else {
@@ -1048,7 +1465,69 @@ impl Binder {
     }
 
     /// Resolves a type against the reference world, reporting `CS0246` if unknown.
+    ///
+    /// **THIS IS ALSO THE GENERIC USE SITE'S FEATURE GATE, AND THE PLACEMENT IS THE WHOLE OF ITS
+    /// CORRECTNESS.** A generic USE can appear in a program that declares no generic type, so the
+    /// declaration-level gate in `bind_type_bodies` never fires for `void M() { List<int> x; }`. A
+    /// gate on signatures but not body locals would ship an accepts-invalid, which for a construct
+    /// no emitter can encode is a miscompile rather than a missing message.
+    ///
+    /// **THIS IS 21 OF THE 23 POSITIONS AND NOT ALL OF THEM, WHICH IS A MEASUREMENT AND NOT AN
+    /// ESTIMATE.** A delegate's return and parameter types never reach here, so they gate at their
+    /// own declaration through
+    /// [`gate_generic_use_including_elements`](Self::gate_generic_use_including_elements). The
+    /// division is recorded by `a_generic_use_is_refused_in_every_position_a_type_can_appear` and
+    /// its control, which is a table rather than an example because "every position" is a claim an
+    /// example cannot support -- and which found that exception rather than having it written in.
     pub(crate) fn resolve_named_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
+        let resolved = self.resolve_named_type_unchecked(ty, span);
+        self.check_type_argument_constraints(&resolved, span);
+        resolved
+    }
+
+    /// Resolves the operand of `typeof(List<>)` -- an `unbound-type-name` (14.5.11) already bound
+    /// by [`bind_type`] to the spec's `object`-substituted instantiation -- to the UNBOUND GENERIC
+    /// TYPE it names.
+    ///
+    /// Two things separate this from [`resolve_named_type`](Self::resolve_named_type), and 14.5.11
+    /// states both:
+    ///
+    /// - **Constraints are ignored.** *Evaluate the resulting type-name, while ignoring all type
+    ///   parameter constraints.* The substituted `object`s satisfy nothing in particular, so
+    ///   checking them would refuse `typeof(Nullable<>)` -- which csc compiles -- for a violation by
+    ///   an argument the programmer did not write. This is the ONE caller outside the wrapper, and
+    ///   it is here rather than at a `skip_constraints` flag so that the exemption is attached to
+    ///   the construct the standard grants it to.
+    /// - **The answer is the DEFINITION, not the instantiation.** *The unbound-type-name resolves to
+    ///   the unbound generic type associated with the resulting constructed type.* So the resolved
+    ///   `` List`1<object> `` becomes plain `` List`1 ``, through
+    ///   [`definition_symbol`](crate::symbols::definition_symbol) -- the one spelling a token table
+    ///   and the model both hold a generic definition under. Emission then needs no case of its own:
+    ///   `ldtoken` of a [`TypeSymbol::Named`] is the `TypeRef`/`TypeDef` row it has always been.
+    ///
+    /// **MEASURED AGAINST csc RATHER THAN REASONED ABOUT** (`System.Reflection.Metadata` over csc's
+    /// own output for this program): `typeof(List<>)` is `ldtoken` of the **TypeRef** `` List`1 ``
+    /// and `typeof(Dictionary<,>)` of `` Dictionary`2 ``, while `typeof(List<int>)` beside them is a
+    /// `TypeSpec`. The unbound form names no `TypeSpec` at all.
+    ///
+    /// A definition that does not resolve has already drawn its own diagnostic (CS0246, or CS0305
+    /// where the name is in scope at another arity), and `Error` falls through unchanged.
+    pub(crate) fn resolve_unbound_generic_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
+        match self.resolve_named_type_unchecked(ty, span) {
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => crate::symbols::definition_symbol(&definition, arguments.len()),
+            other => other,
+        }
+    }
+
+    /// [`resolve_named_type`](Self::resolve_named_type) without the constraint check -- the
+    /// resolution itself. The split exists so the check has exactly one place to sit, not so
+    /// callers may choose to skip it: the ONE other caller is
+    /// [`resolve_unbound_generic_type`](Self::resolve_unbound_generic_type), which skips it because
+    /// ECMA-334 4th ed 14.5.11 says to and quotes the sentence.
+    fn resolve_named_type_unchecked(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
         self.gate_generic_use(ty, span);
         if let TypeSymbol::Special(special) = ty {
             return self.resolve_special_type(*special, span);
@@ -1063,6 +1542,32 @@ impl Binder {
                 if let Some((namespace, _)) = hits.first() {
                     return type_symbol_in(namespace, name).fold_builtin();
                 }
+            }
+        }
+        if let TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } = ty
+            && let [only] = &definition[..]
+        {
+            let mangled = crate::symbols::definition_metadata_name(definition, arguments.len());
+            if let Some((namespace, _)) = self.type_namespaces_containing(&mangled).first() {
+                let mut parts: Vec<Box<str>> = Vec::new();
+                if !namespace.is_empty() {
+                    parts.extend(namespace.split('.').map(Box::from));
+                }
+                parts.push(only.clone());
+                let resolved: Vec<TypeSymbol> = arguments
+                    .iter()
+                    .map(|argument| self.resolve_named_type(argument, span))
+                    .collect();
+                if resolved.iter().any(TypeSymbol::is_error) {
+                    return TypeSymbol::Error;
+                }
+                return TypeSymbol::Instantiation {
+                    definition: parts.into(),
+                    arguments: resolved.into(),
+                };
             }
         }
         if let TypeSymbol::Array { element, rank } = ty {
@@ -1109,6 +1614,178 @@ impl Binder {
             TypeSymbol::Special(special) => self.resolve_special_type(special, span),
             resolved => resolved,
         }
+    }
+
+    /// Reports every constraint (25.7.1) that a constructed type's arguments fail to satisfy.
+    ///
+    /// **THIS RUNS WHERE THE ARITY CHECK RUNS, AND THAT PLACEMENT IS THE WHOLE OF ITS COVERAGE.**
+    /// `resolve_named_type` is the 21-of-23 position seam the generic use-site gate already
+    /// documents, so a constraint violation is caught in a local's type, a parameter, a return, a
+    /// field, a base clause and a `new` -- rather than in whichever one a test happened to write.
+    /// The two positions it does not reach are a delegate's return and parameter types, which
+    /// cannot name a constructed type in this parser at all.
+    ///
+    /// **THE ARGUMENTS ARE CHECKED AGAINST THE DEFINITION'S OWN CONSTRAINTS, NOT AN INSTANTIATED
+    /// COPY'S.** `Model::get_by_symbol` on an instantiation BUILDS a substituted `TypeInfo`, which
+    /// is the right answer for member lookup and the wrong one here: after substitution the
+    /// parameter list belongs to the closed type and the constraint on `T` no longer has a `T` to
+    /// be about. The definition row is fetched directly for that reason.
+    ///
+    /// **Silence when the definition is absent is deliberate and is not a hole**: an
+    /// instantiation whose definition does not resolve has already drawn CS0246 or CS0305 from
+    /// `definition_refusal`, and a second message about constraints on a type that was never found
+    /// would be a cascade.
+    fn check_type_argument_constraints(&mut self, resolved: &TypeSymbol, span: Span) {
+        let TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } = resolved
+        else {
+            return;
+        };
+        let (namespace, name) = crate::resolve::split_name(definition);
+        let metadata_name = crate::symbols::definition_metadata_name(definition, arguments.len());
+        let Some(info) = self.model.get(&namespace, &metadata_name).cloned() else {
+            return;
+        };
+        let declaration =
+            crate::resolve::quote_candidate(name, info.type_parameters.len(), &info.type_parameters);
+        for (index, argument) in arguments.iter().enumerate() {
+            if argument.is_error() {
+                continue;
+            }
+            let Some(constraints) = info.constraints_on(index) else {
+                continue;
+            };
+            if constraints.is_empty() {
+                continue;
+            }
+            let parameter: Box<str> = info.type_parameters[index].clone();
+            self.check_one_type_argument(
+                argument,
+                &constraints.clone(),
+                &parameter,
+                &declaration,
+                span,
+            );
+        }
+    }
+
+    /// The four constraint tests for ONE type argument of a generic TYPE.
+    fn check_one_type_argument(
+        &mut self,
+        argument: &TypeSymbol,
+        constraints: &crate::symbols::TypeParameterConstraints,
+        parameter: &str,
+        declaration: &str,
+        span: Span,
+    ) {
+        self.check_one_type_argument_as(
+            argument,
+            constraints,
+            parameter,
+            declaration,
+            GenericMember::Type,
+            span,
+        );
+    }
+
+    /// The four constraint tests for ONE type argument, in csc's reporting order.
+    ///
+    /// **ONE IMPLEMENTATION FOR TYPES AND METHODS.** The rules are identical and only the noun in
+    /// the message differs -- csc says *"in the generic type 'Box<T>'"* and *"in the generic method
+    /// 'C.M<T>()'"* under the SAME four codes. `member` is that noun. Writing the tests twice is
+    /// how the next constraint kind would land on one of them.
+    fn check_one_type_argument_as(
+        &mut self,
+        argument: &TypeSymbol,
+        constraints: &crate::symbols::TypeParameterConstraints,
+        parameter: &str,
+        declaration: &str,
+        member: GenericMember,
+        span: Span,
+    ) {
+        if constraints.reference_type && !crate::conversion::is_reference_type(&self.model, argument)
+        {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::TypeArgumentMustBeReferenceType {
+                    argument: alloc::format!("{argument}").into(),
+                    parameter: parameter.into(),
+                    declaration: declaration.into(),
+                    member,
+                },
+                span,
+            ));
+        }
+        if constraints.value_type && !self.is_value_type(argument) {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::TypeArgumentMustBeValueType {
+                    argument: alloc::format!("{argument}").into(),
+                    parameter: parameter.into(),
+                    declaration: declaration.into(),
+                    member,
+                },
+                span,
+            ));
+        }
+        if constraints.default_constructor
+            && !self.has_accessible_parameterless_constructor(argument)
+        {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::TypeArgumentNeedsDefaultConstructor {
+                    argument: alloc::format!("{argument}").into(),
+                    parameter: parameter.into(),
+                    declaration: declaration.into(),
+                    member,
+                },
+                span,
+            ));
+        }
+        for constraint in &constraints.types {
+            let constraint = self.resolve_named_type_quietly(constraint, span);
+            if constraint.is_error() {
+                continue;
+            }
+            if !crate::conversion::converts(&self.model, argument, &constraint) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::TypeArgumentNoConversionToConstraint {
+                        argument: alloc::format!("{argument}").into(),
+                        parameter: parameter.into(),
+                        declaration: declaration.into(),
+                        constraint: alloc::format!("{constraint}").into(),
+                        member,
+                    },
+                    span,
+                ));
+            }
+        }
+    }
+
+    /// Whether `ty` satisfies a `new()` constraint: a value type (which always has one), or a
+    /// non-abstract type declaring a public parameterless constructor -- including one that
+    /// declares NO constructor at all, which C# gives an implicit public parameterless one (17.10).
+    ///
+    /// **A type this model cannot see answers `true`.** That is the same safe under-report
+    /// `is_sealed` and `is_abstract` take for a referenced or synthetic type: a missed CS0310 is a
+    /// gap, whereas a false one would refuse a legal program against an assembly we merely failed
+    /// to decode.
+    fn has_accessible_parameterless_constructor(&self, ty: &TypeSymbol) -> bool {
+        if self.is_value_type(ty) {
+            return true;
+        }
+        let Some(info) = self.model.get_by_symbol(ty) else {
+            return true;
+        };
+        if info.is_abstract {
+            return false;
+        }
+        if info.constructors.is_empty() {
+            return true;
+        }
+        info.constructors.iter().any(|constructor| {
+            constructor.parameters.is_empty()
+                && matches!(constructor.accessibility, Accessibility::Public)
+        })
     }
 
     /// Resolves a predefined type's mention: [`TypeSymbol::Special`] when its `System`
@@ -1170,6 +1847,21 @@ impl Binder {
                 rank: *rank,
             },
             TypeSymbol::Pointer(inner) => TypeSymbol::Pointer(Box::new(self.canonicalize(inner))),
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => TypeSymbol::Instantiation {
+                definition: crate::symbols::canonical_definition(
+                    definition,
+                    arguments.len(),
+                    |mangled| self.model.type_with_simple_name(mangled),
+                ),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| self.canonicalize(argument))
+                    .collect::<Vec<_>>()
+                    .into(),
+            },
             _ => ty.clone(),
         }
     }
@@ -1265,12 +1957,29 @@ impl Binder {
     /// A user-defined conversion method (`op_Implicit`/`op_Explicit`) taking `from` and
     /// returning `to`, declared on either the source or target type (17.9.3). The static
     /// call a `from -> to` conversion lowers to.
+    ///
+    /// A pair for which 17.9.3 forbids declaring an operator is refused before the search runs,
+    /// because the return-type test below is vacuous there: it accepts an operator whose return
+    /// type merely CONVERTS to the target, and every type converts to `object`. Against the real
+    /// BCL that selected `System.String.op_Implicit(String) -> ReadOnlySpan<char>` as the
+    /// conversion from `string` to `object`, and emission -- which looks an operator up keyed by
+    /// its return type -- then missed and refused with *"call to a method outside this module"*.
+    /// `(object)aString` was nine of the C# differential's nine failures.
+    ///
+    /// The guard is in this function rather than at the fourteen call sites that reach it. Only the
+    /// cast expression could actually select the wrong operator -- [`Self::convert`] is safe
+    /// because it tests `converts` first -- but a rule delivered to one caller of fourteen is a
+    /// rule the other thirteen do not have, and which of them can reach the case is not a property
+    /// anyone re-derives when adding the fifteenth.
     pub(crate) fn user_conversion(
         &self,
         from: &TypeSymbol,
         to: &TypeSymbol,
         name: &str,
     ) -> Option<MethodReference> {
+        if no_conversion_operator_can_exist(&self.model, from, to) {
+            return None;
+        }
         let mut fallback: Option<MethodReference> = None;
         for owner in [from, to] {
             for method in self.methods_in_chain(owner, name) {
@@ -1281,14 +1990,18 @@ impl Binder {
                     continue;
                 }
                 let exact = &method.parameters[0] == from && &method.return_type == to;
+                let declaring_type = self.declaring_type_in_chain(owner, name, &method.parameters);
+                let declaring_instantiation =
+                    self.declaring_instantiation_of(&declaring_type, name, &method.parameters);
                 let reference = MethodReference {
-                    declaring_type: self.declaring_type_in_chain(owner, name, &method.parameters),
+                    declaring_type,
                     name: name.into(),
                     parameters: method.parameters,
                     return_type: method.return_type,
                     is_static: true,
                     is_vararg: false,
                     instantiation: None,
+                    declaring_instantiation,
                 };
                 if exact {
                     return Some(reference);
@@ -1544,9 +2257,19 @@ impl Binder {
             ConversionKind::ImplicitNumeric
         } else if self.is_value_type(from) && !self.is_value_type(to) {
             ConversionKind::Boxing
+        } else if self.is_bare_type_parameter(from) && !self.is_value_type(to) {
+            ConversionKind::Boxing
         } else {
             ConversionKind::ImplicitReference
         }
+    }
+
+    /// Whether `ty` is a BARE type parameter of the declaration being bound -- `T`, not `Box<T>`
+    /// and not `T[]`, both of which are ordinary types that merely mention one.
+    #[must_use]
+    pub(crate) fn is_bare_type_parameter(&self, ty: &TypeSymbol) -> bool {
+        matches!(ty, TypeSymbol::Named(parts)
+            if matches!(&parts[..], [only] if self.type_parameter_in_scope(only).is_some()))
     }
 
     /// Whether a type is a value type (boxed when converted to `object`).
@@ -1973,6 +2696,7 @@ impl Binder {
                     is_volatile: false,
                     accessibility: Accessibility::Public,
                     constant: None,
+                    declaring_instantiation: None,
                 }),
             },
         }
@@ -2020,6 +2744,11 @@ impl Binder {
         };
         Some((
             MethodReference {
+                declaring_instantiation: self.declaring_instantiation_of(
+                    &target,
+                    ".ctor",
+                    &chosen.parameters,
+                ),
                 declaring_type: target,
                 name: ".ctor".into(),
                 is_vararg: chosen.is_vararg,
@@ -2395,6 +3124,11 @@ impl Binder {
                         if matches!(as_delegate.kind, BoundExprKind::DelegateCreation { .. }) {
                             let declaring_type =
                                 self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
+                            let declaring_instantiation = self.declaring_instantiation_of(
+                                &declaring_type,
+                                &op_name,
+                                &method.parameters,
+                            );
                             return BoundExpr {
                                 ty: ty.clone(),
                                 kind: BoundExprKind::Call {
@@ -2408,6 +3142,7 @@ impl Binder {
                                         is_static: true,
                                         is_vararg: false,
                                         instantiation: None,
+                                        declaring_instantiation,
                                     }),
                                 },
                             };
@@ -2464,6 +3199,11 @@ impl Binder {
                             let argument = self.convert(operand, &param);
                             let declaring_type =
                                 self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
+                            let declaring_instantiation = self.declaring_instantiation_of(
+                                &declaring_type,
+                                &op_name,
+                                &method.parameters,
+                            );
                             return BoundExpr {
                                 ty: ty.clone(),
                                 kind: BoundExprKind::Call {
@@ -2477,6 +3217,7 @@ impl Binder {
                                         is_static: true,
                                         is_vararg: false,
                                         instantiation: None,
+                                        declaring_instantiation,
                                     }),
                                 },
                             };
@@ -2587,7 +3328,11 @@ impl Binder {
                 }
             }
             ExprKind::TypeOf(target) => {
-                let target_ty = self.resolve_named_type(&bind_type(target), target.span);
+                let target_ty = if matches!(target.kind, TypeRefKind::Unbound { .. }) {
+                    self.resolve_unbound_generic_type(&bind_type(target), target.span)
+                } else {
+                    self.resolve_named_type(&bind_type(target), target.span)
+                };
                 BoundExpr {
                     kind: BoundExprKind::TypeOf(target_ty),
                     ty: system_type(),
@@ -2598,6 +3343,14 @@ impl Binder {
                 BoundExpr {
                     kind: BoundExprKind::SizeOf(target_ty),
                     ty: TypeSymbol::Special(SpecialType::Int32),
+                }
+            }
+            ExprKind::DefaultValue(target) => {
+                self.gate_feature(Feature::DefaultOperator, expr.span);
+                let target_ty = self.resolve_named_type(&bind_type(target), target.span);
+                BoundExpr {
+                    kind: BoundExprKind::DefaultValue(target_ty.clone()),
+                    ty: target_ty,
                 }
             }
             ExprKind::MakeRef(operand) => {
@@ -2734,6 +3487,28 @@ impl Binder {
             } => self.bind_assignment(*operator, target, value, expr.span),
             ExprKind::PredefinedType(predefined) => {
                 let ty = TypeSymbol::Special(SpecialType::from_predefined(*predefined));
+                BoundExpr {
+                    kind: BoundExprKind::TypeReference(ty.clone()),
+                    ty,
+                }
+            }
+            ExprKind::ConstructedType {
+                name,
+                type_arguments,
+            } => {
+                let Some(parts) = dotted_name_parts(name) else {
+                    return BoundExpr {
+                        kind: BoundExprKind::Error,
+                        ty: TypeSymbol::Error,
+                    };
+                };
+                let arguments: Vec<TypeSymbol> =
+                    type_arguments.iter().map(|arg| bind_type(arg)).collect();
+                let constructed = TypeSymbol::Instantiation {
+                    definition: parts.into(),
+                    arguments: arguments.into(),
+                };
+                let ty = self.resolve_named_type(&constructed, expr.span);
                 BoundExpr {
                     kind: BoundExprKind::TypeReference(ty.clone()),
                     ty,
@@ -2963,6 +3738,8 @@ impl Binder {
                 resolve_overload(&self.model, &candidates, &argument_types, &[])
             {
                 let declaring_type = self.declaring_type_in_chain(owner, name, &method.parameters);
+                let declaring_instantiation =
+                    self.declaring_instantiation_of(&declaring_type, name, &method.parameters);
                 let left_arg = self.convert(left.clone(), &method.parameters[0]);
                 let right_arg = self.convert(right.clone(), &method.parameters[1]);
                 return Some(BoundExpr {
@@ -2978,6 +3755,7 @@ impl Binder {
                             is_static: true,
                             is_vararg: false,
                             instantiation: None,
+                            declaring_instantiation,
                         }),
                     },
                 });
@@ -3006,6 +3784,7 @@ impl Binder {
         };
         let bool_type = TypeSymbol::Special(SpecialType::Boolean);
         let method = MethodReference {
+            declaring_instantiation: None,
             declaring_type: delegate_base.clone(),
             name: accessor.into(),
             parameters: alloc::vec![delegate_base.clone(), delegate_base],
@@ -3042,6 +3821,7 @@ impl Binder {
             "Remove"
         };
         let method = MethodReference {
+            declaring_instantiation: None,
             declaring_type: delegate_base.clone(),
             name: accessor.into(),
             parameters: alloc::vec![delegate_base.clone(), delegate_base.clone()],
@@ -3299,6 +4079,8 @@ impl Binder {
             resolve_overload(&self.model, &candidates, &argument_types, &[])
         {
             let declaring_type = self.declaring_type_in_chain(&operand.ty, name, &method.parameters);
+            let declaring_instantiation =
+                self.declaring_instantiation_of(&declaring_type, name, &method.parameters);
             return Some(BoundExpr {
                 ty: method.return_type.clone(),
                 kind: BoundExprKind::Call {
@@ -3312,6 +4094,7 @@ impl Binder {
                         is_static: true,
                         is_vararg: false,
                         instantiation: None,
+                        declaring_instantiation,
                     }),
                 },
             });
@@ -3330,6 +4113,8 @@ impl Binder {
         {
             let declaring_type =
                 self.declaring_type_in_chain(&operand.ty, "op_True", &method.parameters);
+            let declaring_instantiation =
+                self.declaring_instantiation_of(&declaring_type, "op_True", &method.parameters);
             return Some(BoundExpr {
                 ty: method.return_type.clone(),
                 kind: BoundExprKind::Call {
@@ -3343,6 +4128,7 @@ impl Binder {
                         is_static: true,
                         is_vararg: false,
                         instantiation: None,
+                        declaring_instantiation,
                     }),
                 },
             });
@@ -3436,6 +4222,8 @@ impl Binder {
                 continue;
             };
             let declaring_type = self.declaring_type_in_chain(ty, step, &method.parameters);
+            let declaring_instantiation =
+                self.declaring_instantiation_of(&declaring_type, step, &method.parameters);
             let operator = MethodReference {
                 declaring_type,
                 name: step.into(),
@@ -3444,6 +4232,7 @@ impl Binder {
                 is_static: true,
                 is_vararg: false,
                 instantiation: None,
+                declaring_instantiation,
             };
             return Some((operator, result_conversion));
         }
@@ -3543,6 +4332,11 @@ impl Binder {
         accessor.push_str(&event.name);
         let void = TypeSymbol::Special(SpecialType::Void);
         let method = MethodReference {
+            declaring_instantiation: self.declaring_instantiation_of(
+                &declaring,
+                &accessor,
+                core::slice::from_ref(&event.ty),
+            ),
             declaring_type: declaring.clone(),
             name: accessor.clone().into(),
             parameters: alloc::vec![event.ty.clone()],
@@ -3697,6 +4491,7 @@ impl Binder {
             };
             let operand = self.convert(value, &delegate_ty);
             let method = MethodReference {
+                declaring_instantiation: None,
                 declaring_type: delegate_base.clone(),
                 name: accessor.into(),
                 parameters: alloc::vec![delegate_base.clone(), delegate_base.clone()],
@@ -3984,6 +4779,7 @@ impl Binder {
                             is_volatile: false,
                             accessibility: Accessibility::Public,
                             constant: Some(integer_literal(constant)),
+                            declaring_instantiation: None,
                         }),
                     },
                     ty,
@@ -4052,11 +4848,20 @@ impl Binder {
                 self.check_static_instance(receiver_kind, is_static, &declaring_type, name, span);
                 let (getter_declaring, setter_declaring) =
                     self.property_accessor_declarers(&receiver.ty, name);
+                let (getter_instantiation, setter_instantiation) = self
+                    .property_accessor_instantiations(
+                        &getter_declaring,
+                        &setter_declaring,
+                        name,
+                        &ty,
+                    );
                 BoundExpr {
                     kind: BoundExprKind::PropertyAccess {
                         receiver: Box::new(receiver),
                         declaring_type: getter_declaring,
                         setter_declaring_type: setter_declaring,
+                        getter_instantiation,
+                        setter_instantiation,
                         name: name.into(),
                     },
                     ty,
@@ -4082,7 +4887,7 @@ impl Binder {
                 }
                 let unreadable = self
                     .model
-                    .get_by_symbol(&member_lookup_type(&receiver.ty))
+                    .get_by_symbol(&self.lookup_type_of(&receiver.ty))
                     .is_some_and(|info| {
                         info.undecodable_members.iter().any(|m| &**m == name)
                     });
@@ -4206,22 +5011,32 @@ impl Binder {
                 self.resolve_named_type(&symbol, argument.span)
             })
             .collect();
+        let argument_types: Vec<TypeSymbol> = arguments.iter().map(argument_type).collect();
         let mut resolved = match group {
             Some((receiver_ty, name)) if !real_error => {
                 let candidates = self.methods_in_chain(&receiver_ty, &name);
-                let (candidates, definitions) =
-                    self.candidates_for_type_arguments(&candidates, &type_arguments, &receiver_ty, span);
+                let set = self.candidates_for_type_arguments(
+                    &candidates,
+                    &type_arguments,
+                    &argument_types,
+                    &receiver_ty,
+                    span,
+                );
                 let chosen = if has_method_group {
-                    self.resolve_with_method_groups(&name, &receiver_ty, &candidates, &arguments, span)
-                } else {
-                    let argument_types: Vec<TypeSymbol> =
-                        arguments.iter().map(argument_type).collect();
-                    let arg_constants: Vec<Option<i64>> =
-                        arguments.iter().map(constant_int_value).collect();
-                    self.resolve_call(
+                    self.resolve_with_method_groups(
                         &name,
                         &receiver_ty,
-                        &candidates,
+                        &set.candidates,
+                        &arguments,
+                        span,
+                    )
+                } else {
+                    let arg_constants: Vec<Option<i64>> =
+                        arguments.iter().map(constant_int_value).collect();
+                    self.resolve_call_or_uninferable(
+                        &name,
+                        &receiver_ty,
+                        &set,
                         &argument_types,
                         &arg_constants,
                         &arguments,
@@ -4230,15 +5045,18 @@ impl Binder {
                 };
                 chosen.map(|method| {
                     params_method = method.is_params;
-                    let instantiation = Self::instantiation_of(
-                        &method,
-                        &candidates,
-                        &definitions,
-                        &type_arguments,
-                    );
+                    let instantiation = Self::instantiation_of(&method, &set);
                     self.check_argument_modes(&method, &arguments, span);
                     let declaring_type =
                         self.declaring_type_in_chain(&receiver_ty, &method.name, &method.parameters);
+                    let declaring_key = instantiation
+                        .as_deref()
+                        .map_or(&method.parameters[..], |open| &open.parameters[..]);
+                    let declaring_instantiation = self.declaring_instantiation_of(
+                        &declaring_type,
+                        &method.name,
+                        declaring_key,
+                    );
                     if let Some(written) = written_receiver {
                         self.check_protected_qualifier(
                             &declaring_type,
@@ -4259,6 +5077,7 @@ impl Binder {
                         return_type: method.return_type,
                         is_static: method.is_static,
                         instantiation,
+                        declaring_instantiation,
                     }
                 })
             }
@@ -4271,6 +5090,11 @@ impl Binder {
                 .and_then(|info| info.methods.iter().find(|m| &*m.name == "Invoke").cloned())
             {
                 resolved = Some(MethodReference {
+                    declaring_instantiation: self.declaring_instantiation_of(
+                        &callee.ty,
+                        "Invoke",
+                        &invoke.parameters,
+                    ),
                     declaring_type: callee.ty.clone(),
                     name: "Invoke".into(),
                     parameters: invoke.parameters,
@@ -4509,7 +5333,13 @@ impl Binder {
     /// BOTH lists -- a renderer that omitted it would differ from csc in a message a user compares
     /// character by character against a search result.
     ///
-    /// The declaring type is named as the receiver's static type.
+    /// The declaring type is named as the receiver's static type. That is the type the call was
+    /// WRITTEN through, which is what csc quotes; naming the type that actually declares an
+    /// inherited method would be more precise and would not match.
+    ///
+    /// A method with no declared parameter names still renders its angle brackets, from the arity:
+    /// same rule as [`crate::resolve::quote_candidate`]'s, and for the same reason -- inventing
+    /// `T1, T2` would quote a name that appears in no source.
     fn quote_method_candidate(receiver: &TypeSymbol, method: &MethodSymbol) -> Box<str> {
         let mut text = alloc::format!("{receiver}.{}", method.name);
         if !method.type_parameters.is_empty() {
@@ -4541,27 +5371,82 @@ impl Binder {
     /// * *"If F is generic and M includes a type argument list, F is a candidate when F has the
     ///   same number of method type parameters as were supplied"*, and then the parameter list is
     ///   applicable **after substitution**. Measured against csc: a count mismatch is CS0305.
-    /// * *"If F is generic and M has no type argument list"*, F is a candidate only when type
-    ///   INFERENCE succeeds. We have no inference, so such an F is dropped -- see below.
+    /// * *"If F is generic and M has no type argument list"*, F is a candidate when type INFERENCE
+    ///   (25.6.4) succeeds for it -- see [`infer_method_type_arguments`].
+    ///
+    /// **THE SUBSTITUTION IS THE POINT, NOT THE FILTERING.** Returning the matching candidates
+    /// unsubstituted would still pick the right method and would still type-check the arguments
+    /// against `T`, which accepts everything. `Id<string>(1)` would compile. Every candidate that
+    /// survives here is CLOSED, so the ordinary overload resolution and conversion machinery below
+    /// sees real types and needs to know nothing about generics.
+    ///
+    /// **A GENERIC METHOD WHOSE INFERENCE FAILS IS DROPPED RATHER THAN BOUND OPEN**, and that is
+    /// the same rule as the standard's: *"If type inference for a particular method fails, that
+    /// method does not participate in overload resolution."* Keeping it would bind `Id(1)` to the
+    /// open method with `!!0` unsubstituted -- silently the wrong program. The dropped ones are
+    /// returned in [`CandidateSet::uninferable`] so the caller can say CS0411 rather than a bare
+    /// no-such-overload, which is the difference between naming the real problem and describing a
+    /// symptom.
+    ///
+    /// Reports the constraints a generic METHOD call's explicit type arguments fail (25.7.1).
+    ///
+    /// **Only when ONE definition survived the arity filter.** With several, the call is an
+    /// overload set and the winner is not known here; reporting against each would produce a
+    /// message per candidate for a call that resolves fine. csc checks the chosen overload, which
+    /// this cannot see -- so the single-candidate case is checked and the ambiguous one is left,
+    /// deliberately under-reporting rather than guessing.
+    ///
+    /// **An imported method's constraints are ABSENT rather than empty** -- `reference.rs` does
+    /// not decode `GenericParamConstraint` -- so this is silent for a call into a referenced
+    /// assembly. That is a known gap, recorded at the field, not something this function papers
+    /// over.
+    fn check_method_type_arguments(
+        &mut self,
+        definitions: &[MethodSymbol],
+        type_arguments: &[TypeSymbol],
+        receiver_ty: &TypeSymbol,
+        span: Span,
+    ) {
+        let [definition] = definitions else {
+            return;
+        };
+        let declaration = Self::quote_method_candidate(receiver_ty, definition);
+        for (index, argument) in type_arguments.iter().enumerate() {
+            if argument.is_error() {
+                continue;
+            }
+            let Some(constraints) = definition.constraints_on(index) else {
+                continue;
+            };
+            if constraints.is_empty() {
+                continue;
+            }
+            let parameter: Box<str> = definition.type_parameters[index].clone();
+            let constraints = constraints.clone();
+            self.check_one_type_argument_as(
+                argument,
+                &constraints,
+                &parameter,
+                &declaration,
+                GenericMember::Method,
+                span,
+            );
+        }
+    }
+
     fn candidates_for_type_arguments(
         &mut self,
         candidates: &[MethodSymbol],
         type_arguments: &[TypeSymbol],
+        argument_types: &[TypeSymbol],
         receiver_ty: &TypeSymbol,
         span: Span,
-    ) -> (Vec<MethodSymbol>, Vec<MethodSymbol>) {
+    ) -> CandidateSet {
         if type_arguments.is_empty() {
-            return (
-                candidates
-                    .iter()
-                    .filter(|candidate| candidate.type_parameters.is_empty())
-                    .cloned()
-                    .collect(),
-                Vec::new(),
-            );
+            return self.candidates_by_inference(candidates, argument_types, receiver_ty, span);
         }
         if type_arguments.iter().any(TypeSymbol::is_error) {
-            return (Vec::new(), Vec::new());
+            return CandidateSet::default();
         }
         let (matching, definitions): (Vec<MethodSymbol>, Vec<MethodSymbol>) = candidates
             .iter()
@@ -4573,7 +5458,20 @@ impl Binder {
             })
             .unzip();
         if !matching.is_empty() {
-            return (matching, definitions);
+            self.check_method_type_arguments(&definitions, type_arguments, receiver_ty, span);
+            return CandidateSet {
+                origins: definitions
+                    .into_iter()
+                    .map(|definition| {
+                        Some(ClosedFrom {
+                            definition,
+                            arguments: type_arguments.to_vec(),
+                        })
+                    })
+                    .collect(),
+                candidates: matching,
+                uninferable: Vec::new(),
+            };
         }
         if let Some(generic) = candidates
             .iter()
@@ -4596,35 +5494,147 @@ impl Binder {
                 span,
             ));
         }
-        (Vec::new(), Vec::new())
+        CandidateSet::default()
+    }
+
+    /// The candidate set for a call that named NO type arguments -- 14.5.5.1's third bullet, and
+    /// where ECMA-334 4th ed 25.6.4 runs.
+    ///
+    /// A non-generic method is a candidate as it always was. A generic one joins CLOSED over the
+    /// arguments inferred for it, and is dropped when inference fails. **A `params` generic method
+    /// is inferred in its NORMAL form first and its EXPANDED form only if that fails**, which is
+    /// the order 25.6.4's last paragraph gives; taking the expanded form first would infer `T` from
+    /// an array argument's ELEMENT type for a call that meant to pass the array whole.
+    fn candidates_by_inference(
+        &mut self,
+        candidates: &[MethodSymbol],
+        argument_types: &[TypeSymbol],
+        receiver_ty: &TypeSymbol,
+        span: Span,
+    ) -> CandidateSet {
+        let mut set = CandidateSet::default();
+        for candidate in candidates {
+            if candidate.type_parameters.is_empty() {
+                set.candidates.push(candidate.clone());
+                set.origins.push(None);
+                continue;
+            }
+            let inferred =
+                infer_method_type_arguments(&self.model, candidate, argument_types).or_else(|| {
+                    infer_expanded_type_arguments(&self.model, candidate, argument_types)
+                });
+            let Some(arguments) = inferred else {
+                if candidate.parameters.len() == argument_types.len() {
+                    set.uninferable.push(candidate.clone());
+                }
+                continue;
+            };
+            let Some(closed) = candidate.instantiate(&arguments) else {
+                continue;
+            };
+            self.check_method_type_arguments(
+                core::slice::from_ref(candidate),
+                &arguments,
+                receiver_ty,
+                span,
+            );
+            set.candidates.push(closed);
+            set.origins.push(Some(ClosedFrom {
+                definition: candidate.clone(),
+                arguments,
+            }));
+        }
+        set.apply_identical_signature_tie_break();
+        set
     }
 
     /// The open definition `chosen` was closed from, as a [`MethodInstantiation`] emission can mint
-    /// a `MethodSpec` from. `closed` and `definitions` are the parallel lists
-    /// [`Binder::candidates_for_type_arguments`] returned.
+    /// a `MethodSpec` from -- `None` for a call that resolved to an ordinary non-generic method.
+    ///
+    /// **THE TYPE ARGUMENTS COME FROM THE CANDIDATE, NEVER FROM THE CALL SITE.** The site's list is
+    /// EMPTY for an inferred call, so reading them there would mint an instantiation with no
+    /// arguments for exactly the calls inference exists to serve. Each candidate carries the
+    /// arguments it was closed over, whichever way they arose.
+    ///
+    /// **A tie yields `None` rather than a guess.** Two generic overloads that close to the SAME
+    /// signature (`void M<T>(T)` and `void M<T>(int)` at `M<int>(1)`) are already ambiguous to
+    /// overload resolution, and their DEFINITIONS differ -- `(!!0)` against `(int32)` -- so picking
+    /// either would name the wrong `MethodDef` in the row. Emission then refuses the call, which is
+    /// the outcome an unresolvable call should have anyway. Ties that 14.4.2.2 DOES settle never
+    /// reach here: [`CandidateSet::apply_identical_signature_tie_break`] removed the loser.
     fn instantiation_of(
         chosen: &MethodSymbol,
-        closed: &[MethodSymbol],
-        definitions: &[MethodSymbol],
-        type_arguments: &[TypeSymbol],
+        set: &CandidateSet,
     ) -> Option<Box<MethodInstantiation>> {
-        if type_arguments.is_empty() {
-            return None;
-        }
-        let mut matches = closed
+        let mut matches = set
+            .candidates
             .iter()
-            .zip(definitions)
+            .zip(&set.origins)
             .filter(|(candidate, _)| *candidate == chosen);
-        let (_, definition) = matches.next()?;
+        let (_, origin) = matches.next()?;
         if matches.next().is_some() {
             return None;
         }
+        let origin = origin.as_ref()?;
         Some(Box::new(MethodInstantiation {
-            arguments: type_arguments.to_vec(),
-            type_parameters: definition.type_parameters.clone(),
-            parameters: definition.parameters.clone(),
-            return_type: definition.return_type.clone(),
+            arguments: origin.arguments.clone(),
+            type_parameters: origin.definition.type_parameters.clone(),
+            parameters: origin.definition.parameters.clone(),
+            return_type: origin.definition.return_type.clone(),
         }))
+    }
+
+    /// [`Binder::resolve_call`], except that a failure with nothing better to say about it is
+    /// reported as `CS0411` when a generic candidate's type inference is what actually went wrong.
+    ///
+    /// **THE BOUNDARY IS csc's, MEASURED, AND IT IS NARROWER THAN "INFERENCE FAILED".** Four shapes
+    /// pin it:
+    ///
+    /// ```text
+    ///     only `T Id<T>(T)`, called Id(1, 2)            CS1501   wrong ARITY, not inference
+    ///     only `T Choose<T>(T, T)`, called (5, "x")     CS0411
+    ///     plus `int M(string)`, called M(1, "x")        CS0411   the other candidate takes 1
+    ///     plus `int M(string, string)`, called M(1,"x") CS1503   the other candidate takes 2
+    /// ```
+    ///
+    /// So CS0411 is what a call gets when the ordinary machinery would fall all the way through to
+    /// a bare count complaint. A same-arity candidate has a real conversion failure to report and
+    /// csc reports THAT -- naming the argument that could not convert is more use than naming a
+    /// type parameter that could not be inferred for a different overload.
+    fn resolve_call_or_uninferable(
+        &mut self,
+        name: &str,
+        declaring: &TypeSymbol,
+        set: &CandidateSet,
+        argument_types: &[TypeSymbol],
+        arg_constants: &[Option<i64>],
+        arguments: &[BoundExpr],
+        span: Span,
+    ) -> Option<MethodSymbol> {
+        if !set.uninferable.is_empty()
+            && matches!(
+                resolve_overload(&self.model, &set.candidates, argument_types, arg_constants),
+                OverloadResult::WrongArgumentCount
+            )
+        {
+            let candidate = &set.uninferable[0];
+            self.report(Diagnostic::new(
+                DiagnosticKind::TypeArgumentsCannotBeInferred {
+                    candidate: Self::quote_method_candidate(declaring, candidate),
+                },
+                span,
+            ));
+            return None;
+        }
+        self.resolve_call(
+            name,
+            declaring,
+            &set.candidates,
+            argument_types,
+            arg_constants,
+            arguments,
+            span,
+        )
     }
 
     fn resolve_call(
@@ -4672,7 +5682,14 @@ impl Binder {
                     ));
                     return None;
                 }
-                if let [only] = candidates {
+                let group = if candidates.is_empty() {
+                    self.methods_in_chain(declaring, name)
+                } else {
+                    Vec::new()
+                };
+                let describable: &[MethodSymbol] =
+                    if candidates.is_empty() { &group } else { candidates };
+                if let [only] = describable {
                     if argument_types.len() < only.parameters.len() {
                         self.diagnostics.push(Diagnostic::new(
                             DiagnosticKind::MissingArgumentForParameter {
@@ -4863,6 +5880,8 @@ impl Binder {
         )?;
         let declaring_type =
             self.declaring_type_in_chain(receiver_ty, &method.name, &method.parameters);
+        let declaring_instantiation =
+            self.declaring_instantiation_of(&declaring_type, &method.name, &method.parameters);
         let method_ref = MethodReference {
             declaring_type,
             is_vararg: method.is_vararg,
@@ -4871,6 +5890,7 @@ impl Binder {
             return_type: method.return_type,
             is_static: false,
             instantiation: None,
+            declaring_instantiation,
         };
         let arguments = if method_ref.parameters.len() == arguments.len() {
             arguments
@@ -5165,9 +6185,18 @@ impl Binder {
     /// **The interface is required but never CALLED** -- a collection initializer emits `Add`, not
     /// an enumeration. csc demands it anyway as the marker that the type is a collection at all,
     /// which is why this is a separate check from having an `Add` and gets its own diagnostic.
+    ///
+    /// **THE INTERFACE, NOT A `GetEnumerator` METHOD, AND I MEASURED THAT AFTER ASSUMING
+    /// OTHERWISE.** The first version of this asked whether a `GetEnumerator` was reachable,
+    /// reasoning that the interface's only content is that method. csc disagrees: a class with a
+    /// public `IEnumerator GetEnumerator()` and an `Add`, but no `: IEnumerable`, is still CS1922.
+    /// The check is nominal, so duck-typing it would ACCEPT a program csc rejects.
+    ///
+    /// Answers `true` for a type outside the model: refusing something we cannot inspect would
+    /// invent a diagnostic, and the permissive direction here cannot.
     fn implements_enumerable(&self, ty: &TypeSymbol) -> bool {
         const ENUMERABLE: &str = "IEnumerable";
-        let root = member_lookup_type(ty);
+        let root = self.lookup_type_of(ty);
         if self.type_info_of(&root).is_none() {
             return true;
         }
@@ -5233,6 +6262,17 @@ impl Binder {
 
     /// Whether `ty` or any base class declares a `required` member -- the condition for guarding a
     /// constructor with `[Obsolete(.., error: true)]` + `[CompilerFeatureRequired("RequiredMembers")]`.
+    ///
+    /// **THIS IS A DIFFERENT QUESTION FROM THE ONE THE TYPE-LEVEL `RequiredMemberAttribute`
+    /// ANSWERS, and measuring csc is what separated them.** That marker goes on a type that
+    /// DECLARES a required member; this guard goes on every constructor of a type that has one
+    /// ANYWHERE IN ITS CHAIN. A derived type declaring nothing required carries no type-level
+    /// marker and still carries the guard on its constructors -- symmetry gets that backwards, and
+    /// the cost of getting it backwards is a down-level consumer constructing an object with unset
+    /// required members.
+    ///
+    /// Shares [`Self::required_members_in_chain`] rather than re-walking, so the emitter and
+    /// `CS9035` cannot disagree about which types have required members.
     #[must_use]
     pub fn has_required_members_in_chain(&self, ty: &TypeSymbol) -> bool {
         !self.required_members_in_chain(ty).is_empty()
@@ -5240,6 +6280,20 @@ impl Binder {
 
     /// `CS9035`: reports every `required` member of the type being created that the object
     /// initializer does not name -- one diagnostic per member, at the TYPE NAME of the `new`.
+    ///
+    /// **MEASURED, and it is the rule this feature exists for: assigning the member in the
+    /// CONSTRUCTOR BODY does not satisfy it.** `class C { public required int P; public C() { P = 1; } }`
+    /// still draws CS9035 at `new C()`. The only two ways to satisfy one are an object initializer
+    /// and a constructor carrying `[SetsRequiredMembers]`, so this is a metadata rule rather than
+    /// definite assignment. A struct's parameterless constructor is not an exception -- `new S()`
+    /// draws it too.
+    ///
+    /// **THE `[SetsRequiredMembers]` EXEMPTION IS IMPLEMENTED AND IS NOT APPLIED HERE.** It is a
+    /// property of the CHOSEN constructor, so the caller applies it after overload resolution and
+    /// simply does not call this; see [`MethodSymbol::sets_required_members`].
+    ///
+    /// The other condition the caller applies is that an ABSTRACT target reports `CS0144` alone,
+    /// measured: a creation that cannot happen does not also report what it failed to initialize.
     fn check_required_members_are_set(
         &mut self,
         target_ty: &TypeSymbol,
@@ -5302,6 +6356,19 @@ impl Binder {
         {
             return self.bind_delegate_creation_new(&target_ty, arguments, span);
         }
+        if let TypeSymbol::Named(parts) = &target_ty
+            && let [name] = &parts[..]
+            && let Some(constraints) = self.type_parameter_in_scope(name)
+        {
+            if !constraints.requires_default_constructor() {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::CannotCreateVariableTypeInstance {
+                        parameter: name.clone(),
+                    },
+                    span,
+                ));
+            }
+        }
         if self
             .type_info_of(&target_ty)
             .is_some_and(|info| info.is_abstract)
@@ -5328,6 +6395,8 @@ impl Binder {
             if !real_error {
                 if arguments.is_empty() && self.is_value_type(&target_ty) {
                     constructor = Some(MethodReference {
+                        declaring_instantiation: self
+                            .declaring_instantiation_of(&target_ty, ".ctor", &[]),
                         declaring_type: target_ty.clone(),
                         name: ".ctor".into(),
                         parameters: Vec::new(),
@@ -5365,6 +6434,11 @@ impl Binder {
                     if let Some(chosen) = chosen {
                         ctor_sets_required_members = chosen.sets_required_members;
                         let ctor_ref = MethodReference {
+                            declaring_instantiation: self.declaring_instantiation_of(
+                                &target_ty,
+                                ".ctor",
+                                &chosen.parameters,
+                            ),
                             declaring_type: target_ty.clone(),
                             name: ".ctor".into(),
                             parameters: chosen.parameters.clone(),
@@ -5461,6 +6535,11 @@ impl Binder {
                         kind: BoundExprKind::DelegateCreation {
                             delegate_type: delegate_ty.clone(),
                             target: MethodReference {
+                                declaring_instantiation: self.declaring_instantiation_of(
+                                    &operand_ty,
+                                    &operand_invoke.name,
+                                    &operand_invoke.parameters,
+                                ),
                                 declaring_type: operand_ty,
                                 name: operand_invoke.name.clone(),
                                 parameters: operand_invoke.parameters.clone(),
@@ -5552,6 +6631,11 @@ impl Binder {
             kind: BoundExprKind::DelegateCreation {
                 delegate_type: delegate_ty.clone(),
                 target: MethodReference {
+                    declaring_instantiation: self.declaring_instantiation_of(
+                        &declaring,
+                        &target.name,
+                        &target.parameters,
+                    ),
                     declaring_type: declaring,
                     is_vararg: target.is_vararg,
                     name: target.name.clone(),
@@ -5688,6 +6772,7 @@ impl Binder {
         declaring: &TypeSymbol,
         accessibility: Accessibility,
     ) -> bool {
+        let declaring = &definition_of(declaring);
         match accessibility {
             Accessibility::Public => true,
             Accessibility::Internal => !self.type_is_external(declaring),
@@ -6009,7 +7094,7 @@ impl Binder {
     /// event and the symbol of the type that declares it. `+=`/`-=` route through its
     /// accessors from outside that type (17.7), and any other use there is CS0070.
     fn event_declaration(&self, ty: &TypeSymbol, name: &str) -> Option<(EventSymbol, TypeSymbol)> {
-        let lookup = member_lookup_type(ty);
+        let lookup = self.lookup_type_of(ty);
         let mut current = self.type_info_of(&lookup);
         while let Some(info) = current {
             if let Some(event) = info.find_event(name) {
@@ -6027,7 +7112,7 @@ impl Binder {
     }
 
     pub(crate) fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
-        let lookup = member_lookup_type(ty);
+        let lookup = self.lookup_type_of(ty);
         let Some(is_interface) = self
             .type_info_of(&lookup)
             .map(|info| info.kind == TypeKind::Interface)
@@ -6049,10 +7134,13 @@ impl Binder {
                 continue;
             };
             let declaring = type_symbol_in(&info.namespace, &info.name);
+            let named = member_declaring_type(&current_ty, &info);
             let (resolution, accessible) = if let Some(field) = info.find_field(name) {
                 (
                     MemberResolution::Field(FieldReference {
-                        declaring_type: declaring.clone(),
+                        declaring_instantiation: self
+                            .field_instantiation_of(&named, &field.name),
+                        declaring_type: named.clone(),
                         name: field.name.clone(),
                         ty: self.resolve_type(&field.ty),
                         is_static: field.is_static,
@@ -6066,7 +7154,7 @@ impl Binder {
             } else if let Some(property) = info.find_property(name) {
                 (
                     MemberResolution::Property {
-                        declaring_type: declaring.clone(),
+                        declaring_type: named.clone(),
                         ty: self.resolve_type(&property.ty),
                         accessibility: property.accessibility,
                         is_static: property.is_static,
@@ -6079,11 +7167,8 @@ impl Binder {
                     .any(|method| self.is_accessible(&declaring, method.accessibility));
                 (MemberResolution::MethodGroup, any_accessible)
             } else {
-                for base in &info.bases {
-                    pending.push(base.clone());
-                }
-                if let Some(base) = &info.base {
-                    pending.push(base.clone());
+                for base in member_lookup_bases(&info) {
+                    pending.push(base);
                 }
                 continue;
             };
@@ -6091,11 +7176,8 @@ impl Binder {
                 return resolution;
             }
             inaccessible.get_or_insert(resolution);
-            for base in &info.bases {
-                pending.push(base.clone());
-            }
-            if let Some(base) = &info.base {
-                pending.push(base.clone());
+            for base in member_lookup_bases(&info) {
+                pending.push(base);
             }
         }
         inaccessible.unwrap_or(MemberResolution::NoSuchMember(ty.to_string()))
@@ -6137,11 +7219,20 @@ impl Binder {
                 } => {
                     let (getter_declaring, setter_declaring) =
                         self.property_accessor_declarers(&ty, name);
+                    let (getter_instantiation, setter_instantiation) = self
+                        .property_accessor_instantiations(
+                            &getter_declaring,
+                            &setter_declaring,
+                            name,
+                            &property_ty,
+                        );
                     return Some(BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
                             receiver: type_reference(),
                             declaring_type: getter_declaring,
                             setter_declaring_type: setter_declaring,
+                            getter_instantiation,
+                            setter_instantiation,
                             name: name.into(),
                         },
                         ty: property_ty,
@@ -6310,11 +7401,24 @@ impl Binder {
             };
             let interface_name = dotted_type_name(&interface);
             for property in &properties {
-                let Some(declared) = self
+                let declared_all: Vec<PropertySymbol> = self
                     .model
                     .get_by_symbol(class_ty)
-                    .and_then(|info| info.find_property(&property.name).cloned())
-                else {
+                    .map(|info| {
+                        info.properties
+                            .iter()
+                            .filter(|candidate| candidate.name == property.name)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if declared_all.iter().any(|candidate| {
+                    self.normalize_for_signature(&candidate.ty)
+                        == self.normalize_for_signature(&property.ty)
+                }) {
+                    continue;
+                }
+                let Some(declared) = declared_all.into_iter().next() else {
                     continue;
                 };
                 let member = alloc::format!("{}.{}", declaration.name, property.name).into();
@@ -6341,7 +7445,7 @@ impl Binder {
                 }
             }
             for member in &members {
-                let status = self.interface_member_status(class_ty, member);
+                let status = self.interface_member_status(class_ty, &interface, member);
                 if status == InterfaceMemberStatus::Implemented {
                     continue;
                 }
@@ -7074,17 +8178,23 @@ impl Binder {
     /// explicitly (a method registered under a mangled
     /// `<interface>.<member>` name). The implicit search walks only the base-class chain, NOT the
     /// interfaces: the interface's own abstract declaration must not be mistaken for its
-    /// implementation (that is the CS0535 the caller reports). The explicit check is lenient (any
-    /// `.<member>` impl) so a real explicit impl is never falsely flagged.
+    /// implementation (that is the CS0535 the caller reports). An explicit implementation is
+    /// answered ONCE, by [`Self::explicitly_implements`], which names the interface and matches the
+    /// parameter list and runs before the implicit rules.
     ///
     /// TEST-ONLY, and safely so: it collapses [`Self::interface_member_status`] to a boolean, so a
     /// test asking the yes/no question still exercises the four-state routine the diagnostics use.
     /// The production callers all want to know WHICH failure it was, because each names a different
     /// repair (`CS0535` / `CS0737` / `CS0738`) -- so none of them can use this shape.
     #[cfg(test)]
-    fn implements_interface_member(&self, class_ty: &TypeSymbol, member: &MethodSymbol) -> bool {
+    fn implements_interface_member(
+        &self,
+        class_ty: &TypeSymbol,
+        interface: &TypeSymbol,
+        member: &MethodSymbol,
+    ) -> bool {
         matches!(
-            self.interface_member_status(class_ty, member),
+            self.interface_member_status(class_ty, interface, member),
             InterfaceMemberStatus::Implemented
         )
     }
@@ -7094,11 +8204,18 @@ impl Binder {
     /// interface's type, and csc gives each failure its own code (`CS0737`, `CS0738`) because each
     /// names a different repair. Only a member matching by signature can reach those two -- a
     /// class with nothing of that name is plainly `CS0535`.
+    ///
+    /// **An EXPLICIT implementation is matched before any of that (20.4.1)**, so a member that
+    /// fails those rules cannot stand in for one the class also declares explicitly.
     fn interface_member_status(
         &self,
         class_ty: &TypeSymbol,
+        interface: &TypeSymbol,
         member: &MethodSymbol,
     ) -> InterfaceMemberStatus {
+        if self.explicitly_implements(class_ty, interface, member) {
+            return InterfaceMemberStatus::Implemented;
+        }
         let candidate = self
             .methods_in_class_chain(class_ty, &member.name)
             .into_iter()
@@ -7120,23 +8237,58 @@ impl Binder {
         InterfaceMemberStatus::Missing
     }
 
-    /// The two implementation forms the signature walk cannot see: a `get_`/`set_`/`add_`/
-    /// `remove_` member supplied by declaring the property or event itself, and an EXPLICIT
-    /// implementation (`int I.M()`), which the collector stores under a dotted name and which is
-    /// public by construction.
+    /// Whether the class declares an explicit implementation of `member` FOR THIS INTERFACE.
+    ///
+    /// **THE QUALIFIER IS RESOLVED, NOT COMPARED AS TEXT.** The collector stores an explicit
+    /// implementation under the qualifier the source wrote plus `.<member>`, and both
+    /// `IEnumerable.GetEnumerator` and `System.Collections.IEnumerable.GetEnumerator` are legal
+    /// spellings of one member -- so the stored name is split at its last `.` and the qualifier
+    /// put through the same scope search a written type name gets. Naming the interface and
+    /// matching the parameter list is what lets it run BEFORE the implicit rules without crediting
+    /// a member of some other interface.
+    fn explicitly_implements(
+        &self,
+        class_ty: &TypeSymbol,
+        interface: &TypeSymbol,
+        member: &MethodSymbol,
+    ) -> bool {
+        let mut suffix = String::from(".");
+        suffix.push_str(&member.name);
+        let wanted = dotted_type_name(interface);
+        if wanted.is_empty() {
+            return false;
+        }
+        let Some(info) = self.model.get_by_symbol(class_ty) else {
+            return false;
+        };
+        info.methods.iter().any(|declared| {
+            let Some(qualifier) = declared.name.strip_suffix(&suffix) else {
+                return false;
+            };
+            if qualifier.is_empty() || declared.parameters != member.parameters {
+                return false;
+            }
+            let parts: Vec<Box<str>> = qualifier.split('.').map(Box::from).collect();
+            let written = TypeSymbol::Named(parts.into_boxed_slice());
+            dotted_type_name(&self.resolve_type(&written)) == wanted
+        })
+    }
+
+    /// The one implementation form the signature walk cannot see: a `get_`/`set_`/`add_`/
+    /// `remove_` member supplied by declaring the property or field-like event itself. A source
+    /// type keeps those accessors in `properties`/`events` rather than as synthesized methods, so
+    /// the method walk above does not find them.
+    ///
+    /// **AN EXPLICIT IMPLEMENTATION IS NOT ANSWERED HERE.** It is answered once, and strictly, by
+    /// [`Self::explicitly_implements`], which names the interface and matches the parameter list
+    /// and runs before the implicit rules. An explicit PROPERTY is reached by the property walk
+    /// below rather than as a method: the collector stores one under its PLAIN name.
     fn implemented_by_accessor_or_explicit(
         &self,
         class_ty: &TypeSymbol,
         member: &MethodSymbol,
     ) -> bool {
-        if self.accessor_provided_by_property_or_event(class_ty, member) {
-            return true;
-        }
-        let mut suffix = String::from(".");
-        suffix.push_str(&member.name);
-        self.model
-            .get_by_symbol(class_ty)
-            .is_some_and(|info| info.methods.iter().any(|m| m.name.ends_with(&suffix)))
+        self.accessor_provided_by_property_or_event(class_ty, member)
     }
 
     /// The methods named `name` in `ty`'s own type and its base CLASS chain (walking `info.base`,
@@ -7146,7 +8298,7 @@ impl Binder {
     fn methods_in_class_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
         let mut methods: Vec<MethodSymbol> = Vec::new();
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(member_lookup_type(ty));
+        let mut current = Some(self.lookup_type_of(ty));
         while let Some(cur) = current {
             if visited.contains(&cur) {
                 break;
@@ -7197,7 +8349,7 @@ impl Binder {
             return false;
         }
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(member_lookup_type(class_ty));
+        let mut current = Some(self.lookup_type_of(class_ty));
         while let Some(cur) = current {
             if visited.contains(&cur) {
                 break;
@@ -7369,6 +8521,8 @@ impl Binder {
         let chosen = self.resolve_call(name, receiver_ty, &candidates, &[], &[], &[], span)?;
         let declaring_type =
             self.declaring_type_in_chain(receiver_ty, &chosen.name, &chosen.parameters);
+        let declaring_instantiation =
+            self.declaring_instantiation_of(&declaring_type, &chosen.name, &chosen.parameters);
         Some(MethodReference {
             declaring_type,
             is_vararg: chosen.is_vararg,
@@ -7377,6 +8531,7 @@ impl Binder {
             return_type: chosen.return_type,
             is_static: chosen.is_static,
             instantiation: None,
+            declaring_instantiation,
         })
     }
 
@@ -7403,6 +8558,8 @@ impl Binder {
                 is_static: false,
                 ..
             } => Some(MethodReference {
+                declaring_instantiation: self
+                    .declaring_instantiation_of(&declaring_type, &getter, &[]),
                 declaring_type,
                 name: getter.into(),
                 parameters: Vec::new(),
@@ -7446,7 +8603,7 @@ impl Binder {
     /// first match walking the chain (most-derived first) wins.
     fn indexer_accessor(&self, ty: &TypeSymbol, prefix: &str, arity: usize) -> Option<Box<str>> {
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut pending = alloc::vec![member_lookup_type(ty)];
+        let mut pending = alloc::vec![self.lookup_type_of(ty)];
         while let Some(current_ty) = pending.pop() {
             if visited.contains(&current_ty) {
                 continue;
@@ -7460,11 +8617,8 @@ impl Binder {
                     return Some(method.name.clone());
                 }
             }
-            for base in &info.bases {
-                pending.push(base.clone());
-            }
-            if let Some(base) = &info.base {
-                pending.push(base.clone());
+            for base in member_lookup_bases(&info) {
+                pending.push(base);
             }
         }
         None
@@ -7474,7 +8628,7 @@ impl Binder {
         let mut methods: Vec<MethodSymbol> = Vec::new();
         let mut inaccessible: Vec<MethodSymbol> = Vec::new();
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let lookup = member_lookup_type(ty);
+        let lookup = self.lookup_type_of(ty);
         let mut pending = alloc::vec![lookup.clone()];
         if self
             .type_info_of(&lookup)
@@ -7505,11 +8659,8 @@ impl Binder {
                     bucket.push(method.clone());
                 }
             }
-            for base in &info.bases {
-                pending.push(base.clone());
-            }
-            if let Some(base) = &info.base {
-                pending.push(base.clone());
+            for base in member_lookup_bases(&info) {
+                pending.push(base);
             }
         }
         if methods.is_empty() {
@@ -7531,12 +8682,42 @@ impl Binder {
     /// property -- the two walks disagreeing is how `z.P = z.P` bound base's float property but
     /// called the derived double getter. Overrides are unaffected: an override carries its base
     /// declaration's accessibility, so the accessors of any property that resolved stay eligible.
+    /// The OPEN signatures of a property's two accessors, when it was reached through an
+    /// instantiated generic type. `(None, None)` for a property of an ordinary type.
+    ///
+    /// **ONE IMPLEMENTATION FOR ALL THREE PLACES A `PropertyAccess` IS BUILT.** The declaring-type
+    /// walk this pairs with had four copies and was repaired in two of them; writing the
+    /// instantiation lookup three times here would set the same trap one layer up. `property_ty` is
+    /// the SUBSTITUTED property type, which is what the setter takes as its value parameter.
+    fn property_accessor_instantiations(
+        &self,
+        getter_declaring: &TypeSymbol,
+        setter_declaring: &TypeSymbol,
+        name: &str,
+        property_ty: &TypeSymbol,
+    ) -> (Option<Box<TypeInstantiation>>, Option<Box<TypeInstantiation>>) {
+        let _ = property_ty;
+        let accessor = |declaring: &TypeSymbol, want_setter: bool| {
+            let (type_parameters, parameters, return_type) =
+                self.model.open_property_accessor(declaring, name, want_setter)?;
+            Some(Box::new(TypeInstantiation {
+                type_parameters,
+                parameters,
+                return_type,
+            }))
+        };
+        (
+            accessor(getter_declaring, false),
+            accessor(setter_declaring, true),
+        )
+    }
+
     fn property_accessor_declarers(
         &self,
         receiver_ty: &TypeSymbol,
         name: &str,
     ) -> (TypeSymbol, TypeSymbol) {
-        let fallback = member_lookup_type(receiver_ty);
+        let fallback = self.lookup_type_of(receiver_ty);
         let mut getter: Option<TypeSymbol> = None;
         let mut setter: Option<TypeSymbol> = None;
         let mut visited: Vec<TypeSymbol> = Vec::new();
@@ -7551,23 +8732,21 @@ impl Binder {
             };
             if let Some(property) = info.find_property(name) {
                 let declaring = type_symbol_in(&info.namespace, &info.name);
+                let named = member_declaring_type(&ty, &info);
                 if self.is_accessible(&declaring, property.accessibility) {
                     if getter.is_none() && property.has_getter {
-                        getter = Some(declaring.clone());
+                        getter = Some(named.clone());
                     }
                     if setter.is_none() && property.has_setter {
-                        setter = Some(declaring);
+                        setter = Some(named);
                     }
                 }
             }
             if getter.is_some() && setter.is_some() {
                 break;
             }
-            for base in &info.bases {
-                pending.push(base.clone());
-            }
-            if let Some(base) = &info.base {
-                pending.push(base.clone());
+            for base in member_lookup_bases(&info) {
+                pending.push(base);
             }
         }
         (
@@ -7580,13 +8759,31 @@ impl Binder {
     /// `ty` up its base chain that declares the method `name(parameters)`. An override
     /// names the deriving type; a method only inherited names the base that declares
     /// it (so the emitted token resolves there, not on the receiver's type).
+    ///
+    /// **AN INSTANTIATION IS NAMED AS ITSELF, NOT AS ITS DEFINITION.** A member found through
+    /// `Box<int>` is a member OF `Box<int>`; naming it `` Box`1 `` loses the argument list that
+    /// decides what its signature means. [`TypeInfo::instantiate`] deliberately keeps the
+    /// definition's own `name` (its doc says why), so rebuilding the symbol from `namespace`/`name`
+    /// -- which is what every non-generic case wants -- silently drops the `<int>` here.
+    ///
+    /// **THE LOSS IS SILENT AND IT REACHES METADATA.** Measured before this returned the
+    /// instantiation: `Box<int>.Echo(41)` emitted a `MemberRef` whose parent was a `TypeRef` to
+    /// this module's OWN `` Box`1 ``, carrying the SUBSTITUTED signature rather than the
+    /// definition's `!0`; `b.Get()` emitted `callvirt` straight at the open `MethodDef`, whose `!0`
+    /// return is never substituted. Both compiled clean and exited 0, and the IL was
+    /// instruction-for-instruction identical to the non-generic control's -- so nothing at the call
+    /// site could tell the right answer from the wrong one.
+    ///
+    /// The base chain is already substituted (`Box<int> : Base<int>` walks to `Base<int>`, not
+    /// `` Base`1 ``), so the walk's own `current_ty` is the symbol wanted; only the rebuild threw
+    /// it away.
     fn declaring_type_in_chain(
         &self,
         ty: &TypeSymbol,
         name: &str,
         parameters: &[TypeSymbol],
     ) -> TypeSymbol {
-        let lookup = member_lookup_type(ty);
+        let lookup = self.lookup_type_of(ty);
         let mut visited: Vec<TypeSymbol> = Vec::new();
         let mut pending = alloc::vec![lookup.clone()];
         if self
@@ -7615,20 +8812,53 @@ impl Binder {
                     }
                 }
             }
+            let named = member_declaring_type(&current_ty, &info);
             if accessible {
-                return declaring;
+                return named;
             }
             if declares && inaccessible_match.is_none() {
-                inaccessible_match = Some(declaring);
+                inaccessible_match = Some(named);
             }
-            for base in &info.bases {
-                pending.push(base.clone());
-            }
-            if let Some(base) = &info.base {
-                pending.push(base.clone());
+            for base in member_lookup_bases(&info) {
+                pending.push(base);
             }
         }
         inaccessible_match.unwrap_or(lookup)
+    }
+
+    /// The [`TypeInstantiation`] for a member named through an instantiated generic type --
+    /// `None` for a member of an ordinary type, and for a member whose open declaration cannot be
+    /// identified (emission refuses such a call rather than writing a `!n` it guessed).
+    ///
+    /// Takes the SUBSTITUTED parameters, because those are what overload resolution chose and what
+    /// the caller has in hand; the model substitutes each candidate back to find the match.
+    fn declaring_instantiation_of(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> Option<Box<TypeInstantiation>> {
+        let (type_parameters, open) = self.model.open_member(declaring, name, parameters)?;
+        Some(Box::new(TypeInstantiation {
+            type_parameters,
+            parameters: open.parameters,
+            return_type: open.return_type,
+        }))
+    }
+
+    /// The [`FieldInstantiation`] for a field named through an instantiated generic type --
+    /// `None` for a field of an ordinary type, and for one whose open declaration is not in reach
+    /// (emission then refuses rather than naming the definition's shared cell).
+    fn field_instantiation_of(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+    ) -> Option<Box<FieldInstantiation>> {
+        let (type_parameters, ty) = self.model.open_field(declaring, name)?;
+        Some(Box::new(FieldInstantiation {
+            type_parameters,
+            ty,
+        }))
     }
 
     /// Binds a simple name (14.5.2). For now a name resolves only to a local
@@ -7717,11 +8947,20 @@ impl Binder {
                     };
                     let (getter_declaring, setter_declaring) =
                         self.property_accessor_declarers(&current, name);
+                    let (getter_instantiation, setter_instantiation) = self
+                        .property_accessor_instantiations(
+                            &getter_declaring,
+                            &setter_declaring,
+                            name,
+                            &ty,
+                        );
                     return BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
                             receiver: Box::new(receiver),
                             declaring_type: getter_declaring,
                             setter_declaring_type: setter_declaring,
+                            getter_instantiation,
+                            setter_instantiation,
                             name: name.into(),
                         },
                         ty,
@@ -8054,6 +9293,16 @@ fn qualified_method_with_modes(
     let mut qualified = declaring.to_string();
     qualified.push('.');
     qualified.push_str(member);
+    if !method.type_parameters.is_empty() {
+        qualified.push('<');
+        for (index, parameter) in method.type_parameters.iter().enumerate() {
+            if index > 0 {
+                qualified.push_str(", ");
+            }
+            qualified.push_str(parameter);
+        }
+        qualified.push('>');
+    }
     qualified.push('(');
     for (index, parameter) in method.parameters.iter().enumerate() {
         if index > 0 {
@@ -8098,7 +9347,7 @@ fn qualified_method(declaring: &TypeSymbol, member: &str, parameters: &[TypeSymb
     qualified.into()
 }
 
-/// What a named attribute argument's name turned out to be, from
+/// What a named attribute argument's name resolves to, from
 /// [`Binder::named_attribute_argument_target`].
 /// Each "found" variant carries the type that DECLARES the member, which is not always the
 /// attribute class -- an inherited field is declared by a base. The unused-field pass keys on the
@@ -8803,6 +10052,91 @@ fn as_special(ty: &TypeSymbol) -> Option<SpecialType> {
     }
 }
 
+/// The dotted name an expression spells, if it spells one: a simple name, or a member-access chain
+/// of them (`N.Box`). `None` for anything else, because a constructed type's name is a NAME and an
+/// expression in that position that is not one -- `f().Box<int>` -- names no type.
+fn dotted_name_parts(expr: &Expr) -> Option<Vec<Box<str>>> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(alloc::vec![name.clone()]),
+        ExprKind::MemberAccess { receiver, name } => {
+            let mut parts = dotted_name_parts(receiver)?;
+            parts.push(name.clone());
+            Some(parts)
+        }
+        _ => None,
+    }
+}
+
+/// The type a member declared by `info` is NAMED THROUGH, reached from a receiver of type
+/// `receiver_ty`: the receiver itself when that is already an instantiation, and otherwise the
+/// declaration's own [`self_instantiation`] -- so `` H`1 `` is never the answer for a generic type.
+///
+/// One walk resolves fields and properties, a second resolves methods, a third finds a property's
+/// two accessor declarers, and each spelled this closure out again. The first two gained the
+/// self-instantiation case and the third did not, so a generic type's own PROPERTY stayed erased
+/// while its fields and methods were repaired -- the same defect surviving in the one position
+/// nobody edited. Call this; do not write the match again.
+fn member_declaring_type(receiver_ty: &TypeSymbol, info: &TypeInfo) -> TypeSymbol {
+    let declaring = type_symbol_in(&info.namespace, &info.name);
+    match receiver_ty {
+        TypeSymbol::Instantiation { .. } => receiver_ty.clone(),
+        _ => self_instantiation(&declaring, &info.type_parameters).unwrap_or(declaring),
+    }
+}
+
+/// The DEFINITION a type symbol was built from -- `` H`1 `` for `H<int>` and for `` H<!0> `` alike
+/// -- and the symbol itself for every non-instantiated form.
+///
+/// The inverse of [`self_instantiation`], for the questions whose answer a type ARGUMENT cannot
+/// change: accessibility is the whole of that class today.
+fn definition_of(ty: &TypeSymbol) -> TypeSymbol {
+    match ty {
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => crate::symbols::definition_symbol(definition, arguments.len()),
+        _ => ty.clone(),
+    }
+}
+
+/// The instantiation a generic DEFINITION names its own members through -- `H<!0, !1>` for
+/// `class H<T, U>` -- or `None` when `declaring` is not a plain name or the type is not generic.
+///
+/// **A DEFINITION REACHED IN ITS OWN BODY IS STILL AN INSTANTIATION, AND NAMING IT AS THE BARE
+/// DEFINITION LOSES DATA RATHER THAN METADATA.** A member named on the definition reaches its own
+/// field through a `FieldDef`, where csc names it through a `TypeSpec` over the type's own
+/// parameters and emits a `MemberRef` parented by that -- which is why csc's images for a generic
+/// type carry a second `TypeSpec` that ours did not.
+///
+/// **THE FIRST FIELD SURVIVES THE WRONG FORM AND EVERY LATER ONE DOES NOT.** A one-field type
+/// passes, and so does a write from outside the type, so the shapes that would show it are exactly
+/// the ones a small probe uses. A lookup that SUCCEEDS on the wrong row is worse than one that
+/// misses, because nothing reports it.
+///
+/// **`declaring` ARRIVES MANGLED AND AN INSTANTIATION'S `definition` IS NOT**, so the last part is
+/// put back through [`unmangled_type_name`]: `` Holder`1 `` here would have every consumer mangle
+/// the arity in a second time and ask the model for `` Holder`1`1 ``. That misses, the field falls
+/// back to a path with no `TypeSpec` to parent on, and the write is refused with a message about a
+/// field outside this module -- which is the shape this whole function exists to stop.
+fn self_instantiation(declaring: &TypeSymbol, type_parameters: &[Box<str>]) -> Option<TypeSymbol> {
+    let TypeSymbol::Named(parts) = declaring else {
+        return None;
+    };
+    if type_parameters.is_empty() {
+        return None;
+    }
+    let (last, enclosing) = parts.split_last()?;
+    let mut definition: Vec<Box<str>> = enclosing.to_vec();
+    definition.push(unmangled_type_name(last));
+    Some(TypeSymbol::Instantiation {
+        definition: definition.into_boxed_slice(),
+        arguments: type_parameters
+            .iter()
+            .map(|parameter| TypeSymbol::Named(alloc::vec![parameter.clone()].into_boxed_slice()))
+            .collect(),
+    })
+}
+
 /// A named type's dotted name (`["NS", "I"]` -> "NS.I"); empty for a non-named type.
 fn dotted_type_name(ty: &TypeSymbol) -> String {
     match ty {
@@ -8953,6 +10287,45 @@ fn vararg_member_display(
 /// resolves against.
 fn system_array() -> TypeSymbol {
     TypeSymbol::Named([Box::from("System"), Box::from("Array")].into())
+}
+
+/// The types member lookup continues into when a type's own members do not answer a name --
+/// ECMA-334 **7.4**.
+///
+/// **A CLASS OR STRUCT CONTINUES INTO ITS BASE CLASS AND NOT INTO ITS INTERFACES.** An interface's
+/// members are in scope for a receiver of the INTERFACE type; they are not members of a class that
+/// implements it. A class's own implementations are its own members and are found before this
+/// function is reached, which is why the difference is invisible until a member exists ONLY on the
+/// interface -- an EXPLICIT implementation (13.4.1), whose name the class deliberately records
+/// QUALIFIED (`I.Get`) so that it is unreachable unqualified.
+///
+/// **FOLLOWING INTERFACES FROM EVERY TYPE ACCEPTS PROGRAMS csc REJECTS**, and it does so silently
+/// -- there is no refusal to notice, only a call that binds. Measured, with no generics in it:
+///
+/// ```text
+///     class Impl : I { void I.Take(object o) { } public void Take(int i) { } }
+///     new Impl().Take("a string")     accepted, and ran      csc: CS1503
+///
+///     class Impl : I { int I.Get() { return 42; } }
+///     new Impl().Get()                answered 42            csc: CS1061
+/// ```
+///
+/// The second is the sharper one: the class has no `Get` at all, and the call resolved to the
+/// INTERFACE's declaration. On an imported type the same hole let `List<int>.Add("not an int")`
+/// bind to `IList.Add(object)` and throw `ArgumentException` at run time.
+///
+/// **AN INTERFACE CONTINUES INTO ITS BASE INTERFACES**, which is what the interface walk was
+/// written for (`IList : ICollection : IEnumerable`) and is unchanged.
+///
+/// **THIS IS MEMBER LOOKUP AND NOTHING ELSE.** `transitive_interfaces`, `type_reaches` and
+/// `implements_enumerable` ask what a value CONVERTS to -- a class does convert to its interfaces
+/// -- so they walk the whole base graph and must keep doing so. The two questions share a field
+/// (`bases`) and not a rule, which is why they read alike and must not be unified.
+fn member_lookup_bases(info: &TypeInfo) -> Vec<TypeSymbol> {
+    if info.kind == TypeKind::Interface {
+        return info.bases.clone();
+    }
+    info.base.iter().cloned().collect()
 }
 
 /// The type whose members a receiver of type `ty` resolves against: `System.Array`
@@ -9499,6 +10872,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         });
         model.insert(widget);
 
@@ -9657,6 +11031,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         });
         let mut model = Model::new();
         model.insert(widget);
@@ -10092,6 +11467,7 @@ mod tests {
                 conditional: Vec::new(),
                 sets_required_members: false,
                 type_parameters: Vec::new(),
+                type_parameter_constraints: Vec::new(),
             }
         }
         let int = TypeSymbol::Special(SpecialType::Int32);
@@ -10289,6 +11665,68 @@ mod tests {
         );
     }
 
+    /// An explicit implementation must be credited to ITS OWN interface, and to a member with the
+    /// same parameter list.
+    ///
+    /// The first row is the program that showed it was not: a class implementing only `IA.M()`,
+    /// credited with `IB`'s unrelated `M(int)` by a check that compared name SUFFIXES. csc reports
+    /// CS0535 for `IB.M(int)`.
+    ///
+    /// **THE OTHER FOUR ROWS ARE THE FALSE-POSITIVE CONTROLS, AND THEY ARE WHY THE LENIENT CLAUSE
+    /// EXISTED.** One member has two legal qualifier spellings -- written through a `using`, and
+    /// fully qualified -- and a check that compared the stored name as TEXT would refuse one of
+    /// them. A false CS0535 is worse than accepting a bad program, so the strict path has to be
+    /// shown accepting both before the lenient one can be believed dead.
+    #[test]
+    fn an_explicit_implementation_is_credited_only_to_its_own_interface_member() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "interface IA { int M(); } interface IB { string M(int x); } \
+                 class C : IA, IB { int IA.M() { return 1; } }"
+            ),
+            [535]
+        );
+        assert_eq!(
+            codes(
+                "interface IA { int M(); } interface IB { string M(int x); } \
+                 class C : IA, IB { int IA.M() { return 1; } string IB.M(int x) { return null; } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "namespace N { interface I { void M(); } } \
+                 class C : N.I { void N.I.M() { } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "using N; namespace N { interface I { void M(); } } \
+                 class C : N.I { void I.M() { } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "interface I { int P { get; } } \
+                 class C : I { int I.P { get { return 1; } } }"
+            ),
+            []
+        );
+    }
+
     #[test]
     fn interface_accessor_implemented_by_a_property_or_event_is_not_cs0535() {
         use crate::symbols::{
@@ -10311,6 +11749,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         };
         let get_p = accessor("get_P", Vec::new());
         let set_p = accessor("set_P", vec![int()]);
@@ -10343,8 +11782,11 @@ mod tests {
                 class.events = events;
                 let mut model = Model::new();
                 model.insert(class);
-                Binder::with_model(model)
-                    .implements_interface_member(&TypeSymbol::Named(["C".into()].into()), member)
+                Binder::with_model(model).implements_interface_member(
+                    &TypeSymbol::Named(["C".into()].into()),
+                    &TypeSymbol::Named(["I".into()].into()),
+                    member,
+                )
             };
 
         assert!(implements(vec![property(true, true)], Vec::new(), &get_p));
@@ -10531,6 +11973,62 @@ mod tests {
         ] {
             assert_eq!(codes(clean), [], "expected no diagnostic for: {clean}");
         }
+    }
+
+    /// An explicit implementation is matched BEFORE the implicit rules (20.4.1), so a same-named
+    /// member that is not itself a valid implementation does not shadow it.
+    ///
+    /// **THE TABLE IS OVER THE WAYS THE PAIR CAN BE WRITTEN, NOT OVER ONE EXAMPLE.** The shape
+    /// arrives in real source as the canonical collection -- `public IEnumerator<int>
+    /// GetEnumerator()` for `IEnumerable<T>` beside `IEnumerator IEnumerable.GetEnumerator()` for
+    /// the inherited non-generic one -- but nothing about it needs generics or an import, and
+    /// framing it that way is what kept it off the queue. The last two rows are the controls that
+    /// make the accept column non-vacuous: the same class shape with the explicit implementation
+    /// naming a DIFFERENT interface must still report, or the check is crediting anything dotted.
+    #[test]
+    fn an_explicit_implementation_is_not_shadowed_by_a_failing_implicit_candidate() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes.dedup();
+            codes
+        };
+
+        for clean in [
+            "interface IA { int M(); } interface IB { string M(); } \
+             class C : IA, IB { public int M() { return 1; } string IB.M() { return null; } }",
+            "interface IA { int M(); } interface IB { string M(); } \
+             class C : IA, IB { public string M() { return null; } int IA.M() { return 1; } }",
+            "interface IA { int M(); } class C : IA { int M() { return 1; } int IA.M() { return 2; } }",
+            "interface IBase { int M(); } interface IDerived : IBase { string M(string s); } \
+             class C : IDerived { public string M(string s) { return s; } int IBase.M() { return 1; } }",
+            "interface IBase { int M(); } interface IDerived : IBase { string N(); } \
+             class C : IDerived { int IBase.M() { return 1; } string IDerived.N() { return null; } }",
+        ] {
+            assert_eq!(codes(clean), [], "expected no diagnostic for: {clean}");
+        }
+
+        assert_eq!(
+            codes(
+                "interface IA { int M(); } interface IB { string M(); } \
+                 class C : IA, IB { int IA.M() { return 1; } public int M() { return 1; } }"
+            ),
+            [738],
+            "IB.M is not implemented: the explicit member names IA"
+        );
+        assert_eq!(
+            codes(
+                "interface IA { int M(); } interface IB { string M(); } \
+                 class C : IA, IB { int IA.M() { return 1; } private string M() { return null; } }"
+            ),
+            [737],
+            "IB.M is not implemented: the explicit member names IA"
+        );
     }
 
     #[test]
@@ -11205,6 +12703,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         });
         let mut model = Model::new();
         model.insert(calc);

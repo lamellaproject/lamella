@@ -277,6 +277,11 @@ impl SignaturePosition {
 /// Which noun CS0305/CS0308 name, because csc's message templates are parameterized by it:
 /// *"Using the generic **{0}** '{1}' requires {2} type arguments"*. Both codes serve types and
 /// methods, and the two messages differ ONLY in this word -- so it is carried rather than baked in.
+///
+/// Measured against csc, not assumed: `Id<int,string>(1)` on `T Id<T>(T)` reports
+/// *"Using the generic method 'C.Id<T>(T)' requires 1 type arguments"* under the same CS0305 a
+/// wrong-arity TYPE draws. A hardcoded "type" would have produced a confidently wrong sentence
+/// under a right code, which is worse than a wrong code -- a reader believes the prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenericMember {
     /// A generic type: csc says "type" and quotes `Box<T>`.
@@ -321,8 +326,112 @@ pub enum DiagnosticKind {
         /// Which noun csc puts in the message. See [`GenericMember`].
         member: GenericMember,
     },
+    /// `CS0411`: a generic method was called without a type argument list and type inference
+    /// (25.6.4) could not work one out.
+    ///
+    /// **NOT "the method does not exist" and not "no overload takes N arguments".** The method is
+    /// there, at the right arity, and only its type arguments are unknown -- so the message says so
+    /// and tells the author the one thing that fixes it, which is to name them. Reported only when
+    /// the ordinary machinery has nothing more specific to say; see
+    /// [`Binder::resolve_call_or_uninferable`](crate::bound) for the boundary and the four
+    /// measurements that pin it.
+    TypeArgumentsCannotBeInferred {
+        /// The candidate as csc quotes it -- the full signature, `C.Choose<T>(T, T)`.
+        candidate: Box<str>,
+    },
+    /// `CS0452`: a type argument violates its parameter's `class` constraint (25.7.1).
+    ///
+    /// **Every message in this constraint family was measured from csc rather than recalled**, and
+    /// they are NOT interchangeable phrasings of one idea: CS0452 says *must be a reference type*,
+    /// CS0453 says *must be a non-nullable value type*, CS0310 names the constructor requirement,
+    /// and CS0311 quotes the missing conversion. A single "constraint not satisfied" message under
+    /// one code would be a different diagnostic from csc's for all four.
+    TypeArgumentMustBeReferenceType {
+        /// The offending type argument, as csc quotes it.
+        argument: Box<str>,
+        /// The type parameter's declared name -- the `T` in `Box<T>`.
+        parameter: Box<str>,
+        /// The generic type or method, as csc quotes it: `Box<T>`.
+        declaration: Box<str>,
+        /// Which noun csc puts in the message. See [`GenericMember`].
+        member: GenericMember,
+    },
+    /// `CS0453`: a type argument violates its parameter's `struct` constraint (25.7.1).
+    TypeArgumentMustBeValueType {
+        /// The offending type argument, as csc quotes it.
+        argument: Box<str>,
+        /// The type parameter's declared name.
+        parameter: Box<str>,
+        /// The generic type or method, as csc quotes it.
+        declaration: Box<str>,
+        /// Which noun csc puts in the message. See [`GenericMember`].
+        member: GenericMember,
+    },
+    /// `CS0310`: a type argument violates its parameter's `new()` constraint (25.7.1).
+    ///
+    /// **csc quotes the argument WITHOUT a leading "The type"**, unlike CS0452/CS0453/CS0311 --
+    /// *"'NoCtor' must be a non-abstract type..."*. Measured, not stylistic: matching it is what
+    /// keeps a diff against csc empty.
+    TypeArgumentNeedsDefaultConstructor {
+        /// The offending type argument, as csc quotes it.
+        argument: Box<str>,
+        /// The type parameter's declared name.
+        parameter: Box<str>,
+        /// The generic type or method, as csc quotes it.
+        declaration: Box<str>,
+        /// Which noun csc puts in the message. See [`GenericMember`].
+        member: GenericMember,
+    },
+    /// `CS0311`: a type argument does not convert to a named constraint (25.7.1).
+    TypeArgumentNoConversionToConstraint {
+        /// The offending type argument, as csc quotes it.
+        argument: Box<str>,
+        /// The type parameter's declared name.
+        parameter: Box<str>,
+        /// The generic type or method, as csc quotes it.
+        declaration: Box<str>,
+        /// The constraint type the argument does not convert to.
+        constraint: Box<str>,
+        /// Which noun csc puts in the message. See [`GenericMember`].
+        member: GenericMember,
+    },
+    /// `CS0699`: a `where` clause names an identifier that the declaration does not declare as a
+    /// type parameter -- `class Box<T> where Q : class`.
+    UnknownConstrainedTypeParameter {
+        /// The generic type or method, as csc quotes it: `Box<T>`.
+        declaration: Box<str>,
+        /// The name the clause tried to constrain.
+        parameter: Box<str>,
+    },
+    /// `CS0409`: two `where` clauses name the same type parameter.
+    DuplicateConstraintClause {
+        /// The type parameter named twice.
+        parameter: Box<str>,
+    },
+    /// `CS0449`: `class`/`struct` combined with each other, duplicated, or written after another
+    /// constraint. One code covers all three cases in csc, measured.
+    ClassOrStructConstraintMustBeFirst,
+    /// `CS0401`: the `new()` constraint is not last in its clause.
+    NewConstraintMustBeLast,
+    /// `CS0451`: `new()` written together with `struct`, which already implies it.
+    NewConstraintWithStructConstraint,
+    /// `CS0701`: a named constraint is not a valid one -- a sealed class, a struct, or a
+    /// predefined value type. Only an interface, a non-sealed class or a type parameter may stand
+    /// there.
+    InvalidConstraintType {
+        /// The offending constraint type, as csc quotes it.
+        constraint: Box<str>,
+    },
+    /// `CS0304`: `new T()` where `T` is a type parameter with no `new()` constraint.
+    ///
+    /// **This is what stands in place of an lcsc REFUSAL, not in place of silence.**
+    CannotCreateVariableTypeInstance {
+        /// The type parameter named.
+        parameter: Box<str>,
+    },
     /// `CS0308`: a NON-generic type or method was used with type arguments (`Plain<int>`). A
-    /// separate code from CS0305 in csc, measured because there is no arity to suggest.
+    /// separate code from CS0305 in csc, measured rather than assumed, because there is no arity
+    /// to suggest.
     NonGenericTypeWithTypeArguments {
         /// The type or method named, as csc quotes it.
         name: Box<str>,
@@ -518,6 +627,14 @@ pub enum DiagnosticKind {
     },
     /// `LAM0002`: the member EXISTS on a referenced type and this build could not decode its
     /// signature, so it could not be bound.
+    ///
+    /// **THIS IS THE OTHER HALF OF `CS0117` AND THE DISTINCTION IS THE WHOLE POINT.** csc has no
+    /// code for it because csc has no such limitation, so borrowing `CS0117` here would tell the
+    /// programmer their spelling is wrong when the member is right there in the assembly. The
+    /// repair is different too: nothing they write fixes it.
+    ///
+    /// Today this means a generic signature (ECMA-335 4th ed II.23.2.1 -- the extra leading
+    /// `GenParamCount` the decoder refuses rather than misreading).
     MemberSignatureNotSupported {
         /// The type the member was looked for on.
         type_name: Box<str>,
@@ -1013,6 +1130,15 @@ pub enum DiagnosticKind {
     },
     /// `CS1061`: a member is not found on the type of an EXPRESSION (as opposed to `CS0117`, which
     /// is the same absence on a type named directly).
+    ///
+    /// **csc's message names extension methods, and we keep it verbatim even though this compiler
+    /// has no extension methods.** The message is a search key: a user pasting it must land where a
+    /// csc user lands. Softening it to describe only what we implement would break exactly the
+    /// property the wording exists for.
+    ///
+    /// Used today only for a collection initializer's missing `Add`, which is where it was
+    /// measured. **Other sites still report `CS0117` where csc may say `CS1061`; that split is
+    /// unmeasured and is NOT claimed to be right.**
     MemberNotFoundOnExpression {
         /// The type the member was looked for on.
         type_name: Box<str>,
@@ -1051,7 +1177,10 @@ pub enum DiagnosticKind {
     /// `CS9032`: a `required` member is less visible than the type that declares it.
     ///
     /// A caller that cannot see the member cannot satisfy it, so the type would be
-    /// unconstructible from where it is visible.
+    /// unconstructible from where it is visible. **csc's sentence also covers a SETTER less
+    /// visible than the containing type, which this compiler cannot yet express** -- accessor
+    /// access modifiers are not carried on the declaration -- so only the member's own visibility
+    /// is checked. The message is csc's whole sentence either way, because it is a search key.
     RequiredMemberLessVisible {
         /// The member, qualified as csc renders it (`C.F`).
         member: Box<str>,
@@ -1059,12 +1188,27 @@ pub enum DiagnosticKind {
         containing_type: Box<str>,
     },
     /// `CS9035`: an object creation leaves a `required` member unset.
+    ///
+    /// **MEASURED, and it is the rule people get wrong: assigning the member in the
+    /// CONSTRUCTOR BODY does not satisfy it.** The only two ways are an object initializer and a
+    /// constructor carrying `[SetsRequiredMembers]` -- so this is a metadata rule, not definite
+    /// assignment. Reported once per unset member, at the type name of the `new`, and it names the
+    /// member's DECLARING type (`B.P` for a `new D` inheriting it).
     RequiredMemberMustBeSet {
         /// The member, qualified as csc renders it (`C.P`).
         member: Box<str>,
     },
     /// `CS9036`: a `required` member is given a NESTED member or collection initializer rather
     /// than a value.
+    ///
+    /// **Its own code, not `CS9035`, and measured: a nested initializer does not assign the
+    /// member -- it assigns INTO whatever the member already refers to** -- so naming it in the
+    /// initializer neither satisfies the requirement nor leaves it merely unmentioned. csc reports
+    /// this one INSTEAD of `CS9035` for that member.
+    ///
+    /// One measured difference that is not the code: csc anchors this on the NESTED INITIALIZER's
+    /// opening brace and this compiler anchors it on the member name, four columns earlier -- the
+    /// nested initializer carries no span of its own to point at.
     RequiredMemberNeedsValue {
         /// The member, qualified as csc renders it (`C.F`).
         member: Box<str>,
@@ -1329,6 +1473,18 @@ impl DiagnosticKind {
             DiagnosticKind::TypeNotFound { .. } => 246,
             DiagnosticKind::NameNotFound { .. } => 103,
             DiagnosticKind::GenericArityMismatch { .. } => 305,
+            DiagnosticKind::TypeArgumentsCannotBeInferred { .. } => 411,
+            DiagnosticKind::TypeArgumentMustBeReferenceType { .. } => 452,
+            DiagnosticKind::TypeArgumentMustBeValueType { .. } => 453,
+            DiagnosticKind::TypeArgumentNeedsDefaultConstructor { .. } => 310,
+            DiagnosticKind::TypeArgumentNoConversionToConstraint { .. } => 311,
+            DiagnosticKind::UnknownConstrainedTypeParameter { .. } => 699,
+            DiagnosticKind::DuplicateConstraintClause { .. } => 409,
+            DiagnosticKind::ClassOrStructConstraintMustBeFirst => 449,
+            DiagnosticKind::NewConstraintMustBeLast => 401,
+            DiagnosticKind::NewConstraintWithStructConstraint => 451,
+            DiagnosticKind::InvalidConstraintType { .. } => 701,
+            DiagnosticKind::CannotCreateVariableTypeInstance { .. } => 304,
             DiagnosticKind::NonGenericTypeWithTypeArguments { .. } => 308,
             DiagnosticKind::ConstantOutOfRange { .. } => 31,
             DiagnosticKind::NonConstantEnumMember { .. } => 133,
@@ -1527,6 +1683,87 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "Using the generic {} '{candidate}' requires {required} type arguments",
                 member.as_str()
+            ),
+            DiagnosticKind::TypeArgumentsCannotBeInferred { candidate } => write!(
+                f,
+                "The type arguments for method '{candidate}' cannot be inferred from the usage. \
+                 Try specifying the type arguments explicitly."
+            ),
+            DiagnosticKind::TypeArgumentMustBeReferenceType {
+                argument,
+                parameter,
+                declaration,
+                member,
+            } => write!(
+                f,
+                "The type '{argument}' must be a reference type in order to use it as \
+                 parameter '{parameter}' in the generic {} '{declaration}'",
+                member.as_str()
+            ),
+            DiagnosticKind::TypeArgumentMustBeValueType {
+                argument,
+                parameter,
+                declaration,
+                member,
+            } => write!(
+                f,
+                "The type '{argument}' must be a non-nullable value type in order to use it as \
+                 parameter '{parameter}' in the generic {} '{declaration}'",
+                member.as_str()
+            ),
+            DiagnosticKind::TypeArgumentNeedsDefaultConstructor {
+                argument,
+                parameter,
+                declaration,
+                member,
+            } => write!(
+                f,
+                "'{argument}' must be a non-abstract type with a public parameterless constructor \
+                 in order to use it as parameter '{parameter}' in the generic {} '{declaration}'",
+                member.as_str()
+            ),
+            DiagnosticKind::TypeArgumentNoConversionToConstraint {
+                argument,
+                parameter,
+                declaration,
+                constraint,
+                member,
+            } => write!(
+                f,
+                "The type '{argument}' cannot be used as type parameter '{parameter}' in the \
+                 generic {} '{declaration}'. There is no implicit reference conversion from \
+                 '{argument}' to '{constraint}'.",
+                member.as_str()
+            ),
+            DiagnosticKind::UnknownConstrainedTypeParameter {
+                declaration,
+                parameter,
+            } => write!(f, "'{declaration}' does not define type parameter '{parameter}'"),
+            DiagnosticKind::DuplicateConstraintClause { parameter } => write!(
+                f,
+                "A constraint clause has already been specified for type parameter \
+                 '{parameter}'. All of the constraints for a type parameter must be specified in \
+                 a single where clause."
+            ),
+            DiagnosticKind::ClassOrStructConstraintMustBeFirst => f.write_str(
+                "The 'class', 'struct', 'unmanaged', 'notnull', and 'default' constraints cannot \
+                 be combined or duplicated, and must be specified first in the constraints list.",
+            ),
+            DiagnosticKind::NewConstraintMustBeLast => {
+                f.write_str("The new() constraint must be the last restrictive constraint specified")
+            }
+            DiagnosticKind::NewConstraintWithStructConstraint => {
+                f.write_str("The 'new()' constraint cannot be used with the 'struct' constraint")
+            }
+            DiagnosticKind::InvalidConstraintType { constraint } => write!(
+                f,
+                "'{constraint}' is not a valid constraint. A type used as a constraint must be an \
+                 interface, a non-sealed class or a type parameter."
+            ),
+            DiagnosticKind::CannotCreateVariableTypeInstance { parameter } => write!(
+                f,
+                "Cannot create an instance of the variable type '{parameter}' because it does not \
+                 have the new() constraint"
             ),
             DiagnosticKind::NonGenericTypeWithTypeArguments { name, member } => write!(
                 f,

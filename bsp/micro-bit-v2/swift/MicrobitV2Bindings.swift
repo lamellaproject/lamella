@@ -29,6 +29,8 @@ public enum MicroBitV2Bindings {
     // -- on-board devices: PORT group base + pin index + mask --
     public static let LSM303AGR_ADDRESS: UInt32 = 0x19
     public static let LSM303AGR_MAG_ADDRESS: UInt32 = 0x1E
+    public static let INTERFACE_MGMT_ADDRESS: UInt32 = 0x70
+    public static let INTERFACE_STORAGE_ADDRESS: UInt32 = 0x72
     public static let DISPLAY_ROW1_PORT_BASE: UInt32 = 0x50000000
     public static let DISPLAY_ROW1_PIN: UInt32 = 21
     public static let DISPLAY_ROW1_MASK: UInt32 = 0x200000

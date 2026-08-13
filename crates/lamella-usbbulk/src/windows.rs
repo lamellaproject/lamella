@@ -15,12 +15,13 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows_sys::Win32::Devices::Usb::{
-    UsbdPipeTypeBulk, WinUsb_Free, WinUsb_GetDescriptor, WinUsb_GetOverlappedResult,
+    UsbdPipeTypeBulk, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetOverlappedResult,
     WinUsb_AbortPipe, WinUsb_Initialize, WinUsb_ResetPipe, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe,
     WinUsb_SetPipePolicy, WinUsb_WritePipe, USB_DEVICE_DESCRIPTOR_TYPE, USB_INTERFACE_DESCRIPTOR,
     USB_STRING_DESCRIPTOR_TYPE, WINUSB_INTERFACE_HANDLE, WINUSB_PIPE_INFORMATION,
+    WINUSB_SETUP_PACKET,
 };
-use windows_sys::Win32::Foundation::{
+use windows_sys::Win32::Foundation::{WAIT_OBJECT_0,
     CloseHandle, GetLastError, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE,
 };
@@ -28,7 +29,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 const DAP_V2_GUID: GUID = GUID {
@@ -104,9 +105,115 @@ fn instance_id_from_path(path: &[u16]) -> Option<String> {
     Some(parts.next()?.to_string())
 }
 
-/// Case-insensitive substring match of a requested serial against a device's serial.
-fn serial_matches(wanted: &str, actual: &str) -> bool {
-    actual.to_ascii_uppercase().contains(&wanted.to_ascii_uppercase())
+use crate::serial_matches;
+
+/// Whether a path's instance-id segment is Windows' SYNTHESIZED id rather than the device's own
+/// serial -- which is what decides whether a mismatch against it means anything.
+///
+/// Windows names an interface of a COMPOSITE device with an id like `6&1d366a3c&0&0000`; a simple
+/// device that reports an iSerialNumber gets the serial itself. The ampersands are the tell, and
+/// this file's own path documentation has always said so.
+///
+/// NOTE the one way this can be wrong, and which way it falls. A device whose real serial contained
+/// an ampersand would be misread as synthesized -- and that is the SAFE direction: it falls back to
+/// reading the descriptor, which is exactly what the code did for every device before this
+/// distinction existed. The costly mistake would be the other way round, and this cannot make it.
+fn is_synthesized_instance_id(id: &str) -> bool {
+    id.contains('&')
+}
+
+/// What a device path alone can say about whether this is the requested board.
+enum PathVerdict {
+    /// This is the board, or none was requested. Open it.
+    Match,
+    /// This is NOT the board, and the path was able to say so -- the id it carries is the device's
+    /// own serial and it does not match. Nothing further can change that, so do not open it.
+    Mismatch,
+    /// The path cannot say. The id is Windows' synthesized one, so the real serial lives only in a
+    /// descriptor and reaching it costs an open.
+    Unknown,
+}
+
+/// Judges a path against a requested serial WITHOUT opening the device.
+///
+/// The three-way answer is the point. Collapsing it to a boolean makes a settled NO indistinguishable
+/// from a DO NOT KNOW, and the two want opposite handling: a settled no should skip the device, and
+/// only a do-not-know justifies opening one to ask its descriptor. Treating both as "open it" is
+/// what made a bench pay a descriptor fetch per non-matching board.
+fn judge_path(serial: Option<&str>, path: &[u16]) -> PathVerdict {
+    let Some(wanted) = serial else { return PathVerdict::Match };
+    match instance_id_from_path(path) {
+        Some(id) if serial_matches(wanted, &id) => PathVerdict::Match,
+        Some(id) if is_synthesized_instance_id(&id) => PathVerdict::Unknown,
+        Some(_) => PathVerdict::Mismatch,
+        None => PathVerdict::Unknown,
+    }
+}
+
+/// How long a descriptor fetch may take before it is abandoned.
+///
+/// A healthy device answers its own descriptors in microseconds. This bound is not for slowness --
+/// it is for a device that never answers at all, which is a thing that ships: one Lamella Link
+/// RP2350 returns its descriptors in 0 ms and another takes over ten seconds for the same request.
+/// Enumeration reads up to three descriptors per device, so an unbounded fetch multiplies that
+/// across every board on the bus.
+const DESCRIPTOR_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// A descriptor fetch that CANNOT hang, replacing `WinUsb_GetDescriptor`.
+///
+/// `WinUsb_GetDescriptor` is synchronous with no timeout and no way to cancel it, so a device that
+/// does not answer blocks the caller for the driver's own default -- seconds, per descriptor, with
+/// no output. This file's read and write paths both refuse that trade in as many words: *"a hung
+/// tool is far worse than an error"*. The control path is the same trade and had not been given the
+/// same answer.
+///
+/// So the request goes out as an overlapped control transfer instead, which the same
+/// poll-and-abort loop the pipes use can bound and cancel. The setup packet is the standard
+/// GET_DESCRIPTOR that `WinUsb_GetDescriptor` issues internally: direction device-to-host, `wValue`
+/// the type and index, `wIndex` the language id.
+unsafe fn descriptor_bounded(
+    wu: WINUSB_INTERFACE_HANDLE,
+    descriptor_type: u8,
+    index: u8,
+    language: u16,
+    buf: &mut [u8],
+) -> Option<u32> {
+    const REQUEST_TYPE_DEVICE_TO_HOST: u8 = 0x80;
+    const REQUEST_GET_DESCRIPTOR: u8 = 0x06;
+
+    let setup = WINUSB_SETUP_PACKET {
+        RequestType: REQUEST_TYPE_DEVICE_TO_HOST,
+        Request: REQUEST_GET_DESCRIPTOR,
+        Value: (u16::from(descriptor_type) << 8) | u16::from(index),
+        Index: language,
+        Length: buf.len().min(u16::MAX as usize) as u16,
+    };
+    let event = CreateEventW(null(), 1, 0, null());
+    if event.is_null() {
+        return None;
+    }
+    let mut ov: OVERLAPPED = std::mem::zeroed();
+    ov.hEvent = event;
+    let mut got = 0u32;
+    let issued = WinUsb_ControlTransfer(wu, setup, buf.as_mut_ptr(), setup.Length.into(), &mut got, &ov);
+    let outcome = if issued != 0 {
+        Some(got)
+    } else if GetLastError() == ERROR_IO_PENDING {
+        let ms = DESCRIPTOR_TIMEOUT.as_millis() as u32;
+        if WaitForSingleObject(event, ms) == WAIT_OBJECT_0
+            && WinUsb_GetOverlappedResult(wu, &ov, &mut got, 0) != 0
+        {
+            Some(got)
+        } else {
+            WinUsb_AbortPipe(wu, 0);
+            let _ = WinUsb_GetOverlappedResult(wu, &ov, &mut got, 1);
+            None
+        }
+    } else {
+        None
+    };
+    CloseHandle(event);
+    outcome
 }
 
 /// One USB string descriptor via WinUSB, decoded to a `String` (descriptor layout: length byte,
@@ -116,18 +223,8 @@ unsafe fn string_descriptor(wu: WINUSB_INTERFACE_HANDLE, index: u8) -> Option<St
         return None;
     }
     let mut buf = [0u8; 256];
-    let mut got = 0u32;
-    if WinUsb_GetDescriptor(
-        wu,
-        USB_STRING_DESCRIPTOR_TYPE as u8,
-        index,
-        0x0409,
-        buf.as_mut_ptr(),
-        buf.len() as u32,
-        &mut got,
-    ) == 0
-        || got < 2
-    {
+    let got = descriptor_bounded(wu, USB_STRING_DESCRIPTOR_TYPE as u8, index, 0x0409, &mut buf)?;
+    if got < 2 {
         return None;
     }
     let len = (buf[0] as usize).min(got as usize);
@@ -148,18 +245,10 @@ unsafe fn string_descriptor(wu: WINUSB_INTERFACE_HANDLE, index: u8) -> Option<St
 /// (which names the string indices).
 unsafe fn product_and_serial(wu: WINUSB_INTERFACE_HANDLE) -> (Option<String>, Option<String>) {
     let mut desc = [0u8; 18];
-    let mut got = 0u32;
-    if WinUsb_GetDescriptor(
-        wu,
-        USB_DEVICE_DESCRIPTOR_TYPE as u8,
-        0,
-        0,
-        desc.as_mut_ptr(),
-        desc.len() as u32,
-        &mut got,
-    ) == 0
-        || got < 18
-    {
+    let Some(got) = descriptor_bounded(wu, USB_DEVICE_DESCRIPTOR_TYPE as u8, 0, 0, &mut desc) else {
+        return (None, None);
+    };
+    if got < 18 {
         return (None, None);
     }
     (string_descriptor(wu, desc[15]), string_descriptor(wu, desc[16]))
@@ -185,6 +274,15 @@ fn guid_from_str(s: &str) -> Option<GUID> {
 }
 
 /// Lists the CMSIS-DAP v2 devices -- the same body [`enumerate_guid`] runs, and it must be.
+///
+/// **THE DESCRIPTOR READ IS NOT OPTIONAL: SKIP IT AND EVERY COMPOSITE PROBE LISTS UNDER A SYNTHESIZED
+/// ID INSTEAD OF ITS SERIAL.** Both an RPi Debug Probe and a micro:bit DAPLink are composite, and
+/// Windows names an interface of a composite device with a port-derived id (`6&526bcf1&0&0000`) --
+/// so `list()` reported two probes whose "serials" changed with the USB port and matched nothing a
+/// user could read off the hardware. `open` never had the bug: it already falls back to the
+/// descriptor for exactly this reason (see `open_with`). **Listing and opening disagreeing about
+/// what a device is CALLED is worse than either being wrong alone** -- a tool selects by the name
+/// the list gave it and finds nothing.
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     unsafe { Ok(enumerate_iface(&DAP_V2_GUID)) }
 }
@@ -198,6 +296,10 @@ pub fn enumerate_guid(interface_guid: &str) -> Result<Vec<DeviceInfo>> {
 
 /// The shared body. The serial falls back to the device path's instance id when the descriptor
 /// cannot be read -- which keeps a device another host is driving listed rather than invisible.
+///
+/// **That fallback is a LAST RESORT and not an equivalent.** It is the real serial only for a
+/// SIMPLE device; for a composite one it is a synthesized, port-dependent id. A caller that needs
+/// a stable identity must treat a fallback id as "unnamed", not as a serial.
 unsafe fn enumerate_iface(guid: &GUID) -> Vec<DeviceInfo> {
     let mut out = Vec::new();
     unsafe {
@@ -365,11 +467,11 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                 if vid_pid_from_path(&path) != Some((vendor_id, product_id)) {
                     continue;
                 }
-                let matched_by_path = match (serial, instance_id_from_path(&path)) {
-                    (None, _) => true,
-                    (Some(wanted), Some(id)) => serial_matches(wanted, &id),
-                    (Some(_), None) => false,
-                };
+                let verdict = judge_path(serial, &path);
+                if matches!(verdict, PathVerdict::Mismatch) {
+                    continue;
+                }
+                let matched_by_path = matches!(verdict, PathVerdict::Match);
                 let h = CreateFileW(
                     path.as_ptr(),
                     GENERIC_READ | GENERIC_WRITE,
@@ -390,10 +492,7 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                 if !matched_by_path {
                     let wanted = serial.expect("only reachable when a serial was requested");
                     let descriptor_serial = product_and_serial(wu).1;
-                    let ok = descriptor_serial
-                        .as_deref()
-                        .is_some_and(|actual| serial_matches(wanted, actual));
-                    if !ok {
+                    if !crate::candidate_satisfies(Some(wanted), descriptor_serial.as_deref()) {
                         WinUsb_Free(wu);
                         CloseHandle(h);
                         continue;
@@ -529,5 +628,48 @@ impl Drop for Device {
             WinUsb_Free(self.wu);
             CloseHandle(self.h);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{judge_path, PathVerdict};
+
+    /// A device-interface path as Windows spells it, wide and null-terminated.
+    fn path(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(core::iter::once(0)).collect()
+    }
+
+    /// A simple device: Windows puts the device's OWN serial in the instance-id segment.
+    const SIMPLE: &str = r"\?\usb#vid_39e9&pid_0001#7A5C9E20D14--with-a-serial#{guid}";
+    /// A composite device's interface: the id is SYNTHESIZED and carries no serial at all.
+    const COMPOSITE: &str = r"\?\usb#vid_0483&pid_374b#6&1d366a3c&0&0000#{guid}";
+
+    #[test]
+    fn no_requested_serial_takes_any_board() {
+        assert!(matches!(judge_path(None, &path(SIMPLE)), PathVerdict::Match));
+        assert!(matches!(judge_path(None, &path(COMPOSITE)), PathVerdict::Match));
+    }
+
+    #[test]
+    fn a_real_serial_that_matches_needs_no_open() {
+        assert!(matches!(judge_path(Some("7A5C9E20D14"), &path(SIMPLE)), PathVerdict::Match));
+    }
+
+    #[test]
+    fn a_real_serial_that_does_not_match_is_conclusive() {
+        assert!(matches!(judge_path(Some("DEADBEEF"), &path(SIMPLE)), PathVerdict::Mismatch));
+    }
+
+    #[test]
+    fn a_synthesized_id_leaves_the_question_open() {
+        assert!(matches!(judge_path(Some("DEADBEEF"), &path(COMPOSITE)), PathVerdict::Unknown));
+        assert!(matches!(judge_path(Some("0&0000"), &path(COMPOSITE)), PathVerdict::Match));
+    }
+
+    #[test]
+    fn a_path_with_no_id_segment_is_not_a_refusal() {
+        let truncated = path(r"\\?\usb#vid_0001&pid_0002");
+        assert!(matches!(judge_path(Some("ANY"), &truncated), PathVerdict::Unknown));
     }
 }

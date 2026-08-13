@@ -4,6 +4,12 @@
 #
 # THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
 # its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
+#
+# THE AF7 COLUMN ON THIS PART IS HEADED SPI2/3/6, USART1/2/3/6, UART7 AND SDMMC1, which is a
+# different set from the sibling ST families here even where they agree about USART3. The two
+# cells this map claims were read from THIS part's table under THAT header rather than carried
+# across, and the check that the reading is right is the board's own manual: UM2408 assigns the
+# virtual COM port to the same two pins by name, from the other side of the connection.
 
 [table]
 kind = "pins"

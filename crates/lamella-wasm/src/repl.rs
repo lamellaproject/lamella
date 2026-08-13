@@ -173,16 +173,46 @@ mod tests {
     use super::*;
 
     /// Reads the managed corlib + packs the net8.0 ref assemblies the way the host does.
-    /// Returns `None` (and the test skips) when an asset is absent.
+    ///
+    /// Both are committed fixtures, so a fresh checkout runs these tests with nothing configured
+    /// and no machine-specific path anywhere. `LAMELLA_REF_DIR` still wins when it is set, so a
+    /// caller can bind against a different reference pack without editing a test.
+    ///
+    /// Returns `None`, and the tests skip, only where the fixtures are absent.
     fn assets() -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         let corlib = std::fs::read(format!(
             "{}/../lamella-load/tests/fixtures/corlib.dll",
             env!("CARGO_MANIFEST_DIR")
         ))
         .ok()?;
-        let runtime = std::fs::read(r"E:\lamella-web\corelib\System.Runtime.dll").ok()?;
-        let console = std::fs::read(r"E:\lamella-web\corelib\System.Console.dll").ok()?;
+        let reference_dir = std::env::var("LAMELLA_REF_DIR")
+            .unwrap_or_else(|_| fixture_dir().to_string_lossy().into_owned());
+        let runtime = std::fs::read(format!("{reference_dir}/System.Runtime.dll")).ok()?;
+        let console = std::fs::read(format!("{reference_dir}/System.Console.dll")).ok()?;
         Some((corlib, vec![runtime, console]))
+    }
+
+    /// Where the committed reference assemblies live.
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR")))
+    }
+
+    /// The four tests below report the SAME `ok` line whether they ran or returned at their first
+    /// statement, so an asset that stops resolving disables them without reddening anything --
+    /// elapsed time is the only tell, about a tenth of a second against roughly two. This row is
+    /// what makes that impossible to do by accident: where the fixtures are supposed to exist,
+    /// failing to load one is a failure and not a skip.
+    #[test]
+    fn every_repl_asset_loads_where_the_fixtures_are_present() {
+        if !fixture_dir().is_dir() {
+            eprintln!("no fixture directory -- the tests below skip, as intended here");
+            return;
+        }
+        assert!(
+            assets().is_some(),
+            "the fixture directory is present, so every REPL asset must load: a missing one \
+             silently disables four tests that go on reporting ok"
+        );
     }
 
     fn parse(buffer: Vec<u8>) -> serde_json::Value {

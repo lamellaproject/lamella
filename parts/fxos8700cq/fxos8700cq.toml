@@ -1,0 +1,175 @@
+# PART: NXP FXOS8700CQ, a six-axis accelerometer and magnetometer in ONE combined device.
+#
+# THE SHAPE THIS PART EXISTS TO CONTRAST WITH. It measures the same two quantities as an LSM303AGR
+# and presents them completely differently: one slave address, one identity register, one continuous
+# register map covering both sensors. Where the ST part is two bus residents, this is one. So the
+# decision to model that part as two members follows the silicon rather than a preference -- the
+# same function arrives here as a single device and is described as one.
+#
+# WHY THIS PART IS IN THE CATALOGUE AT ALL: it is the ALTERNATIVE on a shared footprint. The
+# micro:bit v2 has one motion-sensor footprint that takes either this part or an LSM303AGR, only one
+# is ever placed, and the board's own vendor states that its reference runtime detects which at run
+# time. A board file cannot say which is fitted, so a reader must be able to describe both.
+
+[table]
+kind = "device"
+family = "fxos8700cq"
+part = "fxos8700cq"
+sources = [
+    "NXP FXOS8700CQ data sheet: register map ch 14 table 25 (0x00 to 0x78), WHO_AM_I ch 14.1.7 table 31, I2C slave addressing ch 10.1.1 table 11, I2C read and write operations ch 10.1.2.",
+]
+notes = [
+    "One device, one address, one register map. The accelerometer output registers occupy 0x01 to 0x06 and the magnetometer's 0x33 to 0x38, with control registers for each at 0x2A and 0x5B.",
+    "Valid magnetometer data requires reading M_OUT_X_MSB first, in burst or single-read mode: that read is what triggers the update of the whole magnetic data block. A driver that reads the Z axis alone gets a stale sample and no error.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own data sheet.
+#
+# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates, the dynamic ranges and the
+# counts-per-unit each implies, the hybrid accelerometer-plus-magnetometer mode and its rate
+# halving, the FIFO, the orientation and pulse detection blocks, the magnetic threshold interrupts,
+# and the hard-iron offset registers. All are in the data sheet and none is transcribed.
+#
+# Validation is `none`: no physical part of this type has answered anything. There is not one on
+# this bench -- what is here is the other candidate for the same footprint.
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- buses -----------------------------------------------------------------------------------------
+#
+# ONLY THE I2C PATH IS DESCRIBED. The part also has an SPI interface, documented in its own chapter,
+# and nothing about it is transcribed here -- treat it as absent rather than defaulted.
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "THE BURST RULE IS THE OPPOSITE OF THE PART THIS ONE SHARES A FOOTPRINT WITH, and both directions fail quietly. This part increments the register pointer AUTOMATICALLY on a multi-byte read, so the address is written as-is for one byte or for many. An LSM303AGR requires bit 7 of that byte to be SET to enable auto-increment. So a driver written for the ST part, run against this one, addresses register 0x8D where it means 0x0D -- past the end of a map that stops at 0x78. A driver written for this part, run against the ST part, re-reads one register and returns three identical axis values. Neither reports an error. A separate auto-increment table describes how the pointer moves in the hybrid accelerometer-plus-magnetometer mode, which this table does not describe."
+
+# --- identity ------------------------------------------------------------------------------------
+#
+# ONE REGISTER, ONE VALUE, AND IT IS NOWHERE NEAR THE ST PART'S. That matters because the two parts
+# can occupy the SAME ADDRESS, so an identity read is the only thing that separates them -- see the
+# address section below, which is where this gets dangerous.
+
+[identity]
+reg = 0x0D
+width = 8
+values = [0xC7]
+notes = "The register map lists this as Device ID with a reset value of 0xC7."
+
+# --- address: THE MODEL CANNOT STATE THIS PART'S ADDRESS, AND NO STRAP IS DECLARED ------------------
+#
+# Four addresses selected by two pins, SA1 and SA0. The data sheet gives them as a table:
+#
+#     SA1  SA0   slave address
+#      0    0    0x1E
+#      0    1    0x1D
+#      1    0    0x1C
+#      1    1    0x1F
+#
+# THAT IS NOT A BASE PLUS PER-PIN BITS, WHICH IS THE ONLY ADDRESS MODEL THIS SCHEMA HAS. A strap row
+# states that one pin contributes one bit at one position, and here SA0's contribution DEPENDS ON
+# SA1: setting SA0 moves the address down by one from the 0,0 corner and up by three from the 1,0
+# corner. Written as bits, the low two are `SA1 XNOR SA0` and `SA0`, which no per-pin row can say.
+#
+# SO NO STRAP IS DECLARED, AND THAT IS A DELIBERATE ABSENCE RATHER THAN A CLAIM. A reader of the
+# emitted table will find a strap count of zero, which elsewhere in this catalogue means an address
+# that cannot be moved. IT DOES NOT MEAN THAT HERE. The alternative was to invent two strap rows
+# whose composed addresses would be wrong for two of the four combinations, and a wrong address that
+# computes is worse than an absent one that is described.
+#
+# The base recorded is the 0,0 corner, which the data sheet lists first.
+
+[address]
+bus = "i2c"
+base = 0x1E
+notes = "FOUR ADDRESSES, SELECTED BY SA1 AND SA0, AND THE SELECTION IS A LOOKUP RATHER THAN A BIT COMPOSITION: 0,0 gives 0x1E; 0,1 gives 0x1D; 1,0 gives 0x1C; 1,1 gives 0x1F. The value here is the 0,0 corner. NO STRAP ROW IS DECLARED because a strap states one pin's contribution at one bit position and this part's two pins do not compose that way, so a strap count of zero here does NOT mean a fixed address as it does for other parts in this catalogue. Which way the pins are tied is a property of the board a part is fitted to."
+
+# --- registers ---------------------------------------------------------------------------------
+
+[registers.status]
+reg = 0x00
+width = 8
+access = "read-only"
+notes = "Real-time data-ready status, or FIFO status depending on configuration."
+
+[registers.out_x]
+reg = 0x01
+width = 16
+access = "read-only"
+fields = { out_x_lsb = [0, 8], out_x_msb = [8, 8] }
+notes = "MSB FIRST, which is the opposite order to the ST part's accelerometer. 14-bit sample left justified: the MSB register holds the top 8 bits and only bits 7 to 2 of the LSB register carry data."
+
+[registers.out_y]
+reg = 0x03
+width = 16
+access = "read-only"
+fields = { out_y_lsb = [0, 8], out_y_msb = [8, 8] }
+
+[registers.out_z]
+reg = 0x05
+width = 16
+access = "read-only"
+fields = { out_z_lsb = [0, 8], out_z_msb = [8, 8] }
+
+[registers.who_am_i]
+reg = 0x0D
+width = 8
+access = "read-only"
+fields = { who_am_i = [0, 8] }
+
+[registers.ctrl_reg1]
+reg = 0x2A
+width = 8
+access = "read-write"
+notes = "The accelerometer's rate and active-mode control."
+
+[registers.m_dr_status]
+reg = 0x32
+width = 8
+access = "read-only"
+notes = "Magnetic data ready."
+
+[registers.m_out_x]
+reg = 0x33
+width = 16
+access = "read-only"
+fields = { m_out_x_lsb = [0, 8], m_out_x_msb = [8, 8] }
+notes = "MSB first, 16-bit. READING THIS REGISTER IS WHAT UPDATES THE WHOLE MAGNETIC BLOCK, so the X axis must be read first even by a driver that wants only Z."
+
+[registers.m_out_y]
+reg = 0x35
+width = 16
+access = "read-only"
+fields = { m_out_y_lsb = [0, 8], m_out_y_msb = [8, 8] }
+
+[registers.m_out_z]
+reg = 0x37
+width = 16
+access = "read-only"
+fields = { m_out_z_lsb = [0, 8], m_out_z_msb = [8, 8] }
+
+# STATED BECAUSE OF WHAT IT COLLIDES WITH, not because a driver needs it. This register holds
+# measured magnetometer data -- a value that changes with the field the board is sitting in -- and
+# it is at the address the LSM303AGR magnetometer answers its IDENTITY at. See the note below.
+[registers.min_z_msb]
+reg = 0x4F
+width = 8
+access = "read-only"
+notes = "Magnetometer Z-axis minimum value, high byte. Measured data rather than a constant."
+
+[registers.m_ctrl_reg1]
+reg = 0x5B
+width = 8
+access = "read-write"
+notes = "Selects accelerometer-only, magnetometer-only or hybrid operation, and the magnetometer oversampling."
+
+[measurement]
+burst_length = 6
+resolution_bits = "14 for acceleration, 16 for the magnetic field"

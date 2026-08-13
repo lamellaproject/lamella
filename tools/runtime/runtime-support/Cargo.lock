@@ -107,16 +107,21 @@ name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-net-core",
  "lamella-reactor",
  "lamella-token",
  "lamella-wtf8",
 ]
 
 [[package]]
+name = "lamella-net-core"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-net-smoltcp"
 version = "0.0.0"
 dependencies = [
- "lamella-cil-runtime",
+ "lamella-net-core",
  "smoltcp",
 ]
 

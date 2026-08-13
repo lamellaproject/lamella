@@ -189,4 +189,94 @@ public enum Stm32f746gDiscoBindings {
     public static let MEMORY_SDRAM_REFRESH_COUNT_HSI_16MHZ: UInt32 = 105
     public static let MEMORY_SDRAM_SDRTR_HSI_16MHZ: UInt32 = 0xD2
     public static let MEMORY_SDRAM_SDTR1_HSI_16MHZ: UInt32 = 0x1126361
+
+    // -- discriminators: what an attached board can be asked to confirm it is the board an
+    // image was built for. A chip identity register cannot answer this on its own, because the
+    // parts that separate one board from its sibling are soldered outside the die and a bare
+    // board answers the same identity as a populated one. So each row names the CLAIM it
+    // reaches -- `part`, or `memory:<region>` -- alongside the rung a successful read of its
+    // kind establishes: `identified` (it answered its identity register) or `exercised` (it
+    // produced measurements a driver decoded). A region's ACCESSIBLE size is reachable only at
+    // `exercised`: an identity read reports the fitted device, and a board may wire less of a
+    // device than it holds --
+    public static let DISCRIMINATOR_COUNT: UInt32 = 2
+    public static let DISCRIMINATOR_QSPI_JEDEC_CONFIRMS: StaticString = "memory:qspi"
+    public static let DISCRIMINATOR_QSPI_JEDEC_VALIDATION: StaticString = "identified"
+    public static let DISCRIMINATOR_QSPI_JEDEC_EXPECT: UInt32 = 0x20BA18
+    public static let DISCRIMINATOR_QSPI_JEDEC_READS: StaticString = "the fitted quad-SPI NOR's JEDEC identity, over the region's single-line `read` configuration -- the one command with no dummy phase, so it needs no count established first"
+    public static let DISCRIMINATOR_SDRAM_SWEEP_CONFIRMS: StaticString = "memory:sdram"
+    public static let DISCRIMINATOR_SDRAM_SWEEP_VALIDATION: StaticString = "exercised"
+    public static let DISCRIMINATOR_SDRAM_SWEEP_EXPECT: UInt32 = 0x800000
+    public static let DISCRIMINATOR_SDRAM_SWEEP_READS: StaticString = "with the fmc controller configured, a write-then-read sweep of the region, answering the number of bytes that read back what was written"
+
+    // -- connectors: the sockets a removable module plugs into. The socket is board truth --
+    // it is on the schematic and identical on every unit -- and what is plugged into it is not,
+    // so no row here names a module. A socket brings out whole BUSES, each named by the binding
+    // role that serves it, and single LINES, each named by the standard's own name for that
+    // position and carrying the port wiring a driver needs to drive it. Which of a socket's
+    // protocols an attached module speaks is a property of the module, so a board that offers
+    // several states all of them and chooses none --
+    public static let CONNECTOR_COUNT: UInt32 = 1
+    public static let CONNECTOR_ARDUINO_STANDARD: StaticString = "arduino-uno-v3"
+    public static let CONNECTOR_ARDUINO_I2C_ROLE: StaticString = "header-i2c"
+    public static let CONNECTOR_ARDUINO_A0_PORT_BASE: UInt32 = 0x40020000
+    public static let CONNECTOR_ARDUINO_A0_PIN: UInt32 = 0
+    public static let CONNECTOR_ARDUINO_A0_MASK: UInt32 = 0x1
+    public static let CONNECTOR_ARDUINO_A1_PORT_BASE: UInt32 = 0x40021400
+    public static let CONNECTOR_ARDUINO_A1_PIN: UInt32 = 10
+    public static let CONNECTOR_ARDUINO_A1_MASK: UInt32 = 0x400
+    public static let CONNECTOR_ARDUINO_A2_PORT_BASE: UInt32 = 0x40021400
+    public static let CONNECTOR_ARDUINO_A2_PIN: UInt32 = 9
+    public static let CONNECTOR_ARDUINO_A2_MASK: UInt32 = 0x200
+    public static let CONNECTOR_ARDUINO_A3_PORT_BASE: UInt32 = 0x40021400
+    public static let CONNECTOR_ARDUINO_A3_PIN: UInt32 = 8
+    public static let CONNECTOR_ARDUINO_A3_MASK: UInt32 = 0x100
+    public static let CONNECTOR_ARDUINO_A4_PORT_BASE: UInt32 = 0x40021400
+    public static let CONNECTOR_ARDUINO_A4_PIN: UInt32 = 7
+    public static let CONNECTOR_ARDUINO_A4_MASK: UInt32 = 0x80
+    public static let CONNECTOR_ARDUINO_A5_PORT_BASE: UInt32 = 0x40021400
+    public static let CONNECTOR_ARDUINO_A5_PIN: UInt32 = 6
+    public static let CONNECTOR_ARDUINO_A5_MASK: UInt32 = 0x40
+    public static let CONNECTOR_ARDUINO_D0_PORT_BASE: UInt32 = 0x40020800
+    public static let CONNECTOR_ARDUINO_D0_PIN: UInt32 = 7
+    public static let CONNECTOR_ARDUINO_D0_MASK: UInt32 = 0x80
+    public static let CONNECTOR_ARDUINO_D1_PORT_BASE: UInt32 = 0x40020800
+    public static let CONNECTOR_ARDUINO_D1_PIN: UInt32 = 6
+    public static let CONNECTOR_ARDUINO_D1_MASK: UInt32 = 0x40
+    public static let CONNECTOR_ARDUINO_D2_PORT_BASE: UInt32 = 0x40021800
+    public static let CONNECTOR_ARDUINO_D2_PIN: UInt32 = 6
+    public static let CONNECTOR_ARDUINO_D2_MASK: UInt32 = 0x40
+    public static let CONNECTOR_ARDUINO_D3_PORT_BASE: UInt32 = 0x40020400
+    public static let CONNECTOR_ARDUINO_D3_PIN: UInt32 = 4
+    public static let CONNECTOR_ARDUINO_D3_MASK: UInt32 = 0x10
+    public static let CONNECTOR_ARDUINO_D4_PORT_BASE: UInt32 = 0x40021800
+    public static let CONNECTOR_ARDUINO_D4_PIN: UInt32 = 7
+    public static let CONNECTOR_ARDUINO_D4_MASK: UInt32 = 0x80
+    public static let CONNECTOR_ARDUINO_D5_PORT_BASE: UInt32 = 0x40022000
+    public static let CONNECTOR_ARDUINO_D5_PIN: UInt32 = 0
+    public static let CONNECTOR_ARDUINO_D5_MASK: UInt32 = 0x1
+    public static let CONNECTOR_ARDUINO_D6_PORT_BASE: UInt32 = 0x40021C00
+    public static let CONNECTOR_ARDUINO_D6_PIN: UInt32 = 6
+    public static let CONNECTOR_ARDUINO_D6_MASK: UInt32 = 0x40
+    public static let CONNECTOR_ARDUINO_D7_PORT_BASE: UInt32 = 0x40022000
+    public static let CONNECTOR_ARDUINO_D7_PIN: UInt32 = 3
+    public static let CONNECTOR_ARDUINO_D7_MASK: UInt32 = 0x8
+    public static let CONNECTOR_ARDUINO_D8_PORT_BASE: UInt32 = 0x40022000
+    public static let CONNECTOR_ARDUINO_D8_PIN: UInt32 = 2
+    public static let CONNECTOR_ARDUINO_D8_MASK: UInt32 = 0x4
+    public static let CONNECTOR_ARDUINO_D9_PORT_BASE: UInt32 = 0x40020000
+    public static let CONNECTOR_ARDUINO_D9_PIN: UInt32 = 15
+    public static let CONNECTOR_ARDUINO_D9_MASK: UInt32 = 0x8000
+    public static let CONNECTOR_ARDUINO_D10_PORT_BASE: UInt32 = 0x40020000
+    public static let CONNECTOR_ARDUINO_D10_PIN: UInt32 = 8
+    public static let CONNECTOR_ARDUINO_D10_MASK: UInt32 = 0x100
+    public static let CONNECTOR_ARDUINO_D11_PORT_BASE: UInt32 = 0x40020400
+    public static let CONNECTOR_ARDUINO_D11_PIN: UInt32 = 15
+    public static let CONNECTOR_ARDUINO_D11_MASK: UInt32 = 0x8000
+    public static let CONNECTOR_ARDUINO_D12_PORT_BASE: UInt32 = 0x40020400
+    public static let CONNECTOR_ARDUINO_D12_PIN: UInt32 = 14
+    public static let CONNECTOR_ARDUINO_D12_MASK: UInt32 = 0x4000
+    public static let CONNECTOR_ARDUINO_D13_PORT_BASE: UInt32 = 0x40022000
+    public static let CONNECTOR_ARDUINO_D13_PIN: UInt32 = 1
+    public static let CONNECTOR_ARDUINO_D13_MASK: UInt32 = 0x2
 }

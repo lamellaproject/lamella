@@ -40,6 +40,10 @@ pub enum LowerError {
     UnresolvedGlobal(String),
     /// A name-pool index was out of range.
     BadNameIndex(u32),
+    /// An op's `site` did not index the code object's `wide_operands` table. Unreachable for a code
+    /// object this crate built or the decoder produced -- both assign the index and the entry
+    /// together -- so it means the two were built by different passes.
+    BadOperandSite(u32),
     /// A function name was used as a plain operand (functions are not first-class
     /// values in the typed subset).
     CallableAsValue,
@@ -90,6 +94,9 @@ impl core::fmt::Display for LowerError {
                 write!(f, "global `{name}` is not a user function in this module")
             }
             LowerError::BadNameIndex(i) => write!(f, "name index {i} out of range"),
+            LowerError::BadOperandSite(i) => {
+                write!(f, "operand site {i} out of range")
+            }
             LowerError::CallableAsValue => {
                 f.write_str("a function name was used as a plain value")
             }
@@ -1967,7 +1974,11 @@ fn lower_op(
             };
             stack.push(StackEntry::Value(id, MirType::I32));
         }
-        bc::Op::LoadAttr { name, cache } => {
+        bc::Op::LoadAttr { site } => {
+            let [name, cache] = co
+                .wide_operands
+                .get(*site as usize)
+                .ok_or(LowerError::BadOperandSite(*site))?;
             let (obj, _ot) = pop_value(stack)?;
             if matches!(arrays.get(&obj).map(|info| info.kind), Some(SeqKind::GrowList))
                 && co.names.get(*name as usize).is_some_and(|n| n == "append")
@@ -2561,7 +2572,11 @@ fn lower_op(
                 }
             }
         }
-        bc::Op::CallKw { argc, kwnames } => {
+        bc::Op::CallKw { site } => {
+            let [argc, kwnames] = co
+                .wide_operands
+                .get(*site as usize)
+                .ok_or(LowerError::BadOperandSite(*site))?;
             let argc = *argc as usize;
             let names: &[String] = match co.consts.get(*kwnames as usize) {
                 Some(bc::Const::KwNames(names)) => names,
@@ -2686,10 +2701,21 @@ fn module_constants(body: &bc::CodeObject) -> BTreeMap<String, i32> {
 /// Lower every function of a compiled module, returning each `(name, Function)`.
 /// The `<module>` body is not lowered in the typed path: the parity harness drives
 /// the call boundary.
+///
+/// **`Ok` IS NOT "THIS PROGRAM REACHES THE TYPED LANE".** A module with no `def` at all -- an
+/// ordinary dynamic script -- has no function to lower and returns `Ok(vec![])`, which is a truthful
+/// answer to the question this asks and a badly misleading one to the question a caller usually
+/// means. Measured on the 443-row corpus: **51 rows lower "successfully" with ZERO functions**, and
+/// a first pass at counting AOT coverage read every one of them as covered.
+///
+/// **The AOT lane's real entry condition is a lowered function named `main`**, which is what
+/// `--example diff-run` requires and what `--example lower-probe` reports separately from the count.
+/// A caller asking "can this be AOT-compiled" must check what came back, not merely that something
+/// did.
 pub fn lower_module(module: &bc::Module) -> Result<Vec<(String, Function)>, LowerError> {
     let funcs: BTreeMap<String, FuncSig> = module
         .functions
-        .iter()
+        .iter_bodies()
         .enumerate()
         .map(|(i, co)| {
             (co.name.clone(), FuncSig {
@@ -2704,7 +2730,7 @@ pub fn lower_module(module: &bc::Module) -> Result<Vec<(String, Function)>, Lowe
     let constants = module_constants(&module.body);
     module
         .functions
-        .iter()
+        .iter_bodies()
         .map(|co| Ok((co.name.clone(), lower_function(co, &funcs, &constants)?)))
         .collect()
 }

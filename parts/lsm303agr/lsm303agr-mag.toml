@@ -1,0 +1,143 @@
+# PART: the MAGNETOMETER half of an ST LSM303AGR.
+#
+# The second of two independent bus residents in one package. It answers a different address, a
+# different identity register and a disjoint range of the shared register map.
+
+[table]
+kind = "device"
+family = "lsm303agr"
+part = "lsm303agr-mag"
+base = "lsm303agr"
+sources = [
+    "ST LSM303AGR datasheet DocID027765 Rev 11: register address map ch 8 table 26 (the 0x45 to 0x6F range), WHO_AM_I_M ch 8.38, the magnetic sensor slave address and SAD + read/write patterns ch 6.1 table 25.",
+]
+notes = [
+    "Board truth names this half `lsm303agr-mag`, and this table uses the same name.",
+    "The register map prints OUTY_H_REG_M with hex 6B and binary 01101010, which is 0x6A and is the byte printed for OUTY_L_REG_M directly above it. The hex column is consistent with the surrounding sequence and with the six output registers being contiguous, so the binary is a document defect and the address carried here is 0x6B.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own datasheet.
+#
+# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates and their codes, the operating
+# and power modes, the offset cancellation and low-pass filter settings, the interrupt block, the
+# self-test, and the sensitivity a raw count represents. All are in the datasheet, none transcribed.
+#
+# Identified, and no further: a physical part has answered the identity register below against a
+# negative control. No magnetic field has been measured through this table.
+
+[sourcing]
+facts = "primary"
+validation = "identified"
+evidence = "A physical part answered the identity register on a Raspberry Pi Pico 2, over I2C0 at 100 kHz, on a breakout reached through a four-wire cable: register 0x4F read 0x40 at address 0x1E, the single value this table accepts at the single address it states, repeated across five consecutive passes with 0 faulted of 112 addresses walked in each. THE NEGATIVE CONTROL RAN AT THE SAME ADDRESS ON THE SAME REGISTER: with the module unplugged, the identical read ABORTED in four consecutive passes, during which nothing answered anywhere on the bus and 0 of 112 addresses were faulted. A SECOND CONTROL CAME FREE AND IT TESTS THIS FAMILY'S WHOLE MODEL: the accelerometer half of the same package was checked in the same passes at ITS address and ITS register, 0x0F at 0x19, and answered its own value and not this one -- so the two halves are separated by different registers at different addresses on silicon and not merely on paper, which is the claim that made this package two parts rather than one with a plural address. EVERY NUMBER IN THE CHECK -- the address, the register and the accepted value -- was taken from this table's own emitted artifact by a bench program that includes it, so what was tested is the row that ships and not a copy of it."
+
+# --- identity ------------------------------------------------------------------------------------
+#
+# A DIFFERENT REGISTER FROM THE OTHER HALF'S, not merely a different value in the same one -- which
+# is what makes the two halves two parts rather than one part with two identities. Reading 0x0F on
+# this address reaches a reserved register, and reading 0x4F on the accelerometer's address reaches
+# a different reserved register.
+
+[identity]
+reg = 0x4F
+width = 8
+values = [0x40]
+notes = "WHO_AM_I_M, reset value 01000000. The accelerometer half of the same package answers 0x33 at register 0x0F."
+
+# --- address: FIXED, with no strap -----------------------------------------------------------------
+
+[address]
+bus = "i2c"
+base = 0x1E
+notes = "The datasheet states the magnetic sensor slave address is 0011110b, described as the default factory setting, and describes no pin that alters it. The composed bytes 0x3D for a read and 0x3C for a write are that address with the direction bit appended and are NOT addresses in their own right."
+
+# --- registers -------------------------------------------------------------------------------------
+
+[registers.who_am_i_m]
+reg = 0x4F
+width = 8
+access = "read-only"
+fields = { who_am_i = [0, 8] }
+
+# The hard-iron offset registers, six bytes from 0x45, low byte first per axis. These hold factory
+# calibration at boot; the datasheet's own warning about boot-loaded registers applies.
+[registers.offset_x_m]
+reg = 0x45
+width = 16
+access = "read-write"
+fields = { offset_x_l = [0, 8], offset_x_h = [8, 8] }
+
+[registers.offset_y_m]
+reg = 0x47
+width = 16
+access = "read-write"
+fields = { offset_y_l = [0, 8], offset_y_h = [8, 8] }
+
+[registers.offset_z_m]
+reg = 0x49
+width = 16
+access = "read-write"
+fields = { offset_z_l = [0, 8], offset_z_h = [8, 8] }
+
+[registers.cfg_reg_a_m]
+reg = 0x60
+width = 8
+access = "read-write"
+notes = "Reset value 00000011. The mode field comes up at 11, which is idle -- so this half takes no measurement until a mode is written, the same shape as the accelerometer's rate field."
+
+[registers.cfg_reg_b_m]
+reg = 0x61
+width = 8
+access = "read-write"
+
+[registers.cfg_reg_c_m]
+reg = 0x62
+width = 8
+access = "read-write"
+
+[registers.int_ctrl_reg_m]
+reg = 0x63
+width = 8
+access = "read-write"
+notes = "Reset value 11100000, the only register in this half whose reset state is not zero apart from the configuration register above. The datasheet's map spells this INT_CRTL_REG_M, transposing two letters; the name carried here is the one its own interrupt chapter uses."
+
+[registers.int_source_reg_m]
+reg = 0x64
+width = 8
+access = "read-only"
+
+[registers.int_ths_m]
+reg = 0x65
+width = 16
+access = "read-write"
+fields = { int_ths_l = [0, 8], int_ths_h = [8, 8] }
+
+[registers.status_reg_m]
+reg = 0x67
+width = 8
+access = "read-only"
+notes = "Data-ready and overrun flags for the magnetic outputs."
+
+[registers.outx_m]
+reg = 0x68
+width = 16
+access = "read-only"
+fields = { outx_l = [0, 8], outx_h = [8, 8] }
+notes = "Low byte first at 0x68 and 0x69. The six output bytes are contiguous from 0x68 to 0x6D, so one burst covers all three axes -- with the auto-increment bit the family base describes."
+
+[registers.outy_m]
+reg = 0x6A
+width = 16
+access = "read-only"
+fields = { outy_l = [0, 8], outy_h = [8, 8] }
+
+[registers.outz_m]
+reg = 0x6C
+width = 16
+access = "read-only"
+fields = { outz_l = [0, 8], outz_h = [8, 8] }
+
+[measurement]
+burst_length = 6
+resolution_bits = "16, as three signed 16-bit axes"

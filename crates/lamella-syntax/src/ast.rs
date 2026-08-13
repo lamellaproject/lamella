@@ -35,6 +35,21 @@ pub enum ExprKind {
     /// static member access such as `int.Parse`. Binding rejects it anywhere a
     /// value, rather than a type name, is required.
     PredefinedType(PredefinedType),
+    /// A CONSTRUCTED GENERIC TYPE in expression position: the left side of a static member
+    /// access such as `Box<int>.Count`.
+    ///
+    /// It is its own node rather than an `Invocation` with no arguments because the `<` here is
+    /// ambiguous with a comparison and only the FOLLOWING token resolves it. The parser commits to
+    /// this reading when a `.` follows the closing `>`, which is one of the followers the
+    /// disambiguation rule names; `a < b > .c` is not a legal comparison, so nothing is taken away
+    /// from the operator parser by claiming it.
+    ConstructedType {
+        /// The type's name -- a simple name, or a member-access chain for a qualified one.
+        name: Box<Expr>,
+        /// The type arguments between the angle brackets. Never empty: `Box<>` is not a
+        /// type-argument list and the parser does not commit to one.
+        type_arguments: Vec<TypeRef>,
+    },
     /// The `this` access (14.5.7).
     This,
     /// A `base` access (14.5.8): valid only as `base.member` or `base[args]`.
@@ -55,6 +70,11 @@ pub enum ExprKind {
         receiver: Box<Expr>,
         /// The explicit type arguments at this call site -- the `int` of `Identity<int>(x)` --
         /// empty for an ordinary call and for one whose arguments are inferred.
+        ///
+        /// These belong to the CALL SITE, not to the method: `Identity<int>(a)` and
+        /// `Identity<string>(b)` are two sites over one declaration, and each emits its own
+        /// `MethodSpec`. A site that loses them still binds -- to the OPEN method, with `!!0`
+        /// unsubstituted -- so dropping this field is silent rather than a compile error.
         type_arguments: Vec<TypeRef>,
         /// The argument expressions, in order.
         arguments: Vec<Expr>,
@@ -120,6 +140,14 @@ pub enum ExprKind {
     /// A `sizeof` expression (unsafe, III.4.25): `sizeof ( type )`. Its value is the type's
     /// byte size; for a struct it is the `sizeof` opcode over the shared layout.
     SizeOf(TypeRef),
+    /// A `default` expression (C# 2.0): `default ( type )` -- the type's default value. `null` for
+    /// a reference type, zero for a numeric, and the all-zero value for a struct.
+    ///
+    /// **It is the only way to write the zero of a TYPE PARAMETER**, whose default is not
+    /// spellable otherwise: `T` may be closed over a reference type (where the answer is `null`)
+    /// or a value type (where it is not), so no literal covers both and the choice has to be made
+    /// where `T` is known.
+    DefaultValue(TypeRef),
     /// A `stackalloc` expression (unsafe): `stackalloc T [ count ]`. Allocates
     /// `count * sizeof(T)` bytes on the call stack and yields a `T*` to the start.
     StackAlloc {
@@ -258,11 +286,34 @@ pub enum TypeRefKind {
     /// A constructed generic type `A.B.C<T, U>` (C# 2.0; ECMA-334 4th ed 25.5): the definition's
     /// name parts in the same order [`TypeRefKind::Name`] carries them, and the type arguments in
     /// the order written. The arity is `arguments.len()`.
+    ///
+    /// `arguments` is never empty. A name with no argument list is a [`TypeRefKind::Name`], and
+    /// keeping the two apart is what lets `Box` and `Box<T>` be different types rather than one
+    /// type with a sometimes-empty list -- the arity is part of the identity (25.5.1), which is
+    /// also why the metadata spells it with a backtick.
     Generic {
         /// The generic definition's name parts in order.
         parts: Vec<Box<str>>,
         /// The type arguments, in declaration order; at least one.
         arguments: Vec<TypeRef>,
+    },
+    /// An UNBOUND generic type -- `List<>`, `Dictionary<,>` -- the generic definition named with a
+    /// `generic-dimension-specifier` in place of a type-argument list (ECMA-334 4th ed 14.5.11).
+    ///
+    /// **THE GRAMMAR ADMITS THIS IN ONE POSITION ONLY: THE OPERAND OF `typeof`.** `unbound-type-name`
+    /// appears in no other production, and 25.5 says so in terms -- *an unbound generic type can
+    /// only be used within a typeof-expression*. So the parser builds this from
+    /// [`Parser::parse_typeof_operand`](crate::parser::Parser) and nowhere else, which is why every
+    /// other type position still refuses `List<>` without having to say so itself.
+    ///
+    /// `arity` is the specifier's comma count PLUS ONE: `<>` is 1, `<,>` is 2. It is never 0 --
+    /// a name carrying no specifier at all is a [`TypeRefKind::Name`], which is 14.5.11's own
+    /// tie-break for a token sequence that satisfies both grammars.
+    Unbound {
+        /// The generic definition's name parts in order, as [`TypeRefKind::Name`] carries them.
+        parts: Vec<Box<str>>,
+        /// How many type parameters the definition takes; at least one.
+        arity: usize,
     },
     /// An array type (12.1): an element type and the rank (dimension count) of
     /// this array. `int[][]` nests an `Array` whose element is another `Array`.
@@ -598,6 +649,10 @@ pub enum MemberInitializerValue {
     /// `F = expr` -- an ordinary assignment.
     Expression(Expr),
     /// `F = { ... }` -- a NESTED initializer.
+    ///
+    /// **This does NOT construct anything.** `new C { F = { G = 1 } }` assigns into the object
+    /// `F` ALREADY refers to, so a null `F` is a run-time failure rather than a fresh `D`. Reading
+    /// it as an implicit `new` is the natural mistake and it is the opposite of what it does.
     Nested(Initializer),
 }
 
@@ -686,6 +741,7 @@ pub struct DelegateDecl {
     pub span: Span,
 }
 
+
 /// A `namespace` declaration (16.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceDecl {
@@ -724,6 +780,9 @@ pub struct TypeDecl {
     pub type_parameters: Vec<TypeParameter>,
     /// The base class and/or interfaces listed after `:`.
     pub bases: Vec<TypeRef>,
+    /// The `where` clauses written after the base list (25.7). Empty for an ordinary type, and
+    /// empty for a generic type that constrains nothing.
+    pub constraints: Vec<TypeParameterConstraintClause>,
     /// The type's members.
     pub members: Vec<Member>,
     /// The byte range the declaration covers.
@@ -732,15 +791,66 @@ pub struct TypeDecl {
 
 /// One declared type parameter (C# 2.0): the `T` in `class Box<T>` or `T M<T>(T)`.
 ///
-/// The name is the whole of it today. Constraints (`where T : IComparable`) are a separate clause
-/// that follows the parameter LIST rather than the parameter, so they are not a field here; they
-/// arrive with the constraint work and belong beside the declaration that carries them.
+/// The name is the whole of it. Constraints (`where T : IComparable`) are a separate clause that
+/// follows the parameter LIST rather than the parameter, so they are not a field here; they live
+/// on the declaration as [`TypeParameterConstraintClause`], which is the shape the grammar has
+/// (25.7) and the shape that lets a clause name a parameter that was never declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeParameter {
     /// The parameter's name.
     pub name: Box<str>,
     /// The byte range the name covers.
     pub span: Span,
+}
+
+/// One `where` clause (C# 2.0; ECMA-334 4th ed 25.7): `where T : class, IComparable, new()`.
+///
+/// **A clause names its parameter rather than being positional**, which is why this is a list on
+/// the declaration and not a field on [`TypeParameter`]: the grammar permits clauses in any order,
+/// permits a parameter to have none, and permits a clause to name an identifier that is not a type
+/// parameter at all (CS0699). Binding it positionally would make that last case unrepresentable and
+/// so unreportable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeParameterConstraintClause {
+    /// The type parameter the clause constrains -- the `T` in `where T : class`.
+    pub parameter: Box<str>,
+    /// The byte range the parameter name covers, which is where CS0699 points.
+    pub parameter_span: Span,
+    /// The constraints, in the order written. The order is not free in the language (a `class` or
+    /// `struct` constraint must come first and `new()` last), so preserving it is what lets the
+    /// binder report CS0401/CS0449 rather than silently accepting a reordering.
+    pub constraints: Vec<TypeParameterConstraint>,
+    /// The byte range the whole clause covers, from `where` through the last constraint.
+    pub span: Span,
+}
+
+/// One constraint inside a [`TypeParameterConstraintClause`] (25.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeParameterConstraint {
+    /// `class` -- the reference-type constraint. Metadata flag `0x0004`.
+    ReferenceType(Span),
+    /// `struct` -- the non-nullable value-type constraint. Metadata flag `0x0008`, and it implies
+    /// `0x0010`: every value type has a parameterless constructor, so `struct` subsumes `new()`,
+    /// which is why writing both is CS0451 rather than a redundancy.
+    ValueType(Span),
+    /// `new()` -- the constructor constraint. Metadata flag `0x0010`.
+    DefaultConstructor(Span),
+    /// A named class, interface, or type parameter constraint. Unlike the three above this is a
+    /// real type reference and becomes a `GenericParamConstraint` row rather than a flag bit.
+    Type(TypeRef),
+}
+
+impl TypeParameterConstraint {
+    /// The byte range the constraint covers.
+    #[must_use]
+    pub fn span(&self) -> Span {
+        match self {
+            TypeParameterConstraint::ReferenceType(span)
+            | TypeParameterConstraint::ValueType(span)
+            | TypeParameterConstraint::DefaultConstructor(span) => *span,
+            TypeParameterConstraint::Type(reference) => reference.span,
+        }
+    }
 }
 
 /// Which kind of type a [`TypeDecl`] declares.
@@ -827,13 +937,16 @@ pub enum Member {
         /// enclosing type declares -- the distinction the metadata encoding spells `!!0` against
         /// `!0`.
         type_parameters: Vec<TypeParameter>,
+        /// The `where` clauses written after the parameter list (25.7). Empty for an ordinary
+        /// method.
+        constraints: Vec<TypeParameterConstraintClause>,
         /// The formal parameters.
         parameters: Vec<Parameter>,
         /// Whether the parameter list ends with csc's `__arglist` marker (parsed only under
         /// the typedref knob): the method takes variable arguments via the CLI vararg calling
         /// convention, beyond `parameters`.
         is_vararg: bool,
-        /// The method body, or `None` if it was a bare `;`.
+        /// The method body, or `None` for a bare `;`.
         body: Option<Stmt>,
         /// For an explicit interface member implementation (20.4.1), the interface
         /// the method implements -- the part before the final dot of a qualified
@@ -1170,7 +1283,7 @@ pub enum ConstructorInitializerKind {
 pub struct Accessor {
     /// The attributes on the accessor itself (17.6.2 accessor-declarations).
     pub attributes: Vec<AttributeSection>,
-    /// The accessor body, or `None` if it was a bare `;`.
+    /// The accessor body, or `None` for a bare `;`.
     pub body: Option<Stmt>,
     /// The byte range the accessor covers.
     pub span: Span,

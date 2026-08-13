@@ -83,5 +83,10 @@ lamella-assemble = { path = "../lamella-assemble" }
 # the StorageProvider seam -- the host twin of sam4s's device SD boot-mount.
 lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }
 
+# Measures how many images a repeatedly-served board retains, so it needs the path that serves
+# them. Declared rather than left to auto-discovery: without this, a build that does not select
+# `baked-image` still tries to compile the target and fails on imports that are gated out -- and
+# `required-features` is the one mechanism that turns "this suite silently ran nothing" into a
+# hard error rather than a green with no tests behind it.
 [lints]
 workspace = true

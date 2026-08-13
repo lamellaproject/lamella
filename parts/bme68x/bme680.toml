@@ -1,0 +1,152 @@
+# PART: Bosch BME680 temperature, pressure, humidity and gas sensor.
+#
+# The older of the two members. It holds ONE set of measurement results and offers two operating
+# modes, where its sibling holds three sets and offers three.
+#
+# WHAT A READER SHOULD TAKE FROM THIS FILE BEFORE ANY OTHER FACT IN IT: the identity value below is
+# the SAME value the BME688 answers, at the same register, in the same two-address range. The
+# identity register narrows a reading to this family and cannot go further, so nothing that
+# distinguishes this part from its sibling can be established by reading it.
+
+[table]
+kind = "device"
+family = "bme68x"
+part = "bme680"
+base = "bme68x"
+sources = [
+    "Bosch BST-BME680-DS001 rev 1.9 (February 2024): memory map ch 5.2 table 20, identity register ch 5.3.1.6, gas control registers ch 5.3.3, measurement data registers ch 5.3.4, operation modes ch 3.1 table 10.",
+]
+notes = [
+    "The datasheet describes exactly two operating modes, where the BME688's describes three.",
+    "THIS PART'S DATASHEET DESCRIBES NO REGISTER AT 0xF0. The BME688 carries a variant identifier there and answers 0x01 in it; the BME680 memory map has no row at that address and no section describes one. So what a physical BME680 returns from 0xF0 is not known from its own document, and it may be a reserved register, for which this datasheet states outright that no specific value is guaranteed on a read. NO REGISTER IS DECLARED HERE FOR IT, because declaring one would assert the very existence that is in question. A driver that separates the two parts by reading 0xF0 and treating anything other than 0x01 as a BME680 is resting on a value this part has never promised.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
+#
+# WHAT THIS TABLE DELIBERATELY DOES NOT STATE, so that a reader can tell a fact from a gap:
+#   - the temperature, pressure and humidity trimming parameters and their compensation arithmetic;
+#   - the gas resistance conversion and the heater resistance calculation, which turns a target
+#     heater temperature into a register code;
+#   - power figures, timing, and the measurement-duration table a non-blocking driver would need.
+# Each is present in the datasheet and none has been transcribed. Treat them as absent rather than
+# defaulted.
+#
+# Validation is `none`: no physical part of this type has answered anything. That is the honest
+# starting rank for a table written from a document, and it is what a reading is for.
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- identity: the value this part shares with its sibling ----------------------------------------
+#
+# One accepted value, and the datasheet documents no sample-revision alternatives for it.
+#
+# THE SET HAS ONE MEMBER AND STILL DOES NOT IDENTIFY THE PART. Everywhere else in this catalogue
+# the identity register answers the question the address could not; here it answers a strictly
+# smaller one. A reading of 0x61 at 0xD0 on an address in this range establishes that the part is a
+# BME680 OR a BME688, and no further read of this register will ever separate the two.
+
+[identity]
+reg = 0xD0
+width = 8
+values = [0x61]
+notes = "The BME688 answers this same value at this same register. What separates the two is a variant register the BME688 has and this part's datasheet does not describe."
+
+# --- the gas enable bit, which is NOT where the sibling puts it -----------------------------------
+#
+# THE SHARPEST DIFFERENCE IN THE FAMILY AND THE ONE WITH THE QUIETEST FAILURE. Both members put
+# this register at 0x71 and both spell the field `run_gas`. This part places it at bit 4 and the
+# BME688 places it at bit 5. The datasheets even give the two bits different names, `run_gas_l`
+# here and `run_gas_h` there, which is the vendor acknowledging the move.
+#
+# A driver that identified the part by its identity register -- the only discriminator this
+# catalogue models -- would enable the wrong bit on one of the two. Nothing reports an error: the
+# gas conversion simply never runs, and the gas result reads as an unset measurement.
+
+[registers.ctrl_gas_1]
+reg = 0x71
+width = 8
+access = "read-write"
+fields = { nb_conv = [0, 4], run_gas = [4, 1] }
+notes = "Gas conversions are started only in an appropriate mode and only when run_gas is 1. In forced mode nb_conv selects which of the ten stored heater set-points is used, indexed from zero."
+
+# --- the heater profile arrays --------------------------------------------------------------------
+#
+# Ten set-points, each held in three parallel arrays of ten single-byte registers. The schema has no
+# array-of-registers shape, so each array states its FIRST element and the note states the stride
+# and the count. The registers ascend with the index.
+
+[registers.idac_heat_0]
+reg = 0x50
+width = 8
+access = "read-write"
+fields = { idac_heat = [0, 8] }
+notes = "The first of ten, idac_heat_0 through idac_heat_9 at 0x50 through 0x59, one byte each, ascending with the index. Holds an optional initial heater current."
+
+[registers.res_heat_0]
+reg = 0x5A
+width = 8
+access = "read-write"
+fields = { res_heat = [0, 8] }
+notes = "The first of ten, res_heat_0 through res_heat_9 at 0x5A through 0x63, one byte each, ascending with the index. Holds the target heater resistance as a register code. The conversion from a heater temperature to that code is NOT transcribed in this table."
+
+[registers.gas_wait_0]
+reg = 0x64
+width = 8
+access = "read-write"
+fields = { gas_wait = [0, 8] }
+notes = "The first of ten, gas_wait_0 through gas_wait_9 at 0x64 through 0x6D, one byte each, ascending with the index. Holds the heat-up duration."
+
+# --- the single field of measurement results -------------------------------------------------------
+#
+# One bank, at 0x1D through 0x2B, opening with its own status byte. The BME688 has three of these at
+# three different addresses, so not one register in this section is shared with it.
+
+[registers.meas_status_0]
+reg = 0x1D
+width = 8
+access = "read-only"
+fields = { gas_meas_index_0 = [0, 4], measuring = [5, 1], gas_measuring = [6, 1], new_data_0 = [7, 1] }
+notes = "Opens the field. new_data_0 marks a completed conversion, so a polled driver reads this byte as the first of the burst rather than as a separate transaction."
+
+[registers.press]
+reg = 0x1F
+width = 24
+access = "read-only"
+fields = { press_xlsb = [4, 4], press_lsb = [8, 8], press_msb = [16, 8] }
+notes = "20 bits, MSB first, left justified: the value is (msb << 12) | (lsb << 4) | (xlsb >> 4)."
+
+[registers.temp]
+reg = 0x22
+width = 24
+access = "read-only"
+fields = { temp_xlsb = [4, 4], temp_lsb = [8, 8], temp_msb = [16, 8] }
+notes = "20 bits, MSB first, left justified, decoded like press."
+
+[registers.hum]
+reg = 0x25
+width = 16
+access = "read-only"
+fields = { hum_lsb = [0, 8], hum_msb = [8, 8] }
+notes = "16 bits, MSB first: (msb << 8) | lsb. Unlike pressure and temperature it is not left justified."
+
+[registers.gas_r]
+reg = 0x2A
+width = 16
+access = "read-only"
+fields = { gas_range_r = [0, 4], heat_stab_r = [4, 1], gas_valid_r = [5, 1], gas_r = [6, 10] }
+notes = "10 bits of gas ADC reading packed above four bits of range and two status bits. A reading whose gas_valid_r is 0 has not been measured, and one whose heat_stab_r is 0 was taken before the heater settled -- neither is reported as an error by anything else."
+
+# --- modes: two, where the sibling has three --------------------------------------------------------
+
+[enums.mode]
+sleep = 0
+forced = 1
+notes = "The datasheet's operating-mode table lists exactly these two. Forced performs a single temperature, pressure, humidity and gas cycle and returns to sleep, which is the mode a polled driver uses. The BME688 adds a third code at this same field, so a shared encoding across the family would offer this part a mode its own document does not describe."
+
+[measurement]
+burst_length = 15
+resolution_bits = "20 for temperature and pressure, 16 for humidity, 10 for the gas reading"

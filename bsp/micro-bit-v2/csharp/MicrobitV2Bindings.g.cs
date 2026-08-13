@@ -25,6 +25,8 @@ namespace Lamella.Generated
 
         public const uint LSM303AGR_ADDRESS = 0x19;
         public const uint LSM303AGR_MAG_ADDRESS = 0x1E;
+        public const uint INTERFACE_MGMT_ADDRESS = 0x70;
+        public const uint INTERFACE_STORAGE_ADDRESS = 0x72;
         public const uint DISPLAY_ROW1_PORT_BASE = 0x50000000;
         public const uint DISPLAY_ROW1_PIN = 21;
         public const uint DISPLAY_ROW1_MASK = 0x200000;

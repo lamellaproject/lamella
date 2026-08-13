@@ -98,4 +98,25 @@ public sealed class Rp2350GpioDriver : GpioDriver
     {
         Mmio.Write32(_sioOutXor, 1u << pinNumber);
     }
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void AddCallbackForPinValueChangedEvent(
+        int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("RP2350 pin-change events are not implemented");
+#else
+        throw new System.Exception("RP2350 pin-change events are not implemented");
+#endif
+    }
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void RemoveCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("RP2350 pin-change events are not implemented");
+#else
+        throw new System.Exception("RP2350 pin-change events are not implemented");
+#endif
+    }
 }

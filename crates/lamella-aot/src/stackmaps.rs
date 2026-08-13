@@ -48,13 +48,15 @@ pub const STACKMAP_KIND_TAGGED: u16 = 3;
 
 /// The sentinel `ValueType` layout handle marking a one-word ObjectRef CELL: an ADDRESS-taken
 /// reference local, memory-homed so `&local` is a real pointer (a `ref`/`out` reference parameter),
-/// whose word is STILL enumerated as an `ObjectRef` GC root. A reference stored in a bare value-type
-/// cell is invisible to the type-keyed root walk (both the entry zero-init and `method_record_roots`
-/// key on `is_gc_reference()`), so the sentinel lets those two predicates recognize the cell and
-/// treat its word as an object reference. Chosen outside the metadata-token space (no type token is
-/// `0xFFFF_FFFF` -- the table is the high byte, `0x00..=0x2B`) and distinct from a plain scalar
-/// cell's `TypeHandle(0)`. A stack cell never gets a descriptor, so the handle is never looked up for
-/// layout -- `InitStruct`/`FieldLoad`/`FieldStore`/`FieldAddr` are all size/offset-based.
+/// whose word is STILL enumerated as an `ObjectRef` GC root.
+///
+/// **THE SENTINEL IS AN IDENTITY, NOT A SIGNAL.** What a slot contributes to the collector is
+/// answered by [`slot_roots`], where a ref cell is not a special case at all -- it is the ordinary
+/// trace map `RefWords::at_word(0)`. All this handle marks is that the cell is not any metadata
+/// type. It is chosen outside the metadata-token space (no type token is `0xFFFF_FFFF` -- the table
+/// is the high byte, `0x00..=0x2B`) and distinct from a plain scalar cell's `TypeHandle(0)`. A stack
+/// cell never gets a descriptor, so the handle is never looked up for layout --
+/// `InitStruct`/`FieldLoad`/`FieldStore`/`FieldAddr` are all size/offset-based.
 pub(crate) const REF_CELL_HANDLE: lamella_ir::TypeHandle = lamella_ir::TypeHandle(0xFFFF_FFFF);
 
 /// The sentinel `ValueType` layout handle marking a frame-materialized EXCEPTION OBJECT cell: the
@@ -73,9 +75,51 @@ pub(crate) const EXCEPTION_CELL_HANDLE: lamella_ir::TypeHandle =
     lamella_ir::TypeHandle(0xFFFF_FFFE);
 
 /// Whether `ty` is a [`REF_CELL_HANDLE`] reference cell -- a memory-homed reference local whose word
-/// the GC must trace as an object reference. Used by the entry zero-init and the root record builder.
+/// the GC must trace as an object reference.
+///
+/// **TEST-ONLY.** No emitter asks this question: the entry zero-init and the root record builder
+/// both go through [`slot_roots`], where a ref cell is not a special case but the ordinary value
+/// `RefWords::at_word(0)`. What this predicate serves is a test asserting that a memory-homed
+/// reference local really does take the sentinel handle -- a claim about the LOWERING, worth pinning
+/// independently of who reads the handle afterwards.
+#[cfg(test)]
 pub(crate) fn is_ref_cell(ty: MirType) -> bool {
     matches!(ty, MirType::ValueType { handle, .. } if handle == REF_CELL_HANDLE)
+}
+
+/// Every GC root one value's frame slot contributes, as `(byte offset from the slot base, kind)`.
+///
+/// **THE POINT OF THIS FUNCTION IS THAT TWO PLACES MUST AGREE AND USED TO AGREE BY CONVENTION.**
+/// The per-method record builder says which words the collector VISITS; the entry zero-init says
+/// which words are guaranteed to read null before anything writes them. A word in the first list and
+/// not the second is stack garbage traced -- and RELOCATED -- as a pointer; a word in neither is a
+/// live reference the collector never sees. Both backends had their own copy of the first rule and a
+/// differently-shaped copy of the second, welded by a comment saying "in LOCKSTEP".
+///
+/// A VALUE-TYPE cell contributes one root per reference word of its trace map, which is what makes a
+/// reference inside a struct local a root at all -- see [`MirType::ValueType`]'s `refs`. Both
+/// sentinel cells fall out of the same rule rather than needing an arm: a ref cell's map is word 0,
+/// an exception cell's is empty.
+pub(crate) fn slot_roots(ty: MirType, pinned: bool) -> impl Iterator<Item = (u32, u16)> {
+    let scalar = match ty {
+        MirType::ObjectRef if pinned => Some(STACKMAP_KIND_PINNED),
+        MirType::ObjectRef => Some(STACKMAP_KIND_OBJECT_REF),
+        MirType::ManagedPtr => Some(STACKMAP_KIND_MANAGED_PTR),
+        MirType::PyValue => Some(STACKMAP_KIND_TAGGED),
+        _ => None,
+    };
+    let interior = match ty {
+        MirType::ValueType { refs, .. } => Some(refs),
+        _ => None,
+    };
+    scalar
+        .map(|kind| (0u32, kind))
+        .into_iter()
+        .chain(
+            interior
+                .into_iter()
+                .flat_map(|refs| refs.offsets().map(|off| (off, STACKMAP_KIND_OBJECT_REF))),
+        )
 }
 
 /// The runtime-support seams a green thread can be switched away inside (or a collection can run

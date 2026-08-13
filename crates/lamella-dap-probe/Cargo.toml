@@ -1,0 +1,20 @@
+[package]
+name = "lamella-dap-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A DebugBackend over a debug probe: run control, registers, memory and hardware breakpoints over SWD."
+
+[dependencies]
+# The backend seam. A dependency-free leaf crate, so this backend reaches the DAP adapter
+# without linking the interpreter or the JSON layer.
+lamella-debug-backend = { path = "../lamella-debug-backend" }
+# TargetAccess -- the probe-neutral target surface. Depending on the trait crate rather than on a
+# probe is what makes one backend serve every probe family: an ST-Link implements TargetAccess
+# directly, and ArmDap implements it over any CMSIS-DAP adapter.
+lamella-probe-core = { path = "../lamella-probe-core" }
+
+[lints]
+workspace = true

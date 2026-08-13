@@ -9,3 +9,9 @@
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# CPython's bytecode cache. The bundled Python stdlib is SOURCE inside a crate, and validating a
+# module against CPython means running CPython over those very files -- which drops a __pycache__
+# beside them. It is build output of another interpreter and must never be committed.
+__pycache__/
+*.pyc

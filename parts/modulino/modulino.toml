@@ -1,0 +1,45 @@
+# PART FAMILY: the Arduino Modulino nodes whose I2C interface is FIRMWARE rather than silicon.
+#
+# THESE ARE NOT SENSORS WITH DATASHEETS. Each carries its own microcontroller running Arduino's
+# firmware, and what answers on the bus is that firmware. The register map is defined by a software
+# release, not by a part, and the vendor's own document publishes none -- so these tables record
+# what makes each node FINDABLE and stop there, deliberately.
+#
+# THREE MODULINO NODES ARE NOT IN THIS FAMILY, and the split is the point rather than an accident of
+# filing: Movement, Distance and Thermo carry ordinary sensors with their own manufacturers'
+# datasheets, so they are `parts/lsm6dsox`, `parts/vl53l4cd` and `parts/hs3xxx`. The Hub carries a
+# bus multiplexer with its own datasheet and is `parts/tca9548a`.
+#
+# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# deltas; the generator resolves the base and emits a fully flattened table per part.
+
+[table]
+kind = "device-base"
+family = "modulino"
+sources = [
+    "Arduino Modulino user manuals, section 7.5 'I2C Address Reference' in each: ABX00107 (Knob), ABX00108 (Buzzer), ABX00109 (Pixels), ABX00110 (Buttons), ABX00114 (Motors), ABX00130 (Vibro), ABX00135 (Joystick), ABX00152 (LED Matrix). Each states a default address, an editable-address note, and a second 'Hardware I2C Address' column.",
+]
+notes = [
+    "Each node runs its own microcontroller as an I2C target. The bus sees that firmware, so the interface is a property of a software release rather than of a part, and a firmware update can change it without any part number changing.",
+    "EVERY ONE OF THESE ADDRESSES IS SOFTWARE-ASSIGNABLE. The manuals say so in the same words -- any custom address via firmware or library configuration -- and several provide a blank silk rectangle for writing the new one on the board. So a documented address is a factory DEFAULT and never a property a program may rely on; what a given unit answers at is a property of whatever configured it last.",
+    "THE MANUALS PRINT TWO ADDRESS COLUMNS AND THE HEADLINE ONE IS NOT THE BUS ADDRESS. The column named for the product gives the 8-bit form -- the 7-bit address shifted up with the read/write bit appended -- and a second column headed 'Hardware I2C Address' gives the 7-bit form a bus scan sees. Arduino's Buttons manual says so outright: the hardware address 'might be seen by advanced scanners, but you should use 0x7C in your code'. A value taken from the headline column and written into a 7-bit field addresses a different device or nothing at all.",
+]
+
+# --- the bus -------------------------------------------------------------------------------------
+#
+# NO READ PROTOCOL IS NAMED, and that is the honest state rather than an oversight. The manuals
+# document an address and nothing about how to talk to the node: no register map, no command set, no
+# transfer shape. Naming a protocol here would state something no document supports.
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+
+# --- identity: THERE IS NONE -----------------------------------------------------------------------
+#
+# Inherited by every member. A node's firmware may well answer something at some register, but no
+# vendor document states one, so nothing here can say which part answered an address.
+
+[identity]
+absent = "These nodes run vendor firmware as an I2C target and Arduino's manuals document no identity register for any of them: no WHO_AM_I, no device id, no part id. Nothing on the bus can confirm WHICH node answered an address -- and because every address here is software-assignable, an address is not evidence of type either. Presence and type can be established only by exercising the node."

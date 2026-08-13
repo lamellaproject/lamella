@@ -44,6 +44,9 @@ pub struct Frame {
     /// Local slots that must be PINNED in the signature -- a `fixed` statement's array
     /// holder, so the GC does not move the array while a pointer into it is live.
     pinned: RefCell<BTreeSet<u16>>,
+    /// The DECLARING TYPE's own type-parameter names, in declaration order, so emission can turn
+    /// a `T` into the `!n` a token spells it with. Empty for a method of a non-generic type.
+    type_parameters: Vec<Box<str>>,
 }
 
 impl Frame {
@@ -60,6 +63,7 @@ impl Frame {
     pub fn build(
         parameters: &[Box<str>],
         byref_params: &[(Box<str>, TypeSymbol)],
+        type_parameters: &[Box<str>],
         body: &BoundStmt,
         arg_base: u16,
     ) -> Frame {
@@ -72,8 +76,24 @@ impl Frame {
         for (name, ty) in byref_params {
             frame.byref_types.insert(name.clone(), ty.clone());
         }
+        frame.type_parameters = type_parameters.to_vec();
         frame.collect_locals(body);
         frame
+    }
+
+    /// The POSITION of `name` in the declaring type's parameter list -- the `n` of the `!n` a
+    /// metadata token spells it with (II.23.1.16) -- or `None` when the name is not one.
+    ///
+    /// **THIS IS THE ONE PLACE EMISSION TURNS A NAME INTO A NUMBER.** The binder works by name and
+    /// metadata numbers, and everywhere else that meeting happens in `open_type_sig` at signature
+    /// time. `default(T)` needs it at INSTRUCTION time too, because `initobj` takes a token and a
+    /// bare `T` has none -- deliberately, since minting one would invent a type called `T`.
+    #[must_use]
+    pub fn type_parameter_index(&self, name: &str) -> Option<u32> {
+        self.type_parameters
+            .iter()
+            .position(|parameter| &**parameter == name)
+            .map(|index| index as u32)
     }
 
     /// The slot a name occupies, if any.

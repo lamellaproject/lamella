@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -56,16 +57,23 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 ///
 /// Version 26 dropped [`Op::CallEx`]'s `argc`, which restated the length of the argument-tag list it
 /// already points at. The four wire bytes are incidental; what it buys is in memory, where an enum
-/// is as wide as its widest variant and this was the only one carrying three payload words.
+/// is as wide as its widest variant and a three-word payload sets that width.
 ///
 /// Version 27 gave a module a trailing length-prefixed DEBUG SECTION, empty in every artifact this
 /// build writes. It costs four bytes a module and buys the ability to add source positions later
-/// without moving this number -- see [`RESERVED_DEBUG_SECTION_LEN`], where the reasoning lives.
+/// without moving this number. It shipped EMPTY and now carries line tables, which is the
+/// reservation paying out rather than a second format change.
 pub const FORMAT_VERSION: u16 = 27;
 
-/// The feature-flag bits a module's header carries, declaring which language
-/// surface its bytecode assumes. A reader lacking a required feature rejects the
-/// artifact rather than mis-executing it.
+/// The capability bits an artifact's header carries: what its bytecode REQUIRES of the runtime that
+/// loads it. A reader that does not implement a required capability refuses the artifact by name
+/// rather than mis-executing it -- see [`SUPPORTED_FEATURES`] and [`DecodeError::UnsupportedFeatures`].
+///
+/// A bit means "the reader must implement this to run me", never "the writer had this turned on".
+/// An artifact that requires NOTHING declares zero and stays loadable by any reader that understands
+/// the base format, however much older that reader is than the toolchain that wrote it. That is the
+/// property the mask exists for, and it is why this is a set of capabilities rather than a minimum
+/// version: a floor refuses artifacts an old reader could actually have run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FeatureFlags(pub u16);
 
@@ -78,6 +86,207 @@ impl FeatureFlags {
     #[must_use]
     pub fn contains(self, other: FeatureFlags) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// The bits set here that are absent from `supported`.
+    #[must_use]
+    pub fn missing_from(self, supported: FeatureFlags) -> FeatureFlags {
+        FeatureFlags(self.0 & !supported.0)
+    }
+
+    /// Whether no bits are set.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// The capabilities THIS build's reader implements. An artifact requiring anything outside this is
+/// refused.
+///
+/// Deliberately a separate constant from whatever a writer puts in a header, and they are not the
+/// same question even while they hold the same value: a toolchain that gains a capability raises what
+/// it may WRITE, a reader that gains one raises what it may READ, and the whole point of the mask is
+/// that those two move independently. Collapsing them into one constant is how a reader ends up
+/// claiming to support whatever it happens to emit.
+pub const SUPPORTED_FEATURES: FeatureFlags = FeatureFlags::FIRST_LIGHT;
+
+/// One capability an image either provides or does not -- the vocabulary a [`Profile`] is written in.
+///
+/// Each name here is a knob that EXISTS: a cargo feature on `lamella-py-runtime`, whose absence a
+/// running interpreter already answers by name. This enum does not invent capabilities; it lets a
+/// compiler be told about the ones the runtime already enforces, so a developer hears about them
+/// while typing instead of when the program runs.
+///
+/// Deliberately short. `bundled-stdlib` and the GC tier are real knobs and are ABSENT, because
+/// neither changes what the front end accepts or what an editor should offer -- one is the caller's
+/// import resolver and the other is invisible to the language. Minting a name before there is a
+/// consequence for it is what this lane argued against for [`FeatureFlags`]' bits, and the argument
+/// does not change because the enum is a different one. Adding a variant is additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Capability {
+    /// The `float` type and everything that produces one (`lamella-py-runtime`'s `float` feature).
+    /// Off is the no-float tier, where the interpreter answers `FloatUnavailable` by name.
+    Float,
+    /// The `complex` type, `1j` literals and complex arithmetic (the `complex` feature).
+    ///
+    /// A complex is a PAIR of `f64`, so it cannot outlive [`Capability::Float`] -- the cargo feature
+    /// says `complex = ["float"]` and [`Profile`] enforces the same implication.
+    Complex,
+    /// `dir()` and the per-type name lists it reports from (the `introspection` feature). Off, every
+    /// method stays callable and only the ASKING goes away, so this gates what an editor offers and
+    /// refuses nothing at compile time.
+    Introspection,
+}
+
+impl Capability {
+    /// Every capability, in declaration order.
+    ///
+    /// [`Profile::FULL`] is derived from this, so a variant missing HERE narrows the default
+    /// profile for every caller and narrows it silently. The guard below is what makes that a
+    /// compile error rather than a behavior change.
+    pub const ALL: &'static [Capability] =
+        &[Capability::Float, Capability::Complex, Capability::Introspection];
+
+    /// The name this capability is spelled with in a diagnostic and in the runtime's cargo manifest --
+    /// the SAME string in both, so a developer who reads "float is not available" in an editor can
+    /// find the knob that turned it off.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::Float => "float",
+            Capability::Complex => "complex",
+            Capability::Introspection => "introspection",
+        }
+    }
+
+    /// This capability's bit in a [`Profile`].
+    const fn bit(self) -> u16 {
+        match self {
+            Capability::Float => 0x0001,
+            Capability::Complex => 0x0002,
+            Capability::Introspection => 0x0004,
+        }
+    }
+}
+
+/// Ties [`Capability::ALL`]'s LENGTH to the variant list, which no test can do.
+///
+/// `ALL` is hand-written and [`Profile::FULL`] is derived from it, so a variant left out of `ALL`
+/// narrows the default profile while every runtime check agrees with the narrowed answer -- there
+/// is nothing for a test to disagree with. `as_str` and `bit` are exhaustive, so adding a variant
+/// does force two edits; `ALL` is the third, and nothing else forces it.
+///
+/// The match below is exhaustive too, so adding a variant fails to compile HERE, in the one place
+/// that also states the length the assertion checks.
+const fn _every_capability_is_in_all(capability: Capability) -> usize {
+    match capability {
+        Capability::Float => 0,
+        Capability::Complex => 1,
+        Capability::Introspection => 2,
+    }
+}
+const _: () = assert!(Capability::ALL.len() == 3, "a capability was added without extending ALL");
+
+impl core::fmt::Display for Capability {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What an image PROVIDES: the capability set a compiler is compiling against.
+///
+/// # The dual of [`FeatureFlags`], and why both exist
+///
+/// [`FeatureFlags`] travels ON an artifact and says what a runtime must implement to RUN it; it is
+/// checked at LOAD, on the device, after the compile is over. A `Profile` travels INTO a compile and
+/// says what the runtime will turn out to have; it is checked while there is still a source line to
+/// point at. Same subject, opposite directions, and neither substitutes for the other -- an
+/// `eval` on a device produces no artifact at all, so a capability list that could only describe
+/// artifacts would have nothing to check.
+///
+/// # Why a value rather than a cargo feature
+///
+/// The knobs are cargo features on the RUNTIME. One front-end build compiles for every profile --
+/// the same process serves a host and a device in the browser IDE -- so a `cfg!` in this crate could
+/// only ever describe the machine the compiler was built for. Worse, a front end compiled INTO a
+/// device image with a mismatched feature set would disagree with its own runtime silently, because
+/// nothing compares two build configurations. A value cannot drift from itself, and it can carry a
+/// profile that is not knowable when the compiler is built: one read from a BSP, or chosen at bake
+/// time.
+///
+/// # The invariant
+///
+/// A `Profile` cannot express an image that cannot be built. [`Capability::Complex`] requires
+/// [`Capability::Float`] in the cargo manifest, so dropping `float` here drops `complex` with it and
+/// adding `complex` adds `float`. Without that, a profile could say "no floats, but imaginary
+/// literals are fine" and the compiler would faithfully accept a program no image can run.
+///
+/// Matches the sibling C# front end's [`LanguageVersion::supports(Feature)`] shape -- a value asked
+/// a predicate -- so the two languages gate the same way rather than inventing two conventions.
+///
+/// [`LanguageVersion::supports(Feature)`]: https://docs.rs/lamella-syntax
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Profile(u16);
+
+impl Profile {
+    /// Every capability: a host, a browser, and any device image built with the runtime's default
+    /// features. The default, so a caller that has no profile to give compiles exactly as it did
+    /// before this type existed.
+    ///
+    /// DERIVED from [`Capability::ALL`] rather than written as a literal. `bit` and `as_str` are
+    /// exhaustive matches the compiler checks, so a new capability cannot skip them; a literal here
+    /// could be skipped, and the result would be a `FULL` that quietly means "every capability
+    /// except the newest" while its own documentation still says otherwise. That is the direction
+    /// that looks like it worked, so the fact is computed once rather than written twice.
+    pub const FULL: Profile = {
+        let mut bits = 0;
+        let mut index = 0;
+        while index < Capability::ALL.len() {
+            bits |= Capability::ALL[index].bit();
+            index += 1;
+        }
+        Profile(bits)
+    };
+
+    /// No optional capability at all -- the smallest tier, for building a profile up by name.
+    pub const BARE: Profile = Profile(0);
+
+    /// Whether this image provides `capability`.
+    #[must_use]
+    pub fn supports(self, capability: Capability) -> bool {
+        self.0 & capability.bit() != 0
+    }
+
+    /// This profile with `capability` added, plus anything it requires.
+    #[must_use]
+    pub fn with(self, capability: Capability) -> Profile {
+        let mut bits = self.0 | capability.bit();
+        if capability == Capability::Complex {
+            bits |= Capability::Float.bit();
+        }
+        Profile(bits)
+    }
+
+    /// This profile with `capability` removed, plus anything that requires it.
+    ///
+    /// Removing [`Capability::Float`] removes [`Capability::Complex`] too. The alternative is a
+    /// value describing an image nobody can build, and a compiler that then accepts `1j` for it.
+    #[must_use]
+    pub fn without(self, capability: Capability) -> Profile {
+        let mut bits = self.0 & !capability.bit();
+        if capability == Capability::Float {
+            bits &= !Capability::Complex.bit();
+        }
+        Profile(bits)
+    }
+
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Profile::FULL
     }
 }
 
@@ -92,7 +301,15 @@ impl FeatureFlags {
 /// no choice of Rust string type fixes that.
 ///
 /// The bytes are WTF-8, written by [`lamella_wtf8`] so this and the C# string tiers cannot drift in
-/// the byte form.
+/// the byte form. **Each code point is encoded INDEPENDENTLY -- a surrogate PAIR is NOT combined
+/// into the supplementary 4-byte form.** That combining is what makes C#'s tier WTF-8 rather than
+/// CESU-8 and is correct there, because a `System.String` is UTF-16 and a pair IS one character. In
+/// Python the same two surrogates are TWO characters, so combining them would change `len` and `ord`
+/// under a running program. This is the "generalized" form, and it is byte-for-byte what CPython's
+/// own `surrogatepass` produces.
+///
+/// **Text with no surrogate in it is byte-identical to UTF-8**, which is what makes [`Self::as_str`]
+/// answer `Some` for every string any ordinary program builds.
 #[derive(Debug, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub struct PyStr(Vec<u8>);
 
@@ -123,6 +340,11 @@ impl PyStr {
     }
 
     /// Append another string's code points -- adjacent-literal concatenation, `"ab" "cd"`.
+    ///
+    /// **Byte concatenation is correct here precisely BECAUSE pairs are not combined.** A high
+    /// surrogate ending one string and a low surrogate starting the next stay TWO characters, which
+    /// is what Python does; a pair-combining encoder would have to re-encode across the join, and
+    /// joining its output byte-wise would silently produce a different string than CPython's.
     pub fn append(&mut self, other: &PyStr) {
         self.0.extend_from_slice(&other.0);
     }
@@ -283,6 +505,7 @@ pub const EXCEPTION_HIERARCHY: &[(&str, &str)] = &[
     ("StopAsyncIteration", "Exception"),
     ("UnicodeError", "ValueError"),
     ("UnicodeEncodeError", "UnicodeError"),
+    ("BlockingIOError", "OSError"),
 ];
 
 /// The AOT exception TAG of a Python exception `name`: FNV-1a-32 over `"python." + name`, the high
@@ -481,10 +704,9 @@ pub enum Op {
     /// operation in first light, lowering to the `py_getattr` intrinsic. `cache` is
     /// this site's inline-cache slot (RAM side array; see [`CodeObject::cache_count`]).
     LoadAttr {
-        /// The attribute name's index into the code object's `names` pool.
-        name: u32,
-        /// This site's inline-cache slot, assigned by ascending static position.
-        cache: u32,
+        /// This site's entry in [`CodeObject::wide_operands`]: `[name, cache]`, where `name` indexes
+        /// the code object's `names` pool and `cache` is the inline-cache slot.
+        site: u32,
     },
     /// Pop the index then the container, and push `container[index]` (subscript),
     /// lowering to the `py_getitem` intrinsic. `cache` is this site's inline-cache slot.
@@ -567,8 +789,8 @@ pub enum Op {
     /// `__init_subclass__(cls, **kw)` needs to build its keyword arguments. `metaclass` is not among
     /// them, being outside this subset.
     ///
-    /// A class header WITHOUT keywords still emits the plain [`Op::BuildClass`], so nothing that
-    /// existed before this op changes shape.
+    /// A class header WITHOUT keywords still emits the plain [`Op::BuildClass`], so this op is
+    /// purely additive: no other class-header encoding changes shape.
     BuildClassKw {
         /// The index into `consts` of the [`Const::KwNames`] naming the keywords in order.
         kwnames: u32,
@@ -576,10 +798,8 @@ pub enum Op {
     /// Pop the object, then the value, and do `object.<names[name]> = value` (`cache` is the
     /// inline-cache slot). For an attribute assignment `obj.attr = value`.
     SetAttr {
-        /// The attribute name (index into the names pool).
-        name: u32,
-        /// The inline-cache slot.
-        cache: u32,
+        /// This site's entry in [`CodeObject::wide_operands`]: `[name, cache]`.
+        site: u32,
     },
     /// Pop a sequence and push its `count` elements in REVERSE, so following `StoreFast`s bind
     /// the first element first. A length mismatch raises `ValueError`. For tuple-unpacking
@@ -605,10 +825,9 @@ pub enum Op {
     /// LIST of the middle (`len - before - after` elements), then the `after` tail elements.
     /// Requires `len >= before + after`, else `ValueError`. For `a, *b = seq`.
     UnpackEx {
-        /// The number of targets before the star.
-        before: u32,
-        /// The number of targets after the star.
-        after: u32,
+        /// This site's entry in [`CodeObject::wide_operands`]: `[before, after]`, the target counts
+        /// either side of the star.
+        site: u32,
     },
     /// Pop the right operand then the left, and push `left <op> right`.
     Binary(BinOp),
@@ -639,10 +858,9 @@ pub enum Op {
     /// NAMES in the order their values were pushed. Pop them all plus the callable, bind by CPython's
     /// call rules, and push the result. [`Op::Call`] stays the positional-only fast path.
     CallKw {
-        /// The number of positional arguments (those below the keyword-argument values).
-        argc: u32,
-        /// The index into `consts` of the [`Const::KwNames`] naming the keyword arguments in order.
-        kwnames: u32,
+        /// This site's entry in [`CodeObject::wide_operands`]: `[argc, kwnames]`, the positional
+        /// count and the `Const::KwNames` index.
+        site: u32,
     },
     /// Pop a value and return it from the current function.
     Return,
@@ -664,6 +882,11 @@ pub enum Op {
     /// the runtime, and that call can FAIL (a full heap); the store that follows must then not
     /// happen, and skipping it needs a branch, and a branch needs a block boundary. Grow and store
     /// inside one op leave nowhere to put it -- so they are two ops, and this is the first.
+    ///
+    /// **It changes nothing observable and pushes nothing.** An engine whose lists manage their own
+    /// capacity has nothing to do here: the following `append` call is still the whole operation, and
+    /// this is a no-op for it. A mis-emitted one is therefore harmless rather than wrong, which is
+    /// what lets the compiler emit it from a static guess about the receiver's type.
     ListGrow {
         /// The local slot holding the list, which the following call appends to.
         list: u32,
@@ -693,12 +916,14 @@ pub enum Op {
     /// The argument COUNT is that tag list's length rather than a field of its own. It was once
     /// both, and the two could disagree -- a reader had to compare them and refuse a mismatch. Two
     /// spellings of one number is a state that can be malformed; one spelling cannot be.
+    ///
+    /// This is also the variant that sets the WIDTH OF EVERY OP. An enum is as wide as its
+    /// widest variant, so three `u32` payloads here cost four bytes on all of them -- and in a real
+    /// program this op is rare enough to be a rounding error while the ops it widened are not.
     CallEx {
-        /// The index into `consts` of the [`Const::ArgKinds`] tagging each argument slot. Its length
-        /// is the number of argument values on the stack.
-        kinds: u32,
-        /// The index into `consts` of the [`Const::KwNames`] naming the keyword-tagged slots.
-        kwnames: u32,
+        /// This site's entry in [`CodeObject::wide_operands`]: `[kinds, kwnames]`, the
+        /// [`Const::ArgKinds`] and [`Const::KwNames`] indices.
+        site: u32,
     },
     /// `del container[index]`. Pop the index, then the container, and delete the element (a step-1
     /// slice deletes a range). Pushes nothing.
@@ -803,6 +1028,34 @@ pub enum Const {
     Bytes(Vec<u8>),
 }
 
+impl Const {
+    /// The [`Capability`] an image must provide to MATERIALIZE this constant, or `None` for one every
+    /// image can hold.
+    ///
+    /// This is the whole refusal set a [`Profile`] gives a compiler, and it is deliberately expressed
+    /// on the CONSTANT rather than on the syntax that produced it: the front end refuses exactly what
+    /// it cannot ENCODE and nothing it merely cannot PREDICT, and what can be encoded is a property
+    /// of the constant pool. `1 / 3` is a float and is NOT here -- it can sit in
+    /// a branch that never runs, and a compiler that refuses it turns a working program into one that
+    /// will not build. The interpreter answers that case by name at the one choke point every
+    /// float-producing path passes.
+    #[must_use]
+    pub fn required_capability(&self) -> Option<Capability> {
+        match self {
+            Const::Float(_) => Some(Capability::Float),
+            Const::Imaginary(_) => Some(Capability::Complex),
+            Const::None
+            | Const::Bool(_)
+            | Const::Int(_)
+            | Const::Str(_)
+            | Const::ArgKinds(_)
+            | Const::KwNames(_)
+            | Const::BigInt(_)
+            | Const::Bytes(_) => None,
+        }
+    }
+}
+
 /// The first-light type lattice for an annotated value. Annotations (PEP 484), inert
 /// at runtime in CPython, are honored here at compile time as the contract that
 /// drives the typed fast path (the mypyc model). First light distinguishes only "a
@@ -875,6 +1128,66 @@ pub struct Param {
     pub ty: StaticType,
 }
 
+/// Encode one line per op into the run-length form [`CodeObject::line_table`] holds.
+///
+/// Returns an EMPTY table when every line is 0 -- which is what a build that tracked no positions
+/// produces, so such an artifact carries no line bytes at all rather than a table of zeroes.
+#[must_use]
+pub fn encode_line_table(lines: &[u32]) -> Vec<u8> {
+    if lines.iter().all(|&l| l == 0) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut previous: i64 = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let mut run = 1usize;
+        while index + run < lines.len() && lines[index + run] == line {
+            run += 1;
+        }
+        put_uvarint(&mut out, run as u64);
+        put_svarint(&mut out, i64::from(line) - previous);
+        previous = i64::from(line);
+        index += run;
+    }
+    out
+}
+
+fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn put_svarint(out: &mut Vec<u8>, value: i64) {
+    put_uvarint(out, ((value << 1) ^ (value >> 63)) as u64);
+}
+
+fn take_uvarint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*at)?;
+        *at += 1;
+        value |= u64::from(byte & 0x7f).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+fn take_svarint(bytes: &[u8], at: &mut usize) -> Option<i64> {
+    let raw = take_uvarint(bytes, at)?;
+    Some(((raw >> 1) as i64) ^ -((raw & 1) as i64))
+}
+
 /// A code object's identifiers, held as ONE text buffer plus a span per name rather than as a
 /// `Vec<String>` of separately allocated strings.
 ///
@@ -884,22 +1197,48 @@ pub struct Param {
 /// one of those names cost a 16-byte block plus a 12-byte `String` header on a 32-bit target, for a
 /// mean of nine bytes of text. Interning them collapses that to one block for the text and one for
 /// the spans.
+///
+/// The saving that matters is not only bytes. It is 296 fewer live allocations on that bundle, on a
+/// part whose whole RAM is 128 KiB, and allocation COUNT is what a segregated allocator charges for
+/// twice -- once in rounding and again in the fragmentation that outlives the block.
+///
+/// It reads like a `Vec<String>` on purpose: indexing yields `str`, so `&pool[i]` is a `&str` and the
+/// consumers that only ever read a name did not move when this replaced the `Vec`.
+///
+/// # Why each pool owns its own buffer
+///
+/// One shared buffer per MODULE, with every pool holding spans into it, is the obvious next step and
+/// it was measured rather than assumed: **85 fewer allocations and 304 bytes** on a bundle importing
+/// `asyncio`. It is not worth what it costs. Sharing needs the buffer behind an `Rc`, which takes
+/// `Send` off every bytecode type and the threading model needs it; equality has to become
+/// content-based, because the compiler's offsets and the decoder's differ for identical names; and
+/// the decoder grows a module-level buffer threaded through three signatures.
+///
+/// Freezing these two fields instead -- `Box` rather than `String`/`Vec` -- returned **2,752 bytes**
+/// on the same bundle for none of that, because a code object has FOUR pools and most of them are
+/// empty, so 176 of them pay for a capacity word they will never use. Nine times the bytes, no shared
+/// ownership, and the pool stays self-contained, which is what let another crate compile against
+/// interning without changing a line.
+///
+/// Recorded here rather than in a post so the next person to have the idea finds the number.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct NamePool {
     /// Every name's bytes, concatenated in index order.
-    text: String,
-    /// `(offset, length)` into `text`, one per name.
-    spans: Vec<(u32, u32)>,
+    ///
+    /// Boxed rather than a `String`, and that is worth four bytes per pool: a `String` carries a
+    /// CAPACITY it will never use again, because a pool is built once and then only read. Four
+    /// bytes sounds like nothing until you count the pools -- a code object has FOUR, most of them
+    /// empty, so a 44-code-object bundle carries 176 of them and pays for every one.
+    text: Box<str>,
+    /// `(offset, length)` into `text`, one per name. Boxed for the same reason.
+    spans: Box<[(u32, u32)]>,
 }
 
 impl NamePool {
     /// An empty pool, allocating nothing.
     #[must_use]
     pub fn new() -> NamePool {
-        NamePool {
-            text: String::new(),
-            spans: Vec::new(),
-        }
+        NamePool::default()
     }
 
     /// The number of names.
@@ -922,27 +1261,12 @@ impl NamePool {
             .get(offset as usize..offset as usize + length as usize)
     }
 
-    /// A pool sized for `names` names, so filling it does not grow the span table.
-    #[must_use]
-    pub fn with_capacity(names: usize) -> NamePool {
+    /// Freeze a built-up text buffer and span table into a pool, releasing the capacity both grew.
+    fn freeze(text: String, spans: Vec<(u32, u32)>) -> NamePool {
         NamePool {
-            text: String::new(),
-            spans: Vec::with_capacity(names),
+            text: text.into_boxed_str(),
+            spans: spans.into_boxed_slice(),
         }
-    }
-
-    /// Append `name`, returning its index.
-    pub fn push(&mut self, name: &str) -> usize {
-        let offset = self.text.len() as u32;
-        self.text.push_str(name);
-        self.spans.push((offset, name.len() as u32));
-        self.spans.len() - 1
-    }
-
-    /// Release any capacity beyond what the names actually occupy.
-    pub fn shrink_to_fit(&mut self) {
-        self.text.shrink_to_fit();
-        self.spans.shrink_to_fit();
     }
 
     /// The names in index order.
@@ -987,14 +1311,20 @@ impl core::fmt::Debug for NamePool {
 }
 
 impl<S: AsRef<str>> FromIterator<S> for NamePool {
+    /// The one way a pool is built. It fills a growable buffer and then FREEZES it, which is not
+    /// tidiness: `String` and `Vec` grow geometrically, so a pool filled name by name holds close to
+    /// twice the bytes its text needs -- and a decoded bundle keeps every pool for the whole
+    /// program, so that slack would be permanent rather than transient.
     fn from_iter<I: IntoIterator<Item = S>>(names: I) -> NamePool {
         let names = names.into_iter();
-        let mut pool = NamePool::with_capacity(names.size_hint().0);
+        let mut text = String::new();
+        let mut spans: Vec<(u32, u32)> = Vec::with_capacity(names.size_hint().0);
         for name in names {
-            pool.push(name.as_ref());
+            let name = name.as_ref();
+            spans.push((text.len() as u32, name.len() as u32));
+            text.push_str(name);
         }
-        pool.shrink_to_fit();
-        pool
+        NamePool::freeze(text, spans)
     }
 }
 
@@ -1004,6 +1334,31 @@ impl<'a> IntoIterator for &'a NamePool {
 
     fn into_iter(self) -> Self::IntoIter {
         alloc::boxed::Box::new(self.iter())
+    }
+}
+
+impl CodeObject {
+    /// The source line of the op at `index`, or `None` when this artifact carries no line
+    /// information -- which is the honest answer for an older build, not a guess of 0.
+    ///
+    /// Scans the run-length table from the start. That is deliberate: a traceback formats a handful
+    /// of frames once, on the way to reporting an error a program is already failing on, so the scan
+    /// is paid at the only moment anyone wants it. An index to make this O(log n) would cost RAM on
+    /// every program including the ones that never raise.
+    #[must_use]
+    pub fn line_for(&self, index: usize) -> Option<u32> {
+        let mut at = 0usize;
+        let mut line: i64 = 0;
+        let mut first = 0usize;
+        while at < self.line_table.len() {
+            let run = take_uvarint(&self.line_table, &mut at)? as usize;
+            line += take_svarint(&self.line_table, &mut at)?;
+            if index < first + run {
+                return u32::try_from(line).ok();
+            }
+            first += run;
+        }
+        None
     }
 }
 
@@ -1079,7 +1434,34 @@ pub struct CodeObject {
     /// already come from. A MODULE and a CLASS bind their own `__doc__` as a name instead, since
     /// both have a namespace to bind it into.
     pub doc: Option<String>,
+    /// The source line of each op, run-length encoded -- EMPTY when this artifact carries none.
+    ///
+    /// Held as BYTES and scanned on demand rather than decoded into a table, because that is what it
+    /// is for: nothing reads a line until an exception is being formatted. Decoding it into one entry
+    /// per run would cost roughly three times these bytes in RAM, permanently, for data a program
+    /// that never raises will never look at.
+    ///
+    /// The encoding is a sequence of `(run, delta)` pairs: `run` is how many consecutive ops share
+    /// the line, as an unsigned varint, and `delta` is the change from the previous line, zigzag
+    /// signed -- a line runs backwards as often as a loop does. Roughly four ops share an entry in
+    /// real code, which is what makes this about half a byte per op rather than four.
+    pub line_table: Vec<u8>,
     /// How many inline-cache slots a running frame allocates for this code: the count
+    /// The two-word operands of the ops too wide to carry them inline, one entry per such site.
+    ///
+    /// An enum is as wide as its widest variant, so a variant holding two `u32`s sets the size of
+    /// EVERY op in the array -- and the ops that pay for it are the common ones while the ones that
+    /// need it are not. Moving those payloads here leaves every variant at a single word, which took
+    /// `size_of::<Op>()` from 12 bytes to 8: on a bundle importing `asyncio` that is 1,263 ops and
+    /// about 5 KiB of device RAM, against a table of 136 entries.
+    ///
+    /// It is NOT on the wire. Each op still encodes its own pair inline exactly as before, and the
+    /// table is rebuilt while decoding -- so this costs no format version and no deployed artifact.
+    ///
+    /// The index is assigned in ascending static op order by whatever built the array, and the
+    /// decoder reproduces that by appending as it reads. Nothing else may reorder the ops without
+    /// rebuilding this alongside them.
+    pub wide_operands: Vec<[u32; 2]>,
     /// of cacheable sites (each [`Op::LoadAttr`]), numbered in ascending static order.
     pub cache_count: usize,
     /// The exception table: covering `[start, end)` op ranges mapped to a handler op
@@ -1102,6 +1484,134 @@ pub struct ExcEntry {
     pub depth: u32,
 }
 
+/// A module's function table, addressed by index and QUERYABLE BY NAME WITHOUT READING A BODY.
+///
+/// **The split between what this answers cheaply and what it answers by materialising is the whole
+/// reason it is a type rather than a `Vec`.** A module's functions are reached two ways and only one
+/// of them needs a body:
+///
+/// - **By NAME, to find out whether a function exists and at what index** -- resolving a global,
+///   building a module's namespace on import, and the front end's own "is there already a function
+///   called this" checks. [`Functions::names`], [`Functions::name`] and [`Functions::position`]
+///   serve these and are guaranteed never to need a body.
+/// - **By INDEX, to CALL it** -- [`Functions::get`] and `Index`, which do need one.
+///
+/// Every caller in both crates was measured before this shape was chosen: of the front end's 54 uses
+/// about 29 are `iter().any(|f| f.name == ..)`-shaped, and BOTH of the interpreter's scans
+/// (`resolve_global`'s lookup and `build_module_namespace`'s import-time walk) read `name` and
+/// nothing else. **A container that offered only `iter()` would therefore have forced every body in
+/// a module to materialise on that module's first global lookup**, which is the one access pattern
+/// that would make a lazy body worth nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Functions {
+    /// Every function's code object, materialised.
+    eager: Vec<CodeObject>,
+}
+
+impl Functions {
+    /// How many functions the module defines.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.eager.len()
+    }
+
+    /// Whether the module defines none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.eager.is_empty()
+    }
+
+    /// Function `index`'s name, or `None` if there is no such function. **Never needs a body.**
+    #[must_use]
+    pub fn name(&self, index: usize) -> Option<&str> {
+        self.eager.get(index).map(|code| code.name.as_str())
+    }
+
+    /// Every function's name, in table order. **Never needs a body**, so an import-time walk that
+    /// binds each name to its index costs the names alone.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.eager.iter().map(|code| code.name.as_str())
+    }
+
+    /// The index of the FIRST function with this name, or `None`. **Never needs a body.**
+    ///
+    /// First rather than only: a module may rebind a name, and the front end emits both definitions.
+    /// Taking the first matches what a positional scan over the table did before this type existed.
+    #[must_use]
+    pub fn position(&self, name: &str) -> Option<usize> {
+        self.eager.iter().position(|code| code.name == name)
+    }
+
+    /// Function `index`'s code object, or `None`. **Materialises the body.**
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&CodeObject> {
+        self.eager.get(index)
+    }
+
+    /// Appends a function -- the front end building a module up as it compiles.
+    pub fn push(&mut self, code: CodeObject) {
+        self.eager.push(code);
+    }
+
+    /// Every code object, materialised, for a consumer that genuinely needs them all: the encoder
+    /// writing the table out, and the differential harness comparing two of them.
+    ///
+    /// **Named for what it costs.** A caller that wants names wants [`Functions::names`].
+    pub fn iter_bodies(&self) -> impl Iterator<Item = &CodeObject> {
+        self.eager.iter()
+    }
+
+    /// The same, mutably: the front end rewriting a table in place (a fold, a late binding).
+    /// Producer-side only -- a materialised table is the only kind there is on that side.
+    pub fn iter_bodies_mut(&mut self) -> impl Iterator<Item = &mut CodeObject> {
+        self.eager.iter_mut()
+    }
+
+    /// Every code object as an owned vector. **Materialises the whole table**, so it is the one call
+    /// here that a deferred table cannot serve cheaply.
+    ///
+    /// It exists because the interpreter's module handle is an `Rc<[CodeObject]>` -- a CONTIGUOUS
+    /// slice, which by construction cannot hold anything unmaterialised. Every caller of this is
+    /// therefore a place that has to become `Rc<Functions>` before a deferred body is worth
+    /// anything, and there are exactly two of them.
+    #[must_use]
+    pub fn into_bodies(self) -> Vec<CodeObject> {
+        self.eager
+    }
+
+    /// The table as a contiguous slice. **Materialises the whole table**, and is the borrowed twin of
+    /// [`Functions::into_bodies`] with the same one-way property: a slice is contiguous, so a table
+    /// holding anything unmaterialised cannot produce one.
+    ///
+    /// It exists for the callers that hand a whole function table to something typed
+    /// `&[CodeObject]` -- the interpreter's `run_module`/`run` seam and the harnesses around it.
+    #[must_use]
+    pub fn as_bodies(&self) -> &[CodeObject] {
+        &self.eager
+    }
+}
+
+impl From<Vec<CodeObject>> for Functions {
+    fn from(eager: Vec<CodeObject>) -> Functions {
+        Functions { eager }
+    }
+}
+
+impl FromIterator<CodeObject> for Functions {
+    fn from_iter<I: IntoIterator<Item = CodeObject>>(iter: I) -> Functions {
+        Functions { eager: iter.into_iter().collect() }
+    }
+}
+
+impl core::ops::Index<usize> for Functions {
+    type Output = CodeObject;
+
+    /// **Materialises the body.** Panics on an out-of-range index, as a slice does.
+    fn index(&self, index: usize) -> &CodeObject {
+        &self.eager[index]
+    }
+}
+
 /// A compiled module: its top-level function definitions plus the code object for its
 /// top-level statements.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1109,8 +1619,10 @@ pub struct Module {
     /// The module's name (for diagnostics; e.g. the source stem).
     pub name: String,
     /// The functions defined at module scope, in source order.
-    pub functions: Vec<CodeObject>,
-    /// The `"<module>"` code object: the top-level statements, run on import.
+    pub functions: Functions,
+    /// The `"<module>"` code object: the top-level statements, run on import. Never part of
+    /// [`Functions`]: an import ALWAYS enters it, so it is the one code object that is never the
+    /// deferred case.
     pub body: CodeObject,
 }
 
@@ -1128,6 +1640,14 @@ pub enum DecodeError {
     BadTag(&'static str, u8),
     /// A string field was not valid UTF-8.
     BadUtf8,
+    /// The artifact requires capabilities this reader does not implement. Carries what it asked for
+    /// and the subset that is missing, so the refusal names the gap rather than only reporting one.
+    UnsupportedFeatures {
+        /// Everything the artifact declared it needs.
+        required: FeatureFlags,
+        /// The bits of `required` this build does not implement.
+        missing: FeatureFlags,
+    },
 }
 
 impl core::fmt::Display for DecodeError {
@@ -1138,6 +1658,11 @@ impl core::fmt::Display for DecodeError {
             DecodeError::UnsupportedVersion(v) => {
                 write!(f, "unsupported bytecode format version {v}")
             }
+            DecodeError::UnsupportedFeatures { required, missing } => write!(
+                f,
+                "the artifact requires capabilities this build does not implement:                  required {:#06x}, missing {:#06x}",
+                required.0, missing.0
+            ),
             DecodeError::BadTag(what, tag) => write!(f, "invalid {what} tag {tag}"),
             DecodeError::BadUtf8 => f.write_str("invalid UTF-8 in bytecode string"),
         }
@@ -1209,7 +1734,7 @@ fn put_const(buf: &mut Vec<u8>, c: &Const) {
     }
 }
 
-fn put_op(buf: &mut Vec<u8>, op: &Op) {
+fn put_op(buf: &mut Vec<u8>, op: &Op, wide: &[[u32; 2]]) {
     match op {
         Op::LoadConst(i) => {
             buf.push(0);
@@ -1227,10 +1752,11 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(3);
             put_u32(buf, *i);
         }
-        Op::LoadAttr { name, cache } => {
+        Op::LoadAttr { site } => {
             buf.push(4);
-            put_u32(buf, *name);
-            put_u32(buf, *cache);
+            let [name, cache] = wide[*site as usize];
+            put_u32(buf, name);
+            put_u32(buf, cache);
         }
         Op::Binary(b) => {
             buf.push(5);
@@ -1311,10 +1837,11 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(57);
             put_u32(buf, *kwnames);
         }
-        Op::SetAttr { name, cache } => {
+        Op::SetAttr { site } => {
             buf.push(32);
-            put_u32(buf, *name);
-            put_u32(buf, *cache);
+            let [name, cache] = wide[*site as usize];
+            put_u32(buf, name);
+            put_u32(buf, cache);
         }
         Op::UnpackSequence(count) => {
             buf.push(33);
@@ -1331,15 +1858,17 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(38);
             put_u32(buf, *count);
         }
-        Op::UnpackEx { before, after } => {
+        Op::UnpackEx { site } => {
             buf.push(39);
-            put_u32(buf, *before);
-            put_u32(buf, *after);
+            let [before, after] = wide[*site as usize];
+            put_u32(buf, before);
+            put_u32(buf, after);
         }
-        Op::CallKw { argc, kwnames } => {
+        Op::CallKw { site } => {
             buf.push(40);
-            put_u32(buf, *argc);
-            put_u32(buf, *kwnames);
+            let [argc, kwnames] = wide[*site as usize];
+            put_u32(buf, argc);
+            put_u32(buf, kwnames);
         }
         Op::Yield => buf.push(41),
         Op::YieldFrom => buf.push(54),
@@ -1349,10 +1878,11 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             put_u32(buf, *list);
         }
         Op::ImportStar => buf.push(55),
-        Op::CallEx { kinds, kwnames } => {
+        Op::CallEx { site } => {
             buf.push(42);
-            put_u32(buf, *kinds);
-            put_u32(buf, *kwnames);
+            let [kinds, kwnames] = wide[*site as usize];
+            put_u32(buf, kinds);
+            put_u32(buf, kwnames);
         }
         Op::DeleteItem => buf.push(43),
         Op::DeleteAttr { name } => {
@@ -1441,7 +1971,7 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
     put_len(buf, co.cache_count);
     put_len(buf, co.ops.len());
     for op in &co.ops {
-        put_op(buf, op);
+        put_op(buf, op, &co.wide_operands);
     }
     put_len(buf, co.exc_table.len());
     for e in &co.exc_table {
@@ -1457,30 +1987,100 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
 fn put_module_content(buf: &mut Vec<u8>, module: &Module) {
     put_str(buf, &module.name);
     put_len(buf, module.functions.len());
-    for f in &module.functions {
+    for f in module.functions.iter_bodies() {
         put_code_object(buf, f);
     }
     put_code_object(buf, &module.body);
-    put_len(buf, RESERVED_DEBUG_SECTION_LEN as usize);
+    put_debug_section(buf, module);
 }
 
-/// The length this build writes for a module's trailing debug section: none. The section is EMPTY
-/// today, and reserving it now is the point rather than an accident of layout.
+/// Write the module's debug section: one line table per code object, in the order the code objects
+/// were just written (functions, then the body).
 ///
-/// A reader compares the format version for strict equality, so a format change after a version has
-/// shipped on a device means reflashing every board that holds one. Source positions are the change
-/// most likely to be wanted later -- there is no line table, so no traceback can name a line -- and
-/// they are the kind of thing that gets deferred precisely because it is not needed to run a program.
+/// This fills the section reserved at format 27 WITHOUT moving the version, which is the whole
+/// reason the four bytes were spent: a reader built before line tables existed skips the section by
+/// its declared length and loses only diagnostics it never had.
+fn put_debug_section(buf: &mut Vec<u8>, module: &Module) {
+    let tables: Vec<&[u8]> = module
+        .functions
+        .iter_bodies()
+        .chain(core::iter::once(&module.body))
+        .map(|co| co.line_table.as_slice())
+        .collect();
+    if tables.iter().all(|t| t.is_empty()) {
+        put_len(buf, 0);
+        return;
+    }
+    let mut section = Vec::new();
+    put_len(&mut section, tables.len());
+    for table in tables {
+        put_len(&mut section, table.len());
+        section.extend_from_slice(table);
+    }
+    put_len(buf, section.len());
+    buf.extend_from_slice(&section);
+}
+
+/// Read a debug section into one line table per code object, positionally.
 ///
-/// A reader that skips this section BY ITS DECLARED LENGTH skips a longer one it has never seen. So
-/// the bytes that would carry a line table can be added later without moving the version: an old
-/// reader steps over them and loses only the diagnostics it never had, and a new reader given an old
-/// artifact reads a length of zero and behaves as it always did. Both directions degrade to what the
-/// reader can actually do, which is what makes the later change a compiler change rather than a
-/// fleet-wide reflash.
-const RESERVED_DEBUG_SECTION_LEN: u32 = 0;
+/// LENIENT BY DESIGN. Anything unexpected -- a count that does not match the code objects, a
+/// truncated table, trailing bytes -- yields NO line information rather than an error or a partial
+/// assignment. A reader that cannot make sense of a debug section has to degrade to the state it was
+/// in before the section existed: WRONG lines are worse than none, and refusing to load a runnable
+/// program because its diagnostics are malformed is worse still.
+fn take_debug_section(section: &[u8], code_objects: usize) -> Vec<Vec<u8>> {
+    let none = || alloc::vec![Vec::new(); code_objects];
+    if section.is_empty() {
+        return none();
+    }
+    let mut at = 0usize;
+    let u32_at = |at: &mut usize| -> Option<usize> {
+        let bytes = section.get(*at..*at + 4)?;
+        *at += 4;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+    };
+    let Some(count) = u32_at(&mut at) else {
+        return none();
+    };
+    if count != code_objects {
+        return none();
+    }
+    let mut tables = Vec::with_capacity(count);
+    for _ in 0..count {
+        let Some(len) = u32_at(&mut at) else {
+            return none();
+        };
+        let Some(bytes) = section.get(at..at + len) else {
+            return none();
+        };
+        at += len;
+        tables.push(bytes.to_vec());
+    }
+    if at != section.len() {
+        return none();
+    }
+    tables
+}
+
 
 impl Module {
+    /// Drop every code object's line information, so this module encodes with no debug section.
+    ///
+    /// Line tables are not free and a device profile may not want them: on a bundle importing
+    /// `asyncio` they are about 709 bytes of wire and 1,557 of decoded structure, the difference
+    /// being that each table is its own allocation. A build that will never format a traceback --
+    /// no REPL, no host attached, a program whose only failure mode is a trap -- can spend neither.
+    ///
+    /// It is a method rather than a compiler flag on purpose. Whether a PROFILE strips line tables
+    /// is a knob question that spans three languages rather than one front end; this method is the
+    /// mechanism such a knob would drive, available now and committing no caller to it.
+    pub fn strip_line_tables(&mut self) {
+        for function in self.functions.iter_bodies_mut() {
+            function.line_table = Vec::new();
+        }
+        self.body.line_table = Vec::new();
+    }
+
     /// Serialize this module to the versioned binary container.
     #[must_use]
     pub fn encode(&self, features: FeatureFlags) -> Vec<u8> {
@@ -1504,6 +2104,13 @@ impl Module {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let features = FeatureFlags(r.u16()?);
+        let missing = features.missing_from(SUPPORTED_FEATURES);
+        if !missing.is_empty() {
+            return Err(DecodeError::UnsupportedFeatures {
+                required: features,
+                missing,
+            });
+        }
         let module = r.module_content()?;
         Ok((module, features))
     }
@@ -1540,6 +2147,20 @@ pub struct Bundle {
 }
 
 impl Bundle {
+    /// Drop every module's line information, so this bundle encodes with no debug sections.
+    ///
+    /// The bundle form is the one a device is actually sent, so this is the level the decision gets
+    /// made at: a bundle carries its entry and every module its imports reach, and stripping one
+    /// module while leaving another would give a traceback that names a line in some frames and not
+    /// others. See [`Module::strip_line_tables`] for what it costs and why it is a method rather
+    /// than a compiler flag.
+    pub fn strip_line_tables(&mut self) {
+        self.entry.strip_line_tables();
+        for module in &mut self.modules {
+            module.strip_line_tables();
+        }
+    }
+
     /// Serialize this bundle to the versioned binary container (magic + [`BUNDLE_FORMAT_VERSION`]).
     #[must_use]
     pub fn encode(&self, features: FeatureFlags) -> Vec<u8> {
@@ -1566,6 +2187,13 @@ impl Bundle {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let features = FeatureFlags(r.u16()?);
+        let missing = features.missing_from(SUPPORTED_FEATURES);
+        if !missing.is_empty() {
+            return Err(DecodeError::UnsupportedFeatures {
+                required: features,
+                missing,
+            });
+        }
         let entry = r.module_content()?;
         let n_modules = r.u32()? as usize;
         let mut modules = Vec::with_capacity(n_modules);
@@ -1629,13 +2257,14 @@ impl<'a> Reader<'a> {
     /// nine characters, and costs it again in the fragmentation the freed blocks leave behind.
     fn name_pool(&mut self) -> Result<NamePool, DecodeError> {
         let count = self.u32()? as usize;
-        let mut pool = NamePool::new();
+        let mut text = String::new();
+        let mut spans: Vec<(u32, u32)> = Vec::new();
         for _ in 0..count {
             let name = self.str_slice()?;
-            pool.push(name);
+            spans.push((text.len() as u32, name.len() as u32));
+            text.push_str(name);
         }
-        pool.shrink_to_fit();
-        Ok(pool)
+        Ok(NamePool::freeze(text, spans))
     }
 
     /// Read a module's CONTENT (name + functions + body) -- the header-less body of a bare module or
@@ -1647,12 +2276,17 @@ impl<'a> Reader<'a> {
         for _ in 0..n_functions {
             functions.push(self.code_object()?);
         }
-        let body = self.code_object()?;
+        let mut body = self.code_object()?;
         let debug_len = self.u32()? as usize;
-        let _debug = self.bytes(debug_len)?;
+        let debug = self.bytes(debug_len)?;
+        let mut tables = take_debug_section(debug, functions.len() + 1).into_iter();
+        for function in &mut functions {
+            function.line_table = tables.next().unwrap_or_default();
+        }
+        body.line_table = tables.next().unwrap_or_default();
         Ok(Module {
             name,
-            functions,
+            functions: functions.into(),
             body,
         })
     }
@@ -1696,17 +2330,21 @@ impl<'a> Reader<'a> {
         Ok(c)
     }
 
-    fn op(&mut self) -> Result<Op, DecodeError> {
+    fn op(&mut self, wide: &mut Vec<[u32; 2]>) -> Result<Op, DecodeError> {
         let tag = self.u8()?;
         let op = match tag {
             0 => Op::LoadConst(self.u32()?),
             1 => Op::LoadFast(self.u32()?),
             2 => Op::StoreFast(self.u32()?),
             3 => Op::LoadGlobal(self.u32()?),
-            4 => Op::LoadAttr {
-                name: self.u32()?,
-                cache: self.u32()?,
-            },
+            4 => {
+                let first = self.u32()?;
+                let second = self.u32()?;
+                wide.push([first, second]);
+                Op::LoadAttr {
+                    site: (wide.len() - 1) as u32,
+                }
+            }
             5 => {
                 let b = self.u8()?;
                 Op::Binary(BinOp::from_u8(b).ok_or(DecodeError::BadTag("BinOp", b))?)
@@ -1748,29 +2386,45 @@ impl<'a> Reader<'a> {
                 flags: self.u8()?,
             },
             31 => Op::BuildClass,
-            32 => Op::SetAttr {
-                name: self.u32()?,
-                cache: self.u32()?,
-            },
+            32 => {
+                let first = self.u32()?;
+                let second = self.u32()?;
+                wide.push([first, second]);
+                Op::SetAttr {
+                    site: (wide.len() - 1) as u32,
+                }
+            }
             33 => Op::UnpackSequence(self.u32()?),
             34 => Op::ListAppend,
             35 => Op::SetAdd,
             36 => Op::DictInsert,
             37 => Op::LoadSuper(self.u32()?),
             38 => Op::BuildSet(self.u32()?),
-            39 => Op::UnpackEx {
-                before: self.u32()?,
-                after: self.u32()?,
-            },
-            40 => Op::CallKw {
-                argc: self.u32()?,
-                kwnames: self.u32()?,
-            },
+            39 => {
+                let first = self.u32()?;
+                let second = self.u32()?;
+                wide.push([first, second]);
+                Op::UnpackEx {
+                    site: (wide.len() - 1) as u32,
+                }
+            }
+            40 => {
+                let first = self.u32()?;
+                let second = self.u32()?;
+                wide.push([first, second]);
+                Op::CallKw {
+                    site: (wide.len() - 1) as u32,
+                }
+            }
             41 => Op::Yield,
-            42 => Op::CallEx {
-                kinds: self.u32()?,
-                kwnames: self.u32()?,
-            },
+            42 => {
+                let kinds = self.u32()?;
+                let kwnames = self.u32()?;
+                wide.push([kinds, kwnames]);
+                Op::CallEx {
+                    site: (wide.len() - 1) as u32,
+                }
+            }
             43 => Op::DeleteItem,
             44 => Op::DeleteAttr { name: self.u32()? },
             45 => Op::LoadDeref(self.u32()?),
@@ -1835,9 +2489,11 @@ impl<'a> Reader<'a> {
         let cache_count = self.u32()? as usize;
         let n_ops = self.u32()? as usize;
         let mut ops = Vec::with_capacity(n_ops);
+        let mut wide_operands: Vec<[u32; 2]> = Vec::new();
         for _ in 0..n_ops {
-            ops.push(self.op()?);
+            ops.push(self.op(&mut wide_operands)?);
         }
+        wide_operands.shrink_to_fit();
         let n_exc = self.u32()? as usize;
         let mut exc_table = Vec::with_capacity(n_exc);
         for _ in 0..n_exc {
@@ -1866,6 +2522,8 @@ impl<'a> Reader<'a> {
             consts,
             names,
             ops,
+            wide_operands,
+            line_table: Vec::new(),
             doc,
             cache_count,
             exc_table,
@@ -1914,6 +2572,157 @@ mod tests {
         );
     }
 
+    /// An artifact requiring a capability this build does not implement is REFUSED, and the refusal
+    /// names the gap.
+    ///
+    /// This is the row the mechanism was missing. The header word was written, read, and handed to
+    /// the caller -- and every caller on the device path binds it as `_features` and drops it, so an
+    /// artifact could declare anything at all and still run. The type's own documentation said a
+    /// reader "rejects the artifact rather than mis-executing it", which described an intention
+    /// rather than the code. That is the same shape as the bundle version that identified nothing:
+    /// a field faithfully carried, believed to be a gate, gating nothing.
+    #[test]
+    fn an_artifact_requiring_an_unimplemented_capability_is_refused() {
+        let m = sample_module();
+
+        assert!(Module::decode(&m.encode(FeatureFlags::FIRST_LIGHT)).is_ok());
+        assert!(
+            Module::decode(&m.encode(FeatureFlags::default())).is_ok(),
+            "an artifact that requires NOTHING must load on any reader that knows the base format"
+        );
+
+        let unknown = FeatureFlags(!SUPPORTED_FEATURES.0);
+        assert!(!unknown.is_empty(), "there must be a bit this build does not implement");
+        let demanding = FeatureFlags(SUPPORTED_FEATURES.0 | unknown.0);
+
+        let bundle = Bundle {
+            entry: m.clone(),
+            modules: Vec::new(),
+        };
+        let cases: [(&str, DecodeError); 2] = [
+            (
+                "bare module",
+                Module::decode(&m.encode(demanding)).expect_err("a bare module must be refused"),
+            ),
+            (
+                "bundle",
+                Bundle::decode(&bundle.encode(demanding)).expect_err("a bundle must be refused"),
+            ),
+        ];
+        for (container, refused) in cases {
+            match Some(refused) {
+                Some(DecodeError::UnsupportedFeatures { required, missing }) => {
+                    assert_eq!(required, demanding, "{container}");
+                    assert_eq!(
+                        missing, unknown,
+                        "the {container} refusal must name the MISSING bits, not merely that                          something was wrong"
+                    );
+                }
+                other => panic!("expected an UnsupportedFeatures refusal for a {container}, got {other:?}"),
+            }
+        }
+    }
+
+    /// One line per op goes in, and every op reports its own line back.
+    ///
+    /// Checked against the INPUT rather than against a re-encode: a round trip through one
+    /// implementation's own inverse passes on two consistent misreadings, and this codec has a
+    /// zigzag and a run length that could both be wrong in the same direction.
+    #[test]
+    fn a_line_table_reports_the_line_of_every_op() {
+        let lines: Vec<u32> = vec![1, 1, 1, 2, 2, 7, 3, 3, 3, 3, 200, 1];
+        let table = encode_line_table(&lines);
+        let mut co = sample_module().body;
+        co.line_table = table;
+
+        for (index, &expected) in lines.iter().enumerate() {
+            assert_eq!(
+                co.line_for(index),
+                Some(expected),
+                "op {index} should report line {expected}"
+            );
+        }
+        assert_eq!(co.line_for(lines.len()), None, "past the last op there is no line");
+    }
+
+    /// A build that tracked no positions produces NO table, not a table of zeroes -- and a reader
+    /// then says it does not know rather than claiming line 0.
+    #[test]
+    fn no_line_information_is_absent_rather_than_zero() {
+        assert!(encode_line_table(&[0, 0, 0]).is_empty());
+        assert!(encode_line_table(&[]).is_empty());
+        let mut co = sample_module().body;
+        co.line_table = encode_line_table(&[0, 0, 0]);
+        assert_eq!(co.line_for(0), None);
+    }
+
+    /// The encoding is COMPACT, which is the only reason it is affordable on a device: a program
+    /// whose ops group into runs must cost far less than a word per op.
+    #[test]
+    fn a_line_table_costs_far_less_than_a_word_per_op() {
+        let lines: Vec<u32> = (0..400).map(|i| 1 + i / 4).collect();
+        let table = encode_line_table(&lines);
+        assert!(
+            table.len() * 4 < lines.len() * 4,
+            "the table is {} bytes for {} ops, which is no better than a u32 each",
+            table.len(),
+            lines.len()
+        );
+        assert_eq!(co_line(&table, 0), Some(1));
+        assert_eq!(co_line(&table, 399), Some(100));
+    }
+
+    fn co_line(table: &[u8], index: usize) -> Option<u32> {
+        let mut co = sample_module().body;
+        co.line_table = table.to_vec();
+        co.line_for(index)
+    }
+
+    /// Stripping the lines makes the artifact byte-identical to one from a build that never had
+    /// them -- so a profile that does not want diagnostics pays nothing at all, not merely less.
+    #[test]
+    fn stripping_the_lines_leaves_no_debug_section() {
+        let mut m = sample_module();
+        m.body.line_table = encode_line_table(&[1, 1, 2, 2, 3, 3]);
+        let with_lines = m.encode(FeatureFlags::FIRST_LIGHT);
+
+        let mut bare = m.clone();
+        bare.strip_line_tables();
+        let without = bare.encode(FeatureFlags::FIRST_LIGHT);
+
+        assert!(without.len() < with_lines.len(), "lines cost wire bytes");
+        assert_eq!(
+            &without[without.len() - 4..],
+            &0u32.to_le_bytes(),
+            "a stripped module declares an EMPTY section, exactly as a build with no lines does"
+        );
+        let (back, _) = Module::decode(&without).expect("decodes");
+        assert_eq!(back.body.line_for(0), None, "and reports no line rather than line 0");
+    }
+
+    /// Stripping a BUNDLE reaches every module, entry included -- a half-stripped bundle would give
+    /// a traceback that names a line in some frames and not others, which is worse than either.
+    #[test]
+    fn stripping_a_bundle_reaches_the_entry_and_every_module() {
+        let mut m = sample_module();
+        m.body.line_table = encode_line_table(&[1, 1, 2, 2, 3, 3]);
+        let mut bundle = Bundle {
+            entry: m.clone(),
+            modules: alloc::vec![m.clone(), m],
+        };
+        let with_lines = bundle.encode(FeatureFlags::FIRST_LIGHT);
+
+        bundle.strip_line_tables();
+        let without = bundle.encode(FeatureFlags::FIRST_LIGHT);
+        assert!(without.len() < with_lines.len());
+
+        let (back, _) = Bundle::decode(&without).expect("decodes");
+        assert_eq!(back.entry.body.line_for(0), None, "the entry is stripped");
+        for module in &back.modules {
+            assert_eq!(module.body.line_for(0), None, "and every imported module too");
+        }
+    }
+
     /// A pool reads like the `Vec<String>` it replaced: same order, same names, indexable.
     #[test]
     fn a_name_pool_reads_like_the_vec_it_replaced() {
@@ -1932,23 +2741,30 @@ mod tests {
         assert!(NamePool::new().is_empty());
     }
 
+    /// THE SLACK IS UNREPRESENTABLE, AND THIS PINS THE REPRESENTATION THAT MAKES IT SO.
+    ///
+    /// A pool built from `String` + `Vec` fields CAN hold spare capacity: both grow GEOMETRICALLY,
+    /// so a pool filled name by name sits close to twice the bytes its text needs. Asserting the
+    /// absence of that slack checks a RUNTIME value, which a later edit can quietly reintroduce.
+    ///
+    /// Frozen into `Box<str>` and `Box<[_]>`, a pool has nowhere to PUT slack -- and it also drops
+    /// the capacity words themselves, four bytes per field on a 32-bit target. That sounds
+    /// negligible until the pools are counted: a code object has FOUR, most of them empty, so a
+    /// 44-code-object bundle carries 176 of them and pays for every one.
+    ///
+    /// So the assertion is on the TYPE: two fat pointers and nothing else. It holds at any pointer
+    /// width, and it fails the moment someone restores a growable field.
     #[test]
-    fn a_built_pool_holds_no_slack() {
+    fn a_pool_is_two_fat_pointers_and_cannot_hold_slack() {
+        assert_eq!(
+            core::mem::size_of::<NamePool>(),
+            2 * core::mem::size_of::<&[u8]>(),
+            "a pool must be exactly its two frozen buffers -- a capacity word here is paid 176 times              on a bundle importing `asyncio`, and it lets the geometric slack back in"
+        );
         let names: Vec<String> = (0..40).map(|i| alloc::format!("identifier_{i}")).collect();
         let pool: NamePool = names.iter().collect();
-
-        let text = pool.text.len();
-        assert!(
-            pool.text.capacity() <= text + 16,
-            "the text buffer holds {} bytes of slack over {text}",
-            pool.text.capacity() - text
-        );
-        assert!(
-            pool.spans.capacity() <= pool.spans.len() + 4,
-            "the span table holds {} entries of slack over {}",
-            pool.spans.capacity() - pool.spans.len(),
-            pool.spans.len()
-        );
+        assert_eq!(pool.len(), 40);
+        assert_eq!(&pool[39], "identifier_39");
     }
 
     /// Every artifact this build writes declares an EMPTY debug section, and it round-trips. This is
@@ -1966,6 +2782,19 @@ mod tests {
         assert_eq!(back, m);
     }
 
+    /// THE ONLY PART OF THE RESERVATION ACTUALLY UNDER TEST: a reader built to TODAY's layout is
+    /// handed a module carrying a section LONGER than any this build can write, and must still read
+    /// every field that FOLLOWS it.
+    ///
+    /// The whole value of reserving four bytes a module is the claim "a reader that skips by declared
+    /// length skips a longer one", and that is a claim about a producer which does not exist yet --
+    /// so nothing in ordinary use can exercise it, and it would sit unproven until the day it was
+    /// relied on. An escape hatch nobody has opened is worse than none, because it gets trusted.
+    ///
+    /// The following field is a real one rather than a contrivance: a bundle stores its modules back
+    /// to back, so the SECOND module is what lands immediately after the first module's section. If
+    /// the reader stepped over a fixed zero instead of the declared length, the second module would
+    /// decode from the middle of the first one's debug bytes.
     #[test]
     fn a_reader_steps_over_a_debug_section_longer_than_it_can_write() {
         let m = sample_module();
@@ -2009,15 +2838,15 @@ mod tests {
     /// pointer width and this measurement holds for a 32-bit target as well as the host it runs on.
     /// A `usize` or a reference in a variant would break that, and would break this test first.
     #[test]
-    fn no_op_variant_is_wider_than_two_payload_words() {
+    fn no_op_variant_is_wider_than_one_payload_word() {
         assert_eq!(
             core::mem::align_of::<Op>(),
             4,
             "a payload wider than 4-byte alignment would pad every op"
         );
         assert!(
-            core::mem::size_of::<Op>() <= 12,
-            "size_of::<Op>() is {}; a variant carrying three payload words widens EVERY op, and at \
+            core::mem::size_of::<Op>() <= 8,
+            "size_of::<Op>() is {}; a variant carrying a second payload word widens EVERY op, and at \
              roughly 1,300 ops in a real bundle each byte is another 1.3 KiB of device RAM",
             core::mem::size_of::<Op>()
         );
@@ -2047,7 +2876,7 @@ mod tests {
 
     /// A bundle written before the version carried its payload's layout is REFUSED rather than
     /// decoded with today's field expectations. 17 is that artifact's version, and it is the case the
-    /// strict-equality check exists for: the same bytes it used to accept.
+    /// strict-equality check exists for.
     #[test]
     fn a_bundle_declaring_the_old_container_version_is_refused() {
         let m = sample_module();
@@ -2092,10 +2921,12 @@ mod tests {
                 Op::LoadConst(0),
                 Op::Binary(BinOp::Add),
                 Op::Return,
-                Op::LoadAttr { name: 0, cache: 0 },
+                Op::LoadAttr { site: 0 },
                 Op::PopTop,
             ],
             cache_count: 1,
+            wide_operands: vec![[0, 0]],
+            line_table: Vec::new(),
             exc_table: vec![ExcEntry {
                 start: 0,
                 end: 5,
@@ -2105,7 +2936,7 @@ mod tests {
         };
         Module {
             name: String::from("m"),
-            functions: vec![func],
+            functions: vec![func].into(),
             body: CodeObject {
                 name: String::from("<module>"),
                 doc: None,
@@ -2126,6 +2957,8 @@ mod tests {
                 names: NamePool::new(),
                 ops: vec![Op::LoadConst(0), Op::Return],
                 cache_count: 0,
+                wide_operands: Vec::new(),
+                line_table: Vec::new(),
                 exc_table: Vec::new(),
             },
         }
@@ -2178,7 +3011,7 @@ mod tests {
             Op::LoadFast(1),
             Op::StoreFast(2),
             Op::LoadGlobal(3),
-            Op::LoadAttr { name: 4, cache: 5 },
+            Op::LoadAttr { site: 0 },
             Op::Binary(BinOp::Mod),
             Op::Compare(CmpOp::Le),
             Op::PopTop,
@@ -2203,17 +3036,17 @@ mod tests {
             Op::DeleteFast(2),
             Op::MakeFunction { func: 0, flags: 1 },
             Op::BuildClass,
-            Op::SetAttr { name: 0, cache: 7 },
+            Op::SetAttr { site: 1 },
             Op::UnpackSequence(2),
             Op::ListAppend,
             Op::SetAdd,
             Op::DictInsert,
             Op::LoadSuper(3),
             Op::BuildSet(2),
-            Op::UnpackEx { before: 1, after: 1 },
-            Op::CallKw { argc: 2, kwnames: 1 },
+            Op::UnpackEx { site: 2 },
+            Op::CallKw { site: 3 },
             Op::Yield,
-            Op::CallEx { kinds: 2, kwnames: 1 },
+            Op::CallEx { site: 4 },
             Op::DeleteItem,
             Op::DeleteAttr { name: 4 },
             Op::LoadDeref(2),
@@ -2232,17 +3065,24 @@ mod tests {
             Op::ListGrow { list: 2 },
             Op::Return,
         ];
+        let wide = [[4, 5], [0, 7], [1, 1], [2, 1], [2, 1]];
+
         let mut buf = Vec::new();
         for op in &ops {
-            put_op(&mut buf, op);
+            put_op(&mut buf, op, &wide);
         }
         let mut r = Reader {
             data: &buf,
             pos: 0,
         };
+        let mut decoded_wide: Vec<[u32; 2]> = Vec::new();
         for expected in &ops {
-            assert_eq!(r.op().unwrap(), *expected);
+            assert_eq!(r.op(&mut decoded_wide).unwrap(), *expected);
         }
+        assert_eq!(
+            decoded_wide, wide,
+            "the side table must come back with the same entries in the same order"
+        );
     }
 
     #[test]
@@ -2275,6 +3115,8 @@ mod tests {
                 Op::Return,
             ],
             cache_count: 0,
+            wide_operands: Vec::new(),
+            line_table: Vec::new(),
             exc_table: Vec::new(),
         };
         let mut buf = Vec::new();
@@ -2306,6 +3148,8 @@ mod tests {
                 names: NamePool::new(),
                 ops: vec![Op::Await, Op::Return],
                 cache_count: 0,
+                wide_operands: Vec::new(),
+                line_table: Vec::new(),
                 exc_table: Vec::new(),
             };
             let mut buf = Vec::new();
@@ -2341,6 +3185,8 @@ mod tests {
                 names: NamePool::new(),
                 ops: vec![Op::Return],
                 cache_count: 0,
+                wide_operands: Vec::new(),
+                line_table: Vec::new(),
                 exc_table: Vec::new(),
             };
             let mut buf = Vec::new();
@@ -2371,7 +3217,7 @@ mod tests {
 
             let module = Module {
                 name: String::from("m"),
-                functions: Vec::new(),
+                functions: Functions::default(),
                 body: CodeObject {
                     name: String::from("<module>"),
                     doc: None,
@@ -2392,6 +3238,8 @@ mod tests {
                     names: NamePool::new(),
                     ops: vec![Op::LoadConst(0), Op::Return],
                     cache_count: 0,
+                    wide_operands: Vec::new(),
+                    line_table: Vec::new(),
                     exc_table: Vec::new(),
                 },
             };
@@ -2450,5 +3298,49 @@ mod tests {
         assert_eq!(BinOp::from_u8(13), None);
         assert_eq!(CmpOp::from_u8(8), None);
         assert_eq!(UnaryOp::from_u8(3), None);
+    }
+
+    #[test]
+    fn a_full_profile_is_exactly_the_capabilities_that_exist() {
+        let built = Capability::ALL.iter().fold(Profile::BARE, |p, c| p.with(*c));
+        assert_eq!(built, Profile::FULL, "FULL is every capability in ALL, and no others");
+        for capability in Capability::ALL {
+            assert!(Profile::FULL.supports(*capability));
+            assert!(!Profile::BARE.supports(*capability));
+            assert!(!capability.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_profile_cannot_describe_an_image_that_cannot_be_built() {
+        let no_float = Profile::FULL.without(Capability::Float);
+        assert!(!no_float.supports(Capability::Float));
+        assert!(!no_float.supports(Capability::Complex), "no float means no complex");
+        assert!(no_float.supports(Capability::Introspection), "and nothing else moved");
+
+        let complex_only = Profile::BARE.with(Capability::Complex);
+        assert!(complex_only.supports(Capability::Float), "asking for complex asks for float");
+
+        let no_complex = Profile::FULL.without(Capability::Complex);
+        assert!(no_complex.supports(Capability::Float));
+        assert!(!no_complex.supports(Capability::Complex));
+    }
+
+    #[test]
+    fn only_the_constants_an_image_cannot_materialize_need_a_capability() {
+        assert_eq!(Const::Float(0).required_capability(), Some(Capability::Float));
+        assert_eq!(Const::Imaginary(0).required_capability(), Some(Capability::Complex));
+        for konst in [
+            Const::None,
+            Const::Bool(true),
+            Const::Int(7),
+            Const::Str(PyStr::from_wtf8(vec![b's'])),
+            Const::ArgKinds(vec![0]),
+            Const::KwNames(vec![String::from("k")]),
+            Const::BigInt(String::from("123")),
+            Const::Bytes(vec![1, 2]),
+        ] {
+            assert_eq!(konst.required_capability(), None, "{konst:?} needs nothing");
+        }
     }
 }

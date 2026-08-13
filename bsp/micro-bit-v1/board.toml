@@ -39,6 +39,24 @@ source = "hfclk"            # the TWI times itself from the high-frequency clock
 # for one of its jobs. A scan on this board sees whatever is plugged in as well as what is
 # soldered down.
 #
+# THIS FILE STATES NO MOTION-SENSOR DEVICE ROW, AND THAT IS A FACT ABOUT THE FILE'S SCOPE RATHER
+# THAN AN UNFINISHED SECTION. One board id covers revisions that carry DIFFERENT SENSORS at
+# DIFFERENT ADDRESSES, and no row is true of all of them:
+#
+#   v1.3 and v1.3B   MMA8653FC accelerometer at 0x1D, MAG3110 magnetometer at 0x0E -- two chips
+#   v1.5             LSM303AGR, one package answering as two residents at 0x19 and 0x1E
+#
+# The two sets are DISJOINT. A row saying 0x19 would be wrong for every v1.3 ever made and a row
+# saying 0x1D would be wrong for every v1.5, so stating either here would be a claim this file
+# cannot support -- the same objection that keeps a plugged-in module out of a board file.
+#
+# The vendor's own hardware pages name the parts per revision, and every address above is the
+# part's own datasheet fact rather than this board's. Both pairs have been read on silicon through
+# this board's bus and each answered its identity register, so what is missing here is not the
+# knowledge -- it is a way for one board file to say "it depends which revision you are holding".
+# Splitting this into two board files would need a second board_model, which is a wire-protocol
+# constant and not this file's to mint.
+#
 # The chip pins come from the Foundation's own runtime (microbit-dal MicroBitPin.h), which maps
 # edge pin 19 to P0.00 and edge pin 20 to P0.30. Bus pull-ups are the board's; the TWI pins are
 # therefore configured pull-disabled, which is what the twi block's PIN_CNF_TWI value encodes.

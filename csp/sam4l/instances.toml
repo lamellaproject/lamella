@@ -1,5 +1,22 @@
 # INSTANCE map for the SAM4L family -- identity-first: ONLY the placed block copies a current
 # binding or control line references.
+#
+# THIS FAMILY IS SHAPED UNLIKE ITS SAM4 NEIGHBOURS, AND THE PORT ROW BELOW IS WHERE IT SHOWS.
+# The SAM4S, SAM4N and SAM4E each place SEPARATE port controllers -- PIOA, PIOB, PIOC at three
+# base addresses, each with its own peripheral id. This series has ONE GPIO controller whose user
+# interface is organized into PORTS as register banks inside it, at the block base plus n * 0x200.
+# So a row here is a BANK rather than a controller, and the address it carries is the bank's, not
+# a peripheral's.
+#
+# THAT IS EXACTLY WHY THE PORT GROUP IS DATA. There is no instance name to pattern-match here: the
+# vendor names the block GPIO and numbers the banks 0, 1 and 2 while naming the PINS PA, PB and PC.
+# A derivation that guessed a group's name from a pin's letter would look for a `portc` or `gpioc`
+# that does not exist and never will, because this controller has no such thing.
+#
+# THE RECORD IS `base` ALONE, and that is another shape difference rather than an omission. The
+# SAM4S-style families carry a peripheral id serving as both the clock-gate bit and the interrupt
+# line, because a PMC gates their peripherals. This series has no PMC at all -- it has a Power
+# Manager with per-bus clock masks -- so there is no id to carry.
 
 [table]
 kind = "instances"

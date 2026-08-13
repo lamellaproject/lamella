@@ -145,6 +145,16 @@ pub const PROBE_SERIAL_ENV: &str = "LAMELLA_PROBE_SERIAL";
 
 impl Selector {
     /// Matches the only connected probe, and REFUSES when there is more than one.
+    ///
+    /// **It does NOT mean "the first one discovered", which stops being a usable answer the
+    /// moment a bench holds two probes of the same model.** Every RPi Debug Probe enumerates as
+    /// `2e8a:000c`, so "the first" is decided by USB enumeration order -- which changes with plug
+    /// order and across reboots. Writing to an arbitrary board is not a failure that announces
+    /// itself: the flash SUCCEEDS, on the wrong target, and the board's owner finds it running
+    /// somebody else's program with no error anywhere in the log.
+    ///
+    /// So an unconstrained selector now means *the only one*, and [`open`] answers
+    /// [`ProbeError::Ambiguous`] rather than guessing. A single attached probe is unaffected.
     pub fn any() -> Self {
         Self::default()
     }
@@ -291,8 +301,8 @@ impl Session {
     }
 }
 
-/// A [`Transport`] over whichever native USB backend reached a probe -- HID reports for v1, bulk
-/// pipes for v2 -- so one [`Dap`] type drives either.
+/// A [`Transport`] over whichever native USB backend reached a probe -- HID reports for CMSIS-DAP
+/// v1, bulk pipes for CMSIS-DAP v2 -- so one [`Dap`] type drives either.
 pub enum AnyTransport {
     /// A CMSIS-DAP v1 probe over USB HID.
     Hid(lamella_usbhid::Device),
@@ -337,6 +347,12 @@ impl Transport for AnyTransport {
 ///
 /// `requested` first, then [`PROBE_SERIAL_ENV`], then the sole attached probe, then
 /// [`ProbeError::Ambiguous`] naming every candidate. **No rung guesses.**
+///
+/// **Why this exists at all: every micro:bit is `0d28:0204` and every RPi Debug Probe is
+/// `2e8a:000c`.** On a bench with more than one, "the first match" is decided by USB enumeration
+/// order, which changes with plug order and across reboots -- and writing to the wrong board does
+/// not announce itself. The flash SUCCEEDS, on someone else's target, and they find it running a
+/// program nobody sent it with no error in any log.
 pub fn resolve_serial(
     vendor_id: u16,
     product_id: u16,
@@ -371,6 +387,16 @@ fn choose_serial(probes: &[ProbeInfo], selector: &Selector) -> Result<String, Pr
 /// device-specific flash or diagnostic routine wants a concrete transport it can hand to its own
 /// chip-family code. That is a fair reason not to use [`open`]; it is not a reason to open by
 /// vendor/product alone and take whichever board answers.
+/// IT SELECTS THE INTERFACE, NOT ONLY THE PROBE, and that is the whole point of the second half.
+/// [`resolve_serial`] settles WHICH PHYSICAL PROBE; a composite probe then puts several HID
+/// interfaces on that one vid/pid/serial, and opening by vid/pid/serial takes whichever the OS
+/// enumerates first. On an MCU-Link Pro that is `LPCSIO`, not CMSIS-DAP -- every DAP request then
+/// times out and `ArmDap::connect` reports *"no SWD response -- is the probe wired to the target?"*,
+/// so a HOST-SIDE MIS-SELECTION IS REPORTED AS AN UNREACHABLE BOARD. That is the expensive direction
+/// to be wrong in: it sends someone to a bench to re-check wiring that was never the problem.
+///
+/// Ranked by [`selection_rank`] -- the SAME rule [`open`] uses -- so "which interface is the DAP
+/// one" has one spelling in this crate rather than one per caller.
 pub fn open_hid(
     vendor_id: u16,
     product_id: u16,
@@ -412,6 +438,10 @@ fn choose_hid_interface(
 }
 
 /// [`open_hid`]'s CMSIS-DAP v2 sibling, over USB bulk -- the RPi Debug Probe and its kin.
+///
+/// **Every RPi Debug Probe enumerates as `2e8a:000c`.** Where more than one is attached, "the
+/// first that answers" is decided by USB enumeration order, and the write that lands on the wrong
+/// board SUCCEEDS.
 #[cfg(feature = "usbbulk")]
 pub fn open_bulk(
     vendor_id: u16,
@@ -444,6 +474,16 @@ pub fn list() -> Vec<ProbeInfo> {
 
 /// How many PHYSICAL probes `candidates` covers, named for a diagnostic -- one entry per distinct
 /// `(vendor, product, serial)`, the same identity [`list`] dedupes on.
+///
+/// **Counting candidates instead would be wrong and would look right.** [`all_candidates`] yields
+/// one entry per INTERFACE, so a single composite probe legitimately appears several times -- that
+/// is exactly why [`open`] tries them in turn. An ambiguity check over candidates would refuse the
+/// one-probe bench it is supposed to leave alone.
+///
+/// **And the limit of the check, stated rather than left to be discovered:** two physical probes
+/// reporting the SAME serial are indistinguishable here and read as one composite probe, so no
+/// refusal fires -- and no selector could have separated them either. It is a gap in what USB tells
+/// us, not one in this function.
 fn distinct_probes(candidates: &[ProbeInfo]) -> Vec<String> {
     let mut seen: Vec<(u16, u16, Option<&str>)> = Vec::new();
     let mut names = Vec::new();
@@ -589,7 +629,7 @@ mod tests {
         ProbeInfo {
             vendor_id: 0x1fc9,
             product_id: 0x0143,
-            serial: Some("STKVKH3CMA5YD".into()),
+            serial: Some("PROBE0000001".into()),
             product: product.map(Into::into),
             wire: Wire::CmsisDapV1Hid,
             usage_page,
@@ -626,6 +666,10 @@ mod tests {
         }
     }
 
+    /// A probe that puts several vendor-defined HID interfaces on ONE vid/pid/serial. Opening by
+    /// vid/pid/serial takes whichever the OS enumerates first, and every DAP request then times
+    /// out, which `ArmDap::connect` reports as "no SWD response -- is the probe wired to the
+    /// target?". **A host-side mis-selection presenting as an unreachable board.**
     #[test]
     fn the_dap_interface_wins_over_a_probes_other_hid_interfaces() {
         let interfaces = [
@@ -633,7 +677,7 @@ mod tests {
             mcu_link_interface(0xffeb, "MCU-LINK NXP TRACE/POWER", "path-trace"),
             mcu_link_interface(0xff00, "MCU-LINK Pro CMSIS-DAP", "path-dap"),
         ];
-        let chosen = choose_hid_interface(&interfaces, 0x1fc9, 0x0143, "STKVKH3CMA5YD");
+        let chosen = choose_hid_interface(&interfaces, 0x1fc9, 0x0143, "PROBE0000001");
         assert_eq!(
             chosen.unwrap(),
             "path-dap",
@@ -644,33 +688,37 @@ mod tests {
     /// A probe that resolved but has no HID DAP interface must SAY SO rather than report itself
     /// missing -- a v2 bulk-only probe, or one whose HID interface vanished across a firmware
     /// update. "No matching probe found" would send the reader looking for a cable.
+    ///
+    /// The MCU-Link Pro at firmware V3.172 is exactly this: bulk-only DAP, and its LPCSIO and
+    /// TRACE/POWER HID interfaces still enumerate. Opening one of THOSE is what produced the
+    /// original false finding, so "some HID interface exists" must not count as a DAP interface.
     #[test]
     fn a_probe_with_no_dap_interface_is_named_not_reported_missing() {
         let interfaces = [
             mcu_link_interface(0xffea, "LPCSIO", "path-lpcsio"),
             mcu_link_interface(0xffeb, "MCU-LINK NXP TRACE/POWER", "path-trace"),
         ];
-        let err = choose_hid_interface(&interfaces, 0x1fc9, 0x0143, "STKVKH3CMA5YD")
+        let err = choose_hid_interface(&interfaces, 0x1fc9, 0x0143, "PROBE0000001")
             .expect_err("a probe with only a decoy interface must not open the decoy");
         let ProbeError::NoHidDapInterface { serial } = err else {
             panic!("expected NoHidDapInterface, got {err:?}")
         };
-        assert_eq!(serial, "STKVKH3CMA5YD", "the refusal must name the probe");
+        assert_eq!(serial, "PROBE0000001", "the refusal must name the probe");
     }
 
     #[test]
     fn one_attached_board_needs_no_serial() {
         let chosen = choose_serial(
-            &[microbit("6e052820")],
+            &[microbit("b0ard0001")],
             &Selector::any().with_vid_pid(0x0d28, 0x0204),
         );
-        assert_eq!(chosen.unwrap(), "6e052820", "a one-board bench must be unaffected");
+        assert_eq!(chosen.unwrap(), "b0ard0001", "a one-board bench must be unaffected");
     }
 
     #[test]
     fn two_alike_boards_are_refused_rather_than_guessed_between() {
         let err = choose_serial(
-            &[microbit("6e052820"), microbit("9796990b")],
+            &[microbit("b0ard0001"), microbit("b0ard0002")],
             &Selector::any().with_vid_pid(0x0d28, 0x0204),
         )
         .unwrap_err();
@@ -681,19 +729,19 @@ mod tests {
     #[test]
     fn a_serial_picks_its_board_out_of_several() {
         let chosen = choose_serial(
-            &[microbit("6e052820"), microbit("9796990b")],
-            &Selector::by_serial("9796990b").with_vid_pid(0x0d28, 0x0204),
+            &[microbit("b0ard0001"), microbit("b0ard0002")],
+            &Selector::by_serial("b0ard0002").with_vid_pid(0x0d28, 0x0204),
         );
-        assert_eq!(chosen.unwrap(), "9796990b");
+        assert_eq!(chosen.unwrap(), "b0ard0002");
     }
 
     #[test]
     fn a_sibling_model_does_not_count_toward_ambiguity() {
         let chosen = choose_serial(
-            &[microbit("6e052820"), probe_with_serial(Some("STKVKH3CMA5YD"))],
+            &[microbit("b0ard0001"), probe_with_serial(Some("PROBE0000001"))],
             &Selector::any().with_vid_pid(0x0d28, 0x0204),
         );
-        assert_eq!(chosen.unwrap(), "6e052820");
+        assert_eq!(chosen.unwrap(), "b0ard0001");
     }
 
     #[test]
@@ -792,7 +840,7 @@ mod tests {
     fn selector_matches_on_set_fields_only() {
         let p = hid_probe(Some(0xff00), Some(0x01), Some(65), None);
         assert!(Selector::any().matches(&p));
-        assert!(Selector::by_serial("STKVKH3CMA5YD").matches(&p));
+        assert!(Selector::by_serial("PROBE0000001").matches(&p));
         assert!(!Selector::by_serial("OTHER").matches(&p));
         assert!(Selector::by_vid_pid(0x1fc9, 0x0143).matches(&p));
         assert!(!Selector::by_vid_pid(0x1fc9, 0x9999).matches(&p));

@@ -6,6 +6,7 @@
 /// The v0 per-(chip, peripheral) dialect below coexists with it until every
 /// family migrates.
 pub mod fit;
+pub mod reconcile;
 pub mod strata;
 
 /// An integer fact plus how the table spelled it (hex spelling is preserved in the emission,

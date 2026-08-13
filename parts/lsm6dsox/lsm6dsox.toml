@@ -1,0 +1,166 @@
+# PART: ST LSM6DSOX, a six-axis inertial module -- a three-axis accelerometer and a three-axis
+# gyroscope in one package, answering on one address.
+#
+# THIS TABLE IS DELIBERATELY PARTIAL, and what is missing is named rather than left as an absence a
+# reader has to notice. It carries the facts a driver needs to FIND the part and talk to it -- the
+# identity, the address and its strap, the bus protocol and the control registers that select a
+# mode -- and it stops short of the rate and full-scale enumerations, for the reason given in the
+# last comment block of this file.
+
+[table]
+kind = "device"
+family = "lsm6dsox"
+part = "lsm6dsox"
+sources = [
+    "ST LSM6DSOX datasheet DS12814 Rev 4 (June 2024): WHO_AM_I ch 9.14 and its value in the register-map table's default column; the I2C slave address and the SDO/SA0 strap ch 5.1, with the composed SAD+read/write bytes in table 10; the subaddress protocol and the IF_INC auto-increment bit ch 5.1; CTRL1_XL ch 9.15 tables 49-50; the accelerometer ODR codes table 51.",
+]
+notes = [
+    "One package, two sensors, one I2C address: the accelerometer and the gyroscope are configured through separate control registers and read from separate output registers, but nothing on the bus distinguishes them.",
+    "NO RATE OR FULL-SCALE ENUMERATION IS STATED, and that is a refusal rather than an omission. Table 51 maps ODR_XL[3:0] to a rate through TWO columns selected by XL_HM_MODE in CTRL6_C (15h), a bit in a DIFFERENT register: code 1011 is 1.6 Hz in one column and 12.5 Hz in the other, an eightfold difference. An enum here is a flat map from a code to a value, so it cannot express that, and a table that picked one column would be right for one configuration and silently wrong for the other. A wrong rate does not fail -- an inertial output is integrated over an assumed period, so the error accumulates and reports a plausible number throughout.",
+    "Table 51 is NOT printed in code order: its rows run 0000, 1011, 0001, 0010, so the low-power special case sits second. A reader stepping down the page and counting up from zero mis-assigns every rate after the first.",
+]
+
+# --- sourcing --------------------------------------------------------------------------------
+#
+# EXERCISED, WHICH IS TWO READINGS AND NOT ONE. The weaker came first: a part of this type answered
+# its identity register against a negative control, establishing that a part of this type is present
+# and reachable and that the identity row below is right. The stronger came after: the same part
+# produced a measurement that decoded to gravity.
+#
+# WHAT IS STILL NOT ESTABLISHED, because the measurement was taken at codes chosen to avoid the
+# ambiguity rather than to resolve it: the rate and full-scale enumerations this table declines to
+# state remain unstated. A magnitude of about 1000 mg confirms the sensitivity at ONE full scale and
+# says nothing about the other three, and it is not a rate measurement at all.
+
+[sourcing]
+facts = "primary"
+validation = "exercised"
+evidence = "TWO READINGS, AND THE SECOND CARRIES ITS OWN ORACLE. EXERCISED: with the accelerometer configured through CTRL1_XL, a six-byte burst from OUTX_L_A (0x28) decoded to an acceleration vector whose MAGNITUDE was 1005 mg on 28 of 28 readings, min and max both 1005 -- gravity, within half a percent, on a part at rest. The magnitude is the check rather than any axis: it is about 1000 mg for a body at rest IN ANY ORIENTATION, so the reading needs no reference instrument and no note about which way up a breakout on a cable happens to be lying. It was lying on its side, as the frame shows (x about -16490 LSB, y and z near zero), and the magnitude does not care. BOTH CONFIGURATION CODES WERE CHOSEN TO BE UNAMBIGUOUS: this part's rate and full-scale tables are each selected by a bit in ANOTHER register, so most codes name two different values -- ODR code 0001 is 12.5 Hz in both columns and full-scale code 00 is plus or minus 2 g in both, which is what lets one sensitivity figure (0.061 mg/LSB) be right whatever those other bits hold. IDENTIFIED, the weaker reading that came first: WHO_AM_I (0x0F) answered 0x6C on 21 of 21 passes, at address 0x6A, over an I2C controller on a Raspberry Pi Pico 2 and across a bus multiplexer channel. THE NEGATIVE CONTROL RAN IN THE SAME PASSES AND IS WHAT MAKES THE READ MEAN ANYTHING: the identical read, of the identical register, at both 0x6A and 0x6B with no part behind them, aborted at the address phase on 21 of 21 -- so the byte came from a part rather than from the state of an idle wire, and 0 of 21 control reads produced the identity value. The address it answered at is the SA0-low strap this table states, so the strap model is corroborated from the low side; the high side is unexercised. EVERY NUMBER IN THE CHECK -- the two candidate addresses, the register, the expected value -- was taken from this table's own emitted artifact rather than retyped into the bench program, so what was tested is the row that ships and not a copy of it. An earlier reading had already established only that SOMETHING acknowledged 0x6A, which is a weaker claim: an acknowledgement says a device drove SDA low for an address, not which part did."
+
+# --- identity --------------------------------------------------------------------------------
+#
+# The document states this twice, which is what makes it worth having: ch 9.14 says the value is
+# fixed at 6Ch, and the register map's default column independently gives 01101100 for the same
+# register. Two statements of one number, agreeing.
+
+[identity]
+reg = 0x0F
+width = 8
+values = [0x6C]
+notes = "DS12814 Rev 4 ch 9.14: 'WHO_AM_I register (R). This is a read-only register. Its value is fixed at 6Ch.' The register-map table gives the same register a default of 01101100. Read-only, so it cannot be perturbed into agreeing."
+
+# --- address ------------------------------------------------------------------------------------
+#
+# THE STRAP IS A PROPERTY OF THE CARRIER, NOT THE PART, which is why no value is defaulted here.
+# The part states a range of two; which one a given board answers at depends on where that board
+# tied the pin. A carrier that leaves it floating leaves the address undefined.
+
+[address]
+bus = "i2c"
+base = 0x6A
+notes = "DS12814 Rev 4 ch 5.1: 'The slave address (SAD) associated to the LSM6DSOX is 110101xb. The SDO/SA0 pin can be used to modify the less significant bit of the device address.' Its table 10 gives the composed bytes as D4h/D5h with the strap low and D6h/D7h with it high -- those are the 7-bit addresses below shifted up with the read/write bit appended, and are not addresses in their own right."
+
+[[address.straps]]
+pin = "SA0"
+bit = 0
+low = 0x6A
+high = 0x6B
+
+# --- the bus protocol ---------------------------------------------------------------------------
+#
+# AUTO-INCREMENT IS A CONTROL BIT ON THIS PART RATHER THAN A PROPERTY OF THE TRANSFER, which is the
+# one thing here a driver written against a simpler sensor would get wrong. A burst read returns the
+# SAME register repeatedly unless IF_INC is set -- and a repeated first byte looks like a plausible
+# measurement rather than like a failure.
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "DS12814 Rev 4 ch 5.1: after the start condition a slave address is sent, then an 8-bit subaddress, and for a read a repeated start must be issued. 'The increment of the address is configured by the CTRL3_C (12h) (IF_INC).'"
+
+# --- the registers a driver must write to get anything at all -----------------------------------
+
+[registers.who_am_i]
+reg = 0x0F
+width = 8
+access = "read"
+notes = "The identity register above. Read-only."
+
+[registers.ctrl1_xl]
+reg = 0x10
+width = 8
+access = "read-write"
+fields = { lpf2_xl_en = [1, 1], fs_xl = [2, 2], odr_xl = [4, 4] }
+notes = "DS12814 Rev 4 ch 9.15 tables 49-50. Bit 0 is a reserved 0 and the document says outright it 'must be set to 0 for the correct operation of the device' -- so it is a bit a read-modify-write must preserve as zero rather than merely leave alone. The accelerometer is activated from power-down by writing ODR_XL, so a part left at the reset value produces nothing and reports no error."
+
+[registers.ctrl2_g]
+reg = 0x11
+width = 8
+access = "read-write"
+notes = "The gyroscope's counterpart to CTRL1_XL: 'the gyroscope is activated from power-down by writing ODR_G[3:0] in CTRL2_G (11h)'. Its field layout is not transcribed here, for the same reason the rate enumerations are not, given in the last comment block of this file."
+
+[registers.ctrl3_c]
+reg = 0x12
+width = 8
+access = "read-write"
+notes = "Carries IF_INC, which decides whether a multi-byte transfer walks the address map or re-reads one register, and SIM, which selects the three-wire SPI wiring. Named here because IF_INC is a precondition for every burst read, not because the whole register is transcribed."
+
+# --- reading a measurement --------------------------------------------------------------------
+#
+# THE TWO SENSORS ARE TWO SEPARATE BLOCKS AND THE GYROSCOPE COMES FIRST. A driver that started its
+# burst at the accelerometer and read twelve bytes would get six of acceleration and six of
+# whatever follows; one that started at the gyroscope and took six would get angular rate while
+# believing it had acceleration. Each block is named, so neither is reached by arithmetic on the
+# other.
+
+[registers.status_reg]
+reg = 0x1E
+width = 8
+access = "read"
+fields = { xlda = [0, 1], gda = [1, 1], tda = [2, 1] }
+notes = "DS12814 Rev 4 ch 9.29 tables 85-86. XLDA is set when a new set of accelerometer data is available, GDA for the gyroscope, TDA for temperature; bits 3 to 7 are zero. Polling the matching flag is what separates a fresh conversion from the previous one re-read, which is otherwise indistinguishable."
+
+[registers.outx_l_g]
+reg = 0x22
+width = 8
+access = "read"
+notes = "DS12814 Rev 4 ch 9.31: the first byte of the ANGULAR RATE block, which runs 0x22 to 0x27 as three little-endian 16-bit values in X, Y, Z order."
+
+[registers.outx_l_a]
+reg = 0x28
+width = 8
+access = "read"
+notes = "DS12814 Rev 4: the first byte of the ACCELERATION block, which runs 0x28 to 0x2D as three little-endian 16-bit values in X, Y, Z order. Each is signed, so a reader that treats them as unsigned turns half of every axis into a large positive number."
+
+# ONE BURST COVERS ONE SENSOR'S THREE AXES, and the length is per BLOCK rather than per part: this
+# device has two such blocks at two addresses, so a single figure describes either read and not
+# both together.
+#
+# THE AUTO-INCREMENT BIT IS A PRECONDITION. Without IF_INC set in CTRL3_C the same address is
+# re-read for every byte, and all three axes come back equal to X -- a plausible-looking frame that
+# no length check catches.
+
+[measurement]
+burst_length = 6
+resolution_bits = "16 per axis, two's complement, little-endian, at every full-scale setting"
+
+# --- WHAT IS NOT HERE, AND WHY -----------------------------------------------------------------
+#
+# THE RATE ENUMERATION IS TWO-DIMENSIONAL AND THIS MODEL'S ENUMS ARE ONE-DIMENSIONAL. Table 51 maps
+# ODR_XL[3:0] to a rate through TWO columns, selected by XL_HM_MODE in CTRL6_C (15h) -- a bit in a
+# DIFFERENT register. The same code means different things in the two columns: 1011 is 1.6 Hz in
+# one and 12.5 Hz in the other, an eightfold difference. An `[enums]` block here is a flat map from
+# a code to a value, so it cannot state that, and a table that picked one column would be right for
+# one configuration and silently wrong for the other.
+#
+# A gyroscope's or accelerometer's output is integrated over an assumed period, so a wrong rate does
+# not fail -- it accumulates and reports a plausible number the whole time. That is the same shape
+# as the sibling family's five-percent rate disagreement, which is why this is stated as a gap
+# rather than resolved by choosing.
+#
+# AND TABLE 51 IS NOT PRINTED IN CODE ORDER: its rows run 0000, 1011, 0001, 0010 ... so the
+# special low-power code sits second. A reader stepping down the page and counting up from zero
+# assigns every rate after the first to the wrong code.
+

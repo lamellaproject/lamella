@@ -1,5 +1,25 @@
 //! STMicroelectronics STM32 flash programming over a Lamella debug probe.
 
+//! The H7 lives in its own module rather than beside the others, because its controller shares
+//! almost nothing with them -- a 32-byte write granule, a queue flag that is not `BSY`, and two
+//! banks with two register sets. Keeping it here would have invited exactly the constant-swapping
+//! that makes a flash algorithm subtly wrong.
+//! The C0 is likewise its own module, and for a reason that reads as a coincidence until it
+//! bites: it shares the F0's 2 KB page and NOT its programming granule (64-bit double words against
+//! the F0's 16 bits). Two families that agree on the easy fact and differ on the hard one are
+//! exactly the pair worth keeping apart.
+mod c0;
+pub use c0::{STM32C0_DOUBLE_WORD, STM32C0_FLASH_BASE, STM32C0_PAGE, Stm32C0Flash};
+
+/// The U5 gets its own module again: 8 KB pages, a 128-bit quad-word granule, two banks selected
+/// by a `BKER` bit, and TrustZone-aliased registers. Four families in this crate now have four
+/// different programming granules -- 16, 64, 128 and 256 bits -- which is the fact most likely to be
+/// copied from a neighbour and the one that only fails on silicon.
+mod u5;
+pub use u5::{
+    STM32U5_FLASH_BASE, STM32U5_PAGE, STM32U5_MAX_PAGES_PER_BANK, STM32U5_QUAD_WORD, Stm32U5Flash,
+};
+
 mod h7;
 pub use h7::{
     STM32H7_BANK2_BASE, STM32H7_FLASH_BASE, STM32H7_FLASH_WORD, STM32H7_SECTOR, Stm32H7Flash,
@@ -16,6 +36,12 @@ const SR_BSY: u32 = 1 << 16;
 const CR_PG: u32 = 1 << 0;
 const CR_SER: u32 = 1 << 1;
 const CR_SNB_SHIFT: u32 = 3;
+/// The largest sector index `FLASH_CR.SNB` can carry on any part this trait drives.
+///
+/// The field is FOUR bits on an F4/F74x ([6:3]) and FIVE on an F76x ([7:3], RM0410), which needs
+/// them for a dual-bank part's 24 sectors. This is the wider of the two, so it bounds the register
+/// rather than the part -- see the refusal in `erase_sector` for why a bound belongs here at all.
+const SNB_MAX: u32 = 0b1_1111;
 const CR_PSIZE_X32: u32 = 0b10 << 8;
 const CR_STRT: u32 = 1 << 16;
 const CR_LOCK: u32 = 1 << 31;
@@ -23,6 +49,14 @@ const CR_LOCK: u32 = 1 << 31;
 /// STM32F4 embedded-flash programming, added to ANY [`TargetAccess`] probe. Halt the core before
 /// erasing or writing so it is not fetching from flash during the operation, and program only
 /// erased (0xFF) flash.
+///
+/// **NOT CMSIS-DAP-ONLY, whatever this crate is called.** The impl below is blanket over
+/// `TargetAccess`, so an ST-Link gets these methods too -- `lamella_stlink::StLink` implements that
+/// trait directly, and `lamella-stlink`'s `stlink-flash` example is the composition with no glue.
+/// This doc previously said "a CMSIS-DAP `TargetAccess` probe", which together with the crate's name
+/// read as a transport binding that does not exist, and cost a lane a bug report for a gap that was
+/// not there. **A name that under-claims fails in the direction where nobody files a bug**, because
+/// the reader assumes the limit is real and works around it.
 pub trait Stm32F4Flash {
     /// Unlocks `FLASH_CR` for erase/program (writes the two `FLASH_KEYR` keys). Idempotent: the
     /// keys have no effect if the controller is already unlocked.
@@ -49,6 +83,11 @@ impl<A: TargetAccess> Stm32F4Flash for A {
     }
 
     fn erase_sector(&mut self, sector: u32) -> Result<(), ProbeError> {
+        if sector > SNB_MAX {
+            return Err(ProbeError::Device(
+                "STM32 sector index does not fit the FLASH_CR SNB field -- refusing rather than erasing a different sector",
+            ));
+        }
         wait_not_busy(self)?;
         let base = CR_PSIZE_X32 | CR_SER | (sector << CR_SNB_SHIFT);
         self.write_word(FLASH_CR, base)?;
@@ -85,6 +124,16 @@ const F0_SR_EOP: u32 = 1 << 5;
 
 /// The sector sizes of an STM32F4 with 1 MB of flash, in order from sector 0: four of 16 KB, one
 /// of 64 KB, then seven of 128 KB (RM0090).
+///
+/// THE TABLE HAS TO DESCRIBE THE WHOLE PART, AND A SHORT ONE IS A LIVE UNDER-ERASE.
+/// `sectors_covering` saturates at the end of the table, so an image reaching past the last entry
+/// erases the sectors the table knows about, is told those were all of them, and then programs its
+/// tail into flash that was never erased. Nothing reports it: the trigger is simply "the firmware
+/// grew past what the table covers".
+///
+/// A 2 MB dual-bank F4 (the F429ZI among them) has a SECOND bank of twelve more sectors that this
+/// table does not describe. An image inside the first megabyte is unaffected; a larger one needs
+/// the bank-2 geometry added rather than this table extended.
 pub const STM32F4_SECTOR_SIZES: [usize; 12] = [
     16 * 1024, 16 * 1024, 16 * 1024, 16 * 1024,
     64 * 1024,
@@ -92,9 +141,50 @@ pub const STM32F4_SECTOR_SIZES: [usize; 12] = [
 ];
 
 /// The sector sizes of an STM32F74x/F75x with 1 MB of flash, in order from sector 0 (RM0385).
+///
+/// THE F7 SHARES THE F4'S FLASH CONTROLLER AND NOT ITS GEOMETRY -- the only place the two
+/// diverge, and the easiest to miss. Verified against RM0385 rather than assumed: the register
+/// block sits at the same base with the same offsets (`ACR/KEYR/OPTKEYR/SR/CR` =
+/// `0x00/0x04/0x08/0x0C/0x10`), the same two keys, the same `CR` bit positions (`PG` 0, `SER` 1,
+/// `MER` 2, `SNB` [6:3], `PSIZE` [9:8], `STRT` 16, `LOCK` 31) and `SR.BSY` at 16. **So
+/// [`Stm32F4Flash`] IS the F7's sequence**, and is reused deliberately rather than copied under a
+/// second name. What differs is the geometry: an F4 starts with four 16 KB sectors and tails in
+/// 128 KB; an F7 starts with four of 32 KB and tails in 256 KB.
+///
+/// Getting this wrong in the SMALL direction is the dangerous one -- too few sectors erased
+/// leaves part of an image programmed into flash that was never erased, which corrupts or fails
+/// per word rather than failing up front.
 pub const STM32F7_SECTOR_SIZES: [usize; 8] = [
     32 * 1024, 32 * 1024, 32 * 1024, 32 * 1024, 128 * 1024, 256 * 1024, 256 * 1024, 256 * 1024,
 ];
+
+/// The sector sizes of an STM32F76x/F77x with 2 MB of flash **in single-bank mode**, in order from
+/// sector 0: four of 32 KB, one of 128 KB, then seven of 256 KB (RM0410).
+///
+/// THE GEOMETRY OF THIS PART IS NOT FIXED BY ITS PART NUMBER -- IT IS SET BY AN OPTION BIT, AND
+/// THAT IS THE WHOLE FINDING. `FLASH_OPTCR.nDBANK` (bit 29) selects between this layout and a
+/// DUAL-bank one of two 1 MB banks, each 4x16 KB + 1x64 KB + 7x128 KB. Same silicon, same order
+/// code, two different sector maps. **A table chosen from the part number would be right or wrong
+/// depending on a bit nobody looked at**, which is the same shape as a chip id being unable to tell
+/// a populated board from a bare one.
+///
+/// A caller can tell which layout it is holding without guessing: `nDBANK` SET in `FLASH_OPTCR`
+/// (`0xffffaafd` on a part in single-bank mode) selects this table, and the flash-size register at
+/// `0x1ff0f442` gives the total in KB -- `0x0800` is 2048 KB, which this table's entries sum to.
+///
+/// The DUAL-bank layout is deliberately NOT added here yet. It needs its own sector NUMBERING
+/// (RM0410 says dual-bank numbering differs from single-bank), and a table without the bit that
+/// selects it would be an invitation to pick the wrong one.
+pub const STM32F76X_SECTOR_SIZES_SINGLE_BANK: [usize; 12] = [
+    32 * 1024, 32 * 1024, 32 * 1024, 32 * 1024,
+    128 * 1024,
+    256 * 1024, 256 * 1024, 256 * 1024, 256 * 1024, 256 * 1024, 256 * 1024, 256 * 1024,
+];
+
+/// `FLASH_OPTCR`, whose bit 29 (`nDBANK`) decides which of the two F76x geometries applies.
+pub const STM32F7_OPTCR: u32 = 0x4002_3C14;
+/// `FLASH_OPTCR.nDBANK`: SET means single bank, CLEAR means dual.
+pub const STM32F7_OPTCR_NDBANK: u32 = 1 << 29;
 
 /// How many sectors from 0 an image of `len` bytes spans, given a family's sector `sizes`.
 ///
@@ -259,6 +349,10 @@ fn wait_not_busy<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
 mod geometry_tests {
     use super::*;
 
+    /// THE TWO FAMILIES DISAGREE FOR EVERY IMAGE SIZE THAT MATTERS, which is why the table is a
+    /// parameter rather than a constant baked into a caller. A 200 KB serve image needs SIX sectors
+    /// on an F4 and only FIVE on an F7 -- and the dangerous direction is using the F7's answer on an
+    /// F4, which leaves the tail of the image in flash that was never erased.
     #[test]
     fn the_f4_and_f7_geometries_are_not_interchangeable() {
         let image = 200 * 1024;
@@ -286,6 +380,15 @@ mod geometry_tests {
         assert_eq!(sectors_covering(huge, &STM32F4_SECTOR_SIZES), STM32F4_SECTOR_SIZES.len() as u32);
     }
 
+    /// THIS TEST FOUND A REAL UNDER-ERASE THE MOMENT IT WAS WRITTEN, and the reason it could is
+    /// that it checks each table against the PART rather than against the other table. Every other
+    /// test here compares the two geometries to each other, and a matched pair of wrong tables
+    /// would satisfy all of them perfectly.
+    ///
+    /// What it caught: the F4 table had EIGHT entries summing to 512 KB, so `sectors_covering`
+    /// saturated there and an image over 512 KB would have had its tail programmed into flash that
+    /// was never erased. It had never fired because no image flashed to an F4 had yet exceeded
+    /// half a megabyte.
     #[test]
     fn the_tables_describe_the_flash_the_parts_actually_have() {
         assert_eq!(
@@ -298,6 +401,33 @@ mod geometry_tests {
             1024 * 1024,
             "a 1 MB F7 is 4x32K + 128K + 3x256K = eight sectors"
         );
+        assert_eq!(
+            STM32F76X_SECTOR_SIZES_SINGLE_BANK.iter().sum::<usize>(),
+            2048 * 1024,
+            "a 2 MB F76x in single-bank mode is 4x32K + 128K + 7x256K = twelve sectors"
+        );
+        assert_eq!(
+            STM32F76X_SECTOR_SIZES_SINGLE_BANK.len(),
+            STM32F7_SECTOR_SIZES.len() + 4,
+            "the F76x has four more sectors than the F74x, not a different shape"
+        );
+        assert_eq!(STM32F7_OPTCR_NDBANK, 1 << 29);
+    }
+
+    /// AN OUT-OF-RANGE SECTOR INDEX MUST BE REFUSED, AND MASKING WOULD BE WORSE THAN NOTHING.
+    /// `SNB` is five bits at most, so sector 32 masks to **0** -- erasing the vector table the part
+    /// boots from, while every call reports success. This asserts the arithmetic that makes that
+    /// outcome reachable, so nobody "simplifies" the refusal into a mask.
+    #[test]
+    fn a_sector_index_too_large_would_wrap_onto_sector_zero() {
+        assert_eq!((32u32 << CR_SNB_SHIFT) >> CR_SNB_SHIFT & SNB_MAX, 0, "32 wraps to sector 0");
+        assert_eq!((33u32 << CR_SNB_SHIFT) >> CR_SNB_SHIFT & SNB_MAX, 1);
+        for sector in [0u32, 11, 23, SNB_MAX] {
+            assert!(sector <= SNB_MAX);
+            assert_eq!((sector << CR_SNB_SHIFT) >> CR_SNB_SHIFT, sector, "sector {sector} survives");
+        }
+        assert!(STM32F4_SECTOR_SIZES.len() as u32 - 1 <= SNB_MAX);
+        assert!(STM32F76X_SECTOR_SIZES_SINGLE_BANK.len() as u32 * 2 - 1 <= SNB_MAX);
         assert_ne!(STM32F4_SECTOR_SIZES.len(), STM32F7_SECTOR_SIZES.len());
     }
 }

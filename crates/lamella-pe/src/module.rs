@@ -63,11 +63,20 @@ pub struct ImageBuilder {
     /// `AssemblyRef` rows by assembly name, so each external type is referenced through the
     /// assembly that actually defines it (not just mscorlib).
     assembly_refs: BTreeMap<String, u32>,
+    /// Interned TypeRef rows, keyed by (resolution scope, qualified name) -- see [`ImageBuilder::type_ref`].
+    /// The scope is the whole `ResolutionScope` token, not an `AssemblyRef` row: a nested type
+    /// scopes to its enclosing `TypeRef` instead, and keying on the row alone would let an
+    /// `AssemblyRef` and a `TypeRef` of the same row number answer for each other.
+    type_refs: BTreeMap<(Token, String), u32>,
     /// The defining assembly of an external type, by `namespace.name`, recorded before emission
     /// so [`ImageBuilder::type_ref`] scopes the `TypeRef` to the right `AssemblyRef`.
     type_assemblies: BTreeMap<String, String>,
+    /// The ENCLOSING type of an external nested type, by `namespace.name` -- recorded the same way
+    /// and at the same moment as `type_assemblies`, so [`ImageBuilder::type_ref`] can scope a
+    /// nested type's row to its enclosing `TypeRef` (II.22.38) rather than flattening it.
+    type_enclosing: BTreeMap<String, String>,
     /// The identity (version + full public key) of a referenced assembly, by simple name, taken
-    /// from the reference the unit was compiled against. An `AssemblyRef` we emit for that name
+    /// from the reference the unit was compiled against. An `AssemblyRef` emitted for that name
     /// carries this identity so an external consumer (csc + the ref pack) reconciles it with the
     /// same assembly instead of rejecting a `Version=0.0.0.0, PublicKeyToken=null` phantom (CS0012).
     assembly_identities: BTreeMap<String, (u16, u16, u16, u16, Vec<u8>)>,
@@ -96,7 +105,9 @@ impl ImageBuilder {
             bodies: Vec::new(),
             mscorlib: None,
             assembly_refs: BTreeMap::new(),
+            type_refs: BTreeMap::new(),
             type_assemblies: BTreeMap::new(),
+            type_enclosing: BTreeMap::new(),
             assembly_identities: BTreeMap::new(),
             object: None,
             object_ctor: None,
@@ -217,6 +228,14 @@ impl ImageBuilder {
     pub fn set_type_assembly(&mut self, qualified_name: &str, assembly: &str) {
         self.type_assemblies
             .insert(qualified_name.to_string(), assembly.to_string());
+    }
+
+    /// Records that the external type `qualified_name` is NESTED in `enclosing` (also a
+    /// `namespace.name`), so its `TypeRef` scopes to the enclosing type's row rather than to an
+    /// assembly.
+    pub fn set_type_enclosing(&mut self, qualified_name: &str, enclosing: &str) {
+        self.type_enclosing
+            .insert(qualified_name.to_string(), enclosing.to_string());
     }
 
     /// Sets this assembly's own version (the `Assembly` row, II.22.2), from an
@@ -360,6 +379,13 @@ impl ImageBuilder {
     /// TypeDef table; there is no reference from the TypeDef table to the GenericParam table". The
     /// finalizer sorts by `Owner`, and because that sort is stable, adding a declaration's
     /// parameters in `number` order is what satisfies the secondary key.
+    ///
+    /// **THE SORT IS SAFE ONLY BECAUSE IT REMAPS, AND THAT IS NOT OPTIONAL HERE.** A
+    /// `GenericParamConstraint`'s `Owner` column indexes `GenericParam` BY ROW, so reordering these
+    /// rows underneath it would silently repoint every constraint at a different type parameter --
+    /// real constraints attached to the wrong parameters, which nothing structural detects. `finish`
+    /// therefore sorts through [`TableStream::sort_by_coded_column_remapping`], which rewrites the
+    /// dependent table's row references with the permutation.
     pub fn add_generic_param(&mut self, owner: Token, number: u16, flags: u16, name: &str) -> Token {
         let name = self.strings.intern(name);
         let row = self.tables.add_row(
@@ -372,6 +398,34 @@ impl ImageBuilder {
             ],
         );
         Token::new(table::GENERIC_PARAM, row)
+    }
+
+    /// Adds a `GenericParamConstraint` row (ECMA-335 4th ed, II.22.21): one named class, interface
+    /// or type-parameter constraint on a declared type parameter.
+    ///
+    /// `owner` is the `GenericParam` token [`Module::add_generic_param`] returned; `constraint` is a
+    /// `TypeDef`, `TypeRef` or `TypeSpec` token naming the type the argument must be convertible to.
+    ///
+    /// **THE THREE `class`/`struct`/`new()` CONSTRAINTS DO NOT COME HERE.** They are bits in the
+    /// owner's `GenericParam` flag word (II.23.1.7, mask `0x001C`), not rows -- so a parameter with
+    /// only `where T : class` produces NO row in this table. Sending them here instead would name a
+    /// type for a constraint that has none.
+    ///
+    /// **`Owner` IS A ROW INDEX, WHICH IS WHY `finish` MUST REMAP IT.** `GenericParam` is a
+    /// required-sorted table and the finalizer reorders it; every row added here holds a reference
+    /// that reordering would invalidate. `finish` sorts through
+    /// [`TableStream::sort_by_coded_column_remapping`] for exactly that reason. The failure mode if
+    /// it did not is not a malformed file -- it is real constraints attached to the WRONG
+    /// parameters, which nothing structural would detect.
+    pub fn add_generic_param_constraint(&mut self, owner: Token, constraint: Token) -> Token {
+        let row = self.tables.add_row(
+            table::GENERIC_PARAM_CONSTRAINT,
+            alloc::vec![
+                Column::Index(table::GENERIC_PARAM, owner.row()),
+                Column::Coded(CodedIndex::TypeDefOrRef, constraint),
+            ],
+        );
+        Token::new(table::GENERIC_PARAM_CONSTRAINT, row)
     }
 
     /// Interns a UTF-16 string in the `#US` heap, returning its `ldstr` token (the
@@ -413,6 +467,16 @@ impl ImageBuilder {
     /// to one elsewhere, the two members of the `MethodDefOrRef` coded index. `instantiation` is the
     /// blob from [`method_spec_signature`](crate::method_spec_signature): the type ARGUMENTS at this
     /// site.
+    ///
+    /// **A `MethodSpec` is the call site's, not the method's.** `Identity<int>(..)` and
+    /// `Identity<string>(..)` are two rows over one `MethodDef`, and each `call`/`callvirt` names its
+    /// own row rather than the definition -- which is what makes the arguments reach the callee at
+    /// all. Emitting the definition's token at the site instead loses them silently: the call still
+    /// binds, to the OPEN method, and `!!0` never gets substituted.
+    ///
+    /// Rows are NOT deduplicated here and need no sort: `MethodSpec` is absent from II.24.2.6's
+    /// sorted-table list, so file order is free. A caller that mints one row per site is emitting
+    /// valid metadata; interning identical sites is a size optimization, not a correctness rule.
     pub fn method_spec(&mut self, method: Token, instantiation: &[u8]) -> Token {
         let blob = self.blobs.intern(instantiation);
         let row = self.tables.add_row(
@@ -426,29 +490,74 @@ impl ImageBuilder {
     }
 
     /// A `TypeRef` to `namespace.name` in `mscorlib`, for naming an external type.
+    ///
+    /// **INTERNED BY (SCOPE, QUALIFIED NAME), BECAUSE EVERY CALLER MINTED A FRESH ROW.** Two
+    /// `where T : struct` parameters each emit a `GenericParamConstraint` naming
+    /// `System.ValueType`, and every destructor names `System.Object::Finalize` -- so a program
+    /// with N of either carried N identical `TypeRef` rows where csc carries one.
+    ///
+    /// The scope is part of the key and not an afterthought: two assemblies may both declare
+    /// `Foo.Bar`, and keying on the name alone would hand the second one the first's row -- a
+    /// reference that resolves cleanly to the wrong type, which is worse than the duplication it
+    /// removes. Same reason the `TypeSpec` map is keyed by blob rather than by display.
     pub fn type_ref(&mut self, namespace: &str, name: &str) -> Token {
         let qualified = if namespace.is_empty() {
             name.to_string()
         } else {
             alloc::format!("{namespace}.{name}")
         };
-        let scope = match self.type_assemblies.get(&qualified).cloned() {
-            Some(assembly) if assembly != "mscorlib" => self.assembly_ref(&assembly),
-            _ => self.mscorlib(),
+        self.qualified_type_ref(&qualified)
+    }
+
+    /// [`ImageBuilder::type_ref`] by the type's whole `namespace.name`, which is the key both
+    /// side tables are recorded under and the one form the nesting walk can recurse on.
+    ///
+    /// **A NESTED TYPE'S `TypeRef` SCOPES TO ITS ENCLOSING TYPE, NOT TO AN ASSEMBLY (II.22.38),
+    /// AND ITS OWN NAMESPACE IS EMPTY (II.22.37).** Written flat as `` List`1.Enumerator `` in an
+    /// `AssemblyRef` scope it is a type no assembly declares, and the image throws
+    /// `TypeLoadException` on load -- which is what `foreach` over a BCL `List<T>` produced, since
+    /// the enumerator it walks is `` List`1/Enumerator ``. The enclosing reference is minted first
+    /// and its token becomes this row's scope; a doubly-nested type recurses, because the enclosing
+    /// type's own entry answers the same question about it.
+    ///
+    /// This is the ONE site that decides a `TypeRef`'s shape, on purpose: the ~10 `split_type_name`
+    /// callers upstream hand over a qualified name and nothing else, so threading nesting through
+    /// them would be the same rule in ten places. It mirrors how `type_assemblies` already
+    /// re-scopes a non-CoreLib type here rather than at each caller.
+    fn qualified_type_ref(&mut self, qualified: &str) -> Token {
+        let nested = self.type_enclosing.get(qualified).and_then(|outer| {
+            let simple = qualified.strip_prefix(outer.as_str())?.strip_prefix('.')?;
+            Some((outer.clone(), simple))
+        });
+        let (scope, namespace, name) = match nested {
+            Some((outer, simple)) => (self.qualified_type_ref(&outer), "", simple),
+            None => {
+                let row = match self.type_assemblies.get(qualified).cloned() {
+                    Some(assembly) if assembly != "mscorlib" => self.assembly_ref(&assembly),
+                    _ => self.mscorlib(),
+                };
+                let (namespace, name) = match qualified.rsplit_once('.') {
+                    Some((namespace, name)) => (namespace, name),
+                    None => ("", qualified),
+                };
+                (Token::new(table::ASSEMBLY_REF, row), namespace, name)
+            }
         };
+        if let Some(row) = self.type_refs.get(&(scope, qualified.to_string())) {
+            return Token::new(table::TYPE_REF, *row);
+        }
+        let key = (scope, qualified.to_string());
         let namespace = self.strings.intern(namespace);
         let name = self.strings.intern(name);
         let row = self.tables.add_row(
             table::TYPE_REF,
             alloc::vec![
-                Column::Coded(
-                    CodedIndex::ResolutionScope,
-                    Token::new(table::ASSEMBLY_REF, scope)
-                ),
+                Column::Coded(CodedIndex::ResolutionScope, scope),
                 Column::StringRef(name),
                 Column::StringRef(namespace),
             ],
         );
+        self.type_refs.insert(key, row);
         Token::new(table::TYPE_REF, row)
     }
 
@@ -875,7 +984,12 @@ impl ImageBuilder {
         align4(&mut self.bodies);
         self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
         self.tables.sort_by_coded_column(table::METHOD_SEMANTICS, 2);
-        self.tables.sort_by_coded_column(table::GENERIC_PARAM, 2);
+        self.tables.sort_by_coded_column_remapping(
+            table::GENERIC_PARAM,
+            2,
+            &[table::GENERIC_PARAM_CONSTRAINT],
+        );
+        self.tables.sort_by_index_column(table::GENERIC_PARAM_CONSTRAINT, 0);
         let tables = self.tables.serialize(HeapSizes::default());
         let strings = self.strings.into_bytes();
         let guids = self.guids.into_bytes();
@@ -1154,6 +1268,101 @@ mod tests {
         assert_eq!(runtime.version(), (8, 0, 0, 0));
         assert_eq!(runtime.flags() & 0x0000_0001, 0x0000_0001, "afPublicKey set");
         assert_eq!(runtime.public_key_or_token(), &key);
+    }
+
+    #[test]
+    fn a_nested_type_ref_scopes_to_its_enclosing_ref_and_carries_no_namespace() {
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        builder.set_type_assembly("System.Collections.Generic.List`1", "System.Collections");
+        builder.set_type_assembly(
+            "System.Collections.Generic.List`1.Enumerator",
+            "System.Collections",
+        );
+        builder.set_type_enclosing(
+            "System.Collections.Generic.List`1.Enumerator",
+            "System.Collections.Generic.List`1",
+        );
+        let nested = builder.type_ref("System.Collections.Generic.List`1", "Enumerator");
+        let flat = builder.type_ref("System.Collections.Generic", "List`1");
+        let pe = builder.finish(Token::new(0, 0), true);
+
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+        let row = assembly.type_ref(nested.row()).expect("the nested TypeRef");
+        let name = row.name().expect("a named row");
+        assert_eq!(name.name, "Enumerator");
+        assert_eq!(
+            name.namespace, "",
+            "a nested type carries no namespace of its own"
+        );
+        let scope = row.resolution_scope();
+        assert_eq!(
+            scope.table(),
+            table::TYPE_REF,
+            "a nested type's scope is its enclosing TypeRef, not an AssemblyRef"
+        );
+        assert_eq!(scope.row(), flat.row(), "and it is the enclosing type's row");
+
+        let outer = assembly.type_ref(flat.row()).expect("the enclosing TypeRef");
+        let outer_name = outer.name().expect("a named row");
+        assert_eq!(outer_name.namespace, "System.Collections.Generic");
+        assert_eq!(
+            outer.resolution_scope().table(),
+            table::ASSEMBLY_REF,
+            "a top-level type still scopes to the assembly that defines it"
+        );
+    }
+
+    #[test]
+    fn a_nested_type_names_itself_alike_as_a_typedef_and_as_a_typeref() {
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        let object = builder.object_type();
+        let widget = builder.add_type("Lamella.Checks", "Widget", object, PUBLIC_CLASS);
+        let defined = builder.add_type("", "Nested", object, PUBLIC_CLASS);
+        builder.add_nested_class(defined, widget);
+        let gadget = builder.add_type("Lamella.Checks", "Gadget", object, PUBLIC_CLASS);
+        let other = builder.add_type("", "Nested", object, PUBLIC_CLASS);
+        builder.add_nested_class(other, gadget);
+
+        builder.set_type_assembly("Lamella.Checks.Widget", "Other");
+        builder.set_type_assembly("Lamella.Checks.Widget.Nested", "Other");
+        builder.set_type_enclosing("Lamella.Checks.Widget.Nested", "Lamella.Checks.Widget");
+        let referenced = builder.type_ref("Lamella.Checks.Widget", "Nested");
+        let top_level = builder.type_ref("Lamella.Checks", "Plain");
+
+        let pe = builder.finish(Token::new(0, 0), true);
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+
+        let expected = (
+            String::from("Lamella.Checks.Widget"),
+            String::from("Nested"),
+        );
+        assert_eq!(
+            assembly.type_token_full_name(defined),
+            Some(expected.clone()),
+            "a nested TypeDef is named through its NestedClass row"
+        );
+        assert_eq!(
+            assembly.type_token_full_name(referenced),
+            Some(expected),
+            "and a nested TypeRef through its ResolutionScope -- the SAME name, or a reference \
+             can never find its definition"
+        );
+        assert_eq!(
+            assembly.type_token_full_name(other),
+            Some((
+                String::from("Lamella.Checks.Gadget"),
+                String::from("Nested")
+            )),
+            "the same simple name under a different enclosing type is a DIFFERENT type"
+        );
+        assert_eq!(
+            assembly.type_token_full_name(widget),
+            Some((String::from("Lamella.Checks"), String::from("Widget")))
+        );
+        assert_eq!(
+            assembly.type_token_full_name(top_level),
+            Some((String::from("Lamella.Checks"), String::from("Plain")))
+        );
     }
 
     #[test]

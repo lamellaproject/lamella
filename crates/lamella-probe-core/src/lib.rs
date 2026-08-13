@@ -128,6 +128,15 @@ pub trait DapAccess {
     /// every signature above here. [`DapAccessExt::read_ap_block`] is the allocating convenience for
     /// callers that would rather have a `Vec`; it is deliberately NOT a member of this trait, so an
     /// implementation cannot accelerate the convenience and leave the primitive on the slow path.
+    ///
+    /// AN IMPLEMENTATION MUST WRITE EVERY SLOT OR RETURN `Err`. A PARTIAL FILL REPORTED AS `Ok`
+    /// IS THE ONE FORBIDDEN OUTCOME, and stating it here is load-bearing rather than pedantry: while
+    /// this returned a `Vec`, a short read came back as a SHORT VEC and callers caught it by
+    /// comparing lengths -- `stlink-flash`'s verify did exactly that, on the grounds that "a short
+    /// read is a failed verify, not a shorter one". A caller-provided buffer is always full length,
+    /// so that check can no longer fire and the guarantee has nowhere to live except here. An
+    /// implementation that filled a prefix and answered `Ok` would hand back a buffer that LOOKS
+    /// complete, with the untouched tail carrying whatever the caller left there.
     fn read_ap_block_into(&mut self, address: u8, out: &mut [u32]) -> Result<(), ProbeError> {
         for slot in out.iter_mut() {
             *slot = self.read_ap(address)?;
@@ -221,6 +230,11 @@ pub trait TargetAccess {
     /// The buffer form is the primitive for the same reason it is one layer down -- see
     /// [`DapAccess::read_ap_block_into`]. [`TargetAccessExt::read_words`] is the allocating
     /// convenience, and lives on an extension trait so it cannot be overridden in place of this.
+    ///
+    /// EVERY SLOT IS WRITTEN OR AN `Err` IS RETURNED -- a partial fill reported as `Ok` is the
+    /// one forbidden outcome, for the reason spelled out on [`DapAccess::read_ap_block_into`]: a
+    /// caller who sized the buffer itself cannot detect a short read by checking its LENGTH, so the
+    /// guarantee has to be made here.
     fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError>;
     /// Writes consecutive words, batched where the probe allows.
     fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError>;

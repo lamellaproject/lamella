@@ -138,6 +138,15 @@ pub extern "C" fn lamella_rint(x: f64) -> f64 {
 /// A caller may ignore the value and behave exactly as it did while this returned `()` -- which is
 /// what lets the two halves of the fix land independently. But ignoring it re-opens the defect
 /// below, so a caller that appends MUST branch on it.
+///
+/// **WHY THIS IS FALLIBLE AT ALL:** while
+/// this seam was `void` it could not report exhaustion, so an append past a full heap wrote ONE PAST
+/// the capacity it had asked for -- a memory-safety defect, not a formatting one. The alternative
+/// considered was storing an exception tag here and letting the caller's existing after-call check
+/// route it; that was refused because **setting a tag does not skip the store that follows**, so it
+/// needed the same caller change while additionally making the only allocating seam in this archive
+/// that raises. Every sibling here (`lamella_string_substring_impl`, `lamella_char_to_string_impl`,
+/// `lamella_double_to_string_impl`) already reports exhaustion by RETURN VALUE; this rejoins them.
 #[no_mangle]
 pub extern "C" fn py_list_grow(header: *mut u32, needed_cap: u32, element_size: u32) -> u32 {
     unsafe {
@@ -236,7 +245,7 @@ unsafe extern "C" {
 
 /// ONE console byte, to whichever sink this build selected.
 ///
-/// Every console entry point bottoms out here, and that is the point. The sink used to be written
+/// Every console entry point bottoms out here, and that is the point. A sink written
 /// inline at every call site, so "where does console output go" had no single answer and no place
 /// to bind a different one -- which is why the ARM console was semihosting-only, and why it
 /// HARDFAULTS on bare silicon with no debugger attached to service the `bkpt`.

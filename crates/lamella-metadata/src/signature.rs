@@ -32,6 +32,12 @@ pub mod calling {
     pub const LOCAL_SIG: u8 = 0x07;
     /// The leading byte of a `MethodSpec` instantiation signature (II.23.2.15):
     /// `IMAGE_CEE_CS_CALLCONV_GENERICINST`.
+    ///
+    /// **`0x0A`, NOT `0x15`, AND THE TWO ARE BOTH CALLED `GENERICINST`.** This one is a CALLING
+    /// CONVENTION and leads a whole blob; [`super::element::GENERICINST`] (`0x15`) is an ELEMENT
+    /// TYPE that appears INSIDE a type signature. Same name, different namespaces, different
+    /// positions -- and `0x0A` is also [`super::element::I8`], so a reader that takes this byte for
+    /// an element type decodes a `long` and reports no error.
     pub const GENERICINST: u8 = 0x0A;
 }
 
@@ -76,13 +82,21 @@ pub mod element {
     /// A generic TYPE parameter in a generic type definition (`!0`), II.23.1.16: "represented as
     /// number (compressed unsigned integer)".
     ///
-    /// DECODED into [`super::SigType::Var`].
+    /// Decodes into [`super::SigType::Var`]. It is folded into the AOT's
+    /// interface-method tag (`lamella_aot::resolver::interface_method_tag`), which is FROZEN
+    /// cross-assembly ABI -- **the byte alone is not the contribution.** A parameter number
+    /// follows it, because `!0` and `!1` are different types and one byte cannot say which.
     pub const VAR: u8 = 0x13;
     /// A general (multi-dimensional) array; followed by element type and shape.
     pub const ARRAY: u8 = 0x14;
     /// A generic type INSTANTIATION (`List<int>`), II.23.1.16: "Followed by type type-arg-count
-    /// type-1 ... type-n". Decoded into [`super::SigType::GenericInst`] -- see [`VAR`] for the tag
-    /// question that decoding does NOT answer.
+    /// type-1 ... type-n". Decoded into [`super::SigType::GenericInst`].
+    ///
+    /// **THIS BYTE IS THE ONE THAT CANNOT CARRY ITS OWN IDENTITY**, and the AOT's interface-method
+    /// tag folds the instantiation's CANONICAL SPELLING after it rather than the byte alone: the
+    /// byte says "an instantiation" and cannot say WHICH, so `List<int>` and `HashSet<int>` would be
+    /// one dispatch key. A definition token cannot stand in for the name either -- a token is
+    /// meaningful only inside its own assembly, and that tag is cross-assembly ABI.
     pub const GENERICINST: u8 = 0x15;
     /// `System.TypedReference`.
     pub const TYPEDBYREF: u8 = 0x16;
@@ -117,6 +131,18 @@ pub mod element {
 /// AOT's interface tag kept its own version and `Pointer`/`ByRef` had no arm in it: `IFoo.Bar(int*)`,
 /// `IFoo.Bar(byte*)` and `IFoo.Bar(ref int)` all tagged alike. One table, beside the decoder it must
 /// agree with.
+///
+/// **EVERY BYTE IS FROZEN.** The AOT folds these into interface-method tags, which are baked
+/// into emitted code and into itable entries in type descriptors, and a program object links against
+/// library objects compiled at other times -- so changing a byte silently mis-dispatches unless every
+/// artifact is rebuilt. There is deliberately NO fallback arm: a `SigType` this does not name is a
+/// COMPILE ERROR here, which is what forces the value to be chosen on purpose.
+///
+/// **THE THREE GENERIC BYTES ARE CORRECT AS BYTES AND INSUFFICIENT AS IDENTITIES.**
+/// `GENERICINST` says "an instantiation" and cannot say WHICH; `VAR` says "a type parameter" and
+/// cannot say which NUMBER. **A caller that wants a single byte must ask whether one is enough for
+/// its own question** -- the AOT's `fold_tag_element` adds what the byte cannot carry, and its
+/// `unbox_normal_form` decided one byte is not enough and refuses instead.
 #[must_use]
 pub fn element_byte(ty: &super::SigType) -> u8 {
     use super::SigType;
@@ -161,6 +187,11 @@ pub enum SigError {
     /// A field signature did not begin with the FIELD calling convention.
     BadCallingConvention(u8),
     /// A method signature declares type parameters (the GENERIC convention, II.23.2.1).
+    ///
+    /// **NOT RETURNED** -- [`super::parse_method`] decodes the GENERIC convention. The variant is
+    /// public, so removing it would break anyone matching on it, and the reason it names is worth
+    /// keeping: that layout carries an extra leading `GenParamCount`, so reading straight past it
+    /// yields a plausible and wrong signature rather than an error.
     GenericSignature,
 }
 
@@ -182,6 +213,10 @@ pub struct MethodSig {
     /// variable-argument types.
     pub is_vararg: bool,
     /// How many type parameters the method itself declares (the `1` of `T Identity<T>(T)`), or 0.
+    ///
+    /// **BINDING-SIGNIFICANT, NOT BOOKKEEPING** (II.23.2.1): the runtime overloads generic methods
+    /// by their type-parameter count, so `M<T>()` and `M<T,U>()` are different methods and this is
+    /// the difference. A reader that skipped it could not tell them apart.
     pub generic_param_count: u32,
     /// For a vararg call-site signature, the index in `parameters` at which the sentinel appeared --
     /// the count of FIXED parameters (the remainder are the variable arguments). `None` if no
@@ -255,6 +290,9 @@ pub enum SigType {
     /// seen from inside it (`ELEMENT_TYPE_VAR`, II.23.1.16).
     Var(u32),
     /// A generic parameter of the METHOD itself (`ELEMENT_TYPE_MVAR`).
+    ///
+    /// **Not interchangeable with [`SigType::Var`].** A generic method inside a generic type has
+    /// both numbering spaces live at once, so `!0` and `!!0` are different types there.
     MVar(u32),
     /// An instantiation of a generic type: `List<int>`, or `Box<!0>` inside another generic
     /// (`ELEMENT_TYPE_GENERICINST`).
@@ -404,6 +442,10 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
 /// This is the last signature shape in the format that had no decoder here, which left its only
 /// consumer walking the blob itself and finding each argument's boundary by the shortest prefix
 /// that parses. That works and is a workaround; one decoder per format is the rule.
+///
+/// The leading byte is [`calling::GENERICINST`] (`0x0A`) and NOT `element::GENERICINST` (`0x15`).
+/// A reader that checks the wrong one rejects every real blob; one that checks NEITHER and reads
+/// straight on takes `0x0A` for `ELEMENT_TYPE_I8` and decodes a `long`, with no error.
 pub fn parse_method_spec(blob: &[u8]) -> Result<Vec<SigType>, SigError> {
     let mut reader = Reader::new(blob);
     let convention = reader.read_u8()?;

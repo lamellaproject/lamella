@@ -2,6 +2,33 @@
 # The record carries the enable REGISTER OFFSET as data because ST spreads the gates across banked
 # enable registers, so [base, rcc_en_off, rcc_en_bit] states each gate in full. `-1` = the row
 # gates nothing (the RCC itself).
+#
+# EVERY BASE HERE IS THE NONSECURE ALIAS, AND THAT IS A DECISION RATHER THAN A DEFAULT. This is
+# an Armv8-M TrustZone part, so RM0456 Table 6 prints TWO address columns for every peripheral --
+# "Secure boundary address" and "Nonsecure boundary address" -- and an instance row has one `base`.
+# The rows below state the NONSECURE one.
+#
+# WHY ONE FIELD IS ENOUGH, AND WHY THE OBVIOUS SHORTCUT IS STILL REFUSED. The two aliases differ
+# by a CONSTANT +0x10000000 across the table, so a second per-instance field would be filled by
+# formula on every row -- the dead-data shape csp/ra4m1 refused for the module-stop record and the
+# H7 pad hit before it. But the constant is NOT safe to encode as a derivation either: Table 6 has
+# at least one row where it does not hold. GTZC1_MPCBB5 and GTZC1_MPCBB6 have their two columns
+# MIRRORED against each other -- MPCBB6 reads secure 0x50033800 / nonsecure 0x40033C00 while
+# MPCBB5 reads secure 0x50033C00 / nonsecure 0x40033800 -- almost certainly a transposition in the
+# manual, and exactly the kind of exception that makes a derivation rule worse than none. Every
+# instance below obeys the constant; the rule is recorded as an observation and nothing computes it.
+#
+# AND WHETHER THE SECURE ALIAS IS EVEN REACHABLE IS CHIP STATE, NOT BOARD TRUTH. TrustZone is
+# enabled by TZEN, bit 31 of FLASH_OPTR -- a user option byte, programmable, and not a property of
+# the part or of the board. Its value does not move any address below: with TZEN = 0 only the
+# nonsecure alias is meaningful, and with TZEN = 1 the secure alias exists IN ADDITION at the same
+# offset. So this table is correct either way, which is the whole reason the schema did not have to
+# change for a TrustZone part.
+#
+# THE BASES ARE NOT THE OTHER ST FAMILIES' BASES. This part puts its GPIO ports on AHB2 at
+# 0x42020000 and above and its RCC at 0x46020C00, where the vendor's F0, F4 and F7 lines put them at
+# 0x40020000 and 0x40023800 and the H7 puts them at 0x58020000. A row copied across any of those
+# would be wrong on every peripheral here.
 
 [table]
 kind = "instances"
@@ -15,8 +42,11 @@ sources = [
 ]
 notes = [
     "Every bit position here is taken from the reference manual's per-bit descriptions rather than from its register bit-map diagram: the diagram is a wide grid whose columns do not survive a text conversion, and this manual's does not -- its GPIOHEN cell converts adjacent to an I2C3RST from a different register entirely. The per-bit prose states the same fact unambiguously.",
+    "RCC_AHB2ENR1's RESET VALUE differs by sub-group: 0x40000000 for STM32U535/545 against 0xC0000000 for STM32U575/585. The offset and the two bit positions are shared across both, so only the reset value distinguishes them, and a table spanning both would have to state one and be wrong for half the parts it claimed.",
     "This family places two GPIO ports rather than the ten the part carries, because a present-list and an instance map here are evidence-only: a row is added when a board reaches the block. The board this family was built for reaches port H for its two RGB LEDs and port G for its links to the application processor.",
+    "THE TWO ENABLE REGISTERS BELOW ARE NOT THE SAME REGISTER AND THE GAP BETWEEN THEM IS SMALL ENOUGH TO MISREAD. The GPIO ports gate through RCC_AHB2ENR1 at offset 0x08C; SPI3 and LPUART1 gate through RCC_APB3ENR at 0x0A8. Two peripherals a board reaches together therefore need two different writes, and 0x08C and 0x0A8 are close enough that a transposition lands inside the RCC's register file rather than outside it -- so the wrong one writes a real register and gates something else.",
     "SPI3 and LPUART1 sit in the 0x46000000 region on APB3 rather than in the APB1/APB2 space the vendor's other lines use, and their bit positions are ADJACENT -- SPI3EN at 5 and LPUART1EN at 6 -- while the GPIO ports' bits in the other register are also 6 and 7. Four small numbers over two registers, and only the register name distinguishes them.",
+    "NEITHER SPI3 NOR LPUART1 CARRIES A BLOCK LAYOUT FILE, so their rows state WHERE they sit and HOW they are gated and nothing about what is inside them. That is the same shape as the rcc row: an instance is useful the moment its base and gate are known, and a register map is a separate reading. A consumer needing register offsets must not infer them from a sibling family.",
 ]
 
 [[instances]]
@@ -34,6 +64,9 @@ rcc_en_off = 0x8C   # RCC_AHB2ENR1
 rcc_en_bit = 7      # GPIOHEN
 
 # --- the two links to a companion processor -------------------------------------------------
+#
+# THESE GATE THROUGH A DIFFERENT REGISTER FROM THE PORTS ABOVE: RCC_APB3ENR at 0x0A8, not
+# RCC_AHB2ENR1 at 0x08C. See the note on that.
 
 [[instances]]
 name = "spi3"

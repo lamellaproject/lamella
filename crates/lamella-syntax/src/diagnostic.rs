@@ -122,8 +122,25 @@ pub enum DiagnosticKind {
     /// `class`/`struct`/`interface`/`enum`/`delegate` keyword was missing (16.4).
     TypeDeclarationExpected,
     /// `CS1671`: a namespace declaration carried an attribute section or a modifier (16.2).
+    ///
+    /// **ONE PER OFFENDING ITEM, AT ITS OWN START** -- measured: `[Obsolete] public namespace N { }`
+    /// draws TWO, at the `[` and at the `public`, not one for the declaration.
+    ///
+    /// **TOP-LEVEL ONLY.** Inside a namespace BODY csc answers `CS0116` instead, at a different
+    /// position -- a nested `[Obsolete] namespace Inner { }` is parsed as an attempt at a member, so
+    /// the diagnostic is about what a namespace may CONTAIN rather than about the declaration.
+    /// Applying this rule uniformly would report a code csc does not.
+    ///
+    /// **AND THE NESTED CASE IS STILL AN ACCEPTS-INVALID, MEASURED: lcsc reports NOTHING for
+    /// `namespace Outer { [Obsolete] namespace Inner { } }` where csc reports CS0116.** This rule
+    /// did not close that; it is a separate `CS0116` item and is recorded here rather than left to
+    /// look closed by association.
     NamespaceCannotHaveModifiersOrAttributes,
     /// `CS1730`: an `[assembly:]` or `[module:]` section appeared after a member (24.2).
+    ///
+    /// Measured: legal after `using` directives and `extern alias` declarations, illegal after a
+    /// type OR a namespace -- which is exactly the condition the file-scoped-namespace work already
+    /// tracks as `members_precede`. Reported at the TARGET keyword, not at the `[`.
     GlobalAttributeMustPrecedeMembers,
     /// `operator` was not followed by an overloadable operator (17.9).
     OverloadableOperatorExpected,

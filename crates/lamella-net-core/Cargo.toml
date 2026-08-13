@@ -1,0 +1,22 @@
+[package]
+name = "lamella-net-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The socket seam every Lamella language runtime drives: non-blocking sockets plus a readiness poll, behind a trait the embedder supplies."
+
+# A leaf, on the `lamella-gc` / `lamella-reactor` / `lamella-wtf8` pattern: a contract that every
+# language runtime and both execution tiers drive, depending on nothing so that any of them can
+# depend on IT. A backend implements this crate alone -- it does not need a language runtime, and a
+# language runtime does not need a backend.
+#
+# Binding this seam rather than wrapping one backend is what gives a language EVERY backend at once
+# (a Wi-Fi module, a Pico W radio, smoltcp over an Ethernet MAC, the host's own sockets) together
+# with settled would-block and handle-lifetime semantics. The alternative is a second socket stack
+# that disagrees with this one about whether a `recv` of 0 is a clean close.
+[dependencies]
+
+[lints]
+workspace = true

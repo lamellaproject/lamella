@@ -23,6 +23,11 @@ pub const SYNTHETIC_ARRAY_HANDLE_TABLE: u32 = 0x04;
 /// element kind would share one `__lamella_typedesc_*` with it -- and word 0 of an array descriptor
 /// is `MARK | rank` where word 0 of a class descriptor is a PAYLOAD SIZE, so whichever was laid
 /// first would describe the other.
+///
+/// The byte is `0x09` and not the next one up because `0x08` is the bare-handle spelling of the
+/// backends' EH-tag symbol word, which is matched by EXACT EQUALITY -- an instantiation whose hash
+/// payload happened to be zero would land on it. Leaving a byte between the two costs nothing and
+/// removes the knife edge rather than sizing a bound to it.
 pub const INSTANTIATION_HANDLE_TABLE: u32 = 0x09;
 
 /// The reserved handle for a synthesized array whose elements are `element_kind` -- the identity a
@@ -45,6 +50,16 @@ pub const fn synthetic_array_handle(element_kind: u32) -> TypeHandle {
 /// How far [`array_handle`] lifts an element's table byte to reach the array's own: `0x01` ->
 /// `0x05`, `0x02` -> `0x06`, `0x03` -> `0x07`, and [`INSTANTIATION_HANDLE_TABLE`] `0x09` -> `0x0D`.
 /// Those four bytes are RESERVED for array identities.
+///
+/// A handle rides the low bits of a descriptor reference word, so it is bounded by that word's
+/// flags -- but NOT, as this comment once said, by the lowest of them. The flags occupy bits 31..27
+/// and only three of them constrain a handle: the two that are BIT TESTED (bit 31 extern, bit 29
+/// string) and the one whose payload is matched by TOP BYTE (bit 28 statics, top byte `0x10`). The
+/// EH word at bit 27 is matched by EXACT EQUALITY and the descriptor flag at bit 30 is decoded
+/// FIRST, so neither bounds the space. A TypeSpec handle -- table byte `0x1B`, every rank-N array
+/// in shipping code -- has ridden above bit 27 for exactly this reason since before generics
+/// existed. The real rule is pinned as a property by
+/// `the_handle_space_is_bounded_by_the_bit_tested_flags`.
 pub const ARRAY_HANDLE_TABLE_OFFSET: u32 = 0x04;
 
 /// The handle identifying the rank-1 ARRAY whose elements are `element` -- `T[]`, given `T`.
@@ -62,6 +77,12 @@ pub const ARRAY_HANDLE_TABLE_OFFSET: u32 = 0x04;
 /// A handle that is ALREADY an array identity (a synthetic `0x04`) or that names no class
 /// descriptor at all (a bare TypeSpec, which is what an element the reader cannot name resolves to)
 /// is its own array handle: there is no class descriptor for it to collide with.
+///
+/// A generic INSTANTIATION is lifted like a class identity rather than passed through, because it
+/// is the one handle in that group that does own a class descriptor -- payload size, GC trace map
+/// and type tag, laid by the same emitter that lays an ordinary type's. Passing it through would
+/// give `Box<int>` and `Box<int>[]` one handle and therefore one descriptor, which is the exact
+/// collision this function was written to remove for `int` and `int[]`.
 #[must_use]
 pub const fn array_handle(element: TypeHandle) -> TypeHandle {
     match element.0 >> 24 {
@@ -103,14 +124,91 @@ pub enum MirType {
     /// runtime's contract; the IR treats it as one opaque word.
     PyValue,
     /// A value-type instance: a `size`-byte struct laid out inline, identified by its
-    /// layout [`TypeHandle`]. The size is carried for stack-slot allocation; field
-    /// offsets and which fields hold `O`/`&` come from the handle's metadata layout.
+    /// layout [`TypeHandle`], and carrying WHICH OF ITS WORDS HOLD OBJECT REFERENCES.
+    ///
+    /// **`refs` IS HERE BECAUSE THE HANDLE CANNOT ANSWER IT.** Field offsets and which fields hold
+    /// `O`/`&` are recorded in the handle's metadata layout, but no backend holds metadata at the
+    /// point it needs them: the stack-map root builder sees only a [`crate::Function`]. Without
+    /// this field a frame holding a live reference inside a struct local enumerates that reference
+    /// nowhere -- the containing slot is not a pointer, and its interior words are invisible to a
+    /// type-keyed walk. On a MARK-COMPACT heap that is an object collected while live, and a stale
+    /// word if it survives.
+    ///
+    /// **THE TWO SENTINEL HANDLES ARE WHAT SAID THE IR WAS UNDER-SPECIFIED.** `REF_CELL_HANDLE` and
+    /// `EXCEPTION_CELL_HANDLE` were smuggled into `handle` because a caller needed to express
+    /// per-cell GC semantics the type could not carry; both are ordinary values of this field
+    /// (`RefWords::at_word(0)` and [`RefWords::NONE`]), which is what makes it the right vocabulary
+    /// rather than a third special case.
     ValueType {
-        /// The value type's layout handle: its identity for field offsets and GC map.
+        /// The value type's layout handle: its identity for field offsets.
         handle: TypeHandle,
         /// The instance's size in bytes, for stack-slot allocation.
         size: u32,
+        /// Which words of the instance hold object references, for the GC stack map.
+        refs: RefWords,
     },
+}
+
+/// Which WORDS of a value-type instance hold object references -- the GC trace map of one inline
+/// struct, as a bitmask: bit `i` marks the word at byte offset `i * 4`.
+///
+/// # Why a bitmask, and what it costs
+///
+/// [`MirType`] is `Copy` and is copied everywhere a compiler copies a type, so a `Vec` is not
+/// available here. A bitmask keeps that and bounds the map at **32 words (128 bytes)**. Past the
+/// bound [`RefWords::from_offsets`] REFUSES rather than truncating: a truncated trace map is a
+/// reference the collector never visits, which is the exact defect this type exists to close, and a
+/// frame-resident aggregate that large is pathological on this tier. Refuse loudly, do not round.
+///
+/// **DELIBERATELY NOT `Default`**, for the reason [`crate::TypeHandle`]'s owner-stamping analogue in
+/// the backend is not: the safe-looking value is `NONE`, which is exactly what a forgotten
+/// assignment would take and exactly the one that drops a live root. Constructing a value-type slot
+/// must state its trace map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RefWords(u32);
+
+impl RefWords {
+    /// No word of the instance holds an object reference -- every scalar struct, and the
+    /// frame-materialized exception cell whose words are a descriptor address and zeroed fields.
+    pub const NONE: RefWords = RefWords(0);
+
+    /// The map whose only reference is the word at `word` (`REF_CELL_HANDLE`'s shape).
+    #[must_use]
+    pub const fn at_word(word: u32) -> RefWords {
+        RefWords(1u32 << word)
+    }
+
+    /// The map for references at these BYTE offsets, or `None` if any lies past the 32-word bound
+    /// or is not word-aligned. Both refusals are the same rule: a map that cannot be represented
+    /// exactly is not narrowed to one that can.
+    #[must_use]
+    pub fn from_offsets(offsets: &[u32]) -> Option<RefWords> {
+        let mut bits = 0u32;
+        for offset in offsets {
+            if offset % 4 != 0 || offset / 4 >= 32 {
+                return None;
+            }
+            bits |= 1u32 << (offset / 4);
+        }
+        Some(RefWords(bits))
+    }
+
+    /// Whether the word at byte offset `offset` holds an object reference.
+    #[must_use]
+    pub const fn contains_offset(self, offset: u32) -> bool {
+        offset % 4 == 0 && offset / 4 < 32 && (self.0 >> (offset / 4)) & 1 == 1
+    }
+
+    /// The byte offsets of the reference words, ascending.
+    pub fn offsets(self) -> impl Iterator<Item = u32> {
+        (0..32).filter(move |w| (self.0 >> w) & 1 == 1).map(|w| w * 4)
+    }
+
+    /// Whether any word holds a reference.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 impl MirType {
@@ -170,10 +268,24 @@ mod tests {
         assert!(
             !MirType::ValueType {
                 handle: TypeHandle(1),
-                size: 8
+                size: 8,
+                refs: RefWords::at_word(0),
             }
             .is_gc_reference()
         );
+    }
+
+    #[test]
+    fn a_trace_map_refuses_rather_than_narrowing_past_its_bound() {
+        assert_eq!(
+            RefWords::from_offsets(&[0, 124]).map(|m| m.offsets().collect::<Vec<_>>()),
+            Some(vec![0, 124])
+        );
+        assert_eq!(RefWords::from_offsets(&[128]), None);
+        assert_eq!(RefWords::from_offsets(&[2]), None);
+        assert!(RefWords::NONE.is_empty());
+        assert!(RefWords::at_word(0).contains_offset(0));
+        assert!(!RefWords::at_word(0).contains_offset(4));
     }
 
     #[test]
@@ -191,7 +303,23 @@ mod tests {
     ///
     /// A handle rides the low bits of a descriptor reference word alongside five flags in bits
     /// 31..27, and for years the rule written down here was "every table byte must stay under
-    /// `0x08`, where the flags begin".
+    /// `0x08`, where the flags begin". THAT RULE WAS NEVER TRUE OF SHIPPING CODE: a TypeSpec
+    /// handle -- table byte `0x1B`, every rank-N array -- has ridden above bit 27 the whole time.
+    /// What actually keeps the word unambiguous is which flags are BIT TESTED:
+    ///
+    /// - bit 31 (extern) and bit 29 (string) are bit tested, so a table byte may not reach either;
+    /// - bit 28 (statics) is matched by TOP BYTE, so a handle need only differ there from `0x10`;
+    /// - bit 27 (EH) is matched by EXACT EQUALITY and bit 30 (descriptor) is decoded FIRST, so
+    ///   neither bounds a handle at all.
+    ///
+    /// Stating it as a ceiling made the space look one byte from full and cost a real decision:
+    /// a generic instantiation was minted onto `0x04`, already the front-end synthetic array's,
+    /// because that read left nowhere else for it to go. So this test pins the BOUND rather than
+    /// the CENSUS -- it fails if a new flag is added below bit 30, if a bit-tested flag moves down
+    /// onto an allocated byte, or if two identity kinds are given one byte, and it stays silent
+    /// about how many bytes remain, which is not a property anything depends on. Its backend-side
+    /// twin is `arm32::tests::a_typespec_handle_never_aliases_a_bit_tested_symbol_flag`, which
+    /// pins the same discipline from the descriptor reference word's side.
     #[test]
     fn the_handle_space_is_bounded_by_the_bit_tested_flags() {
         const EXTERN_SYMBOL_FLAG: u32 = 0x8000_0000;

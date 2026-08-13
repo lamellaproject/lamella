@@ -93,4 +93,25 @@ public sealed class Samd21GpioDriver : GpioDriver
     {
         return GroupBase(pinNumber) + Samd21PortLayout.PINCFG0_OFF + (uint)(pinNumber & 31);
     }
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void AddCallbackForPinValueChangedEvent(
+        int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("SAMD21 pin-change events are not implemented");
+#else
+        throw new System.Exception("SAMD21 pin-change events are not implemented");
+#endif
+    }
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void RemoveCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("SAMD21 pin-change events are not implemented");
+#else
+        throw new System.Exception("SAMD21 pin-change events are not implemented");
+#endif
+    }
 }

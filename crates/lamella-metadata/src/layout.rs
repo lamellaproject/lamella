@@ -59,6 +59,12 @@ pub enum LayoutError {
     /// A nested value-type field's token could not be resolved to its layout.
     UnresolvedValueType(Token),
     /// A field's type still mentions a type parameter, so it has no layout yet.
+    ///
+    /// **A REFUSAL, NOT A GAP.** `T` has no size until an instantiation supplies one, and
+    /// `Box<int>` has none until the definition is resolved -- so there is no correct number to
+    /// return and any guess would be a size the collector later walks. Under bake-time lowering
+    /// nothing generic should reach layout at all: the baker substitutes first. Reaching this means
+    /// the lowering did not run, and saying so loudly is the whole point.
     GenericNotInstantiated(SigType),
 }
 

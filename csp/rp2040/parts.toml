@@ -17,7 +17,11 @@ part = "rp2040"
 package = "QFN-56"
 flash = 0
 ram = 0x42000
-pins = ["GP0-GP1", "GP7", "GP13", "GP16-GP17", "GP23-GP25", "GP29"]
+pins = ["GP0-GP3", "GP7", "GP13", "GP16-GP17", "GP23-GP25", "GP29"]
+# GP2 and GP3 join on the datasheet rather than on silicon, which the first paragraph allows and
+# which is worth marking as the different kind of evidence it is: Table 615, the part's own pin
+# list, gives GPIO2 as package pin 4 and GPIO3 as pin 5, both digital IO in the IOVDD domain. A
+# board brings them out to an expansion socket, which is what demanded the rows.
 # TWO PROCESSOR SOCKETS, and the part has had them since the day this family landed -- nothing
 # above changed because nothing an IMAGE is built against differs between them. The datasheet
 # calls it a "symmetric dual-core processor complex": both cores are AHB-Lite masters on one bus
@@ -26,4 +30,4 @@ pins = ["GP0-GP1", "GP7", "GP13", "GP16-GP17", "GP23-GP25", "GP29"]
 # code, via the mailbox" -- so boot is single-core and the SECOND core is started by the program.
 cores = { core0 = ["cortex-m0plus"], core1 = ["cortex-m0plus"] }
 cores_share_memory = true
-source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- the pin list is PARTIAL rather than the package's full set. Every pin here is inside the range section 2.19.1 states outright: RP2040 has 36 GPIOs in two banks, and the QSPI bank aside, the User bank is GPIO0 to GPIO29 for the programmer to use. What SELECTS the ten listed is evidence rather than the package: two are reached by a uart binding and the other eight by wired control lines. One cell can be reached for different purposes by different carriers -- GP25 drives an indicator on one and a chip select on another -- which is why nothing about a pin's USE belongs on this row."
+source = "RP2040 datasheet 2.6 (264 KB SRAM) + ch 1 (QFN-56, external QSPI flash) -- the pin list is PARTIAL rather than the package's full set. Every pin here is inside the range section 2.19.1 states outright: RP2040 has 36 GPIOs in two banks, and the QSPI bank aside, the User bank is GPIO0 to GPIO29 for the programmer to use. What SELECTS the pins listed is evidence rather than the package: a uart binding reaches some, wired control lines others, and an expansion socket the two a board brings out. The list grows with the evidence, so it states no total. One cell can be reached for different purposes by different carriers -- GP25 drives an indicator on one and a chip select on another -- which is why nothing about a pin's USE belongs on this row."

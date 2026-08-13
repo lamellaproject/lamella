@@ -313,7 +313,7 @@ const ABBREV_SUBPROGRAM: u64 = 2;
 /// `DW_LANG_C_sharp` -- the registered `DW_AT_language` code for C#, default lower bound 0.
 ///
 /// It is NOT in the DWARF 5 spec: table 7.17 ends at `DW_LANG_BLISS` (0x25). It was registered
-/// afterwards through the standard's public-comment process (issue 230203.1, accepted 2023-04-11)
+/// afterwards through the standard's public-comment process (issue 230203.1, accepted April 2023)
 /// and carried into DWARF 6. The stated motivation is worth knowing, because it is the same problem
 /// we have: .NET began emitting DWARF for natively compiled executables and had no code to name the
 /// language with.

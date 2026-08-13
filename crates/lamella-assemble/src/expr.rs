@@ -112,6 +112,16 @@ fn method_instantiation_marker_symbol() -> TypeSymbol {
 
 /// The token-table key for a generic CALL SITE: the definition's OPEN parameters, the marker,
 /// then the type arguments the site named.
+///
+/// **THE TYPE ARGUMENTS MUST BE IN THE KEY, AND THE SUBSTITUTED PARAMETERS ARE NOT A
+/// SUBSTITUTE FOR THEM.** A generic method need not mention its own type parameter in its
+/// signature -- `T Make<T>(int seed)` closes to `Make(int)` for EVERY `T` -- so keying a site by
+/// what it resolved to would give `Make<int>(0)` and `Make<string>(0)` one row, one `MethodSpec`,
+/// and whichever argument was minted first. That is the same collapse a shared `TypeSpec` would
+/// be, reached through the method table instead of the type one.
+///
+/// The OPEN parameters lead rather than the closed ones so that a site key can never coincide
+/// with another method's DEF key (which has no marker) or a vararg site's (whose marker differs).
 pub(crate) fn generic_site_lookup_params(
     open_parameters: &[TypeSymbol],
     type_arguments: &[TypeSymbol],
@@ -148,8 +158,16 @@ pub fn emit_expression(
                 if emit_pointer_arithmetic(*operator, left, right, *checked, frame, tokens, out)? {
                     return Ok(());
                 }
+                let reference_equality =
+                    matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual);
                 emit_expression(left, frame, tokens, out)?;
+                if reference_equality {
+                    box_type_parameter(&left.ty, tokens, out)?;
+                }
                 emit_expression(right, frame, tokens, out)?;
+                if reference_equality {
+                    box_type_parameter(&right.ty, tokens, out)?;
+                }
                 let is_string =
                     |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(SpecialType::String));
                 if matches!(operator, BinaryOperator::Add) && is_string(&expr.ty) {
@@ -231,7 +249,7 @@ pub fn emit_expression(
             emit_expression(operand, frame, tokens, out)?;
             if matches!(conversion, ConversionKind::Boxing) {
                 let token = tokens
-                    .type_token(&operand.ty)
+                    .instruction_type_token(&operand.ty)
                     .ok_or(EmitError::Unsupported(
                         "boxing a value type with no metadata token",
                     ))?;
@@ -264,7 +282,7 @@ pub fn emit_expression(
             if is_value_type(&expr.ty, tokens) {
                 if tokens.is_struct(&expr.ty) || tokens.is_enum(&expr.ty) {
                     let token = tokens
-                        .type_token(&expr.ty)
+                        .instruction_type_token(&expr.ty)
                         .ok_or(EmitError::Unsupported("a value-type `this` with no token"))?;
                     out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
                 } else {
@@ -309,6 +327,7 @@ pub fn emit_expression(
         } => emit_conditional(condition, when_true, when_false, frame, tokens, out),
         BoundExprKind::TypeOf(target) => emit_typeof(target, tokens, out),
         BoundExprKind::SizeOf(target) => emit_sizeof(target, tokens, out),
+        BoundExprKind::DefaultValue(target) => emit_default_value(target, frame, tokens, out),
         BoundExprKind::MakeRef(operand) => emit_makeref(operand, frame, tokens, out),
         BoundExprKind::ArgListValue => {
             out.push(Instruction::simple(Opcode::Arglist));
@@ -360,12 +379,12 @@ pub fn emit_expression(
                 return Ok(());
             }
             if is_value_type(&operand.ty, tokens) {
-                let box_token = tokens.type_token(&operand.ty).ok_or(EmitError::Unsupported(
+                let box_token = tokens.instruction_type_token(&operand.ty).ok_or(EmitError::Unsupported(
                     "boxing a value type for a type test with no metadata token",
                 ))?;
                 out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
             }
-            let token = tokens.type_token(target).ok_or(EmitError::Unsupported(
+            let token = tokens.instruction_type_token(target).ok_or(EmitError::Unsupported(
                 "a type test against a type with no metadata token",
             ))?;
             out.push(Instruction::new(Opcode::Isinst, Operand::Token(token)));
@@ -434,7 +453,7 @@ pub fn emit_expression(
                 out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
                 emit_expression(value, frame, tokens, out)?;
                 let kept = keep_assigned(true, &value.ty, frame, out);
-                let token = tokens.type_token(&target.ty).ok_or(EmitError::Unsupported(
+                let token = tokens.instruction_type_token(&target.ty).ok_or(EmitError::Unsupported(
                     "`this =` on a value type with no token",
                 ))?;
                 out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
@@ -526,7 +545,7 @@ fn emit_array_creation(
         return Ok(());
     }
     let element_token = tokens
-        .type_token(element)
+        .instruction_type_token(element)
         .ok_or(EmitError::Unsupported("array element type has no token"))?;
     if !elements.is_empty() || lengths.is_empty() {
         if let Some(length) = lengths.first() {
@@ -550,7 +569,7 @@ fn emit_array_creation(
                 out.push(Instruction::new(Opcode::Stobj, Operand::Token(element_token)));
             } else {
                 emit_expression(value, frame, tokens, out)?;
-                out.push(Instruction::simple(stelem_opcode(element)?));
+                out.push(stelem_instruction(element, tokens)?);
             }
         }
         return Ok(());
@@ -683,12 +702,12 @@ fn emit_element_load(
         || matches!(element_ty, TypeSymbol::Special(SpecialType::Decimal))
     {
         let token = tokens
-            .type_token(element_ty)
+            .instruction_type_token(element_ty)
             .ok_or(EmitError::Unsupported("array element type has no token"))?;
         out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
         out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
     } else {
-        out.push(Instruction::simple(ldelem_opcode(element_ty)?));
+        out.push(ldelem_instruction(element_ty, tokens)?);
     }
     Ok(())
 }
@@ -743,7 +762,7 @@ pub(crate) fn emit_element_store(
         || matches!(element_ty, TypeSymbol::Special(SpecialType::Decimal))
     {
         let token = tokens
-            .type_token(element_ty)
+            .instruction_type_token(element_ty)
             .ok_or(EmitError::Unsupported("array element type has no token"))?;
         out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
         emit_expression(value, frame, tokens, out)?;
@@ -753,7 +772,7 @@ pub(crate) fn emit_element_store(
     } else {
         emit_expression(value, frame, tokens, out)?;
         let kept = keep_assigned(leave, &value.ty, frame, out);
-        out.push(Instruction::simple(stelem_opcode(element_ty)?));
+        out.push(stelem_instruction(element_ty, tokens)?);
         kept
     };
     load_kept(kept, out);
@@ -761,7 +780,38 @@ pub(crate) fn emit_element_store(
 }
 
 /// The `ldelem.*` opcode for reading an element of the given type.
-pub(crate) fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
+/// The instruction that READS `array[index]` for an element of this type.
+///
+/// **A TYPE PARAMETER TAKES THE TOKEN-CARRYING `ldelem` (III.4.7), NOT ONE OF THE WIDTH-SPECIFIC
+/// FORMS.** `T[]` is `int[]` under one instantiation and `string[]` under another, so no opcode
+/// chosen at compile time is right for both -- `ldelem.ref` on a `T` closed over `int` reads the
+/// value as a reference. The token form defers the decision to the instantiation in hand, which is
+/// what csc emits and the only lowering that is correct for either.
+pub(crate) fn ldelem_instruction(
+    element_ty: &TypeSymbol,
+    tokens: &Tokens,
+) -> Result<Instruction, EmitError> {
+    if let Some(spec) = tokens.type_parameter_spec(element_ty) {
+        return Ok(Instruction::new(Opcode::Ldelem, Operand::Token(spec)));
+    }
+    Ok(Instruction::simple(ldelem_opcode(element_ty)?))
+}
+
+/// The instruction that WRITES `array[index]` for an element of this type. The `stelem` twin of
+/// [`ldelem_instruction`], and the same rule for the same reason -- `stelem.ref` storing a `T`
+/// closed over `int` writes an integer where a reference is expected, which faults at the next read
+/// rather than at the store.
+pub(crate) fn stelem_instruction(
+    element_ty: &TypeSymbol,
+    tokens: &Tokens,
+) -> Result<Instruction, EmitError> {
+    if let Some(spec) = tokens.type_parameter_spec(element_ty) {
+        return Ok(Instruction::new(Opcode::Stelem, Operand::Token(spec)));
+    }
+    Ok(Instruction::simple(stelem_opcode(element_ty)?))
+}
+
+fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
     Ok(match element_ty {
         TypeSymbol::Special(special) => match special {
             SpecialType::SByte => Opcode::LdelemI1,
@@ -789,7 +839,7 @@ pub(crate) fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
 }
 
 /// The `stelem.*` opcode for writing an element of the given type.
-pub(crate) fn stelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
+fn stelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
     Ok(match element_ty {
         TypeSymbol::Special(special) => match special {
             SpecialType::SByte | SpecialType::Byte | SpecialType::Boolean => Opcode::StelemI1,
@@ -829,7 +879,7 @@ fn emit_new(
     };
     if arguments.is_empty() && is_value_type(&constructor.declaring_type, tokens) {
         let type_token = tokens
-            .type_token(&constructor.declaring_type)
+            .instruction_type_token(&constructor.declaring_type)
             .ok_or(EmitError::Unsupported(
                 "a value type with no metadata token for initobj",
             ))?;
@@ -904,7 +954,7 @@ fn emit_delegate_creation(
                 && !matches!(receiver.kind, BoundExprKind::Base)
                 && is_value_type(&receiver.ty, tokens)
             {
-                let box_token = tokens.type_token(&receiver.ty).ok_or(EmitError::Unsupported(
+                let box_token = tokens.instruction_type_token(&receiver.ty).ok_or(EmitError::Unsupported(
                     "boxing a delegate receiver with no type token",
                 ))?;
                 out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
@@ -955,6 +1005,10 @@ fn emit_call(
         Some(r) if is_value_type(&r.ty, tokens) => Some(&r.ty),
         _ => None,
     };
+    let type_parameter_receiver = match receiver {
+        Some(r) if tokens.body_type_parameter(&r.ty).is_some() => Some(&r.ty),
+        _ => None,
+    };
     let is_base_call = matches!(receiver, Some(r) if matches!(r.kind, BoundExprKind::Base));
     let inherited_value_call =
         matches!(value_type_receiver, Some(ty) if !same_type(&method.declaring_type, ty));
@@ -962,9 +1016,16 @@ fn emit_call(
     if !method.is_static {
         match &callee.kind {
             BoundExprKind::MethodGroup { receiver, .. } => {
-                if inherited_value_call {
+                if type_parameter_receiver.is_some() {
                     emit_value_type_receiver(receiver, frame, tokens, out)?;
-                    constrained_token = Some(tokens.type_token(&receiver.ty).ok_or(
+                    constrained_token = Some(tokens.instruction_type_token(&receiver.ty).ok_or(
+                        EmitError::Unsupported(
+                            "a call on a type parameter with no metadata token",
+                        ),
+                    )?);
+                } else if inherited_value_call {
+                    emit_value_type_receiver(receiver, frame, tokens, out)?;
+                    constrained_token = Some(tokens.instruction_type_token(&receiver.ty).ok_or(
                         EmitError::Unsupported(
                             "a virtual call on a value type with no metadata token",
                         ),
@@ -1014,7 +1075,7 @@ fn emit_call(
                 ))?
         }
     };
-    let opcode = if inherited_value_call {
+    let opcode = if inherited_value_call || type_parameter_receiver.is_some() {
         Opcode::Callvirt
     } else if method.is_static || value_type_receiver.is_some() || is_base_call {
         Opcode::Call
@@ -1290,6 +1351,11 @@ pub(crate) fn emit_indexer_store(
 /// dup ; <value> ; callvirt C::Add         a collection element
 /// dup ; ldfld C::F ; <nested...> ; pop    a NESTED initializer
 /// ```
+///
+/// **The nested form loads the member and assigns INTO it -- it constructs nothing.** `ldfld` then
+/// the nested members then `pop`: the `pop` discards the member value the nested stores were made
+/// against, leaving the outer object. Emitting a `newobj` there instead would be the natural
+/// misreading and would silently replace whatever `F` already referred to.
 fn emit_initializer(
     initializer: &BoundInitializer,
     target_ty: &TypeSymbol,
@@ -1442,7 +1508,7 @@ fn emit_cast(
         return Err(EmitError::Unsupported("this pointer cast is not lowered"));
     }
     if is_value_type(to, tokens) && !is_value_type(from, tokens) {
-        let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
+        let token = tokens.instruction_type_token(to).ok_or(EmitError::Unsupported(
             "unboxing to a value type with no metadata token",
         ))?;
         out.push(Instruction::new(Opcode::Unbox, Operand::Token(token)));
@@ -1454,15 +1520,15 @@ fn emit_cast(
         return Ok(());
     }
     if matches!(to, TypeSymbol::Special(SpecialType::String)) {
-        let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
+        let token = tokens.instruction_type_token(to).ok_or(EmitError::Unsupported(
             "a cast to string with no metadata token",
         ))?;
         out.push(Instruction::new(Opcode::Castclass, Operand::Token(token)));
         return Ok(());
     }
     if matches!(to, TypeSymbol::Special(SpecialType::Object)) {
-        if is_value_type(from, tokens) {
-            let token = tokens.type_token(from).ok_or(EmitError::Unsupported(
+        if boxes_to_a_reference(from, tokens) {
+            let token = tokens.instruction_type_token(from).ok_or(EmitError::Unsupported(
                 "boxing to object with no metadata token",
             ))?;
             out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
@@ -1480,23 +1546,65 @@ fn emit_cast(
         }
         return emit_numeric_conversion(from, to, out);
     }
-    if is_value_type(from, tokens) {
-        let token = tokens.type_token(from).ok_or(EmitError::Unsupported(
+    if boxes_to_a_reference(from, tokens) {
+        let token = tokens.instruction_type_token(from).ok_or(EmitError::Unsupported(
             "boxing to an interface with no metadata token",
         ))?;
         out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
         return Ok(());
     }
     let to_reference = matches!(to, TypeSymbol::Array { .. })
-        || (matches!(to, TypeSymbol::Named(_)) && !is_value_type(to, tokens));
+        || (matches!(to, TypeSymbol::Named(_) | TypeSymbol::Instantiation { .. })
+            && !is_value_type(to, tokens));
     if to_reference {
-        let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
+        let token = tokens.instruction_type_token(to).ok_or(EmitError::Unsupported(
             "a cast to a reference type with no metadata token",
         ))?;
         out.push(Instruction::new(Opcode::Castclass, Operand::Token(token)));
         return Ok(());
     }
     Err(EmitError::Unsupported("this cast is not lowered yet"))
+}
+
+/// Emits `box !T` when `ty` is a bare type parameter of the body being emitted, and nothing
+/// otherwise. A reference comparison converts its operand to `object`, and for a type parameter
+/// that conversion is a box.
+///
+/// It is keyed on [`Tokens::body_type_parameter`] rather than on [`is_value_type`], which answers
+/// NO for a type parameter: a `T` is neither a struct nor an enum in the token tables, so a box
+/// gated on that predicate is skipped for exactly the types that need one.
+fn box_type_parameter(
+    ty: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if tokens.body_type_parameter(ty).is_none() {
+        return Ok(());
+    }
+    let token = tokens
+        .instruction_type_token(ty)
+        .ok_or(EmitError::Unsupported(
+            "boxing a type parameter for a reference comparison with no metadata token",
+        ))?;
+    out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
+    Ok(())
+}
+
+/// Whether converting `ty` to `object` or to an interface must emit `box`.
+///
+/// **A TYPE PARAMETER BOXES HERE EVEN THOUGH IT IS NOT A VALUE TYPE**, and that is the difference
+/// between a program that runs and one the runtime refuses to load. `T` is decided per
+/// instantiation, so the compiler cannot know which conversion it is -- and `box !n` is the answer
+/// for BOTH: it copies a value type onto the heap and is a no-op returning the same reference for a
+/// reference type (III.4.1). Omitting it leaves a `!0` on the stack where the callee's signature
+/// says `object`, which is not a type error the emitter can see and IS one the verifier reports as
+/// `InvalidProgramException` at the first call.
+///
+/// Stated once and used at every boxing site, because the value-type test and the parameter test
+/// answer the same question and a site that asks only the first one silently emits the shorter,
+/// wrong sequence.
+fn boxes_to_a_reference(ty: &TypeSymbol, tokens: &Tokens) -> bool {
+    is_value_type(ty, tokens) || tokens.body_type_parameter(ty).is_some()
 }
 
 /// Whether `ty` is a value type that boxes/unboxes by token: a numeric/`bool`/`char`
@@ -1745,7 +1853,7 @@ pub(crate) fn emit_value_type_receiver(
             }
             if indices.len() == 1 {
                 let element = tokens
-                    .type_token(&receiver.ty)
+                    .instruction_type_token(&receiver.ty)
                     .ok_or(EmitError::Unsupported("ldelema element type has no token"))?;
                 out.push(Instruction::new(Opcode::Ldelema, Operand::Token(element)));
             } else {
@@ -1779,7 +1887,7 @@ pub(crate) fn emit_local(
         out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
         if tokens.is_struct(element) || tokens.is_enum(element) {
             let token = tokens
-                .type_token(element)
+                .instruction_type_token(element)
                 .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
             out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
         } else {
@@ -1932,7 +2040,7 @@ pub(crate) fn emit_byref_load(
 ) -> Result<(), EmitError> {
     if tokens.is_struct(element) || tokens.is_enum(element) {
         let token = tokens
-            .type_token(element)
+            .instruction_type_token(element)
             .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
         out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
     } else {
@@ -1951,7 +2059,7 @@ pub(crate) fn emit_byref_store(
 ) -> Result<(), EmitError> {
     if tokens.is_struct(element) || tokens.is_enum(element) {
         let token = tokens
-            .type_token(element)
+            .instruction_type_token(element)
             .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
         out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
     } else {
@@ -2049,7 +2157,7 @@ fn emit_typeof(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     let type_token = tokens
-        .type_token(target)
+        .instruction_type_token(target)
         .ok_or(EmitError::Unsupported("typeof of a type with no token"))?;
     out.push(Instruction::new(Opcode::Ldtoken, Operand::Token(type_token)));
     let method = tokens
@@ -2066,6 +2174,86 @@ fn emit_typeof(
 /// Lowers `sizeof(T)`: a struct/enum emits the `sizeof` opcode over its token (the runtime
 /// computes the size from the shared value-type layout); a primitive is its constant byte
 /// size (csc likewise folds `sizeof(primitive)`).
+/// Lowers `default(T)` (14.5.13): the target type's zero.
+///
+/// Three shapes, chosen by what the type IS rather than by what it is called:
+///
+/// - a REFERENCE type -- `ldnull`;
+/// - a PRIMITIVE -- its zero literal, at the right width (`ldc.i4.0`, `ldc.i8 0`, `ldc.r4 0`);
+/// - a VALUE type OR a TYPE PARAMETER -- a temporary, `ldloca; initobj; ldloc`.
+///
+/// **THE TYPE PARAMETER IS THE CASE THE OPERATOR EXISTS FOR, AND IT IS WHY THE VALUE CANNOT BE
+/// FOLDED EARLIER.** `T` may close over a reference type, where the answer is `null`, or a struct,
+/// where it is an all-zero value -- and one `default(T)` is both, decided per instantiation. So the
+/// lowering is the one form that is correct for either: `initobj` over a token naming `!n`, which
+/// the runtime resolves against the instantiation in hand.
+///
+/// **A BARE `T` HAS NO ORDINARY TOKEN, DELIBERATELY** -- minting one would invent a `TypeRef` to
+/// a type called `T` that no assembly declares, which is a defect this compiler had and removed. It
+/// is named instead by a `TypeSpec` whose blob is `ELEMENT_TYPE_VAR n`, pre-minted per POSITION
+/// (see `Tokens::var_spec`) because emission cannot mint.
+fn emit_default_value(
+    target: &TypeSymbol,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if let TypeSymbol::Named(parts) = target
+        && let [only] = &parts[..]
+        && let Some(index) = frame.type_parameter_index(only)
+    {
+        let spec = tokens.var_spec(index).ok_or(EmitError::Unsupported(
+            "default of a type parameter with no TypeSpec minted for its position",
+        ))?;
+        let slot = frame.reserve_local(target);
+        out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+        out.push(Instruction::new(Opcode::Initobj, Operand::Token(spec)));
+        out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+        return Ok(());
+    }
+    if let TypeSymbol::Special(special) = target {
+        match special {
+            SpecialType::Boolean
+            | SpecialType::Char
+            | SpecialType::SByte
+            | SpecialType::Byte
+            | SpecialType::Int16
+            | SpecialType::UInt16
+            | SpecialType::Int32
+            | SpecialType::UInt32 => {
+                out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+                return Ok(());
+            }
+            SpecialType::Int64 | SpecialType::UInt64 => {
+                out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+                out.push(Instruction::new(Opcode::ConvI8, Operand::None));
+                return Ok(());
+            }
+            SpecialType::Single => {
+                out.push(Instruction::new(Opcode::LdcR4, Operand::Float32(0.0)));
+                return Ok(());
+            }
+            SpecialType::Double => {
+                out.push(Instruction::new(Opcode::LdcR8, Operand::Float64(0.0)));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    if is_value_type(target, tokens) {
+        let type_token = tokens.instruction_type_token(target).ok_or(EmitError::Unsupported(
+            "default of a value type with no metadata token",
+        ))?;
+        let slot = frame.reserve_local(target);
+        out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+        out.push(Instruction::new(Opcode::Initobj, Operand::Token(type_token)));
+        out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+        return Ok(());
+    }
+    out.push(Instruction::new(Opcode::Ldnull, Operand::None));
+    Ok(())
+}
+
 pub(crate) fn emit_sizeof(
     target: &TypeSymbol,
     tokens: &Tokens,
@@ -2078,7 +2266,7 @@ pub(crate) fn emit_sizeof(
         return Ok(());
     }
     let token = tokens
-        .type_token(target)
+        .instruction_type_token(target)
         .ok_or(EmitError::Unsupported("sizeof of a type with no token"))?;
     out.push(Instruction::new(Opcode::Sizeof, Operand::Token(token)));
     Ok(())
@@ -2141,7 +2329,7 @@ fn emit_makeref(
 ) -> Result<(), EmitError> {
     emit_value_type_receiver(operand, frame, tokens, out)?;
     let token = tokens
-        .type_token(&operand.ty)
+        .instruction_type_token(&operand.ty)
         .ok_or(EmitError::Unsupported("__makeref operand type has no token"))?;
     out.push(Instruction::new(Opcode::Mkrefany, Operand::Token(token)));
     Ok(())
@@ -2158,7 +2346,7 @@ fn emit_refvalue(
 ) -> Result<(), EmitError> {
     emit_expression(reference, frame, tokens, out)?;
     let token = tokens
-        .type_token(target)
+        .instruction_type_token(target)
         .ok_or(EmitError::Unsupported("__refvalue type has no token"))?;
     out.push(Instruction::new(Opcode::Refanyval, Operand::Token(token)));
     emit_byref_load(target, tokens, out)

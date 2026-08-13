@@ -1,5 +1,28 @@
 # PARTS table for the stm32h7 family. Pin lists are PARTIAL present-lists: they carry the pins the
 # boards reach, so a consumer must not read one as the package.
+#
+# THE FAMILY NAME IS NARROWER THAN IT LOOKS, and saying so is the point of this paragraph. A
+# family here owns ONE reference manual and one pin-function table. RM0399's introduction states
+# its own scope -- it "provides complete information on how to use the STM32H745/55/47/57xx
+# microcontroller memory and peripherals" -- and that is four lines, not the H7 series. The board
+# manual for the carrier below is a manual for THREE boards, and one of them carries an
+# STM32H7A3ZIT6Q, a part RM0399 never mentions and whose reference manual is a different document.
+# So `stm32h7` is a name too narrow for its contents in exactly the way `stm32f42x` and
+# `stm32f091` are, and a later H7 part joins only if RM0399's own scope sentence names its line.
+#
+# THE PART HAS TWO PROCESSORS AND THEY ARE NOT INTERCHANGEABLE, which is what this row is here
+# to say. The sockets below run DIFFERENT architectures, so no single image can drive both: the
+# combinability test comes back refused on its architecture arm, and a target selects one core.
+# RM0399's own registers call them CPU1 and CPU2 -- CPU1 is the Cortex-M7, in the D1 domain, and
+# CPU2 is the Cortex-M4, in D2 -- while the option bytes that pick their boot addresses are named
+# BCM7 and BCM4, by core. The sockets are named for the cores here because on this part a socket
+# is not a slot that could hold either one; which core sits where is silicon.
+#
+# AND WHICH CORE BOOTS IS A FLASHED FACT, NOT A PROGRAM'S DECISION. RM0399 Table 8 is four
+# rows over two option bits, and the fourth row is easy to lose: BCM7/BCM4 = 0/0 boots the M7 with
+# the M4 gated, 0/1 boots the M4 with the M7 gated, 1/0 boots the M7 with the M4 gated again, and
+# 1/1 boots both. So the two bits are NOT one enable each: BCM4 decides whether the M4 runs, and
+# BCM7 changes nothing unless BCM4 is already 1. There is no encoding in which neither core boots.
 
 [table]
 kind = "parts"
@@ -26,6 +49,29 @@ pins = [
     "PD8-PD9",
     "PE1",
 ]
+# TWO PROCESSOR SOCKETS RUNNING TWO DIFFERENT ARCHITECTURES. That is the whole reason this row
+# exists: it is the first part here whose cores CANNOT be driven as one threaded system, and the
+# refusal comes from the architecture condition rather than from the memory one.
+#
+# cores_share_memory IS TRUE, and it is read rather than assumed. RM0399 Table 6 prints a column
+# per core and the two columns are identical everywhere it matters: both cores see flash bank 1 at
+# 0x08000000 AND flash bank 2 at 0x08100000, the AXI SRAM, SRAM1/2/3 and their aliases, SRAM4, the
+# backup SRAM and every peripheral bus, all at the same addresses. Table 2 agrees from the bus
+# side, giving the Cortex-M4's S-, D- and I-buses an access path to both flash banks and to the
+# AXI SRAM. The columns differ in exactly three rows, and all three are core-private by
+# construction rather than a second address space: the M7's ITCM at 0x00000000 and DTCM at
+# 0x20000000 are tightly coupled to that core and read Reserved for the M4, which instead has a
+# VTOR remap alias at 0x00000000, and the system memory at 0x1FF00000 is the M7's.
+#
+# SO THE FLASH FIGURE ABOVE IS A PART FACT AND NOT A BUDGET, AND THE SHARED MAP IS WHY IT
+# BITES. Each core is pointed at one 1 Mbyte bank by an option byte -- ST programs BCM7_ADD0 to
+# 0x08000000 and BCM4_ADD0 to 0x08100000 -- but nothing in the silicon partitions the two. RM0399
+# says those option bytes accept ANY address from 0x00000000 to 0x3FFF0000, and the memory map
+# puts both banks in both cores' reach. A gate holding an image against 2 Mbytes therefore passes
+# an image that runs past 0x080FFFFF into the other core's bank by up to a megabyte, and the
+# failure is not a link error: it is the other core's program being overwritten. Same class as the
+# dual-bank note csp/stm32f42x already carries, one step sharper, because there the two banks
+# belong to one program and here they belong to two.
 cores = { cm7 = ["cortex-m7f"], cm4 = ["cortex-m4f"] }
 cores_share_memory = true
 source = "DS12919 Rev 3 section 8 ordering information (Z = 144 pins, I = 2 Mbytes flash, T = LQFP) decoding the STM32H755ZIT6 that UM2408 Rev 6 Table 1 names as this carrier's target. flash 0x200000 is that 2 Mbytes; RM0399 Rev 4 Table 6 splits it into bank 1 at 0x08000000-0x080FFFFF and bank 2 at 0x08100000-0x081FFFFF, one megabyte each. ram 0x80000 is the AXI SRAM at 0x24000000-0x2407FFFF, which DS12919's feature list counts inside 864 Kbytes of user SRAM and RM0399 section 2.4 places in the D1 domain as the block for application data not held in DTCM. The two core architectures are DS12919's own words -- a Cortex-M7 core with double-precision FPU and a Cortex-M4 core with FPU -- and their boot addresses are RM0399 Table 9's ST-programmed BCM7_ADD0 and BCM4_ADD0. The pin list is PARTIAL rather than the package's 144: PD8 and PD9 carry the virtual COM port and PB0, PE1 and PB14 the three user LEDs, and DS12919 Table 8 gives each of the five an LQFP144 pin number -- PB0 at 49, PB14 at 74, PD8 at 76, PD9 at 77 and PE1 at 139."
@@ -42,6 +88,36 @@ pins = [
     "PJ13",
     "PK5", "PK6", "PK7",
 ]
+# RM0399 NAMES THIS LINE OUTRIGHT, WHICH IS WHY IT COSTS A ROW AND NOT A TABLE OF ITS OWN. The
+# scope paragraph at the top of this file admits a part when the reference manual's own sentence
+# names its line, and RM0399 does so twice: its title reads "STM32H745/755 and STM32H747/757
+# advanced Arm-based 32-bit MCUs", and its introduction claims complete information on how to use
+# the STM32H745/55/47/57xx. So every address, every bit position and every clock fact this family
+# states was written for this part as well as for the 144-pin one.
+#
+# THE TWO PROCESSORS AND THE ONE ADDRESS SPACE ARE STATED AGAIN, NOT CARRIED DOWN FROM THE ROW
+# ABOVE. A row states its own truth, and these two are the sharpest facts this table holds: two
+# sockets running two architectures, so no single image can drive both, and one shared map, so the
+# refusal comes from the architecture condition alone. DS12930's feature list gives the core pair
+# in its own words -- a Cortex-M7 core with double-precision FPU up to 480 MHz beside a Cortex-M4
+# core with FPU up to 240 MHz -- and RM0399 Table 6 is the table that prints one map per core.
+#
+# AND THE FLASH FIGURE IS THE SAME HAZARD ON A LARGER PACKAGE. It is the part's 2 Mbytes across
+# two 1-Mbyte banks and nothing partitions them, so an image held against the whole figure can run
+# past 0x080FFFFF into the bank the other processor boots from. A carrier that starts its
+# application some way into bank 1 has LESS than the figure suggests, not more: the room left is
+# the distance from that offset to 0x08100000, and no consequence stated anywhere here computes it.
+#
+# FOUR PADS OF THIS PACKAGE CANNOT BE NAMED AT ALL, SO THEY ARE ABSENT RATHER THAN RESERVED, AND
+# THAT IS A LIMIT OF THE MODEL AND NOT OF THE DOCUMENT. DS12930 Table 7 gives PA0 and PA0_C two
+# rows, two ball designators in the TFBGA240+25 column -- N5 and T1 -- and two pin types, I/O
+# against ANA; PA1_C, PC2_C and PC3_C repeat the shape at T2, R1 and R2. The table's own footnote
+# settles what they are: "Pxy_C and Pxy pins/balls are two separate pads (analog switch open)",
+# closed through a SYSCFG register. A pin name here is a port letter and an index, so PA0_C parses
+# as no pin at all, and writing PA0 in its place would name a different ball that this package also
+# carries. `reserved` cannot hold them either -- a reservation must name a pin the present-list
+# already carries, and the present-list cannot carry a name it cannot parse. Naming an analog-only
+# pad is a schema question rather than a transcription, and none of the four is stated below.
 cores = { cm7 = ["cortex-m7f"], cm4 = ["cortex-m4f"] }
 cores_share_memory = true
-source = "DS12930 Rev 1 section 8 ordering information decoding STM32H747XIH6: X = 240 balls, I = 2 Mbytes flash memory, H = TFBGA, 6 = -40 to 85 C, under the device subfamily entry '747 = STM32H7x7 dual core MIPI-DSI line'. flash 0x200000 is that 2 Mbytes, which RM0399 Rev 4 Table 6 splits into bank 1 at 0x08000000-0x080FFFFF and bank 2 at 0x08100000-0x081FFFFF. ram 0x80000 is the AXI SRAM at 0x24000000-0x2407FFFF: DS12930's feature list counts a megabyte of RAM, and that figure is a SUM over 192 Kbytes of TCM, 864 Kbytes of user SRAM and 4 Kbytes of backup SRAM lying at three separate addresses across three independently switchable power domains, so the largest contiguous span both processors address is the AXI SRAM and that is the figure a single field can honestly hold. The two core architectures are DS12930's own words. The pin list is PARTIAL rather than the package's 240, and every entry carries a TFBGA240+25 ball designator from DS12930 Table 7 read from the page as laid out: PC13 at E3, PE3 at D3, PI12 at H1, PJ13 at E10, PK5 at A8, PK6 at C7 and PK7 at D7. PI12 and PJ13 have no designator in any other package column of that table, so the list could not have been derived from the 144-pin row above."
+source = "DS12930 Rev 1 section 8 ordering information decoding STM32H747XIH6: X = 240 balls, I = 2 Mbytes flash memory, H = TFBGA, 6 = -40 to 85 C, under the device subfamily entry '747 = STM32H7x7 dual core MIPI-DSI line'. flash 0x200000 is that 2 Mbytes, which RM0399 Rev 4 Table 6 splits into bank 1 at 0x08000000-0x080FFFFF and bank 2 at 0x08100000-0x081FFFFF. ram 0x80000 is the AXI SRAM at 0x24000000-0x2407FFFF: DS12930's feature list counts a megabyte of RAM, and that figure is a SUM over 192 Kbytes of TCM, 864 Kbytes of user SRAM and 4 Kbytes of backup SRAM lying at three separate addresses across three independently switchable power domains, so the largest contiguous span both processors address is the AXI SRAM and that is the figure a single field can honestly hold. The two core architectures are DS12930's own words. The pin list is PARTIAL rather than the package's 240, and every entry carries a TFBGA240+25 ball designator from DS12930 Table 7 read from the page as laid out: PC13 at E3, PE3 at D3, PI12 at H1, PJ13 at E10, PK5 at A8, PK6 at C7 and PK7 at D7. PI12 and PJ13 have no designator in any other package column of that table, so the list could not have been derived from the 144-pin row above. The three port K designators are the sharpest case for reading a ball out of the column that names the package rather than out of a shorter string: the same Table 7 gives A8, C7 and D7 as designators for PB4(NJTRST), PB6 and BOOT0 in OTHER package columns, so those three strings name six different things across one table."

@@ -1,5 +1,36 @@
 # BOARD binding: the Arduino Portenta H7, an STM32H747XIH6 on Arduino's ABX00042 in the Portenta
 # form factor.
+#
+# THIS IS A MODULE RATHER THAN A BOARD WITH HEADERS, AND ITS DEBUG PATH IS OFF-BOARD. Nothing on
+# the module is a debugger and nothing on it is a serial bridge; the datasheet's block diagram names
+# every fitted part and the debug signals leave through the two 80-pin high-density connectors,
+# where its own high-density pinout carries SWDIO and SWCK. So a probe reaches this part only
+# through whatever carrier the module is seated in, and the carrier is not this file's subject. The
+# USB-C connector J3 is wired to the microcontroller's own device controller, which is what the
+# carrier row below names.
+#
+# ONE DATASHEET COVERS THREE PRODUCTS AND THIS FILE IS TRUE OF ALL THREE, WHICH IS WORTH STATING
+# BECAUSE IT IS A COINCIDENCE OF WHAT IS MODELLED RATHER THAN A CLAIM THAT THEY ARE THE SAME BOARD.
+# The collective datasheet's own comparison table separates ABX00042 from ABX00045 and ABX00046 on
+# exactly two axes: the security element (a second one, an NXP SE050C2, is fitted only to ABX00042)
+# and connectivity (the wireless module is absent from ABX00045). It gives all three the same
+# microcontroller, the same 8 Mbytes of SDRAM and the same 16 Mbytes of QSPI flash. Every fact below
+# is on the common side of that split.
+# AND NOTHING A DEBUG PORT CAN READ SEPARATES THEM. The part is identical, so its identification
+# registers are identical; the difference is which components are populated, and a populated-part
+# difference is invisible to every instrument here. A model number is the only discriminator, and it
+# has to be told rather than discovered.
+#
+# THERE IS NO USER BUTTON AND THE ABSENCE IS READ RATHER THAN ASSUMED. The word button does not
+# occur anywhere in this module's datasheet, and the same publisher's manual for the carrier-less
+# board in the same family names its RESET and BOOT0 buttons explicitly -- so a document that names
+# buttons where they exist names none here. No `gpio-in` row is stated.
+#
+# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the 8 Mbytes of SDRAM and the 16 Mbytes of
+# QSPI NOR flash (both fitted, both belonging to the external-memory stratum), the wireless module,
+# both security elements, the Ethernet PHY, the MIPI-DSI bridge and its camera and display
+# connectors, the power management circuit and its battery connector, and the two 80-pin
+# high-density connectors themselves, whose signals are a carrier's subject rather than this one's.
 
 [table]
 kind = "board"
@@ -9,13 +40,18 @@ family = "stm32h7"
 part = "stm32h747xi"
 board_model = 35            # lamella_wire::board_model::ARDUINO_PORTENTA_H7
 sources = [
-    "Arduino Portenta H7 Collective Datasheet (SKU ABX00042-ABX00045-ABX00046), description and comparison table: the family runs on two processors; the table separates Portenta H7 (ABX00042), Portenta H7 Lite (ABX00045) and Portenta H7 Lite Connected (ABX00046) by security element and connectivity only, and gives all three 8 MB SDRAM and 16 MB QSPI flash. Section 3.1 gives the USB-C connector and section 3.2 the high density connectors, whose pinout carries SWDIO and SWCK",
+    "Arduino Portenta H7 Collective Datasheet (SKU ABX00042-ABX00045-ABX00046, modified 06/08/2026), description and comparison table: the family runs on two processors; the table separates Portenta H7 (ABX00042), Portenta H7 Lite (ABX00045) and Portenta H7 Lite Connected (ABX00046) by security element and connectivity only, and gives all three 8 MB SDRAM and 16 MB QSPI flash. Section 3.1 gives the USB-C connector and section 3.2 the high density connectors, whose pinout carries SWDIO and SWCK",
     "Arduino Portenta H7 full pinout (ABX00042): the RGB LED table gives three rows -- red / A8 / LEDR, green / C7 / LEDG and blue / D7 / LEDB -- where the middle column is the microcontroller's BALL designator rather than a pin name",
     "Arduino Portenta H7 schematics (SL-ABX00042 Rev V4.10, 5/16/2023, sheet STM32H747XIH6): the microcontroller symbol gives ball A8 as PK5, ball C7 as PK6 and ball D7 as PK7. DL1 is an SMLP34RGB2W3 whose three anodes are joined to the +3V1 rail and whose cathodes run through R12, R11 and R13, each 330 ohm, to the nets PK5, PK6 and PK7 respectively",
     "STM32H747xI/G datasheet DS12930 Rev 1, Table 7 pin/ball definition: the TFBGA240+25 column gives PK5 at ball A8, PK6 at ball C7 and PK7 at ball D7, each an I/O pin with FT tolerance",
 ]
 notes = [
     "EVERY FACT IN THIS FILE HAS ANSWERED ON THE PART. The port's base and its clock-enable bit were checked by writing a register with the gate closed and again with it open, and the three legs by driving each pin in turn and reading the colour off the board: driving all three together lit all three, and driving one lit exactly one, which settles the colour of each leg and the direction of all three in a single pass. The document join below was reached first and independently, and the observation agreed with it.",
+    "THE COLOUR OF EACH LEG IS ESTABLISHED BY JOINING TWO DOCUMENTS ON A BALL DESIGNATOR, AND DELIBERATELY NOT BY THE COLOURS THE SCHEMATIC DRAWS. The pinout names the legs by colour against the balls A8, C7 and D7; the schematic's own microcontroller symbol maps those three balls to PK5, PK6 and PK7; and the part's datasheet gives the same three ball-to-pin pairs independently of the board. The diode symbols on the schematic happen to be drawn in matching colours, and that is treated as a third reading rather than the first, because a schematic's fill colour is a drawing convention and not a net.",
+    "THE PINOUT'S MIDDLE COLUMN LOOKS LIKE A PIN NAME AND IS NOT ONE, WHICH IS THE MISTAKE THIS ROW SET IS MOST LIKELY TO ATTRACT. Read as a pin, 'A8' is PA8 -- and PA8 is a real pin of this part that the very same pinout assigns to digital pin D6, so writing it would state something TRUE about the part and wrong about which leg is driven, and no gate on a part row could see the difference. The distinction is only visible by noticing that the column's values are ball designators.",
+    "A BALL DESIGNATOR IS MEANINGLESS WITHOUT ITS PACKAGE COLUMN, and this part's own datasheet proves it inside one table: DS12930 Table 7 uses the strings A8, C7 and D7 in other package columns as the designators for PB4(NJTRST), PB6 and BOOT0. Three strings, six meanings, one table. Every designator cited here was read from the TFBGA240+25 column, which is the package this module carries.",
+    "THE THREE LEGS ARE ONE COMPONENT DESCRIBED AS THREE, which is the model's limit rather than the board's shape. DL1 is a single part with one common anode and three cathodes, and three independent output rows say nothing about their sharing a package, a supply or a duty budget.",
+    "NO OPERATING POINT IS STATED, AND THAT FOLLOWS FROM THE CARRIER RATHER THAN BEING AN OMISSION. With no uart binding there is no divisor to derive, and the value a native-USB wire actually constrains is not a rate this schema carries.",
 ]
 
 # --- the carrier ------------------------------------------------------------------------------
@@ -29,6 +65,17 @@ kind = "native-usb"
 default = true
 
 # --- control lines ----------------------------------------------------------------------------
+#
+# ALL THREE LEGS SINK, AND THE POLARITY IS READ FROM THE WIRING RATHER THAN FROM A WORD. The
+# schematic joins DL1's three anodes to the +3V1 rail and returns each cathode through its own
+# 330 ohm resistor to a microcontroller pin, so the pin is the driven end below the diode and a leg
+# lights when its pin is driven LOW.
+#
+# THE OPENING WRITE IS NOT THE ONE A DRIVER WOULD EXPECT ON THIS PART. Pins come out of reset in
+# ANALOG mode rather than as inputs, so a program that sets or clears an output register without
+# first putting the pin in output mode drives nothing at all. That is a chip fact and it lives on
+# the gpio block table; it is repeated here because these three rows are the first thing anyone
+# drives on a new carrier.
 
 [[devices]]
 name = "led_red"

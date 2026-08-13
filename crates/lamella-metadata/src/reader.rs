@@ -5,6 +5,7 @@ use crate::constant::{ConstantValue, decode_constant};
 use crate::flags;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::heaps::{StringsHeap, read_compressed_u32};
@@ -595,6 +596,33 @@ impl<'a> Assembly<'a> {
             .find(|type_def| type_def.name() == Some(TypeName { namespace, name }))
     }
 
+    /// The first of `references` declaring `namespace.name`, as `(ordinal, TypeDef)`.
+    ///
+    /// **REFERENCE ORDER IS THE TIE-BREAK, AND THAT IS THE WHOLE RULE**: a name declared by two
+    /// references resolves to the EARLIER one, exactly as the build was handed them. Ordinals are
+    /// identity downstream -- a descriptor symbol, a statics region and a `TypeHandle` all encode
+    /// one -- so the index returned here is the same index every later stage means.
+    ///
+    /// **IT IS A FREE FUNCTION ON PURPOSE.** Two callers need this rule from different crates: the
+    /// AOT resolver, which turns a `TypeRef` into a qualified handle, and the generic collector,
+    /// which has to decide whether an instantiation's definition is declared here or next door.
+    /// Written twice it would be two rules that agree until one of them gains a case.
+    #[must_use]
+    pub fn find_in_references(
+        references: &[&Assembly<'a>],
+        namespace: &str,
+        name: &str,
+    ) -> Option<(usize, TypeDef<'a>)> {
+        references
+            .iter()
+            .enumerate()
+            .find_map(|(ordinal, reference)| {
+                reference
+                    .find_type(namespace, name)
+                    .map(|type_def| (ordinal, type_def))
+            })
+    }
+
     /// This assembly's own simple name (the `Assembly` row, II.22.2), if present.
     #[must_use]
     pub fn assembly_name(&self) -> Option<&'a str> {
@@ -717,6 +745,11 @@ impl<'a> Assembly<'a> {
     /// It is returned encoded because decoding it here would silently invent a token for a row
     /// index that may not exist, and a caller comparing against a known owner does not need it
     /// decoded.
+    ///
+    /// **This reports the DECLARATIONS only.** It says a type has parameters named `T`; it does
+    /// not make a signature mentioning `!0` decodable, which is a separate and larger piece of work.
+    /// Reading this as "generics are supported" would be exactly the half-right reading the rest of
+    /// this module is arranged to prevent.
     pub fn generic_params(&self) -> impl Iterator<Item = (u32, u32, u32, Option<&'a str>)> + '_ {
         (1..=self.tables.row_count(table::GENERIC_PARAM)).filter_map(move |index| {
             let row = self.tables.row(table::GENERIC_PARAM, index)?;
@@ -729,9 +762,64 @@ impl<'a> Assembly<'a> {
         })
     }
 
+    /// Every declared type parameter's CONSTRAINTS, keyed by `(owner, number)` where `owner` is the
+    /// raw `TypeOrMethodDef` coded index exactly as [`Assembly::generic_params`] reports it.
+    ///
+    /// Each entry is `(flags, constraint_tokens)`: the `GenericParam` flag word (II.23.1.7, whose
+    /// `0x001C` bits are `class`/`struct`/`new()`) and one `TypeDefOrRef` token per
+    /// `GenericParamConstraint` row (II.22.21) naming a class, interface or type parameter.
+    ///
+    /// **BOTH HALVES OR NEITHER.** A constraint has two encodings and reading one is worse than
+    /// reading none: a consumer that took only the rows would report `where T : class` as
+    /// unconstrained, and one that took only the flags would miss every named constraint. Returning
+    /// them together is what stops a caller choosing accidentally.
+    ///
+    /// **KEYED BY `(owner, number)`, NOT BY ROW.** `GenericParamConstraint.Owner` is a ROW index
+    /// into `GenericParam`, and row order is not parameter order -- II.22.20's sort is a property
+    /// the file asserts rather than one a reader may assume. Resolving through the row and then
+    /// keying by the declared `Number` means a mis-sorted input yields the right constraints on the
+    /// right parameter instead of a plausible permutation, which is the failure that would silently
+    /// enforce `where T : IFoo` against `U`.
+    #[must_use]
+    pub fn generic_param_constraints(&self) -> BTreeMap<(u32, u32), (u32, Vec<Token>)> {
+        let rows: Vec<(u32, u32, u32)> = self
+            .generic_params()
+            .map(|(number, flags, owner, _)| (owner, number, flags))
+            .collect();
+        let mut result: BTreeMap<(u32, u32), (u32, Vec<Token>)> = BTreeMap::new();
+        for &(owner, number, flags) in &rows {
+            result.entry((owner, number)).or_insert((flags, Vec::new()));
+        }
+        for index in 1..=self.tables.row_count(table::GENERIC_PARAM_CONSTRAINT) {
+            let Some(row) = self.tables.row(table::GENERIC_PARAM_CONSTRAINT, index) else {
+                continue;
+            };
+            let Some(&(owner, number, _)) = rows.get(row.raw(0).saturating_sub(1) as usize) else {
+                continue;
+            };
+            let token = crate::CodedIndex::TypeDefOrRef.decode(row.raw(1));
+            if token.table() == 0 {
+                continue;
+            }
+            if let Some((_, constraints)) = result.get_mut(&(owner, number)) {
+                constraints.push(token);
+            }
+        }
+        result
+    }
+
     /// Every generic METHOD's declared type-parameter names, keyed by the owning `MethodDef` row
     /// and ordered by the `Number` column -- the `!!0` half of `GenericParam`, where
     /// [`Assembly::type_parameter_names`] reads the `!0` half.
+    ///
+    /// **A CALLER THAT HAS ONLY THE TYPE HALF SEES EVERY IMPORTED GENERIC METHOD AS
+    /// NON-GENERIC**, because the coded-index tag it filters on discards exactly these rows. That
+    /// is not a missing feature that announces itself: an imported `T Id<T>(T)` read without this
+    /// has an empty parameter list, so a call site naming `Id<int>(x)` is told the method is not
+    /// generic at all -- a confidently wrong diagnostic rather than a gap.
+    ///
+    /// Same `Number` ordering discipline as the type half, for the same reason: II.22.20's sort is
+    /// a property the file asserts rather than one a reader may assume.
     #[must_use]
     pub fn method_type_parameter_names(&self) -> BTreeMap<u32, Vec<&'a str>> {
         let mut by_owner: BTreeMap<u32, Vec<(u32, &'a str)>> = BTreeMap::new();
@@ -756,6 +844,13 @@ impl<'a> Assembly<'a> {
     /// ordered by the `Number` column (II.22.20). Indexed once for the whole assembly, like
     /// [`Assembly::param_array_params`], so a caller walking every type does not rescan the table
     /// per type. Method type parameters are excluded -- the owner tag selects `TypeDef` only.
+    ///
+    /// **ORDERED BY `Number`, NEVER BY ROW ORDER.** II.22.20 requires the table sorted by owner
+    /// then number, but that sort is a property the file ASSERTS rather than one a reader can
+    /// assume, and `GenericParamConstraint` indexes `GenericParam` BY ROW -- so a future writer that
+    /// re-sorts has to keep both true. Reading the number explicitly means a mis-sorted input yields
+    /// the right names in the right order instead of a plausible permutation of them, which is the
+    /// failure that would show up as a diagnostic naming `Box<U, T>`.
     #[must_use]
     pub fn type_parameter_names(&self) -> BTreeMap<u32, Vec<&'a str>> {
         let mut by_owner: BTreeMap<u32, Vec<(u32, &'a str)>> = BTreeMap::new();
@@ -1071,6 +1166,70 @@ impl<'a> Assembly<'a> {
         }
     }
 
+    /// The `(namespace, name)` a type token is IDENTIFIED by, with a NESTED type's enclosing chain
+    /// standing in for its namespace: `` Widget.Nested `` answers `("Lamella.Checks.Widget",
+    /// "Nested")`. `None` for a token that names no type.
+    ///
+    /// **[`Assembly::type_token_name`] IS NOT AN IDENTITY, AND THE DIFFERENCE IS INVISIBLE UNTIL A
+    /// NESTED TYPE ARRIVES.** A nested type's namespace is EMPTY on both sides of the metadata --
+    /// a `TypeDef` puts its enclosing type in `NestedClass` (II.22.32) and a `TypeRef` puts it in
+    /// its `ResolutionScope` (II.22.38) -- so reading the row directly answers a bare `Nested` for
+    /// every nested type in an assembly, and `Widget.Nested` and `Gadget.Nested` become one key.
+    /// A consumer that indexes on it either misses the type or, worse, binds it to the other one.
+    ///
+    /// **THE TWO TABLES MUST ANSWER ALIKE OR A CROSS-ASSEMBLY REFERENCE CANNOT FIND ITS
+    /// DEFINITION**, which is the whole reason this is one function rather than a walk at each
+    /// consumer: the DEFINING assembly reaches the type as a `TypeDef` and the referencing one as
+    /// a `TypeRef`, and they meet only if both spell it the same way.
+    ///
+    /// Only the OUTERMOST type carries a namespace, so reaching one ends the walk. The walk is
+    /// bounded: a malformed cyclic `NestedClass` or `ResolutionScope` cannot spin here.
+    #[must_use]
+    pub fn type_token_full_name(&self, token: Token) -> Option<(String, String)> {
+        let own = self.type_token_name(token)?;
+        let mut prefix = String::new();
+        let mut current = self.enclosing_token(token);
+        for _ in 0..16 {
+            let Some(outer) = current else { break };
+            let outer_name = self.type_token_name(outer)?;
+            let mut next = String::from(outer_name.name);
+            if !prefix.is_empty() {
+                next.push('.');
+                next.push_str(&prefix);
+            }
+            prefix = next;
+            if !outer_name.namespace.is_empty() {
+                prefix = alloc::format!("{}.{}", outer_name.namespace, prefix);
+                break;
+            }
+            current = self.enclosing_token(outer);
+        }
+        let namespace = if prefix.is_empty() {
+            String::from(own.namespace)
+        } else {
+            prefix
+        };
+        Some((namespace, String::from(own.name)))
+    }
+
+    /// The token of the type `token` is nested in, or `None` when it is top level. The enclosing
+    /// type lives in a different place for each table -- `NestedClass` for a `TypeDef` (II.22.32),
+    /// the `ResolutionScope` for a `TypeRef` (II.22.38) -- and a `ResolutionScope` that is NOT a
+    /// `TypeRef` is an assembly or module, which means top level.
+    fn enclosing_token(&self, token: Token) -> Option<Token> {
+        match token.table() {
+            table::TYPE_DEF => self
+                .type_def(token.row())
+                .and_then(|type_def| type_def.enclosing_type())
+                .map(|outer| outer.token()),
+            table::TYPE_REF => {
+                let scope = self.type_ref(token.row())?.resolution_scope();
+                (scope.table() == table::TYPE_REF).then_some(scope)
+            }
+            _ => None,
+        }
+    }
+
     /// The exception TAG for a type, for the no-GC tag-dispatch exception model: one `u32`
     /// identifying the exception type identically wherever it is named -- the throw site,
     /// every catch, and the runtime -- so the compiler, interpreter, and AOT backend never
@@ -1136,12 +1295,51 @@ impl<'a> Assembly<'a> {
     /// Matches on the declaring type of the attribute's CONSTRUCTOR, which is how an attribute is
     /// identified in metadata: a `CustomAttribute` row names its ctor, not its type.
     #[must_use]
+    /// **THIS IS O(CustomAttribute ROWS) AND MUST NOT BE CALLED PER MEMBER.** `custom_attributes`
+    /// scans the whole table to find one parent's rows, so asking it about every method of a
+    /// reference assembly is rows x members -- and on a real reference set that dominates the
+    /// whole cost of loading it, by an order of magnitude over everything else put together.
+    ///
+    /// Use [`Assembly::tokens_with_attribute`] to index the whole assembly in ONE pass and then ask
+    /// the set. This entry point is for a caller with a SINGLE token in hand.
+    #[must_use]
     pub fn has_attribute(&self, parent: Token, namespace: &str, name: &str) -> bool {
         self.custom_attributes(parent).any(|attribute| {
             self.resolve_method(attribute.constructor)
                 .and_then(|ctor| ctor.declaring_type)
                 .is_some_and(|declaring| declaring.namespace == namespace && declaring.name == name)
         })
+    }
+
+    /// Every token carrying `[namespace.name]`, computed in ONE pass over the CustomAttribute table
+    /// (II.22.10) -- the set form of [`Assembly::has_attribute`], for a caller that would otherwise
+    /// ask it once per member.
+    ///
+    /// Same shape and the same reason as [`Assembly::param_array_params`] and
+    /// [`Assembly::conditional_symbols`], which index one attribute each. Those two already carried
+    /// the warning ("*catastrophic across a large reference assembly*") when three later attribute
+    /// reads were written as per-member calls anyway, so this is the general form rather than a
+    /// fourth special case: the attribute is a parameter, and the next one needs no new function.
+    ///
+    /// Keyed by TOKEN, not by row, because the parents span tables -- a `Field`, a `Property` and a
+    /// `MethodDef` row all number from 1 and a row-keyed set would answer for whichever shares the
+    /// number.
+    #[must_use]
+    pub fn tokens_with_attribute(&self, namespace: &str, name: &str) -> BTreeSet<Token> {
+        let mut found = BTreeSet::new();
+        for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
+            let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
+                continue;
+            };
+            let matches = self
+                .resolve_method(row.token(1))
+                .and_then(|ctor| ctor.declaring_type)
+                .is_some_and(|declaring| declaring.namespace == namespace && declaring.name == name);
+            if matches {
+                found.insert(row.token(0));
+            }
+        }
+        found
     }
 
     /// Whether `method_token` is a `[Lamella.Runtime.RuntimeProvided]` seam: a method whose body the
@@ -1410,6 +1608,14 @@ impl<'a> TypeDef<'a> {
     #[must_use]
     pub fn is_interface(&self) -> bool {
         flags::type_is_interface(self.flags())
+    }
+
+    /// Whether this type's initializer has RELAXED timing (`beforefieldinit`) -- see
+    /// [`flags::type_is_before_field_init`](crate::flags::type_is_before_field_init) for the two
+    /// rules and why the difference is not observable without asking.
+    #[must_use]
+    pub fn is_before_field_init(&self) -> bool {
+        flags::type_is_before_field_init(self.flags())
     }
 
     /// Whether the type is abstract.

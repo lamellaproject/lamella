@@ -11,6 +11,21 @@
 # the manual's title names its group AND that datasheet's product list carries its order code, and
 # an RA6-series group is a different manual and a different family whatever its part number
 # resembles.
+#
+# A PIN NAME IS REWRITTEN HERE AND THE REWRITE IS THE ONE THING A READER MUST KNOW BEFORE
+# GREPPING. The vendor writes a pin as Pmnn with NO separator -- P111, P012 -- and its own register
+# section defines the fields as m = 0 to 9 and n = 00 to 15, one digit of port and two of pin. A pin
+# name in this model is a port and an index, and the undelimited form does not parse: P111 offers no
+# boundary between the port digit and the pin digits. Every pin below is therefore written with the
+# separator this model already uses for numbered ports -- P111 becomes P1.11, P012 becomes P0.12 --
+# which is reversible and loses nothing, but means a search for the vendor's spelling finds nothing
+# here and a search for this spelling finds nothing in the vendor's documents.
+#
+# THE PART CARRIES THREE MEMORIES AND `flash` IS ONE OF THEM. Code flash is 256 KB, SRAM is 32 KB,
+# and there is a further 8 KB of DATA FLASH that the datasheet lists in its own column beside them.
+# Data flash is byte-rewritable non-volatile storage rather than a place to link a program, so it is
+# neither part of `flash` nor part of `ram`, and no field here holds it. A program budgeted against
+# 264 KB would be counting a memory it cannot execute from.
 
 [table]
 kind = "parts"
@@ -34,4 +49,12 @@ pins = [
     "P0.12", "P0.13",
     "P1.11",
 ]
+# THE ORDER CODE DECODES FIELD BY FIELD AND TWO OF ITS FIELDS ARE THE ONES THAT MATTER HERE.
+# R7FA4M1AB3CFM splits as R7 = the vendor's microcontroller prefix, F = flash memory, A = RA family,
+# 4 = RA4 series, M1 = the RA4M1 group, A = feature set, B = 256 KB of code flash, 3 = -40 C to
+# 105 C, C = quality grade, FM = LQFP 64 pins. The suffix after the # is packing, terminal material
+# and a production identification code, none of which is a property of the silicon: #AA0 reads as
+# tray packing, tin-only terminals and production code 0. So the package and the flash size below
+# are read out of the order code AND confirmed independently by the datasheet's product list, which
+# pairs this part number with package code PLQP0064KB-C.
 source = "R01DS0355EJ0110 Rev.1.10 Figure 1.2 decoding R7FA4M1AB3CFM: B = 256 KB code flash, 3 = -40 C to 105 C, FM = LQFP 64 pins. Table 1.13 carries the same part number against package code PLQP0064KB-C with 256 KB code flash, 8 KB data flash and 32 KB SRAM, so flash 0x40000 and ram 0x8000 are each stated twice by documents that do not derive from one another. The core is the Arm Cortex-M4 the datasheet's feature list names for the group. The pin list is PARTIAL rather than the package's 52: P1.11 drives a user LED and P0.12 and P0.13 drive two more, and R01UH0887EJ0110 Rev.1.10 Table 19.1 carries all three in its 64-pin column, which gives PORT0 as P000 to P004 and P010 to P015 and PORT1 as P100 to P113."

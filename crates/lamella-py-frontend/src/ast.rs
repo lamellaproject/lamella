@@ -345,8 +345,15 @@ pub enum AssignTarget {
         attr: String,
     },
     /// `(a, b)` or `[a, b]` -- a nested tuple/list target; its element sequence is unpacked
-    /// recursively. (A starred target `*x` inside a nested tuple is unsupported.)
+    /// recursively, and at most one element may be [`AssignTarget::Starred`].
     Tuple(Vec<AssignTarget>),
+    /// `*rest` -- binds a LIST of the elements its sibling targets do not take.
+    ///
+    /// A star is a property of the target and not of the statement, which is what lets it sit at any
+    /// depth: `[*a], b = [1, 2], 3` stars the first of two targets, and `(a, *b), *c = (1, 2), 3, 4`
+    /// stars one target at each of two levels. The limit is ONE PER SEQUENCE, not one per statement,
+    /// because a level with two stars has no single answer for which absorbs the surplus.
+    Starred(Box<AssignTarget>),
 }
 
 impl AssignTarget {
@@ -360,6 +367,7 @@ impl AssignTarget {
                     elem.collect_names(out);
                 }
             }
+            AssignTarget::Starred(inner) => inner.collect_names(out),
             AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {}
         }
     }
@@ -381,7 +389,7 @@ pub fn import_bound_name<'a>(module: &'a str, alias: &'a Option<String>) -> &'a 
 
 /// A statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Stmt {
+pub enum StmtKind {
     /// A function definition.
     FuncDef(FuncDef),
     /// `return` with an optional value (a bare `return` yields `None`).
@@ -399,13 +407,15 @@ pub enum Stmt {
         value: Expr,
     },
     /// Tuple-unpacking assignment `a, b = expr` -- the value is a sequence whose elements
-    /// bind to the targets in order. Flat targets only (nested `(a, (b, c))` is post-cut).
+    /// bind to the targets in order.
     TupleAssign {
-        /// The targets, in source order (names, subscripts, or attributes).
+        /// The targets, in source order: names, subscripts, attributes, nested tuple/list targets,
+        /// and at most one [`AssignTarget::Starred`], which absorbs the surplus elements.
+        ///
+        /// This is a target SEQUENCE and carries no star index of its own, so it is the same shape
+        /// at every depth: the statement's target list and a nested one differ only in where they
+        /// sit.
         targets: Vec<AssignTarget>,
-        /// The index of the starred target `*name`, if any (`a, *b, c` -> `Some(1)`); the
-        /// star binds a list of the leftover elements.
-        star: Option<usize>,
         /// The sequence value to unpack.
         value: Expr,
     },
@@ -528,7 +538,7 @@ pub enum Stmt {
     },
     /// An `async for target in aiterable:` loop -- the ASYNC iterator protocol
     /// (`__aiter__` / awaited `__anext__`, ending on `StopAsyncIteration`). A separate node from
-    /// [`Stmt::ForIter`] rather than a flag on it, because the two share no ops: the sync loop uses
+    /// [`StmtKind::ForIter`] rather than a flag on it, because the two share no ops: the sync loop uses
     /// `GetIter`/`ForIter` and this one desugars to awaited dunder calls.
     AsyncFor {
         /// The loop variable, bound to each item.
@@ -541,7 +551,7 @@ pub enum Stmt {
         orelse: Vec<Stmt>,
     },
     /// An `async with context [as name]:` statement (a single context manager). The same PEP 343
-    /// protocol as [`Stmt::With`], but `__aenter__` / `__aexit__` and both awaited.
+    /// protocol as [`StmtKind::With`], but `__aenter__` / `__aexit__` and both awaited.
     AsyncWith {
         /// The context-manager expression, evaluated once.
         context: Expr,
@@ -571,7 +581,7 @@ pub enum Stmt {
     Decorated {
         /// The decorator expressions, in source (top-to-bottom) order.
         decorators: Vec<Expr>,
-        /// The decorated statement -- a [`Stmt::FuncDef`] or [`Stmt::ClassDef`].
+        /// The decorated statement -- a [`StmtKind::FuncDef`] or [`StmtKind::ClassDef`].
         inner: Box<Stmt>,
     },
     /// `import module [as alias], ...` -- import one or more modules, binding each to its `as`
@@ -609,6 +619,35 @@ pub enum Stmt {
     Pass,
 }
 
+/// A statement, and the source line it began on.
+///
+/// The line is carried on a WRAPPER rather than as a field of each variant for one reason: every
+/// statement in this grammar is produced by a single parser entry point, so a wrapper is stamped in
+/// ONE place while a per-variant field would be spelled at every construction site and forgotten at
+/// the next one added.
+///
+/// It is a LINE and not a span, which is a measured choice rather than a shortcut. CPython's own
+/// table costs about 1.96 bytes per instruction because it also encodes column ranges; a line-only
+/// run-length table costs about 0.49. Column precision buys the `^^^^` markers under a modern
+/// traceback and it is four times the size on a part where the decoded program is already the
+/// constraint. The C# front end carries a full span here, and that difference is deliberate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stmt {
+    /// The 1-based source line the statement began on.
+    pub line: u32,
+    /// What the statement is.
+    pub kind: StmtKind,
+}
+
+impl Stmt {
+    /// A statement at `line`.
+    #[must_use]
+    pub fn new(line: u32, kind: StmtKind) -> Stmt {
+        Stmt { line, kind }
+    }
+}
+
+
 /// An assignment statement: a target name, an optional annotation, and an optional
 /// value. The three forms are `name = value`, `name: ann = value`, and the bare
 /// declaration `name: ann` (which records a type but stores nothing).
@@ -622,7 +661,7 @@ pub struct Assign {
     pub value: Option<Expr>,
 }
 
-/// One `except [type [as name]]:` clause of a [`Stmt::Try`].
+/// One `except [type [as name]]:` clause of a [`StmtKind::Try`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExceptHandler {
     /// The exception type to match, or `None` for a bare `except:` (catches anything).

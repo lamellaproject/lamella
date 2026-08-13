@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
-//! The shared garbage-collection contract.
+//! The shared garbage-collection contract, and the collector that implements it.
 
 pub mod heap;
 
@@ -19,10 +19,10 @@ pub use device::{lamella_gc_collect, lamella_gc_collect_device};
 pub use device_heap::{DeviceHeap, DeviceTypeDesc};
 pub use heap::{Heap, Ref, StackMapEntry, StackMapTable, TypeDesc};
 
-/// An opaque reference to a managed object on our collector's heap.
+/// An opaque reference to a managed object on the collector's heap.
 ///
 /// The representation is deliberately hidden: a handle / arena index or a tagged
-/// linear-memory offset for our own collector (bare metal and WASM 1.0 linear
+/// linear-memory offset for a Lamella-managed collector (bare metal and WASM 1.0 linear
 /// memory). Under WasmGC the host VM tracks references with its own type and this
 /// contract is not used at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

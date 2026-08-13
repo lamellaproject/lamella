@@ -7,6 +7,20 @@
 # puts the pin in alternate-function MODE (2 bits per pin), and an AFR register selects WHICH
 # function (4 bits per pin). Setting one without the other leaves the pin either driving nothing or
 # driving the wrong peripheral.
+#
+# AND THE RESET MODE ON THIS PART IS ANALOG, NOT INPUT. On the vendor's F0, F4, F7 and L4
+# lines MODER reads 00 -- input -- for a pin nobody has configured. The encoding on this part is
+# the same four values but the DEFAULT is the other end of it: RM0399 marks 11, analog mode, as
+# the reset state, and gives the register's reset value as 0xFFFF FFFF for every port but A and B.
+# So an untouched pin here is not a digital input that reads whatever is on it -- its input buffer
+# is off, and IDR reads zero forever. A driver carried across from one of those lines that reads a
+# button without writing MODER works there and reads a permanently unpressed button on this part,
+# silently.
+#
+# PORTS A AND B COME UP PARTLY IN ALTERNATE-FUNCTION MODE, which is the exception to that: their
+# reset values are 0xABFF FFFF and 0xFFFF FEBF, because the debug pins are already muxed. On port
+# B that is bits [7:6] and [9:8] -- pins 3 and 4 -- so a board using PB3 or PB4 as a plain output
+# is taking them off the debug port, and nothing in this file will tell it so.
 
 [table]
 kind = "block"

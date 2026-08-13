@@ -80,11 +80,11 @@ impl FlashParams {
 
 /// How much of the image travels in one data command.
 ///
-/// This is OUR choice, not a published limit: the write is declared up front with its packet size, so
-/// the loader is told what to expect rather than assuming. One sector keeps a single packet small
-/// enough to be uncontroversial for any receive buffer while still amortizing the per-packet exchange
-/// over a useful amount of data. It is a constant rather than a parameter because a caller has no
-/// information with which to choose better.
+/// A choice of this crate's rather than a published limit: the write is declared up front with its
+/// packet size, so the loader is told what to expect rather than assuming. One sector keeps a single
+/// packet small enough to be uncontroversial for any receive buffer while still amortizing the
+/// per-packet exchange over a useful amount of data. It is a constant rather than a parameter
+/// because a caller has no information with which to choose better.
 const BLOCK: usize = 4096;
 
 /// How many times to send the establishing command before giving up.
@@ -1081,7 +1081,7 @@ mod tests {
         }
     }
 
-    /// **A DEFECT SILICON FOUND, and no host-side test could have.** A real target answers ONE
+    /// **THE DEFECT SILICON FOUND, and no host-side test could have.** A real target answers ONE
     /// establishing command EIGHT times; the first reply advances the session, and the surplus seven
     /// arrive while the next command is outstanding. A test target that answers each request once does
     /// not have surplus replies, so this shape exists only against a part.

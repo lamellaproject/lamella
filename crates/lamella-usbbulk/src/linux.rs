@@ -33,6 +33,19 @@ struct Found {
     ep_out: u8,
 }
 
+impl Found {
+    /// Whether this device is the one `vendor_id`/`product_id`/`serial` asks for.
+    ///
+    /// Separate from the scan and from the open so it can be exercised without a bus: a selection
+    /// rule reachable only through real hardware is a rule that gets tested on whatever happens to
+    /// be plugged in, which is one board on a developer's desk and several on a bench.
+    fn selected_by(&self, vendor_id: u16, product_id: u16, serial: Option<&str>) -> bool {
+        self.vid == vendor_id
+            && self.pid == product_id
+            && serial.is_none_or(|wanted| self.serial.as_deref() == Some(wanted))
+    }
+}
+
 fn read_hex16(path: &Path) -> Option<u16> {
     u16::from_str_radix(fs::read_to_string(path).ok()?.trim(), 16).ok()
 }
@@ -170,11 +183,19 @@ impl Device {
         (self.ep_in, self.ep_out)
     }
 
-    pub fn open(vendor_id: u16, product_id: u16, _serial: Option<&str>) -> Result<Self> {
-        let f = scan()
-            .into_iter()
-            .find(|f| f.vid == vendor_id && f.pid == product_id)
-            .ok_or(Error::NotFound)?;
+    /// Opens the device with `vendor_id`/`product_id`, and with `serial` when one is named.
+    ///
+    /// **A NAMED SERIAL IS A FILTER, NOT A LABEL.** Several boards of one model answer to the same
+    /// VID/PID, so taking the first match opens whichever the bus happened to enumerate first --
+    /// and the caller that named a serial is precisely the caller who cannot tolerate that. A
+    /// serial that matches nothing attached is [`Error::NotFound`]: refusing names a board the
+    /// operator can go and plug in, where opening a different one writes to it.
+    pub fn open(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
+        let f = crate::select_requested(
+            scan().into_iter().filter(|f| f.vid == vendor_id && f.pid == product_id),
+            serial,
+            |f| f.serial.as_deref(),
+        )?;
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -259,4 +280,48 @@ pub fn diagnose(_interface_guid: &str, vendor_id: u16, product_id: u16) -> Resul
         .into_iter()
         .any(|device| device.vendor_id == vendor_id && device.product_id == product_id);
     Ok(if present { Binding::Bound } else { Binding::Absent })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Found;
+
+    const VID: u16 = 0x39e9;
+    const PID: u16 = 0x0001;
+
+    fn board(serial: Option<&str>) -> Found {
+        Found {
+            node: String::from("/dev/bus/usb/001/002"),
+            vid: VID,
+            pid: PID,
+            serial: serial.map(String::from),
+            product: None,
+            interface: 0,
+            ep_in: 0x81,
+            ep_out: 0x01,
+        }
+    }
+
+    #[test]
+    fn an_unnamed_open_takes_any_board_of_the_model() {
+        assert!(board(Some("AAAA")).selected_by(VID, PID, None));
+        assert!(board(None).selected_by(VID, PID, None));
+    }
+
+    #[test]
+    fn a_named_open_takes_that_board_and_refuses_its_twin() {
+        assert!(board(Some("AAAA")).selected_by(VID, PID, Some("AAAA")));
+        assert!(!board(Some("BBBB")).selected_by(VID, PID, Some("AAAA")));
+    }
+
+    #[test]
+    fn a_named_open_refuses_a_board_that_reports_no_serial() {
+        assert!(!board(None).selected_by(VID, PID, Some("AAAA")));
+    }
+
+    #[test]
+    fn the_ids_still_select_when_a_serial_agrees() {
+        assert!(!board(Some("AAAA")).selected_by(VID, PID + 1, Some("AAAA")));
+        assert!(!board(Some("AAAA")).selected_by(VID + 1, PID, Some("AAAA")));
+    }
 }

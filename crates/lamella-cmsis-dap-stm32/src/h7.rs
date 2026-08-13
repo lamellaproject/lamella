@@ -88,6 +88,9 @@ fn h7_sector_of(address: u32) -> u32 {
 }
 
 /// Waits for the bank holding `address` to go idle, then reports any error it left behind.
+///
+/// IT WAITS ON `QW` AS WELL AS `BSY`, which is the reason this is not the F4's routine with
+/// different constants -- see the module note.
 fn h7_wait_idle<A: TargetAccess>(target: &mut A, address: u32) -> Result<(), ProbeError> {
     let sr_at = h7_reg(address, H7_SR);
     for _ in 0..200_000 {
@@ -111,6 +114,10 @@ fn h7_wait_idle<A: TargetAccess>(target: &mut A, address: u32) -> Result<(), Pro
 /// it exactly as a CMSIS-DAP probe does. Halt the core before erasing or writing.
 pub trait Stm32H7Flash {
     /// Unlocks the control register of the bank holding `address`. Idempotent.
+    ///
+    /// PER BANK: unlocking bank 1 leaves bank 2 locked. And the key sequence is checked for
+    /// having already been done, because RM0399 is explicit that performing it TWICE locks the
+    /// register until the next system reset -- so a "harmless" repeat bricks the session.
     fn h7_unlock_flash(&mut self, address: u32) -> Result<(), ProbeError>;
     /// Re-locks the control register of the bank holding `address`.
     fn h7_lock_flash(&mut self, address: u32) -> Result<(), ProbeError>;

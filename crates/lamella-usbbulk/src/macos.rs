@@ -31,6 +31,7 @@ struct CFUUIDBytes {
 
 const kIOReturnSuccess: IOReturn = 0;
 const kUSBIn: u8 = 1;
+#[allow(dead_code)]
 const kUSBOut: u8 = 0;
 const kUSBBulk: u8 = 2;
 const DONT_CARE: u16 = 0xFFFF;
@@ -85,7 +86,7 @@ struct IOUSBDeviceInterface500 {
     GetNumberOfConfigurations: *const c_void,
     GetLocationID: *const c_void,
     GetConfigurationDescriptorPtr: extern "C" fn(*mut c_void, u8, *mut *const u8) -> IOReturn,
-    GetConfiguration: *const c_void,
+    GetConfiguration: extern "C" fn(*mut c_void, *mut u8) -> IOReturn,
     SetConfiguration: extern "C" fn(*mut c_void, u8) -> IOReturn,
     GetBusFrameNumber: *const c_void,
     ResetDevice: *const c_void,
@@ -216,7 +217,7 @@ impl Device {
         (self.ep_in, self.ep_out)
     }
 
-    pub fn open(vendor_id: u16, product_id: u16, _serial: Option<&str>) -> Result<Self> {
+    pub fn open(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
         unsafe {
             let plugin_id = cfuuid(&ID_CFPLUGIN);
             let dev_user = cfuuid(&ID_DEV_USERCLIENT);
@@ -237,6 +238,11 @@ impl Device {
                     let svc = IOIteratorNext(iter);
                     if svc == 0 {
                         break;
+                    }
+                    let reported = registry_string(svc, "USB Serial Number");
+                    if !crate::candidate_satisfies(serial, reported.as_deref()) {
+                        IOObjectRelease(svc);
+                        continue;
                     }
                     let d = try_device(svc, plugin_id, dev_user, intf_user, dev_iid, intf_iid, vendor_id, product_id);
                     IOObjectRelease(svc);
@@ -440,7 +446,11 @@ unsafe fn try_device(
         ((**dev).Release)(dev as *mut c_void);
         return None;
     }
-    ((**dev).SetConfiguration)(dev as *mut c_void, 1);
+    let mut current: u8 = 0;
+    let known = ((**dev).GetConfiguration)(dev as *mut c_void, &mut current) == kIOReturnSuccess;
+    if !known || current != 1 {
+        ((**dev).SetConfiguration)(dev as *mut c_void, 1);
+    }
 
     match open_vendor_interface(dev, plugin_id, intf_user, intf_iid) {
         Some((intf, ep_in, ep_out, pipes)) => Some(Device { dev, intf, ep_in, ep_out, pipes }),

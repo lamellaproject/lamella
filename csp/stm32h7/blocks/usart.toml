@@ -6,6 +6,22 @@
 # register is a plain divisor with no mantissa-and-fraction split. A driver carried across from an
 # F4 writes its first byte into the control register, which disables the peripheral it was
 # configuring rather than transmitting anything.
+#
+# AND THIS PART ADDS A PRESCALER IN FRONT OF THAT DIVISOR. USART_PRESC at offset 0x2C divides
+# the selected kernel clock BEFORE the BRR divider sees it, so the arithmetic is
+# BRR = round(usart_ker_ck / prescaler / baud) and not round(f_ck / baud). Its reset value is 0,
+# which is "input clock not divided", so at any reset operating point the two forms agree and the
+# generated divisor is right -- but they stop agreeing the moment a program writes PRESC, and the
+# symptom is a channel at the wrong rate rather than a channel that fails. The prescaler is also
+# NOT a plain shift: its codes run 1, 2, 4, 6, 8, 10, 12, 16, 32, 64, 128, 256, so codes 3 and 5
+# divide by 6 and by 10 where a power-of-two reading would give 8 and 32.
+#
+# CR1 AND ISR EACH HAVE TWO DOCUMENTED LAYOUTS AT ONE OFFSET, selected by CR1.FIFOEN at bit 29.
+# The BIT POSITIONS do not move -- what changes is what the bits mean and what they are called:
+# ISR bit 5 is RXNE with the FIFO off and RXFNE with it on, bit 7 is TXE off and TXFNF on. FIFOEN
+# resets to 0, so the layout stated below is the reset layout, and a driver that never enables the
+# FIFO never meets the other one. The names are worth knowing anyway, because a reader searching
+# the manual for TXE finds a section that says the register is the alternate form.
 
 [table]
 kind = "block"

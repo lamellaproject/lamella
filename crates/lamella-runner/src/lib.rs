@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+pub mod carriers;
+
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -1967,10 +1969,16 @@ pub fn load_deployed(
 }
 
 /// Boot a baked image ([`lamella_cil_runtime::Module::from_baked`]) and run its entry point,
-/// capturing console output + exit code -- [`run_program`]'s twin for the PE-less path. The
-/// image bytes are leaked to `'static` (the image is borrowed in place, never copied): the
-/// host reference runner accepts one leak per evaluation; a device firmware's bump-arena
-/// reset between evaluations reclaims it.
+/// capturing console output + exit code -- [`run_program`]'s twin for the PE-less path.
+///
+/// **The image bytes are LEAKED to `'static`** -- the loader borrows an image in place rather than
+/// copying it, and the type it produces is not generic over a lifetime, so the bytes must outlive
+/// every reference the run can create. One leak per evaluation.
+///
+/// **A device that serves repeatedly should bound this** by supplying an [`ImageResidence`] to
+/// [`serve_one_baked_with_residence`], which reuses one buffer instead of retaining every image.
+/// This entry point keeps leaking because a host runner evaluating once has nothing to gain from a
+/// ceiling it would have to pick.
 #[cfg(feature = "baked-image")]
 #[must_use]
 pub fn run_image(image: Vec<u8>) -> RunResult {
@@ -2001,7 +2009,23 @@ pub fn run_image_serviced(
     configure: &mut dyn FnMut(&mut Vm),
     service: &mut dyn FnMut(),
 ) -> RunResult {
-    let image: &'static [u8] = Box::leak(image.into_boxed_slice());
+    run_image_static(Box::leak(image.into_boxed_slice()), corlib, configure, service)
+}
+
+/// [`run_image_serviced`] over bytes the caller has already placed somewhere that outlives the run.
+///
+/// **This is the entry point that does not leak.** A device serving repeatedly reaches it through
+/// [`serve_one_baked_with_residence`], having put the image in a buffer it reuses; the retention is
+/// then one image rather than one per request. See [`run_image`] for why the arena rewind that
+/// appears to cover the difference does not.
+#[cfg(feature = "baked-image")]
+#[must_use]
+pub fn run_image_static(
+    image: &'static [u8],
+    corlib: Option<&'static [u8]>,
+    configure: &mut dyn FnMut(&mut Vm),
+    service: &mut dyn FnMut(),
+) -> RunResult {
     let (module, entry) = match load_deployed(image, corlib) {
         Ok(booted) => booted,
         Err(why) => return failure(&why),
@@ -2058,10 +2082,70 @@ pub fn serve_one_baked_with(
     transport: &mut impl Transport,
     configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<bool, TransportError> {
+    serve_one_baked_with_residence(transport, configure, &mut LeakEachImage)
+}
+
+/// Where a served image's bytes live for as long as the loader can reach them.
+///
+/// # Why this is the caller's choice and not this crate's
+///
+/// The loader borrows an image in place and the type it produces is not generic over a lifetime, so
+/// the bytes have to be `'static`. This crate can only get that by leaking, and it cannot take a
+/// leak back: it forbids unsafe code, and recovering a leaked allocation is the one thing that
+/// needs it. **So an unbounded number of served images is not a policy this crate chose -- it is
+/// the only policy it can implement.**
+///
+/// The caller can do better, because the caller knows two things this crate does not: how much
+/// memory the board has, and that **nothing survives a request by design** -- the module and the
+/// machine are dropped before the next frame is read. That second fact is what makes reuse sound,
+/// and it is knowable exactly where the serve loop is written and nowhere else.
+///
+/// A host implementation should just leak ([`LeakEachImage`]); a host evaluating once gains nothing
+/// from a ceiling it would have to invent. A device implementation should hand back slices of one
+/// buffer it owns for the lifetime of the program.
+#[cfg(feature = "baked-image")]
+pub trait ImageResidence {
+    /// Place one image's bytes where the loader can borrow them for as long as it needs.
+    ///
+    /// `None` refuses the image -- the bytes do not fit whatever the implementation set aside. A
+    /// refusal is reported to the host as a failed run rather than dropped, because an image that
+    /// is too large for the board is a fact the person who sent it needs.
+    fn admit(&mut self, image: Vec<u8>) -> Option<&'static [u8]>;
+}
+
+/// The [`ImageResidence`] that leaks each image, retaining every one it is given.
+///
+/// Correct for a host, and for a device that serves a bounded number of times. **On a device that
+/// serves repeatedly it is a leak per request**, and on a reclaiming heap nothing takes it back --
+/// see [`run_image`] for why the arena rewind that appears to cover this does not.
+#[cfg(feature = "baked-image")]
+pub struct LeakEachImage;
+
+#[cfg(feature = "baked-image")]
+impl ImageResidence for LeakEachImage {
+    fn admit(&mut self, image: Vec<u8>) -> Option<&'static [u8]> {
+        Some(Box::leak(image.into_boxed_slice()))
+    }
+}
+
+/// [`serve_one_baked_with`] with the image-retention policy named rather than assumed.
+///
+/// This is the entry point a device that serves repeatedly should use: supply an
+/// [`ImageResidence`] that reuses one buffer and the board retains one image instead of all of
+/// them. Everything else about the serve is identical.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn serve_one_baked_with_residence(
+    transport: &mut impl Transport,
+    configure: &mut dyn FnMut(&mut Vm),
+    residence: &mut dyn ImageResidence,
+) -> Result<bool, TransportError> {
     let Some(frame) = transport.poll()? else {
         return Ok(false);
     };
-    serve_frame_baked(transport, frame, None, configure)?;
+    serve_frame_baked(transport, frame, None, configure, residence)?;
     Ok(true)
 }
 
@@ -2076,19 +2160,27 @@ fn serve_frame_baked(
     frame: lamella_wire::Frame,
     corlib: Option<&'static [u8]>,
     configure: &mut dyn FnMut(&mut Vm),
+    residence: &mut dyn ImageResidence,
 ) -> Result<(), TransportError> {
     use lamella_wire::msg;
     note_resident_corlib(corlib);
     match frame.msg_type {
         msg::HELLO => hello_reply(transport, &frame)?,
         repl::RUN_IMAGE => {
-            let result = run_image_serviced(frame.payload, corlib, configure, &mut || {
-                let _ = transport.poll();
-            });
+            let result = match residence.admit(frame.payload) {
+                Some(image) => run_image_static(image, corlib, configure, &mut || {
+                    let _ = transport.poll();
+                }),
+                None => failure("image does not fit this target's reserved image buffer"),
+            };
             transport.send(repl::RUN_RESULT, frame.seq, &result.encode())?;
         }
         debug::DBG_IMAGE => {
-            let image: &'static [u8] = alloc::boxed::Box::leak(frame.payload.into_boxed_slice());
+            let Some(image) = residence.admit(frame.payload) else {
+                let payload = lamella_wire::error::unknown_message_type(debug::DBG_IMAGE);
+                transport.send(msg::ERROR, frame.seq, &payload)?;
+                return Ok(());
+            };
             run_debug_session_static(transport, image, corlib, frame.seq, serve_caps(), configure)?;
         }
         profile::GET_PROFILE => {
@@ -2241,7 +2333,7 @@ fn serve_deploy_frame(
                 configure,
             )?;
         }
-        _ => serve_frame_baked(transport, frame, flash.resident_corlib(), configure)?,
+        _ => serve_frame_baked(transport, frame, flash.resident_corlib(), configure, &mut LeakEachImage)?,
     }
     Ok(Served::Handled)
 }
@@ -2878,7 +2970,7 @@ fn serve_repl_frame(
         }
         lamella_wire::msg::HELLO => hello_reply_repl(transport, &frame)?,
         #[cfg(feature = "baked-image")]
-        _ => serve_frame_baked(transport, frame, corlib, configure)?,
+        _ => serve_frame_baked(transport, frame, corlib, configure, &mut LeakEachImage)?,
         #[cfg(not(feature = "baked-image"))]
         other => transport.send(
             lamella_wire::msg::ERROR,
@@ -2973,7 +3065,7 @@ pub fn send_image(transport: &mut impl Transport, seq: u16, image: &[u8]) -> Res
 
 /// Host driver: poll for the [`repl::RUN_RESULT`] matching `seq` (non-blocking; `None` if not in yet).
 ///
-/// `Ok(None)` means ONE thing -- no answer has arrived yet -- and the two other outcomes that used to
+/// `Ok(None)` means ONE thing -- no answer has arrived yet -- and the two other outcomes that would otherwise
 /// share it now have their own. Both were indistinguishable from "keep waiting", so a caller polled
 /// each to its deadline and reported a timeout: the most expensive reading, because it points at the
 /// link when the link is fine.

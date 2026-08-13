@@ -223,6 +223,19 @@ impl<T: Transport> Dap<T> {
     /// and leaves its own: the probe stays poisoned until it is physically unplugged, and the
     /// symptom is a pair of errors that alternate as each run shifts the queue by one. Discarding
     /// replies until the echo matches consumes the backlog and ends it.
+    ///
+    /// **BUT A REFUSAL IS NOT A STALE REPLY, AND READING PAST ONE IS HOW A COMMAND FAILS
+    /// SILENTLY.** A probe answers a command it does not implement with [`proto::INVALID_COMMAND`]
+    /// in place of the echo, and a probe that ran the command but could not carry it out answers
+    /// [`proto::DAP_ERROR`] in the status byte. Read neither, and an unimplemented command is
+    /// indistinguishable from a completed one: the resync loop discards the refusal as though it
+    /// were backlog, the probe -- having already answered -- sends nothing more, and the operation
+    /// surfaces several steps later as a transport timeout naming a command that had nothing to do
+    /// with the cause. Both are reported against the command that earned them.
+    ///
+    /// The two checks stay distinct because they can disagree: a refusal that IS stale backlog is
+    /// still recoverable, so a [`proto::INVALID_COMMAND`] reply is only fatal once the loop fails
+    /// to find this command's own echo behind it.
     fn command(&mut self, request: &[u8]) -> Result<&[u8], DapError> {
         self.transport.write_packet(request)?;
         let want = request.first().copied().unwrap_or(0);
@@ -359,6 +372,13 @@ impl<T: Transport> Dap<T> {
     /// concludes anything about a wire protocol should be able to say the wire exists first.
     ///
     /// Bit 0 is SWCLK, bit 1 SWDIO, bit 7 nRESET (CMSIS-DAP `DAP_SWJ_Pins`).
+    ///
+    /// **THE LEVELS ARE AT INDEX 1, AND TAKING INDEX 0 PRODUCES A CONFIDENT WRONG DIAGNOSIS
+    /// RATHER THAN AN ERROR.** The reply is `0x10 | Pin Input`, so index 0 is the echoed command id
+    /// -- a constant `0x10`, whose only set bit is bit 4, which is not an assigned pin. Read from
+    /// there, SWCLK, SWDIO and nRESET all appear LOW on a perfectly good link, which is precisely
+    /// the signature of an absent target. A tool whose whole purpose is to answer "is anything on
+    /// the wire" then answers "no" about a board that is connected, powered and working.
     pub fn read_swd_pins(&mut self) -> Result<u8, DapError> {
         let reply = self.command(&proto::swj_pins(0, 0, 0))?;
         Ok(reply.get(1).copied().unwrap_or(0))
@@ -382,6 +402,22 @@ impl<T: Transport> Dap<T> {
     /// A line reset first (a select is only honored from the reset state) and at least two idle
     /// cycles, then the 8-bit write request for DP register `0x0C`, then five bits of
     /// turnaround-and-acknowledge, then the 32-bit address with even parity.
+    ///
+    /// **Those five bits are the whole difficulty, and getting them wrong is silent.** Nobody
+    /// drives an acknowledge here, but the DP still expects the line HANDED OVER -- so a host that
+    /// keeps driving is not merely redundant, it is clocking the DP's state machine through a phase
+    /// the protocol says belongs to the other side, and the port never comes out of it. That is why
+    /// this uses `DAP_SWD_Sequence`, whose phases can release SWDIO, and not `DAP_SWJ_Sequence`,
+    /// which can only ever drive. Built from the driving primitive alone the selection leaves an
+    /// RP2040 answering nothing at all -- indistinguishable, from the host, from a part that ignored
+    /// it.
+    ///
+    /// The `DPIDR` read that follows is not a formality: it is the only evidence the intended port
+    /// is listening, and until it answers the bus is indistinguishable from one where every port is
+    /// still tristated. **Check the value before powering the port up** -- on a part whose candidate
+    /// ports include a rescue DP, a debug power-up request is a chip reset.
+    ///
+    /// Returns that `DPIDR`.
     pub fn select_multidrop_target(&mut self, target_id: u32) -> Result<u32, DapError> {
         use proto::SwdPhase;
         const SELECT_REQUEST: u8 = 0x99;
@@ -443,56 +479,6 @@ impl<T: Transport> Dap<T> {
     pub fn configure_transfers(&mut self, idle_cycles: u8, wait_retry: u16, match_retry: u16) -> Result<(), DapError> {
         self.command(&proto::transfer_configure(idle_cycles, wait_retry, match_retry))?;
         Ok(())
-    }
-
-    /// Writes `words` to consecutive addresses starting at `address` through the MEM-AP,
-    /// streaming them with `DAP_TransferBlock` -- the bulk path for staging an image in target
-    /// RAM. The MEM-AP auto-increments `TAR` per word; the increment is only architecturally
-    /// guaranteed within a 1 KB window (ADIv5), so `TAR` is rewritten at every 1 KB boundary,
-    /// and blocks are sized to the probe packet.
-    pub fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), DapError> {
-        /// 64-byte packet: 5 header bytes + 14 x 4-byte values.
-        const WORDS_PER_PACKET: usize = 14;
-        let mut address = address;
-        let mut remaining = words;
-        while !remaining.is_empty() {
-            let to_boundary = ((0x400 - (address & 0x3ff)) / 4) as usize;
-            let count = remaining.len().min(WORDS_PER_PACKET).min(to_boundary);
-            self.write_ap(0x4, address)?;
-            let reply = self.command(&proto::transfer_block_write(proto::ap_write(0xC), &remaining[..count]))?;
-            let (done, ack) = proto::parse_block_write(reply)?;
-            if ack != Ack::Ok || done as usize != count {
-                return Err(DapError::Ack(ack));
-            }
-            address += (count * 4) as u32;
-            remaining = &remaining[count..];
-        }
-        Ok(())
-    }
-
-    /// Reads `count` consecutive words starting at `address` through the MEM-AP, streaming them
-    /// with `DAP_TransferBlock` -- the bulk path for verifying a programmed image. Chunked like
-    /// [`write_words`](Self::write_words) (probe packet size, 1 KB auto-increment windows).
-    pub fn read_words(&mut self, address: u32, count: usize) -> Result<Vec<u32>, DapError> {
-        /// 64-byte reply packet: 4 header bytes + 14 x 4-byte values (a `DAP_Transfer` block
-        /// read resolves the posted AP read, so values come back in the same reply).
-        const WORDS_PER_PACKET: usize = 14;
-        let mut out = Vec::with_capacity(count);
-        let mut address = address;
-        let mut remaining = count;
-        while remaining > 0 {
-            let to_boundary = ((0x400 - (address & 0x3ff)) / 4) as usize;
-            let batch = remaining.min(WORDS_PER_PACKET).min(to_boundary);
-            self.write_ap(0x4, address)?;
-            let reply = self.command(&proto::transfer_block_read(proto::ap_read(0xC), batch as u16))?;
-            let (done, ack) = proto::parse_block_read(reply, &mut out)?;
-            if ack != Ack::Ok || done as usize != batch {
-                return Err(DapError::Ack(ack));
-            }
-            address += (batch * 4) as u32;
-            remaining -= batch;
-        }
-        Ok(out)
     }
 
     /// Reads a 32-bit word from target memory through the MEM-AP. A CMSIS-DAP
@@ -990,6 +976,66 @@ mod tests {
         );
     }
 
+    /// `TAR` IS WRITTEN ONCE PER 1 KB MEM-AP WINDOW, NOT ONCE PER PROBE PACKET -- asserted at a
+    /// window EDGE, where the two rules disagree about how many there should be.
+    ///
+    /// The MEM-AP auto-increments `TAR` per access and ADIv5 guarantees that only within a 1 KB
+    /// window, so a bulk transfer needs a fresh `TAR` at each window start and nowhere else. The
+    /// packet split underneath it is the probe's business: 14 words per 64-byte report, carrying
+    /// no address at all. **The two concerns live in different crates on purpose** -- windowing in
+    /// `ArmDap`, chunking in this crate's `DapAccess` impl -- so only their composition can show
+    /// that neither one re-does the other's job, and that is what this drives.
+    ///
+    /// The existing coverage is a SAM flash page: 128 words, one `TAR`, entirely INSIDE one
+    /// window. A per-packet implementation is wrong there too, but nothing pinned the crossing --
+    /// which is the case where "one per window" and "one per packet" are not merely different
+    /// counts but different ADDRESSES, and where a wrong `TAR` puts a word somewhere else in
+    /// memory rather than merely costing a round trip.
+    ///
+    /// 300 words from 64 words into a window: 192 to the boundary (14 packets), then 108 (8),
+    /// with exactly two `TAR` writes. Per packet it would be 22.
+    #[test]
+    fn a_block_crossing_a_window_writes_tar_at_each_window_start_and_nowhere_else() {
+        use lamella_probe_core::{ArmDap, TargetAccess};
+        const START: u32 = 0x2000_0100;
+        const TOTAL: usize = 300;
+        const TO_BOUNDARY: usize = 192;
+        const PER_PACKET: usize = 14;
+
+        let expected: Vec<u32> = (0..TOTAL).map(|i| START + (i * 4) as u32).collect();
+        let tar_ack = || echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut replies = vec![tar_ack()];
+        for chunk in expected[..TO_BOUNDARY].chunks(PER_PACKET) {
+            replies.push(block_reply(chunk));
+        }
+        replies.push(tar_ack());
+        for chunk in expected[TO_BOUNDARY..].chunks(PER_PACKET) {
+            replies.push(block_reply(chunk));
+        }
+
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        let mut out = [0u32; TOTAL];
+        let outcome = target.read_words_into(START, &mut out);
+
+        let sent = &target.inner().transport().sent;
+        let tars: Vec<(usize, u32)> = sent
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p[0] == proto::cmd::TRANSFER)
+            .map(|(i, p)| (i, u32::from_le_bytes([p[4], p[5], p[6], p[7]])))
+            .collect();
+        assert_eq!(
+            tars,
+            vec![(0, START), (15, 0x2000_0400)],
+            "one TAR per window, each at its window's first address -- and 22 of them would be the \
+             per-packet rule the MEM-AP does not need"
+        );
+        assert_eq!(sent.len(), 24, "2 TAR writes + 14 packets + 8 packets");
+
+        outcome.unwrap();
+        assert_eq!(out.to_vec(), expected, "words must land in address order across the window edge");
+    }
+
     /// A reply carrying more words than the caller's buffer is refused, never written past the end.
     #[test]
     fn block_read_refuses_a_reply_longer_than_the_buffer() {
@@ -998,6 +1044,20 @@ mod tests {
         assert!(proto::parse_block_read(&reply, &mut out).is_err());
     }
 
+    /// A PROBE THAT COMPLETES FEWER TRANSFERS THAN ASKED MUST BE AN ERROR, AND THE UNWRITTEN
+    /// TAIL MUST NOT COME BACK AS DATA.
+    ///
+    /// This is the case the caller-provided buffer took a safety net away from, which is why it is
+    /// tested at the level that now owns the guarantee. While the read returned a `Vec`, a short
+    /// transfer produced a SHORT VEC and callers compared lengths -- `stlink-flash`'s verify did
+    /// exactly that, on the stated grounds that a short read is a failed verify and not a shorter
+    /// one. A buffer the caller sized is always full length, so that comparison is now always equal
+    /// and cannot fire. `read_ap_block_into` is therefore specified to write every slot or return
+    /// `Err`, and this is what holds it to that: an `Ok` here would hand back a buffer that LOOKS
+    /// complete with a tail the probe never sent.
+    ///
+    /// The sentinel is deliberately not zero -- zero is what a fresh buffer already holds, so a
+    /// test using it would pass against an implementation that wrote nothing at all.
     #[test]
     fn block_read_refuses_a_short_transfer_and_leaves_no_partial_fill() {
         const SENTINEL: u32 = 0xdead_beef;

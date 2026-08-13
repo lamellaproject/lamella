@@ -6,6 +6,38 @@
 # A port's direction and its output data therefore live in ONE register: PCNTR1 holds the direction
 # bits in [15:0] and the output data bits in [31:16], so pin n's direction is bit n and its output
 # level is bit n + 16 of the same word.
+#
+# EACH HALF ALSO HAS A 16-BIT NAME AND AN ADDRESS OF ITS OWN, AND THE TWO ARE ORDERED THE
+# OPPOSITE WAY ROUND FROM WHAT THE BIT POSITIONS PREDICT. This is the sharpest trap the block holds.
+# In all four registers the manual places the HIGH half [31:16] at the register's own address and
+# the LOW half [15:0] two bytes above it:
+#
+#     PCNTR1  0x00   PODR [31:16] at 0x00   PDR  [15:0] at 0x02
+#     PCNTR2  0x04   EIDR [31:16] at 0x04   PIDR [15:0] at 0x06
+#     PCNTR3  0x08   PORR [31:16] at 0x08   POSR [15:0] at 0x0A
+#     PCNTR4  0x0C   EORR [31:16] at 0x0C   EOSR [15:0] at 0x0E
+#
+# On a little-endian core the halfword at a 32-bit register's own address is that register's LOW
+# half, so a consumer that computes a half's address from its bit positions gets both halves of
+# every one of these registers backwards. In PCNTR1 that swap is between output DATA and output
+# DIRECTION: a program meaning to drive a pin high would instead mark pins as outputs, and a program
+# meaning to set a direction would write a level. Both registers are read/write and both accept the
+# write, so nothing faults and the pin simply does the other thing. The four rows below are the
+# 32-bit registers, whose bit positions the manual states unambiguously and which it says are
+# accessed in 32-bit units; the 16-bit aliases are deliberately not given offsets here, because
+# stating them would mean choosing between the manual's address list and the arithmetic, and a
+# 32-bit access needs neither.
+#
+# TWO OF THESE REGISTERS DO NOT EXIST ON EVERY PORT, and one of the absences lands on a port this
+# family already places. PCNTR4 is listed for PORT1 through PORT4 only, so PORT0 has no PCNTR4 at
+# all; the EIDR half of PCNTR2 is listed for the same four ports, while its PIDR half is listed for
+# every port. Those are the event-link registers, and a port outside that range has no event input
+# or output to carry. An offset here is the block's layout and not a promise that every instance
+# carries the register.
+#
+# A PIN NEEDS NO CLOCK GATE OPENED BEFORE ANY OF THIS. The I/O ports are absent from the list of
+# modules the module-stop function can stop, so a port answers out of reset -- which is the opposite
+# of the usual opening move and is stated on the instance map beside the module-stop reading itself.
 
 [table]
 kind = "block"

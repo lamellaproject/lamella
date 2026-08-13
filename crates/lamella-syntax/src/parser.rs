@@ -7,7 +7,8 @@ use crate::ast::{
     GotoTarget, Initializer, Literal, Member, MemberInitializer, MemberInitializerValue, Modifier,
     NamespaceDecl, NamespaceMember, OverloadableOperator,
     Parameter, ParameterModifier, PostfixOperator, PredefinedType, QualifiedName, Stmt, StmtKind,
-    SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeParameter, TypeRef, TypeRefKind,
+    SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeParameter, TypeParameterConstraint,
+    TypeParameterConstraintClause, TypeRef, TypeRefKind,
     TypeTestOperation,
     UnaryOperator, UsingDirective, UsingKind, UsingResource, VariableDeclarator,
 };
@@ -912,8 +913,7 @@ impl Parser {
                 labels.push(label);
             }
             let mut statements = Vec::new();
-            while self.current_keyword() != Some(Keyword::Case)
-                && self.current_keyword() != Some(Keyword::Default)
+            while !self.at_switch_label()
                 && self.current_punctuator() != Some(Punctuator::CloseBrace)
                 && !matches!(self.current().kind, TokenKind::EndOfFile)
             {
@@ -951,7 +951,7 @@ impl Parser {
                 );
                 Some(SwitchLabel::Case(value))
             }
-            Some(Keyword::Default) => {
+            Some(Keyword::Default) if self.at_switch_label() => {
                 self.bump();
                 self.expect(
                     Punctuator::Colon,
@@ -960,6 +960,30 @@ impl Parser {
                 Some(SwitchLabel::Default)
             }
             _ => None,
+        }
+    }
+
+    /// Whether the scanner is at the start of a switch LABEL -- `case`, or a `default` that a `:`
+    /// follows.
+    ///
+    /// **THE `default` HALF NEEDS THE LOOKAHEAD, AND BOTH LOOPS MUST AGREE ON IT.** A section's
+    /// label run and its statement run are separate loops over the same tokens: one collects while
+    /// a label starts here, the other collects until one does. `default` begins a label AND the
+    /// `default(T)` operator, so a definition that stops at the keyword makes
+    /// `case 1: default(int).ToString();` -- a legal program -- terminate the statement run at a
+    /// label that is not there. The section loop's no-progress guard then BUMPS PAST the keyword,
+    /// so the failure is a silently dropped token rather than a diagnostic.
+    ///
+    /// One predicate, both callers, for that reason: two spellings of "a label starts here" is the
+    /// shape where one of them gains a case and the other does not.
+    fn at_switch_label(&self) -> bool {
+        match self.current_keyword() {
+            Some(Keyword::Case) => true,
+            Some(Keyword::Default) => matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Punctuator(Punctuator::Colon))
+            ),
+            _ => false,
         }
     }
 
@@ -1407,6 +1431,9 @@ impl Parser {
     /// MISPLACED file-scoped namespace (one written inside `namespace M { ... }`) from swallowing
     /// the enclosing declaration's brace and turning one reportable mistake into a parse cascade.
     ///
+    /// The three placement rules are csc's, MEASURED one compilation each, and every
+    /// one of them turns on the immediate CONTAINER rather than on anything file-wide:
+    ///
     /// | container | diagnostic |
     /// |---|---|
     /// | the compilation unit, nothing declared yet | none -- this is the form the feature is for |
@@ -1513,6 +1540,7 @@ impl Parser {
         } else {
             Vec::new()
         };
+        let constraints = self.parse_type_parameter_constraint_clauses();
         self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
         let mut members = Vec::new();
         while self.current_punctuator() != Some(Punctuator::CloseBrace)
@@ -1532,6 +1560,7 @@ impl Parser {
             name,
             type_parameters,
             bases,
+            constraints,
             members,
             span: Span::new(start, end),
         }
@@ -1696,6 +1725,7 @@ impl Parser {
             let (name, _) = self.expect_identifier();
             let type_parameters = self.parse_type_parameter_list();
             let (parameters, arglist) = self.parse_parameter_list();
+            let constraints = self.parse_type_parameter_constraint_clauses();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
                 let end = block.span.end;
@@ -1709,6 +1739,7 @@ impl Parser {
                 return_type: ty,
                 name,
                 type_parameters,
+                constraints,
                 parameters,
                 is_vararg: arglist.is_some(),
                 body,
@@ -1740,6 +1771,7 @@ impl Parser {
             }
             let type_parameters = self.parse_type_parameter_list();
             let (parameters, arglist) = self.parse_parameter_list();
+            let constraints = self.parse_type_parameter_constraint_clauses();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
                 let end = block.span.end;
@@ -1753,6 +1785,7 @@ impl Parser {
                 return_type: ty,
                 name: member,
                 type_parameters,
+                constraints,
                 parameters,
                 is_vararg: arglist.is_some(),
                 body,
@@ -2509,6 +2542,17 @@ impl Parser {
                         span,
                     );
                 }
+                Some(Punctuator::LessThan) if self.generic_type_name_ahead() => {
+                    let (type_arguments, end, _) = self.parse_type_argument_list(false);
+                    let span = Span::new(expr.span.start, end);
+                    expr = Expr::new(
+                        ExprKind::ConstructedType {
+                            name: Box::new(expr),
+                            type_arguments,
+                        },
+                        span,
+                    );
+                }
                 Some(Punctuator::LessThan) if self.generic_call_ahead() => {
                     let (type_arguments, _, _) = self.parse_type_argument_list(false);
                     let open = self.current().span.start;
@@ -2639,7 +2683,7 @@ impl Parser {
                     Punctuator::OpenParen,
                     DiagnosticKind::TokenExpected { expected: "(" },
                 );
-                let target = self.parse_type();
+                let target = self.parse_typeof_operand();
                 let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
                 Expr::new(ExprKind::TypeOf(target), Span::new(span.start, end))
             }
@@ -2652,6 +2696,16 @@ impl Parser {
                 let target = self.parse_type();
                 let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
                 Expr::new(ExprKind::SizeOf(target), Span::new(span.start, end))
+            }
+            TokenKind::Keyword(Keyword::Default) => {
+                self.bump();
+                self.expect(
+                    Punctuator::OpenParen,
+                    DiagnosticKind::TokenExpected { expected: "(" },
+                );
+                let target = self.parse_type();
+                let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                Expr::new(ExprKind::DefaultValue(target), Span::new(span.start, end))
             }
             TokenKind::Keyword(Keyword::Stackalloc) => {
                 self.bump();
@@ -3241,6 +3295,105 @@ impl Parser {
         Expr::new(ExprKind::ArrayInitializer(elements), Span::new(start, end))
     }
 
+    /// Parses the operand of `typeof` (ECMA-334 4th ed 14.5.11): a `type` as everywhere else, or
+    /// the `unbound-type-name` that is legal in this one position and no other.
+    ///
+    /// **THE TWO GRAMMARS OVERLAP AND THE SPEC BREAKS THE TIE, SO THE UNBOUND FORM IS TRIED
+    /// FIRST AND ONLY COMMITS ON ITS OWN SHAPE.** 14.5.11: *when the operand is a sequence of
+    /// tokens that satisfies the grammars of both unbound-type-name and type-name, namely when it
+    /// contains neither a generic-dimension-specifier nor a type-argument-list, the sequence of
+    /// tokens is considered to be a type-name.* A `generic-dimension-specifier` is the only thing
+    /// that tells them apart, so [`Parser::parse_unbound_type_name`] answers `None` unless it finds
+    /// one -- `typeof(int)`, `typeof(T)`, `typeof(List<int>)` and `typeof(void)` all fall through
+    /// to the ordinary type parse, unchanged.
+    ///
+    /// The grammar puts `unbound-type-name` in this production alone, so the parser does too: no
+    /// other type position accepts a `generic-dimension-specifier`, and none of them needs a rule
+    /// of its own to refuse one.
+    fn parse_typeof_operand(&mut self) -> TypeRef {
+        match self.parse_unbound_type_name() {
+            Some(unbound) => unbound,
+            None => self.parse_type(),
+        }
+    }
+
+    /// Parses an `unbound-type-name` (14.5.11) at the cursor, or answers `None` having consumed
+    /// nothing.
+    ///
+    /// The shape is `identifier ('.' identifier)* '<' ','* '>'`, and the trailing
+    /// `generic-dimension-specifier` is what makes it one: `arity` is the comma count plus one, so
+    /// `<>` is 1 and `<,>` is 2.
+    ///
+    /// **SPECULATIVE, BECAUSE THE DECIDING TOKEN IS PAST THE NAME.** `List<>` and `List<int>` are
+    /// identical until the token after the `<`, and a dotted name puts arbitrarily many tokens in
+    /// front of that. So this walks the shape and rewinds the position AND the diagnostics on any
+    /// mismatch, exactly as [`type_argument_list_ahead`](Self::type_argument_list_ahead) does --
+    /// the same pair, for the same reason: a half-walked name that reported `IdentifierExpected` on
+    /// the way must not leave that behind for a `typeof(int[])` the caller then parses cleanly.
+    ///
+    /// Below C# 2 this answers `None` rather than reporting, so the refusal comes from the ordinary
+    /// type parse -- one feature diagnostic (CS8022) at the `<`, the same one `typeof(List<int>)`
+    /// draws, from the same line of code.
+    ///
+    /// A specifier on a NON-FINAL part -- `typeof(Outer<>.Inner)` -- is not accepted, though the
+    /// grammar allows one after every part. [`TypeRefKind::Unbound`] carries ONE arity for a whole
+    /// dotted name because [`TypeRefKind::Generic`] carries ONE argument list for one, so the
+    /// constructed form `List<int>.Enumerator` and the unbound form `List<>.Enumerator` are
+    /// unrepresentable for the same reason. This answers `None` for it and the ordinary type parse
+    /// refuses, which is what it already does for the constructed form.
+    fn parse_unbound_type_name(&mut self) -> Option<TypeRef> {
+        if !self.version.supports(Feature::Generics) {
+            return None;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let unbound = self.walk_unbound_type_name();
+        if unbound.is_none() || self.diagnostics.len() != saved_diagnostics {
+            self.position = saved_position;
+            self.diagnostics.truncate(saved_diagnostics);
+            return None;
+        }
+        unbound
+    }
+
+    /// The walk behind [`parse_unbound_type_name`](Self::parse_unbound_type_name), which owns the
+    /// rewind. Consumes tokens as it goes and answers `None` the moment the shape does not hold.
+    fn walk_unbound_type_name(&mut self) -> Option<TypeRef> {
+        let start = self.current().span.start;
+        let mut parts = Vec::new();
+        loop {
+            match &self.current().kind {
+                TokenKind::Identifier(name) => {
+                    parts.push(name.clone());
+                    self.bump();
+                }
+                _ => return None,
+            }
+            if self.current_punctuator() != Some(Punctuator::Dot) {
+                break;
+            }
+            self.bump();
+        }
+        if self.current_punctuator() != Some(Punctuator::LessThan) {
+            return None;
+        }
+        self.bump();
+        let mut arity = 1;
+        while self.current_punctuator() == Some(Punctuator::Comma) {
+            self.bump();
+            arity += 1;
+        }
+        if self.current_punctuator() != Some(Punctuator::GreaterThan) {
+            return None;
+        }
+        let end = self.current().span.end;
+        self.bump();
+        Some(TypeRef::new(
+            TypeRefKind::Unbound { parts, arity },
+            Span::new(start, end),
+        ))
+    }
+
     /// Parses a type name (11.1): `identifier ('.' identifier)*`, with a generic type-argument
     /// list `<...>` where one follows and the dialect permits it (25.5).
     fn parse_type_name(&mut self) -> TypeRef {
@@ -3298,7 +3451,60 @@ impl Parser {
     /// Parses a generic type-argument list from the current `<` (25.5): `< type (, type)* >`.
     /// Returns the arguments, the offset past the closing `>`, and any [`AngleCredit`] left for an
     /// enclosing list.
+    ///
+    /// **THE CLOSING `>` IS NOT ALWAYS A `>` TOKEN, AND THE OBVIOUS FIX IS A MISCOMPILE.** The
+    /// lexer takes the longest match (9.4.5), so `List<List<int>>` ends in ONE
+    /// [`Punctuator::GreaterThanGreaterThan`] closing two levels. Narrowing that token in place --
+    /// rewriting it as the second `>` -- reads as the natural fix and is wrong: a local declaration
+    /// is told from an expression by parsing a type SPECULATIVELY and rolling the position back
+    /// ([`parse_declaration_or_expression_statement`](Self::parse_declaration_or_expression_statement)),
+    /// and a rolled-back position does not restore a rewritten token. **Measured by building it:**
+    /// `a<b>>c;` parsed as `a<b>`, rolled back, and re-parsed as `(a < b) > c` -- **one `>` of the
+    /// source silently deleted from the program**, compiling clean, at every dialect above C# 2.
+    ///
+    /// So the `>>` is consumed WHOLE by the inner list, which hands its second half outward as a
+    /// credit. Nothing in the token stream is mutated, and rollback stays position-only.
+    ///
+    /// **ONLY A `nested` LIST MAY CONSUME A `>>`, AND THAT IS C#'s RULE RATHER THAN AN
+    /// IMPLEMENTATION CONVENIENCE.** The grammar splits `>>` into two `>` for a type-argument list
+    /// and nowhere else, so an OUTERMOST list has nothing to give the second half to. Letting it
+    /// close on one anyway reads `a<b>>c;` as a local declaration `a<b> c;` where the language --
+    /// and csc -- read the shift expression `a < b >> c`. Refusing to close leaves the `>>` in
+    /// place, the speculative type parse fails, and the statement falls through to the expression
+    /// reading it should have had.
+    /// Whether the `<` at the cursor opens a generic method call's type-argument list rather than a
+    /// less-than operator -- decided by SPECULATION, because the two are identical up to the `>`.
+    ///
+    /// `a < b > (c)` is two comparisons and `M<int>(x)` is one call, and no amount of looking at the
+    /// `<` itself separates them. So this parses a candidate type-argument list and asks what
+    /// follows: a `(` means the list was real. That is the invocation case of the spec's
+    /// disambiguation rule -- ECMA-334 9.2.3 admits `)`, `]`, `:`, `;`, `,`, `.`, `?`, `==` and `!=` too
+    /// as well, and none of those is reachable from the postfix loop, so admitting them here would
+    /// claim `<` for a type-argument list in positions this parser then could not use.
+    ///
+    /// **THE RESTORE MUST TRUNCATE DIAGNOSTICS, NOT ONLY THE POSITION.** A failed speculation
+    /// walks `a < b > (c)` as a type-argument list, and `b > (c)` reports errors on the way. Rewinding
+    /// the cursor while leaving those behind turns a legal comparison into a program that refuses to
+    /// compile, with diagnostics pointing at a construct the user did not write. Every other
+    /// speculation in this parser restores both; this is the same pair.
+    /// Whether the `<` at the cursor opens a type-argument list closing on a `.` -- a CONSTRUCTED
+    /// TYPE whose static member is being accessed, `Box<int>.Count`.
+    ///
+    /// Every condition [`Parser::generic_call_ahead`] states applies here for the same reasons; only
+    /// the FOLLOWER differs. Kept as its own predicate rather than a parameter because the two
+    /// commit to different nodes, and a shared one would have to hand back which follower matched.
+    fn generic_type_name_ahead(&mut self) -> bool {
+        self.type_argument_list_ahead(Punctuator::Dot)
+    }
+
     fn generic_call_ahead(&mut self) -> bool {
+        self.type_argument_list_ahead(Punctuator::OpenParen)
+    }
+
+    /// The shared speculation behind [`Parser::generic_call_ahead`] and
+    /// [`Parser::generic_type_name_ahead`]: parse a type-argument list at the cursor, decide whether
+    /// it IS one from `follower`, and rewind either way.
+    fn type_argument_list_ahead(&mut self, follower: Punctuator) -> bool {
         if !self.version.supports(Feature::Generics) {
             return false;
         }
@@ -3309,7 +3515,7 @@ impl Parser {
         let committed = clean
             && credit.closes == 0
             && !arguments.is_empty()
-            && self.current_punctuator() == Some(Punctuator::OpenParen);
+            && self.current_punctuator() == Some(follower);
         self.position = saved_position;
         self.diagnostics.truncate(saved_diagnostics);
         committed
@@ -3370,6 +3576,23 @@ impl Parser {
     /// (`class C<T>`, `T M<T>(T)`). Parses it where the dialect permits generics; below C# 2
     /// reports the feature diagnostic once and skips the balanced `<...>` so the rest of the
     /// declaration still parses. Returns the declared parameters, empty in both other cases.
+    ///
+    /// **THE USE SITE HAD THE GATE AND THE DECLARATION SITES DID NOT, AND THE DIFFERENCE WAS
+    /// VISIBLE IN THE DIAGNOSTICS.** Measured against csc at `/langversion:ISO-1`, which answers all
+    /// three of `class C<T> { }`, `T M<T>(T x)` and `List<int>` with ONE feature diagnostic. lcsc
+    /// answered the use site the same way and the two declaration sites with a parse CASCADE --
+    /// `class C<T> { }` drew CS1031 + CS1514 + CS1519 and a generic method drew six codes, none of
+    /// which csc emits there. Codes csc does not emit are the false-positive column, so this was
+    /// not merely untidy.
+    ///
+    /// **PARSING IS NOT ACCEPTING, AND THE DIFFERENCE LIVES IN THE BINDER.**
+    /// [`crate::version::Feature::Generics`] is in the NOT-IMPLEMENTED set, so above C# 2 the
+    /// binder's `gate_feature` refuses the construct as LAM0001 -- *permitted by this dialect, not
+    /// built in this compiler* -- which is a different sentence from CS8022 and is deliberately NOT
+    /// silenced by raising the language version. Producing the tree here is what lets the binder
+    /// name the construct at all; a half-implemented feature that reaches EMIT is the silent
+    /// miscompile this pair of bits exists to prevent, and is how the automatically-implemented
+    /// -property hole got in.
     fn parse_type_parameter_list(&mut self) -> Vec<TypeParameter> {
         if self.current_punctuator() != Some(Punctuator::LessThan) {
             return Vec::new();
@@ -3404,6 +3627,94 @@ impl Parser {
         }
         self.expect(Punctuator::GreaterThan, DiagnosticKind::TokenExpected { expected: ">" });
         parameters
+    }
+
+    /// Parses a run of `where` clauses (C# 2.0; ECMA-334 4th ed 25.7), the
+    /// *type-parameter-constraints-clauses* that follow a type's base list or a method's parameter
+    /// list. Returns empty when the next token does not begin one.
+    ///
+    /// **`where` IS CONTEXTUAL, so the test is three tokens rather than one.** It is an ordinary
+    /// identifier everywhere else, and `class where { }` declares a type called `where` that a
+    /// program may then name in a base list -- `class C : where { }`. Requiring
+    /// `where` + identifier + `:` is what tells the clause from the type: a base list has already
+    /// consumed its `:` by the time this runs, so a bare `where` in that position is a type name and
+    /// is left alone.
+    ///
+    /// **Parsed at every language version, INCLUDING below C# 2 where generics are gated.** The
+    /// gate fires once, in [`Parser::parse_type_parameter_list`]; if the clauses were then left
+    /// unparsed, `class C<T> where T : class { }` would report the honest CS8022 and follow it with
+    /// a cascade at `where` from the brace expectation -- codes csc does not emit here, which is the
+    /// false-positive column this parser measures itself against. Producing the tree is not
+    /// accepting it; the binder is what refuses.
+    fn parse_type_parameter_constraint_clauses(&mut self) -> Vec<TypeParameterConstraintClause> {
+        let mut clauses = Vec::new();
+        while self.current_is_constraint_clause_start() {
+            let start = self.current().span.start;
+            self.bump();
+            let parameter_span = self.current().span;
+            let (parameter, parameter_end) = self.expect_identifier();
+            self.expect(Punctuator::Colon, DiagnosticKind::TokenExpected { expected: ":" });
+            let mut constraints = Vec::new();
+            let end = loop {
+                let constraint = self.parse_type_parameter_constraint();
+                let at = constraint.span().end;
+                constraints.push(constraint);
+                if !self.eat(Punctuator::Comma) {
+                    break at;
+                }
+            };
+            clauses.push(TypeParameterConstraintClause {
+                parameter,
+                parameter_span: Span::new(parameter_span.start, parameter_end),
+                constraints,
+                span: Span::new(start, end),
+            });
+        }
+        clauses
+    }
+
+    /// Whether the current position begins a `where` clause: the contextual keyword, then an
+    /// identifier, then `:`. See [`Parser::parse_type_parameter_constraint_clauses`] for why all
+    /// three are required.
+    fn current_is_constraint_clause_start(&self) -> bool {
+        if !matches!(&self.current().kind, TokenKind::Identifier(name) if &**name == "where") {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.position + 1).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_))
+        ) && matches!(
+            self.tokens.get(self.position + 2).map(|token| &token.kind),
+            Some(TokenKind::Punctuator(Punctuator::Colon))
+        )
+    }
+
+    /// Parses one constraint inside a `where` clause: `class`, `struct`, `new()`, or a type.
+    ///
+    /// **`class` and `struct` are reserved words here, not type names**, so they are matched as
+    /// keywords rather than routed through [`Parser::parse_type`] -- which would take `class` as a
+    /// parse error rather than the reference-type constraint. `new` is likewise the constructor
+    /// constraint and never an object creation: a constraint position has no expression in it.
+    fn parse_type_parameter_constraint(&mut self) -> TypeParameterConstraint {
+        let span = self.current().span;
+        match &self.current().kind {
+            TokenKind::Keyword(Keyword::Class) => {
+                self.bump();
+                TypeParameterConstraint::ReferenceType(span)
+            }
+            TokenKind::Keyword(Keyword::Struct) => {
+                self.bump();
+                TypeParameterConstraint::ValueType(span)
+            }
+            TokenKind::Keyword(Keyword::New) => {
+                self.bump();
+                self.expect(Punctuator::OpenParen, DiagnosticKind::TokenExpected { expected: "(" });
+                let end =
+                    self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                TypeParameterConstraint::DefaultConstructor(Span::new(span.start, end))
+            }
+            _ => TypeParameterConstraint::Type(self.parse_type()),
+        }
     }
 
     /// Skips a generic type-argument list `< ... >` from the current `<`, balancing nested `<`/`>`
@@ -3673,6 +3984,12 @@ mod tests {
             ExprKind::MemberAccess { receiver, name } => {
                 format!("(. {} {name})", dump(receiver))
             }
+            ExprKind::ConstructedType {
+                name,
+                type_arguments,
+            } => {
+                format!("(ctype {} {})", dump(name), type_arguments.len())
+            }
             ExprKind::Invocation {
                 receiver,
                 type_arguments,
@@ -3743,6 +4060,7 @@ mod tests {
             ),
             ExprKind::TypeOf(target) => format!("(typeof {})", dump_type(target)),
             ExprKind::SizeOf(target) => format!("(sizeof {})", dump_type(target)),
+            ExprKind::DefaultValue(target) => format!("(default {})", dump_type(target)),
             ExprKind::StackAlloc { element, count } => {
                 format!("(stackalloc {} {})", dump_type(element), dump(count))
             }
@@ -3861,6 +4179,15 @@ mod tests {
                         text.push(',');
                     }
                     text.push_str(&dump_type(argument));
+                }
+                text.push('>');
+                text
+            }
+            TypeRefKind::Unbound { parts, arity } => {
+                let mut text = parts.join(".");
+                text.push('<');
+                for _ in 1..*arity {
+                    text.push(',');
                 }
                 text.push('>');
                 text
@@ -5507,6 +5834,69 @@ mod tests {
         dump_type(ty)
     }
 
+    /// `typeof(List<>)` -- the UNBOUND generic type (ECMA-334 4th ed 14.5.11). The arity is the
+    /// `generic-dimension-specifier`'s comma count plus one, and it reaches the tree, so an
+    /// assertion here can fail: a dump printing `(typeof List)` either way would pass against a
+    /// parser that discarded the specifier and left `List` behind.
+    #[test]
+    fn an_unbound_generic_type_is_a_typeof_operand_and_its_arity_is_the_comma_count_plus_one() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(tree_at("typeof(List<>)", v2), "(typeof List<>)");
+        assert_eq!(tree_at("typeof(Dictionary<,>)", v2), "(typeof Dictionary<,>)");
+        assert_eq!(tree_at("typeof(A<,,>)", v2), "(typeof A<,,>)");
+        assert_eq!(
+            tree_at("typeof(System.Collections.Generic.List<>)", v2),
+            "(typeof System.Collections.Generic.List<>)"
+        );
+
+        assert_eq!(tree_at("typeof(int)", v2), "(typeof int)");
+        assert_eq!(tree_at("typeof(List)", v2), "(typeof List)");
+        assert_eq!(tree_at("typeof(List<int>)", v2), "(typeof List<int>)");
+        assert_eq!(tree_at("typeof(int[])", v2), "(typeof int[])");
+    }
+
+    /// The unbound form is legal in the `typeof` operand and NOWHERE else, so every other position
+    /// still refuses it -- which is the property that lets the parser scope the grammar to one
+    /// production instead of teaching ~20 type positions to say no.
+    ///
+    #[test]
+    fn an_unbound_generic_name_outside_typeof_is_refused() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert!(!unit_codes_at("class P { void M() { List<> x = null; } }", v2).is_empty());
+        assert!(!unit_codes_at("class P { List<> f; }", v2).is_empty());
+        assert!(!unit_codes_at("class P { void M(List<> x) { } }", v2).is_empty());
+        assert!(!unit_codes_at("class P : List<> { }", v2).is_empty());
+        assert!(!unit_codes_at("class P { void M(object o) { var x = (List<>)o; } }", v2).is_empty());
+        assert!(!unit_codes_at("class P { void M() { int n = sizeof(List<>); } }", v2).is_empty());
+        assert!(!unit_codes_at("class P { void M() { var t = typeof(List<>[]); } }", v2).is_empty());
+    }
+
+    /// Below C# 2 the unbound form draws ONE feature diagnostic, and it is the SAME one
+    /// `typeof(List<int>)` draws from the same line of code -- [`parse_unbound_type_name`] declines
+    /// rather than reporting, so the gate keeps a single implementation.
+    #[test]
+    fn an_unbound_generic_type_gates_as_generics_below_csharp_2() {
+        assert_eq!(
+            unit_codes_at(
+                "class P { void M() { var t = typeof(List<>); } }",
+                LanguageVersion::CSharp1
+            ),
+            unit_codes_at(
+                "class P { void M() { var t = typeof(List<int>); } }",
+                LanguageVersion::CSharp1
+            )
+        );
+        assert!(
+            unit_codes_at(
+                "class P { void M() { var t = typeof(List<>); } }",
+                LanguageVersion::CSharp1
+            )
+            .contains(&8022)
+        );
+    }
+
     #[test]
     fn a_generic_call_site_is_told_from_two_comparisons_by_what_follows_the_angle() {
         let v2 = LanguageVersion::CSharp2;
@@ -5541,6 +5931,31 @@ mod tests {
 
         let v1 = LanguageVersion::CSharp1;
         assert!(!tree_at("a < b > (c)", v1).contains("call<"));
+    }
+
+    #[test]
+    fn a_constructed_type_is_told_from_two_comparisons_by_the_dot_that_follows() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(tree_at("Box<int>.Count", v2), "(. (ctype Box 1) Count)");
+        assert_eq!(
+            tree_at("Pair<int,string>.Count", v2),
+            "(. (ctype Pair 2) Count)"
+        );
+        assert_eq!(tree_at("N.Box<int>.Count", v2), "(. (ctype (. N Box) 1) Count)");
+
+        assert!(!tree_at("a < b > .5", v2).contains("ctype"));
+        assert!(!tree_at("a < b > s.V", v2).contains("ctype"));
+        assert_eq!(tree_at("Identity<int>(x)", v2), "(call<int> Identity x)");
+        assert!(!tree_at("a < b", v2).contains("ctype"));
+
+        assert_eq!(
+            unit_codes_at(
+                "class C { void M() { int n = Box<int>.Count; } }",
+                LanguageVersion::CSharp1
+            ),
+            [1525]
+        );
     }
 
     #[test]

@@ -216,6 +216,19 @@ impl TypeResolver for PtrResolver {
     /// slot, so there is nothing here to answer with. That is a true answer today rather than a
     /// placeholder: no emitted type declares one, because the only weak reference the C# tier has
     /// is the interpreter heap's `Object::Weak`, which is a different heap.
+    ///
+    /// **And giving it one is NOT merely a wire-format change.** The descriptor is packed between
+    /// two computed-offset structures, and the backend emits
+    /// the itable's address as `desc + 16 + nrefs * 4` INTO THE INSTRUCTION STREAM. So a new
+    /// per-slot array between `ref_offsets` and the itable moves the itable for every
+    /// `CallInterface` site already compiled into every shipped image -- the shape is frozen by
+    /// emitted machine code, not just by a reader.
+    ///
+    /// **The way round it is the one this crate already took for the host: keep strength BESIDE the
+    /// descriptor rather than inside it.** [`crate::Heap::set_weak_offsets`] is a map keyed by
+    /// type-descriptor id and touches no descriptor byte; the device equivalent would key by the
+    /// descriptor's ADDRESS, which is what a device header word already holds. So a weak slot on
+    /// device costs a lookup, not a format break.
     fn for_each_weak_offset(&self, _header_word: u32, _f: &mut dyn FnMut(u32)) {}
 }
 
@@ -389,7 +402,7 @@ mod tests {
     /// A backend-shaped type descriptor built on the host, leaked so its address is stable (the
     /// object header stores that address, exactly as on device).
     ///
-    /// **Built from the EMITTER's shape, deliberately.** This helper used to write a two-word
+    /// **Built from the EMITTER's shape, deliberately.** Writing a two-word
     /// header -- the READER's assumption -- so every test here compared the reader against a
     /// replica of itself and passed while the reader disagreed with both backends. One of them was
     /// even named for the property it was not checking. The words below mirror

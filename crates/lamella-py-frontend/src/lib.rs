@@ -15,6 +15,7 @@ pub mod lexer;
 pub mod lower;
 mod named_chars;
 pub mod parser;
+pub mod profile;
 
 /// The shared bytecode contract (the `lamella-py-bytecode` crate), re-exported so
 /// callers can name the emitted [`bytecode::Module`] without a separate dependency.
@@ -32,6 +33,8 @@ pub enum FrontendError {
     Compile(compile::CompileError),
     /// A board fact the program names and the board does not state.
     BoardFact(boardfacts::BoardFactError),
+    /// A constant the target image's capability profile cannot materialize.
+    Capability(profile::CapabilityError),
     /// A failure in a module reached through the import graph, naming the module it came from.
     ///
     /// The name has to travel with the error because the inner one's line number is a line in THAT
@@ -55,6 +58,7 @@ impl core::fmt::Display for FrontendError {
             FrontendError::Parse(e) => write!(f, "syntax error: {e}"),
             FrontendError::Compile(e) => write!(f, "compile error: {e}"),
             FrontendError::BoardFact(e) => write!(f, "board fact error: {e}"),
+            FrontendError::Capability(e) => write!(f, "capability error: {e}"),
             FrontendError::InModule { module, error } => write!(f, "in module '{module}': {error}"),
         }
     }
@@ -63,6 +67,12 @@ impl core::fmt::Display for FrontendError {
 impl From<boardfacts::BoardFactError> for FrontendError {
     fn from(e: boardfacts::BoardFactError) -> Self {
         FrontendError::BoardFact(e)
+    }
+}
+
+impl From<profile::CapabilityError> for FrontendError {
+    fn from(e: profile::CapabilityError) -> Self {
+        FrontendError::Capability(e)
     }
 }
 
@@ -86,13 +96,46 @@ impl From<compile::CompileError> for FrontendError {
 
 /// Compile Python `source` (named `module_name` for diagnostics) all the way to
 /// a versioned [`bytecode::Module`]: tokenize, parse, then lower.
+///
+/// Compiles for an image that provides every capability ([`profile::Profile::FULL`]). A caller
+/// targeting a knob-limited tier wants [`compile_str_for_profile`], which refuses at a source line
+/// what that tier's interpreter would otherwise refuse at run time.
 pub fn compile_str(
     module_name: &str,
     source: &str,
 ) -> Result<bytecode::Module, FrontendError> {
+    compile_str_for_profile(module_name, source, profile::Profile::FULL)
+}
+
+/// Compile Python `source` for an image whose capability [`profile::Profile`] is `profile`,
+/// refusing anything that image could not materialize.
+///
+/// # Why the profile is an argument
+///
+/// The knobs are cargo features on the RUNTIME, and one front-end build compiles for every profile
+/// -- the same process serves a host and a device tier in the browser IDE, and an on-device `eval`
+/// compiles for the very image it is running inside. A `cfg!` here could only describe the machine
+/// the compiler was built for, and a front end built into a device image with a mismatched feature
+/// set would disagree with its own runtime in silence, because nothing compares two build
+/// configurations. A value cannot drift from itself.
+///
+/// The refusal set is small on purpose, and the rule is not a taste call: the front end refuses
+/// exactly what it cannot ENCODE, and nothing it merely cannot PREDICT -- see [`profile`] for what
+/// is refused, and for the larger set that deliberately is not.
+///
+/// # Errors
+///
+/// Everything [`compile_str`] can fail with, plus [`FrontendError::Capability`] naming the missing
+/// capability and the source line that needs it.
+pub fn compile_str_for_profile(
+    module_name: &str,
+    source: &str,
+    profile: profile::Profile,
+) -> Result<bytecode::Module, FrontendError> {
     let tokens = lexer::tokenize(source)?;
     let ast = parser::parse(tokens)?;
     let module = compile::compile_module(module_name, &ast)?;
+    profile::check_module(&module, profile)?;
     Ok(module)
 }
 
@@ -109,6 +152,22 @@ pub fn compile_str_for_board(
     source: &str,
     board_source: &str,
 ) -> Result<(bytecode::Module, usize), FrontendError> {
+    compile_str_for_board_and_profile(module_name, source, board_source, profile::Profile::FULL)
+}
+
+/// [`compile_str_for_board`] against a board's facts AND a capability [`profile::Profile`] -- the
+/// two halves of "compile for THIS board": what it can tell you about itself, and what its image
+/// can run.
+///
+/// # Errors
+///
+/// Everything [`compile_str_for_board`] can fail with, plus [`FrontendError::Capability`].
+pub fn compile_str_for_board_and_profile(
+    module_name: &str,
+    source: &str,
+    board_source: &str,
+    profile: profile::Profile,
+) -> Result<(bytecode::Module, usize), FrontendError> {
     let facts = boardfacts::BoardFacts::parse(board_source)?;
     if facts.is_empty() {
         return Err(FrontendError::from(boardfacts::BoardFactError::Unparsable(
@@ -119,6 +178,7 @@ pub fn compile_str_for_board(
     let mut ast = parser::parse(tokens)?;
     let bound = boardfacts::fold_module(&mut ast, &facts)?;
     let module = compile::compile_module(module_name, &ast)?;
+    profile::check_module(&module, profile)?;
     Ok((module, bound))
 }
 
@@ -136,12 +196,32 @@ pub fn compile_bundle(
     entry_source: &str,
     resolve: &dyn Fn(&str) -> Option<alloc::string::String>,
 ) -> Result<bytecode::Bundle, FrontendError> {
+    compile_bundle_for_profile(entry_name, entry_source, resolve, profile::Profile::FULL)
+}
+
+/// [`compile_bundle`] for an image whose capability [`profile::Profile`] is `profile`.
+///
+/// EVERY module in the bundle is checked, not just the entry: a bundle is the form a device is sent,
+/// so an imported module's refused constant would otherwise reach the board and fail there -- the
+/// exact distance this exists to close. A failure inside an imported module is named with that
+/// module, as any other failure inside one is.
+///
+/// # Errors
+///
+/// Everything [`compile_bundle`] can fail with, plus [`FrontendError::Capability`].
+pub fn compile_bundle_for_profile(
+    entry_name: &str,
+    entry_source: &str,
+    resolve: &dyn Fn(&str) -> Option<alloc::string::String>,
+    profile: profile::Profile,
+) -> Result<bytecode::Bundle, FrontendError> {
     use alloc::collections::{BTreeSet, VecDeque};
     use alloc::string::String;
     use alloc::vec::Vec;
 
     let entry_ast = parser::parse(lexer::tokenize(entry_source)?)?;
     let entry = compile::compile_module(entry_name, &entry_ast)?;
+    profile::check_module(&entry, profile)?;
 
     let mut modules: Vec<bytecode::Module> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -164,7 +244,9 @@ pub fn compile_bundle(
                 queue.push_back(imported);
             }
         }
-        modules.push(compile::compile_module(&name, &ast).map_err(|e| in_module(e.into()))?);
+        let module = compile::compile_module(&name, &ast).map_err(|e| in_module(e.into()))?;
+        profile::check_module(&module, profile).map_err(|e| in_module(e.into()))?;
+        modules.push(module);
     }
     Ok(bytecode::Bundle { entry, modules })
 }
@@ -174,14 +256,14 @@ pub fn compile_bundle(
 fn top_level_imports(module: &ast::ModuleAst) -> alloc::vec::Vec<alloc::string::String> {
     let mut names = alloc::vec::Vec::new();
     for stmt in &module.body {
-        match stmt {
-            ast::Stmt::Import { modules } => {
+        match &stmt.kind {
+            ast::StmtKind::Import { modules } => {
                 for (module_name, _alias) in modules {
                     names.push(module_name.clone());
                 }
             }
-            ast::Stmt::ImportFrom { module, .. } => names.push(module.clone()),
-            ast::Stmt::ImportStar { module } => names.push(module.clone()),
+            ast::StmtKind::ImportFrom { module, .. } => names.push(module.clone()),
+            ast::StmtKind::ImportStar { module } => names.push(module.clone()),
             _ => {}
         }
     }
@@ -241,13 +323,13 @@ print(fib(10))
         let module = compile_str("first_light", FIRST_LIGHT).expect("compiles");
         assert_eq!(module.functions.len(), 2);
 
-        let fib = module.functions.iter().find(|f| f.name == "fib").unwrap();
+        let fib = module.functions.iter_bodies().find(|f| f.name == "fib").unwrap();
         assert_eq!(fib.params[0].ty, StaticType::Int);
         assert_eq!(fib.ret_ty, StaticType::Int);
         assert!(fib.local_types.iter().all(|t| *t == StaticType::Int));
         assert_eq!(fib.cache_count, 0);
 
-        let get_x = module.functions.iter().find(|f| f.name == "get_x").unwrap();
+        let get_x = module.functions.iter_bodies().find(|f| f.name == "get_x").unwrap();
         assert_eq!(get_x.cache_count, 1);
 
         assert!(module.body.ops.iter().any(|op| matches!(op, Op::LoadGlobal(_))));
@@ -268,6 +350,35 @@ print(fib(10))
         let err = compile_str("m", "a = )\n").unwrap_err();
         let _: String = alloc::format!("{err}");
         assert!(matches!(err, FrontendError::Parse(_)));
+    }
+
+    #[test]
+    fn line_tables_survive_the_wire_without_a_version_bump() {
+        use bytecode::{FeatureFlags, FORMAT_VERSION};
+
+        let module =
+            compile_str("m", "def f(a):
+    b = a
+    return b
+").expect("compiles");
+        let source_lines: Vec<Option<u32>> = {
+            let f = &module.functions[0];
+            (0..f.ops.len()).map(|i| f.line_for(i)).collect()
+        };
+        assert!(source_lines.iter().all(Option::is_some), "the compiler produced lines");
+
+        let bytes = module.encode(FeatureFlags::FIRST_LIGHT);
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            FORMAT_VERSION,
+            "carrying lines must not have moved the format version -- that is what the reservation bought"
+        );
+
+        let (back, _) = bytecode::Module::decode(&bytes).expect("decodes");
+        let f = &back.functions[0];
+        let decoded: Vec<Option<u32>> = (0..f.ops.len()).map(|i| f.line_for(i)).collect();
+        assert_eq!(decoded, source_lines, "every op reports the same line after a round trip");
+        assert_eq!(back, module, "and the module is otherwise unchanged");
     }
 
     #[test]

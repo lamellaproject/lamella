@@ -3,8 +3,8 @@
 use crate::bind::{bind_type, parameter_symbol};
 use crate::bound::{Binder, literal_int_value};
 use crate::declaration::{
-    accessibility_of, collect_into, is_constant_form, model_const_values, qualified_type_name,
-    resolve_const_expr, resolve_constants,
+    accessibility_of, collect_into, declared_type_name, is_constant_form, model_const_values,
+    qualified_type_name, resolve_const_expr, resolve_constants,
 };
 use crate::diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition, compiling_version};
 use lamella_syntax::version::{Feature, LanguageVersion};
@@ -19,9 +19,53 @@ use lamella_metadata::Assembly;
 use lamella_syntax::ast::{
     AttributeSection, CompilationUnit, ConversionDirection, DelegateDecl, EnumDecl, Member, Modifier,
     NamespaceMember, OverloadableOperator, Parameter, ParameterModifier, QualifiedName, TypeDecl,
-    TypeKind, TypeRef, TypeRefKind, UsingDirective, UsingKind,
+    TypeKind, TypeParameter, TypeParameterConstraint as SyntaxConstraint,
+    TypeParameterConstraintClause, TypeRef, TypeRefKind, UsingDirective, UsingKind,
 };
+use crate::resolve::quote_candidate;
 use lamella_syntax::span::Span;
+
+/// The command-line policy a compilation binds under: everything the DRIVER decided that the
+/// binder must honour, in one value.
+///
+/// **A STRUCT RATHER THAN A GROWING PARAMETER LIST, BECAUSE BOTH OF ITS FIELDS WERE THREADED TO
+/// THE SINGLE-UNIT PATH AND NOT TO THE MULTI-UNIT ONE -- ONCE EACH, MONTHS APART.** `/unsafe` was
+/// found against a real program whose entry-point file was safe; `/langversion` was found because
+/// generics compiled in one file and drew `CS8022` the moment an entry-point file joined them.
+/// Two paths, two options, two identical misses -- so the repair is not a third careful call but a
+/// single value that [`apply_bind_options`] applies in ONE place. A new option becomes a field
+/// here and reaches every path by construction rather than by whoever adds it remembering.
+///
+/// [`Default`] is "no command line behind this compilation": nothing was omitted, and the dialect
+/// is [`LanguageVersion::DEFAULT`]. Only a driver that actually parsed options departs from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindOptions {
+    /// Whether the command line OMITTED `/unsafe`, in which case `unsafe` in the source is
+    /// `CS0227`. Inverted at the driver rather than at the report site, so the binder reads the
+    /// question it actually asks.
+    pub unsafe_option_missing: bool,
+    /// The dialect `/langversion` selected. The LEXER already gates on it, and the binder must
+    /// gate on the SAME one -- two sources for one selection is how a `??` gets lexed under C# 2
+    /// and then bound under C# 1.
+    pub language_version: LanguageVersion,
+}
+
+impl Default for BindOptions {
+    fn default() -> BindOptions {
+        BindOptions {
+            unsafe_option_missing: false,
+            language_version: LanguageVersion::DEFAULT,
+        }
+    }
+}
+
+/// Applies `options` to `binder`. **THE ONLY PLACE EITHER OPTION IS APPLIED**, which is the whole
+/// point of [`BindOptions`]: a path that builds a binder without coming through here is the defect
+/// this function exists to make impossible to reintroduce quietly.
+fn apply_bind_options(binder: &mut Binder, options: BindOptions) {
+    binder.set_unsafe_option_missing(options.unsafe_option_missing);
+    binder.set_language_version(options.language_version);
+}
 
 /// Binds `unit` against its own declared types, returning every semantic
 /// diagnostic.
@@ -72,6 +116,25 @@ pub fn bind_compilation_unit_with_dialect(
     unsafe_option_missing: bool,
     language_version: LanguageVersion,
 ) -> Vec<Diagnostic> {
+    bind_compilation_unit_with_options(
+        unit,
+        references,
+        BindOptions {
+            unsafe_option_missing,
+            language_version,
+        },
+    )
+}
+
+/// Binds one `unit` against `references` under `options` -- the single-unit twin of
+/// [`bind_compilation_units_with_options`], and the one both of the older single-unit entry points
+/// now reach. See [`BindOptions`] for why the policy travels as one value.
+#[must_use]
+pub fn bind_compilation_unit_with_options(
+    unit: &CompilationUnit,
+    references: &[Assembly],
+    options: BindOptions,
+) -> Vec<Diagnostic> {
     let mut model = Model::new();
     for reference in references {
         load_assembly(&mut model, reference);
@@ -81,8 +144,7 @@ pub fn bind_compilation_unit_with_dialect(
     model.link_bases();
     resolve_constants(&mut model, core::slice::from_ref(unit));
     let mut binder = Binder::with_model(model);
-    binder.set_unsafe_option_missing(unsafe_option_missing);
-    binder.set_language_version(language_version);
+    apply_bind_options(&mut binder, options);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
@@ -273,6 +335,29 @@ pub fn bind_compilation_units_with_references_and_options(
     references: &[Assembly],
     unsafe_option_missing: bool,
 ) -> Vec<Vec<Diagnostic>> {
+    bind_compilation_units_with_options(
+        units,
+        references,
+        BindOptions {
+            unsafe_option_missing,
+            ..BindOptions::default()
+        },
+    )
+}
+
+/// Binds every unit of a multi-file compilation against `references` under `options`.
+///
+/// **THE DIALECT REACHES THIS PATH, AND FOR MOST OF GENERICS' LIFE IT DID NOT.** `/langversion` was
+/// read into a local in the driver's multi-source arm and never passed on, so a program that
+/// compiled as C# 2 in one file drew `CS8022` the moment a second file joined it -- which is every
+/// real program, because the entry point usually lives in its own. `rustc` reported the dead local
+/// on every build; the warning is not a substitute for the option arriving. See [`BindOptions`].
+#[must_use]
+pub fn bind_compilation_units_with_options(
+    units: &[CompilationUnit],
+    references: &[Assembly],
+    options: BindOptions,
+) -> Vec<Vec<Diagnostic>> {
     let mut model = Model::new();
     for reference in references {
         load_assembly(&mut model, reference);
@@ -284,7 +369,7 @@ pub fn bind_compilation_units_with_references_and_options(
     model.link_bases();
     resolve_constants(&mut model, units);
     let mut binder = Binder::with_model(model);
-    binder.set_unsafe_option_missing(unsafe_option_missing);
+    apply_bind_options(&mut binder, options);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     let mut per_unit: Vec<Vec<Diagnostic>> = units
         .iter()
@@ -582,6 +667,113 @@ fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaratio
 /// bases. Any other type -- long, ulong, double, decimal, a struct, an enum with a 64-bit base --
 /// is CS0677. Conservative: a pointer or an unresolved type is never flagged, so a valid program
 /// is never rejected.
+/// Reports every way a `where` clause list can be ill-formed (25.7), for ONE declaration.
+///
+/// **ONE IMPLEMENTATION, CALLED FOR A TYPE AND FOR EVERY GENERIC METHOD.** The rules are identical
+/// on both -- csc emits the same six codes for `class C<T> where Q : class` and
+/// `void M<T>() where Q : class` -- and writing them twice is the shape where the next case lands
+/// in one copy. `parameters` is whichever declaration's list is in view, and `quoted` is how csc
+/// names it in CS0699.
+///
+/// **The checks are ordered as csc reports them**, and each is independent: a clause may be both
+/// duplicated and misordered, and csc says both.
+fn validate_constraint_clauses(
+    binder: &mut Binder,
+    quoted: &str,
+    parameters: &[TypeParameter],
+    clauses: &[TypeParameterConstraintClause],
+) {
+    let mut seen: Vec<&str> = Vec::new();
+    for clause in clauses {
+        if !parameters
+            .iter()
+            .any(|parameter| *parameter.name == *clause.parameter)
+        {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::UnknownConstrainedTypeParameter {
+                    declaration: quoted.into(),
+                    parameter: clause.parameter.clone(),
+                },
+                clause.parameter_span,
+            ));
+        } else if seen.contains(&&*clause.parameter) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::DuplicateConstraintClause {
+                    parameter: clause.parameter.clone(),
+                },
+                clause.parameter_span,
+            ));
+        }
+        seen.push(&clause.parameter);
+        validate_constraint_order(binder, clause);
+    }
+}
+
+/// The ORDER rules inside one clause (25.7): `class`/`struct` first and never both, `new()` last
+/// and never with `struct`.
+fn validate_constraint_order(binder: &mut Binder, clause: &TypeParameterConstraintClause) {
+    let mut has_class_or_struct = false;
+    let mut has_struct = false;
+    for (index, constraint) in clause.constraints.iter().enumerate() {
+        match constraint {
+            SyntaxConstraint::ReferenceType(span) | SyntaxConstraint::ValueType(span) => {
+                if index > 0 {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::ClassOrStructConstraintMustBeFirst,
+                        *span,
+                    ));
+                }
+                has_class_or_struct = true;
+                has_struct |= matches!(constraint, SyntaxConstraint::ValueType(_));
+            }
+            SyntaxConstraint::DefaultConstructor(span) => {
+                if has_struct {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::NewConstraintWithStructConstraint,
+                        *span,
+                    ));
+                } else if index + 1 != clause.constraints.len() {
+                    binder
+                        .report(Diagnostic::new(DiagnosticKind::NewConstraintMustBeLast, *span));
+                }
+            }
+            SyntaxConstraint::Type(reference) => {
+                let _ = has_class_or_struct;
+                validate_constraint_type(binder, reference);
+            }
+        }
+    }
+}
+
+/// CS0701 -- a named constraint must be an interface, a non-sealed class, or a type parameter.
+///
+/// **Silence when the model does not know the type.** `is_sealed` defaults to `false` for a
+/// referenced or synthetic type, so a type we failed to decode is not reported -- the same safe
+/// under-report the flag itself documents. A false CS0701 would refuse a legal program against an
+/// assembly we merely could not read.
+fn validate_constraint_type(binder: &mut Binder, reference: &lamella_syntax::ast::TypeRef) {
+    let symbol = binder.resolve_named_type_quietly(&bind_type(reference), reference.span);
+    if symbol.is_error() {
+        return;
+    }
+    let invalid = if binder.is_value_type(&symbol) {
+        true
+    } else {
+        binder
+            .model()
+            .get_by_symbol(&symbol)
+            .is_some_and(|info| info.is_sealed)
+    };
+    if invalid {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::InvalidConstraintType {
+                constraint: alloc::format!("{symbol}").into(),
+            },
+            reference.span,
+        ));
+    }
+}
+
 fn validate_volatile_fields(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     let type_full = qualified_type_name(namespace, &declaration.name);
     for member in &declaration.members {
@@ -623,6 +815,17 @@ fn validate_volatile_fields(binder: &mut Binder, namespace: &str, declaration: &
 /// | a method, constructor, indexer, event, static or `const` member, or the TYPE itself | `CS0106` |
 /// | a `readonly` field, or a property with no `set` | `CS9034` |
 /// | less visible than the type that declares it | `CS9032` |
+///
+/// **THE VISIBILITY RULE IS NOT THE ACCESSIBILITY-DOMAIN MASK, AND A MEASURED ROW PROVES IT.**
+/// `protected class C { protected required int F; }` draws `CS9032` even though the member and the
+/// type have the SAME declared accessibility -- because a `protected` MEMBER is reachable from
+/// types derived from `C`, while a `protected` TYPE is reachable from types derived from its
+/// ENCLOSING type, and those are different sets. [`access_mask`] collapses both to one "derived"
+/// bit and so cannot express it. So `protected` and `protected internal` are refused outright, and
+/// only the `internal`/`public` half is compared by domain.
+///
+/// The rule this all serves: **whoever can construct the type must be able to set the member**,
+/// since an object initializer is one of only two ways to satisfy one.
 fn validate_required_members(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     if declaration.modifiers.iter().any(|m| matches!(m, Modifier::Required)) {
         binder.report(Diagnostic::new(
@@ -633,7 +836,7 @@ fn validate_required_members(binder: &mut Binder, namespace: &str, declaration: 
         ));
     }
     let type_full = qualified_type_name(namespace, &declaration.name);
-    let type_mask = effective_type_mask(binder.model(), &named_symbol(namespace, &declaration.name));
+    let type_mask = effective_type_mask(binder.model(), &declared_symbol(namespace, declaration));
     for member in &declaration.members {
         if matches!(member, Member::Destructor { .. }) {
             continue;
@@ -933,6 +1136,7 @@ fn event_type_is_non_delegate(model: &Model, ty: &TypeSymbol) -> bool {
 /// Validates that every field-like event's type is a delegate (17.7); a non-delegate type is CS0066.
 fn validate_event_types(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     let type_full = qualified_type_name(namespace, &declaration.name);
+    binder.enter_type(declared_symbol(namespace, declaration));
     for member in &declaration.members {
         let Member::EventField {
             ty, declarators, ..
@@ -956,6 +1160,7 @@ fn validate_event_types(binder: &mut Binder, namespace: &str, declaration: &Type
             }
         }
     }
+    binder.exit_type();
 }
 
 /// Whether an overloadable operator can only be unary (17.9.1) -- it takes one operand, so a
@@ -999,7 +1204,7 @@ fn member_attributes(member: &Member) -> Option<&[AttributeSection]> {
 /// as written. csc reports the declaration and stops, and the repair is to fix the declaration and
 /// compile again.
 ///
-/// IT IS COMPILATION-WIDE, NOT PER-MEMBER, and that was the surprise worth measuring: a bad
+/// IT IS COMPILATION-WIDE, NOT PER-MEMBER, and the consequence is easy to miss: a bad
 /// signature in one class withholds an unrelated definite-assignment error in a DIFFERENT class,
 /// in a different file. The two passes are over the whole compilation, so the gate is too -- which
 /// is why this takes every unit's diagnostics at once rather than filtering each as it finishes.
@@ -1623,7 +1828,7 @@ fn validate_conditional_methods(binder: &mut Binder, declaration: &TypeDecl) {
 /// (10.2.2) -- is not valid on it (CS0106). A NESTED type is exempt (private and new are both valid
 /// there), so the check keys off the model's `enclosing`, which is `None` only for a top-level type.
 fn validate_top_level_type_modifiers(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
-    let symbol = named_symbol(namespace, &declaration.name);
+    let symbol = declared_symbol(namespace, declaration);
     let is_nested = binder
         .model()
         .get_by_symbol(&symbol)
@@ -1850,13 +2055,14 @@ fn validate_parameter_names(binder: &mut Binder, parameters: &[Parameter]) {
 }
 
 fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
-    let type_parameters = binder.enter_type_parameters(&declaration.type_parameters);
+    let type_parameters =
+        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
     bind_type_bodies_inner(binder, namespace, declaration);
-    binder.exit_type_parameters(&type_parameters);
+    binder.exit_type_parameters(type_parameters);
 }
 
 fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
-    let enclosing = named_symbol(namespace, &declaration.name);
+    let enclosing = declared_symbol(namespace, declaration);
     for member in &declaration.members {
         let parameters = match member {
             Member::Method { parameters, .. }
@@ -1866,6 +2072,46 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             _ => continue,
         };
         validate_parameter_names(binder, parameters);
+    }
+    validate_constraint_clauses(
+        binder,
+        &quote_candidate(
+            &declaration.name,
+            declaration.type_parameters.len(),
+            &declaration
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect::<Vec<_>>(),
+        ),
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
+    for member in &declaration.members {
+        if let Member::Method {
+            name,
+            type_parameters,
+            constraints,
+            ..
+        } = member
+        {
+            if constraints.is_empty() {
+                continue;
+            }
+            let quoted = alloc::format!(
+                "{}.{}",
+                declaration.name,
+                quote_candidate(
+                    name,
+                    type_parameters.len(),
+                    &type_parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect::<Vec<_>>(),
+                )
+            );
+            validate_constraint_clauses(binder, &quoted, type_parameters, constraints);
+        }
     }
     validate_volatile_fields(binder, namespace, declaration);
     validate_required_members(binder, namespace, declaration);
@@ -2747,8 +2993,10 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     for member in &declaration.members {
         let signature_parameters = match member {
             Member::Method {
-                type_parameters, ..
-            } => binder.enter_type_parameters(type_parameters),
+                type_parameters,
+                constraints,
+                ..
+            } => binder.enter_type_parameters(type_parameters, constraints),
             _ => alloc::vec::Vec::new(),
         };
         match member {
@@ -2796,7 +3044,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             }
             _ => {}
         }
-        binder.exit_type_parameters(&signature_parameters);
+        binder.exit_type_parameters(signature_parameters);
     }
     binder.exit_type();
     for member in &declaration.members {
@@ -2806,12 +3054,14 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 return_type,
                 name,
                 type_parameters,
+                constraints,
                 parameters,
                 is_vararg,
                 body: Some(body),
                 ..
             } => {
-                let method_parameters = binder.enter_type_parameters(type_parameters);
+                let method_parameters =
+                    binder.enter_type_parameters(type_parameters, constraints);
                 let params = bound_parameters(parameters);
                 if *is_vararg {
                     binder.set_next_method_vararg();
@@ -2825,7 +3075,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     is_static_member(modifiers),
                     body,
                 );
-                binder.exit_type_parameters(&method_parameters);
+                binder.exit_type_parameters(method_parameters);
             }
             Member::Operator {
                 return_type,
@@ -2999,8 +3249,13 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     let is_candidate =
                         !is_const && !field_ty.is_void() && declarator.name != declaration.name;
                     if is_candidate {
+                        let own_type_parameters = binder
+                            .model()
+                            .get_by_symbol(&enclosing)
+                            .map(|info| info.type_parameters.clone())
+                            .unwrap_or_default();
                         let eligible_never_used = !is_const
-                            && type_is_resolvable(binder.model(), &field_ty)
+                            && type_is_resolvable(binder.model(), &field_ty, &own_type_parameters)
                             && declarator.initializer.is_none()
                             && !duplicate_field_names.contains(&*declarator.name);
                         let default_value = default_value_string(binder.model(), &field_ty);
@@ -3355,6 +3610,19 @@ fn operator_source_symbol(operator: OverloadableOperator) -> &'static str {
     }
 }
 
+/// The model symbol for a TYPE DECLARATION, which is [`named_symbol`] over its METADATA name.
+///
+/// **`collect_into` keys the model by `declared_type_name`, so a generic declaration is registered
+/// as `` Box`1 `` and NOTHING resolves it under `Box`.** Every consumer that reaches back into the
+/// model for a declaration it is currently walking has to spell it the same way; a lookup by the
+/// source name silently finds nothing, and "nothing" is indistinguishable from "no members" -- which
+/// is how `class Box<T> { public T Value; public T Get() { return Value; } }` reported that `Value`
+/// does not exist in the current context. Non-generic declarations mangle to themselves, so this is
+/// the declared name unchanged for every C# 1.0 program.
+fn declared_symbol(namespace: &str, declaration: &TypeDecl) -> TypeSymbol {
+    named_symbol(namespace, &declared_type_name(declaration))
+}
+
 fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
     let mut parts: Vec<Box<str>> = Vec::new();
     if !namespace.is_empty() {
@@ -3468,14 +3736,31 @@ fn enclosing_mask(model: &Model, enclosing: &str) -> u8 {
     info.map_or(ACCESS_FULL, |info| effective_info_mask(model, info))
 }
 
-fn type_is_resolvable(model: &Model, ty: &TypeSymbol) -> bool {
+/// Whether a field's type is one this build can resolve, which gates the CS0169 unused-field
+/// warning: csc suppresses that warning on a field whose type has a problem of its own, and then
+/// reports the problem instead.
+///
+/// `type_parameters` names the DECLARING type's own parameters. **Without them a type parameter
+/// reads as an unresolved name**, because the model holds no entry for `T` -- a type parameter is
+/// in scope, not declared -- so every field whose type was a type parameter silently lost its
+/// warning while an `int` beside it on the same generic type kept one.
+fn type_is_resolvable(model: &Model, ty: &TypeSymbol, type_parameters: &[Box<str>]) -> bool {
     match ty {
         TypeSymbol::Special(_) => true,
-        TypeSymbol::Named(_) => model.get_by_symbol(ty).is_some(),
+        TypeSymbol::Named(parts) => match &parts[..] {
+            [only] if type_parameters.iter().any(|name| name == only) => true,
+            _ => model.get_by_symbol(ty).is_some(),
+        },
         TypeSymbol::Array { element, .. }
         | TypeSymbol::Pointer(element)
-        | TypeSymbol::ByRef(element) => type_is_resolvable(model, element),
-        TypeSymbol::Instantiation { .. } | TypeSymbol::Error => false,
+        | TypeSymbol::ByRef(element) => type_is_resolvable(model, element, type_parameters),
+        TypeSymbol::Instantiation { arguments, .. } => {
+            model.get_by_symbol(ty).is_some()
+                && arguments
+                    .iter()
+                    .all(|argument| type_is_resolvable(model, argument, type_parameters))
+        }
+        TypeSymbol::Error => false,
     }
 }
 
@@ -3534,6 +3819,12 @@ mod tests {
     }
 
     /// Like [`sorted_codes_at`], but PARSING under `version` as well as binding under it.
+    ///
+    /// **The two are not interchangeable and one feature proves it: `required` is a CONTEXTUAL
+    /// modifier, so whether the word is a modifier at all is decided by the PARSER's dialect.**
+    /// Parsed at the default version, `public required static int S;` is not a required member at
+    /// any binding dialect -- the word is read as a type name. A test that parsed by default and
+    /// bound at 11 would be asserting against a program the compiler never sees.
     fn sorted_codes_parsed_at(unit: &str, version: LanguageVersion) -> Vec<(CodeNamespace, u16)> {
         let options = lamella_syntax::lexer::LexOptions {
             version,
@@ -3556,7 +3847,7 @@ mod tests {
 
         assert_eq!(
             sorted_codes_parsed_at("public class Box<T> { public T Value; }", v2),
-            [(CodeNamespace::Lam, 1)]
+            []
         );
 
         assert_eq!(
@@ -3564,7 +3855,7 @@ mod tests {
                 "public class Box<T> { public T Value; } public class Other { public T Leaked; }",
                 v2
             ),
-            [(CodeNamespace::Lam, 1), (CodeNamespace::Cs, 246)]
+            [(CodeNamespace::Cs, 246)]
         );
 
         assert_eq!(
@@ -3572,7 +3863,7 @@ mod tests {
                 "public class T { } public class Box<T> { public T Value; } public class After { public T Kept; }",
                 v2
             ),
-            [(CodeNamespace::Lam, 1)]
+            []
         );
     }
 
@@ -3624,22 +3915,34 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_use_is_refused_in_every_position_a_type_can_appear() {
+    fn a_generic_use_is_accepted_in_every_position_a_type_can_appear() {
         let v2 = LanguageVersion::CSharp2;
 
-        let mut holes = Vec::new();
+        let mut refused = Vec::new();
         let mut wrong_message = Vec::new();
+        let mut unbound = Vec::new();
         for (position, template) in TYPE_POSITIONS {
             let program = at_position(template, "Nope<int>");
             let (refusals, codes) = refusal_count(&program, v2);
-            if refusals != 1 {
-                holes.push(alloc::format!("{position}: {refusals} refusals, {codes:?}"));
+            if refusals != 0 {
+                refused.push(alloc::format!("{position}: {refusals} refusals, {codes:?}"));
             }
             if codes.contains(&(CodeNamespace::Cs, 8022)) {
                 wrong_message.push(alloc::format!("{position}: {codes:?}"));
             }
+            if !codes.contains(&(CodeNamespace::Cs, 246)) {
+                unbound.push(alloc::format!("{position}: {codes:?}"));
+            }
         }
-        assert!(holes.is_empty(), "positions with no use-site gate: {holes:#?}");
+        assert!(
+            refused.is_empty(),
+            "a constructed type must be ACCEPTED in every position: {refused:#?}"
+        );
+        assert_eq!(
+            unbound,
+            ["delegate return: []", "delegate parameter: []"],
+            "the set of positions that never resolve their type has changed"
+        );
         assert!(
             wrong_message.is_empty(),
             "a use site told a C# 2 compilation to raise its language version: {wrong_message:#?}"
@@ -3680,28 +3983,31 @@ mod tests {
         );
         assert_eq!(
             sorted_codes_parsed_at(
-                "public class Box<T> { } class U { void M() { Undeclared q; } }",
+                "class D { public int P { get; set; } } class U { void M() { Undeclared q; } }",
                 v2
             ),
-            [(CodeNamespace::Lam, 1)]
+            [(CodeNamespace::Cs, 8023)]
         );
     }
 
     #[test]
-    fn a_nested_or_array_generic_use_is_refused_once_and_not_once_per_level() {
+    fn a_nested_or_array_generic_use_reports_once_and_not_once_per_level() {
         let v2 = LanguageVersion::CSharp2;
-        let refusals = |source: &str| refusal_count(source, v2).0;
+        let absences = |source: &str| {
+            sorted_codes_parsed_at(source, v2)
+                .into_iter()
+                .filter(|&(namespace, code)| namespace == CodeNamespace::Cs && code == 246)
+                .count()
+        };
 
-        assert_eq!(refusals("public class Box<T> { } class U { Box<int> f; }"), 2);
-        assert_eq!(refusals("public class Box<T> { } class U { Box<int>[] f; }"), 2);
-        assert_eq!(refusals("public class Box<T> { } class U { Box<int>[][] f; }"), 2);
+        assert_eq!(absences("class U { Nope<int> f; }"), 1);
+        assert_eq!(absences("class U { Nope<int>[] f; }"), 1);
+        assert_eq!(absences("class U { Nope<int>[][] f; }"), 1);
+        assert_eq!(absences("class U { Nope<Nope<int>> f; }"), 2);
+        assert_eq!(absences("class U { Nope<int> f; Nope<int> g; }"), 2);
         assert_eq!(
-            refusals("public class Box<T> { } class U { Box<Box<int>> f; }"),
-            2
-        );
-        assert_eq!(
-            refusals("public class Box<T> { } class U { Box<int> f; Box<int> g; }"),
-            3
+            absences("public class Box<T> { } class U { Box<int> f; Box<int>[] g; Box<Box<int>> h; }"),
+            0
         );
     }
 
@@ -3709,12 +4015,19 @@ mod tests {
     fn a_nested_type_argument_list_closes_on_a_right_shift_token() {
         let v2 = LanguageVersion::CSharp2;
 
-        let (refusals, codes) = refusal_count("class U { Nope<Nope<int>> f; }", v2);
-        assert_eq!(refusals, 1, "{codes:?}");
-        let (refusals, codes) = refusal_count("class U { Nope<Nope<Nope<int>>> f; }", v2);
-        assert_eq!(refusals, 1, "{codes:?}");
-        let (refusals, codes) = refusal_count("class U { Nope<int, Nope<int>> f; }", v2);
-        assert_eq!(refusals, 1, "{codes:?}");
+        let absences = |source: &str| {
+            sorted_codes_parsed_at(source, v2)
+                .into_iter()
+                .filter(|&(namespace, code)| namespace == CodeNamespace::Cs && code == 246)
+                .count()
+        };
+        assert_eq!(absences("class U { Nope<Nope<int>> f; }"), 2);
+        assert_eq!(absences("class U { Nope<Nope<Nope<int>>> f; }"), 3);
+        assert_eq!(absences("class U { Nope<int, Nope<int>> f; }"), 2);
+        assert_eq!(
+            absences("public class Box<T> { } public class Two<A,B> { } class U { Box<Box<int>> f; Two<int, Box<int>> g; }"),
+            0
+        );
     }
 
     #[test]
@@ -3745,16 +4058,13 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_declaration_is_refused_as_not_built_rather_than_as_not_permitted() {
+    fn a_generic_declaration_is_accepted_where_permitted_and_refused_below() {
         let v2 = LanguageVersion::CSharp2;
 
-        assert_eq!(
-            sorted_codes_parsed_at("public class C<T> { }", v2),
-            [(CodeNamespace::Lam, 1)]
-        );
+        assert_eq!(sorted_codes_parsed_at("public class C<T> { }", v2), []);
         assert_eq!(
             sorted_codes_parsed_at("public class E { public int M<T>(int x) { return x; } }", v2),
-            [(CodeNamespace::Lam, 1)]
+            []
         );
 
         assert_eq!(
@@ -4738,6 +5048,31 @@ mod tests {
         assert_eq!(sorted_codes("class C { public event int E; }"), [66]);
         assert_eq!(sorted_codes("class C { public event string E; }"), [66]);
         assert!(sorted_codes("delegate void D(); class C { public event D E; }").is_empty());
+    }
+
+    #[test]
+    fn an_events_type_resolves_in_the_same_scope_every_other_members_type_does() {
+        let nested = "public delegate void H(int x);";
+        let unresolved = |source: &str| sorted_codes(source).contains(&246);
+        for position in [
+            "public event H E;",
+            "public H Field;",
+            "public H Prop { get { return null; } }",
+            "public H M() { return null; }",
+            "public void P(H h) { }",
+        ] {
+            let source = alloc::format!("class C {{ {nested} {position} }}");
+            assert!(
+                !unresolved(&source),
+                "{position} should resolve the nested delegate: {:?}",
+                sorted_codes(&source)
+            );
+        }
+        assert!(!unresolved("delegate void H(int x); class C { public event H E; }"));
+        assert!(!unresolved(
+            "class D { public delegate void H(int x); } class C { public event D.H E; }"
+        ));
+        assert_eq!(sorted_codes("class C { public event Missing E; }"), [246]);
     }
 
     #[test]
@@ -5928,6 +6263,7 @@ mod tests {
                 conditional: Vec::new(),
                 sets_required_members: false,
                 type_parameters: Vec::new(),
+                type_parameter_constraints: Vec::new(),
             });
             model.insert(object);
             model
@@ -6153,6 +6489,7 @@ mod tests {
                 conditional: Vec::new(),
                 sets_required_members: false,
                 type_parameters: Vec::new(),
+                type_parameter_constraints: Vec::new(),
             });
             model.insert(object);
             let mut seam = TypeInfo::new("", "Seam", TypeKind::Class);
@@ -6173,6 +6510,7 @@ mod tests {
                 conditional: Vec::new(),
                 sets_required_members: false,
                 type_parameters: Vec::new(),
+                type_parameter_constraints: Vec::new(),
             });
             model.insert(seam);
             model
@@ -6257,6 +6595,7 @@ mod tests {
             conditional: Vec::new(),
             sets_required_members: false,
             type_parameters: Vec::new(),
+            type_parameter_constraints: Vec::new(),
         });
         bcl.insert(console);
 

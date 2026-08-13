@@ -48,5 +48,21 @@ namespace Lamella.Generated
         public const string MEMORY_FLASH_KIND = "flash";
         public const uint MEMORY_FLASH_SIZE = 0x800000;
         public const uint MEMORY_FLASH_OPTIONAL = 0;
+
+        /// -- connectors: the sockets a removable module plugs into. The socket is board truth --
+        /// it is on the schematic and identical on every unit -- and what is plugged into it is not,
+        /// so no row here names a module. A socket brings out whole BUSES, each named by the binding
+        /// role that serves it, and single LINES, each named by the standard's own name for that
+        /// position and carrying the port wiring a driver needs to drive it. Which of a socket's
+        /// protocols an attached module speaks is a property of the module, so a board that offers
+        /// several states all of them and chooses none --
+        public const uint CONNECTOR_COUNT = 1;
+        public const string CONNECTOR_QT_STANDARD = "stemma-qt";
+        public const uint CONNECTOR_QT_SDA_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_QT_SDA_PIN = 2;
+        public const uint CONNECTOR_QT_SDA_MASK = 0x4;
+        public const uint CONNECTOR_QT_SCL_PORT_BASE = 0xD0000000;
+        public const uint CONNECTOR_QT_SCL_PIN = 3;
+        public const uint CONNECTOR_QT_SCL_MASK = 0x8;
     }
 }

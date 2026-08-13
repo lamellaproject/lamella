@@ -43,8 +43,8 @@ pub mod arm {
     /// `R_ARM_ABS32` -- a 32-bit absolute reference, `(S + A) | T`.
     pub const R_ARM_ABS32: u32 = 2;
     /// `R_ARM_THM_CALL` -- a Thumb `BL`/`BLX` call (the 32-bit T1 `BL`): `((S + A) | T) - P`, the
-    /// 24-bit signed halfword-scaled offset in the S:J1:J2:imm10:imm11 swizzle. Our Thumb backend's
-    /// calls become these.
+    /// 24-bit signed halfword-scaled offset in the S:J1:J2:imm10:imm11 swizzle. A call emitted by a
+    /// Thumb code generator becomes one of these.
     pub const R_ARM_THM_CALL: u32 = 10;
     /// `R_ARM_CALL` -- an A32 (ARM-state) `BL`/`BLX` call: `((S + A) | T) - P`, a 24-bit signed
     /// word-scaled offset in bits[23:0].
@@ -132,6 +132,39 @@ pub const STACKMAP_RECORD_PREFIX: &str = "__lamella_smrec_";
 
 /// The CARRIED section holding per-function RETURN-ADDRESS stack-map fragments, from which
 /// `lamella-link` synthesizes the whole-program [`STACKMAP_BLOB_SYMBOL`] map.
+///
+/// **THIS IS A DIFFERENT MAP FROM [`STACKMAP_RECORD_PREFIX`], NOT A SECOND ENCODING OF IT.** A
+/// `__lamella_smrec_*` record is per-METHOD and answers "how do I step past this frame"; this map is
+/// per-SAFEPOINT and answers "which slots are roots at this exact PC". One is a table and the other
+/// is an index into the code; neither substitutes for the other.
+///
+/// **NOT `SHF_ALLOC`, which is the whole point of the vehicle**: a fragment is an input the linker
+/// consumes and never a byte the target flashes, so the synthesized map costs what the SURVIVING
+/// functions need rather than what the compiler happened to see. Emitting fragments into `.text`
+/// instead would pay for every surviving function twice.
+///
+/// The section is a concatenation of self-delimiting fragments, each little-endian:
+///
+/// ```text
+///   u32  name_len          the owning FUNCTION symbol's name length
+///   u8   name[name_len]    the name, padded with zeros to a 4-byte boundary
+///   u32  entry_count
+///   repeat entry_count:
+///     u32  rel_pc          the safepoint's return address RELATIVE TO ITS FUNCTION's start
+///     u32  tail_len        byte length of the opaque tail
+///     u8   tail[tail_len]  the entry's encoded bytes AFTER its `return_pc` word, verbatim,
+///                          padded with zeros to a 4-byte boundary
+/// ```
+///
+/// The padding is the FRAGMENT's, not the map's. An entry's tail is an even number of bytes but
+/// not always a multiple of four, and `tail_len` is what the linker copies -- so the padding keeps
+/// the next fragment word-aligned while the synthesized map keeps the exact unpadded layout
+/// the GC ABI defines for a stack map.
+///
+/// **THE TAIL IS DELIBERATELY OPAQUE, AND THAT IS A DRIFT DEFENCE RATHER THAN LAZINESS.** The
+/// linker rebases `rel_pc` into the map's key and copies the tail through, so it never learns the
+/// entry's internal shape (`nrefs`, `ntagged`, the root arrays). One encoder writes that shape and
+/// one walker reads it; a linker that parsed it would be a third party to drift from.
 pub const STACKMAP_GCMAP_SECTION: &str = ".lamella_gcmap";
 
 /// The whole-program return-address stack map a collector binary-searches (`__lamella_gc_stackmaps`),
@@ -143,6 +176,10 @@ pub const STACKMAP_BLOB_SYMBOL: &str = "__lamella_gc_stackmaps";
 /// The image's `.text` start (`__lamella_text_base`), the base a collector subtracts from a runtime
 /// return address to get a [`STACKMAP_BLOB_SYMBOL`] lookup key. Defined by `lamella-link` at image
 /// offset 0 whenever it synthesizes the map.
+///
+/// **THE LINKER DEFINES IT AND THE BACKEND DELIBERATELY DOES NOT.** A backend-emitted definition
+/// is an offset into ONE object, which stops being the image's `.text` start the moment a second
+/// object links ahead of it -- and a zero-size symbol does not survive `garbage_collect`.
 pub const TEXT_BASE_SYMBOL: &str = "__lamella_text_base";
 
 /// Whether a PROGBITS, non-`SHF_ALLOC` section is one the linker CARRIES through the link as itself
@@ -645,7 +682,7 @@ pub const EXEC_TEXT_OFFSET: u32 = EHDR_SIZE + 32;
 /// Emits a minimal ELF32 EXECUTABLE (`ET_EXEC`): one `PT_LOAD` segment mapping the whole file at
 /// `base` (read + execute), with `e_entry` at `base + headers + entry_offset`. Runnable under a
 /// user-mode loader (e.g. `qemu-<arch>`). The linked `text` must be correct for this `base` --
-/// PC-relative code (what our linker produces) is, regardless of `base`; absolute relocations need
+/// PC-relative code (what `lamella_link` produces) is, regardless of `base`; absolute relocations need
 /// the matching `lamella_link::link_at_base`. `base` must be page-aligned (a multiple of `p_align`
 /// = 0x1000) so the file-offset-0 mapping satisfies the loader.
 pub fn write_executable(machine: Machine, text: &[u8], entry_offset: u32, base: u32) -> Vec<u8> {
@@ -654,7 +691,7 @@ pub fn write_executable(machine: Machine, text: &[u8], entry_offset: u32, base: 
 
 /// As [`write_executable`], but for an ARM Thumb entry: `e_entry` gets its low bit set so the loader
 /// (the Linux/`qemu-arm` ELF loader keys ARM-vs-Thumb start state off `e_entry & 1`) enters Thumb
-/// state. Our AArch32 backend emits Thumb (thumbv6m), so a hosted ARM image starts here.
+/// state. The AArch32 code generator emits Thumb (thumbv6m), so a hosted ARM image starts here.
 pub fn write_executable_arm_thumb(text: &[u8], entry_offset: u32, base: u32) -> Vec<u8> {
     write_executable_impl(Machine::Arm, text, entry_offset, base, true, None)
 }
@@ -1017,7 +1054,8 @@ pub struct Object {
     /// The `.text` section bytes.
     pub text: Vec<u8>,
     /// `.text`'s `sh_addralign` -- the byte alignment the linker must give this object's code (4 for
-    /// RISC-V + our own output, 2 for an ARM `-mthumb` toolchain's `.text`). 1 if absent.
+    /// RISC-V and for this crate's own output, 2 for an ARM `-mthumb` toolchain's `.text`). 1 if
+    /// absent.
     pub text_align: u32,
     /// The symbols, in symbol-table order (index 0 is the null symbol).
     pub symbols: Vec<ParsedSymbol>,

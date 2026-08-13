@@ -1099,6 +1099,10 @@ fn normalize_bounds(start: Option<i64>, end: Option<i64>, len: i64) -> (i64, i64
 /// [`lamella_wtf8::next_code_point`] rather than a second decoder: the byte form is a FORMAT shared
 /// with the constant pool and the C# string tiers, so a second reading of it could disagree with the
 /// bundle a device was flashed with.
+///
+/// **`.chars()` is NOT a substitute and the difference is the whole item**: a Rust `char` is a
+/// Unicode SCALAR VALUE, so `char::from_u32(0xD800)` is `None` BY DEFINITION and no iterator of
+/// `char` can yield a surrogate.
 pub(crate) fn code_points(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     let mut at = 0;
     core::iter::from_fn(move || {
@@ -1792,9 +1796,12 @@ struct I2cSimDevice {
 /// easy to overlook.** A handle is an index into a `Vec`, so every object of that kind costs a SLOT in
 /// the outer vector plus a PAYLOAD hanging off it. Releasing a dead object's payload while keeping its
 /// slot -- which keeps every outstanding handle valid, and is what makes such a release cheap -- recovers
-/// the payload and nothing else. **The slot is charged per ALLOCATION, not per live object**, so a loop
-/// that allocates forever grows the slot vector forever even when every payload is released the instant
-/// it dies.
+/// the payload and nothing else. **A slot is charged per ALLOCATION and comes back only when the handle
+/// is REUSED**, so payload release on its own leaves a loop that allocates forever growing the slot
+/// vector forever, even where every payload dies the instant it is made. A free list is what closes
+/// that: what the table keeps is then its high-water CAPACITY, which a `Vec` does not hand back, and
+/// that high-water is bounded by how many allocations happen before the first collection -- which the
+/// heap size bounds in turn. Bounded by the configuration, rather than by the iteration count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Arena {
     /// The handle table itself -- the outer vector's reserved slots, live and dead alike -- plus the
@@ -2180,10 +2187,24 @@ pub struct ObjectModel {
     /// which happens at a safe point while a quarter of the heap is still free, and held here until it
     /// is needed. A GC root while it waits, or the collection that built it would take it straight back.
     ///
-    /// Taken when it is handed to a raise, and rebuilt by the next collection. A program that exhausts
-    /// memory twice with no collection in between gets the old behavior for the second one, which is a
-    /// fatal trap; that is a narrower gap than the one this closes and it is not pretended away.
+    /// Taken when it is handed to a raise, and rebuilt by the next collection.
+    ///
+    /// **This covers the exception OBJECT and nothing after it**, which is the narrower half of the
+    /// problem: a handler that does anything at all -- format a message, print it -- allocates on its
+    /// first line, into the same exhausted heap, and an instance held ready says nothing about that.
+    /// The bytes for the handler are [`ObjectModel::handler_reserve`], and the two are separate on
+    /// purpose: this one exists because building the instance needs the whole exception hierarchy to
+    /// have been built at a moment that could afford it, and that is a debt no amount of free space
+    /// pays off at the moment of exhaustion.
     memory_error_reserve: Option<Value>,
+    /// The bytes of object heap withheld from the program so that CATCHING a `MemoryError` is
+    /// survivable -- the handler's own allocations, which the reserved instance above does not cover.
+    ///
+    /// Armed on the heap at construction and re-armed by each collection that can afford it; released
+    /// in full at the moment a `MemoryError` is handed to the program, because that is the moment the
+    /// exhaustion it was kept for has happened. See [`ObjectModel::set_handler_reserve`], which is
+    /// where the size is argued.
+    handler_reserve: usize,
     /// The module namespace (top-level name -> value): classes and other top-level bindings the
     /// module body produces, which a function reaches by `LoadGlobal`. The body mirrors its locals
     /// here as it binds them.
@@ -2446,6 +2467,23 @@ pub struct ObjectModel {
     /// Whether a safe point collects under pressure. ON by default -- see `under_memory_pressure`.
     #[cfg(feature = "gc-collect")]
     collect_when_full: bool,
+    /// The object heap's occupancy immediately after the most recent collection, in bytes: the floor
+    /// the next collection has to clear by a margin before pressure is reported again. Zero until the
+    /// first collection, so the first one triggers on occupancy alone. See `worth_collecting`.
+    #[cfg(feature = "gc-collect")]
+    heap_floor: usize,
+    /// The same floor for the embedder's arena, when an `arena_probe` answers for it. Kept separately
+    /// because the two quantities move independently: a collection can empty the heap while the arena
+    /// behind it, which a device bumps and does not reuse, stays exactly where it was.
+    #[cfg(feature = "gc-collect")]
+    arena_floor: usize,
+    /// How many collections have run -- see [`ObjectModel::collections`].
+    #[cfg(feature = "gc-collect")]
+    collections: usize,
+    /// Whether the heap has refused an allocation since the last collection. Set at the allocation
+    /// chokepoint, which cannot collect, and answered at the safe point, which can.
+    #[cfg(feature = "gc-collect")]
+    allocation_refused: bool,
     /// How many interpreter drive loops are running, maintained by the driver itself. The safe point
     /// needs to know whether the loop reaching it is the OUTERMOST one, because only that loop's frame
     /// stack is every frame there is; see `is_outermost_drive`.
@@ -2472,6 +2510,31 @@ pub struct ObjectModel {
     monotonic_fn: Option<fn() -> i64>,
     /// Blocks for a count of nanoseconds.
     sleep_fn: Option<fn(i64)>,
+    /// The embedder's networking seam -- non-blocking sockets plus a readiness poll. `None` when
+    /// none was installed, which is a runtime with no sockets rather than a broken one.
+    ///
+    /// A `Box<dyn>` rather than the function pointers the clock uses, because a backend is STATEFUL:
+    /// it owns the socket table the handles index into, so the seam has to be an object.
+    net_backend: Option<alloc::boxed::Box<dyn lamella_net_core::NetBackend>>,
+    /// Per-socket operation deadlines -- the SHARED component, so this runtime and the sibling C#
+    /// one answer the same way about what a receive timeout does on one board.
+    ///
+    /// It holds only sockets with a POSITIVE timeout. Python's other two states are not deadlines:
+    /// the default (`timeout = None`) is the absence of an entry, and non-blocking is the set below.
+    net_timeouts: lamella_net_core::timeout::Timeouts,
+    /// Sockets whose owner called `setblocking(False)` or the `settimeout(0)` that means the same
+    /// thing.
+    ///
+    /// **A SEPARATE SET RATHER THAN A ZERO DEADLINE, and the seam's own doc argues the same way.**
+    /// Encoding non-blocking as a deadline already past is expressible and is the wrong shape: every
+    /// operation would enter the reactor block point and come straight back out, a round trip per
+    /// operation inside the loop that chose non-blocking precisely to avoid parking. It is a
+    /// control-flow decision, not a duration.
+    ///
+    /// It also carries the only thing that can pick the exception class: a deadline says WHEN a wait
+    /// ended and can never say WHY, and `BlockingIOError` and `TimeoutError` are different types a
+    /// program branches on.
+    net_nonblocking: alloc::collections::BTreeSet<lamella_net_core::SocketHandle>,
     mmio_write_fn: Option<fn(u32, u32)>,
     /// The volatile MMIO read seam (device: `lamella_mmio::read32`; host: the sim).
     mmio_read_fn: Option<fn(u32) -> u32>,
@@ -2594,6 +2657,45 @@ impl ObjectModel {
     fn range_member_as_int(&self, element: Value) -> Option<i64> {
         element.as_int()
     }
+}
+
+/// The share of the object heap withheld for a `MemoryError` handler by default: a sixteenth. See
+/// [`ObjectModel::set_handler_reserve`] for why it is a share, and `tests/handler_reserve.rs` for
+/// what a handler measurably costs against what a sixteenth provides.
+const HANDLER_RESERVE_SHARE: usize = 16;
+
+/// The floor under [`default_handler_reserve`]: what a sixteenth comes to on the 4 KiB object heap a
+/// micro:bit v2 runs, which is the smallest heap in the v1 board set.
+///
+/// It binds only BELOW that heap, and what it is really for is the shape of the failure there. A
+/// pure share goes on rounding down past the point where it can hold anything, so a heap of a few
+/// hundred bytes would arm a reserve of tens -- present, reported, and too small to run a handler
+/// out of, which is the defect this whole mechanism exists to leave behind. Holding the floor makes
+/// such a heap fail the "leave the collector a working heap" test in
+/// [`ObjectModel::arm_handler_reserve`] and arm NOTHING instead, which is the truth: a heap that
+/// small cannot hold the exception hierarchy either, so it was never going to deliver a catchable
+/// `MemoryError`.
+const MIN_HANDLER_RESERVE: usize = 4096 / HANDLER_RESERVE_SHARE;
+
+/// The most of a heap that may be withheld for a handler: an EIGHTH. A larger reserve is refused,
+/// and what it would break is not the program's room -- it is the collector's trigger.
+///
+/// A collection is driven by the heap passing three quarters occupied, so a heap must be able to GET
+/// there with an object still to spare. Withhold a quarter and it cannot: the usable heap ends
+/// exactly at the trigger, so whether the trigger ever fires comes down to whether an allocation
+/// happens to land on the last aligned word, and it does not. Measured on a 4 KiB heap at exactly a
+/// quarter: **zero collections**, so nothing ever built the exception hierarchy, so the `MemoryError`
+/// the reserve was withheld to deliver could not be built -- a reserve generous enough to guarantee a
+/// handler plenty of room, which guarantees the handler is never reached.
+///
+/// An eighth leaves the trigger an eighth of the heap of clearance, which is room for any object this
+/// runtime allocates rather than a margin to be checked. The default is half of it.
+const MAX_HANDLER_RESERVE_SHARE: usize = 8;
+
+/// The default [`ObjectModel::handler_reserve`] for a heap of `capacity` bytes.
+#[must_use]
+fn default_handler_reserve(capacity: usize) -> usize {
+    (capacity / HANDLER_RESERVE_SHARE).max(MIN_HANDLER_RESERVE)
 }
 
 impl ObjectModel {
@@ -3057,9 +3159,13 @@ impl ObjectModel {
         let mut heap = Heap::new(heap_capacity, descs);
         #[cfg(feature = "gc-collect")]
         heap.set_weak_offsets(weakref_type_id, alloc::vec![0]);
-        ObjectModel {
+        let handler_reserve = default_handler_reserve(heap.capacity());
+        let mut model = ObjectModel {
             heap,
             types,
+            net_backend: None,
+            net_timeouts: lamella_net_core::timeout::Timeouts::new(),
+            net_nonblocking: alloc::collections::BTreeSet::new(),
             strings: Vec::new(),
             seqs: Vec::new(),
             dicts: Vec::new(),
@@ -3093,6 +3199,7 @@ impl ObjectModel {
             exception_classes: Vec::new(),
             pending_exception: None,
             memory_error_reserve: None,
+            handler_reserve,
             globals: Vec::new(),
             modules: Vec::new(),
             managed_modules: Vec::new(),
@@ -3121,6 +3228,14 @@ impl ObjectModel {
             gc_stress: false,
             #[cfg(feature = "gc-collect")]
             collect_when_full: true,
+            #[cfg(feature = "gc-collect")]
+            heap_floor: 0,
+            #[cfg(feature = "gc-collect")]
+            arena_floor: 0,
+            #[cfg(feature = "gc-collect")]
+            collections: 0,
+            #[cfg(feature = "gc-collect")]
+            allocation_refused: false,
             #[cfg(feature = "gc-collect")]
             drive_nesting: 0,
             console_fn: None,
@@ -3222,18 +3337,20 @@ impl ObjectModel {
             generator_return: None,
             delegated_throw: None,
             reactor: crate::reactor::ParkStore::default(),
-        }
+        };
+        let _armed = model.arm_handler_reserve();
+        model
     }
 
     /// The single managed-allocation chokepoint: every `new_*` heap object is allocated here, so
     /// the GC / allocation tier is chosen in ONE place (the `gc(none|bump|collected)` knob).
-    /// The default (allocation-capable) tier bumps the moving
-    /// heap and returns `None` when full, at which point a collected tier drives `collect()` before
-    /// retrying (the interpreter never auto-collects today, so it is allocate-only / bump). The
-    /// `gc-none` tier has NO managed heap: every allocation is `None` -> a loud `OutOfMemory`, so a
-    /// pure fixnum / mmio / control-flow driver runs (it never allocates) while an allocating
-    /// program fails fast -- upholding "runs on interpreter-P => runs on device-P" for the tiniest
-    /// micros.
+    /// The default (allocation-capable) tier bumps the moving heap and returns `None` when full.
+    /// A collected tier does NOT retry here: collecting needs the interpreter's live frames as
+    /// roots, which this function cannot see, so the refusal is recorded and acted on at the next
+    /// safe point -- see [`Self::under_memory_pressure`]. The `gc-none` tier has NO managed heap:
+    /// every allocation is `None` -> a loud `OutOfMemory`, so a pure fixnum / mmio / control-flow
+    /// driver runs (it never allocates) while an allocating program fails fast -- upholding
+    /// "runs on interpreter-P => runs on device-P" for the tiniest micros.
     #[must_use]
     fn alloc_object(&mut self, type_id: u32) -> Option<Ref> {
         #[cfg(feature = "gc-none")]
@@ -3243,7 +3360,12 @@ impl ObjectModel {
         }
         #[cfg(not(feature = "gc-none"))]
         {
-            self.heap.alloc(type_id)
+            let slot = self.heap.alloc(type_id);
+            #[cfg(feature = "gc-collect")]
+            if slot.is_none() {
+                self.allocation_refused = true;
+            }
+            slot
         }
     }
 
@@ -3262,6 +3384,11 @@ impl ObjectModel {
     /// The bytes must be what [`lamella_wtf8::push_code_point`] would have written; that is the same
     /// contract [`lamella_py_bytecode::PyStr::from_wtf8`] states, and the constant pool's bytes
     /// arrive here unchanged.
+    ///
+    /// **This exists so the surrogate path is REACHABLE FROM A TEST.** The lexer refuses a lone
+    /// surrogate today, so without a constructor of this shape nothing in the runtime could build one
+    /// and every row would pass over an unexercised path -- the storage change alone is
+    /// behavior-identical and would gate green while proving nothing.
     pub fn new_str_wtf8(&mut self, bytes: &[u8]) -> Result<Value, Trap> {
         let index = take_arena_slot(&mut self.strings, &mut self.freed_slots.strings, bytes.to_vec());
         let reference = self.alloc_object(self.str_type_id).ok_or(Trap::OutOfMemory)?;
@@ -3277,6 +3404,10 @@ impl ObjectModel {
     /// have as a `&str`" -- across every call site, all of which read it as the first. A
     /// surrogate-bearing string would then be silently treated as NOT A STRING: a wrong answer rather
     /// than a refusal, and the wrong answer would surface somewhere else entirely.
+    ///
+    /// **This lane has met that exact shape before**: `find_dunder` answered `None` to "absent" and
+    /// to "present but not a function" alike, and the fix was to ask the two questions separately.
+    /// [`Self::str_text`] is the other question.
     #[must_use]
     pub fn str_bytes(&self, value: Value) -> Option<&[u8]> {
         let reference = value.as_ref()?;
@@ -3313,6 +3444,13 @@ impl ObjectModel {
     /// cannot act on the difference:** they build a `Vec<String>` of names for `dir()`, `__slots__`
     /// or a type's `__name__`, so a name with no `&str` form has nowhere to go whichever question
     /// failed -- the list's element type is the limit, not the accessor's shape.
+    ///
+    /// **The consequence, stated where someone meets it: an attribute whose name holds a surrogate
+    /// is OMITTED from `dir()`, and cannot be reached by `getattr` either** -- the whole attribute
+    /// path takes a Rust `&str` for the name it looks up, so there is no way to ASK for one. It can
+    /// still be stored and read back through a `dict`, whose keys compare as
+    /// [`Self::str_bytes`] and are exact. Widening the attribute path is a separate change and
+    /// nothing has asked for it.
     #[must_use]
     pub(crate) fn str_name(&self, value: Value) -> Option<&str> {
         core::str::from_utf8(self.str_bytes(value)?).ok()
@@ -5963,6 +6101,12 @@ impl ObjectModel {
     /// A heap `float` holding the IEEE-754 double `n`. Unlike `new_long`, a float is ALWAYS boxed
     /// (there is no immediate float form -- `Value` is a 32-bit word, an f64 does not fit), so even
     /// `0.0`/`1.0` allocate. Mirrors `new_long`'s heap-leaf storage (two u32 words of raw bits).
+    ///
+    /// **THIS IS THE ONE CHOKE POINT OF THE `float` CAPABILITY.** Without the feature it allocates
+    /// nothing and answers [`Trap::FloatUnavailable`]. Every path that can produce a float passes
+    /// here, so a no-float build refuses the ones nobody thought to enumerate as well as the obvious
+    /// ones -- which is the property that matters, because in Python a float arrives out of INTEGER
+    /// expressions (`1 / 3`, and `x ** n` for a negative `n`) and not only out of float literals.
     #[cfg(feature = "float")]
     pub fn new_float(&mut self, n: f64) -> Result<Value, Trap> {
         let reference = self.alloc_object(self.float_type_id).ok_or(Trap::OutOfMemory)?;
@@ -6158,7 +6302,7 @@ impl ObjectModel {
     pub fn set_managed_modules(&mut self, modules: Vec<Module>) {
         self.managed_functions = modules
             .iter()
-            .map(|m| Rc::from(m.functions.clone().into_boxed_slice()))
+            .map(|m| Rc::from(m.functions.clone().into_bodies().into_boxed_slice()))
             .collect();
         self.managed_bodies = modules.iter().map(|m| Rc::new(m.body.clone())).collect();
         self.managed_globals = modules.iter().map(|_| Vec::new()).collect();
@@ -6751,6 +6895,13 @@ impl ObjectModel {
     /// The caller has already checked [`Self::supports_weak_reference`]; a `target` that is not a
     /// heap object would have no address to name, so it is refused here too rather than stored as
     /// something a weak slot cannot describe.
+    ///
+    /// **This reads `target`'s address and then allocates, so it depends on the standing rule that
+    /// nothing collects from inside an allocation path** ([`Self::collect`] states it): a collection
+    /// between those two lines would move the target and leave `target_ref` naming whatever landed
+    /// there. Every constructor here has the same dependency for the same reason -- this one is
+    /// called out because a weak slot is the one field a later reader may assume the collector is
+    /// already looking after.
     pub fn new_weakref(&mut self, target: Value) -> Result<Value, Trap> {
         let target_ref = target.as_ref().ok_or(Trap::TypeError)?;
         let reference = self.alloc_object(self.weakref_type_id).ok_or(Trap::OutOfMemory)?;
@@ -6790,6 +6941,14 @@ impl ObjectModel {
     /// Narrower than CPython, which also allows `set`, `frozenset`, generators and several more.
     /// Those are additions to this list rather than changes to anything else, and none of them is
     /// the case a cache or a back-reference is written for.
+    ///
+    /// **A FUNCTION is refused, and the reason is representational rather than a decision.** A
+    /// plain `def` compiles to a function INDEX -- an immediate, like a fixnum, with no heap address
+    /// to name and no moment at which it could die. Only the defaulted and closure spellings become
+    /// heap objects, so admitting "functions" would mean `weakref.ref(f)` succeeding or raising
+    /// according to whether `f` happened to take a default argument. A uniform refusal is the
+    /// honest surface; making a function weakly referenceable means giving every function an
+    /// identity on the heap, which is a change to how functions are represented, not to this list.
     #[must_use]
     pub fn supports_weak_reference(&self, value: Value) -> bool {
         self.is_instance(value) || self.is_class(value)
@@ -7843,6 +8002,14 @@ impl ObjectModel {
     /// module's namespace, and -- because a function object has no `__dict__` slot -- the
     /// `function_dicts` side table. Every one of them is a dict underneath, which is why they share
     /// [`ObjectModel::delete_dict_str_key`] and differ only in which dict and how the miss is worded.
+    ///
+    /// **A CLASS and an INSTANCE are genuinely different operations rather than one with a
+    /// wrinkle**, and CPython words their failures differently to say so: `type object 'C' has no
+    /// attribute 'x'` against `'C' object has no attribute 'x'`.
+    ///
+    /// **NOT covered, deliberately: a built-in type.** CPython refuses `del int.x` with a `TypeError`
+    /// about built-in types rather than an `AttributeError`, which is a REFUSAL rather than a failed
+    /// deletion; it wants its own message and is not this function's shape.
     pub fn py_delattr(&mut self, target: Value, name: &str) -> Result<(), Trap> {
         if self.is_class(target) {
             self.py_delattr_class(target, name)
@@ -8030,10 +8197,13 @@ impl ObjectModel {
     /// derives from). Each entry's base is built before it; `""` is the root's
     /// (BaseException's) base.
     fn ensure_exception_types(&mut self) {
-        if !self.exception_classes.is_empty() {
+        if self.exception_classes.len() == lamella_py_bytecode::EXCEPTION_HIERARCHY.len() {
             return;
         }
         for &(name, base_name) in lamella_py_bytecode::EXCEPTION_HIERARCHY {
+            if self.exc_class_lookup(name).is_some() {
+                continue;
+            }
             let name_value = match self.new_str(name) {
                 Ok(v) => v,
                 Err(_) => return,
@@ -8100,6 +8270,7 @@ impl ObjectModel {
     /// internal/fatal traps, which are not catchable Python exceptions.
     pub fn trap_to_exception(&mut self, trap: Trap) -> Option<Value> {
         if matches!(trap, Trap::OutOfMemory) {
+            self.heap.release_alloc_reserve();
             if let Some(reserved) = self.memory_error_reserve.take() {
                 self.pending_trap_arg = None;
                 return Some(reserved);
@@ -8216,6 +8387,133 @@ impl ObjectModel {
     /// through. Handed out rather than made public so the store has exactly one door.
     pub(crate) fn reactor_store(&mut self) -> &mut lamella_reactor::Reactor {
         &mut self.reactor.0
+    }
+
+    /// The park store and the network backend as DISJOINT borrows, which is the pair the one block
+    /// point needs at the same moment and cannot get through two `&mut self` calls.
+    pub(crate) fn reactor_store_and_net(
+        &mut self,
+    ) -> (&mut lamella_reactor::Reactor, Option<&mut (dyn lamella_net_core::NetBackend + 'static)>) {
+        (&mut self.reactor.0, self.net_backend.as_deref_mut())
+    }
+
+    /// Installs the embedder's networking seam. The same shape as [`Self::set_clock`] and
+    /// [`Self::set_file_ops`]: absent by default, and its absence changes behavior rather than being
+    /// papered over -- a program that opens a socket on a host with no backend is told so.
+    ///
+    /// **A backend implements `lamella-net-core` and nothing else**, so installing one here reaches
+    /// smoltcp over a wired MAC, a WINC1500, or a Pico W's CYW43439 without this runtime naming any
+    /// of them -- and without a line of another language's runtime in the graph.
+    pub fn set_net_backend(&mut self, backend: alloc::boxed::Box<dyn lamella_net_core::NetBackend>) {
+        self.net_backend = Some(backend);
+    }
+
+    /// The installed networking seam, or `None`.
+    pub(crate) fn net_backend(
+        &mut self,
+    ) -> Option<&mut (dyn lamella_net_core::NetBackend + 'static)> {
+        self.net_backend.as_deref_mut()
+    }
+
+    /// **THE ONE PLACE PYTHON'S TIMEOUT VALUE BECOMES THE SEAM'S, and it INVERTS at zero.**
+    ///
+    /// `seconds` is CPython's own tri-state, exactly as a program wrote it:
+    ///
+    /// | Python                | means                    | here                          |
+    /// |-----------------------|--------------------------|-------------------------------|
+    /// | `settimeout(None)`    | block indefinitely       | no entry, not in the set      |
+    /// | `settimeout(0)`       | never wait               | the non-blocking set          |
+    /// | `settimeout(n > 0)`   | wait at most n seconds   | a deadline of `n` in millis   |
+    ///
+    /// **Measured against CPython 3.14.6 rather than recalled**, because the middle row is a silent
+    /// inversion and not a gap:
+    ///
+    /// ```text
+    /// after settimeout(0)    -> gettimeout: 0.0  | getblocking: False
+    /// after setblocking(F)   -> gettimeout: 0.0  | getblocking: False
+    /// after settimeout(None) -> gettimeout: None | getblocking: True
+    /// ```
+    ///
+    /// `settimeout(0)` IS `setblocking(False)` in Python -- the same call. The seam's table reads
+    /// zero as CLEAR, which is right for the `SO_RCVTIMEO` the sibling C# runtime forwards and is
+    /// the OPPOSITE answer here: forwarded unchanged it would block forever on the one socket whose
+    /// owner asked never to block at all.
+    ///
+    /// **AND THE MEANER FORM, which nobody writes deliberately: the seam takes `u32` MILLISECONDS
+    /// and Python's timeout is a float in SECONDS, so `settimeout(0.0005)` truncates to zero and
+    /// would become INFINITE** -- the caller asking for the shortest timeout it can express getting
+    /// the longest there is. Every value under half a millisecond inverts. So a positive timeout
+    /// that rounds to zero is held at ONE millisecond: the smallest wait this seam can express is
+    /// nearer the request than never waiting and far nearer than waiting forever.
+    pub(crate) fn set_socket_timeout(
+        &mut self,
+        socket: lamella_net_core::SocketHandle,
+        seconds: Option<f64>,
+    ) {
+        use lamella_net_core::Interest;
+        self.net_nonblocking.remove(&socket);
+        for interest in [Interest::Read, Interest::Write] {
+            self.net_timeouts.set(socket, interest, 0);
+        }
+        let Some(seconds) = seconds else { return };
+        if seconds <= 0.0 {
+            self.net_nonblocking.insert(socket);
+            return;
+        }
+        let millis = seconds * 1000.0 + 0.5;
+        let millis = if millis >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            (millis as u32).max(1)
+        };
+        for interest in [Interest::Read, Interest::Write] {
+            self.net_timeouts.set(socket, interest, millis);
+        }
+    }
+
+    /// What a program gets back from `gettimeout()`: `None` for indefinite, `0.0` for non-blocking,
+    /// else the remaining timeout in seconds. The inverse of [`Self::set_socket_timeout`], and it
+    /// has to be, because a program may round-trip the value.
+    pub(crate) fn socket_timeout(
+        &self,
+        socket: lamella_net_core::SocketHandle,
+    ) -> Option<f64> {
+        if self.net_nonblocking.contains(&socket) {
+            return Some(0.0);
+        }
+        let millis = self.net_timeouts.get(socket, lamella_net_core::Interest::Read)?;
+        Some(f64::from(millis) / 1000.0)
+    }
+
+    /// Whether `socket` is in non-blocking mode -- the control-flow question, asked before any
+    /// deadline arithmetic because the two have different answers and different exception classes.
+    #[must_use]
+    pub(crate) fn socket_is_nonblocking(&self, socket: lamella_net_core::SocketHandle) -> bool {
+        self.net_nonblocking.contains(&socket)
+    }
+
+    /// When a park on `socket` must give up, or `None` to wait for readiness alone.
+    pub(crate) fn socket_deadline(
+        &self,
+        socket: lamella_net_core::SocketHandle,
+        interest: lamella_net_core::Interest,
+    ) -> Option<u64> {
+        let now = self.monotonic_fn.map(|clock| (clock() / 1_000_000).max(0) as u64);
+        self.net_timeouts.deadline(socket, interest, now)
+    }
+
+    /// Forgets everything remembered about `socket` -- called when it closes, so a handle the
+    /// backend reissues cannot inherit the previous owner's timeout.
+    pub(crate) fn forget_socket(&mut self, socket: lamella_net_core::SocketHandle) {
+        self.net_timeouts.forget(socket);
+        self.net_nonblocking.remove(&socket);
+    }
+
+    /// Whether this runtime can measure elapsed time at all -- what `settimeout` has to ask before
+    /// accepting a promise it may not be able to keep.
+    #[must_use]
+    pub(crate) fn has_monotonic_clock(&self) -> bool {
+        self.monotonic_fn.is_some()
     }
 
     /// Stashes an exception thrown into a frame suspended mid-delegation -- a generator in a `yield
@@ -8516,6 +8814,17 @@ impl ObjectModel {
 
     /// Renders `value` the way `print()` shows it: an int as decimal, a top-level `str` raw, the
     /// singletons by name, a container via its `repr`.
+    ///
+    /// **`Trap::Unsupported` for a `str` holding a surrogate, and the `Result` is why this is not
+    /// a wrong answer.** The output is Rust text, which cannot carry one. Both of the silent
+    /// alternatives are wrong in a DIFFERENT direction, which is what settled it: substituting
+    /// U+FFFD loses the character on the `print()` path, and rendering the `\udXXX` escape would make
+    /// `f"{s}"` produce SIX characters where CPython produces one. This function serves both paths,
+    /// so it cannot pick one and be right.
+    ///
+    /// CPython also refuses the `print()` half -- `print('\ud800')` to a UTF-8 stream raises
+    /// `UnicodeEncodeError` -- and runs the interpolation half. So this agrees with CPython where it
+    /// matters most and refuses where it cannot, rather than answering.
     pub fn display(&self, value: Value) -> Result<String, Trap> {
         #[cfg(feature = "complex")]
         if let Some((re, im)) = self.complex_value(value) {
@@ -8638,9 +8947,9 @@ impl ObjectModel {
     /// Raises `TypeError: unhashable type: '<Class>'` if `value` is a user instance whose class defines
     /// `__eq__` but not `__hash__` -- CPython makes such a class unhashable (defining `__eq__` nulls the
     /// inherited `__hash__`), so it cannot be a set element or dict key. A non-instance, or an instance
-    /// whose class defines both dunders (or neither), is hashable. Our sets/dicts linear-scan `__eq__`
-    /// and never call `__hash__`, so this is the guard that rejects an unhashable key/element the way
-    /// CPython's hashing does.
+    /// whose class defines both dunders (or neither), is hashable. This runtime's sets and dicts
+    /// linear-scan `__eq__` and never call `__hash__`, so this is the guard that rejects an unhashable
+    /// key/element the way CPython's hashing does.
     ///
     /// Caveat: the test is by MRO presence, so a subclass that adds `__eq__` while a BASE supplies
     /// `__hash__` is (leniently) treated as hashable, where CPython would null it -- a rare pattern.
@@ -8663,7 +8972,9 @@ impl ObjectModel {
     /// at an allocation, because a collection needs the interpreter's live frames as roots and an
     /// allocation deep inside this model cannot see them.
     ///
-    /// Three quarters full by default. Under the stress knob, ALWAYS: see [`Self::set_gc_stress`].
+    /// Three quarters full, and grown by a margin since the last collection: see
+    /// [`Self::worth_collecting`], which is where the second half is argued. Under the stress knob,
+    /// ALWAYS: see [`Self::set_gc_stress`].
     #[cfg(feature = "gc-collect")]
     #[must_use]
     pub fn under_memory_pressure(&self) -> bool {
@@ -8675,13 +8986,110 @@ impl ObjectModel {
         }
         if let Some(probe) = self.arena_probe {
             let (used, capacity) = probe();
-            if used.saturating_mul(4) >= capacity.saturating_mul(3) {
+            if Self::worth_collecting(used, capacity, self.arena_floor, false) {
                 return true;
             }
         }
         let used = self.heap.used() as usize;
         let capacity = self.heap.capacity();
+        Self::worth_collecting(used, capacity, self.heap_floor, self.allocation_refused)
+    }
+
+    /// Whether `used` of `capacity` bytes is worth collecting, given the `floor` the last collection
+    /// left behind. Two conditions, and the second one is what keeps the cost of collecting bounded.
+    ///
+    /// **Three quarters full** is the occupancy at which a collection is worth its scan.
+    ///
+    /// **A margin above the floor** is the price of collecting AGAIN. Occupancy alone cannot tell a
+    /// heap that is full of garbage from one that is full of live data, and the difference is the
+    /// whole cost model: reclaiming nothing leaves `used` exactly where the collection found it, so an
+    /// occupancy-only trigger is still satisfied at the very next safe point, and a program whose live
+    /// set simply keeps growing collects once per allocation. That costs O(allocations) collections of
+    /// O(live set) each -- quadratic, and it replaces a prompt `MemoryError` with a program that makes
+    /// no further progress and says nothing. A productive collection drops `used` far below the floor
+    /// and pays the margin without noticing it, so ordinary behavior is unchanged.
+    ///
+    /// **The margin is half the remaining headroom, capped at an eighth of the heap.** The cap is what
+    /// bounds the ordinary case. Halving the REMAINDER rather than taking a fixed step is what keeps a
+    /// collection reachable at every occupancy: a fixed `capacity / 8` step demands more allocation
+    /// than the heap has left once the floor passes seven eighths, and a heap whose next collection is
+    /// unreachable can no longer reclaim anything -- so a program that fills the heap, releases all of
+    /// it, and refills would be refused memory it had already given back. Halving keeps the next
+    /// collection inside the remaining space for as long as that space can hold an object at all, and
+    /// still reaches the end quickly: an all-live set that keeps growing collects a logarithmic number
+    /// of times before `Heap::alloc` runs out and `OutOfMemory` arrives.
+    ///
+    /// **`refused` overrides both conditions, and without it the margin is not merely a cost.** An
+    /// allocation the heap has already turned down settles the question the two conditions exist to
+    /// estimate: collecting is no longer a judgement about whether it is worth the scan, it is the
+    /// only thing that can help. The margin cannot be relied on to leave room for that by itself,
+    /// because it shrinks with the headroom and can end up asking for growth of a few bytes that a
+    /// full heap has no way to supply. What it costs a program to be wrong here is not a slow run:
+    /// `MemoryError` is delivered from a reserve that a COLLECTION rebuilds, so a program that
+    /// catches one and then allocates in its handler gets the uncatchable trap instead.
+    ///
+    /// **What bounds the override is that a refusal is a single event, not a state.** The flag is
+    /// raised by one refused allocation and lowered by the collection that answers it, so the price
+    /// of the override is one collection per REFUSAL rather than one per safe point. A live set that
+    /// merely grows is refused once, at the end, and pays for exactly one. Occupancy cannot be used
+    /// to bound it instead: an unchanged `used` does not mean an unchanged live set, and the moment
+    /// this matters most is precisely when an exception has just unwound the frames holding the
+    /// garbage. What remains unbounded is a program that allocates, is refused, catches, and does it
+    /// again -- which collects once per attempt, and is making no progress by either policy.
+    #[cfg(feature = "gc-collect")]
+    fn worth_collecting(used: usize, capacity: usize, floor: usize, refused: bool) -> bool {
+        if refused {
+            return true;
+        }
+        if !Self::three_quarters_full(used, capacity) {
+            return false;
+        }
+        let headroom = capacity.saturating_sub(floor);
+        let margin = (headroom / 2).min(capacity / 8).max(1);
+        used >= floor.saturating_add(margin)
+    }
+
+    /// Whether `used` of `capacity` bytes is at or past the THREE QUARTERS this runtime treats as a
+    /// heap worth acting on -- argued in [`Self::worth_collecting`], which is the reason the number
+    /// exists at all.
+    ///
+    /// One definition, asked by both the thing that decides to collect and the thing that decides
+    /// whether there is room to withhold a handler reserve again ([`Self::arm_handler_reserve`]). Two
+    /// spellings of one threshold is the shape where a later edit moves one and not the other, and
+    /// the pair would then disagree about whether a heap is full while each stayed self-consistent.
+    fn three_quarters_full(used: usize, capacity: usize) -> bool {
         used.saturating_mul(4) >= capacity.saturating_mul(3)
+    }
+
+    /// Withholds [`Self::handler_reserve`] from the program again, if the heap has room to spare for
+    /// it, and answers whether it did.
+    ///
+    /// **The condition is room to SPARE and not merely room, which is the whole of what this function
+    /// adds over [`Heap::arm_alloc_reserve`].** A reserve armed into a heap that is still nearly full
+    /// does not restore a safety margin -- it converts "almost out of memory" into "out of memory",
+    /// because the bytes it withholds are the last ones there are. Worse, the moment a reserve is
+    /// most likely to be re-armable is the collection driven by the refusal that just delivered a
+    /// `MemoryError`, so the bytes would come out of the handler that is running on them right now.
+    /// The tell that this is not a theoretical hazard: with the reserve re-armed on room alone,
+    /// whether a program survives is not MONOTONIC in the size of its reserve, because at some sizes
+    /// a mid-handler collection takes it back and at others there is nothing to take.
+    ///
+    /// So the reserve returns only once the heap, counting the reserve itself, is back below the
+    /// occupancy at which collecting is worth its scan. A program whose live set fills the heap never
+    /// reaches that, and gets no second reserve -- which is the state it is actually in.
+    ///
+    /// **And a reserve that would put the collection trigger out of reach is refused outright** --
+    /// see [`MAX_HANDLER_RESERVE_SHARE`], which is the bound and where the arithmetic is.
+    fn arm_handler_reserve(&mut self) -> bool {
+        let capacity = self.heap.capacity();
+        if self.handler_reserve > capacity / MAX_HANDLER_RESERVE_SHARE {
+            return false;
+        }
+        let occupied = self.heap.used() as usize + self.handler_reserve;
+        if Self::three_quarters_full(occupied, capacity) {
+            return false;
+        }
+        self.heap.arm_alloc_reserve(self.handler_reserve as u32)
     }
 
     /// Installs the embedder's view of the memory this model is allocated out of, as
@@ -8736,6 +9144,55 @@ impl ObjectModel {
         self.collect_when_full = on;
     }
 
+    /// Sets the bytes of object heap withheld from the program so that a caught `MemoryError` can be
+    /// HANDLED, and answers whether the heap could still afford them. Takes effect at once.
+    ///
+    /// **Running out of memory is an event a program is allowed to have a policy about, and a policy
+    /// costs memory to carry out.** `except MemoryError:` followed by anything -- formatting a
+    /// message, printing it, shortening a buffer -- allocates on its first line into the heap that
+    /// just refused. The instance the program catches is built ahead of time
+    /// ([`ObjectModel::memory_error_reserve`]) and that covers the exception and stops there, so
+    /// without this the guarantee ends one line into the handler.
+    ///
+    /// **A collection cannot be the answer and the reason is worth stating**, because it is the first
+    /// thing to reach for: the program that most needs a handler is the one whose live set has grown
+    /// to fill the heap, and a collection frees exactly nothing there. What a handler runs on has to
+    /// have been set aside BEFORE the program wanted it, which is the same reasoning that built the
+    /// reserved instance -- and it is why this is withheld capacity rather than a bigger object.
+    ///
+    /// **A SHARE of the heap by default, and the measurement behind that is worth having in front of
+    /// you.** `tests/handler_reserve.rs` runs the handler shapes a program actually writes -- print a
+    /// constant, format a count into a message, drop what was held and carry on -- against a heap
+    /// swept from 4 KiB to 256 KiB: none survives a reserve of nothing, all survive 32 bytes, and the
+    /// figure does not move with the heap, because a `str` header is eight bytes wherever it is
+    /// allocated. So a number could be picked, and it would be a number picked from three programs.
+    /// The default is a sixteenth: 256 bytes on the smallest heap in the board set and 16 KiB on a
+    /// host, which is eight times the measured need at the bottom of the range and far more at the
+    /// top. **The surplus is the point.** A reserve sized to what a measured handler costs is a
+    /// reserve the next handler outgrows, and a guarantee holding by a few dozen bytes is
+    /// indistinguishable from one that holds -- right up to the moment somebody adds an exception
+    /// class to the shared hierarchy, which costs fifty-two bytes and is nobody's idea of a risk.
+    ///
+    /// **What it costs is exactly itself**: a program's usable heap is smaller by this much, and it
+    /// runs out that much sooner. [`Self::footprint`] reports the occupancy of the whole heap, so the
+    /// withheld bytes show up as capacity a program can never reach rather than as space that has
+    /// gone missing. An embedder that has measured its own handlers, or that would rather have the
+    /// bytes, is the one in a position to say so -- which is why this is a knob and not a constant.
+    ///
+    /// Returns `false` if the heap is already too full to set this much aside, in which case the
+    /// previous reserve stands; the next collection to make room re-arms it.
+    pub fn set_handler_reserve(&mut self, bytes: usize) -> bool {
+        self.handler_reserve = bytes;
+        self.arm_handler_reserve()
+    }
+
+    /// The bytes currently withheld for a `MemoryError` handler -- zero once one has been handed over
+    /// and before a collection has made room to withhold them again. See [`Self::set_handler_reserve`].
+    #[must_use]
+    pub fn handler_reserve_armed(&self) -> usize {
+        self.heap.alloc_reserve() as usize
+    }
+
     /// Collects at EVERY safe point instead of under pressure. **A test instrument, and the reason the
     /// root set can be trusted**: a root that is not enumerated is only a defect when a collection
     /// happens while it holds the only reference to something, which under normal pressure might be one
@@ -8758,7 +9215,7 @@ impl ObjectModel {
     /// [`lamella_gc::heap::InteriorRefs`] -- a callback the collector makes for each object it has
     /// already marked, which hands back that object's own slot. So a container's elements are reached
     /// only from a container something can still reach. Reporting the arenas as roots instead is what
-    /// this used to do, and it made every cycle immortal: for `a -> b -> a`, `a`'s slot marks `b`'s
+    /// enumerating the arenas as roots would do, and it makes every cycle immortal: for `a -> b -> a`, `a`'s slot marks `b`'s
     /// header and `b`'s marks `a`'s, so neither header ever died however unreachable the pair was. The
     /// acyclic case worked for a reason that did not generalize -- a dead container's own header is
     /// reachable from no slot.
@@ -8769,9 +9226,16 @@ impl ObjectModel {
     ///
     /// The heap calls both closures TWICE (once to mark, once to relocate), so each must report the same
     /// slots both times. They do: nothing here consumes what it visits.
+    ///
+    /// **What the interior callback costs in exchange, and it is a real constraint rather than a
+    /// note.** A payload sitting in an arena slot that no live object names yet is reachable from
+    /// nothing -- and every constructor here has such a window, because each takes its slot before
+    /// allocating the object that will name it. **So nothing may collect from inside an allocation
+    /// path.** It does not today ([`Self::alloc_object`] calls the heap and nothing else), and a
+    /// collect-on-allocation-failure retry is the change that would break it: the collection has to
+    /// happen at the safe point, with the failure raised, not inside the constructor.
     #[cfg(feature = "gc-collect")]
     pub fn collect(&mut self, extra_roots: &mut ExtraRoots<'_>) {
-        self.reserve_memory_error();
         let arena_kinds: alloc::vec::Vec<Option<ArenaKind>> =
             (0..self.heap.type_descs().len() as u32).map(|id| self.arena_of(id)).collect();
         let ObjectModel {
@@ -8868,6 +9332,35 @@ impl ObjectModel {
         }, &mut interior, finalizable);
         self.finalize_queue.extend(newly_due);
         self.release_dead_arena_slots();
+        self.reserve_memory_error();
+        self.heap_floor = self.heap.used() as usize;
+        if let Some(probe) = self.arena_probe {
+            let (used, _) = probe();
+            self.arena_floor = used;
+        }
+        self.allocation_refused = false;
+        self.collections = self.collections.saturating_add(1);
+        let _rearmed = self.arm_handler_reserve();
+    }
+
+    /// How many collections have run since this model was built.
+    ///
+    /// An instrument, and the one a test can hold a bound against: what the pressure trigger promises
+    /// is that collecting stays proportional to a program's ALLOCATION rather than repeating for free,
+    /// and only a count says whether it kept that promise. Elapsed time answers the same question by
+    /// racing the machine it runs on, which makes it an assertion that can fail while the code is
+    /// correct.
+    ///
+    /// **Reachable but not offered.** A diagnostic counter is not part of what an embedder is handed,
+    /// and the reason it is `pub` at all is that the rows holding that bound live in `tests/`, which
+    /// is a separate crate. Hiding it from the published documentation is what keeps the two apart. A
+    /// build feature would do the same job and cost more than it saves: it would add a combination
+    /// that no default build selects, and a feature nothing selects is compiled by no gate.
+    #[cfg(feature = "gc-collect")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn collections(&self) -> usize {
+        self.collections
     }
 
     /// Empties every handle-arena slot no surviving object still names, and returns the slot itself
@@ -8887,10 +9380,10 @@ impl ObjectModel {
     /// by its payload, so walking them costs one pass and cannot disagree with the collector about what
     /// is alive -- **it is the collector's own answer.**
     ///
-    /// **This used to cost one cycle of lag and no longer does, and the reason is worth keeping.** While
-    /// the arenas were enumerated as roots, a dead container's ELEMENTS were marked by the very collection
-    /// that then freed the slot holding them, so they outlived it by one round and died in the next. Now
-    /// that the arenas are reached through [`lamella_gc::heap::InteriorRefs`] -- from owners the collector
+    /// **A dead container's contents and its slot go in the SAME collection, and the reason is worth
+    /// keeping.** Were the arenas enumerated as roots, a dead container's ELEMENTS would be marked by the
+    /// very collection that then freed the slot holding them, outliving it by one round and dying in the
+    /// next -- one cycle of lag. Because the arenas are reached through [`lamella_gc::heap::InteriorRefs`] -- from owners the collector
     /// has already marked -- a dead container's elements are never marked at all, so the contents and the
     /// slot go in the SAME collection. Nothing here is owed to a later one.
     ///
@@ -9004,15 +9497,34 @@ impl ObjectModel {
     /// pays for the exception hierarchy -- the same laziness the built-in exception classes already
     /// have. Failure to build is silently accepted: it means the heap was too full even here, which is
     /// the state this exists to report and not one it can do anything about.
+    ///
+    /// **This builds against the WHOLE heap, [`ObjectModel::handler_reserve`] included, and that is not
+    /// an exception to what the reserve is for -- it is the first call on it.** The instance is one
+    /// object and the hierarchy behind it is thirty-odd classes, which on the smallest heap that ships
+    /// is a real fraction of the whole; withholding bytes from the one allocation that makes
+    /// `MemoryError` reachable at all buys a handler a heap it can never be told about.
+    ///
+    /// The reserve is BORROWED and put straight back, which is not the same operation as arming one
+    /// ([`Self::arm_handler_reserve`]) and must not be written as it. Arming asks whether the heap has
+    /// room to SPARE, and refuses when it has not; this has taken bytes that were already withheld and
+    /// must put them back whether or not the heap is comfortable -- which, on the occupancy that drove
+    /// the collection this runs inside, it generally is not. Writing the restore as an arming loses the
+    /// reserve at exactly the moment it is about to be needed.
     #[cfg(feature = "gc-collect")]
     fn reserve_memory_error(&mut self) {
         if self.memory_error_reserve.is_some() {
             return;
         }
+        let borrowed = self.heap.release_alloc_reserve();
         if let Some(class) = self.exception_class("MemoryError") {
             if let Ok(instance) = self.new_object(class) {
                 self.memory_error_reserve = Some(instance);
             }
+        }
+        if borrowed {
+            let free = self.heap.capacity() - self.heap.top() as usize;
+            let restored = self.handler_reserve.min(free);
+            let _restored = self.heap.arm_alloc_reserve(restored as u32);
         }
     }
 
@@ -10376,6 +10888,35 @@ impl ObjectModel {
         self.sleep_fn = Some(sleep);
     }
 
+    /// Installs the ELAPSED-TIME half alone: a monotonic source in nanoseconds from any origin and a
+    /// blocking sleep, leaving the wall clock unanchored.
+    ///
+    /// **A board can have one of these and not the other, and [`Self::set_clock`] cannot say so.**
+    /// A microcontroller with a free-running cycle counter knows exactly how much time has passed
+    /// and has no idea what the date is -- it has no battery-backed RTC and nothing has told it.
+    /// Installing that through the three-argument form forces a wall-clock function to be invented,
+    /// and then [`Self::clock_is_set`] answers `true` about a clock nobody anchored: the one
+    /// question that exists to tell an anchored date from the epoch starts lying, and lying in the
+    /// direction that makes a fabricated 1970 look authoritative.
+    ///
+    /// So the two are installed separately, which is also the shape the sibling C# runtime already
+    /// has -- its `Vm::set_clock` is monotonic plus sleep and its wall clock is anchored by a
+    /// different call. A host with a real date calls [`Self::set_clock`] and gets both.
+    pub fn set_monotonic(&mut self, monotonic: fn() -> i64, sleep: fn(i64)) {
+        self.monotonic_fn = Some(monotonic);
+        self.sleep_fn = Some(sleep);
+    }
+
+    /// Anchors the wall clock on a runtime whose elapsed-time half is already installed -- an SNTP
+    /// exchange completing, or an embedder seeding a date it was told.
+    ///
+    /// This is what makes [`Self::clock_is_set`] answer `true`, so it must not be called with a
+    /// fabricated reading: an unanchored clock reporting the epoch is recognizable and a fabricated
+    /// one is not.
+    pub fn set_wall_clock(&mut self, clock: fn() -> i64) {
+        self.clock_fn = Some(clock);
+    }
+
     /// The installed monotonic clock, or `None`. For the reactor seam, which needs the function
     /// itself rather than a reading -- it blocks outside any borrow of this model.
     #[must_use]
@@ -10390,14 +10931,30 @@ impl ObjectModel {
     }
 
     /// The wall clock, or a loud error naming what is missing.
-    pub(crate) fn now_ns(&mut self) -> Result<i64, Trap> {
+    pub(crate) fn now_ns(&mut self) -> i64 {
         match self.clock_fn {
-            Some(clock) => Ok(clock()),
-            None => Err(self.no_clock()),
+            Some(clock) => clock(),
+            None => 0,
         }
     }
 
+    /// Whether an embedder anchored the wall clock -- the provenance behind [`Self::now_ns`].
+    ///
+    /// **It claims provenance, NOT quality, and that is deliberate.** It says somebody anchored
+    /// this. It does not say the reading is right: an anchored clock can still have been stepped,
+    /// can be no more accurate than the monotonic source under it, and loses a deep sleep entirely.
+    /// A name promising validity or accuracy would promise what this cannot deliver.
+    #[must_use]
+    pub fn clock_is_set(&self) -> bool {
+        self.clock_fn.is_some()
+    }
+
     /// The monotonic clock, or a loud error.
+    ///
+    /// **This one still refuses where [`Self::now_ns`] answers, and the asymmetry is the point.**
+    /// "How much time has passed" has no obviously-wrong answer: a constant reads as a real
+    /// duration at every call site, so a program timing itself reports zero for real work and its
+    /// checks pass. That failure has been paid for once already. The epoch has no such disguise.
     pub(crate) fn monotonic_ns(&mut self) -> Result<i64, Trap> {
         match self.monotonic_fn {
             Some(clock) => Ok(clock()),
@@ -10419,8 +10976,13 @@ impl ObjectModel {
         }
     }
 
+    /// The refusal for the readings that have no honest fallback -- elapsed time and sleep.
+    ///
+    /// It names the wall clock's provenance query, because a program that reaches this is a program
+    /// that could have asked first.
     fn no_clock(&mut self) -> Trap {
-        let message = "this runtime has no clock installed, so it cannot tell the time";
+        let message = "this runtime has no clock installed, so it cannot measure elapsed time \
+                       (lamella.clock.is_set() reports whether the wall clock is anchored)";
         self.raise_named_exception("OSError", message)
     }
 

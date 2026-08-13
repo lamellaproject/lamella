@@ -18,8 +18,8 @@ use lamella_ir::TypeHandle;
 use lamella_metadata::signature::element;
 use lamella_metadata::tables::table;
 use lamella_metadata::{
-    Assembly, CodedIndex, SigType, exception_tag_for_name, fnv1a32, parse_local_vars, parse_method,
-    parse_method_spec,
+    Assembly, CodedIndex, Method, SigType, exception_tag_for_name, fnv1a32, parse_local_vars,
+    parse_method, parse_method_spec,
 };
 use lamella_token::Token;
 
@@ -35,6 +35,11 @@ const PATH_BACKSTOP: usize = 128;
 
 /// A type as a monomorphizer must see it: a tree, with generic definitions named rather than
 /// tokenized.
+///
+/// **NAMES, NOT TOKENS, AND THAT IS THE POINT.** A metadata token is meaningful only inside its
+/// own assembly, so the same token number in a program and in its corlib are different types. The
+/// canonical name is the only identity that survives the assembly boundary -- which is the same
+/// reason it is the interface tag's spelling, and the reason it is this set's key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TypeArg {
     /// A built-in element type carried as its ECMA-335 element byte (II.23.1.16) -- `I4`, `STRING`,
@@ -216,9 +221,36 @@ impl TypeArg {
 /// A handle is `TypeHandle(token.0)` -- a table byte over a row -- and an instantiation has no
 /// metadata row at all (the resolver reads a READ-ONLY `Assembly`), so it takes a byte no type
 /// table occupies and carries a value derived from its NAME instead of a row number.
+///
+/// **THE BYTE IS ALLOCATED IN `lamella-ir` AND RE-EXPORTED HERE, NOT DECLARED HERE.** The handle
+/// space is shared with every front end that mints a synthesized identity, so a byte chosen against
+/// this tier's view of it is a byte chosen against half the population -- which is how an
+/// instantiation and a front-end synthesized array came to share `0x04`, and a descriptor is
+/// deduplicated BY HANDLE.
+///
+/// **AND THE CEILING THAT ARGUMENT WAS MADE AGAINST WAS NEVER REAL:** the
+/// handle space is ALREADY past bit 27 -- a TypeSpec handle is table byte `0x1B` and sets bits 28 and
+/// 27, in every rank-N array in shipping code, with both backends correct anyway. So `0x04` was not
+/// chosen from a full space; it was chosen against a stale census.
 pub use lamella_ir::INSTANTIATION_HANDLE_TABLE;
 
 /// The handle for the instantiation spelled `name`.
+///
+/// **DERIVED FROM THE NAME, BECAUSE THE NAME IS THE IDENTITY AND A ROW NUMBER IS NOT.** The same
+/// instantiation named from a program and from a library must get the SAME handle, or the two
+/// assemblies emit two descriptors for one type and `o is Box<int>` stops working across the
+/// boundary. A per-assembly row number cannot do that; the canonical spelling can, because it is
+/// already the thing both sides agree on.
+///
+/// **AND 24 BITS OF HASH CAN COLLIDE, SO A COLLISION IS A REFUSAL RATHER THAN A RISK.** Two
+/// distinct instantiations sharing a handle share a DESCRIPTOR -- two types under one tag, which is
+/// the precise failure the by-name rule exists to prevent, arriving through the allocator instead
+/// of through a cast. [`Program::instantiations`] checks the whole set and refuses by name; see
+/// [`Refusal::HandleCollision`].
+///
+/// **The check protects a build that RUNS THE COLLECTOR.** Emission does not run it yet, so a
+/// build that mints a handle through `lamella_aot::resolver` alone is currently unchecked. That is a
+/// named gap, not a silent one, and it closes when the collector joins the build path.
 #[must_use]
 pub fn instantiation_handle(name: &str) -> TypeHandle {
     TypeHandle((INSTANTIATION_HANDLE_TABLE << 24) | (exception_tag_for_name("", name) & 0x00ff_ffff))
@@ -233,26 +265,59 @@ pub fn instantiation_handle(name: &str) -> TypeHandle {
 /// substitution has to happen for an instantiation to have a shape at all. Converting a `TypeArg`
 /// back to a `SigType` is not possible without inventing tokens, so the two directions are separate
 /// functions over separate types rather than one function with a conversion in it.
+///
+/// **A METHOD parameter (`!!n`) resolves from the METHOD's arguments, which are a separate list.**
+/// This form passes an empty one, so every `!!n` answers `None` here exactly as it always has --
+/// see [`substitute_sig_with`] for why that is now a consequence of the rule rather than a rule of
+/// its own.
+///
+/// `None` when a parameter number has no argument, for the same reason
+/// [`TypeArg::substitute`] refuses: a signature naming `!3` of a two-parameter type is not something
+/// to substitute a default into.
 #[must_use]
 pub fn substitute_sig(ty: &SigType, arguments: &[SigType]) -> Option<SigType> {
+    substitute_sig_with(ty, arguments, &[])
+}
+
+/// `ty` with `!n` replaced from `type_arguments` and `!!n` from `method_arguments`.
+///
+/// **TWO LISTS, BECAUSE THERE ARE TWO AXES AND ECMA-335 SPELLS THEM WITH DIFFERENT BYTES.** A
+/// TYPE's arguments come from the `TypeSpec` naming the instantiation; a generic METHOD's come from
+/// a `MethodSpec` AT THE CALL SITE, and no amount of looking at the enclosing type will produce
+/// them. Collapsing the two into one list would make `Pick<int>` inside `Box<string>` resolve `!!0`
+/// to `string`, which is a wrong answer rather than a missing one.
+///
+/// **THE OLD UNCONDITIONAL `!!n` REFUSAL SURVIVES AS A CONSEQUENCE, NOT AS A SPECIAL CASE.** The
+/// type axis calls [`substitute_sig`], which passes an EMPTY method list, so `method_arguments.get`
+/// answers `None` for every `!!n` exactly as the hard-coded arm did. That is deliberate: the runtime
+/// tier reached the same arrangement independently in its own loader, and having the two tiers agree
+/// by construction is worth more than either being clever.
+///
+/// **Silently leaving `!!0` in place is the failure this refuses.** It would produce a type that
+/// looks closed and is not, and it would then be laid out as whatever the layout code makes of an
+/// unresolved parameter -- a size and a trace map invented from nothing.
+#[must_use]
+pub fn substitute_sig_with(
+    ty: &SigType,
+    type_arguments: &[SigType],
+    method_arguments: &[SigType],
+) -> Option<SigType> {
+    let recur = |inner: &SigType| substitute_sig_with(inner, type_arguments, method_arguments);
     Some(match ty {
-        SigType::Var(number) => arguments.get(*number as usize)?.clone(),
-        SigType::MVar(_) => return None,
+        SigType::Var(number) => type_arguments.get(*number as usize)?.clone(),
+        SigType::MVar(number) => method_arguments.get(*number as usize)?.clone(),
         SigType::GenericInst {
             definition,
             arguments: inner,
         } => SigType::GenericInst {
-            definition: Box::new(substitute_sig(definition, arguments)?),
-            arguments: inner
-                .iter()
-                .map(|argument| substitute_sig(argument, arguments))
-                .collect::<Option<Vec<_>>>()?,
+            definition: Box::new(recur(definition)?),
+            arguments: inner.iter().map(recur).collect::<Option<Vec<_>>>()?,
         },
-        SigType::Pointer(inner) => SigType::Pointer(Box::new(substitute_sig(inner, arguments)?)),
-        SigType::ByRef(inner) => SigType::ByRef(Box::new(substitute_sig(inner, arguments)?)),
-        SigType::SzArray(inner) => SigType::SzArray(Box::new(substitute_sig(inner, arguments)?)),
+        SigType::Pointer(inner) => SigType::Pointer(Box::new(recur(inner)?)),
+        SigType::ByRef(inner) => SigType::ByRef(Box::new(recur(inner)?)),
+        SigType::SzArray(inner) => SigType::SzArray(Box::new(recur(inner)?)),
         SigType::Array { element, rank } => SigType::Array {
-            element: Box::new(substitute_sig(element, arguments)?),
+            element: Box::new(recur(element)?),
             rank: *rank,
         },
         other => other.clone(),
@@ -260,6 +325,15 @@ pub fn substitute_sig(ty: &SigType, arguments: &[SigType]) -> Option<SigType> {
 }
 
 /// Converts a decoded [`SigType`] into a [`TypeArg`], resolving every token to a NAME.
+///
+/// **THIS IS WHERE THE TIER'S IDENTITY CHANGES FROM A TOKEN TO A NAME, AND IT IS THE WHOLE REASON
+/// [`TypeArg`] EXISTS RATHER THAN `SigType` BEING USED DIRECTLY.** A token is meaningful only inside
+/// its own assembly, so `SigType::Class(0x01000004)` from a program and the same number from its
+/// corlib are different types. The canonical name is the only identity that survives the assembly
+/// boundary -- which is also why it is the interface tag's spelling and the instantiation set's key.
+///
+/// It takes ONE assembly because that is all it needs: a `TypeRef` row carries its own namespace and
+/// name, so naming never requires the defining assembly to be loaded.
 pub fn sig_to_type_arg(assembly: &Assembly<'_>, ty: &SigType) -> Result<TypeArg, Refusal> {
     let named = |token: Token| -> Result<Box<str>, Refusal> {
         type_def_full_name(assembly, token)
@@ -313,9 +387,68 @@ pub fn sig_to_type_arg(assembly: &Assembly<'_>, ty: &SigType) -> Result<TypeArg,
 }
 
 /// The canonical spelling of a `SigType`, through [`TypeArg::spell`].
+///
+/// It exists so a caller holding a `SigType` never formats one itself. **A second spelling of a
+/// frozen identity is the hazard this prevents** -- two implementations that agree today and
+/// diverge on the first nested or array argument.
 #[must_use]
 pub fn spell_sig(assembly: &Assembly<'_>, ty: &SigType) -> Option<String> {
     sig_to_type_arg(assembly, ty).ok().map(|arg| arg.name())
+}
+
+/// The canonical spelling of an OPEN signature whose `!n` are filled from a DIFFERENT assembly --
+/// the one shape where a definition and its type arguments are written in two different worlds.
+///
+/// **A MONOMORPHIZED BODY DECLARED NEXT DOOR IS THE CASE.** Its CIL is the OWNER's, so a `TypeSpec`
+/// in it names the owner's definition; the instantiation's type arguments are the CALLER's, because
+/// the caller is what spelled the instantiation. Substituting first and spelling second reads BOTH
+/// through one assembly, and whichever one is wrong gets a name out of the other's tables -- a real,
+/// unrelated type, and a lookup that misses or, worse, hits.
+///
+/// So each side is decoded in its own world FIRST and composed after: `definition` through
+/// `definition_assembly`, every argument through `argument_assembly`, then substituted. It is
+/// [`spell_sig`] for the ordinary one-world case and stays that, byte for byte, when the two
+/// assemblies are the same.
+///
+/// `None` when either side does not decode, which is [`spell_sig`]'s own refusal rather than a
+/// second rule: a spelling that cannot be produced exactly must not be produced approximately.
+#[must_use]
+pub fn spell_sig_across(
+    definition_assembly: &Assembly<'_>,
+    argument_assembly: &Assembly<'_>,
+    open: &SigType,
+    arguments: &[SigType],
+) -> Option<String> {
+    let definition = sig_to_type_arg(definition_assembly, open).ok()?;
+    let decoded: Vec<TypeArg> = arguments
+        .iter()
+        .map(|argument| sig_to_type_arg(argument_assembly, argument).ok())
+        .collect::<Option<_>>()?;
+    Some(definition.substitute(&decoded, &[])?.name())
+}
+
+/// Whether a signature instantiates a VALUE type -- `Holder<int>`, never `List<int>`.
+///
+/// **ONE PREDICATE, BECAUSE TWO SITES REFUSE ON IT AND THEY MUST REFUSE ON THE SAME SHAPE.** The
+/// AOT types a method's slots twice -- once in the resolver, for what a diagnostic reads, and once
+/// inline in the build, for what the image is emitted from -- and each has to reject this shape.
+/// Written out at both, they are two hand-kept-in-step arms, which is exactly the arrangement that
+/// let the defect sit: the pair already carried *"must stay in step"* comments and had drifted
+/// anyway.
+///
+/// The distinction is not cosmetic. An instantiation of a CLASS is an object reference whatever its
+/// arguments are, so it is answerable with no layout at all. An instantiation of a VALUE type
+/// carries a SIZE and a trace map that only the substituted layout can supply, and until this tier
+/// monomorphizes value types it has neither -- so the honest answer is a refusal rather than a
+/// guess one field wide.
+///
+/// Keyed POSITIVELY on `ValueType`, not as "anything that is not a `Class`". `GENERICINST` is
+/// followed by exactly one of those two element bytes (ECMA-335 II.23.2.12), so the two readings
+/// agree on every well-formed blob -- and on a malformed one the positive form leaves behavior
+/// where it is instead of turning a decoding gap into a build failure.
+#[must_use]
+pub fn is_value_type_instantiation(ty: &SigType) -> bool {
+    matches!(ty, SigType::GenericInst { definition, .. } if matches!(**definition, SigType::ValueType(_)))
 }
 
 /// The type arguments a `TypeSpec` token instantiates its definition with, and the definition's own
@@ -350,6 +483,18 @@ pub fn instantiation_of(assembly: &Assembly<'_>, token: Token) -> Option<(String
 /// cast that fails, a static field that exists twice, an `is` that answers wrong. Today one codebase
 /// produces both sides so the agreement is accidental; the moment a device baked by one toolchain
 /// loads a PE instantiated by another, the spelling is a WIRE CONTRACT.
+///
+/// **IT IS DERIVED, NOT DECLARED, AND THAT IS THE WHOLE POINT.** A hand-maintained
+/// `SPELLING_VERSION` constant is a twin of the thing it describes, and this project has already
+/// been bitten by a hand-maintained twin drifting from its original. This hashes what the rule
+/// actually PRODUCES over a corpus with one entry per clause of the rule, so **changing a separator,
+/// an argument order, an arity suffix, a nesting join, a compound suffix or a primitive's BCL name
+/// moves the fingerprint whether or not anyone remembers to bump it.** Forgetting is not available.
+///
+/// **The corpus below is the specification.** A clause with no entry here is a clause this
+/// fingerprint does not cover, so an addition to the rule needs a matching addition to the corpus --
+/// [`tests::the_spelling_rule_fingerprint_is_pinned`] fails loudly when the value moves, which is
+/// the prompt to check that the move was intended and to say so where consumers can see it.
 #[must_use]
 pub fn spelling_rule_fingerprint() -> u32 {
     let named = |name: &str| TypeArg::Named {
@@ -452,6 +597,10 @@ pub struct Instantiation {
 pub enum Refusal {
     /// The program's static instantiation set is INFINITE. `class C<T> { void M() { new C<C<T>>(); } }`
     /// is legal C# whose closure never terminates, and a monomorphizing tier cannot enumerate it.
+    ///
+    /// The criterion is GROWTH ON A CYCLE, not recursion: an edge revisiting a definition already
+    /// on the current path at STRICTLY GREATER type-argument nesting depth. `class Node<T> { Node<T>
+    /// next; }` revisits at equal depth and is finite and perfectly ordinary.
     GrowthOnCycle {
         /// The definition the walk re-entered.
         definition: Box<str>,
@@ -474,6 +623,12 @@ pub enum Refusal {
     PathBackstop,
     /// Two DISTINCT instantiations minted the same [`TypeHandle`] from
     /// [`instantiation_handle`]'s 24-bit hash of their names.
+    ///
+    /// **REFUSED RATHER THAN RISKED, BECAUSE THE FAILURE IS THE ONE THE WHOLE SCHEME EXISTS TO
+    /// PREVENT.** Two types under one handle share a DESCRIPTOR: one GC trace map for two layouts,
+    /// one tag for two identities. It arrives through the allocator rather than through a cast, but
+    /// it is the same hole `generics-identity-and-sharing` s2 forbids. A build that cannot name a
+    /// type uniquely must stop, not pick one.
     HandleCollision {
         /// One instantiation's canonical name.
         first: Box<str>,
@@ -527,6 +682,11 @@ impl<'a> Program<'a> {
 
     /// How many methods a definition declares -- the number of BODIES monomorphizing one
     /// instantiation of it would emit. `None` when the definition is not one of ours to see.
+    ///
+    /// It counts DECLARED methods, not `T`-dependent ones. A measured corpus put `M` at 58.9% of a generic
+    /// type's methods as `T`-dependent and reported it as a LOWER BOUND, so the honest reading of a
+    /// total built from this is an UPPER bound on bodies that must duplicate -- and both bounds are
+    /// compile-time, which is not the count the cap governs.
     #[must_use]
     pub fn definition_method_count(&self, definition: &str) -> Option<usize> {
         let &(index, row) = self.definitions.get(definition)?;
@@ -572,6 +732,10 @@ impl<'a> Program<'a> {
 
     /// Every closed instantiation the PROGRAM names directly: its `TypeSpec` rows, the type
     /// arguments of its `MethodSpec` rows, and the field and method signatures of its own types.
+    ///
+    /// Open ones are skipped here rather than refused: `List<!0>` inside a generic definition is
+    /// not a root, it is an EDGE from that definition's own instantiations, and the closure walk is
+    /// what closes it.
     fn roots(&self) -> Result<Vec<TypeArg>, Refusal> {
         let Some(assembly) = self.assemblies.first() else {
             return Ok(Vec::new());
@@ -890,12 +1054,229 @@ impl Walk<'_, '_> {
     }
 }
 
+/// One (generic method, call-site type arguments) pair -- the unit a tier emits a body for.
+///
+/// It names the DECLARING TYPE rather than carrying a metadata row, because a row is an index into
+/// one assembly's tables and this set crosses assemblies. A name is the identity both tiers already
+/// share.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodPair {
+    /// The full name of the type declaring the body this pair runs.
+    pub declaring: Box<str>,
+    /// The method's name.
+    pub method: Box<str>,
+    /// Its declared parameter signature, still open where it mentions `!n` / `!!n`.
+    pub parameters: Vec<SigType>,
+    /// How many type parameters the method itself declares.
+    pub arity: u32,
+    /// The type arguments the CALL SITE supplied.
+    pub arguments: Vec<SigType>,
+}
+
+impl Program<'_> {
+    /// Closes `named` over the OVERRIDE relation: for every pair the caller found, every override of
+    /// that method in the program's closed hierarchy, at the SAME type arguments.
+    ///
+    /// # The assumption this exists to break
+    ///
+    /// A consumer of the `MethodSpec` table naturally reads it as *a finite, already-closed
+    /// enumeration of the generic methods a program calls*. **That is true for static and
+    /// non-virtual generic methods and FALSE for virtual ones.** `b.Tag<int>()` on a `Base b` emits
+    /// ONE row, naming `Base::Tag`; the body that must actually run is `Derived::Tag<int>`, and
+    /// **nothing anywhere names it**. Lowering only the pair the token names BINDS -- to the base's
+    /// declaration -- so the program loads, bakes clean, runs, and answers wrong. That is why the
+    /// set has to be closed rather than read.
+    ///
+    /// # Why it terminates
+    ///
+    /// The arguments come from the table and are never grown here: an override is emitted at the
+    /// SAME arguments as the pair it overrides, so this adds bodies and never new instantiations.
+    /// The hierarchy is closed at bake time and finite. There is no growth-on-a-cycle refusal to
+    /// make, unlike [`Program::instantiations`], because nothing in this walk can enlarge an
+    /// argument list.
+    ///
+    /// # What it matches on, and why not a string
+    ///
+    /// Name, generic ARITY and the declared parameter signature, compared STRUCTURALLY. ECMA-335
+    /// II.9.9 makes arity part of the rule outright (*"the number of generic parameters shall match
+    /// exactly those of the overridden method"*), and a structural comparison is the one form of
+    /// identity that cannot drift from someone else's spelling rule -- the same reason
+    /// `find_instantiation` compares decoded arguments rather than names.
+    ///
+    /// # What it cannot see, and says so by omission
+    ///
+    /// A definition in an assembly this `Program` was not given is not walked, so an override
+    /// declared there is not found. That is [`Program::can_walk`]'s stated boundary rather than a
+    /// silent skip, and a caller that needs the guarantee must ask it.
+    ///
+    /// **AN EXPLICIT INTERFACE IMPLEMENTATION IS NOT COVERED.** `int IFoo.Tag<T>()` is named through
+    /// the `MethodImpl` table under a MANGLED name, so it is a third LOOKUP rather than a third
+    /// branch, and neither the class rule nor the interface rule below finds it. An IMPLICIT
+    /// implementation is covered. A caller must not read this function's answer as covering both.
+    #[must_use]
+    pub fn close_over_overrides(&self, named: &[MethodPair]) -> Vec<MethodPair> {
+        let mut found: Vec<MethodPair> = Vec::new();
+        let mut seen: BTreeSet<(Box<str>, Box<str>, u32)> = BTreeSet::new();
+        for pair in named {
+            let declaring_is_interface = self.is_interface(&pair.declaring).unwrap_or(false);
+            for (candidate, &(index, row)) in &self.definitions {
+                if candidate.as_ref() == pair.declaring.as_ref() {
+                    continue;
+                }
+                let related = if declaring_is_interface {
+                    self.implements(candidate, &pair.declaring)
+                } else {
+                    self.derives_from(candidate, &pair.declaring)
+                };
+                if !related {
+                    continue;
+                }
+                let assembly = &self.assemblies[index];
+                let Some(type_def) = assembly.type_def(row) else {
+                    continue;
+                };
+                for method in type_def.methods() {
+                    if !method.is_virtual() {
+                        continue;
+                    }
+                    if !declaring_is_interface && method.flags() & METHOD_NEWSLOT != 0 {
+                        continue;
+                    }
+                    if method.name() != Some(pair.method.as_ref()) {
+                        continue;
+                    }
+                    let Some(signature) = method.signature() else {
+                        continue;
+                    };
+                    if signature.generic_param_count != pair.arity
+                        || signature.parameters != pair.parameters
+                    {
+                        continue;
+                    }
+                    let key = (
+                        candidate.clone(),
+                        pair.method.clone(),
+                        pair.arity,
+                    );
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    found.push(MethodPair {
+                        declaring: candidate.clone(),
+                        method: pair.method.clone(),
+                        parameters: signature.parameters.clone(),
+                        arity: pair.arity,
+                        arguments: pair.arguments.clone(),
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether `candidate` implements `interface`, by NAME.
+    ///
+    /// Both edges are followed, and each is load-bearing: a type inherits its BASE's interface list
+    /// (`class D : C` where `C : IFoo` implements `IFoo`), and an interface can EXTEND another
+    /// (`IDerived : IBase` means an implementer of `IDerived` also implements `IBase`). Following
+    /// only the type's own `interfaces()` row answers the one-line case and misses both.
+    ///
+    /// Breadth-first over a worklist with a visited set, rather than the depth-bounded chain
+    /// [`Program::derives_from`] uses: interfaces form a DAG, not a chain, so the same interface is
+    /// reachable by several routes and a depth bound alone would either stop early or revisit.
+    fn implements(&self, candidate: &str, interface: &str) -> bool {
+        let mut seen: BTreeSet<Box<str>> = BTreeSet::new();
+        let mut queue: Vec<Box<str>> = alloc::vec![candidate.into()];
+        while let Some(at) = queue.pop() {
+            if !seen.insert(at.clone()) {
+                continue;
+            }
+            if seen.len() > PATH_BACKSTOP {
+                return false;
+            }
+            let Some(&(index, row)) = self.definitions.get(at.as_ref()) else {
+                continue;
+            };
+            let assembly = &self.assemblies[index];
+            let Some(type_def) = assembly.type_def(row) else {
+                continue;
+            };
+            for token in
+                core::iter::once(type_def.extends()).chain(type_def.interfaces().collect::<Vec<_>>())
+            {
+                if token.0 == 0 {
+                    continue;
+                }
+                let name = if token.table() == table::TYPE_SPEC {
+                    instantiation_of(assembly, token).map(|(name, _)| name)
+                } else {
+                    type_def_full_name(assembly, token)
+                };
+                let Some(name) = name else {
+                    continue;
+                };
+                if name == interface {
+                    return true;
+                }
+                queue.push(name.into_boxed_str());
+            }
+        }
+        false
+    }
+
+    /// Whether `candidate` reaches `ancestor` by following `extends`, by NAME.
+    ///
+    /// Bounded by [`PATH_BACKSTOP`] rather than by a visited set: a base chain is not a graph and a
+    /// cycle in one is malformed metadata, so the honest response is to stop walking rather than to
+    /// tidy it into an answer.
+    fn derives_from(&self, candidate: &str, ancestor: &str) -> bool {
+        let mut at = candidate;
+        let mut owned;
+        for _ in 0..PATH_BACKSTOP {
+            let Some(&(index, row)) = self.definitions.get(at) else {
+                return false;
+            };
+            let assembly = &self.assemblies[index];
+            let Some(type_def) = assembly.type_def(row) else {
+                return false;
+            };
+            let extends = type_def.extends();
+            if extends.0 == 0 {
+                return false;
+            }
+            let name = if extends.table() == table::TYPE_SPEC {
+                instantiation_of(assembly, extends).map(|(name, _)| name)
+            } else {
+                type_def_full_name(assembly, extends)
+            };
+            let Some(name) = name else {
+                return false;
+            };
+            if name == ancestor {
+                return true;
+            }
+            owned = name;
+            at = &owned;
+        }
+        false
+    }
+}
+
+/// `mdNewSlot` (II.23.1.10) -- the method starts a new vtable slot rather than overriding one.
+const METHOD_NEWSLOT: u32 = 0x0100;
+
 /// A type token's full name: the enclosing chain joined with `+`, prefixed by the OUTERMOST type's
 /// namespace, exactly as .NET spells a nested type.
 ///
 /// It works for a `TypeRef` as well as a `TypeDef`, and that is load-bearing: a reference carries
 /// its own namespace and name, so the spelling never needs the defining assembly to be present.
-fn type_def_full_name(assembly: &Assembly<'_>, token: Token) -> Option<String> {
+///
+/// **PUBLIC BECAUSE A CONSUMER OF THE PLAN HAS TO ASK THE SAME QUESTION AND MUST NOT RE-SPELL IT.**
+/// [`MonoMethodBody::declaring`] is written by this function; a dispatch table looking a body up by
+/// its declaring type computes the key with it too, so the two sides cannot drift. A second
+/// spelling of a nested chain is exactly where they would.
+#[must_use]
+pub fn type_def_full_name(assembly: &Assembly<'_>, token: Token) -> Option<String> {
     let mut chain = Vec::new();
     let mut namespace;
     let mut current = token;
@@ -950,14 +1331,29 @@ fn type_def_full_name(assembly: &Assembly<'_>, token: Token) -> Option<String> {
 pub struct MonoBody {
     /// The function index this body occupies -- past `max_rid`, in the SAME index space
     /// `Inst::Call { callee }` already names.
+    ///
+    /// **IT IS NOT A MethodDef RID AND THERE IS DELIBERATELY NO SYNTHETIC ONE.** The reachability
+    /// walk's worklist is a `Vec<u32>` of FUNCTION INDICES; it calls its variable `rid` only because
+    /// nothing has ever occupied an index above `max_rid`. So the index space EXTENDS and the
+    /// boundary is DERIVED (`max_rid` is computed from the metadata) rather than maintained, which is
+    /// the whole reason a synthetic rid -- a hand-maintained twin of a metadata row -- is not needed.
     pub index: u32,
     /// The instantiation's canonical spelling -- the identity half of the call-site key, and the
     /// only identity that survives an assembly boundary.
     pub instantiation: Box<str>,
     /// The `TypeSpec` token, in the module's OWN assembly, that spells this instantiation.
+    ///
+    /// **The token is kept rather than the arguments' names because the ARGUMENTS are what
+    /// substitution needs, and they are `SigType`s whose `Class`/`ValueType` tokens are meaningful
+    /// only in this assembly.** [`substitute_sig`]'s own documentation records why the name-keyed
+    /// [`TypeArg`] cannot be converted back: doing so would have to invent tokens.
     pub spec: Token,
     /// The `MethodDef` rid of the definition method whose CIL body is lowered under the
     /// instantiation.
+    ///
+    /// **SEVERAL BODIES SHARE ONE RID -- that is what monomorphization IS**, and it is exactly why
+    /// they cannot be rid-indexed: a second body written to one rid REPLACES the first, silently,
+    /// which is what `lamella_aot::build::BuildError::DuplicateMethodBody` refuses.
     pub rid: u32,
     /// The method's name.
     pub name: Box<str>,
@@ -969,13 +1365,163 @@ pub struct MonoBody {
     /// substitution on either side. Matching on the NAME alone would bind an overload to its
     /// sibling, which is the fabricated-nullary collision one more layer out.
     pub parameters: Vec<SigType>,
+    /// WHICH ASSEMBLY'S METADATA `rid` INDEXES. See [`BodyOwner`].
+    pub owner: BodyOwner,
+}
+
+/// Which assembly declares the definition whose CIL a [`MonoBody`] lowers.
+///
+/// # Why this is carried rather than re-derived
+///
+/// **THE COLLECTOR ALREADY KNOWS, AND ASKING AGAIN IS THIS LANE'S RECURRING BUG CLASS.** Deciding
+/// "which assembly is this rid in" a second time, at the emitter, means two answers that agree
+/// until one of them meets a case the other does not -- and the disagreement is silent, because
+/// `assembly.method(rid)` returns a perfectly good method from the WRONG assembly. So the owner is
+/// decided once, where the name was resolved, and handed out.
+///
+/// **AN ORDINAL IS ONLY MEANINGFUL AGAINST THE REFERENCE LIST THE PLAN WAS BUILT WITH.** It is
+/// the same ordinal a descriptor symbol, a statics region and a reference-owned `TypeHandle` all
+/// encode, and they are identity -- so a plan built against one reference order and consumed
+/// against another is a wrong bind, not a lookup failure. Build and consume with one list.
+/// **DELIBERATELY NOT `Default`.** The safe-looking default is `Own`, which is exactly the value
+/// a forgotten assignment would take and exactly the one that reads a rid out of the wrong
+/// assembly without complaint. Constructing a body must state where its CIL lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyOwner {
+    /// The assembly being built declares the definition: `rid` is its own `MethodDef` row.
+    Own,
+    /// A REFERENCED assembly declares it, at this ordinal in the reference list the plan was built
+    /// with; `rid` is a `MethodDef` row of THAT assembly.
+    Reference(u8),
+}
+
+/// One monomorphized body of a generic METHOD: the definition's CIL lowered under the type
+/// arguments a single call site supplied.
+///
+/// # Why this is not a [`MonoBody`] with an extra field
+///
+/// **THE TWO AXES ARE KEYED DIFFERENTLY, AND THAT IS THE ONLY REASON THE TYPE AXIS COULD NOT BE
+/// REUSED.** A type instantiation is found by `(spelling, method name, parameters)`, because a call
+/// site names it through a `MemberRef` parented by a `TypeSpec` and the overload has to be told from
+/// its siblings. A generic METHOD's call site names a `MethodSpec` row, and that row IS the
+/// `(method, arguments)` pair -- so the token is the key, exactly, with no spelling comparison and
+/// no overload question. Folding both into one struct would mean one field meaning two things
+/// depending on a second field, which is how a wrong bind gets written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonoMethodBody {
+    /// The function index this body occupies -- past `max_rid`, in the same space
+    /// [`MonoBody::index`] uses and `Inst::Call { callee }` already names.
+    pub index: u32,
+    /// The `MethodDef` rid of the generic definition whose CIL is lowered under `arguments`.
+    ///
+    /// **SEVERAL BODIES SHARE ONE RID**, exactly as on the type axis -- `Pick<int>` and
+    /// `Pick<string>` are one row and two bodies.
+    pub rid: u32,
+    /// The method's name.
+    pub name: Box<str>,
+    /// The call site's type arguments, closed, in `!!n` order -- what `!!0` substitutes to.
+    pub arguments: Vec<SigType>,
+    /// The full name of the type DECLARING this body.
+    ///
+    /// **A rid alone cannot say which type's dispatch this body belongs to, and the override
+    /// closure makes that a live question rather than a tidy one.** `Base::Tag<int>` and
+    /// `Derived::Tag<int>` are two bodies of one `(name, arity, parameters, arguments)` pair, told
+    /// apart only by this -- so a consumer placing them in vtable slots reads it, and
+    /// `dump-mono-bodies` prints it, because "which `MethodDef` did this bind to" is unanswerable
+    /// from a rid the reader would have to look up.
+    pub declaring: Box<str>,
+    /// The canonical spelling of the pair (`` Pick``1[System.Int32] ``), for diagnostics and for the
+    /// symbol an eventual cross-assembly identity would need. Not the lookup key: the token is.
+    pub instantiation: Box<str>,
+    /// WHICH ASSEMBLY'S METADATA `rid` INDEXES -- the same field [`MonoBody`] carries, for the same
+    /// reason. See [`BodyOwner`].
+    pub owner: BodyOwner,
 }
 
 /// Every monomorphized body a module emits, and the map from a CALL SITE to the index its body
 /// occupies.
+///
+/// # THE ORDERING IS FORCED, AND THIS TYPE IS WHAT MAKES IT EXPRESSIBLE
+///
+/// A reachability walk discovers a monomorphized body **the ordinary way, through `Inst::Call`** --
+/// which it can only do if the resolver already answered a call with that body's index. So the plan
+/// is built from METADATA ALONE, before anything is lowered: **collect, assign indices, THEN walk.**
+/// On the RISC-V object path a body the walk never reached is a `stub()` that RETURNS -- a silent
+/// wrong answer rather than a link error -- so getting this order wrong is not a build failure.
+///
+/// # What it deliberately does not cover yet
+///
+/// **A definition in a REFERENCED assembly is planned only when the references are supplied**
+/// ([`for_assembly_with_references`](Self::for_assembly_with_references)), and **no shipping build
+/// path supplies them**, so on every path that ships today `List<int>` is absent while `Box<int>`
+/// is present. Measured on a two-assembly fixture: the collector finds both
+/// `` Box`1[System.Int32] `` and `` Box`1[System.String] ``, the plan emits ZERO bodies, and
+/// `Main` refuses with `UnresolvedCall`. It never falls back to the definition's own body, which
+/// would be one body serving every instantiation.
+///
+/// **AND THE MISSING HALF IS EMISSION, NOT COLLECTION.** A planned reference-owned body carries
+/// a rid into the OWNER's tables and CIL full of the owner's tokens. Until that rebase exists, a
+/// consumer must read [`MonoBody::owner`] and decline rather than lower -- lowering it against the
+/// caller reads a real method from the wrong assembly and produces a plausible wrong answer.
+///
+/// **AND THE OBSTRUCTION IS NARROWER THAN "TWO TOKEN SPACES", WHICH IS WHAT MEASURING IT
+/// CORRECTED.** A [`MonoBody`] carries a `TypeSpec` token from the CALLER, and lowering a
+/// reference's body needs a resolver over the REFERENCE, in whose token space that token means
+/// nothing -- so the carrier, not the idea, is what is program-local. But a type ARGUMENT is only
+/// token-bearing when it is NAMED: `SigType::I4` and `SigType::String` carry no token at all, so
+/// `List<int>` could be planned by carrying its arguments as `SigType`s directly, while
+/// `List<MyProgramClass>` genuinely cannot without a name-keyed argument. **The cheap slice and the
+/// hard one are different problems, and calling both "the cross-assembly case" hides that.**
 #[derive(Debug, Clone, Default)]
 pub struct MonoPlan {
     bodies: Vec<MonoBody>,
+    method_bodies: Vec<MonoMethodBody>,
+    /// Every `MethodSpec` token this assembly declares that the plan LOWERS, paired with the index
+    /// of the body it binds to. Several tokens may share one index -- two rows naming the same
+    /// `(method, arguments)` pair are one body -- so this is a map and not a parallel array.
+    ///
+    /// A token ABSENT here is one the plan does not lower, and its call site then finds no binding
+    /// at all and refuses `UnresolvedCall`. **That absence is load-bearing and is why nothing here
+    /// falls back to the definition's own body**: binding a `MethodSpec` to the `MethodDef` it names
+    /// produces a program that links, runs, and answers with `!!0` never substituted.
+    ///
+    /// **A VIRTUAL PAIR IS NOT IN HERE.** See [`Self::virtual_spec_index`].
+    method_spec_index: Vec<(Token, u32)>,
+    /// The same map for a `MethodSpec` naming a VIRTUAL generic method: the token, and the index of
+    /// the body ITS OWN `MethodDef` contributes -- the base's declaration, which is the right answer
+    /// for a base receiver and the WRONG one for every derived receiver.
+    ///
+    /// **IT IS A SECOND FIELD RATHER THAN A FLAG, AND THAT IS THE WHOLE SAFETY PROPERTY.** A caller
+    /// reading [`Self::method_index_of`] gets exactly what it always got: a body it may bind
+    /// directly. Reaching a virtual pair takes [`Self::virtual_method_index_of`], which cannot be
+    /// arrived at by accident and whose every caller must have decided what to do about dispatch.
+    /// Folding the two into one map with a boolean beside it would make the safe read the DEFAULT
+    /// read, and a caller that forgot to consult the boolean would emit a direct call to the base --
+    /// a program that builds, links, runs and answers 5 where 42 is correct.
+    virtual_spec_index: Vec<(Token, u32)>,
+    /// Every distinct VIRTUAL generic pair the module's `MethodSpec` table spells, in table order.
+    ///
+    /// **A DISPATCH TABLE'S SLOTS ARE A PROGRAM-GLOBAL QUESTION AND THIS IS WHERE IT IS ANSWERED.**
+    /// Which argument lists a virtual generic method expands into must be the same for EVERY type in
+    /// a hierarchy: a `callvirt` through a `Base`-typed receiver computes its slot in `Base`'s
+    /// numbering and indexes `Derived`'s table, so a per-type answer -- "the arguments THIS type has
+    /// bodies for" -- would number the two differently the moment one of them failed to override.
+    virtual_pairs: Vec<MethodPair>,
+}
+
+/// What [`MonoPlan::method_axis`] produces: the generic-METHOD half of a plan, before it is joined
+/// with the type half.
+///
+/// It is a named struct rather than a tuple because the two `(Token, u32)` maps in it are the two
+/// halves of the virtual-generic guard, and they are the same TYPE -- so a tuple return puts the
+/// safe map and the unsafe one one position apart with nothing to catch a swap.
+struct MethodAxis {
+    method_bodies: Vec<MonoMethodBody>,
+    /// `MethodSpec` -> body, for pairs a caller may bind DIRECTLY.
+    index: Vec<(Token, u32)>,
+    /// `MethodSpec` -> the base's body, for pairs that must DISPATCH.
+    virtual_index: Vec<(Token, u32)>,
+    virtual_pairs: Vec<MethodPair>,
 }
 
 impl MonoPlan {
@@ -987,7 +1533,34 @@ impl MonoPlan {
     /// Every instantiation the assembly SPELLS (a `TypeSpec` row) that is closed and whose definition
     /// this assembly declares contributes one body per method the definition declares WITH A BODY --
     /// an abstract or extern method has no CIL to substitute into and no body to emit.
+    ///
+    /// **An UNDECODABLE method signature REFUSES the whole plan rather than skipping the method.**
+    /// A skipped method cannot be keyed, so a call to it would bind to a same-named sibling -- the
+    /// wrong-bind shape, not a missing-bind one. It is the same rule `decodable_params` follows.
     pub fn for_assembly(assembly: &Assembly<'_>, first_index: u32) -> Result<MonoPlan, Refusal> {
+        Self::for_assembly_with_references(assembly, &[], first_index)
+    }
+
+    /// [`for_assembly`](Self::for_assembly), with the REFERENCES available so an instantiation of a
+    /// definition declared next door can be planned too.
+    ///
+    /// **AN EMPTY REFERENCE LIST REPRODUCES `for_assembly` EXACTLY, AND THAT IS THE SAFETY
+    /// PROPERTY.** A `TypeRef` definition cannot resolve against no references, so every
+    /// instantiation whose definition is imported is declined by the same path as before -- which
+    /// is why the existing callers can keep calling `for_assembly` and emit byte-identical images
+    /// while this grows underneath them.
+    ///
+    /// **PLANNING A CROSS-ASSEMBLY BODY IS NOT THE SAME AS BEING ABLE TO EMIT ONE.** The
+    /// definition's CIL is in the OWNER's token space: every field, call and string literal in it
+    /// is an owner token, while the emitted body lands in the CALLER's function table. A consumer
+    /// that lowers one of these bodies with a resolver over the CALLER produces a body that links,
+    /// boots and answers wrong. [`MonoBody::owner`] is what a consumer must read before it lowers,
+    /// and no shipping build path passes references here yet.
+    pub fn for_assembly_with_references<'a>(
+        assembly: &Assembly<'a>,
+        references: &[&Assembly<'a>],
+        first_index: u32,
+    ) -> Result<MonoPlan, Refusal> {
         let mut bodies = Vec::new();
         let mut seen: BTreeSet<Box<str>> = BTreeSet::new();
         let mut next = first_index;
@@ -1010,10 +1583,26 @@ impl MonoPlan {
             let (SigType::Class(token) | SigType::ValueType(token)) = definition.as_ref() else {
                 continue;
             };
-            if token.table() != table::TYPE_DEF {
-                continue;
-            }
-            let Some(type_def) = assembly.type_def(token.row()) else {
+            let owned = *token;
+            let (owner, type_def) = if owned.table() == table::TYPE_DEF {
+                match assembly.type_def(owned.row()) {
+                    Some(type_def) => (BodyOwner::Own, type_def),
+                    None => continue,
+                }
+            } else if owned.table() == table::TYPE_REF {
+                let Some(name) = assembly.type_token_name(owned) else {
+                    continue;
+                };
+                match Assembly::find_in_references(references, name.namespace, name.name) {
+                    Some((ordinal, type_def)) => {
+                        let Ok(ordinal) = u8::try_from(ordinal) else {
+                            continue;
+                        };
+                        (BodyOwner::Reference(ordinal), type_def)
+                    }
+                    None => continue,
+                }
+            } else {
                 continue;
             };
             for method in type_def.methods() {
@@ -1034,11 +1623,504 @@ impl MonoPlan {
                     rid: method.rid(),
                     name: Box::from(method_name),
                     parameters,
+                    owner,
                 });
                 next += 1;
             }
         }
-        Ok(MonoPlan { bodies })
+        let axis = Self::method_axis(assembly, references, &mut next)?;
+        Ok(MonoPlan {
+            bodies,
+            method_bodies: axis.method_bodies,
+            method_spec_index: axis.index,
+            virtual_spec_index: axis.virtual_index,
+            virtual_pairs: axis.virtual_pairs,
+        })
+    }
+
+    /// The GENERIC METHOD half of the plan: one body per distinct `(MethodDef, call-site arguments)`
+    /// pair the assembly's `MethodSpec` rows name.
+    ///
+    /// **THE TABLE IS WALKED, NOT THE CALL SITES.** A `MethodSpec` row is a finite, already-closed
+    /// enumeration of every pair the assembly spells, so there is no closure to walk and no
+    /// growth-on-a-cycle criterion to re-derive here -- the type axis needs one because an
+    /// instantiation's own body can name a further instantiation, and a method's arguments cannot
+    /// grow that way. (The runtime tier reached the same conclusion for the same reason.)
+    ///
+    /// **A VIRTUAL GENERIC METHOD'S OWN PAIR IS PLANNED, AND ITS TOKEN IS PUT SOMEWHERE AN ORDINARY
+    /// BIND CANNOT REACH.** A `callvirt` at a `MethodSpec` names ONE `MethodDef` -- the declaration,
+    /// not the override -- so the body lowered from that token is the BASE's, and binding it is a
+    /// program that links, runs and calls the wrong method on a derived receiver. The runtime tier
+    /// measured exactly that: without the guard, zero violations and the answer 10 where 20 was
+    /// correct.
+    ///
+    /// **THE GUARD IS NOT "DO NOT PLAN IT", BECAUSE THAT FORBIDS THE CORRECT PROGRAM TOO** -- a base
+    /// receiver holding a base object has to reach that very body, so a rule stated that way carries
+    /// a correctness property and a scope boundary in one sentence with nothing separating them. It
+    /// is instead the pair of [`Self::virtual_spec_index`] and [`Program::close_over_overrides`]:
+    ///
+    /// * the base's body is planned, but its token lands in a map no ordinary caller reads;
+    /// * every OVERRIDE at the same arguments is planned too -- bodies named by nothing anywhere,
+    ///   which is the whole reason they must be computed rather than read off a table.
+    ///
+    /// A tier that reaches these through a dispatch table answers correctly; one that does not
+    /// reach them at all refuses, because the only token in play is in the map it does not read.
+    ///
+    /// Everything else declined here is declined by ABSENCE, which is safe on this tier: an
+    /// unplanned `MethodSpec` has no binding, and `resolve` then answers `UnresolvedCall` rather
+    /// than falling back to the open definition.
+    fn method_axis<'a>(
+        assembly: &Assembly<'a>,
+        references: &[&Assembly<'a>],
+        next: &mut u32,
+    ) -> Result<MethodAxis, Refusal> {
+        let mut method_bodies: Vec<MonoMethodBody> = Vec::new();
+        let mut index: Vec<(Token, u32)> = Vec::new();
+        let mut virtual_index: Vec<(Token, u32)> = Vec::new();
+        let mut virtual_pairs: Vec<MethodPair> = Vec::new();
+        let mut named: Vec<MethodPair> = Vec::new();
+        for row in 1..=assembly.tables().row_count(table::METHOD_SPEC) {
+            let spec = Token::new(table::METHOD_SPEC, row);
+            let (Some(method), Some(arguments)) = (
+                assembly.method_spec_method(spec),
+                assembly.method_spec_instantiation(spec),
+            ) else {
+                continue;
+            };
+            let (owner, rid, definition) = if method.table() == table::METHOD_DEF {
+                match assembly.method(method.row()) {
+                    Some(definition) => (BodyOwner::Own, method.row(), definition),
+                    None => continue,
+                }
+            } else if method.table() == table::MEMBER_REF {
+                match Self::imported_generic_method(assembly, references, method) {
+                    Some((ordinal, rid, definition)) => {
+                        (BodyOwner::Reference(ordinal), rid, definition)
+                    }
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            let mut spelled = Vec::new();
+            let mut open = false;
+            for argument in &arguments {
+                let arg = sig_to_type_arg(assembly, argument)?;
+                if !arg.is_closed() {
+                    open = true;
+                    break;
+                }
+                spelled.push(arg.name());
+            }
+            if open {
+                continue;
+            }
+            let name = definition
+                .name()
+                .ok_or_else(|| undecodable("generic method name"))?;
+            let declaring_assembly = Self::owning_assembly(assembly, references, owner);
+            let seed = Self::seed_pair(declaring_assembly, &definition, name, rid, &arguments);
+            if let Some(pair) = &seed {
+                named.push(pair.clone());
+                if definition.is_virtual() && !virtual_pairs.contains(pair) {
+                    virtual_pairs.push(pair.clone());
+                }
+            }
+            if definition.body().is_none() {
+                continue;
+            }
+            let instantiation = alloc::format!("{name}[{}]", spelled.join(",")).into_boxed_str();
+            let declaring = Self::declaring_name(declaring_assembly, rid);
+            let at = Self::plan_body(
+                &mut method_bodies,
+                next,
+                rid,
+                owner,
+                name,
+                declaring,
+                arguments,
+                instantiation,
+            );
+            if definition.is_virtual() {
+                virtual_index.push((spec, at));
+            } else {
+                index.push((spec, at));
+            }
+        }
+        Self::plan_overrides(assembly, references, &named, &mut method_bodies, next)?;
+        Ok(MethodAxis {
+            method_bodies,
+            index,
+            virtual_index,
+            virtual_pairs,
+        })
+    }
+
+    /// Adds one monomorphized method body, or returns the index of the one already planned.
+    ///
+    /// **DEDUPLICATED BY THE PAIR, NOT BY THE ROW.** Two `MethodSpec` rows naming the same method
+    /// with the same arguments are one body and both tokens map to it. The OWNER is part of the key,
+    /// because one rid in two assemblies is two methods.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_body(
+        method_bodies: &mut Vec<MonoMethodBody>,
+        next: &mut u32,
+        rid: u32,
+        owner: BodyOwner,
+        name: &str,
+        declaring: Box<str>,
+        arguments: Vec<SigType>,
+        instantiation: Box<str>,
+    ) -> u32 {
+        if let Some(body) = method_bodies
+            .iter()
+            .find(|body| body.rid == rid && body.owner == owner && body.arguments == arguments)
+        {
+            return body.index;
+        }
+        let at = *next;
+        *next += 1;
+        method_bodies.push(MonoMethodBody {
+            index: at,
+            rid,
+            name: Box::from(name),
+            arguments,
+            declaring,
+            instantiation,
+            owner,
+        });
+        at
+    }
+
+    /// The assembly a [`BodyOwner`] names, out of the program and its references.
+    ///
+    /// One place, because the ordinal's meaning -- `Reference(0)` is `references[0]`, and the
+    /// program is not in that list at all -- is the kind of off-by-one that reads a real method out
+    /// of the wrong assembly rather than failing.
+    fn owning_assembly<'x, 'a>(
+        assembly: &'x Assembly<'a>,
+        references: &'x [&'x Assembly<'a>],
+        owner: BodyOwner,
+    ) -> &'x Assembly<'a> {
+        match owner {
+            BodyOwner::Own => assembly,
+            BodyOwner::Reference(ordinal) => references
+                .get(ordinal as usize)
+                .copied()
+                .unwrap_or(assembly),
+        }
+    }
+
+    /// The full name of the type declaring the method at `rid`, or an empty string when the row has
+    /// no owner this assembly can name.
+    ///
+    /// **THE OWNER IS FOUND BY ASKING THE TYPES, NOT BY RESOLVING A NAME.** II.22.37 puts the
+    /// method list on the TypeDef side as a RANGE, so there is no reverse index and a scan is the
+    /// honest form. Going the other way -- reading the method's declaring-type NAME and looking it
+    /// up -- would pass through a flat `(namespace, name)` pair, which II.22.38 makes ambiguous for
+    /// a nested type: `Widget.Nested` and `Gadget.Nested` both read `('', 'Nested')`. A wrong owner
+    /// here does not fail; it files a body under another type's name.
+    fn declaring_name(assembly: &Assembly<'_>, rid: u32) -> Box<str> {
+        assembly
+            .type_defs()
+            .find(|type_def| type_def.methods().any(|method| method.rid() == rid))
+            .and_then(|type_def| type_def_full_name(assembly, type_def.token()))
+            .unwrap_or_default()
+            .into_boxed_str()
+    }
+
+    /// One `MethodSpec` pair as the override closure's input, or `None` when the definition's
+    /// signature does not decode.
+    ///
+    /// **AN UNDECODABLE SIGNATURE YIELDS NO SEED RATHER THAN A FABRICATED ONE**, for
+    /// `decodable_params`' reason one level out: [`Program::close_over_overrides`] matches on the
+    /// declared parameter list, so a seed carrying an empty one would select as "the override" any
+    /// same-named nullary method in the hierarchy.
+    fn seed_pair(
+        assembly: &Assembly<'_>,
+        definition: &Method<'_>,
+        name: &str,
+        rid: u32,
+        arguments: &[SigType],
+    ) -> Option<MethodPair> {
+        let signature = definition.signature()?;
+        let declaring = Self::declaring_name(assembly, rid);
+        if declaring.is_empty() {
+            return None;
+        }
+        Some(MethodPair {
+            declaring,
+            method: Box::from(name),
+            parameters: signature.parameters,
+            arity: signature.generic_param_count,
+            arguments: arguments.to_vec(),
+        })
+    }
+
+    /// Plans a body for every OVERRIDE of a named pair -- [`Program::close_over_overrides`]'s
+    /// additions, resolved back to the `MethodDef` each one names.
+    ///
+    /// # Why this is a consumer and not a second closure
+    ///
+    /// The override rule has ONE implementation, in this crate, and both tiers consume it. A second
+    /// walk written beside it would let the two tiers' answers about which method overrides which
+    /// drift apart silently, and neither tier's tests can see the other's.
+    ///
+    /// # What the closure's stated boundary means for this caller
+    ///
+    /// Two things it does NOT cover, and neither may be papered over here:
+    ///
+    /// * A definition in an assembly the [`Program`] was not given is not walked. The `Program` is
+    ///   built over the module and its references, which is every assembly this build can lower
+    ///   from, so an unwalked definition is one whose body could not be emitted either way.
+    /// * An EXPLICIT interface implementation is named through `MethodImpl` under a mangled name
+    ///   and is a third LOOKUP. It is absent from the additions, so a dispatch built on them must
+    ///   refuse that shape rather than read this set as covering it.
+    ///
+    /// # The additions carry no token, which is what makes them safe to add
+    ///
+    /// Nothing anywhere names `Derived::Tag<int>` -- no `MethodSpec` row, no `MemberRef` -- so no
+    /// entry is made in `method_spec_index` and no call site can bind to one by token. A dispatch
+    /// arm reaches these bodies through a table or not at all.
+    fn plan_overrides<'a>(
+        assembly: &Assembly<'a>,
+        references: &[&Assembly<'a>],
+        named: &[MethodPair],
+        method_bodies: &mut Vec<MonoMethodBody>,
+        next: &mut u32,
+    ) -> Result<(), Refusal> {
+        if named.is_empty() {
+            return Ok(());
+        }
+        let assemblies: Vec<Assembly<'a>> = core::iter::once(*assembly)
+            .chain(references.iter().map(|reference| **reference))
+            .collect();
+        let program = Program::new(&assemblies);
+        for addition in program.close_over_overrides(named) {
+            let Some((owner, rid, definition)) =
+                Self::override_definition(assembly, references, &addition)
+            else {
+                continue;
+            };
+            if definition.body().is_none() {
+                continue;
+            }
+            let mut spelled = Vec::new();
+            for argument in &addition.arguments {
+                spelled.push(sig_to_type_arg(assembly, argument)?.name());
+            }
+            let instantiation =
+                alloc::format!("{}[{}]", addition.method, spelled.join(",")).into_boxed_str();
+            Self::plan_body(
+                method_bodies,
+                next,
+                rid,
+                owner,
+                &addition.method,
+                addition.declaring.clone(),
+                addition.arguments.clone(),
+                instantiation,
+            );
+        }
+        Ok(())
+    }
+
+    /// The `MethodDef` an override pair names: where it lives, its rid there, and the method.
+    ///
+    /// The match is the closure's own -- name, generic arity and declared parameters, compared
+    /// structurally -- because this is re-finding what the closure already found. `MethodPair`
+    /// carries the type NAME rather than a row, so the row has to be recovered, and recovering it
+    /// by a DIFFERENT rule is how the two sides come to disagree about which method was meant.
+    ///
+    /// The program is searched before its references, which is [`Program::new`]'s own first-wins
+    /// precedence rather than a second one written here.
+    fn override_definition<'a>(
+        assembly: &Assembly<'a>,
+        references: &[&Assembly<'a>],
+        pair: &MethodPair,
+    ) -> Option<(BodyOwner, u32, Method<'a>)> {
+        let candidates = core::iter::once(assembly).chain(references.iter().copied());
+        for (ordinal, candidate) in candidates.enumerate() {
+            for type_def in candidate.type_defs() {
+                if type_def_full_name(candidate, type_def.token()).as_deref()
+                    != Some(pair.declaring.as_ref())
+                {
+                    continue;
+                }
+                for method in type_def.methods() {
+                    if method.name() != Some(pair.method.as_ref()) {
+                        continue;
+                    }
+                    let Some(signature) = method.signature() else {
+                        continue;
+                    };
+                    if signature.generic_param_count != pair.arity
+                        || signature.parameters != pair.parameters
+                    {
+                        continue;
+                    }
+                    let owner = match ordinal {
+                        0 => BodyOwner::Own,
+                        _ => BodyOwner::Reference(u8::try_from(ordinal - 1).ok()?),
+                    };
+                    return Some((owner, method.rid(), method));
+                }
+            }
+        }
+        None
+    }
+
+    /// The generic method a cross-assembly `MethodSpec` names: its owner's ordinal, its `MethodDef`
+    /// rid THERE, and the method itself -- or `None` when it does not resolve to exactly one.
+    ///
+    /// # Why the match is by shape and not by signature
+    ///
+    /// A `MemberRef`'s blob carries the DEFINITION's signature spelled in the CALLER's token space,
+    /// so its `Class`/`ValueType` tokens mean nothing in the owner's tables and the two sides cannot
+    /// be compared type by type. What CAN be compared is the shape both sides agree on without
+    /// resolving a token: the name, the number of type parameters the method declares (II.23.2.1 --
+    /// **binding-significant**, `M<T>()` and `M<T,U>()` are different methods) and the number of
+    /// parameters.
+    ///
+    /// **AMBIGUITY IS A REFUSAL, NOT A FIRST-MATCH.** Two overloads sharing that shape differ only
+    /// in parameter TYPES, which is exactly what cannot be compared here -- so binding to the first
+    /// would be a coin flip that links, runs and calls the wrong method. Declining leaves the call
+    /// site unbound, which fails loud.
+    ///
+    /// **BOTH HALVES ARE RED-PROVED BY ONE PERTURBATION, AND THE FIXTURE WAS BUILT FOR IT.**
+    /// `genmethlib` declares an `Echo<T>(T, T)` that nothing calls. Drop the shape comparison and
+    /// the two `Echo` candidates make this refuse; the call site then finds no binding and the build
+    /// fails LOUD, with every other pair in the gate unmoved. Without that sibling the comparison
+    /// could be deleted with every row still green.
+    fn imported_generic_method<'a>(
+        assembly: &Assembly<'a>,
+        references: &[&Assembly<'a>],
+        method: Token,
+    ) -> Option<(u8, u32, Method<'a>)> {
+        let member = assembly.member_ref(method.row())?;
+        let name = member.name()?;
+        let signature = member.method_signature()?;
+        let parent = assembly.type_token_name(member.parent())?;
+        let (ordinal, type_def) =
+            Assembly::find_in_references(references, parent.namespace, parent.name)?;
+        let ordinal = u8::try_from(ordinal).ok()?;
+        let mut found = None;
+        for candidate in type_def.methods() {
+            if candidate.name() != Some(name) {
+                continue;
+            }
+            let Some(candidate_signature) = candidate.signature() else {
+                continue;
+            };
+            if candidate_signature.generic_param_count != signature.generic_param_count
+                || candidate_signature.parameters.len() != signature.parameters.len()
+                || candidate_signature.has_this != signature.has_this
+            {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some((ordinal, candidate.rid(), candidate));
+        }
+        found
+    }
+
+    /// The function index the call site at `spec` (a `MethodSpec` token) binds to, or `None` when
+    /// this plan does not lower that pair -- in which case the call site refuses rather than binding
+    /// to the open definition.
+    #[must_use]
+    pub fn method_index_of(&self, spec: Token) -> Option<u32> {
+        self.method_spec_index
+            .iter()
+            .find(|(token, _)| *token == spec)
+            .map(|(_, index)| *index)
+    }
+
+    /// The index of the body the `MethodSpec` at `spec` names when that pair is VIRTUAL -- the
+    /// BASE's declaration, which is the right body only for a receiver of the declaring type itself.
+    ///
+    /// **A CALLER THAT BINDS THIS DIRECTLY FROM A `callvirt` HAS WRITTEN THE DEFECT THE WHOLE
+    /// SPLIT EXISTS TO PREVENT**, and it is a quiet one: the program builds, links, runs and answers
+    /// with the base's implementation. Use it for a non-virtual `call` -- `base.Tag<int>(x)`, where
+    /// binding exactly what the token names IS the semantics -- and otherwise only to type the call,
+    /// with [`Self::virtual_method_instantiations`] supplying the dispatch.
+    #[must_use]
+    pub fn virtual_method_index_of(&self, spec: Token) -> Option<u32> {
+        self.virtual_spec_index
+            .iter()
+            .find(|(token, _)| *token == spec)
+            .map(|(_, index)| *index)
+    }
+
+    /// The distinct argument lists a virtual generic method is called at anywhere in the module, in
+    /// `MethodSpec` table order -- one dispatch slot each, for every type in its hierarchy.
+    ///
+    /// **PROGRAM-GLOBAL BY CONSTRUCTION, WHICH IS THE PROPERTY A VTABLE NEEDS.** The order and the
+    /// membership come from the module's own table, so `Base` and `Derived` expand one declaration
+    /// into the same slots in the same order -- and a `callvirt` computing its slot in `Base`'s
+    /// numbering indexes the right entry of `Derived`'s table. Answering "the arguments this type
+    /// has a body for" instead would renumber the moment a type in the middle failed to override.
+    ///
+    /// The key is the declaration's identity as ECMA-335 II.9.9 defines it for overriding -- name,
+    /// generic ARITY and declared parameters -- and not the declaring type, because the whole point
+    /// is that several types share these slots.
+    ///
+    /// **THE PRICE IS PAID IN SLOTS AND NEVER IN CORRECTNESS.** Two UNRELATED hierarchies declaring
+    /// the same signature share this list, so each expands into the union of both their argument
+    /// lists and the surplus slots hold the open definition's rid -- a `stub()` nothing dispatches
+    /// to, since a call site can only name an argument list that seeded the list in the first place.
+    /// Narrowing the key to the hierarchy would save those slots and reintroduce exactly the
+    /// disagreement the paragraph above describes, which is a bad trade at ~58 B a slot.
+    #[must_use]
+    pub fn virtual_method_instantiations(
+        &self,
+        method: &str,
+        arity: u32,
+        parameters: &[SigType],
+    ) -> Vec<&[SigType]> {
+        let mut found: Vec<&[SigType]> = Vec::new();
+        for pair in &self.virtual_pairs {
+            if pair.method.as_ref() != method
+                || pair.arity != arity
+                || pair.parameters != parameters
+            {
+                continue;
+            }
+            if !found.iter().any(|seen| *seen == pair.arguments.as_slice()) {
+                found.push(&pair.arguments);
+            }
+        }
+        found
+    }
+
+    /// The index of the body `declaring` contributes for `method` at `arguments`, or `None` when
+    /// this type has none -- an abstract declaration, or a type that does not override.
+    ///
+    /// This is the mapping a dispatch slot is filled from, and it is keyed by the DECLARING TYPE
+    /// precisely where [`Self::virtual_method_instantiations`] is not: which slots exist is a
+    /// property of the program, which body sits in one is a property of the type.
+    #[must_use]
+    pub fn virtual_method_body(
+        &self,
+        declaring: &str,
+        method: &str,
+        arguments: &[SigType],
+    ) -> Option<u32> {
+        self.method_bodies
+            .iter()
+            .find(|body| {
+                body.declaring.as_ref() == declaring
+                    && body.name.as_ref() == method
+                    && body.arguments == arguments
+            })
+            .map(|body| body.index)
+    }
+
+    /// Every generic-METHOD body to emit, in index order.
+    #[must_use]
+    pub fn method_bodies(&self) -> &[MonoMethodBody] {
+        &self.method_bodies
     }
 
     /// The function index a call on `instantiation` naming `name` with `parameters` binds to, or
@@ -1077,17 +2159,17 @@ impl MonoPlan {
         out
     }
 
-    /// How many bodies this plan emits.
+    /// How many bodies this plan emits, both axes.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.bodies.len()
+        self.bodies.len() + self.method_bodies.len()
     }
 
     /// Whether this plan emits nothing -- which is the case for every non-generic program, and is
     /// what keeps the ordinary path untouched.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.bodies.is_empty()
+        self.bodies.is_empty() && self.method_bodies.is_empty()
     }
 }
 
@@ -1115,9 +2197,15 @@ mod tests {
             rid: 4,
             name: name.to_owned().into_boxed_str(),
             parameters,
+            owner: BodyOwner::Own,
         }
     }
 
+    /// THE CONTROL IS THE PAIR, NOT EITHER ROW. Two instantiations of ONE definition share a
+    /// method name, a parameter signature AND a MethodDef rid -- everything except the type
+    /// argument. A lookup keyed on anything less than the instantiation's canonical spelling
+    /// answers the same index for both, which is one body serving two types: the wrong GC trace map
+    /// for one of them, and no size anywhere can see it.
     #[test]
     fn two_instantiations_of_one_definition_bind_to_different_bodies() {
         let plan = MonoPlan {
@@ -1125,6 +2213,7 @@ mod tests {
                 body(11, "Box`1[System.Int32]", "Get", Vec::new()),
                 body(12, "Box`1[System.String]", "Get", Vec::new()),
             ],
+            ..MonoPlan::default()
         };
         assert_eq!(plan.index_of("Box`1[System.Int32]", "Get", &[]), Some(11));
         assert_eq!(plan.index_of("Box`1[System.String]", "Get", &[]), Some(12));
@@ -1146,6 +2235,7 @@ mod tests {
                     alloc::vec![SigType::Var(0), SigType::I4]
                 ),
             ],
+            ..MonoPlan::default()
         };
         assert_eq!(
             plan.index_of("Box`1[System.Int32]", "Set", &[SigType::Var(0)]),
@@ -1258,6 +2348,16 @@ mod tests {
         }
     }
 
+    /// THE FREEZE ITEM, AS A CONTROL RATHER THAN AN EXERCISE. The collapsed spelling and the
+    /// by-name spelling are separated here: under a shared reference marker the two names below
+    /// would be EQUAL, and `o is IList<string>` would answer true for a type implementing only
+    /// `IList<Foo>`. A test that only checked `IList<int>` against `IList<string>` would pass under
+    /// BOTH candidates, since a value argument is not what the shortcut collapses.
+    ///
+    /// **The half that asserts the INTERFACE TAG consumes this spelling lives in `lamella-aot`**
+    /// (`resolver::tests::an_instantiations_interface_tag_takes_the_canonical_spelling`), because
+    /// `interface_method_tag` is that crate's. The claim spans two crates, so it takes two tests,
+    /// and each names the other.
     #[test]
     fn instantiations_are_distinct_interfaces() {
         let of_string = TypeArg::Instance {
@@ -1284,6 +2384,19 @@ mod tests {
         assert!(!"System.Collections.ArrayList".contains('['));
     }
 
+    /// THE SPELLING RULE'S FINGERPRINT, PINNED. It is a wire contract between a baked image and a
+    /// separately-loaded PE: one character of disagreement is two types where there should be one.
+    ///
+    /// **A moved value is not automatically a failure -- it is a prompt.** If the rule changed on
+    /// purpose, update the literal AND say so where consumers can see it, because the artifacts that
+    /// carry the old spelling do not update themselves.
+    ///
+    /// **THE LITERAL WAS READ OFF THIS IMPLEMENTATION, SO IT PROVES NOTHING ON ITS OWN** -- a
+    /// value pinned to whatever the code already did is the shape this project rules against. What
+    /// makes it meaningful is the pair of tests either side of it, and they are independent of it:
+    /// [`spelling_matches_the_dotnet_oracle`] checks the rule against an EXTERNAL authority (a
+    /// running .NET 8), and [`the_fingerprint_moves_for_every_clause_of_the_rule`] checks that this
+    /// number can SEE each clause. The literal only carries that verified state forward in time.
     #[test]
     fn the_spelling_rule_fingerprint_is_pinned() {
         assert_eq!(
@@ -1293,6 +2406,13 @@ mod tests {
         );
     }
 
+    /// A PINNED CONSTANT PROVES NOTHING UNLESS IT MOVES WHEN THE RULE DOES, and the failure mode
+    /// of a fingerprint is that it is blind to the clause someone actually changes. So each clause
+    /// is perturbed here and the fingerprint must move for every one.
+    ///
+    /// This is the control the pin above cannot be. A corpus that happened to omit, say, the array
+    /// rank would leave `[,,]` free to become `[3]` with the pin still green -- which is exactly how
+    /// a contract stops being one.
     #[test]
     fn the_fingerprint_moves_for_every_clause_of_the_rule() {
         let base = spelling_rule_fingerprint();
@@ -1364,6 +2484,12 @@ mod tests {
     /// A `MethodSpec`'s arguments are CONSECUTIVE in one blob, so the decoder must stop each type at
     /// its own end and not run into the next. This module depends on that and no longer implements
     /// it, so the pin is on the CONTRACT rather than on the code.
+    ///
+    /// **`C<int>` followed by `string` is the row that matters.** A `GenericInst` is the only
+    /// shape whose length depends on a COUNT read from inside the blob, so a decoder that guessed
+    /// would land mid-signature and every argument after it would be wrong -- a plausible wrong walk
+    /// rather than an error. A blob of ONE argument cannot catch that; the second argument is what
+    /// proves the first one ended where it should.
     #[test]
     fn a_method_specs_arguments_do_not_run_into_each_other() {
         let token = 13u8;

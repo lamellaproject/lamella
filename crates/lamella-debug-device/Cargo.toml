@@ -27,6 +27,12 @@ lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
 lamella-stlink = { path = "../lamella-stlink", optional = true }
 lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32", optional = true }
 
+# OPTIONAL, AND THE OPTIONALITY IS THE POINT. `DeviceBackend` must not know which probes or which
+# parts exist -- that is the property the widening to `TargetAccess` bought, and a plain dependency
+# here would reintroduce the coupling it removed. A `[[bin]]` cannot use a dev-dependency, so the
+# SERVER's probe-and-part selection lives behind this feature instead: `cargo build -p
+# lamella-debug-device` with default features has neither crate anywhere in its graph, which is a
+# checkable statement rather than a promise in a comment.
 [features]
 default = []
 ## Lets `device-dap-server` drive an ST-Link and program STM32 flash, so an ST board with an
@@ -34,4 +40,8 @@ default = []
 st = ["dep:lamella-stlink", "dep:lamella-cmsis-dap-stm32"]
 
 [dev-dependencies]
+# THE POINT OF WIDENING `DeviceBackend` TO `TargetAccess`, ASSERTED RATHER THAN CLAIMED: an
+# ST-Link must be able to drive a native C# debug session. It is a dev-dependency because the
+# backend must NOT know which probes exist -- a normal dependency here would be the coupling this
+# change removed, reintroduced to prove it was removed.
 lamella-stlink = { path = "../lamella-stlink" }

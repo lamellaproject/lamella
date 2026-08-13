@@ -1,4 +1,4 @@
-//! Lowering the AST to our bytecode.
+//! Lowering the AST to Lamella's Python bytecode.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use lamella_py_bytecode as bc;
 
-use crate::ast::{self, Assign, BoolOp, CompClause, ExceptHandler, Expr, FuncDef, ModuleAst, Stmt};
+use crate::ast::{self, Assign, BoolOp, CompClause, ExceptHandler, Expr, FuncDef, ModuleAst, Stmt, StmtKind};
 
 /// A failure while lowering the AST to bytecode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,9 +58,16 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
     if max_helper.is_some() {
         func_rets.insert(String::from(MAX_LIST_INT_HELPER), bc::StaticType::Int);
     }
+    {
+        let refs: Vec<&Stmt> = ast.body.iter().collect();
+        let module_bound = bound_names(&[], &refs);
+        if !module_bound.contains("enumerate") && !module_bound.contains(ENUMERATE_IS_BUILTIN) {
+            func_rets.insert(String::from(ENUMERATE_IS_BUILTIN), bc::StaticType::Dynamic);
+        }
+    }
     for stmt in stmts() {
-        match stmt {
-            Stmt::FuncDef(func) => {
+        match &stmt.kind {
+            StmtKind::FuncDef(func) => {
                 let seen = defs_seen.entry(func.name.clone()).or_insert(0);
                 *seen += 1;
                 if *seen == def_counts[&func.name] {
@@ -70,23 +77,23 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
                 }
                 top_level.push(stmt);
             }
-            Stmt::ClassDef { name, body, .. } => {
+            StmtKind::ClassDef { name, body, .. } => {
                 compile_class_method_bodies(name, body, &mut functions, &[], &func_rets)?;
                 top_level.push(stmt);
             }
-            Stmt::Decorated { inner, .. } => {
-                match &**inner {
-                    Stmt::FuncDef(func) => {
+            StmtKind::Decorated { inner, .. } => {
+                match &inner.kind {
+                    StmtKind::FuncDef(func) => {
                         *defs_seen.entry(func.name.clone()).or_insert(0) += 1;
                     }
-                    Stmt::ClassDef { name, body, .. } => {
+                    StmtKind::ClassDef { name, body, .. } => {
                         compile_class_method_bodies(name, body, &mut functions, &[], &func_rets)?;
                     }
                     _ => {}
                 }
                 top_level.push(stmt);
             }
-            other => top_level.push(other),
+            _ => top_level.push(stmt),
         }
     }
     let (body, body_lambdas) =
@@ -94,7 +101,7 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
     functions.extend(body_lambdas);
     Ok(bc::Module {
         name: String::from(name),
-        functions,
+        functions: functions.into(),
         body,
     })
 }
@@ -102,6 +109,16 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
 /// The synthesized `sum(list[int])` reducer's name. A plain identifier (no `$`) so it symbolizes
 /// cleanly on the AOT lane, dunder-prefixed and specific enough that a real program is not expected to
 /// bind it -- and if one does, the injection is skipped (see [`synthesize_sum_helper`]).
+/// The marker in `func_rets` that says `enumerate` is the builtin everywhere in this module, so
+/// `for i, v in enumerate(seq)` may be desugared to a counted loop.
+///
+/// A NAME rather than a bool because `func_rets` is the only thing both halves of the decision can
+/// see: the emission reads `self.func_rets`, the type inference is a free function that is handed
+/// the same map, and a scope where a nested name could capture the binding gets a zeroed map -- so
+/// carrying the fact here makes "is this the builtin" one answer instead of two. Exactly the trick
+/// [`SUM_LIST_INT_HELPER`] plays for the same reason.
+const ENUMERATE_IS_BUILTIN: &str = "__enumerate_is_builtin";
+
 const SUM_LIST_INT_HELPER: &str = "__sum_list_int";
 
 /// The synthesized `min(list[int])` / `max(list[int])` reducers, named like the `sum` one.
@@ -119,6 +136,16 @@ const MAX_EMPTY_MESSAGE: &str = "max() iterable argument is empty";
 /// [`Compiler::emit_int_pow`]). A literal beyond this stays the dynamic `**` -- the result overflows
 /// `i32` for any base >= 2 well before here anyway, so the cap only bounds emitted code size.
 const POW_UNROLL_MAX: i64 = 64;
+
+/// A statement this compiler SYNTHESIZED rather than parsed -- the typed `sum` / `min` / `max`
+/// reducers and the desugared comprehension bodies.
+///
+/// Line 0 is not a placeholder for a line nobody looked up: these statements have no source, so
+/// there is no line to carry. A traceback that named one would be pointing at a line the user never
+/// wrote, which is worse than naming none.
+fn synthesized(kind: StmtKind) -> Stmt {
+    Stmt::new(0, kind)
+}
 
 /// If a module calls the BUILTIN `sum` (unshadowed at module scope), synthesize a reducer
 ///
@@ -214,13 +241,13 @@ fn build_extremum_reducer_def(builtin: &str) -> Stmt {
         index: Box::new(at),
     };
     let assign = |target: &str, value: Expr| {
-        Stmt::Assign(Assign {
+        synthesized(StmtKind::Assign(Assign {
             target: String::from(target),
             annotation: None,
             value: Some(value),
-        })
+        }))
     };
-    Stmt::FuncDef(FuncDef {
+    synthesized(StmtKind::FuncDef(FuncDef {
         name: String::from(helper),
         params: vec![ast::ParamDef {
             name: String::from("xs"),
@@ -237,25 +264,25 @@ fn build_extremum_reducer_def(builtin: &str) -> Stmt {
         ret: Some(name("int")),
         body: vec![
             assign("n", call1("len", name("xs"))),
-            Stmt::If {
+            synthesized(StmtKind::If {
                 test: Expr::Compare {
                     op: ast::CmpOp::Eq,
                     lhs: Box::new(name("n")),
                     rhs: Box::new(Expr::Int(0)),
                 },
-                body: vec![Stmt::Raise {
+                body: vec![synthesized(StmtKind::Raise {
                     exc: Some(Expr::Call {
                         func: Box::new(name("ValueError")),
                         args: vec![Expr::Str(message.into())],
                         keywords: Vec::new(),
                     }),
                     cause: None,
-                }],
+                })],
                 orelse: Vec::new(),
-            },
+            }),
             assign("m", index("xs", Expr::Int(0))),
             assign("i", Expr::Int(1)),
-            Stmt::While {
+            synthesized(StmtKind::While {
                 test: Expr::Compare {
                     op: ast::CmpOp::Lt,
                     lhs: Box::new(name("i")),
@@ -263,7 +290,7 @@ fn build_extremum_reducer_def(builtin: &str) -> Stmt {
                 },
                 body: vec![
                     assign("v", index("xs", name("i"))),
-                    Stmt::If {
+                    synthesized(StmtKind::If {
                         test: Expr::Compare {
                             op: if is_min { ast::CmpOp::Lt } else { ast::CmpOp::Gt },
                             lhs: Box::new(name("v")),
@@ -271,7 +298,7 @@ fn build_extremum_reducer_def(builtin: &str) -> Stmt {
                         },
                         body: vec![assign("m", name("v"))],
                         orelse: Vec::new(),
-                    },
+                    }),
                     assign(
                         "i",
                         Expr::Binary {
@@ -282,11 +309,11 @@ fn build_extremum_reducer_def(builtin: &str) -> Stmt {
                     ),
                 ],
                 orelse: Vec::new(),
-            },
-            Stmt::Return(Some(name("m"))),
+            }),
+            synthesized(StmtKind::Return(Some(name("m")))),
         ],
         is_async: false,
-    })
+    }))
 }
 
 /// Whether `func(args)` is a ONE-argument `min` / `max` over a fixed int list -- and if so, which
@@ -333,7 +360,7 @@ fn extremum_helper_for(
 /// stay int, and the whole reducer lowers to the AOT counted-reduce.
 fn build_sum_reducer_def() -> Stmt {
     let name = |n: &str| Expr::Name(String::from(n));
-    Stmt::FuncDef(FuncDef {
+    synthesized(StmtKind::FuncDef(FuncDef {
         name: String::from(SUM_LIST_INT_HELPER),
         params: vec![ast::ParamDef {
             name: String::from("xs"),
@@ -349,15 +376,15 @@ fn build_sum_reducer_def() -> Stmt {
         }],
         ret: Some(name("int")),
         body: vec![
-            Stmt::Assign(Assign {
+            synthesized(StmtKind::Assign(Assign {
                 target: String::from("s"),
                 annotation: None,
                 value: Some(Expr::Int(0)),
-            }),
-            Stmt::ForIter {
+            })),
+            synthesized(StmtKind::ForIter {
                 target: String::from("v"),
                 iterable: name("xs"),
-                body: vec![Stmt::Assign(Assign {
+                body: vec![synthesized(StmtKind::Assign(Assign {
                     target: String::from("s"),
                     annotation: None,
                     value: Some(Expr::Binary {
@@ -365,13 +392,13 @@ fn build_sum_reducer_def() -> Stmt {
                         lhs: Box::new(name("s")),
                         rhs: Box::new(name("v")),
                     }),
-                })],
+                }))],
                 orelse: Vec::new(),
-            },
-            Stmt::Return(Some(name("s"))),
+            }),
+            synthesized(StmtKind::Return(Some(name("s")))),
         ],
         is_async: false,
-    })
+    }))
 }
 
 /// Whether the code object being compiled is a function body or the module's
@@ -417,10 +444,10 @@ fn compile_function(
 
 /// The simple method name of a class-body member (a `def` or a decorated `def`), else `None`.
 fn class_member_method_name(member: &Stmt) -> Option<&str> {
-    match member {
-        Stmt::FuncDef(m) => Some(&m.name),
-        Stmt::Decorated { inner, .. } => match &**inner {
-            Stmt::FuncDef(m) => Some(&m.name),
+    match &member.kind {
+        StmtKind::FuncDef(m) => Some(&m.name),
+        StmtKind::Decorated { inner, .. } => match &inner.kind {
+            StmtKind::FuncDef(m) => Some(&m.name),
             _ => None,
         },
         _ => None,
@@ -485,10 +512,10 @@ fn compile_class_method_bodies(
 ) -> Result<(), CompileError> {
     let names = method_qualified_names(class_name, body);
     for (i, member) in body.iter().enumerate() {
-        let method = match member {
-            Stmt::FuncDef(m) => Some(m),
-            Stmt::Decorated { inner, .. } => match &**inner {
-                Stmt::FuncDef(m) => Some(m),
+        let method = match &member.kind {
+            StmtKind::FuncDef(m) => Some(m),
+            StmtKind::Decorated { inner, .. } => match &inner.kind {
+                StmtKind::FuncDef(m) => Some(m),
                 _ => None,
             },
             _ => None,
@@ -524,10 +551,10 @@ struct Outer<'a> {
 fn module_func_return_types(body: &[Stmt]) -> BTreeMap<String, bc::StaticType> {
     let mut rets = BTreeMap::new();
     for stmt in body {
-        let def = match stmt {
-            Stmt::FuncDef(func) => Some(func),
-            Stmt::Decorated { inner, .. } => match &**inner {
-                Stmt::FuncDef(_) => None,
+        let def = match &stmt.kind {
+            StmtKind::FuncDef(func) => Some(func),
+            StmtKind::Decorated { inner, .. } => match &inner.kind {
+                StmtKind::FuncDef(_) => None,
                 _ => None,
             },
             _ => None,
@@ -547,10 +574,10 @@ fn module_func_return_types(body: &[Stmt]) -> BTreeMap<String, bc::StaticType> {
 fn direct_def_counts<'a>(body: impl IntoIterator<Item = &'a Stmt>) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for stmt in body {
-        let def = match stmt {
-            Stmt::FuncDef(func) => Some(func),
-            Stmt::Decorated { inner, .. } => match &**inner {
-                Stmt::FuncDef(func) => Some(func),
+        let def = match &stmt.kind {
+            StmtKind::FuncDef(func) => Some(func),
+            StmtKind::Decorated { inner, .. } => match &inner.kind {
+                StmtKind::FuncDef(func) => Some(func),
                 _ => None,
             },
             _ => None,
@@ -567,14 +594,57 @@ fn direct_def_counts<'a>(body: impl IntoIterator<Item = &'a Stmt>) -> BTreeMap<S
 /// reads the class attribute rather than a shadowed enclosing/module name.
 fn class_body_bound_names(body: &[Stmt]) -> BTreeSet<String> {
     let mut bound = BTreeSet::new();
+    collect_class_body_bound(body, &mut bound);
+    bound
+}
+
+/// The names a class body binds, INCLUDING those bound inside a nested statement -- a `while` or an
+/// `if` in a class body binds members exactly as a top-level assignment does.
+///
+/// It does NOT descend into a nested `def` or `class`. Those are their own scopes, and a name they
+/// bind is theirs rather than this body's; treating one as a class-local would make a read of it
+/// resolve namespace-first in the wrong scope. That is CPython's rule and it is why the recursion
+/// stops where it does.
+fn collect_class_body_bound(body: &[Stmt], bound: &mut BTreeSet<String>) {
     for member in body {
-        if let Stmt::Assign(a) = member {
-            bound.insert(a.target.clone());
-        } else if let Some(method) = class_member_method_name(member) {
-            bound.insert(String::from(method));
+        match &member.kind {
+            StmtKind::Assign(a) => {
+                bound.insert(a.target.clone());
+            }
+            StmtKind::MultiAssign { targets, .. } | StmtKind::TupleAssign { targets, .. } => {
+                for target in targets {
+                    if let ast::AssignTarget::Name(name) = target {
+                        bound.insert(name.clone());
+                    }
+                }
+            }
+            StmtKind::ClassDef { name, .. } => {
+                bound.insert(name.clone());
+            }
+            StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+                collect_class_body_bound(body, bound);
+                collect_class_body_bound(orelse, bound);
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                collect_class_body_bound(body, bound);
+                for handler in handlers {
+                    collect_class_body_bound(&handler.body, bound);
+                }
+                collect_class_body_bound(orelse, bound);
+                collect_class_body_bound(finalbody, bound);
+            }
+            _ => {
+                if let Some(method) = class_member_method_name(member) {
+                    bound.insert(String::from(method));
+                }
+            }
         }
     }
-    bound
 }
 
 /// A body's docstring: the string of a leading bare-string statement, else `None`.
@@ -594,8 +664,8 @@ fn class_body_bound_names(body: &[Stmt]) -> BTreeSet<String> {
 /// string in this position that is not a docstring at all -- an f-string, say -- is untouched, exactly
 /// as it is untouched in CPython.
 fn docstring_of(first: Option<&Stmt>) -> Result<Option<&str>, CompileError> {
-    match first {
-        Some(Stmt::Expr(Expr::Str(text))) => match text.as_str() {
+    match first.map(|s| &s.kind) {
+        Some(StmtKind::Expr(Expr::Str(text))) => match text.as_str() {
             Some(text) => Ok(Some(text)),
             None => Err(error(
                 "a docstring cannot contain a surrogate character (U+D800 to U+DFFF), because a \
@@ -724,6 +794,7 @@ fn compile_code_object(
 
     let mut compiler = Compiler {
         scope,
+        current_line: 0,
         asm: Assembler::new(),
         consts: Vec::new(),
         names: Default::default(),
@@ -768,7 +839,13 @@ fn compile_code_object(
     compiler.asm.emit(bc::Op::LoadConst(none));
     compiler.asm.emit(bc::Op::Return);
 
-    let (ops, cache_count, exc_table) = compiler.asm.finish();
+    let Assembled {
+        ops,
+        cache_count,
+        exc_table,
+        wide_operands,
+        line_table,
+    } = compiler.asm.finish();
     let co_params: Vec<bc::Param> = params
         .iter()
         .map(|p| bc::Param {
@@ -801,6 +878,8 @@ fn compile_code_object(
         names: compiler.names.iter().collect(),
         ops,
         cache_count,
+        wide_operands,
+        line_table,
         exc_table,
     };
     Ok((code_object, compiler.hoisted))
@@ -816,8 +895,8 @@ fn collect_locals(body: &[&Stmt], names: &mut Vec<String>, types: &mut Vec<bc::S
 }
 
 fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc::StaticType>) {
-    match stmt {
-        Stmt::Assign(Assign {
+    match &stmt.kind {
+        StmtKind::Assign(Assign {
             target, annotation, ..
         }) => {
             let ty = resolve_type(annotation);
@@ -833,7 +912,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 }
             }
         }
-        Stmt::MultiAssign { targets, .. } => {
+        StmtKind::MultiAssign { targets, .. } => {
             for target in targets {
                 let mut bound = Vec::new();
                 target.collect_names(&mut bound);
@@ -842,7 +921,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 }
             }
         }
-        Stmt::TupleAssign { targets, .. } => {
+        StmtKind::TupleAssign { targets, .. } => {
             for target in targets {
                 let mut bound = Vec::new();
                 target.collect_names(&mut bound);
@@ -851,18 +930,18 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 }
             }
         }
-        Stmt::Import { modules } => {
+        StmtKind::Import { modules } => {
             for (module, alias) in modules {
                 add_dynamic_local(ast::import_bound_name(module, alias), names, types);
             }
         }
-        Stmt::ImportFrom { names: imports, .. } => {
+        StmtKind::ImportFrom { names: imports, .. } => {
             for (_, bound) in imports {
                 add_dynamic_local(bound, names, types);
             }
         }
-        Stmt::ImportStar { .. } => {}
-        Stmt::If { body, orelse, .. } => {
+        StmtKind::ImportStar { .. } => {}
+        StmtKind::If { body, orelse, .. } => {
             for s in body {
                 collect_locals_stmt(s, names, types);
             }
@@ -870,12 +949,12 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::While { body, orelse, .. } => {
+        StmtKind::While { body, orelse, .. } => {
             for s in body.iter().chain(orelse) {
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::For {
+        StmtKind::For {
             target,
             body,
             orelse,
@@ -889,13 +968,13 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::ForIter {
+        StmtKind::ForIter {
             target,
             body,
             orelse,
             ..
         }
-        | Stmt::AsyncFor {
+        | StmtKind::AsyncFor {
             target,
             body,
             orelse,
@@ -909,7 +988,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::Try {
+        StmtKind::Try {
             body,
             handlers,
             orelse,
@@ -932,12 +1011,12 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 }
             }
         }
-        Stmt::With {
+        StmtKind::With {
             optional_name,
             body,
             ..
         }
-        | Stmt::AsyncWith {
+        | StmtKind::AsyncWith {
             optional_name,
             body,
             ..
@@ -949,19 +1028,19 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::ClassDef { name, .. } => {
+        StmtKind::ClassDef { name, .. } => {
             if !names.iter().any(|n| n == name) {
                 names.push(name.clone());
                 types.push(bc::StaticType::Dynamic);
             }
         }
-        Stmt::FuncDef(func) => {
+        StmtKind::FuncDef(func) => {
             add_dynamic_local(&func.name, names, types);
         }
-        Stmt::Decorated { decorators, inner } => {
-            match &**inner {
-                Stmt::FuncDef(f) => add_dynamic_local(&f.name, names, types),
-                Stmt::ClassDef { name, .. } => add_dynamic_local(name, names, types),
+        StmtKind::Decorated { decorators, inner } => {
+            match &inner.kind {
+                StmtKind::FuncDef(f) => add_dynamic_local(&f.name, names, types),
+                StmtKind::ClassDef { name, .. } => add_dynamic_local(name, names, types),
                 _ => {}
             }
             collect_locals_stmt(inner, names, types);
@@ -969,17 +1048,17 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_comp_targets_expr(d, names, types);
             }
         }
-        Stmt::Return(_)
-        | Stmt::Expr(_)
-        | Stmt::Delete(_)
-        | Stmt::Nonlocal(_)
-        | Stmt::Global(_)
-        | Stmt::Break
-        | Stmt::Continue
-        | Stmt::Pass
-        | Stmt::SetItem { .. }
-        | Stmt::SetAttr { .. }
-        | Stmt::Raise { .. } => {}
+        StmtKind::Return(_)
+        | StmtKind::Expr(_)
+        | StmtKind::Delete(_)
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Global(_)
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass
+        | StmtKind::SetItem { .. }
+        | StmtKind::SetAttr { .. }
+        | StmtKind::Raise { .. } => {}
     }
 }
 
@@ -1016,17 +1095,17 @@ fn collect_comp_targets_stmt(
     names: &mut Vec<String>,
     types: &mut Vec<bc::StaticType>,
 ) {
-    match stmt {
-        Stmt::Assign(a) => {
+    match &stmt.kind {
+        StmtKind::Assign(a) => {
             if let Some(v) = &a.value {
                 collect_comp_targets_expr(v, names, types);
             }
         }
-        Stmt::MultiAssign { value, .. } | Stmt::TupleAssign { value, .. } => {
+        StmtKind::MultiAssign { value, .. } | StmtKind::TupleAssign { value, .. } => {
             collect_comp_targets_expr(value, names, types)
         }
-        Stmt::Return(Some(e)) | Stmt::Expr(e) => collect_comp_targets_expr(e, names, types),
-        Stmt::SetItem {
+        StmtKind::Return(Some(e)) | StmtKind::Expr(e) => collect_comp_targets_expr(e, names, types),
+        StmtKind::SetItem {
             container,
             index,
             value,
@@ -1036,11 +1115,11 @@ fn collect_comp_targets_stmt(
             collect_comp_targets_expr(index, names, types);
             collect_comp_targets_expr(value, names, types);
         }
-        Stmt::SetAttr { obj, value, .. } => {
+        StmtKind::SetAttr { obj, value, .. } => {
             collect_comp_targets_expr(obj, names, types);
             collect_comp_targets_expr(value, names, types);
         }
-        Stmt::Raise { exc, cause } => {
+        StmtKind::Raise { exc, cause } => {
             if let Some(e) = exc {
                 collect_comp_targets_expr(e, names, types);
             }
@@ -1048,13 +1127,13 @@ fn collect_comp_targets_stmt(
                 collect_comp_targets_expr(c, names, types);
             }
         }
-        Stmt::If { test, body, orelse } | Stmt::While { test, body, orelse } => {
+        StmtKind::If { test, body, orelse } | StmtKind::While { test, body, orelse } => {
             collect_comp_targets_expr(test, names, types);
             for s in body.iter().chain(orelse) {
                 collect_comp_targets_stmt(s, names, types);
             }
         }
-        Stmt::For {
+        StmtKind::For {
             start, stop, body, orelse, ..
         } => {
             collect_comp_targets_expr(start, names, types);
@@ -1063,10 +1142,10 @@ fn collect_comp_targets_stmt(
                 collect_comp_targets_stmt(s, names, types);
             }
         }
-        Stmt::ForIter {
+        StmtKind::ForIter {
             iterable, body, orelse, ..
         }
-        | Stmt::AsyncFor {
+        | StmtKind::AsyncFor {
             iterable, body, orelse, ..
         } => {
             collect_comp_targets_expr(iterable, names, types);
@@ -1074,7 +1153,7 @@ fn collect_comp_targets_stmt(
                 collect_comp_targets_stmt(s, names, types);
             }
         }
-        Stmt::Try {
+        StmtKind::Try {
             body, handlers, orelse, finalbody,
         } => {
             for s in body.iter().chain(orelse).chain(finalbody) {
@@ -1086,29 +1165,29 @@ fn collect_comp_targets_stmt(
                 }
             }
         }
-        Stmt::With { context, body, .. } | Stmt::AsyncWith { context, body, .. } => {
+        StmtKind::With { context, body, .. } | StmtKind::AsyncWith { context, body, .. } => {
             collect_comp_targets_expr(context, names, types);
             for s in body {
                 collect_comp_targets_stmt(s, names, types);
             }
         }
-        Stmt::Decorated { decorators, .. } => {
+        StmtKind::Decorated { decorators, .. } => {
             for d in decorators {
                 collect_comp_targets_expr(d, names, types);
             }
         }
-        Stmt::Return(None)
-        | Stmt::FuncDef(_)
-        | Stmt::ClassDef { .. }
-        | Stmt::Import { .. }
-        | Stmt::ImportFrom { .. }
-        | Stmt::ImportStar { .. }
-        | Stmt::Nonlocal(_)
-        | Stmt::Global(_)
-        | Stmt::Break
-        | Stmt::Continue
-        | Stmt::Pass
-        | Stmt::Delete(_) => {}
+        StmtKind::Return(None)
+        | StmtKind::FuncDef(_)
+        | StmtKind::ClassDef { .. }
+        | StmtKind::Import { .. }
+        | StmtKind::ImportFrom { .. }
+        | StmtKind::ImportStar { .. }
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Global(_)
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass
+        | StmtKind::Delete(_) => {}
     }
 }
 
@@ -1128,24 +1207,28 @@ fn call_arg_expr(arg: &ast::CallArg) -> &Expr {
 /// iterating the `.0` parameter -- the pre-evaluated, pre-iter'd outermost iterable. A multi-name
 /// clause target unpacks through a temp. Shared by the emitter and the free-variable analysis so
 /// both see the same synthetic scope.
-fn build_genexpr_body(element: &Expr, clauses: &[CompClause]) -> Vec<Stmt> {
+fn build_genexpr_body(element: &Expr, clauses: &[CompClause], line: u32) -> Vec<Stmt> {
     wrap_comp_clauses(
-        vec![Stmt::Expr(Expr::Yield(Some(Box::new(element.clone()))))],
+        vec![Stmt::new(
+            line,
+            StmtKind::Expr(Expr::Yield(Some(Box::new(element.clone())))),
+        )],
         clauses,
+        line,
     )
 }
 
 /// Wrap `innermost` in a comprehension's nested for/if clause chain (shared by every comprehension
 /// kind's hidden function). The OUTERMOST clause iterates the `.0` parameter -- the eagerly-iter'd
 /// first iterable the call site passes in; inner clauses iterate their own expressions.
-fn wrap_comp_clauses(mut body: Vec<Stmt>, clauses: &[CompClause]) -> Vec<Stmt> {
+fn wrap_comp_clauses(mut body: Vec<Stmt>, clauses: &[CompClause], line: u32) -> Vec<Stmt> {
     for (i, clause) in clauses.iter().enumerate().rev() {
         for cond in clause.conditions.iter().rev() {
-            body = vec![Stmt::If {
+            body = vec![Stmt::new(line, StmtKind::If {
                 test: cond.clone(),
                 body,
                 orelse: Vec::new(),
-            }];
+            })];
         }
         let iterable = if i == 0 {
             Expr::Name(String::from(".0"))
@@ -1153,30 +1236,32 @@ fn wrap_comp_clauses(mut body: Vec<Stmt>, clauses: &[CompClause]) -> Vec<Stmt> {
             clause.iterable.clone()
         };
         body = if clause.targets.len() == 1 {
-            vec![Stmt::ForIter {
+            vec![Stmt::new(line, StmtKind::ForIter {
                 target: clause.targets[0].clone(),
                 iterable,
                 body,
                 orelse: Vec::new(),
-            }]
+            })]
         } else {
             let loopvar = format!(".g{i}");
-            let mut inner = vec![Stmt::TupleAssign {
-                targets: clause
-                    .targets
-                    .iter()
-                    .map(|t| ast::AssignTarget::Name(t.clone()))
-                    .collect(),
-                star: None,
-                value: Expr::Name(loopvar.clone()),
-            }];
+            let mut inner = vec![Stmt::new(
+                line,
+                StmtKind::TupleAssign {
+                    targets: clause
+                        .targets
+                        .iter()
+                        .map(|t| ast::AssignTarget::Name(t.clone()))
+                        .collect(),
+                    value: Expr::Name(loopvar.clone()),
+                },
+            )];
             inner.extend(body);
-            vec![Stmt::ForIter {
+            vec![Stmt::new(line, StmtKind::ForIter {
                 target: loopvar,
                 iterable,
                 body: inner,
                 orelse: Vec::new(),
-            }]
+            })]
         };
     }
     body
@@ -1200,40 +1285,46 @@ fn genexpr_param() -> ast::ParamDef {
 /// source identifier can, so it never collides with a loop target or a captured name. An empty
 /// `[]` / set / `{}` display and the `.append`/`.add`/`[k]=v` on that fresh container are all
 /// shadow-proof -- they never touch the `list`/`set`/`dict` builtins (which a user may have rebound).
-fn build_container_comp_body(kind: CompKind, clauses: &[CompClause]) -> Vec<Stmt> {
+fn build_container_comp_body(kind: CompKind, clauses: &[CompClause], line: u32) -> Vec<Stmt> {
     let acc = String::from(".acc");
     let (init, add): (Expr, Stmt) = match kind {
         CompKind::List(e) => (
             Expr::List(Vec::new()),
-            method_call_stmt(&acc, "append", vec![e.clone()]),
+            method_call_stmt(&acc, "append", vec![e.clone()], line),
         ),
         CompKind::Set(e) => (
             Expr::Set(Vec::new()),
-            method_call_stmt(&acc, "add", vec![e.clone()]),
+            method_call_stmt(&acc, "add", vec![e.clone()], line),
         ),
         CompKind::Dict(k, v) => (
             Expr::Dict(Vec::new()),
-            Stmt::SetItem {
-                container: Expr::Name(acc.clone()),
-                index: k.clone(),
-                value: v.clone(),
-                op: None,
-            },
+            Stmt::new(
+                line,
+                StmtKind::SetItem {
+                    container: Expr::Name(acc.clone()),
+                    index: k.clone(),
+                    value: v.clone(),
+                    op: None,
+                },
+            ),
         ),
     };
-    let mut body = vec![Stmt::Assign(Assign {
-        target: acc.clone(),
-        annotation: None,
-        value: Some(init),
-    })];
-    body.extend(wrap_comp_clauses(vec![add], clauses));
-    body.push(Stmt::Return(Some(Expr::Name(acc))));
+    let mut body = vec![Stmt::new(
+        line,
+        StmtKind::Assign(Assign {
+            target: acc.clone(),
+            annotation: None,
+            value: Some(init),
+        }),
+    )];
+    body.extend(wrap_comp_clauses(vec![add], clauses, line));
+    body.push(Stmt::new(line, StmtKind::Return(Some(Expr::Name(acc)))));
     body
 }
 
 /// A statement `obj.method(args...)` (result discarded) -- the accumulator append/add.
-fn method_call_stmt(obj: &str, method: &str, args: Vec<Expr>) -> Stmt {
-    Stmt::Expr(Expr::Call {
+fn method_call_stmt(obj: &str, method: &str, args: Vec<Expr>, line: u32) -> Stmt {
+    Stmt::new(line, StmtKind::Expr(Expr::Call {
         func: Box::new(Expr::Attribute {
             value: Box::new(Expr::Name(String::from(obj))),
             attr: String::from(method),
@@ -1241,7 +1332,7 @@ fn method_call_stmt(obj: &str, method: &str, args: Vec<Expr>) -> Stmt {
         args,
         keywords: Vec::new(),
     })
-}
+)}
 
 /// Whether a comprehension may compile to its own function scope (so its loop targets do not leak
 /// into the enclosing scope). It may UNLESS a walrus (`:=`) appears in a part that would move into
@@ -1274,7 +1365,7 @@ fn comp_free_uses(main_exprs: &[&Expr], clauses: &[CompClause]) -> BTreeSet<Stri
     } else {
         Expr::Tuple(main_exprs.iter().map(|e| (*e).clone()).collect())
     };
-    let body = build_genexpr_body(&element, clauses);
+    let body = build_genexpr_body(&element, clauses, 0);
     let refs: Vec<&Stmt> = body.iter().collect();
     func_free_uses(&[genexpr_param()], &refs)
 }
@@ -1431,25 +1522,25 @@ fn collect_nonlocals(body: &[&Stmt], out: &mut BTreeSet<String>) {
 }
 
 fn collect_nonlocals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
-    match stmt {
-        Stmt::Nonlocal(names) => {
+    match &stmt.kind {
+        StmtKind::Nonlocal(names) => {
             for n in names {
                 out.insert(n.clone());
             }
         }
-        Stmt::If { body, orelse, .. } | Stmt::While { body, orelse, .. } => {
+        StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
             for s in body.iter().chain(orelse.iter()) {
                 collect_nonlocals_stmt(s, out);
             }
         }
-        Stmt::For { body, orelse, .. }
-        | Stmt::ForIter { body, orelse, .. }
-        | Stmt::AsyncFor { body, orelse, .. } => {
+        StmtKind::For { body, orelse, .. }
+        | StmtKind::ForIter { body, orelse, .. }
+        | StmtKind::AsyncFor { body, orelse, .. } => {
             for s in body.iter().chain(orelse.iter()) {
                 collect_nonlocals_stmt(s, out);
             }
         }
-        Stmt::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody } => {
             for s in body.iter().chain(orelse.iter()).chain(finalbody.iter()) {
                 collect_nonlocals_stmt(s, out);
             }
@@ -1459,7 +1550,7 @@ fn collect_nonlocals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Stmt::With { body, .. } | Stmt::AsyncWith { body, .. } => {
+        StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
             for s in body {
                 collect_nonlocals_stmt(s, out);
             }
@@ -1477,25 +1568,25 @@ fn collect_globals(body: &[&Stmt], out: &mut BTreeSet<String>) {
 }
 
 fn collect_globals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
-    match stmt {
-        Stmt::Global(names) => {
+    match &stmt.kind {
+        StmtKind::Global(names) => {
             for n in names {
                 out.insert(n.clone());
             }
         }
-        Stmt::If { body, orelse, .. } | Stmt::While { body, orelse, .. } => {
+        StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
             for s in body.iter().chain(orelse.iter()) {
                 collect_globals_stmt(s, out);
             }
         }
-        Stmt::For { body, orelse, .. }
-        | Stmt::ForIter { body, orelse, .. }
-        | Stmt::AsyncFor { body, orelse, .. } => {
+        StmtKind::For { body, orelse, .. }
+        | StmtKind::ForIter { body, orelse, .. }
+        | StmtKind::AsyncFor { body, orelse, .. } => {
             for s in body.iter().chain(orelse.iter()) {
                 collect_globals_stmt(s, out);
             }
         }
-        Stmt::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody } => {
             for s in body.iter().chain(orelse.iter()).chain(finalbody.iter()) {
                 collect_globals_stmt(s, out);
             }
@@ -1505,7 +1596,7 @@ fn collect_globals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        Stmt::With { body, .. } | Stmt::AsyncWith { body, .. } => {
+        StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
             for s in body {
                 collect_globals_stmt(s, out);
             }
@@ -1533,8 +1624,8 @@ fn func_free_uses(params: &[ast::ParamDef], body: &[&Stmt]) -> BTreeSet<String> 
 /// scopes (their free variables bubble into `child_free`; their parameter defaults are uses of
 /// THIS scope).
 fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
-    match stmt {
-        Stmt::FuncDef(f) => {
+    match &stmt.kind {
+        StmtKind::FuncDef(f) => {
             let body: Vec<&Stmt> = f.body.iter().collect();
             u.child_free.extend(func_free_uses(&f.params, &body));
             for p in &f.params {
@@ -1543,72 +1634,72 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
                 }
             }
         }
-        Stmt::Decorated { decorators, inner } => {
+        StmtKind::Decorated { decorators, inner } => {
             for d in decorators {
                 walk_expr_uses(d, u);
             }
             walk_stmt_uses(inner, u);
         }
-        Stmt::Return(value) => {
+        StmtKind::Return(value) => {
             if let Some(e) = value {
                 walk_expr_uses(e, u);
             }
         }
-        Stmt::Assign(a) => {
+        StmtKind::Assign(a) => {
             if let Some(v) = &a.value {
                 walk_expr_uses(v, u);
             }
         }
-        Stmt::MultiAssign { targets, value } => {
+        StmtKind::MultiAssign { targets, value } => {
             walk_expr_uses(value, u);
             for t in targets {
                 walk_target_uses(t, u);
             }
         }
-        Stmt::TupleAssign { targets, value, .. } => {
+        StmtKind::TupleAssign { targets, value, .. } => {
             walk_expr_uses(value, u);
             for t in targets {
                 walk_target_uses(t, u);
             }
         }
-        Stmt::SetItem { container, index, value, .. } => {
+        StmtKind::SetItem { container, index, value, .. } => {
             walk_expr_uses(container, u);
             walk_expr_uses(index, u);
             walk_expr_uses(value, u);
         }
-        Stmt::SetAttr { obj, value, .. } => {
+        StmtKind::SetAttr { obj, value, .. } => {
             walk_expr_uses(obj, u);
             walk_expr_uses(value, u);
         }
-        Stmt::Expr(e) => walk_expr_uses(e, u),
-        Stmt::Delete(targets) => {
+        StmtKind::Expr(e) => walk_expr_uses(e, u),
+        StmtKind::Delete(targets) => {
             for t in targets {
                 walk_expr_uses(t, u);
             }
         }
-        Stmt::If { test, body, orelse } => {
+        StmtKind::If { test, body, orelse } => {
             walk_expr_uses(test, u);
             walk_body_uses(body, u);
             walk_body_uses(orelse, u);
         }
-        Stmt::While { test, body, orelse } => {
+        StmtKind::While { test, body, orelse } => {
             walk_expr_uses(test, u);
             walk_body_uses(body, u);
             walk_body_uses(orelse, u);
         }
-        Stmt::For { start, stop, body, orelse, .. } => {
+        StmtKind::For { start, stop, body, orelse, .. } => {
             walk_expr_uses(start, u);
             walk_expr_uses(stop, u);
             walk_body_uses(body, u);
             walk_body_uses(orelse, u);
         }
-        Stmt::ForIter { iterable, body, orelse, .. }
-        | Stmt::AsyncFor { iterable, body, orelse, .. } => {
+        StmtKind::ForIter { iterable, body, orelse, .. }
+        | StmtKind::AsyncFor { iterable, body, orelse, .. } => {
             walk_expr_uses(iterable, u);
             walk_body_uses(body, u);
             walk_body_uses(orelse, u);
         }
-        Stmt::Raise { exc, cause } => {
+        StmtKind::Raise { exc, cause } => {
             if let Some(e) = exc {
                 walk_expr_uses(e, u);
             }
@@ -1616,7 +1707,7 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
                 walk_expr_uses(c, u);
             }
         }
-        Stmt::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody } => {
             walk_body_uses(body, u);
             for h in handlers {
                 if let Some(t) = &h.typ {
@@ -1627,24 +1718,24 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
             walk_body_uses(orelse, u);
             walk_body_uses(finalbody, u);
         }
-        Stmt::With { context, body, .. } | Stmt::AsyncWith { context, body, .. } => {
+        StmtKind::With { context, body, .. } | StmtKind::AsyncWith { context, body, .. } => {
             walk_expr_uses(context, u);
             walk_body_uses(body, u);
         }
-        Stmt::ClassDef { bases, body, .. } => {
+        StmtKind::ClassDef { bases, body, .. } => {
             for b in bases {
                 walk_expr_uses(b, u);
             }
             walk_body_uses(body, u);
         }
-        Stmt::Import { .. }
-        | Stmt::ImportFrom { .. }
-        | Stmt::ImportStar { .. }
-        | Stmt::Nonlocal(_)
-        | Stmt::Global(_)
-        | Stmt::Break
-        | Stmt::Continue
-        | Stmt::Pass => {}
+        StmtKind::Import { .. }
+        | StmtKind::ImportFrom { .. }
+        | StmtKind::ImportStar { .. }
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Global(_)
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass => {}
     }
 }
 
@@ -1670,6 +1761,7 @@ fn walk_target_uses(target: &ast::AssignTarget, u: &mut Uses) {
                 walk_target_uses(t, u);
             }
         }
+        ast::AssignTarget::Starred(inner) => walk_target_uses(inner, u),
     }
 }
 
@@ -1685,7 +1777,7 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
         Expr::Int(_) | Expr::Float(_) | Expr::Imaginary(_) | Expr::BigInt(_) | Expr::Bytes(_)
         | Expr::Str(_) | Expr::Bool(_) | Expr::None => {}
         Expr::Lambda { params, body } => {
-            let ret = Stmt::Return(Some((**body).clone()));
+            let ret = synthesized(StmtKind::Return(Some((**body).clone())));
             let refs: Vec<&Stmt> = vec![&ret];
             u.child_free.extend(func_free_uses(params, &refs));
             for p in params {
@@ -1764,7 +1856,7 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
             if let Some(first) = clauses.first() {
                 walk_expr_uses(&first.iterable, u);
             }
-            let gen_body = build_genexpr_body(element, clauses);
+            let gen_body = build_genexpr_body(element, clauses, 0);
             let refs: Vec<&Stmt> = gen_body.iter().collect();
             u.child_free
                 .extend(func_free_uses(&[genexpr_param()], &refs));
@@ -1819,8 +1911,9 @@ fn infer_local_types(
         *p = true;
     }
     let mut rhss: Vec<Vec<Expr>> = vec![Vec::new(); names.len()];
+    let enumerate_is_builtin = func_rets.contains_key(ENUMERATE_IS_BUILTIN);
     for stmt in body {
-        gather_assignments_stmt(stmt, names, &mut pinned, &mut rhss);
+        gather_assignments_stmt(stmt, names, &mut pinned, &mut rhss, enumerate_is_builtin);
     }
     settle_numeric_types(names, &pinned, &rhss, types, func_rets);
     if settle_growable_lists(body, names, &mut pinned, &rhss, types, func_rets) {
@@ -1925,8 +2018,8 @@ fn settle_growable_lists(
 /// then stays fixed and the lowering refuses the `append`, so the function falls to the interpreter
 /// rather than growing a list the analysis never saw.
 fn gather_appends_stmt(stmt: &Stmt, names: &[String], appends: &mut [Vec<Expr>]) {
-    match stmt {
-        Stmt::Expr(Expr::Call { func, args, keywords }) if keywords.is_empty() && args.len() == 1 => {
+    match &stmt.kind {
+        StmtKind::Expr(Expr::Call { func, args, keywords }) if keywords.is_empty() && args.len() == 1 => {
             if let Expr::Attribute { value, attr } = &**func {
                 if attr == "append" {
                     if let Expr::Name(name) = &**value {
@@ -1937,29 +2030,29 @@ fn gather_appends_stmt(stmt: &Stmt, names: &[String], appends: &mut [Vec<Expr>])
                 }
             }
         }
-        Stmt::If { body, orelse, .. } => {
+        StmtKind::If { body, orelse, .. } => {
             for s in body.iter().chain(orelse) {
                 gather_appends_stmt(s, names, appends);
             }
         }
-        Stmt::While { body, orelse, .. } => {
+        StmtKind::While { body, orelse, .. } => {
             for s in body.iter().chain(orelse) {
                 gather_appends_stmt(s, names, appends);
             }
         }
-        Stmt::For { body, orelse, .. }
-        | Stmt::ForIter { body, orelse, .. }
-        | Stmt::AsyncFor { body, orelse, .. } => {
+        StmtKind::For { body, orelse, .. }
+        | StmtKind::ForIter { body, orelse, .. }
+        | StmtKind::AsyncFor { body, orelse, .. } => {
             for s in body.iter().chain(orelse) {
                 gather_appends_stmt(s, names, appends);
             }
         }
-        Stmt::With { body, .. } | Stmt::AsyncWith { body, .. } => {
+        StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
             for s in body {
                 gather_appends_stmt(s, names, appends);
             }
         }
-        Stmt::Try { body, handlers, orelse, finalbody } => {
+        StmtKind::Try { body, handlers, orelse, finalbody } => {
             for s in body.iter().chain(orelse).chain(finalbody) {
                 gather_appends_stmt(s, names, appends);
             }
@@ -2065,9 +2158,10 @@ fn gather_assignments_stmt(
     names: &[String],
     pinned: &mut [bool],
     rhss: &mut [Vec<Expr>],
+    enumerate_is_builtin: bool,
 ) {
-    match stmt {
-        Stmt::Assign(Assign {
+    match &stmt.kind {
+        StmtKind::Assign(Assign {
             target,
             annotation,
             value,
@@ -2081,7 +2175,7 @@ fn gather_assignments_stmt(
                 }
             }
         }
-        Stmt::MultiAssign { targets, value } => {
+        StmtKind::MultiAssign { targets, value } => {
             for target in targets {
                 let mut bound = Vec::new();
                 target.collect_names(&mut bound);
@@ -2092,11 +2186,10 @@ fn gather_assignments_stmt(
                 }
             }
         }
-        Stmt::TupleAssign { targets, star, value } => {
-            let all_names = star.is_none()
-                && targets
-                    .iter()
-                    .all(|t| matches!(t, ast::AssignTarget::Name(_)));
+        StmtKind::TupleAssign { targets, value } => {
+            let all_names = targets
+                .iter()
+                .all(|t| matches!(t, ast::AssignTarget::Name(_)));
             let decomposed: Option<Vec<Expr>> = if !all_names {
                 None
             } else if let Expr::Tuple(elems) = value {
@@ -2137,20 +2230,20 @@ fn gather_assignments_stmt(
                 }
             }
         }
-        Stmt::If { body, orelse, .. } => {
+        StmtKind::If { body, orelse, .. } => {
             for s in body {
-                gather_assignments_stmt(s, names, pinned, rhss);
+                gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
             for s in orelse {
-                gather_assignments_stmt(s, names, pinned, rhss);
+                gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
         }
-        Stmt::While { body, orelse, .. } => {
+        StmtKind::While { body, orelse, .. } => {
             for s in body.iter().chain(orelse) {
-                gather_assignments_stmt(s, names, pinned, rhss);
+                gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
         }
-        Stmt::For {
+        StmtKind::For {
             target,
             body,
             orelse,
@@ -2160,17 +2253,17 @@ fn gather_assignments_stmt(
                 pinned[slot] = true;
             }
             for s in body.iter().chain(orelse) {
-                gather_assignments_stmt(s, names, pinned, rhss);
+                gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
         }
-        Stmt::ForIter {
+        StmtKind::ForIter {
             target,
             iterable,
             body,
             orelse,
             ..
         }
-        | Stmt::AsyncFor {
+        | StmtKind::AsyncFor {
             target,
             iterable,
             body,
@@ -2183,11 +2276,36 @@ fn gather_assignments_stmt(
                     index: Box::new(Expr::Int(0)),
                 });
             }
-            for s in body.iter().chain(orelse) {
-                gather_assignments_stmt(s, names, pinned, rhss);
+            let mut described_head = false;
+            if enumerate_is_builtin
+                && let Expr::Call { func, args, keywords } = iterable
+                && matches!(&**func, Expr::Name(n) if n == "enumerate")
+                && keywords.is_empty()
+                && args.len() == 1
+                && !names.iter().any(|n| n == "enumerate")
+                && let Some(head) = body.first()
+                && let StmtKind::TupleAssign { targets, value: Expr::Name(unpacked) } = &head.kind
+                && unpacked == target
+                && let [ast::AssignTarget::Name(index_name), ast::AssignTarget::Name(elem_name)] =
+                    targets.as_slice()
+            {
+                if let Some(slot) = names.iter().position(|n| n == index_name) {
+                    rhss[slot].push(Expr::Int(0));
+                }
+                if let Some(slot) = names.iter().position(|n| n == elem_name) {
+                    rhss[slot].push(Expr::Subscript {
+                        value: Box::new(args[0].clone()),
+                        index: Box::new(Expr::Int(0)),
+                    });
+                }
+                described_head = true;
+            }
+            let walked = if described_head { &body[1..] } else { &body[..] };
+            for s in walked.iter().chain(orelse) {
+                gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
         }
-        Stmt::Try {
+        StmtKind::Try {
             body,
             handlers,
             orelse,
@@ -2201,20 +2319,20 @@ fn gather_assignments_stmt(
                 }
             }
             for s in body.iter().chain(orelse).chain(finalbody) {
-                gather_assignments_stmt(s, names, pinned, rhss);
+                gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
             for h in handlers {
                 for s in &h.body {
-                    gather_assignments_stmt(s, names, pinned, rhss);
+                    gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
                 }
             }
         }
-        Stmt::With {
+        StmtKind::With {
             optional_name,
             body,
             ..
         }
-        | Stmt::AsyncWith {
+        | StmtKind::AsyncWith {
             optional_name,
             body,
             ..
@@ -2225,30 +2343,30 @@ fn gather_assignments_stmt(
                 }
             }
             for s in body {
-                gather_assignments_stmt(s, names, pinned, rhss);
+                gather_assignments_stmt(s, names, pinned, rhss, enumerate_is_builtin);
             }
         }
-        Stmt::ClassDef { name, .. } => {
+        StmtKind::ClassDef { name, .. } => {
             if let Some(slot) = names.iter().position(|n| n == name) {
                 pinned[slot] = true;
             }
         }
-        Stmt::Return(_)
-        | Stmt::Expr(_)
-        | Stmt::Delete(_)
-        | Stmt::Nonlocal(_)
-        | Stmt::Global(_)
-        | Stmt::FuncDef(_)
-        | Stmt::Decorated { .. }
-        | Stmt::Import { .. }
-        | Stmt::ImportFrom { .. }
-        | Stmt::ImportStar { .. }
-        | Stmt::Break
-        | Stmt::Continue
-        | Stmt::Pass
-        | Stmt::SetItem { .. }
-        | Stmt::SetAttr { .. }
-        | Stmt::Raise { .. } => {}
+        StmtKind::Return(_)
+        | StmtKind::Expr(_)
+        | StmtKind::Delete(_)
+        | StmtKind::Nonlocal(_)
+        | StmtKind::Global(_)
+        | StmtKind::FuncDef(_)
+        | StmtKind::Decorated { .. }
+        | StmtKind::Import { .. }
+        | StmtKind::ImportFrom { .. }
+        | StmtKind::ImportStar { .. }
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass
+        | StmtKind::SetItem { .. }
+        | StmtKind::SetAttr { .. }
+        | StmtKind::Raise { .. } => {}
     }
 }
 
@@ -2466,6 +2584,10 @@ enum CompKind<'a> {
 struct Compiler {
     scope: Scope,
     asm: Assembler,
+    /// The source line of the statement currently being compiled, set once at `compile_stmt`'s
+    /// single dispatch. Desugarings built here inherit it, because a statement this compiler
+    /// SYNTHESIZED to implement a `with` or a `for ... else` belongs to the line the user wrote.
+    current_line: u32,
     consts: Vec<bc::Const>,
     names: Vec<String>,
     local_names: Vec<String>,
@@ -2622,6 +2744,10 @@ impl Compiler {
             self.asm.emit(bc::Op::StoreGlobal(idx));
             return;
         }
+        if self.in_class_body {
+            self.emit_store_member(name);
+            return;
+        }
         if let Some(deref) = self.deref_slot(name) {
             self.asm.emit(bc::Op::StoreDeref(deref));
         } else {
@@ -2649,13 +2775,21 @@ impl Compiler {
         0x04
     }
 
+    /// A statement this compiler synthesized while desugaring the statement it is compiling. It
+    /// carries that statement's line: the user wrote the `with`, not the `try/finally` it becomes.
+    fn at(&self, kind: StmtKind) -> Stmt {
+        Stmt::new(self.current_line, kind)
+    }
+
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+        self.current_line = stmt.line;
+        self.asm.current_line = stmt.line;
         let direct = self.direct_body_stmt;
         self.direct_body_stmt = false;
         let decorated = self.decorating_a_def;
         self.decorating_a_def = false;
-        match stmt {
-            Stmt::FuncDef(func) => {
+        match &stmt.kind {
+            StmtKind::FuncDef(func) => {
                 if self.scope.is_function() {
                     self.compile_nested_def(func)
                 } else if direct && self.owns_module_def_name(&func.name) && !decorated {
@@ -2664,7 +2798,7 @@ impl Compiler {
                     self.compile_hoisted_module_def(func)
                 }
             }
-            Stmt::Delete(targets) => {
+            StmtKind::Delete(targets) => {
                 for target in targets {
                     match target {
                         Expr::Name(name) => {
@@ -2692,7 +2826,7 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Stmt::Return(value) => {
+            StmtKind::Return(value) => {
                 if !self.scope.is_function() {
                     return Err(error("'return' outside a function"));
                 }
@@ -2707,46 +2841,36 @@ impl Compiler {
                 self.asm.emit(bc::Op::Return);
                 Ok(())
             }
-            Stmt::Assign(assign) => self.compile_assign(assign),
-            Stmt::Decorated { decorators, inner } => self.compile_decorated(decorators, inner, direct),
-            Stmt::MultiAssign { targets, value } => self.compile_multi_assign(targets, value),
-            Stmt::TupleAssign { targets, star, value } => {
+            StmtKind::Assign(assign) => self.compile_assign(assign),
+            StmtKind::Decorated { decorators, inner } => self.compile_decorated(decorators, inner, direct),
+            StmtKind::MultiAssign { targets, value } => self.compile_multi_assign(targets, value),
+            StmtKind::TupleAssign { targets, value } => {
                 self.compile_expr(value)?;
-                match star {
-                    None => self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32)),
-                    Some(i) => self.asm.emit(bc::Op::UnpackEx {
-                        before: *i as u32,
-                        after: (targets.len() - 1 - i) as u32,
-                    }),
-                }
-                for target in targets {
-                    self.compile_unpack_target(target)?;
-                }
-                Ok(())
+                self.compile_unpack_sequence(targets)
             }
-            Stmt::SetItem {
+            StmtKind::SetItem {
                 container,
                 index,
                 value,
                 op,
             } => self.compile_setitem(container, index, value, *op),
-            Stmt::SetAttr {
+            StmtKind::SetAttr {
                 obj,
                 attr,
                 value,
                 op,
             } => self.compile_setattr(obj, attr, value, *op),
-            Stmt::ClassDef { name, bases, keywords, body } => {
+            StmtKind::ClassDef { name, bases, keywords, body } => {
                 self.compile_classdef(name, bases, keywords, body, direct)
             }
-            Stmt::Expr(expr) => {
+            StmtKind::Expr(expr) => {
                 self.compile_expr(expr)?;
                 self.asm.emit(bc::Op::PopTop);
                 Ok(())
             }
-            Stmt::If { test, body, orelse } => self.compile_if(test, body, orelse),
-            Stmt::While { test, body, orelse } => self.compile_while(test, body, orelse),
-            Stmt::For {
+            StmtKind::If { test, body, orelse } => self.compile_if(test, body, orelse),
+            StmtKind::While { test, body, orelse } => self.compile_while(test, body, orelse),
+            StmtKind::For {
                 target,
                 start,
                 stop,
@@ -2754,19 +2878,19 @@ impl Compiler {
                 body,
                 orelse,
             } => self.compile_for(target, start, stop, *step, body, orelse),
-            Stmt::ForIter {
+            StmtKind::ForIter {
                 target,
                 iterable,
                 body,
                 orelse,
             } => self.compile_for_iter(target, iterable, body, orelse),
-            Stmt::AsyncFor {
+            StmtKind::AsyncFor {
                 target,
                 iterable,
                 body,
                 orelse,
             } => self.compile_async_for(target, iterable, body, orelse),
-            Stmt::Raise { exc, cause } => {
+            StmtKind::Raise { exc, cause } => {
                 match (exc, cause) {
                     (Some(e), Some(c)) => {
                         self.compile_expr(e)?;
@@ -2781,7 +2905,7 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Stmt::Try {
+            StmtKind::Try {
                 body,
                 handlers,
                 orelse,
@@ -2793,17 +2917,17 @@ impl Compiler {
                     self.compile_try_finally(body, handlers, orelse, finalbody)
                 }
             }
-            Stmt::With {
+            StmtKind::With {
                 context,
                 optional_name,
                 body,
             } => self.compile_with(context, optional_name, body, false),
-            Stmt::AsyncWith {
+            StmtKind::AsyncWith {
                 context,
                 optional_name,
                 body,
             } => self.compile_with(context, optional_name, body, true),
-            Stmt::Break => {
+            StmtKind::Break => {
                 let (_, target, fin_depth, handler_depth) = self
                     .loops
                     .last()
@@ -2814,7 +2938,7 @@ impl Compiler {
                 self.asm.emit_jump(target);
                 Ok(())
             }
-            Stmt::Continue => {
+            StmtKind::Continue => {
                 let (target, _, fin_depth, handler_depth) = self
                     .loops
                     .last()
@@ -2825,7 +2949,7 @@ impl Compiler {
                 self.asm.emit_jump(target);
                 Ok(())
             }
-            Stmt::Import { modules } => {
+            StmtKind::Import { modules } => {
                 for (module, alias) in modules {
                     let midx = self.name_index(module);
                     self.asm.emit(bc::Op::ImportName(midx));
@@ -2839,7 +2963,7 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Stmt::ImportFrom { module, names } => {
+            StmtKind::ImportFrom { module, names } => {
                 let midx = self.name_index(module);
                 self.asm.emit(bc::Op::ImportName(midx));
                 for (member, bound) in names {
@@ -2850,7 +2974,7 @@ impl Compiler {
                 self.asm.emit(bc::Op::PopTop);
                 Ok(())
             }
-            Stmt::ImportStar { module } => {
+            StmtKind::ImportStar { module } => {
                 if self.scope != Scope::Module {
                     return Err(error("import * is only allowed at module level"));
                 }
@@ -2859,8 +2983,8 @@ impl Compiler {
                 self.asm.emit(bc::Op::ImportStar);
                 Ok(())
             }
-            Stmt::Nonlocal(_) | Stmt::Global(_) => Ok(()),
-            Stmt::Pass => Ok(()),
+            StmtKind::Nonlocal(_) | StmtKind::Global(_) => Ok(()),
+            StmtKind::Pass => Ok(()),
         }
     }
 
@@ -2874,11 +2998,11 @@ impl Compiler {
         direct: bool,
     ) -> Result<(), CompileError> {
         self.direct_body_stmt = direct;
-        self.decorating_a_def = matches!(inner, Stmt::FuncDef(_));
+        self.decorating_a_def = matches!(inner.kind, StmtKind::FuncDef(_));
         self.compile_stmt(inner)?;
-        let name = match inner {
-            Stmt::FuncDef(f) => f.name.clone(),
-            Stmt::ClassDef { name, .. } => name.clone(),
+        let name = match &inner.kind {
+            StmtKind::FuncDef(f) => f.name.clone(),
+            StmtKind::ClassDef { name, .. } => name.clone(),
             _ => unreachable!("the parser wraps only a def or class"),
         };
         let mut value = Expr::Name(name.clone());
@@ -3241,31 +3365,31 @@ impl Compiler {
             typ: None,
             name: Some(exc_name),
             body: vec![
-                Stmt::Assign(Assign {
+                self.at(StmtKind::Assign(Assign {
                     target: hit_name.clone(),
                     annotation: None,
                     value: Some(Expr::Bool(true)),
-                }),
-                Stmt::If {
+                })),
+                self.at(StmtKind::If {
                     test: Expr::Not {
                         operand: Box::new(handler_exit),
                     },
-                    body: vec![Stmt::Raise {
+                    body: vec![self.at(StmtKind::Raise {
                         exc: None,
                         cause: None,
-                    }],
+                    })],
                     orelse: Vec::new(),
-                },
+                }),
             ],
         };
         let final_exit = exit_call(vec![Expr::None, Expr::None, Expr::None]);
-        let finalbody = vec![Stmt::If {
+        let finalbody = vec![self.at(StmtKind::If {
             test: Expr::Not {
                 operand: Box::new(Expr::Name(hit_name)),
             },
-            body: vec![Stmt::Expr(final_exit)],
+            body: vec![self.at(StmtKind::Expr(final_exit))],
             orelse: Vec::new(),
-        }];
+        })];
         self.compile_try_finally(body, &[handler], &[], &finalbody)
     }
 
@@ -3319,6 +3443,8 @@ impl Compiler {
             self.compile_expr(value)?;
         }
         self.asm.emit(bc::Op::SetupClassNamespace);
+        let outer_in_class_body = self.in_class_body;
+        let outer_class_bound = core::mem::take(&mut self.class_body_bound);
         self.in_class_body = true;
         let doc = docstring_of(body.first())?;
         let doc_const = match doc {
@@ -3330,8 +3456,8 @@ impl Compiler {
         self.class_body_bound = class_body_bound_names(body);
         let names = method_qualified_names(&class_qual, body);
         for (i, member) in body.iter().enumerate() {
-            match member {
-                Stmt::FuncDef(method) => {
+            match &member.kind {
+                StmtKind::FuncDef(method) => {
                     let qualified = names[i].as_ref().expect("a method has a qualified name");
                     let freevars = self.method_freevars(qualified);
                     let f = self.name_index(qualified);
@@ -3340,9 +3466,10 @@ impl Compiler {
                     self.asm.emit(bc::Op::MakeFunction { func: f, flags });
                     self.emit_store_member(&method.name);
                 }
-                Stmt::Decorated { decorators, inner } => {
-                    let Stmt::FuncDef(method) = &**inner else {
-                        self.in_class_body = false;
+                StmtKind::Decorated { decorators, inner } => {
+                    let StmtKind::FuncDef(method) = &inner.kind else {
+                        self.in_class_body = outer_in_class_body;
+                        self.class_body_bound = outer_class_bound;
                         return Err(error("only a method may be decorated in a class body"));
                     };
                     for decorator in decorators {
@@ -3359,17 +3486,17 @@ impl Compiler {
                     }
                     self.emit_store_member(&method.name);
                 }
-                Stmt::Assign(assign) => {
+                StmtKind::Assign(assign) => {
                     if let Some(value) = &assign.value {
                         self.compile_expr(value)?;
                         self.emit_store_member(&assign.target);
                     }
                 }
-                _ => {}
+                _ => self.compile_stmt(member)?,
             }
         }
-        self.in_class_body = false;
-        self.class_body_bound = BTreeSet::new();
+        self.in_class_body = outer_in_class_body;
+        self.class_body_bound = outer_class_bound;
         if keywords.is_empty() {
             self.asm.emit(bc::Op::BuildClass);
         } else {
@@ -3421,6 +3548,18 @@ impl Compiler {
                 | bc::StaticType::GrowListFloat
         ) {
             return self.compile_for_iter_list(target, iterable, it_type, body, orelse);
+        }
+        if let Some((seq, seq_type, index_name, elem_name)) =
+            self.typed_enumerate_loop(target, iterable, body)
+        {
+            return self.compile_for_enumerate_list(
+                &seq,
+                seq_type,
+                &index_name,
+                &elem_name,
+                &body[1..],
+                orelse,
+            );
         }
         self.compile_expr(iterable)?;
         self.asm.emit(bc::Op::GetIter);
@@ -3524,8 +3663,8 @@ impl Compiler {
         let not_done = || Expr::Not {
             operand: Box::new(Expr::Name(done_name.clone())),
         };
-        let step = Stmt::Try {
-            body: vec![Stmt::Assign(Assign {
+        let step = self.at(StmtKind::Try {
+            body: vec![self.at(StmtKind::Assign(Assign {
                 target: String::from(target),
                 annotation: None,
                 value: Some(Expr::Await(Box::new(Expr::Call {
@@ -3536,29 +3675,30 @@ impl Compiler {
                     args: Vec::new(),
                     keywords: Vec::new(),
                 }))),
-            })],
+            }))],
             handlers: vec![ExceptHandler {
                 typ: Some(Expr::Name(String::from("StopAsyncIteration"))),
                 name: None,
-                body: vec![Stmt::Assign(Assign {
+                body: vec![self.at(StmtKind::Assign(Assign {
                     target: done_name.clone(),
                     annotation: None,
                     value: Some(Expr::Bool(true)),
-                })],
+                }))],
             }],
             orelse: Vec::new(),
             finalbody: Vec::new(),
-        };
-        let guarded_body = Stmt::If {
+        });
+        let guarded_body = self.at(StmtKind::If {
             test: not_done(),
             body: body.to_vec(),
             orelse: Vec::new(),
-        };
-        self.compile_stmt(&Stmt::While {
+        });
+        let loop_stmt = self.at(StmtKind::While {
             test: not_done(),
             body: vec![step, guarded_body],
             orelse: orelse.to_vec(),
-        })
+        });
+        self.compile_stmt(&loop_stmt)
     }
 
     /// `for target in <typed list/tuple>: body` -- desugared to a counted loop `while i < len(it):
@@ -3600,6 +3740,139 @@ impl Compiler {
         let cache = self.asm.next_cache_slot();
         self.asm.emit(bc::Op::Subscript { cache });
         self.emit_store_name(target);
+        self.loops.push((cont, after, self.finallys.len(), self.handler_depth));
+        for stmt in body {
+            self.compile_stmt(stmt)?;
+        }
+        self.loops.pop();
+        self.asm.place(cont);
+        self.asm.emit(bc::Op::LoadFast(counter));
+        let one = self.const_index(bc::Const::Int(1));
+        self.asm.emit(bc::Op::LoadConst(one));
+        self.asm.emit(bc::Op::Binary(bc::BinOp::Add));
+        self.asm.emit(bc::Op::StoreFast(counter));
+        self.asm.emit_jump(top);
+        self.asm.place(else_label);
+        for stmt in orelse {
+            self.compile_stmt(stmt)?;
+        }
+        self.asm.place(after);
+        Ok(())
+    }
+
+    /// Whether this `for` is `for <i>, <v> in enumerate(<typed list/tuple>):`, and if so the
+    /// sequence, its static type, and the two target names -- in that order.
+    ///
+    /// The parser has already rewritten a tuple target into a synthetic temp plus a `TupleAssign` at
+    /// the HEAD OF THE BODY, so the shape being matched is `for tmp in enumerate(seq): i, v = tmp;
+    /// ...`. Matching it here rather than in the parser keeps the static type of `seq` in reach --
+    /// the parser has no types -- and means a shape this does not recognize simply stays on the
+    /// iterator protocol instead of becoming a refusal.
+    ///
+    /// Deliberately narrow, and every one of these falls through rather than failing:
+    /// a shadowed `enumerate`, the two-argument `enumerate(seq, start)` form, a keyword argument, a
+    /// sequence that is not a typed list or tuple, a target that is not exactly two plain names, and
+    /// a body whose head does not destructure THIS loop's temp. `start` is left out because the
+    /// counter is the index, and a loop that reports `i + start` while indexing with `i` is two
+    /// meanings for one variable -- worth having, not worth conflating with this.
+    fn typed_enumerate_loop(
+        &self,
+        target: &str,
+        iterable: &Expr,
+        body: &[Stmt],
+    ) -> Option<(Expr, bc::StaticType, String, String)> {
+        let Expr::Call { func, args, keywords } = iterable else {
+            return None;
+        };
+        if !matches!(&**func, Expr::Name(n) if n == "enumerate")
+            || !keywords.is_empty()
+            || args.len() != 1
+            || !self.func_rets.contains_key(ENUMERATE_IS_BUILTIN)
+            || self.local_names.iter().any(|n| n == "enumerate")
+        {
+            return None;
+        }
+        let seq_type =
+            expr_static_type(&args[0], &self.local_names, &self.local_types, &self.func_rets);
+        if !matches!(
+            seq_type,
+            bc::StaticType::ListInt
+                | bc::StaticType::ListFloat
+                | bc::StaticType::TupleInt
+                | bc::StaticType::TupleFloat
+                | bc::StaticType::GrowListInt
+                | bc::StaticType::GrowListFloat
+        ) {
+            return None;
+        }
+        let head = body.first()?;
+        let StmtKind::TupleAssign { targets, value: Expr::Name(unpacked) } = &head.kind else {
+            return None;
+        };
+        if unpacked != target || targets.len() != 2 {
+            return None;
+        }
+        let [ast::AssignTarget::Name(index_name), ast::AssignTarget::Name(elem_name)] = targets.as_slice()
+        else {
+            return None;
+        };
+        Some((args[0].clone(), seq_type, index_name.clone(), elem_name.clone()))
+    }
+
+    /// `for i, v in enumerate(<typed list/tuple>): body` -- the counted loop of
+    /// [`Self::compile_for_iter_list`] with `i` and `v` bound at the top of the body, so no iterator
+    /// and no index/element tuple is ever built. `len(it)` is re-read each pass, exactly as the
+    /// plain list loop does, so a body that appends or pops sees the same sequence CPython's
+    /// `enumerate` does.
+    ///
+    /// The counter is a HIDDEN TEMP and `i` is a copy of it, which is not an extra store to save.
+    /// Binding `i` to the counter directly gets two things wrong, and the differential caught the
+    /// first before it could ship:
+    ///
+    /// 1. After the loop, `i` would hold the COUNT rather than the last index -- the counter is
+    ///    incremented once more to fail the test. CPython leaves the last value yielded, so
+    ///    `for i, v in enumerate([7, 8]): pass` leaves `i == 1`, and reading the counter gives 2.
+    /// 2. A body that assigns to `i` would move the LOOP's position. In Python rebinding a loop
+    ///    variable is forgotten at the next iteration and cannot end the loop early.
+    ///
+    /// Both names keep their last values after the loop, which is Python's rule for loop variables
+    /// and the same thing the plain list loop already does with its single target.
+    fn compile_for_enumerate_list(
+        &mut self,
+        seq: &Expr,
+        seq_type: bc::StaticType,
+        index_name: &str,
+        elem_name: &str,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), CompileError> {
+        let it_tmp = self.alloc_temp();
+        self.local_types[it_tmp as usize] = seq_type;
+        self.compile_expr(seq)?;
+        self.asm.emit(bc::Op::StoreFast(it_tmp));
+        let counter = self.alloc_temp();
+        let zero = self.const_index(bc::Const::Int(0));
+        self.asm.emit(bc::Op::LoadConst(zero));
+        self.asm.emit(bc::Op::StoreFast(counter));
+        let top = self.asm.new_label();
+        let cont = self.asm.new_label();
+        let else_label = self.asm.new_label();
+        let after = self.asm.new_label();
+        self.asm.place(top);
+        self.asm.emit(bc::Op::LoadFast(counter));
+        let len_idx = self.name_index("len");
+        self.asm.emit(bc::Op::LoadGlobal(len_idx));
+        self.asm.emit(bc::Op::LoadFast(it_tmp));
+        self.asm.emit(bc::Op::Call(1));
+        self.asm.emit(bc::Op::Compare(bc::CmpOp::Lt));
+        self.asm.emit_branch(else_label);
+        self.asm.emit(bc::Op::LoadFast(counter));
+        self.emit_store_name(index_name);
+        self.asm.emit(bc::Op::LoadFast(it_tmp));
+        self.asm.emit(bc::Op::LoadFast(counter));
+        let cache = self.asm.next_cache_slot();
+        self.asm.emit(bc::Op::Subscript { cache });
+        self.emit_store_name(elem_name);
         self.loops.push((cont, after, self.finallys.len(), self.handler_depth));
         for stmt in body {
             self.compile_stmt(stmt)?;
@@ -3739,7 +4012,8 @@ impl Compiler {
                 self.compile_expr(value)?;
                 let name = self.name_index(attr);
                 let cache = self.asm.next_cache_slot();
-                self.asm.emit(bc::Op::LoadAttr { name, cache });
+                let site = self.asm.wide(name, cache);
+                self.asm.emit(bc::Op::LoadAttr { site });
             }
             Expr::Subscript { value, index } => {
                 self.compile_expr(value)?;
@@ -3780,7 +4054,7 @@ impl Compiler {
             }
             Expr::ListComp { element, clauses } => {
                 if comprehension_hoists(&[element], clauses) {
-                    let body = build_container_comp_body(CompKind::List(element), clauses);
+                    let body = build_container_comp_body(CompKind::List(element), clauses, self.current_line);
                     self.compile_hoisted_comprehension("listcomp", body, &clauses[0].iterable)?;
                 } else {
                     self.compile_comprehension(CompKind::List(element), clauses)?;
@@ -3788,7 +4062,7 @@ impl Compiler {
             }
             Expr::SetComp { element, clauses } => {
                 if comprehension_hoists(&[element], clauses) {
-                    let body = build_container_comp_body(CompKind::Set(element), clauses);
+                    let body = build_container_comp_body(CompKind::Set(element), clauses, self.current_line);
                     self.compile_hoisted_comprehension("setcomp", body, &clauses[0].iterable)?;
                 } else {
                     self.compile_comprehension(CompKind::Set(element), clauses)?;
@@ -3800,14 +4074,14 @@ impl Compiler {
                 clauses,
             } => {
                 if comprehension_hoists(&[key, value], clauses) {
-                    let body = build_container_comp_body(CompKind::Dict(key, value), clauses);
+                    let body = build_container_comp_body(CompKind::Dict(key, value), clauses, self.current_line);
                     self.compile_hoisted_comprehension("dictcomp", body, &clauses[0].iterable)?;
                 } else {
                     self.compile_comprehension(CompKind::Dict(key, value), clauses)?;
                 }
             }
             Expr::GeneratorExp { element, clauses } => {
-                let body = build_genexpr_body(element, clauses);
+                let body = build_genexpr_body(element, clauses, 0);
                 self.compile_hoisted_comprehension("genexpr", body, &clauses[0].iterable)?;
             }
             Expr::Binary { op, lhs, rhs } => {
@@ -3863,10 +4137,8 @@ impl Compiler {
                     }
                     let names: Vec<String> = keywords.iter().map(|k| k.name.clone()).collect();
                     let kwnames = self.const_index(bc::Const::KwNames(names));
-                    self.asm.emit(bc::Op::CallKw {
-                        argc: args.len() as u32,
-                        kwnames,
-                    });
+                    let site = self.asm.wide(args.len() as u32, kwnames);
+                    self.asm.emit(bc::Op::CallKw { site });
                 } else if args.is_empty()
                     && matches!(&**func, Expr::Name(n) if n == "super")
                     && self.current_class.is_some()
@@ -3912,10 +4184,8 @@ impl Compiler {
                 }
                 let kinds_idx = self.const_index(bc::Const::ArgKinds(kinds));
                 let kwnames_idx = self.const_index(bc::Const::KwNames(kwnames));
-                self.asm.emit(bc::Op::CallEx {
-                    kinds: kinds_idx,
-                    kwnames: kwnames_idx,
-                });
+                let site = self.asm.wide(kinds_idx, kwnames_idx);
+                self.asm.emit(bc::Op::CallEx { site });
             }
             Expr::Lambda { params, body } => self.compile_lambda(params, body)?,
             Expr::Yield(value) => {
@@ -4109,7 +4379,7 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let lambda_name = format!("{}.<lambda.{}>", self.name, self.lambda_counter);
         self.lambda_counter += 1;
-        let lambda_body = [Stmt::Return(Some(body.clone()))];
+        let lambda_body = [self.at(StmtKind::Return(Some(body.clone())))];
         let body_refs: Vec<&Stmt> = lambda_body.iter().collect();
         let (lambda_co, nested) = compile_code_object(
             Scope::Function,
@@ -4338,14 +4608,39 @@ impl Compiler {
                 self.compile_expr(obj)?;
                 let name = self.name_index(attr);
                 let cache = self.asm.next_cache_slot();
-                self.asm.emit(bc::Op::SetAttr { name, cache });
+                let site = self.asm.wide(name, cache);
+                self.asm.emit(bc::Op::SetAttr { site });
             }
             ast::AssignTarget::Tuple(targets) => {
-                self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32));
-                for t in targets {
-                    self.compile_unpack_target(t)?;
-                }
+                self.compile_unpack_sequence(targets)?;
             }
+            ast::AssignTarget::Starred(inner) => self.compile_unpack_target(inner)?,
+        }
+        Ok(())
+    }
+
+    /// Unpack the sequence on top of the stack into `targets`, storing each element.
+    ///
+    /// ONE implementation for both depths. A statement's target list and a nested tuple target are
+    /// the same shape -- a sequence of targets, at most one of them starred -- and they differ only
+    /// in where they sit, so the choice between [`bc::Op::UnpackSequence`] and [`bc::Op::UnpackEx`]
+    /// is made here rather than once per site.
+    fn compile_unpack_sequence(
+        &mut self,
+        targets: &[ast::AssignTarget],
+    ) -> Result<(), CompileError> {
+        match targets
+            .iter()
+            .position(|t| matches!(t, ast::AssignTarget::Starred(_)))
+        {
+            None => self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32)),
+            Some(i) => {
+                let site = self.asm.wide(i as u32, (targets.len() - 1 - i) as u32);
+                self.asm.emit(bc::Op::UnpackEx { site });
+            }
+        }
+        for target in targets {
+            self.compile_unpack_target(target)?;
         }
         Ok(())
     }
@@ -4400,7 +4695,8 @@ impl Compiler {
             self.compile_expr(obj)?;
             let name = self.name_index(attr);
             let cache = self.asm.next_cache_slot();
-            self.asm.emit(bc::Op::SetAttr { name, cache });
+            let site = self.asm.wide(name, cache);
+            self.asm.emit(bc::Op::SetAttr { site });
             return Ok(());
         };
         let o = self.alloc_temp();
@@ -4493,9 +4789,27 @@ struct Assembler {
     emits: Vec<Emit>,
     labels: Vec<Option<u32>>,
     cache_count: u32,
+    /// The source line every op emitted from here on belongs to, set by `compile_stmt`.
+    current_line: u32,
+    /// One line per emitted op, parallel to `emits`. Collapsed into the run-length table by
+    /// `finish`; kept flat here because the runs are only visible once the whole body is emitted.
+    lines: Vec<u32>,
+    /// The two-word operands of the ops that no longer carry them inline, in ascending static
+    /// order -- the order `CodeObject::wide_operands` is indexed by and the decoder rebuilds.
+    wide_operands: Vec<[u32; 2]>,
     /// Exception-table entries as `(body-start, body-end, handler, depth)` labels,
     /// resolved to op indices on `finish`.
     exc_entries: Vec<(Label, Label, Label, u32)>,
+}
+
+/// Everything an assembled body yields: the resolved op stream and the tables that ride beside it,
+/// each indexed by op position and therefore only meaningful together.
+struct Assembled {
+    ops: Vec<bc::Op>,
+    cache_count: usize,
+    exc_table: Vec<bc::ExcEntry>,
+    wide_operands: Vec<[u32; 2]>,
+    line_table: Vec<u8>,
 }
 
 /// One pending emission: a ready op, or a jump whose target is a not-yet-resolved
@@ -4514,6 +4828,9 @@ impl Assembler {
     fn new() -> Self {
         Assembler {
             emits: Vec::new(),
+            current_line: 0,
+            lines: Vec::new(),
+            wide_operands: Vec::new(),
             labels: Vec::new(),
             cache_count: 0,
             exc_entries: Vec::new(),
@@ -4531,19 +4848,26 @@ impl Assembler {
     }
 
     fn emit(&mut self, op: bc::Op) {
-        self.emits.push(Emit::Op(op));
+        self.push(Emit::Op(op));
     }
 
     fn emit_jump(&mut self, target: Label) {
-        self.emits.push(Emit::Jump(target));
+        self.push(Emit::Jump(target));
     }
 
     fn emit_branch(&mut self, target: Label) {
-        self.emits.push(Emit::Branch(target));
+        self.push(Emit::Branch(target));
     }
 
     fn emit_for_iter(&mut self, target: Label) {
-        self.emits.push(Emit::ForIter(target));
+        self.push(Emit::ForIter(target));
+    }
+
+    /// The one place an op joins the stream, so the line cannot be recorded for some ops and not
+    /// others -- `lines` and `emits` are the same length by construction rather than by discipline.
+    fn push(&mut self, emit: Emit) {
+        self.emits.push(emit);
+        self.lines.push(self.current_line);
     }
 
     /// Record a protected `[start, end)` op range mapped to `handler` at stack `depth`.
@@ -4561,7 +4885,7 @@ impl Assembler {
 
     /// Resolve jump targets and produce the op stream, the inline-cache count, and the
     /// resolved exception table.
-    fn finish(self) -> (Vec<bc::Op>, usize, Vec<bc::ExcEntry>) {
+    fn finish(self) -> Assembled {
         let mut ops = Vec::with_capacity(self.emits.len());
         for emit in &self.emits {
             let op = match emit {
@@ -4587,7 +4911,20 @@ impl Assembler {
                 depth,
             });
         }
-        (ops, self.cache_count as usize, exc_table)
+        debug_assert_eq!(ops.len(), self.lines.len(), "one line per op");
+        Assembled {
+            line_table: bc::encode_line_table(&self.lines),
+            ops,
+            cache_count: self.cache_count as usize,
+            exc_table,
+            wide_operands: self.wide_operands,
+        }
+    }
+
+    /// Record a two-word operand and return the site index the op carries in its place.
+    fn wide(&mut self, first: u32, second: u32) -> u32 {
+        self.wide_operands.push([first, second]);
+        (self.wide_operands.len() - 1) as u32
     }
 }
 
@@ -4606,7 +4943,7 @@ mod tests {
     fn func<'a>(module: &'a bc::Module, name: &str) -> &'a bc::CodeObject {
         module
             .functions
-            .iter()
+            .iter_bodies()
             .find(|f| f.name == name)
             .expect("function present")
     }
@@ -4619,7 +4956,10 @@ mod tests {
             .ops
             .iter()
             .find_map(|op| match op {
-                Op::CallKw { argc, kwnames } => Some((*argc, *kwnames)),
+                Op::CallKw { site } => {
+                    let [argc, kwnames] = module.body.wide_operands[*site as usize];
+                    Some((argc, kwnames))
+                }
                 _ => None,
             })
             .expect("a CallKw op");
@@ -4638,7 +4978,10 @@ mod tests {
             .ops
             .iter()
             .find_map(|op| match op {
-                Op::CallKw { argc, kwnames } => Some((*argc, *kwnames)),
+                Op::CallKw { site } => {
+                    let [argc, kwnames] = module.body.wide_operands[*site as usize];
+                    Some((argc, kwnames))
+                }
                 _ => None,
             })
             .expect("a CallKw op");
@@ -4658,7 +5001,7 @@ mod tests {
             .ops
             .iter()
             .any(|op| matches!(op, Op::MakeFunction { flags: 1, .. })));
-        assert!(module.functions.iter().any(|co| co.name == "f"));
+        assert!(module.functions.iter_bodies().any(|co| co.name == "f"));
     }
 
     #[test]
@@ -4668,14 +5011,14 @@ mod tests {
             module.body.ops.iter().filter(|op| matches!(op, Op::MakeFunction { .. })).count(),
             1
         );
-        assert!(module.functions.iter().any(|c| c.name == "f"));
+        assert!(module.functions.iter_bodies().any(|c| c.name == "f"));
     }
 
     #[test]
     fn a_module_def_nested_in_a_block_is_hoisted_into_the_function_table() {
         let module = compile_src("if True:\n    def f():\n        return 1\nprint(f())\n").unwrap();
         assert!(
-            module.functions.iter().any(|c| c.name.contains('$') && c.name.ends_with(".f")),
+            module.functions.iter_bodies().any(|c| c.name.contains('$') && c.name.ends_with(".f")),
             "the block-nested def is hoisted under a synthetic name"
         );
         assert!(module.body.ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })));
@@ -4689,7 +5032,7 @@ mod tests {
         .unwrap();
         let fs: Vec<&str> = module
             .functions
-            .iter()
+            .iter_bodies()
             .map(|c| c.name.as_str())
             .filter(|n| n.ends_with(".f"))
             .collect();
@@ -4704,7 +5047,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            module.functions.iter().any(|c| c.name.contains('$') && c.name.ends_with(".m")),
+            module.functions.iter_bodies().any(|c| c.name.contains('$') && c.name.ends_with(".m")),
             "the block-nested class's method is hoisted"
         );
     }
@@ -4715,11 +5058,11 @@ mod tests {
             "def f():\n    return 1\na = f\ndef f():\n    return 2\nprint(a(), f())\n",
         )
         .unwrap();
-        let bare: Vec<&bc::CodeObject> = module.functions.iter().filter(|c| c.name == "f").collect();
+        let bare: Vec<&bc::CodeObject> = module.functions.iter_bodies().filter(|c| c.name == "f").collect();
         assert_eq!(bare.len(), 1, "exactly one table entry owns the bare name");
         assert!(bare[0].ops.iter().any(|op| matches!(op, Op::LoadConst(i) if bare[0].consts[*i as usize] == bc::Const::Int(2))));
         assert_eq!(
-            module.functions.iter().filter(|c| c.name.contains('$') && c.name.ends_with(".f")).count(),
+            module.functions.iter_bodies().filter(|c| c.name.contains('$') && c.name.ends_with(".f")).count(),
             1
         );
     }
@@ -4738,11 +5081,11 @@ mod tests {
     fn a_decorated_def_does_not_own_its_bare_name() {
         let module = compile_src("def d(fn):\n    return fn\n@d\ndef f():\n    return 1\nprint(f())\n").unwrap();
         assert!(
-            !module.functions.iter().any(|c| c.name == "f"),
+            !module.functions.iter_bodies().any(|c| c.name == "f"),
             "no bare table entry for a decorated def"
         );
         assert_eq!(
-            module.functions.iter().filter(|c| c.name.contains('$') && c.name.ends_with(".f")).count(),
+            module.functions.iter_bodies().filter(|c| c.name.contains('$') && c.name.ends_with(".f")).count(),
             1,
             "its body is hoisted under a synthetic name"
         );
@@ -4754,7 +5097,7 @@ mod tests {
             "def d(fn):\n    return fn\n@d\ndef f():\n    return 1\ndef f():\n    return 2\nprint(f())\n",
         )
         .unwrap();
-        let bare: Vec<&bc::CodeObject> = module.functions.iter().filter(|c| c.name == "f").collect();
+        let bare: Vec<&bc::CodeObject> = module.functions.iter_bodies().filter(|c| c.name == "f").collect();
         assert_eq!(bare.len(), 1, "the plain last def owns the bare name");
         assert!(bare[0].ops.iter().any(|op| matches!(op, Op::LoadConst(i) if bare[0].consts[*i as usize] == bc::Const::Int(2))));
     }
@@ -4767,7 +5110,7 @@ mod tests {
         .unwrap();
         let fs: Vec<&str> = module
             .functions
-            .iter()
+            .iter_bodies()
             .map(|c| c.name.as_str())
             .filter(|n| n.starts_with("make.f"))
             .collect();
@@ -4782,8 +5125,8 @@ mod tests {
             "def make_adder(n):\n    def add(x):\n        return x + n\n    return add\n",
         )
         .unwrap();
-        assert!(module.functions.iter().any(|c| c.name == "make_adder.add"));
-        assert!(!module.functions.iter().any(|c| c.name.contains('$')));
+        assert!(module.functions.iter_bodies().any(|c| c.name == "make_adder.add"));
+        assert!(!module.functions.iter_bodies().any(|c| c.name.contains('$')));
     }
 
     #[test]
@@ -5112,7 +5455,7 @@ xs.append(1, 2)
     fn the_coroutine_flag_survives_every_route_a_def_can_take() {
         let decorated = compile_src("@dec\nasync def f():\n    pass\n").unwrap();
         assert!(
-            decorated.functions.iter().any(|f| f.is_coroutine),
+            decorated.functions.iter_bodies().any(|f| f.is_coroutine),
             "decoration does not lose the coroutine flag"
         );
         let method = compile_src("class C:\n    async def m(self):\n        return await g()\n")
@@ -5122,7 +5465,7 @@ xs.append(1, 2)
         assert!(m.ops.iter().any(|op| matches!(op, Op::Await)));
         let nested = compile_src("def outer():\n    async def inner():\n        pass\n").unwrap();
         assert!(
-            nested.functions.iter().any(|f| f.name.ends_with("inner") && f.is_coroutine),
+            nested.functions.iter_bodies().any(|f| f.name.ends_with("inner") && f.is_coroutine),
             "a nested async def is a coroutine"
         );
         assert!(!func(&nested, "outer").is_coroutine);
@@ -5133,7 +5476,7 @@ xs.append(1, 2)
         let module = compile_src("g = (x * x for x in xs)\n").unwrap();
         let genfn = module
             .functions
-            .iter()
+            .iter_bodies()
             .find(|f| f.name.contains("<genexpr."))
             .expect("a hoisted genexpr function");
         assert!(genfn.is_generator, "the genexpr function is a generator");
@@ -5150,7 +5493,7 @@ xs.append(1, 2)
         let module = compile_src("f = lambda x: x + 1\n").unwrap();
         let lam = module
             .functions
-            .iter()
+            .iter_bodies()
             .find(|f| f.name.contains("<lambda."))
             .expect("hoisted lambda function present");
         assert_eq!(lam.params.len(), 1);
@@ -5180,14 +5523,14 @@ xs.append(1, 2)
             .iter()
             .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x01 == 0)));
         let method = compile_src("class C:\n    def m(self, x=1):\n        return x\n").unwrap();
-        assert!(method.functions.iter().any(|c| c.name == "C.m"), "the method body compiled");
+        assert!(method.functions.iter_bodies().any(|c| c.name == "C.m"), "the method body compiled");
     }
 
     #[test]
     fn lambda_capturing_an_enclosing_local_is_a_closure() {
         let module =
             compile_src("def f():\n    n = 5\n    g = lambda: n\n    return g\n").unwrap();
-        let f = module.functions.iter().find(|c| c.name == "f").expect("f present");
+        let f = module.functions.iter_bodies().find(|c| c.name == "f").expect("f present");
         assert_eq!(f.cellvars.len(), 1);
         assert_eq!(&f.cellvars[0], "n");
         assert!(f.ops.iter().any(|op| matches!(op, Op::StoreDeref(0))));
@@ -5198,7 +5541,7 @@ xs.append(1, 2)
             .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x04 != 0)));
         let lam = module
             .functions
-            .iter()
+            .iter_bodies()
             .find(|c| c.name.contains("<lambda."))
             .expect("lambda present");
         assert_eq!(lam.freevars.len(), 1);
@@ -5393,7 +5736,7 @@ xs.append(1, 2)
     fn a_decorated_method_lands_in_the_class_namespace() {
         let src = "def tag(f):\n    return f\nclass C:\n    @tag\n    def m(self):\n        return 1\n";
         let module = compile_src(src).unwrap();
-        assert!(module.functions.iter().any(|c| c.name == "C.m"), "method body compiled");
+        assert!(module.functions.iter_bodies().any(|c| c.name == "C.m"), "method body compiled");
         let ops = &module.body.ops;
         assert!(ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })));
         assert!(ops.iter().any(|op| matches!(op, Op::Call(1))), "the decorator is applied");
@@ -5426,7 +5769,7 @@ xs.append(1, 2)
         .unwrap();
         let xs: Vec<&str> = module
             .functions
-            .iter()
+            .iter_bodies()
             .map(|f| f.name.as_str())
             .filter(|n| n.starts_with("C.x"))
             .collect();
@@ -5476,15 +5819,15 @@ xs.append(1, 2)
         )
         .unwrap();
         assert!(
-            m.functions.iter().any(|f| f.name == "make.Local.hi"),
+            m.functions.iter_bodies().any(|f| f.name == "make.Local.hi"),
             "the method hoists under a scope-qualified name"
         );
         let m2 = compile_src(
             "def a():\n    class Inner:\n        def m(self):\n            return 1\ndef b():\n    class Inner:\n        def m(self):\n            return 2\n",
         )
         .unwrap();
-        assert!(m2.functions.iter().any(|f| f.name == "a.Inner.m"));
-        assert!(m2.functions.iter().any(|f| f.name == "b.Inner.m"));
+        assert!(m2.functions.iter_bodies().any(|f| f.name == "a.Inner.m"));
+        assert!(m2.functions.iter_bodies().any(|f| f.name == "b.Inner.m"));
         assert!(compile_src("G = 1\ndef f():\n    class C:\n        x = G\n    return C\n").is_ok());
         assert!(compile_src(
             "def f(n):\n    class C:\n        def g(self):\n            return n\n    return C()\n"
@@ -5560,7 +5903,7 @@ xs.append(1, 2)
         let module =
             compile_src("LIMIT = 10\ndef f(xs):\n    g = lambda x: x + LIMIT\n    return g\n")
                 .unwrap();
-        assert!(module.functions.iter().any(|f| f.name.contains("<lambda.")));
+        assert!(module.functions.iter_bodies().any(|f| f.name.contains("<lambda.")));
     }
 
     #[test]
@@ -5655,6 +5998,43 @@ xs.append(1, 2)
         let f = func(&module, "f");
         assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "xs").unwrap()], StaticType::ListInt);
         assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "ys").unwrap()], StaticType::ListFloat);
+    }
+
+    #[test]
+    fn enumerate_over_a_typed_sequence_types_both_loop_names() {
+        let module = compile_src(
+            "def f() -> int:\n    xs = [10, 20]\n    ys = [1.5, 2.5]\n    for i, v in enumerate(xs):\n        pass\n    for j, y in enumerate(ys):\n        pass\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        let ty = |n: &str| f.local_types[f.local_names.iter().position(|x| x == n).unwrap()];
+        assert_eq!(ty("i"), StaticType::Int, "the index is a counter");
+        assert_eq!(ty("v"), StaticType::Int, "the element of a list[int]");
+        assert_eq!(ty("j"), StaticType::Int);
+        assert_eq!(ty("y"), StaticType::Float, "the element of a list[float]");
+    }
+
+    #[test]
+    fn enumerate_stays_dynamic_where_the_desugar_does_not_apply() {
+        for (source, why) in [
+            (
+                "def f() -> int:\n    xs = [1, 2]\n    for i, v in enumerate(xs, 1):\n        pass\n    return 0\n",
+                "the two-argument form has a start the counter is not",
+            ),
+            (
+                "def f() -> int:\n    for i, v in enumerate(range(3)):\n        pass\n    return 0\n",
+                "a range is not a typed sequence",
+            ),
+            (
+                "def enumerate(z) -> int:\n    return 0\ndef f() -> int:\n    xs = [1, 2]\n    for i, v in enumerate(xs):\n        pass\n    return 0\n",
+                "a shadowed enumerate is not the builtin",
+            ),
+        ] {
+            let module = compile_src(source).unwrap();
+            let f = func(&module, "f");
+            let ty = |n: &str| f.local_types[f.local_names.iter().position(|x| x == n).unwrap()];
+            assert_eq!(ty("v"), StaticType::Dynamic, "{why}");
+        }
     }
 
     #[test]
@@ -5821,7 +6201,7 @@ xs.append(1, 2)
             "def main() -> int:\n    xs = [1, 2, 3]\n    return sum(xs)\n\nprint(main())\n",
         )
         .unwrap();
-        let reducer = m.functions.iter().find(|f| f.name == "__sum_list_int");
+        let reducer = m.functions.iter_bodies().find(|f| f.name == "__sum_list_int");
         assert!(reducer.is_some(), "the reducer is injected");
         assert_eq!(reducer.unwrap().local_types[0], StaticType::ListInt);
         let mainf = func(&m, "main");
@@ -5851,7 +6231,7 @@ xs.append(1, 2)
     fn a_user_sum_def_suppresses_the_reducer() {
         let m = compile_src("def sum(xs):\n    return 999\n\nprint(sum([1, 2, 3]))\n").unwrap();
         assert!(
-            !m.functions.iter().any(|f| f.name == "__sum_list_int"),
+            !m.functions.iter_bodies().any(|f| f.name == "__sum_list_int"),
             "no reducer when the user shadows sum"
         );
     }
@@ -5859,7 +6239,7 @@ xs.append(1, 2)
     #[test]
     fn no_reducer_is_injected_when_sum_is_unused() {
         let m = compile_src("def main() -> int:\n    return 1\n\nprint(main())\n").unwrap();
-        assert!(!m.functions.iter().any(|f| f.name == "__sum_list_int"));
+        assert!(!m.functions.iter_bodies().any(|f| f.name == "__sum_list_int"));
     }
 
     #[test]
@@ -5930,6 +6310,44 @@ xs.append(1, 2)
         assert_eq!(func(&bare, "g").doc, None);
         let later = compile_src("def h():\n    x = 1\n    \"not a doc\"\n    return x\n").unwrap();
         assert_eq!(func(&later, "h").doc, None);
+    }
+
+    /// A compiled function's ops map back to the lines their statements were written on.
+    ///
+    /// This is the row the whole line-table workstream exists for, and it is checked END TO END --
+    /// source through the parser, the compiler and the run-length codec -- rather than at any one
+    /// seam. Each of those three could be individually right and the composition still wrong, which
+    /// is exactly what a per-seam test cannot see.
+    #[test]
+    fn a_compiled_functions_ops_report_the_lines_they_came_from() {
+        let m = compile_src("def f(a):
+    b = a
+    if b:
+        return 1
+    return 2
+")
+            .unwrap();
+        let f = func(&m, "f");
+        assert!(!f.line_table.is_empty(), "a compiled function must carry lines");
+
+        let lines: Vec<Option<u32>> = (0..f.ops.len()).map(|i| f.line_for(i)).collect();
+        assert!(
+            lines.iter().all(Option::is_some),
+            "every op must report a line, got {lines:?}"
+        );
+
+        let seen: BTreeSet<u32> = lines.iter().flatten().copied().collect();
+        assert!(
+            seen.iter().all(|&l| (2..=5).contains(&l)),
+            "the body's ops must come from lines 2..=5, saw {seen:?}"
+        );
+        assert!(seen.contains(&2) && seen.contains(&5), "both ends of the body appear: {seen:?}");
+
+        let flat: Vec<u32> = lines.iter().flatten().copied().collect();
+        assert!(
+            flat.windows(2).all(|w| w[0] <= w[1]),
+            "a straight-line body's lines must not run backwards: {flat:?}"
+        );
     }
 
     /// A docstring carrying a surrogate is REFUSED, in every position a docstring can occupy.
@@ -6050,7 +6468,7 @@ xs.append(1, 2)
         )
         .unwrap();
         for helper in ["__min_list_int", "__max_list_int"] {
-            let reducer = m.functions.iter().find(|f| f.name == helper);
+            let reducer = m.functions.iter_bodies().find(|f| f.name == helper);
             assert!(reducer.is_some(), "{helper} is injected");
             assert_eq!(reducer.unwrap().local_types[0], StaticType::ListInt);
             assert!(loads_global(func(&m, "main"), helper), "main loads {helper}");
@@ -6082,7 +6500,7 @@ xs.append(1, 2)
     fn a_user_min_def_suppresses_its_reducer() {
         let m = compile_src("def min(xs):\n    return 999\n\nprint(min([1, 2, 3]))\n").unwrap();
         assert!(
-            !m.functions.iter().any(|f| f.name == "__min_list_int"),
+            !m.functions.iter_bodies().any(|f| f.name == "__min_list_int"),
             "no reducer when the user shadows min"
         );
     }
@@ -6091,11 +6509,11 @@ xs.append(1, 2)
     fn an_unused_extremum_injects_no_reducer() {
         let m = compile_src("def main() -> int:\n    return max([1, 2])\n\nprint(main())\n").unwrap();
         assert!(
-            m.functions.iter().any(|f| f.name == "__max_list_int"),
+            m.functions.iter_bodies().any(|f| f.name == "__max_list_int"),
             "max is used, so its reducer is injected"
         );
         assert!(
-            !m.functions.iter().any(|f| f.name == "__min_list_int"),
+            !m.functions.iter_bodies().any(|f| f.name == "__min_list_int"),
             "min is never referenced, so no min reducer is injected"
         );
     }
@@ -6169,9 +6587,9 @@ xs.append(1, 2)
             m.body.ops.iter().filter(|op| matches!(op, Op::MakeFunction { .. })).count(),
             3
         );
-        assert!(m.functions.iter().any(|f| f.name == "C.__init__"));
-        assert!(m.functions.iter().any(|f| f.name == "C.get"));
-        let init = m.functions.iter().find(|f| f.name == "C.__init__").unwrap();
+        assert!(m.functions.iter_bodies().any(|f| f.name == "C.__init__"));
+        assert!(m.functions.iter_bodies().any(|f| f.name == "C.get"));
+        let init = m.functions.iter_bodies().find(|f| f.name == "C.__init__").unwrap();
         assert!(init.ops.iter().any(|op| matches!(op, Op::SetAttr { .. })));
     }
 
@@ -6179,7 +6597,7 @@ xs.append(1, 2)
     fn super_call_in_method_emits_loadsuper() {
         let src = "class A:\n    def m(self):\n        return 1\n\nclass B(A):\n    def m(self):\n        return super().m() + 1\n\ndef main():\n    return B().m()\n";
         let m = compile_src(src).unwrap();
-        let bm = m.functions.iter().find(|f| f.name == "B.m").unwrap();
+        let bm = m.functions.iter_bodies().find(|f| f.name == "B.m").unwrap();
         assert!(bm.ops.iter().any(|op| matches!(op, Op::LoadSuper(_))));
         let g = compile_src("def f():\n    return super()\n").unwrap();
         assert!(!func(&g, "f").ops.iter().any(|op| matches!(op, Op::LoadSuper(_))));
@@ -6321,9 +6739,15 @@ xs.append(1, 2)
     #[test]
     fn starred_assign_emits_unpack_ex() {
         let m = compile_src("def f(p):\n    a, *b = p\n    return a\n").unwrap();
-        assert!(func(&m, "f").ops.iter().any(|op| matches!(op, Op::UnpackEx { before: 1, after: 0 })));
+        let f = func(&m, "f");
+        assert!(f.ops.iter().any(
+            |op| matches!(op, Op::UnpackEx { site } if f.wide_operands[*site as usize] == [1, 0])
+        ));
         let m2 = compile_src("def f(p):\n    a, *b, c = p\n    return a\n").unwrap();
-        assert!(func(&m2, "f").ops.iter().any(|op| matches!(op, Op::UnpackEx { before: 1, after: 1 })));
+        let f2 = func(&m2, "f");
+        assert!(f2.ops.iter().any(
+            |op| matches!(op, Op::UnpackEx { site } if f2.wide_operands[*site as usize] == [1, 1])
+        ));
     }
 
     #[test]
@@ -6333,7 +6757,7 @@ xs.append(1, 2)
         let c = compile_src("def f(r):\n    return {x for x in r}\n").unwrap();
         let comp = c
             .functions
-            .iter()
+            .iter_bodies()
             .find(|co| co.name.contains("<setcomp."))
             .expect("a hoisted setcomp function");
         assert!(comp.ops.iter().any(|op| matches!(op, Op::BuildSet(0))));
@@ -6347,7 +6771,7 @@ xs.append(1, 2)
         let m = compile_src("def f(r):\n    return [x * 2 for x in r if x]\n").unwrap();
         let comp = m
             .functions
-            .iter()
+            .iter_bodies()
             .find(|co| co.name.contains("<listcomp."))
             .expect("a hoisted listcomp function");
         assert!(comp.ops.iter().any(|op| matches!(op, Op::BuildList(0))));
@@ -6358,7 +6782,7 @@ xs.append(1, 2)
         let d = compile_src("def f(r):\n    return {x: x for x in r}\n").unwrap();
         let dc = d
             .functions
-            .iter()
+            .iter_bodies()
             .find(|co| co.name.contains("<dictcomp."))
             .expect("a hoisted dictcomp function");
         assert!(dc.ops.iter().any(|op| matches!(op, Op::BuildDict(0))));
@@ -6447,7 +6871,7 @@ xs.append(1, 2)
             get_x.ops,
             vec![
                 Op::LoadFast(0),
-                Op::LoadAttr { name: 0, cache: 0 },
+                Op::LoadAttr { site: 0 },
                 Op::Return,
                 Op::LoadConst(0),
                 Op::Return,

@@ -1,0 +1,26 @@
+# PART: the Arduino Modulino Motors node.
+#
+# A MAX22211 motor driver, commanded by the node's MCU. What answers on the bus is the node's FIRMWARE, so the interface is a property of a
+# software release rather than of a part. See `modulino.toml` for what that means for every member.
+
+[table]
+kind = "device"
+family = "modulino"
+part = "motors"
+base = "modulino"
+sources = [
+    "Arduino Modulino Motors user manual ABX00114, section 7.5 'I2C Address Reference': default address 0x6A, hardware address 0x35, editable to any custom address in software.",
+]
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- a disagreement worth carrying ------------------------------------------------------------
+#
+# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS. A unit on this bench answered 0x24, where the manual gives 0x6A and 0x35. Since the address is software-assignable the two are not in contradiction -- a unit carries whatever its firmware was built with -- but a program written to the documented default does not find this one.
+
+[address]
+bus = "i2c"
+base = 0x35
+notes = "Arduino ABX00114 section 7.5 prints TWO columns: 0x6A under the product's own name and 0x35 under 'Hardware I2C Address'. The second is the 7-bit address a bus scan sees and is the one stated here; the first is that value shifted up with the read/write bit appended, and writing it into a 7-bit field addresses something else. A node of this type answered address 0x24 on an I2C walk of a Raspberry Pi Pico 2. That establishes only that SOMETHING acknowledged that address: these nodes carry no identity register, so nothing read can say which one it was, and the address is software-assignable so it is not evidence of type either. It matches NEITHER column of the manual, which gives 0x6A and 0x35."

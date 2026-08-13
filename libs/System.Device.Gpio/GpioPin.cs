@@ -33,5 +33,19 @@ namespace System.Device.Gpio
 
         /// <summary>Toggles the output of this pin (when configured as an output).</summary>
         public void Toggle() { _controller.Toggle(_pinNumber); }
+
+        /// <summary>Occurs when the value of this pin changes.</summary>
+        public event PinChangeEventHandler ValueChanged
+        {
+            add
+            {
+                _controller.RegisterCallbackForPinValueChangedEvent(
+                    _pinNumber, PinEventTypes.Rising | PinEventTypes.Falling, value);
+            }
+            remove
+            {
+                _controller.UnregisterCallbackForPinValueChangedEvent(_pinNumber, value);
+            }
+        }
     }
 }

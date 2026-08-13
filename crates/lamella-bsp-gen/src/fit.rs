@@ -32,6 +32,13 @@ pub struct Budget {
 }
 
 /// Whether the image fits the budget.
+///
+/// **`Unknown` IS A THIRD ANSWER AND IT IS NOT `Exceeds`.** A part row that declares no flash
+/// (an XIP chip) on a board that declares no region gives a budget of ZERO -- and rendering zero as
+/// a comparison would answer "your program does not fit" to a question nobody could answer. That is
+/// the same failure as a gate reporting green over a population it enumerated away: the arithmetic
+/// runs, the output looks like a verdict, and it describes nothing. An absent budget must say it is
+/// absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fit {
     /// It fits, with this many bytes to spare.
@@ -80,6 +87,10 @@ pub struct FitVerdict {
     /// The RAM budget, always chip truth.
     pub ram: Budget,
     /// What the verdict took as given -- the profile it describes.
+    ///
+    /// A verdict without these is the failure mode this whole design exists to avoid: somebody
+    /// plans a product around "it fits in the 8 MB PSRAM", the board arrives BARE because nobody
+    /// soldered anything, and it does not fit. **Assumptions belong in the answer, not in a log.**
     pub assumptions: Vec<String>,
     /// What a hardware-free verdict STRUCTURALLY cannot answer, so "fits" is never read as
     /// "verified". Flash and RAM are sound arithmetic; timing and peripheral behaviour are not --
@@ -176,6 +187,9 @@ mod tests {
         PartRow { part: String::from("rp2040"), flash: 0, ram: 0x0004_2000, ..PartRow::default() }
     }
 
+    /// THE CASE THE TWO-SOURCE JOIN EXISTS FOR. The part row says `flash = 0` because the chip
+    /// has none; the board says 2 MB because that is what is soldered on. Reading the PART alone
+    /// answers "nothing fits" for every XIP board in the v1 set -- confidently, and wrongly.
     #[test]
     fn an_xip_boards_flash_comes_from_the_board_not_the_zero_on_its_chip_row() {
         let board = board_with(vec![region("flash", "flash", 0x0020_0000)]);
@@ -207,6 +221,9 @@ mod tests {
         assert_eq!(verdict.flash.source, BudgetSource::Part);
     }
 
+    /// AN ABSENT BUDGET IS `Unknown`, NEVER `Exceeds`. Both sources silent is the one input
+    /// where the arithmetic would otherwise produce a confident refusal out of nothing: budget 0,
+    /// image > 0, "does not fit". A reader cannot tell that from a real overflow.
     #[test]
     fn no_stated_flash_anywhere_is_unknown_rather_than_a_refusal() {
         let verdict = fit(&board_with(Vec::new()), &xip_part(), 100_000);
@@ -230,6 +247,10 @@ mod tests {
         );
     }
 
+    /// A CONTROLLER-GATED region is NOT the XIP budget, and `xip_flash` already refuses it: a
+    /// linker script cannot lay a program into memory that is not there at reset. This pins that
+    /// the fit verdict inherits the refusal rather than quietly counting the bigger number -- the
+    /// exact shape of "plans a product around 8 MB of PSRAM".
     #[test]
     fn a_region_needing_bring_up_is_not_counted_as_the_code_budget() {
         let mut sdram = region("sdram", "flash", 0x0080_0000);

@@ -1,0 +1,54 @@
+# PART FAMILY: ST LSM303AGR, a three-axis accelerometer and a three-axis magnetometer in one
+# package -- and TWO INDEPENDENT BUS RESIDENTS rather than one part with two addresses.
+#
+# WHY THIS FAMILY HAS TWO MEMBERS INSTEAD OF ONE TABLE WITH A PLURAL ADDRESS. The vendor treats the
+# two halves as separate devices everywhere it matters:
+#
+#   - two I2C slave addresses, 0011001b and 0011110b, each stated as its own factory setting;
+#   - two identity registers at different addresses answering different values;
+#   - two DISJOINT register ranges inside one address map, 0x00-0x3F and 0x45-0x6F;
+#   - and, on the SPI path, TWO CHIP SELECTS, named CS_XL and CS_MAG.
+#
+# A part reachable only by selecting one of two chip selects is not one device. So each half states
+# its own address, its own identity and its own registers, and neither can be reached by addressing
+# the other. That also matches how BOARD truth has described this part for months: the micro:bit v2
+# board file carries two `[[devices]]` rows for one package, on the grounds that one package
+# answering two addresses is two bus residents.
+#
+# THE MEMBER NAMES ARE THE VENDOR'S OWN ABBREVIATIONS, taken from those chip-select names: XL for the
+# accelerometer and MAG for the magnetometer.
+#
+# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# facts; the generator RESOLVES the base and emits a fully flattened table per part.
+
+[table]
+kind = "device-base"
+family = "lsm303agr"
+sources = [
+    "ST LSM303AGR datasheet DocID027765 Rev 11: register address map ch 8 table 26, I2C operation ch 6.1 including the subaddress rule and tables 24-25 of SAD + read/write patterns, SPI operation ch 6.2, identity registers ch 8.4 (WHO_AM_I_A) and ch 8.38 (WHO_AM_I_M).",
+]
+notes = [
+    "Register width is 8 bits throughout. The two halves share one printed register map and no register address: the accelerometer occupies 0x00 to 0x3F and the magnetometer 0x45 to 0x6F, with reserved ranges between them.",
+    "Reserved registers must not be written. The datasheet states that writing to them may cause permanent damage to the device, which is a stronger warning than the usual one and is the reason no member describes a register it has not read in the map.",
+    "The registers loaded at boot hold factory calibration values and must not be changed. They are restored automatically at power-up.",
+]
+
+# --- buses ---------------------------------------------------------------------------------------
+#
+# Shared by both halves as a PROTOCOL, while the address and the chip select that select a half are
+# not. Each member states its own address. The SPI chip select is a wire on the board a part is
+# fitted to rather than a property of the part, so no part table states one.
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "THE REGISTER BYTE CARRIES A FLAG THIS MODEL CANNOT PLACE IN THE TRANSFORM. The datasheet states that of the 8-bit subaddress, the 7 low bits are the register address and THE MSB ENABLES ADDRESS AUTO-INCREMENT. So a single-byte read writes the address as-is, and a MULTI-BYTE read must write it with bit 7 SET -- two transforms on one bus, where this schema carries one. A burst issued without the bit re-reads the same register for every byte, which yields three identical axis values rather than an error. The transform above describes the SINGLE-byte case, and the burst case is stated here because there is nowhere else to put it. THE SAME BIT MEANS SOMETHING ELSE ELSEWHERE IN THIS CATALOGUE: on a BMx280's SPI path, bit 7 of the register byte is the read/write direction. Same bit, same position, unrelated meaning, both shipped here."
+
+[buses.spi]
+kind = "spi"
+register_read_transform = "set-bit7"
+register_write_transform = "clear-bit7"
+read_protocol = "single-chip-select-address-then-clock-data"
+notes = "The two halves have SEPARATE CHIP SELECTS, CS_XL and CS_MAG, so this bus reaches one half at a time and which half is a property of the wiring rather than of any byte sent. The interface uses three wires: a chip select per half, SPC and SDI/O."

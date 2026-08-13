@@ -3,6 +3,7 @@ namespace System
 {
     public sealed class Console
     {
+        [Lamella.Runtime.RuntimeProvided] public static void WriteLine() { }
         [Lamella.Runtime.RuntimeProvided] public static void WriteLine(int value) { }
         [Lamella.Runtime.RuntimeProvided] public static void WriteLine(string value) { }
         [Lamella.Runtime.RuntimeProvided] public static void WriteLine(bool value) { }

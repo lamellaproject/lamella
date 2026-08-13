@@ -1,0 +1,62 @@
+# The ECMAScript engine: lexer, parser, early errors, and an interpreter that walks a precompiled
+# artifact rather than a syntax tree.
+#
+# The identifier tables are the one place that will want a shared crate -- `lamella-unicode`
+# ships XID_Start/XID_Continue, and ECMAScript needs ID_Start/ID_Continue, which differ. See
+# `unicode.rs`: the delta is named, measured and refused, never silently substituted.
+[package]
+name = "lamella-js-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "An ECMAScript engine for constrained devices: parser, precompiler, and an interpreter that executes straight out of flash."
+publish = false
+
+[lib]
+name = "lamella_js_frontend"
+path = "src/lib.rs"
+
+# THE FIRST AND ONLY RUNTIME DEPENDENCY, and it is here because `f64` MATH IS `std` RATHER THAN
+# `core`: `trunc`, `sqrt`, `pow`, `sin` and the rest do not exist on a target without `std`, which a
+# Cortex-M33 is. An audit found that was the ONLY category standing between this engine and bare
+# metal -- everything else was already `core` + `alloc`, with exactly two `HashMap`s to swap.
+#
+# It is libm EVERYWHERE rather than std-on-host-and-libm-on-device. The tiers
+# SHARE one soft-float so float results are BIT-IDENTICAL; a host/device split
+# would give one number in a REPL and another on silicon, breaking the engine's guiding principle
+# ("interp-P implies device-P") in the one place the engine controls completely. See src/math.rs.
+# `bench-counters` IS OFF BY DEFAULT AND MUST STAY OFF, because a build that is being TIMED must
+# not carry the instrument that counts for it. The counters supply the DENOMINATOR of a per-node
+# cost; the numerator comes from a build without them. Enabling it by default would fold the cost of
+# counting into every number published here, and the fold would be invisible.
+[features]
+default = []
+bench-counters = []
+
+# `eval` COMPILES SOURCE AT RUN TIME, so it references the PARSER -- 44,952 B on an RP2350.
+#
+# It is a BUILD-time feature rather than a run-time check, and that is the whole reason it exists
+# as a feature at all: the realm installs `eval` unconditionally, so a run-time `if enabled` would
+# keep the reference to the parser in the binary, the linker would keep the parser, and every
+# parser-free image would pay for a facility it refuses. The precompiled tier exists precisely so a
+# device does not carry a parser. Measured rather than assumed: turning it on costs 44,504 B on an
+# RP2350, which is 99% of what the parser costs on its own.
+eval = []
+
+[dependencies]
+libm = { version = "0.2.16", default-features = false }
+
+# THE PRECOMPILED-CODE FORMAT AND ITS IN-PLACE READER. This crate owns the AST, so it is the
+# right home for the two bridges that know about one: `bytecode::encode` (AST -> artifact) and
+# `bytecode::decode` (artifact -> AST). The format crate itself knows nothing of the AST and
+# depends on nothing.
+#
+# THE DIRECTION MATTERS AND IT IS THE FAMILY'S. `lamella-py-bytecode` is the base of the Python
+# trio and both siblings depend on it; this mirrors that. It is also what lets the INTERPRETER
+# consume a `Node`, which a format crate depending on this one could never allow.
+lamella-js-bytecode = { path = "../lamella-js-bytecode" }
+
+# NO DEPENDENCIES AT ANY LEVEL -- not runtime, and deliberately none for development either.
+# The tests and examples that need a corpus or an instrumented allocator are a separate package, so
+# that a consumer of this crate resolves exactly two things: libm, and the format crate below.

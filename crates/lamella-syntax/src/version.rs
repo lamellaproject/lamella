@@ -45,18 +45,28 @@ pub enum LanguageVersion {
     CSharp7_3,
     /// C# 8.0. A gating label only; not yet implemented.
     CSharp8,
-    /// C# 9.0 -- the rung that carries TOP-LEVEL STATEMENTS; a gating label only; not yet implemented.
+    /// C# 9.0 -- the rung that carries TOP-LEVEL STATEMENTS, which is why the ceiling reaches here:
+    /// every dotnet/iot and nanoFramework sample program is a bare statement file with no `Main`.
+    /// A gating label only; not yet implemented.
     CSharp9,
-    /// C# 10.0 -- the rung that carries FILE-SCOPED NAMESPACES.
+    /// C# 10.0 -- the rung that carries FILE-SCOPED NAMESPACES, which 115 files of dotnet/iot use.
     /// A gating label only; not yet implemented.
     CSharp10,
-    /// C# 11.0 -- the rung that carries REQUIRED MEMBERS. A gating label only; not yet
+    /// C# 11.0 -- the rung that carries REQUIRED MEMBERS, the one C# 11 feature both compatibility
+    /// targets adopted (64 uses in dotnet/iot, 56 in nanoFramework). A gating label only; not yet
     /// implemented.
     CSharp11,
 }
 
 impl LanguageVersion {
     /// The dialect compiled when no `/langversion` is given.
+    ///
+    /// **STAYS C# 1.0, and is deliberately NOT derived from [`Self::SELECTABLE_MAX`].** It was
+    /// defined as the ceiling while the two were the same value, and leaving it that way would have
+    /// meant that raising the ceiling silently changed every compilation that never asked for a
+    /// dialect -- including the whole differential corpus, whose job is to hold lcsc against
+    /// ECMA-334 1st edition. The default is a conformance decision; the ceiling is a capability
+    /// one. They coincided once and must not be spelled as if they always will.
     pub const DEFAULT: LanguageVersion = LanguageVersion::CSharp1;
 
     /// The newest dialect `/langversion` will select.
@@ -94,8 +104,8 @@ impl LanguageVersion {
     /// every other, which is the shape this method exists to prevent.
     ///
     /// MEASURED, not read from a standard: a gating diagnostic is not described by ECMA-334 at all,
-    /// so csc is the only oracle there is. One compilation per
-    /// row against `csc /langversion:<v>`, 2026-08-02:
+    /// so csc is the only oracle there is. One compilation per row against
+    /// `csc /langversion:<v>`:
     ///
     /// | version | code | | version | code |
     /// |---|---|---|---|---|
@@ -142,8 +152,8 @@ impl LanguageVersion {
     /// How csc spells this version inside a diagnostic message: `C# 1`, not `C# 1.0`.
     ///
     /// Measured from the message text, which reads "is not available in C# 1." A trailing `.0`
-    /// would make our message differ from csc's for a diagnostic whose whole purpose is to be
-    /// searched for verbatim.
+    /// would differ from csc's for a diagnostic whose whole purpose is to be searched for
+    /// verbatim.
     #[must_use]
     pub fn message_name(self) -> &'static str {
         match self {
@@ -167,7 +177,7 @@ impl LanguageVersion {
     /// How csc spells this version as the REQUIRED one, in "Please use language version N or
     /// greater".
     ///
-    /// **A BARE MAJOR UP TO 6, AND `N.0` FROM 7 ON.** Measured, and I had it wrong first: I
+    /// **A BARE MAJOR UP TO 6, AND `N.0` FROM 7 ON.** Measured rather than generalized: reading
     /// generalized "7.0" from one feature's message into "always carries a minor part", and three
     /// more measurements falsified it -- `static classes` asks for "2", `automatically implemented
     /// properties` for "3", `async` for "5", `using static` for "6", while default interface
@@ -282,7 +292,8 @@ impl LanguageVersion {
         }
     }
 
-    /// A human-readable name such as `C# 1.0`, for OUR OWN prose (driver errors, help text).
+    /// A human-readable name such as `C# 1.0`, for this compiler's own prose (driver errors,
+    /// help text).
     ///
     /// Not for a csc-matched diagnostic: csc spells the same version two other ways depending on
     /// where in the sentence it lands. See [`Self::message_name`] and [`Self::required_name`].
@@ -346,6 +357,12 @@ pub enum Feature {
     AnonymousMethods,
     /// Nullable value types, for example `int?`. Introduced in C# 2.0.
     NullableValueTypes,
+    /// The `default` operator, `default(T)`. Introduced in C# 2.0.
+    ///
+    /// **It is the only spelling of a TYPE PARAMETER's zero**, which is why it arrived with
+    /// generics rather than beside them: `T` may close over a reference type or a value type, so
+    /// neither `null` nor `0` covers it and the choice has to be made where `T` is known.
+    DefaultOperator,
     /// The null-coalescing operator `??` (`a ?? b`). Introduced in C# 2.0.
     ///
     /// **The one feature in this table whose name could not be measured**, because csc's ISO-1 is
@@ -359,6 +376,10 @@ pub enum Feature {
     /// Introduced in C# 2.0.
     AccessorAccessibility,
     /// A lambda expression, `x => x`. Introduced in C# 3.0.
+    ///
+    /// **NOT the same feature as an expression-bodied member, though both are spelled `=>`.**
+    /// This variant covers the LAMBDA only: csc gates the two separately and THREE VERSIONS APART
+    /// -- see [`Feature::ExpressionBodiedMethod`].
     LambdaExpression,
     /// An expression-bodied method, `int M() => 1;`. Introduced in **C# 6.0**.
     ///
@@ -367,6 +388,11 @@ pub enum Feature {
     /// after the lambda that shares its token.** While the two were one variant, a dialect of C# 3,
     /// 4 or 5 PERMITTED an expression-bodied member that csc rejects; that is the accepts-invalid
     /// column, and it was harmless only because neither half is built yet.
+    ///
+    /// **A lexer cannot make this distinction** -- `=>` is one token and which feature it belongs
+    /// to is a question about the enclosing declaration. So the lexer keeps gating
+    /// [`Feature::LambdaExpression`], which is the correct LOWER bound (`=>` does not exist at all
+    /// before C# 3), and the C# 6 half needs a parser-side site that arrives with the feature.
     ExpressionBodiedMethod,
     /// An expression-bodied property, `int P => 1;`. Introduced in **C# 6.0**.
     ///
@@ -376,6 +402,10 @@ pub enum Feature {
     /// accessors at C# 7.0; they get variants when there is a site to raise them from.)
     ExpressionBodiedProperty,
     /// An object initializer, `new C { F = 1 }`. Introduced in C# 3.0.
+    ///
+    /// **csc names the two initializer forms differently and this one is the DEFAULT**: an empty
+    /// `new C { }` is reported as an object initializer, measured. See
+    /// [`Feature::CollectionInitializer`].
     ObjectInitializer,
     /// A collection initializer, `new ArrayList { 1, 2 }`. Introduced in C# 3.0.
     ///
@@ -408,13 +438,22 @@ pub enum Feature {
     DigitSeparators,
     /// Top-level statements -- a compilation unit whose statements ARE the program, with no
     /// enclosing type and no `Main`. Introduced in C# 9.0.
+    ///
+    /// **The reason the ceiling reaches C# 9 at all.** Every dotnet/iot and nanoFramework sample
+    /// program is written this way, so the dialect a drop-in sample needs is set by the samples
+    /// rather than by the libraries -- whose own public surface is C# 6-8.
     TopLevelStatements,
     /// A file-scoped namespace declaration -- `namespace N;` rather than `namespace N { ... }`.
-    /// Introduced in C# 10.0. It is pure
+    /// Introduced in C# 10.0. **115 files of dotnet/iot are written this way**, and it is pure
     /// syntax: no metadata, no runtime, no binder change, so it is the highest ratio of
     /// files-unblocked to work on the compatibility list.
     FileScopedNamespaces,
     /// A `required` member -- an initializer the caller MUST supply. Introduced in C# 11.0.
+    ///
+    /// **The one C# 11 feature both compatibility targets adopted**: 64 uses in dotnet/iot, 56 in
+    /// nanoFramework. Earlier research reported zero, having measured only the PUBLIC surface; the
+    /// uses are in drivers and internals. Unlike the two above it is a real feature rather than
+    /// syntax -- it needs `RequiredMemberAttribute` and an initialization-safety rule.
     RequiredMembers,
     /// A digit separator IMMEDIATELY AFTER a base prefix -- `0x_FF`, `0b_1010`. Introduced in
     /// C# 7.2, a full release AFTER separators themselves.
@@ -427,7 +466,8 @@ pub enum Feature {
     /// `Deconstruct`. Introduced in C# 9.0.
     ///
     /// **Sequenced AFTER generics deliberately**: a record is a code generator whose output binds
-    /// `IEquatable<T>`.
+    /// `IEquatable<T>`, so it cannot land before the thing it generates against. 44 uses in
+    /// dotnet/iot, 11 in nanoFramework.
     Records,
 }
 
@@ -441,14 +481,20 @@ impl Feature {
     /// compile. A feature the dialect permits and we have not built has to be refused by NAME --
     /// telling the user to "use language version 7 or greater" when they already did would be a
     /// lie, and one that sends them looking for a compiler switch that cannot help.
+    ///
+    /// `static class` is the shape to keep in mind: its emit path is complete (see the
+    /// `GATED FEATURE (ISO-2)` markers in `compile.rs` and `declaration.rs`) and it is refused
+    /// anyway, because ISO-1 is the dialect. Implemented and permitted are two bits, and only both
+    /// together admit a construct.
     #[must_use]
     pub fn is_implemented(self) -> bool {
         match self {
             Feature::StaticClasses | Feature::BinaryLiterals | Feature::DigitSeparators => true,
             Feature::FileScopedNamespaces => true,
             Feature::ObjectInitializer | Feature::CollectionInitializer => true,
-            Feature::Generics
-            | Feature::AnonymousMethods
+            Feature::Generics => true,
+            Feature::DefaultOperator => true,
+            Feature::AnonymousMethods
             | Feature::NullableValueTypes
             | Feature::NullCoalescing
             | Feature::NamespaceAlias
@@ -481,6 +527,7 @@ impl Feature {
             | Feature::NullableValueTypes
             | Feature::NullCoalescing
             | Feature::AccessorAccessibility
+            | Feature::DefaultOperator
             | Feature::NamespaceAlias => LanguageVersion::CSharp2,
             Feature::LambdaExpression
             | Feature::ObjectInitializer
@@ -503,6 +550,10 @@ impl Feature {
 
     /// The noun phrase csc quotes in `Feature '<name>' is not available in C# N`.
     ///
+    /// **EVERY STRING HERE IS csc's, MEASURED one compilation each**, because the message is a
+    /// search key: a user who pastes it into a search engine has to land on the same results a csc
+    /// user does.
+    ///
     /// | we said | csc says |
     /// |---|---|
     /// | nullable value types | **nullable types** |
@@ -514,15 +565,19 @@ impl Feature {
     /// | named arguments | **named argument** (singular) |
     /// | null-conditional operators (`'?.'` and `'?['`) | **null propagating operator** (one name, both operators -- measured) |
     ///
-    /// **The pattern in our errors is that we described the LANGUAGE and csc names the
-    /// CONSTRUCT**: a parenthesized operator spelling, a plural where csc reports one occurrence,
+    /// **THE PATTERN IS THAT A DESCRIPTION OF THE LANGUAGE IS NOT csc's NAME FOR THE CONSTRUCT**:
+    /// a parenthesized operator spelling, a plural where csc reports one occurrence,
     /// and two features merged where the message has to pick one noun. The last kind is the one
     /// that cost something real -- see [`Feature::ExpressionBodiedMethod`], where the merge also
     /// carried the wrong VERSION.
+    ///
+    /// **Do NOT add quotes here.** The renderers supply them, and a string carrying its own
+    /// would nest.
     #[must_use]
     pub fn description(self) -> &'static str {
         match self {
             Feature::Generics => "generics",
+            Feature::DefaultOperator => "default operator",
             Feature::AnonymousMethods => "anonymous methods",
             Feature::NullableValueTypes => "nullable types",
             Feature::NullCoalescing => "null coalescing operator",
@@ -606,8 +661,12 @@ mod tests {
         assert!(LanguageVersion::CSharp2.supports(Feature::StaticClasses));
         assert!(!LanguageVersion::CSharp1.supports(Feature::StaticClasses));
 
+        assert!(Feature::Generics.is_implemented());
         assert!(LanguageVersion::CSharp2.supports(Feature::Generics));
-        assert!(!Feature::Generics.is_implemented());
+        assert!(!LanguageVersion::CSharp1.supports(Feature::Generics));
+
+        assert!(LanguageVersion::CSharp2.supports(Feature::AnonymousMethods));
+        assert!(!Feature::AnonymousMethods.is_implemented());
 
         for feature in [
             Feature::Generics,
@@ -678,6 +737,7 @@ mod tests {
     /// by the exhaustive `match` in `description`; adding it here is what makes it caught HERE too.
     const EVERY_FEATURE: &[Feature] = &[
         Feature::Generics,
+        Feature::DefaultOperator,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
         Feature::NullableValueTypes,

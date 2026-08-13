@@ -1,6 +1,37 @@
 # BOARD binding: the STM32072B-EVAL -- an EVALUATION board rather than a Discovery or a Nucleo,
 # which is a different KIND of product: it exists to demonstrate every peripheral of the part at
 # once. Most of what this file has to say is in what it DOES NOT contain.
+#
+# TWENTY POPULATED DEVICE BLOCKS, AND THE SCHEMA HAS ROOM FOR THREE OF THEM. UM1714's own
+# introduction lists what is fitted: a motor-control connector, USB full-speed, RS232, RS485, an
+# audio DAC and a microphone ADC, touch-sensing buttons, a TFT LCD, CAN, IrDA, an IR LED and an IR
+# receiver, a light-dependent resistor, a microSD card, HDMI CEC on two connectors, a smart-card
+# slot, an RF EEPROM and a temperature sensor. What lands below is four LEDs, a button and a
+# joystick.
+#
+# AND THE LIMIT IS NOT THE COUNT -- IT IS THE NUMBER OF SHAPES. A `[[devices]]` row is EITHER
+# pin-wired (a GPIO line with a level) OR bus-wired (a role plus an address, the I2C shape). A
+# colour TFT reached over SPI with a chip select is neither. A microSD with its own select and a
+# card-detect line is neither. A smart card is neither. So the omissions below are not a backlog to
+# be worked through -- each one is the same missing shape, and adding fifty rows of the two shapes
+# that exist would not reach any of them.
+#
+# THIS BOARD HAS NO VIRTUAL COM PORT, WHICH NO OTHER BOARD HERE CAN SAY. Its debugger is an
+# ST-LINK/V2 rather than a V2-1, and UM1714 describes no VCP anywhere: the serial console leaves
+# through an RS-232 transceiver to a 9-pin D connector, so it reaches a host only through a cable
+# and an adapter that are not part of the board. Every carrier kind the model has -- `stlink-vcp`,
+# `cmsis-dap`, `native-usb`, an EDBG bridge -- names a path from the target to the host THROUGH the
+# board. This one has none, so the board declares no carrier at all, and that is a statement rather
+# than an omission.
+#
+# AND UM1714's IO TABLE HAS TWO ASSIGNMENT COLUMNS, NOT ONE. Table 34 is headed "STM32072B-EVAL
+# general IO assignment" and "STM32072B-EVAL motor control IO assignment", and the same pins carry
+# different board-level meanings in the two: PA1 is the light sensor's output in one column and
+# MC_BusVoltage / Emergency_STOP3 in the other; PA6 and PA7 are unused in one and motor encoder
+# inputs in the other; PE8 through PE13 are the six gate drives. A board file states ONE wiring.
+# This board's own manual states TWO, in parallel, and they overlap on real pins. Nothing below
+# names a motor-control pin, so this file describes the general-IO column -- said explicitly,
+# because a reader who assumed a board has one personality would not think to ask.
 
 [table]
 kind = "board"
@@ -17,7 +48,9 @@ sources = [
 notes = [
     "The joystick is FIVE SEPARATE GPIO INPUTS rather than one device -- a select and four directions, each on its own pin with its own pull-down. It is stated as five rows because that is what the board wires; a reader wanting one logical control assembles it, and nothing here decides how.",
     "B1 is the RESET button and carries no row: it drives NRST rather than a port pin, so it is not a line a program can read. B2, labelled 'tamper', is the one general-purpose button.",
+    "The LED colours are LD1 green, LD2 orange, LD3 red, LD4 blue, read off the schematic. No colour reaches an artifact -- it is recorded because the manual's prose calls them only 'four general purpose color LEDs' and a later reader matching a photograph to a pin has nothing else to go on.",
     "NOT MODELLED AND EACH FOR THE SAME REASON: the TFT LCD (SPI1, chip select PE6), the microSD card (chip select PF2, card-detect PB15), the smart card, the audio DAC and microphone, the RF EEPROM and temperature sensor on I2C2, the touch-sensing buttons, CAN, IrDA, the IR LED and receiver, the potentiometer on PC0 and the light-dependent resistor on PA1. Every one of them is a device whose shape is neither a GPIO line nor a bus address.",
+    "THE TFT IS THE SHARPEST CASE AND IT IS WORTH THE SENTENCE. UM1714's note on Table 18: a bidirectional voltage translator sits on the SPI MOSI signal between the MCU and the LCD, and its DIRECTION is driven by PB2 -- 'the IO PE15 is working as MOSI when PB2 is high or as MISO when PB2 is LOW'. So a device row would need a control line that changes what ANOTHER pin means, mid-transfer. No shape in the model expresses that, and a binding that named PE15 as mosi would be right only half the time.",
 ]
 
 # --- control lines ---------------------------------------------------------------------------

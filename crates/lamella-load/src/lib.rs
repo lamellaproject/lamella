@@ -64,7 +64,8 @@ use lamella_cil_runtime::intrinsics::{
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
     object_reference_equals, object_to_string,
     initialize_array, get_custom_attributes, string_concat, string_concat_object2,
-    string_ctor_char_ptr, string_ctor_char_ptr_range, string_get_pinnable_reference,
+    string_ctor_char_array, string_ctor_char_array_range, string_ctor_char_ptr,
+    string_ctor_char_ptr_range, string_ctor_char_repeat, string_get_pinnable_reference,
     string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
     string_intern, string_is_interned,
@@ -256,7 +257,15 @@ impl FieldNameIndex {
 /// The qualified key (`namespace.name`) for a type, matching across assemblies: a program's
 /// `TypeRef` to a corlib interface computes the same key the corlib's `TypeDef` did.
 fn type_name_key(name: TypeName<'_>) -> String {
-    alloc::format!("{}.{}", name.namespace, name.name)
+    type_key(name.namespace, name.name)
+}
+
+/// [`type_name_key`] over an already-resolved pair, which is the form
+/// [`Assembly::type_token_full_name`] answers in: a NESTED type's key carries its enclosing chain
+/// where its namespace would be, and that chain is an owned `String` rather than a borrow of the
+/// row. One formatter for both, so a nested key and a top-level one cannot drift apart.
+fn type_key(namespace: &str, name: &str) -> String {
+    alloc::format!("{namespace}.{name}")
 }
 
 /// A type's canonical FULL name -- `namespace.name`, or the BARE `name` in the global namespace
@@ -286,31 +295,13 @@ fn full_type_name(name: TypeName<'_>) -> String {
 /// answered by construction rather than by a rule anyone has to remember.
 ///
 /// The walk is bounded: a malformed cyclic `NestedClass` cannot spin here.
-fn key_type_name(type_def: &TypeDef<'_>) -> Option<(String, String)> {
-    let own = type_def.name()?;
-    let mut prefix = String::new();
-    let mut current = type_def.enclosing_type();
-    for _ in 0..16 {
-        let Some(outer) = current else { break };
-        let outer_name = outer.name()?;
-        let mut next = String::from(outer_name.name);
-        if !prefix.is_empty() {
-            next.push('.');
-            next.push_str(&prefix);
-        }
-        prefix = next;
-        if !outer_name.namespace.is_empty() {
-            prefix = alloc::format!("{}.{}", outer_name.namespace, prefix);
-            break;
-        }
-        current = outer.enclosing_type();
-    }
-    let namespace = if prefix.is_empty() {
-        String::from(own.namespace)
-    } else {
-        prefix
-    };
-    Some((namespace, String::from(own.name)))
+/// It DELEGATES, and that is the point of it now. This walk existed here and again in the binder,
+/// and the `TypeRef` half -- which a reference to a nested type needs and a definition never does --
+/// existed in neither. One function in `lamella-metadata` answers for both tables, so the index this
+/// builds from a `TypeDef` and the lookup another assembly makes through a `TypeRef` cannot spell
+/// the same type two ways.
+fn key_type_name(assembly: &Assembly<'_>, type_def: &TypeDef<'_>) -> Option<(String, String)> {
+    assembly.type_token_full_name(type_def.token())
 }
 
 /// [`field_name_key`] over an already-resolved `(namespace, type)` pair -- the form
@@ -386,7 +377,93 @@ fn encode_sig_type(assembly: &Assembly, sig: &SigType) -> String {
         SigType::ByRef(referent) => {
             alloc::format!("ByRef({})", encode_sig_type(assembly, referent))
         }
+        SigType::GenericInst {
+            definition,
+            arguments,
+        } => {
+            let mut key = alloc::format!("GenericInst({}", encode_sig_type(assembly, definition));
+            for argument in arguments {
+                key.push(',');
+                key.push_str(&encode_sig_type(assembly, argument));
+            }
+            key.push(')');
+            key
+        }
         other => alloc::format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod encode_sig_type_tests {
+    use super::{Assembly, SigType, encode_sig_type};
+
+    /// A dispatch key must not carry a metadata TOKEN, because the two sides of a cross-assembly
+    /// dispatch name the same type through different ones.
+    ///
+    /// THIS IS THE PROPERTY, NOT THE SPELLING. Asserting the exact string would freeze an encoding
+    /// that is still open; asserting token-freedom is the thing that actually has to hold, and it
+    /// is what `GenericInst` violated by falling through to the `{:?}` fallback.
+    ///
+    /// **IT REFUSES TO PASS VACUOUSLY.** If no fixture contains a generic instantiation in any
+    /// signature, the property is trivially true and the test would be measuring nothing -- so
+    /// finding zero is a FAILURE, not a skip.
+    #[test]
+    fn a_generic_instantiation_encodes_without_a_token() {
+        let dir = alloc::format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("fixtures absent; skipping");
+            return;
+        };
+        let mut seen = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("dll") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(assembly) = Assembly::read(&bytes) else {
+                continue;
+            };
+            seen += generic_instantiations_encode_by_name(&assembly);
+        }
+        assert!(
+            seen > 0,
+            "no fixture carries a generic instantiation in any signature, so this test asserted \
+             nothing -- add one rather than letting it pass vacuously"
+        );
+    }
+
+    /// Encodes every generic instantiation in `assembly`'s signatures and asserts each is
+    /// token-free, returning how many it checked.
+    fn generic_instantiations_encode_by_name(assembly: &Assembly<'_>) -> usize {
+        let mut seen = 0usize;
+        for type_def in assembly.type_defs() {
+            for method in type_def.methods() {
+                let Some(signature) = method.signature() else {
+                    continue;
+                };
+                for parameter in signature
+                    .parameters
+                    .iter()
+                    .chain(core::iter::once(&signature.return_type))
+                {
+                    if !matches!(parameter, SigType::GenericInst { .. }) {
+                        continue;
+                    }
+                    seen += 1;
+                    let key = encode_sig_type(assembly, parameter);
+                    assert!(
+                        !key.contains("Token"),
+                        "a generic instantiation must encode by NAME, not by token -- the two sides \
+                         of a cross-assembly dispatch spell the same type through different tokens \
+                         and would key differently; got `{key}`"
+                    );
+                }
+            }
+        }
+        seen
     }
 }
 
@@ -1325,7 +1402,28 @@ pub fn load_program_lazy_corlib<'c, 'p>(
     }
     let mut module = Module::new();
     let mut resolution = CorlibResolution::new();
-    materialize_corlib_refs(&mut module, &mut resolution, program, corlib);
+    #[cfg(feature = "generics")]
+    let instantiations =
+        monomorphize::collect_instantiations(program, core::slice::from_ref(&corlib.clone()));
+    #[cfg(feature = "generics")]
+    let generic_definitions: Vec<String> = {
+        let mut names: Vec<String> = instantiations
+            .iter()
+            .map(|want| want.definition.clone())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
+    #[cfg(not(feature = "generics"))]
+    let generic_definitions: Vec<String> = Vec::new();
+    materialize_corlib_refs(
+        &mut module,
+        &mut resolution,
+        program,
+        corlib,
+        &generic_definitions,
+    );
     let program_type_offset = module.type_count();
     let entry = load_assembly(
         &mut module,
@@ -1339,15 +1437,23 @@ pub fn load_program_lazy_corlib<'c, 'p>(
     );
     #[cfg(feature = "generics")]
     {
-        let instantiations = monomorphize::collect_instantiations(
-            program,
-            core::slice::from_ref(&corlib.clone()),
-        );
+        let sources = alloc::vec![
+            monomorphize::DefinitionSource {
+                assembly: program.clone(),
+                asm: LAZY_PROGRAM_ASM,
+                type_offset: Some(program_type_offset),
+            },
+            monomorphize::DefinitionSource {
+                assembly: corlib.clone(),
+                asm: LAZY_CORLIB_ASM,
+                type_offset: None,
+            },
+        ];
         monomorphize::monomorphize(
             &mut module,
             program,
             LAZY_PROGRAM_ASM,
-            program_type_offset,
+            &sources,
             &resolution.type_index,
             &resolution.field_index,
             flash_cil,
@@ -1378,7 +1484,7 @@ pub fn load_delta_with_corlib<'d, 'c>(
     delta: &Assembly<'d>,
     corlib: &SourceAssembly<'c>,
 ) -> Result<DeltaInfo, DeltaError> {
-    materialize_corlib_refs(module, &mut context.resolution, delta, corlib);
+    materialize_corlib_refs(module, &mut context.resolution, delta, corlib, &[]);
     let delta_asm = context.next_delta_asm;
     let info = load_delta(module, context, delta)?;
     if let Some(name) = first_unresolved_call(module, delta, delta_asm, corlib) {
@@ -1420,6 +1526,12 @@ fn first_unresolved_call(
                 if token.table() != MEMBER_REF {
                     continue;
                 }
+                if assembly
+                    .member_ref(token.row())
+                    .is_some_and(|member| member.parent().table() == TYPE_SPEC)
+                {
+                    continue;
+                }
                 if module.resolve(asm, *token).is_some()
                     || module.is_delegate_ctor(asm, *token)
                     || module.delegate_invoke(asm, *token).is_some()
@@ -1458,11 +1570,26 @@ fn member_ref_display_name(assembly: &Assembly, token: Token) -> String {
 /// subject's own [`load_assembly`] binds those references by name exactly as it would against an
 /// eagerly-loaded corlib. A reference already materialized (its key is in `resolution.index`) or
 /// naming a NON-corlib type is skipped, left to the ordinary load / the intrinsic fallback.
+///
+/// # `generic_definitions` -- the references this walk cannot reach on its own
+///
+/// The walk follows what the subject's IL NAMES. A generic definition the subject instantiates is
+/// named through a `MemberRef` whose parent is a `TypeSpec`, which resolves to no corlib type by
+/// name, so the definition is invisible here -- and the monomorphizer then COPIES that definition's
+/// bodies out of `corlib` directly, bringing tokens for callees nothing materialized.
+///
+/// **MEASURED, by the tier-equivalence gate rather than by inspection**: with `List<T>` in the
+/// corlib, the eager tier answered 42 and this one answered `UnresolvedCall`, because
+/// `ArgumentOutOfRangeException::.ctor` and `ObjectArrayEnumerator::.ctor` are named only by
+/// `List<T>`'s own bodies. Seeding each definition's methods here is what puts their transitive
+/// closure in -- `materialize_corlib_method_row` already pushes a body's callees, so nothing new
+/// walks; the set just starts in the right place.
 fn materialize_corlib_refs<'c>(
     module: &mut Module,
     resolution: &mut CorlibResolution,
     assembly: &Assembly,
     corlib: &SourceAssembly<'c>,
+    generic_definitions: &[String],
 ) {
     let mut seen: BTreeSet<Token> = BTreeSet::new();
     let mut type_tokens: Vec<Token> = Vec::new();
@@ -1539,6 +1666,23 @@ fn materialize_corlib_refs<'c>(
                 &mut walk,
             );
         }
+    }
+    for definition in generic_definitions {
+        let mut type_row = 0u32;
+        for type_def in corlib.type_defs() {
+            type_row += 1;
+            let Some(name) = type_def.name() else {
+                continue;
+            };
+            if full_type_name(name).as_str() != definition.as_str() {
+                continue;
+            }
+            for method in type_def.methods() {
+                walk.worklist.push(method.rid());
+            }
+            break;
+        }
+        let _ = type_row;
     }
     let mut cursor = 0;
     loop {
@@ -1630,19 +1774,20 @@ fn bind_materialized_body_tokens<'c>(
 /// [`bind_call_targets`] binds to the site and [`resolve_callvirt`](lamella_cil_runtime) looks up in
 /// the runtime type's map, so the two agree by construction.
 fn callvirt_key(assembly: &Assembly, token: Token) -> Option<String> {
-    let (name, params) = match token.table() {
+    let (name, params, arity) = match token.table() {
         MEMBER_REF => {
             let member = assembly.member_ref(token.row())?;
             let name: String = member.name()?.into();
-            let params = member
-                .method_signature()
-                .map(|signature| signature.parameters)
-                .unwrap_or_default();
-            (name, params)
+            let signature = member.method_signature();
+            let arity = signature
+                .as_ref()
+                .map_or(0, |signature| signature.generic_param_count);
+            let params = signature.map(|signature| signature.parameters).unwrap_or_default();
+            (name, params, arity)
         }
         _ => return None,
     };
-    Some(sig_encode(assembly, &name, &params))
+    Some(sig_encode(assembly, &name, &params, arity, &[]))
 }
 
 /// Adds `fresh` keys to the dispatch map of every corlib type materialized so far. A type is
@@ -1978,17 +2123,18 @@ fn materialize_corlib_method_row<'c>(
                         let target = match operand.table() {
                             MEMBER_REF => corlib.member_ref(operand.row()).map(|member| {
                                 let target_name: String = member.name().unwrap_or("").into();
-                                let params = member
-                                    .method_signature()
-                                    .map(|signature| signature.parameters)
-                                    .unwrap_or_default();
-                                (target_name, params)
+                                let signature = member.method_signature();
+                                let arity =
+                                    signature.as_ref().map_or(0, |sig| sig.generic_param_count);
+                                let params =
+                                    signature.map(|sig| sig.parameters).unwrap_or_default();
+                                (target_name, params, arity)
                             }),
                             METHOD_DEF => corlib_method_name_params(corlib, operand.row()),
                             _ => None,
                         };
-                        if let Some((target_name, params)) = target {
-                            let key = sig_encode(corlib, &target_name, &params);
+                        if let Some((target_name, params, arity)) = target {
+                            let key = sig_encode(corlib, &target_name, &params, arity, &[]);
                             let argc = u16::try_from(params.len() + 1).unwrap_or(u16::MAX);
                             module.bind_call_target(LAZY_CORLIB_ASM, *operand, key.clone(), argc);
                             walk.dispatch.want(key);
@@ -2021,7 +2167,7 @@ fn collect_body_tokens(tokens: &mut BodyTokens, opcode: Opcode, operand: Token) 
         Opcode::Ldstr => {
             tokens.strings.insert(operand);
         }
-        Opcode::Call if operand.table() == METHOD_SPEC => {
+        Opcode::Call | Opcode::Callvirt if operand.table() == METHOD_SPEC => {
             tokens.generic_calls.insert(operand);
         }
         Opcode::Newobj => {
@@ -2366,7 +2512,7 @@ fn corlib_named_method_row(corlib: &Assembly, type_name: TypeName<'_>, method: &
 
 /// The declared name + parameter types of the corlib method at global `row` (the same numbering
 /// [`materialize_corlib_method_row`] uses), for building a `callvirt` target's signature key.
-fn corlib_method_name_params(corlib: &Assembly, row: u32) -> Option<(String, Vec<SigType>)> {
+fn corlib_method_name_params(corlib: &Assembly, row: u32) -> Option<(String, Vec<SigType>, u32)> {
     let mut method_row: u32 = 0;
     for type_def in corlib.type_defs() {
         for method in type_def.methods() {
@@ -2375,12 +2521,13 @@ fn corlib_method_name_params(corlib: &Assembly, row: u32) -> Option<(String, Vec
                 continue;
             }
             let name: String = method.name().unwrap_or("").into();
-            let params: Vec<SigType> = method
-                .signature()
+            let signature = method.signature();
+            let params: Vec<SigType> = signature
                 .as_ref()
                 .map(|signature| signature.parameters.clone())
                 .unwrap_or_default();
-            return Some((name, params));
+            let arity = signature.as_ref().map_or(0, |signature| signature.generic_param_count);
+            return Some((name, params, arity));
         }
     }
     None
@@ -2419,7 +2566,7 @@ fn materialize_corlib_sig_methods<'c>(
             break;
         };
         let mut method_row: u32 = 0;
-        let mut own: Vec<(u32, String, Vec<SigType>)> = Vec::new();
+        let mut own: Vec<(u32, String, Vec<SigType>, u32)> = Vec::new();
         let mut extends: Option<Token> = None;
         for type_def in corlib.type_defs() {
             let is_target = type_def
@@ -2431,12 +2578,13 @@ fn materialize_corlib_sig_methods<'c>(
                     continue;
                 }
                 let method_name: String = method.name().unwrap_or("").into();
-                let params: Vec<SigType> = method
-                    .signature()
+                let signature = method.signature();
+                let params: Vec<SigType> = signature
                     .as_ref()
                     .map(|signature| signature.parameters.clone())
                     .unwrap_or_default();
-                own.push((method_row, method_name, params));
+                let arity = signature.as_ref().map_or(0, |sig| sig.generic_param_count);
+                own.push((method_row, method_name, params, arity));
             }
             if is_target {
                 extends = Some(type_def.extends());
@@ -2446,8 +2594,8 @@ fn materialize_corlib_sig_methods<'c>(
         if extends.is_none() {
             break;
         }
-        for (row, method_name, params) in own {
-            let key = sig_encode(corlib, &method_name, &params);
+        for (row, method_name, params, arity) in own {
+            let key = sig_encode(corlib, &method_name, &params, arity, &[]);
             if sig.contains_key(&key) {
                 continue;
             }
@@ -2575,6 +2723,21 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
 /// [`load_with_corlib_unfrozen`] with the program's closed generic instantiations MONOMORPHIZED:
 /// each one becomes its own type identity, and the call sites that reach it bind to members of that
 /// identity instead of leaving the `UnloweredGeneric` mark the bake refuses on.
+///
+/// **THE SET IS A PARAMETER, AND SO IS EACH INSTANTIATION'S CANONICAL NAME.** This crate
+/// collects nothing and spells nothing: both already exist in the AOT tier, and a second collector
+/// or a second spelling would be a source of drift rather than a second opinion. See
+/// [`monomorphize`] for the whole argument. Passing an EMPTY set is exactly what every other
+/// `load_with_corlib*` entry point does, which is why they still refuse a generic program.
+///
+/// Returns the loaded program together with what the pass lowered and REFUSED. A refusal leaves its
+/// call sites marked, so `Module::validate_profile` still reports them and the bake still stops.
+///
+/// # Errors
+/// As [`load_with_corlib_and_libraries`].
+///
+/// # Panics
+/// As [`load_with_corlib_and_libraries`].
 pub fn load_with_corlib_monomorphized<'c, 'p>(
     corlib: &SourceAssembly<'c>,
     program: &SourceAssembly<'p>,
@@ -2609,6 +2772,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
     let mut index = NameIndex::new();
     let mut type_index = TypeNameIndex::new();
     let mut field_index = FieldNameIndex::new();
+    let corlib_type_offset = module.type_count();
     load_assembly(
         &mut module,
         corlib,
@@ -2619,7 +2783,9 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         &mut field_index,
         true,
     );
+    let mut library_type_offsets: Vec<usize> = Vec::with_capacity(libraries.len());
     for (position, library) in libraries.iter().enumerate() {
+        library_type_offsets.push(module.type_count());
         load_assembly(
             &mut module,
             library,
@@ -2643,11 +2809,42 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         &mut field_index,
         true,
     );
+    #[cfg(feature = "generics")]
+    let sources: Vec<monomorphize::DefinitionSource<'_>> = {
+        let mut sources = Vec::with_capacity(2 + libraries.len());
+        sources.push(monomorphize::DefinitionSource {
+            assembly: program.clone(),
+            asm: program_asm,
+            type_offset: Some(program_type_offset),
+        });
+        sources.push(monomorphize::DefinitionSource {
+            assembly: corlib.clone(),
+            asm: 0,
+            type_offset: Some(corlib_type_offset),
+        });
+        for (position, library) in libraries.iter().enumerate() {
+            sources.push(monomorphize::DefinitionSource {
+                assembly: library.clone(),
+                asm: 1 + position as u8,
+                type_offset: Some(library_type_offsets[position]),
+            });
+        }
+        sources
+    };
+    #[cfg(not(feature = "generics"))]
+    let sources: Vec<monomorphize::DefinitionSource<'_>> = {
+        let _ = (corlib_type_offset, &library_type_offsets);
+        alloc::vec![monomorphize::DefinitionSource {
+            assembly: program.clone(),
+            asm: program_asm,
+            type_offset: Some(program_type_offset),
+        }]
+    };
     let lowering = monomorphize::monomorphize(
         &mut module,
         program,
         program_asm,
-        program_type_offset,
+        &sources,
         &type_index,
         &field_index,
         flash_cil,
@@ -2715,7 +2912,7 @@ fn load_assembly<'pe>(
     let mut list_ctor_rows: BTreeMap<u32, u16> = BTreeMap::new();
     let mut sizeof_tokens: BTreeSet<Token> = BTreeSet::new();
     let mut value_type_tokens: Vec<Token> = Vec::new();
-    let mut methoddef_sigs: BTreeMap<u32, (String, Vec<SigType>)> = BTreeMap::new();
+    let mut methoddef_sigs: BTreeMap<u32, (String, Vec<SigType>, u32)> = BTreeMap::new();
     let mut type_extends: Vec<Token> = Vec::new();
     let mut type_interfaces: Vec<Vec<Token>> = Vec::new();
     let mut type_virtuals: Vec<Vec<VirtualMethod>> = Vec::new();
@@ -2727,8 +2924,14 @@ fn load_assembly<'pe>(
     let mut field_row: u32 = 0;
     let mut type_row: u32 = 0;
     index_enum_zeros(assembly, &mut field_index.enum_zeros);
+    let generic_definitions: BTreeSet<u32> = assembly
+        .generic_params()
+        .filter(|&(_, _, owner, _)| owner & 1 == 0)
+        .map(|(_, _, owner, _)| owner >> 1)
+        .collect();
     for type_def in assembly.type_defs() {
         type_row += 1;
+        let is_generic_definition = generic_definitions.contains(&type_row);
         let is_enum = is_enum_type(assembly, type_def.extends());
         if is_enum && has_flags_attribute(assembly, Token::new(TYPE_DEF, type_row)) {
             module.set_enum_flags(asm, Token::new(TYPE_DEF, type_row).0);
@@ -2746,7 +2949,7 @@ fn load_assembly<'pe>(
                     if let (Some(field_name), Some(slot)) =
                         (field.name(), module.static_field_slot(asm, token))
                     {
-                        if let Some((ns, tn)) = key_type_name(&type_def) {
+                        if let Some((ns, tn)) = key_type_name(assembly, &type_def) {
                             field_index.statics.insert(field_key(&ns, &tn, field_name), slot);
                         }
                     }
@@ -2773,7 +2976,7 @@ fn load_assembly<'pe>(
                 }
                 continue;
             }
-            if let (Some((ns, tn)), Some(field_name)) = (key_type_name(&type_def), field.name()) {
+            if let (Some((ns, tn)), Some(field_name)) = (key_type_name(assembly, &type_def), field.name()) {
                 instance_field_keys.insert(token.0, field_key(&ns, &tn, field_name));
             }
             own.push((
@@ -2792,8 +2995,8 @@ fn load_assembly<'pe>(
             {
                 module.set_string_type_id(type_id);
             }
-            if let Some((ns, tn)) = key_type_name(&type_def) {
-                type_index.insert(alloc::format!("{ns}.{tn}"), type_id);
+            if let Some((ns, tn)) = key_type_name(assembly, &type_def) {
+                type_index.insert(type_key(&ns, &tn), type_id);
             }
             module.bind_type_name(asm, Token::new(TYPE_DEF, type_row), name.name.into());
             module.bind_type_full_name(type_id, full_type_name(name));
@@ -2845,7 +3048,8 @@ fn load_assembly<'pe>(
                 .map(|sig| sig.parameters.clone())
                 .unwrap_or_default();
             let return_type: Option<SigType> = method_sig.as_ref().map(|sig| sig.return_type.clone());
-            methoddef_sigs.insert(method_row, (name.clone(), params.clone()));
+            let generic_arity = method_sig.as_ref().map_or(0, |sig| sig.generic_param_count);
+            methoddef_sigs.insert(method_row, (name.clone(), params.clone(), generic_arity));
             if is_delegate {
                 if name == ".ctor" {
                     module.mark_delegate_ctor(asm, token);
@@ -2881,7 +3085,7 @@ fn load_assembly<'pe>(
                 let id = module.add_intrinsic(asm, func, intr_id, arg_count(&method));
                 module.bind_token(asm, token, id);
                 module.set_method_type(id, type_id);
-                if let Some((ns, tn)) = key_type_name(&type_def) {
+                if let Some((ns, tn)) = key_type_name(assembly, &type_def) {
                     index.insert(
                         name_key(assembly, &ns, &tn, &name, &params, return_type.as_ref()),
                         id,
@@ -2893,6 +3097,7 @@ fn load_assembly<'pe>(
                         name: name.clone(),
                         params: params.clone(),
                         newslot: method.flags() & METHOD_NEWSLOT != 0,
+                        generic_arity,
                     });
                 }
                 if token.0 == entry_token {
@@ -2914,6 +3119,9 @@ fn load_assembly<'pe>(
                             callvirt_tokens.insert(*operand);
                             if operand.table() == MEMBER_REF {
                                 bcl_call_tokens.insert(*operand);
+                            }
+                            if operand.table() == METHOD_SPEC {
+                                generic_call_tokens.insert(*operand);
                             }
                         }
                         Opcode::Call if operand.table() == METHOD_SPEC => {
@@ -2980,13 +3188,18 @@ fn load_assembly<'pe>(
                         let tag =
                             exception_tag_for_name(catch_name.namespace, catch_name.name);
                         module.bind_catch_type_tag(asm, catch_token, tag);
+                    } else if matches!(
+                        assembly.type_spec_signature(catch_token),
+                        Some(lamella_metadata::SigType::GenericInst { .. })
+                    ) {
+                        module.mark_unlowered_generic(asm, catch_token);
                     }
                 }
             }
             let id = module.add_method(asm, materialize(raw_il), arg_count(&method));
             module.bind_token(asm, token, id);
             module.set_method_type(id, type_id);
-            if let Some((ns, tn)) = key_type_name(&type_def) {
+            if let Some((ns, tn)) = key_type_name(assembly, &type_def) {
                 index.insert(
                     name_key(assembly, &ns, &tn, &name, &params, return_type.as_ref()),
                     id,
@@ -3017,7 +3230,7 @@ fn load_assembly<'pe>(
                 arg_names.extend(declared);
                 module.set_method_debug(id, qualified, arg_names);
             }
-            if name == ".cctor" {
+            if name == ".cctor" && !is_generic_definition {
                 module.add_static_ctor(id);
             }
             if name == "Finalize" && arg_count(&method) == 1 {
@@ -3029,6 +3242,7 @@ fn load_assembly<'pe>(
                     name,
                     params,
                     newslot: method.flags() & METHOD_NEWSLOT != 0,
+                    generic_arity,
                 });
             } else if !method.is_static() && name != ".ctor" {
                 nonvirtuals.push(VirtualMethod {
@@ -3036,6 +3250,7 @@ fn load_assembly<'pe>(
                     name,
                     params,
                     newslot: false,
+                    generic_arity,
                 });
             }
             if token.0 == entry_token {
@@ -3184,16 +3399,11 @@ fn bind_bcl_calls(
                 let target = match parent.table() {
                     METHOD_DEF => module.resolve(asm, parent),
                     TYPE_DEF | TYPE_REF => {
-                        let parent_type = if parent.table() == TYPE_DEF {
-                            assembly.type_def(parent.row()).and_then(|def| def.name())
-                        } else {
-                            assembly.type_ref(parent.row()).and_then(|reference| reference.name())
-                        };
-                        parent_type.and_then(|parent_type| {
+                        assembly.type_token_full_name(parent).and_then(|(namespace, type_name)| {
                             let key = name_key(
                                 assembly,
-                                parent_type.namespace,
-                                parent_type.name,
+                                &namespace,
+                                &type_name,
                                 method_name,
                                 &params[..fixed],
                                 Some(&sig.return_type),
@@ -3236,13 +3446,9 @@ fn bind_bcl_calls(
         }
 
         if method_name == "Invoke" {
-            let parent_type = match parent.table() {
-                TYPE_DEF => assembly.type_def(parent.row()).and_then(|def| def.name()),
-                TYPE_REF => assembly.type_ref(parent.row()).and_then(|r| r.name()),
-                _ => None,
-            };
-            let declared_by_a_delegate = parent_type
-                .and_then(|parent_type| type_index.get(&type_name_key(parent_type)).copied())
+            let declared_by_a_delegate = assembly
+                .type_token_full_name(parent)
+                .and_then(|(namespace, name)| type_index.get(&type_key(&namespace, &name)).copied())
                 .and_then(|type_id| module.type_base(type_id))
                 .is_some_and(|base| {
                     ["System.MulticastDelegate", "System.Delegate"]
@@ -3276,11 +3482,12 @@ fn bind_bcl_calls(
                 _ => continue,
             }
         } else if parent.table() == TYPE_REF {
-            let Some(parent_type) = assembly
-                .type_ref(parent.row())
-                .and_then(|type_ref| type_ref.name())
-            else {
+            let Some((parent_namespace, parent_name)) = assembly.type_token_full_name(parent) else {
                 continue;
+            };
+            let parent_type = TypeName {
+                namespace: &parent_namespace,
+                name: &parent_name,
             };
             if resolve_external {
                 let key = name_key(
@@ -3330,8 +3537,29 @@ fn bind_bcl_calls(
 }
 
 /// Binds recognized instantiated BCL generic-method calls (a `MethodSpec` operand) to their
-/// intrinsics. Resolves the `MethodSpec` to its generic definition (a `MemberRef`), and binds
-/// the recognized ones -- today `System.Array.Empty<T>()` (a `params T[]` no-argument call).
+/// intrinsics, and MARKS every other one as an unlowered generic.
+///
+/// # The recognized ones, and why dropping their type arguments is sound
+///
+/// `Array.Empty<T>()` and `Interlocked.CompareExchange<T>(..)` are bound to intrinsics that never
+/// see `T`. That is correct for these two rather than correct in general: an empty array is the
+/// same object whatever its element type, and the interchange is over a reference slot. **The list
+/// is the statement that these are the ones where `T` does not reach a value**, which is the same
+/// property that makes `Echo<T>(T) -> T` a vacuous test fixture, and it does not generalize to a
+/// method whose body names `!!0`.
+///
+/// # Why everything else is MARKED rather than left to refuse itself
+///
+/// An unrecognized `MethodSpec` binds to nothing, so without the mark the bake refuses its call
+/// site as an ordinary `UnresolvedCall` -- **the same violation a call to a method that does not
+/// exist produces.** The program is safe, but by an ABSENCE OF A BINDING rather than by a refusal
+/// anyone wrote, and the distinction between "this generic call is not lowered" and "this method is
+/// missing" is then visible only to a reader who decodes the token's table byte.
+///
+/// That arrangement holds exactly as long as no code path can bind a `MethodSpec`, and
+/// [`monomorphize::lower_method_pairs`] is one. So the mark is written here, at the one place that
+/// knows the token is a generic call, and withdrawn per token AFTER the bind -- the same contract
+/// the type axis has, so a PARTIAL lowering stops the bake by name on either axis.
 fn bind_generic_calls(
     assembly: &Assembly,
     module: &mut Module,
@@ -3339,41 +3567,53 @@ fn bind_generic_calls(
     tokens: &BTreeSet<Token>,
 ) {
     for token in tokens {
-        let Some(method_token) = assembly.method_spec_method(*token) else {
-            continue;
-        };
-        if method_token.table() != MEMBER_REF {
+        if bind_recognized_generic_call(assembly, module, asm, *token) {
             continue;
         }
-        let Some(member) = assembly.member_ref(method_token.row()) else {
-            continue;
-        };
-        let parent = member.parent();
-        if parent.table() != TYPE_REF {
+        if module.resolve(asm, *token).is_some() {
             continue;
         }
-        let Some(parent_type) = assembly
-            .type_ref(parent.row())
-            .and_then(|type_ref| type_ref.name())
-        else {
-            continue;
-        };
-        let recognized: Option<((IntrinsicFn, u32), u16)> = match (
-            parent_type.namespace,
-            parent_type.name,
-            member.name(),
-        ) {
+        module.mark_unlowered_generic(asm, *token);
+    }
+}
+
+/// Binds one `MethodSpec` if it names a generic BCL method with an intrinsic. `true` when it did.
+fn bind_recognized_generic_call(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    token: Token,
+) -> bool {
+    let Some(method_token) = assembly.method_spec_method(token) else {
+        return false;
+    };
+    if method_token.table() != MEMBER_REF {
+        return false;
+    }
+    let Some(member) = assembly.member_ref(method_token.row()) else {
+        return false;
+    };
+    let parent = member.parent();
+    if parent.table() != TYPE_REF {
+        return false;
+    }
+    let Some((parent_namespace, parent_name)) = assembly.type_token_full_name(parent) else {
+        return false;
+    };
+    let recognized: Option<((IntrinsicFn, u32), u16)> =
+        match (parent_namespace.as_str(), parent_name.as_str(), member.name()) {
             ("System", "Array", Some("Empty")) => Some((intrinsic!(array_empty), 0)),
             ("System.Threading", "Interlocked", Some("CompareExchange")) => {
                 Some((intrinsic!(interlocked_compare_exchange), 3))
             }
             _ => None,
         };
-        if let Some(((function, intr_id), arg_count)) = recognized {
-            let id = module.add_intrinsic(asm, function, intr_id, arg_count);
-            module.bind_token(asm, *token, id);
-        }
-    }
+    let Some(((function, intr_id), arg_count)) = recognized else {
+        return false;
+    };
+    let id = module.add_intrinsic(asm, function, intr_id, arg_count);
+    module.bind_token(asm, token, id);
+    true
 }
 
 /// The parameter count of a `System.Collections.ArrayList` constructor, if this member is one,
@@ -3406,7 +3646,15 @@ fn list_ctor(
 }
 
 /// Whether a same-assembly (corlib-internal) `newobj` of this type's `.ctor` should allocate a
-/// NATIVE list instead of running the type's managed constructor. **Nothing does any more.**
+/// NATIVE list instead of running the type's managed constructor. **No type answers yes**, and the
+/// rest of this comment is why the list must stay empty rather than why it happens to be.
+///
+/// NAMING `ArrayList` / `Hashtable` / `Stack` / `Queue` HERE WOULD BE A HALF-CONVERSION.
+/// Marking the ctor gives corlib-internal code a native list -- an instance with no managed fields
+/// -- while a corlib-internal CALL to `Add` still resolves to the type's own managed body, which
+/// begins by reading `size`. So construction succeeded and the first field read trapped, and the
+/// same method worked when a program called it (a program's calls bind to the `list_*` intrinsics,
+/// so a program gets native+native and is consistent).
 ///
 /// All four types are complete from-scratch managed implementations with zero `[RuntimeProvided]`,
 /// and `ArrayList`'s own module comment says it *"overrides the native intrinsic ArrayList because
@@ -3424,6 +3672,16 @@ fn same_assembly_list_ctor(_namespace: &str, _type_name: &str) -> bool {
 #[cfg(test)]
 mod same_assembly_list_ctor_tests {
     /// The four collection types are NOT marked for native same-assembly construction.
+    ///
+    /// THIS IS A DECISION TEST, NOT A BEHAVIOR TEST, AND THE DIFFERENCE IS WHY IT IS HERE. The
+    /// defect it guards is DORMANT: `mark_same_assembly_ctors` only marks a ctor that the assembly
+    /// actually `newobj`s, and no corlib code constructs a collection internally today. So a test
+    /// that loads the corlib and inspects the marking passes whether or not the names are listed --
+    /// I wrote that test first, and only red-proving it showed it was measuring nothing.
+    ///
+    /// What CAN be pinned is the decision. Re-adding a name here fails this, which is the moment to
+    /// re-read why it was removed: the managed body and a native instance disagree about whether
+    /// the object has fields, and construction succeeds before the first field read traps.
     #[test]
     fn the_managed_collections_are_not_marked_for_native_construction() {
         for type_name in ["ArrayList", "Hashtable", "Stack", "Queue"] {
@@ -4076,7 +4334,7 @@ fn index_enum_zeros(assembly: &Assembly, enum_zeros: &mut BTreeMap<String, Value
         if !is_enum_type(assembly, type_def.extends()) {
             continue;
         }
-        let Some((namespace, name)) = key_type_name(&type_def) else {
+        let Some((namespace, name)) = key_type_name(assembly, &type_def) else {
             continue;
         };
         let underlying = type_def
@@ -4283,7 +4541,7 @@ fn bind_field_rva_data(
 /// assembly's storage slot, resolved by qualified name through `field_index`.
 ///
 /// The declaring type comes from the `MemberRef` parent (a `TypeRef`/`TypeDef`, named via
-/// [`lamella_metadata::Assembly::type_token_name`]) and the field from the member name; the
+/// [`lamella_metadata::Assembly::type_token_full_name`]) and the field from the member name; the
 /// pair keys `field_index` (which [`bind_static_field`] populated as the corlib loaded). The
 /// program's token then shares the corlib's slot, so a `ldsfld
 /// [corlib]System.BitConverter::IsLittleEndian` reads the cell the corlib `.cctor` set. A
@@ -4307,12 +4565,13 @@ fn bind_static_field_refs(
         if !member.is_field() {
             continue;
         }
-        let (Some(declaring), Some(field_name)) =
-            (assembly.type_token_name(member.parent()), member.name())
+        let (Some((declaring_namespace, declaring_name)), Some(field_name)) =
+            (assembly.type_token_full_name(member.parent()), member.name())
         else {
             continue;
         };
-        if let Some(&slot) = field_index.statics.get(&field_name_key(declaring, field_name)) {
+        let key = field_key(&declaring_namespace, &declaring_name, field_name);
+        if let Some(&slot) = field_index.statics.get(&key) {
             module.bind_static_field_ref(asm, *token, slot);
         }
     }
@@ -4345,14 +4604,15 @@ fn bind_instance_field_refs(
         if !member.is_field() {
             continue;
         }
-        let (Some(declaring), Some(field_name)) =
-            (assembly.type_token_name(member.parent()), member.name())
+        let (Some((declaring_namespace, declaring_name)), Some(field_name)) =
+            (assembly.type_token_full_name(member.parent()), member.name())
         else {
             continue;
         };
-        if let Some(&slot) = field_index.instances.get(&field_name_key(declaring, field_name)) {
+        let key = field_key(&declaring_namespace, &declaring_name, field_name);
+        if let Some(&slot) = field_index.instances.get(&key) {
             module.bind_field(asm, *token, slot);
-            if let Some(&type_id) = type_index.get(&type_name_key(declaring)) {
+            if let Some(&type_id) = type_index.get(&type_key(&declaring_namespace, &declaring_name)) {
                 module.bind_field_type(asm, *token, type_id);
             }
         }
@@ -4945,7 +5205,7 @@ fn cast_elem_of_sig(asm: u8, sig: &SigType) -> CastElem {
 ///
 /// A value type's size is its shared [`lamella_metadata::Assembly::value_type_layout`]
 /// (the one computation the AOT stack maps and the GC ref-map also consume) at the
-/// 32-bit target ([`TargetLayout::ilp32`] -- our targets use a 4-byte pointer). A `sizeof`
+/// 32-bit target ([`TargetLayout::ilp32`] -- these targets use a 4-byte pointer). A `sizeof`
 /// operand that names a primitive (a `TypeRef`/`TypeDef` to `System.Int32` etc., which csc
 /// emits only in hand-written IL since it constant-folds `sizeof(primitive)`) gets its fixed
 /// width; a struct operand is already covered by the value-type pass.
@@ -5084,8 +5344,8 @@ fn resolve_base_fields(
         return BaseFields::None;
     }
     let Some(global) = assembly
-        .type_token_name(extends_token)
-        .and_then(|name| type_index.get(&type_name_key(name)).copied())
+        .type_token_full_name(extends_token)
+        .and_then(|(namespace, name)| type_index.get(&type_key(&namespace, &name)).copied())
     else {
         return BaseFields::None;
     };
@@ -5164,6 +5424,12 @@ struct VirtualMethod {
     name: String,
     params: Vec<SigType>,
     newslot: bool,
+    /// How many type parameters the method itself declares, or 0. Part of the dispatch key, and
+    /// II.9.9 makes it part of the OVERRIDE relation too: "the number of generic parameters shall
+    /// match exactly those of the overridden method". Carried here because `sig_encode` is computed
+    /// from this struct on one side of a dispatch and from a signature on the other, and the two
+    /// have to agree.
+    generic_arity: u32,
 }
 
 /// One slot of a vtable under construction: the virtual method's signature key
@@ -5312,6 +5578,12 @@ pub struct UnboundSeam {
     /// The method's name.
     pub method: String,
     /// The parameter types, encoded by [`encode_sig_type`].
+    ///
+    /// **WITHOUT THIS THE REPORT CANNOT BE ACTED ON, WHICH IS WHAT IT IS FOR.** `Math::Abs` has
+    /// four overloads and only the `double` one is a seam; `Math::Log` has two and BOTH are, so the
+    /// name alone printed one line twice with nothing to tell them apart. The decision this report
+    /// exists to support -- intrinsic, or `[IntendedDefault]` -- is a decision about a SIGNATURE,
+    /// and a list of names asks a reader to go find out which overload was meant.
     pub params: Vec<String>,
     /// The return type, same encoding. It is not part of overload identity in C#, but it IS what
     /// says whether a silent seam hands back a zero, a null, or nothing at all -- which is the
@@ -5550,8 +5822,28 @@ fn constant_as_i64(value: ConstantValue) -> Option<i64> {
 /// BCL-call resolution). A token-free parameter (a primitive, `string`, `object`, or an
 /// array/pointer/byref thereof) keeps its stable short form, so primitive-only signatures encode
 /// exactly as before.
-fn sig_encode(assembly: &Assembly, name: &str, params: &[SigType]) -> String {
-    let mut key = alloc::format!("{name}|");
+fn sig_encode(
+    assembly: &Assembly,
+    name: &str,
+    params: &[SigType],
+    generic_arity: u32,
+    arguments: &[SigType],
+) -> String {
+    let mut key = match (generic_arity, arguments.is_empty()) {
+        (0, _) => alloc::format!("{name}|"),
+        (arity, true) => alloc::format!("{name}`{arity}|"),
+        (arity, false) => {
+            let mut spelled = alloc::format!("{name}`{arity}<");
+            for (index, argument) in arguments.iter().enumerate() {
+                if index > 0 {
+                    spelled.push(',');
+                }
+                spelled.push_str(&encode_sig_type(assembly, argument));
+            }
+            spelled.push_str(">|");
+            spelled
+        }
+    };
     for param in params {
         key.push_str(&encode_sig_type(assembly, param));
         key.push(',');
@@ -5605,7 +5897,10 @@ fn compute_sig_methods(
         None => BTreeMap::new(),
     };
     for method in &virtuals[type_id] {
-        methods.insert(sig_encode(assembly, &method.name, &method.params), method.id);
+        methods.insert(
+            sig_encode(assembly, &method.name, &method.params, method.generic_arity, &[]),
+            method.id,
+        );
     }
     memo[type_id] = Some(methods.clone());
     methods
@@ -5621,12 +5916,15 @@ fn bind_call_targets(
     assembly: &Assembly,
     asm: u8,
     tokens: &BTreeSet<Token>,
-    methoddef_sigs: &BTreeMap<u32, (String, Vec<SigType>)>,
+    methoddef_sigs: &BTreeMap<u32, (String, Vec<SigType>, u32)>,
 ) {
     for token in tokens {
         let (key, param_count) = match token.table() {
             METHOD_DEF => match methoddef_sigs.get(&token.row()) {
-                Some((name, params)) => (sig_encode(assembly, name, params), params.len()),
+                Some((name, params, arity)) => (
+                    sig_encode(assembly, name, params, *arity, &[]),
+                    params.len(),
+                ),
                 None => continue,
             },
             MEMBER_REF => {
@@ -5634,11 +5932,10 @@ fn bind_call_targets(
                     continue;
                 };
                 let name = member.name().unwrap_or("");
-                let params = member
-                    .method_signature()
-                    .map(|sig| sig.parameters)
-                    .unwrap_or_default();
-                (sig_encode(assembly, name, &params), params.len())
+                let signature = member.method_signature();
+                let arity = signature.as_ref().map_or(0, |sig| sig.generic_param_count);
+                let params = signature.map(|sig| sig.parameters).unwrap_or_default();
+                (sig_encode(assembly, name, &params, arity, &[]), params.len())
             }
             _ => continue,
         };
@@ -5792,7 +6089,7 @@ fn compute_vtable(
         BaseVtable::None => Vec::new(),
     };
     for method in &virtuals[type_id] {
-        let key = sig_encode(assembly, &method.name, &method.params);
+        let key = sig_encode(assembly, &method.name, &method.params, method.generic_arity, &[]);
         let overridden = (!method.newslot)
             .then(|| table.iter().position(|slot| slot.key == key))
             .flatten();
@@ -6057,6 +6354,13 @@ fn string_ctor_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u
         [SigType::Pointer(value), SigType::I4, SigType::I4] if **value == SigType::Char => {
             Some(intrinsic!(string_ctor_char_ptr_range))
         }
+        [SigType::SzArray(element)] if **element == SigType::Char => {
+            Some(intrinsic!(string_ctor_char_array))
+        }
+        [SigType::SzArray(element), SigType::I4, SigType::I4] if **element == SigType::Char => {
+            Some(intrinsic!(string_ctor_char_array_range))
+        }
+        [SigType::Char, SigType::I4] => Some(intrinsic!(string_ctor_char_repeat)),
         _ => None,
     }
 }

@@ -1,4 +1,40 @@
 # INSTANCE map: where each RA4M1 block copy sits. Offsets within a block are in blocks/.
+#
+# THE RECORD CARRIES A BASE AND NOTHING ELSE, AND THAT IS A READING OF THE PART RATHER THAN A
+# GAP. On this part the I/O ports have NO clock gate to route. The module-stop function is this
+# vendor's equivalent of a peripheral clock enable, and enumerating every target it names across all
+# four Module Stop Control Registers gives 31 modules -- SRAM0, ECCSRAM, DMAC/DTC, CAC, CRC, CTSU,
+# ELC, DOC, SSIE0, SLCDC, SCE5, POEG, ACMPLP, OPAMP, ADC140, DAC8, DAC12, AGT0, AGT1, GPT321 to
+# GPT320, GPT167 to GPT162, CAN0, IIC0, IIC1, USBFS, SPI0, SPI1, SCI0, SCI1, SCI2 and SCI9 -- and
+# the I/O ports are not among them. A port is reachable out of reset with no gate to open first.
+#
+# AND THAT INVERTS THE HAZARD THE GATE NORMALLY CREATES, SO IT IS WORTH STATING RATHER THAN
+# LEAVING IMPLIED. On parts whose ports ARE gated, the classic silent failure is a program that
+# writes a port register before enabling its clock and sees the write dropped. Here that failure
+# cannot happen to a port -- and the modules that DO have a gate come out of reset STOPPED, because
+# the manual's module-stop section says that after a reset is canceled all modules other than the
+# DMAC, DTC and SRAMs are placed in the module-stop state.
+#
+# THE GATE'S POLARITY IS THE OPPOSITE OF AN ENABLE BIT, WHICH IS WHY NO FIELD HERE IS NAMED FOR
+# ONE. A module-stop bit is set to 1 to STOP a module and cleared to 0 to run it: the manual states
+# it directly -- when the MSTPmi bit is set to 1 the specified module stops operating and enters the
+# module-stop state, and clearing the bit to 0 cancels that state -- and every per-bit description
+# repeats it as "0: Cancel the module-stop state, 1: Enter the module-stop state". A field called an
+# enable bit, carrying the bit number, would be written by a consumer that sets it to switch a
+# peripheral on, and setting it switches the peripheral OFF. The bit number is the same either way
+# and only the name says which direction is meant, so the name is load-bearing.
+#
+# THE GATES ALSO DO NOT SHARE A BASE, so an offset-from-one-base shape would not hold them even
+# with the polarity resolved. MSTPCRA is at 4001 E01Ch in the system-control region while MSTPCRB,
+# MSTPCRC and MSTPCRD are at 4004 7000h, 4004 7004h and 4004 7008h in a region of their own. Two
+# bases, four registers.
+#
+# NOT MODELLED, AND NAMED SO THE OMISSION IS DELIBERATE: the PmnPFS pin-function-select register
+# file at 4004 0800h, one 32-bit register per pin at (m * 16 + n) * 4 from that base. It selects a
+# pin's peripheral function and is guarded by a write-protect register that must be opened first, so
+# it is not a plain register. Nothing below reaches it: a pin comes out of reset as general I/O, and
+# the manual states that the PDR bit in PORTm.PCNTR1 serves the same function as the PDR bit in
+# PFS.PmnPFS, so a general-purpose output is fully configurable through the port block alone.
 
 [table]
 kind = "instances"

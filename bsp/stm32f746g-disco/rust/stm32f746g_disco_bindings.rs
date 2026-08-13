@@ -171,3 +171,93 @@ pub const MEMORY_SDRAM_SDCLK_HZ_HSI_16MHZ: u32 = 8000000;
 pub const MEMORY_SDRAM_REFRESH_COUNT_HSI_16MHZ: u32 = 105;
 pub const MEMORY_SDRAM_SDRTR_HSI_16MHZ: u32 = 0xD2;
 pub const MEMORY_SDRAM_SDTR1_HSI_16MHZ: u32 = 0x1126361;
+
+/// -- discriminators: what an attached board can be asked to confirm it is the board an
+/// image was built for. A chip identity register cannot answer this on its own, because the
+/// parts that separate one board from its sibling are soldered outside the die and a bare
+/// board answers the same identity as a populated one. So each row names the CLAIM it
+/// reaches -- `part`, or `memory:<region>` -- alongside the rung a successful read of its
+/// kind establishes: `identified` (it answered its identity register) or `exercised` (it
+/// produced measurements a driver decoded). A region's ACCESSIBLE size is reachable only at
+/// `exercised`: an identity read reports the fitted device, and a board may wire less of a
+/// device than it holds --
+pub const DISCRIMINATOR_COUNT: u32 = 2;
+pub const DISCRIMINATOR_QSPI_JEDEC_CONFIRMS: &str = "memory:qspi";
+pub const DISCRIMINATOR_QSPI_JEDEC_VALIDATION: &str = "identified";
+pub const DISCRIMINATOR_QSPI_JEDEC_EXPECT: u32 = 0x20BA18;
+pub const DISCRIMINATOR_QSPI_JEDEC_READS: &str = "the fitted quad-SPI NOR's JEDEC identity, over the region's single-line `read` configuration -- the one command with no dummy phase, so it needs no count established first";
+pub const DISCRIMINATOR_SDRAM_SWEEP_CONFIRMS: &str = "memory:sdram";
+pub const DISCRIMINATOR_SDRAM_SWEEP_VALIDATION: &str = "exercised";
+pub const DISCRIMINATOR_SDRAM_SWEEP_EXPECT: u32 = 0x800000;
+pub const DISCRIMINATOR_SDRAM_SWEEP_READS: &str = "with the fmc controller configured, a write-then-read sweep of the region, answering the number of bytes that read back what was written";
+
+/// -- connectors: the sockets a removable module plugs into. The socket is board truth --
+/// it is on the schematic and identical on every unit -- and what is plugged into it is not,
+/// so no row here names a module. A socket brings out whole BUSES, each named by the binding
+/// role that serves it, and single LINES, each named by the standard's own name for that
+/// position and carrying the port wiring a driver needs to drive it. Which of a socket's
+/// protocols an attached module speaks is a property of the module, so a board that offers
+/// several states all of them and chooses none --
+pub const CONNECTOR_COUNT: u32 = 1;
+pub const CONNECTOR_ARDUINO_STANDARD: &str = "arduino-uno-v3";
+pub const CONNECTOR_ARDUINO_I2C_ROLE: &str = "header-i2c";
+pub const CONNECTOR_ARDUINO_A0_PORT_BASE: u32 = 0x40020000;
+pub const CONNECTOR_ARDUINO_A0_PIN: u32 = 0;
+pub const CONNECTOR_ARDUINO_A0_MASK: u32 = 0x1;
+pub const CONNECTOR_ARDUINO_A1_PORT_BASE: u32 = 0x40021400;
+pub const CONNECTOR_ARDUINO_A1_PIN: u32 = 10;
+pub const CONNECTOR_ARDUINO_A1_MASK: u32 = 0x400;
+pub const CONNECTOR_ARDUINO_A2_PORT_BASE: u32 = 0x40021400;
+pub const CONNECTOR_ARDUINO_A2_PIN: u32 = 9;
+pub const CONNECTOR_ARDUINO_A2_MASK: u32 = 0x200;
+pub const CONNECTOR_ARDUINO_A3_PORT_BASE: u32 = 0x40021400;
+pub const CONNECTOR_ARDUINO_A3_PIN: u32 = 8;
+pub const CONNECTOR_ARDUINO_A3_MASK: u32 = 0x100;
+pub const CONNECTOR_ARDUINO_A4_PORT_BASE: u32 = 0x40021400;
+pub const CONNECTOR_ARDUINO_A4_PIN: u32 = 7;
+pub const CONNECTOR_ARDUINO_A4_MASK: u32 = 0x80;
+pub const CONNECTOR_ARDUINO_A5_PORT_BASE: u32 = 0x40021400;
+pub const CONNECTOR_ARDUINO_A5_PIN: u32 = 6;
+pub const CONNECTOR_ARDUINO_A5_MASK: u32 = 0x40;
+pub const CONNECTOR_ARDUINO_D0_PORT_BASE: u32 = 0x40020800;
+pub const CONNECTOR_ARDUINO_D0_PIN: u32 = 7;
+pub const CONNECTOR_ARDUINO_D0_MASK: u32 = 0x80;
+pub const CONNECTOR_ARDUINO_D1_PORT_BASE: u32 = 0x40020800;
+pub const CONNECTOR_ARDUINO_D1_PIN: u32 = 6;
+pub const CONNECTOR_ARDUINO_D1_MASK: u32 = 0x40;
+pub const CONNECTOR_ARDUINO_D2_PORT_BASE: u32 = 0x40021800;
+pub const CONNECTOR_ARDUINO_D2_PIN: u32 = 6;
+pub const CONNECTOR_ARDUINO_D2_MASK: u32 = 0x40;
+pub const CONNECTOR_ARDUINO_D3_PORT_BASE: u32 = 0x40020400;
+pub const CONNECTOR_ARDUINO_D3_PIN: u32 = 4;
+pub const CONNECTOR_ARDUINO_D3_MASK: u32 = 0x10;
+pub const CONNECTOR_ARDUINO_D4_PORT_BASE: u32 = 0x40021800;
+pub const CONNECTOR_ARDUINO_D4_PIN: u32 = 7;
+pub const CONNECTOR_ARDUINO_D4_MASK: u32 = 0x80;
+pub const CONNECTOR_ARDUINO_D5_PORT_BASE: u32 = 0x40022000;
+pub const CONNECTOR_ARDUINO_D5_PIN: u32 = 0;
+pub const CONNECTOR_ARDUINO_D5_MASK: u32 = 0x1;
+pub const CONNECTOR_ARDUINO_D6_PORT_BASE: u32 = 0x40021C00;
+pub const CONNECTOR_ARDUINO_D6_PIN: u32 = 6;
+pub const CONNECTOR_ARDUINO_D6_MASK: u32 = 0x40;
+pub const CONNECTOR_ARDUINO_D7_PORT_BASE: u32 = 0x40022000;
+pub const CONNECTOR_ARDUINO_D7_PIN: u32 = 3;
+pub const CONNECTOR_ARDUINO_D7_MASK: u32 = 0x8;
+pub const CONNECTOR_ARDUINO_D8_PORT_BASE: u32 = 0x40022000;
+pub const CONNECTOR_ARDUINO_D8_PIN: u32 = 2;
+pub const CONNECTOR_ARDUINO_D8_MASK: u32 = 0x4;
+pub const CONNECTOR_ARDUINO_D9_PORT_BASE: u32 = 0x40020000;
+pub const CONNECTOR_ARDUINO_D9_PIN: u32 = 15;
+pub const CONNECTOR_ARDUINO_D9_MASK: u32 = 0x8000;
+pub const CONNECTOR_ARDUINO_D10_PORT_BASE: u32 = 0x40020000;
+pub const CONNECTOR_ARDUINO_D10_PIN: u32 = 8;
+pub const CONNECTOR_ARDUINO_D10_MASK: u32 = 0x100;
+pub const CONNECTOR_ARDUINO_D11_PORT_BASE: u32 = 0x40020400;
+pub const CONNECTOR_ARDUINO_D11_PIN: u32 = 15;
+pub const CONNECTOR_ARDUINO_D11_MASK: u32 = 0x8000;
+pub const CONNECTOR_ARDUINO_D12_PORT_BASE: u32 = 0x40020400;
+pub const CONNECTOR_ARDUINO_D12_PIN: u32 = 14;
+pub const CONNECTOR_ARDUINO_D12_MASK: u32 = 0x4000;
+pub const CONNECTOR_ARDUINO_D13_PORT_BASE: u32 = 0x40022000;
+pub const CONNECTOR_ARDUINO_D13_PIN: u32 = 1;
+pub const CONNECTOR_ARDUINO_D13_MASK: u32 = 0x2;

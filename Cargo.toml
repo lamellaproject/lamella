@@ -32,7 +32,7 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = "symbols"
+strip = "none"
 
 # The profile for host-side batch runs of the compiler over a whole corpus, where an unoptimized
 # build is the difference between a run you can repeat and one you cannot: measured at 109 s per

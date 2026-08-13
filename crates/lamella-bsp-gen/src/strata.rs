@@ -225,10 +225,20 @@ pub struct PartRow {
     /// register, so "which core is in socket 1" is not a fixed property of the part. Listing the
     /// admissible architectures per socket states what the part offers; WHICH ONE AN IMAGE USES is
     /// a target's choice and is not a fact about the chip.
+    ///
+    /// THIS DOES NOT REPLACE `isa`. That field is a RISC-V PROFILE whose consequences (register
+    /// count, multiply path) are derived and checked from its letters. This is a core-architecture
+    /// NAME, a coarser thing, and the two answer different questions -- so a part may state both,
+    /// and a mistake in one is not caught by the other.
     pub cores: Vec<(String, Vec<String>)>,
     /// Whether the sockets reach ONE address space. `None` on a single-core part; REQUIRED once
     /// `cores` is stated, because it is half of the combinability test and a default would decide
     /// it silently.
+    ///
+    /// SHARED MEMORY IS NOT SUFFICIENT FOR THREADING ACROSS CORES, and the part that proves it
+    /// is shipping silicon: sockets running DIFFERENT architectures can share memory and still need
+    /// two separate program images. Same architecture AND shared memory is the condition; this
+    /// field is only the second half.
     pub cores_share_memory: Option<bool>,
     /// Pins the part carries that A PROGRAM MAY NOT USE, each with the peripheral that owns it.
     ///
@@ -238,6 +248,16 @@ pub struct PartRow {
     /// something inside the package, which is what a system-in-package states about the pins its
     /// integrated peripheral is wired through -- and those pins ARE present, so removing them from
     /// the present-list would be a second lie rather than a fix.
+    ///
+    /// THE GAP WAS SILENT AND THE HAZARD IS A BOARD FILE, NOT A DRIVER. A control line needs no
+    /// pin-map row, so the unrouted shape is never consulted for one; a board could bind an LED to
+    /// a reserved pin, pass the present-list, pass the control-pin check, and emit a real port base
+    /// and a real mask. The write lands on a pin the program does not own and the board does
+    /// nothing -- the same silence as a board with no LED at all.
+    ///
+    /// Each entry is `pin = "owner"`. The owner is REQUIRED: "unavailable" stated alone cannot be
+    /// told apart from a field somebody filled in wrongly, and naming what holds the pin is what
+    /// lets a reader decide whether another part of the family carries the same restriction.
     pub reserved: Vec<(String, String)>,
     /// The core's instruction-set profile (`rv32ec`), lowercase; empty when the family has not
     /// stated one. A part that merely names its architecture tells a code generator nothing it
@@ -511,6 +531,117 @@ pub struct MemoryRead {
     pub clock_hz: i64,
 }
 
+/// One thing that can be READ from an attached board to confirm it is the board an image was
+/// built for.
+///
+/// A chip identity register cannot answer this question. The parts that make a board differ from
+/// its siblings are soldered OUTSIDE the die -- a bare board and a fully populated one report the
+/// same chip id -- so a check built only on identity passes the case it exists to catch. A
+/// discriminator therefore names WHAT CLAIM it reaches, not merely what it reads.
+///
+/// The rung vocabulary is [`SOURCING_VALIDATION`], reused verbatim rather than restated: a part
+/// table's `[sourcing] validation` already grades a read as `identified` (one answered its
+/// identity register) or `exercised` (one produced measurements a driver decoded), and that IS the
+/// bare-versus-populated distinction. `reads` is the analogue of that table's `evidence`: a rung
+/// may not be claimed without saying what read earns it.
+///
+/// The rung recorded here is a CEILING declared from documents -- the most a successful read of
+/// this kind could establish -- and never a result. What an attached board actually answered is an
+/// observation, and observations are not board truth.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Discriminator {
+    /// The discriminator id, board-scoped (`qspi-jedec`).
+    pub name: String,
+    /// The claim this read reaches: `part`, or `memory:<region>` naming a declared region.
+    /// Resolved against the board, so a discriminator cannot confirm something that is not there.
+    pub confirms: String,
+    /// What is read, in the board's own terms, so the read can be implemented from this row.
+    /// Required, because a rung without a named read is a rank claimed for nothing.
+    pub reads: String,
+    /// The most this read can establish: `identified` or `exercised`. `none` is refused -- a
+    /// discriminator that can establish nothing discriminates nothing.
+    pub validation: String,
+    /// The answer that confirms the claim. An integer rather than free text because the reading is
+    /// produced by a different program than the one that declares it, and a number has one
+    /// spelling where a formatted string has as many as there are formatters.
+    pub expect: i64,
+    /// Where the expected answer comes from.
+    pub source: String,
+}
+
+/// The connector standards a board may name, in the spelling each standard's own document uses.
+///
+/// A closed set, so a typo refuses rather than becoming a socket nothing can match. Growing it is
+/// one line and a document; inventing a name here would let a board claim a socket that does not
+/// exist.
+///
+/// `qwiic` and `stemma-qt` are two vendors' names for the same four-pin part, and both appear
+/// because a board's silkscreen carries one of them and not the other. Whether the two are
+/// interchangeable is a claim about the two standards rather than about any board, so it is not
+/// stated here.
+pub const CONNECTOR_STANDARDS: [&str; 4] = ["qwiic", "stemma-qt", "mikrobus", "arduino-uno-v3"];
+
+/// The bus kinds a connector may bring out as a whole group, matching the binding kinds.
+pub const CONNECTOR_BUS_SIGNALS: [&str; 3] = ["i2c", "spi", "uart"];
+
+/// One bus a connector brings out whole, named by the binding role that serves it.
+///
+/// A bus is named ONCE, by its role, rather than pin by pin: the role already states the instance,
+/// the pins and the mux function, and a socket that restated them would hold a second copy of a
+/// fact that has a home. The `signal` is the standard's own name for the GROUP, and it is held
+/// equal to the bound role's kind, so a socket cannot claim to carry I2C over a serial port.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectorBus {
+    /// The standard's own group name (`i2c`, `spi`, `uart`).
+    pub signal: String,
+    /// The binding role that serves it.
+    pub role: String,
+}
+
+/// One line a connector brings out as a single pin, named by the standard's own name for that
+/// socket position.
+///
+/// A socket position is a NAME IN THE STANDARD'S VOCABULARY and the pin behind it is this board's
+/// answer, which is the whole content of a connector: `a4` is a position every module built to
+/// that standard knows, and which pin it reaches differs on every board that offers one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectorPin {
+    /// The standard's own name for the socket position (`a4`, `d13`, `int`, `cs`, `sda`).
+    pub signal: String,
+    /// The board pin behind it.
+    pub pin: String,
+}
+
+/// A socket a removable module plugs into: which standard it follows, which buses it brings out
+/// whole, and which single lines it brings out by name.
+///
+/// A CONNECTOR IS BOARD TRUTH AND WHAT IS PLUGGED INTO IT IS NOT. The socket is on the schematic,
+/// it is identical on every unit, and it does not change; the module on the other end is different
+/// on different desks and on different days, so it is supplied per invocation rather than stored
+/// here.
+///
+/// TWO LISTS RATHER THAN ONE, BECAUSE THE TWO KINDS OF LINE ARE SHARED DIFFERENTLY. A board with
+/// two sockets of one standard serves both from ONE set of bus roles and gives each its OWN chip
+/// select, interrupt and reset. That asymmetry is what a bus role alone cannot describe: which
+/// protocol an attached module speaks is a property of the module, and the side-band lines it uses
+/// are per socket.
+///
+/// A LINE IS STATED ONCE. A pin a named bus already brings out must not appear again as a pin row,
+/// because the two spellings would be two statements of one wire and nothing would hold them equal.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Connector {
+    /// The connector id, board-scoped (`qt`, `mikrobus-1`).
+    pub name: String,
+    /// The standard it follows, from [`CONNECTOR_STANDARDS`].
+    pub standard: String,
+    /// Where the socket's wiring is stated.
+    pub source: String,
+    /// The buses it brings out whole, in table order.
+    pub buses: Vec<ConnectorBus>,
+    /// The single lines it brings out by name, in table order.
+    pub pins: Vec<ConnectorPin>,
+}
+
 /// A board BSP: the bindings, carrier, plans, and identity of one product.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoardTable {
@@ -545,6 +676,13 @@ pub struct BoardTable {
     pub plans: Vec<Plan>,
     /// On-board control lines (LEDs, buttons), source-cited.
     pub devices: Vec<ControlPin>,
+    /// What can be read from an attached board to confirm it is the one an image assumed, in
+    /// table order. Empty means the board declares none, and a reconciliation against it can
+    /// confirm nothing -- which is a statement the verdict makes rather than one it hides.
+    pub discriminators: Vec<Discriminator>,
+    /// The sockets a removable module plugs into, in table order. Empty means the board offers
+    /// none that this file states.
+    pub connectors: Vec<Connector>,
 }
 
 impl BoardTable {
@@ -689,6 +827,21 @@ pub struct DeviceIdentity {
     pub width: u32,
     /// Every accepted value, in table order.
     pub values: Vec<Int>,
+    /// Why this part has NO identity register, when it has none. Empty for a part that does.
+    ///
+    /// NOT EVERY PART CAN BE IDENTIFIED, and a model that assumed otherwise could not describe
+    /// parts that exist. A humidity sensor whose whole interface is a measurement request and a
+    /// data fetch carries no readable id at all -- there is no register to read, so the question
+    /// has no answer rather than an answer nobody has looked up.
+    ///
+    /// STATED RATHER THAN OMITTED, exactly as a reserved pin names its owner. An absence expressed
+    /// as a missing section is indistinguishable from an unfinished table, and the two call for
+    /// opposite responses. A part with no identity says so, and says why, so that a reader can
+    /// tell a fact from a gap.
+    ///
+    /// A part with no identity can never reach the `identified` validation rung -- there is
+    /// nothing to answer -- so anything wanting confidence in it must exercise it instead.
+    pub absent: String,
 }
 
 /// One device register. `reg` is an OPERAND written on the wire, never an offset added to an
@@ -1501,6 +1654,7 @@ fn build_device(
                             ("reg", v) => identity.reg = as_int(*line, key, v)?,
                             ("width", v) => identity.width = as_int(*line, key, v)?.value as u32,
                             ("values", v) => identity.values = as_int_array(*line, key, v)?,
+                            ("absent", v) => identity.absent = as_str(*line, key, v)?,
                             ("notes", _) => {}
                             (other, _) => return Err(err(*line, &format!("unexpected identity key '{other}'"))),
                         }
@@ -2317,6 +2471,12 @@ fn build_board(
         Binding,
         Plan,
         Device,
+        Discriminator,
+        Connector,
+        /// A named connector's bus list (`[[connectors.<name>.buses]]`).
+        ConnectorBus(usize),
+        /// A named connector's pin list (`[[connectors.<name>.pins]]`).
+        ConnectorPin(usize),
     }
     let mut at = At::None;
     let mut memory_source_cited = false;
@@ -2347,6 +2507,41 @@ fn build_board(
             Item::ArraySection(name) if name == "devices" => {
                 table.devices.push(ControlPin::default());
                 at = At::Device;
+            }
+            Item::ArraySection(name) if name == "discriminators" => {
+                table.discriminators.push(Discriminator { expect: -1, ..Discriminator::default() });
+                at = At::Discriminator;
+            }
+            Item::ArraySection(name) if name == "connectors" => {
+                table.connectors.push(Connector::default());
+                at = At::Connector;
+            }
+            Item::ArraySection(name)
+                if name.starts_with("connectors.") && name.matches('.').count() == 2 =>
+            {
+                let mut parts = name.splitn(3, '.');
+                let (_, connector, leaf) =
+                    (parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let Some(index) = table.connectors.iter().position(|c| c.name == connector) else {
+                    return Err(err(*line, &format!(
+                        "'[[{name}]]' names connector '{connector}', which no [[connectors]] row above it declares"
+                    )));
+                };
+                at = match leaf {
+                    "buses" => {
+                        table.connectors[index].buses.push(ConnectorBus::default());
+                        At::ConnectorBus(index)
+                    }
+                    "pins" => {
+                        table.connectors[index].pins.push(ConnectorPin::default());
+                        At::ConnectorPin(index)
+                    }
+                    _ => {
+                        return Err(err(*line, &format!(
+                            "'{name}' is not a connector record -- a connector takes [[connectors.<name>.buses]] and [[connectors.<name>.pins]]"
+                        )));
+                    }
+                };
             }
             Item::Section(name) | Item::ArraySection(name)
                 if name.starts_with("memory.") && name.matches('.').count() == 2 =>
@@ -2494,6 +2689,59 @@ fn build_board(
                 At::Device => {
                     control_pin_key(*line, table.devices.last_mut().expect("open"), key, value)?;
                 }
+                At::Discriminator => {
+                    let row = table.discriminators.last_mut().expect("open");
+                    match (key.as_str(), value) {
+                        ("name", RawValue::Str(s)) => row.name = s.clone(),
+                        ("confirms", RawValue::Str(s)) => row.confirms = s.clone(),
+                        ("reads", RawValue::Str(s)) => row.reads = s.clone(),
+                        ("validation", RawValue::Str(s)) => row.validation = s.clone(),
+                        ("expect", RawValue::Int(i)) => row.expect = i.value,
+                        ("source", RawValue::Str(s)) => row.source = s.clone(),
+                        (other, _) => {
+                            return Err(err(*line, &format!(
+                                "unexpected discriminator key '{other}' (a discriminator states name, confirms, reads, validation, expect and source)"
+                            )));
+                        }
+                    }
+                }
+                At::Connector => {
+                    let row = table.connectors.last_mut().expect("open");
+                    match (key.as_str(), value) {
+                        ("name", RawValue::Str(s)) => row.name = s.clone(),
+                        ("standard", RawValue::Str(s)) => row.standard = s.clone(),
+                        ("source", RawValue::Str(s)) => row.source = s.clone(),
+                        (other, _) => {
+                            return Err(err(*line, &format!(
+                                "unexpected connector key '{other}' (a connector states name, standard and source; its lines are [[connectors.<name>.buses]] and [[connectors.<name>.pins]] rows)"
+                            )));
+                        }
+                    }
+                }
+                At::ConnectorBus(index) => {
+                    let row = table.connectors[index].buses.last_mut().expect("open bus");
+                    match (key.as_str(), value) {
+                        ("signal", RawValue::Str(s)) => row.signal = s.clone(),
+                        ("role", RawValue::Str(s)) => row.role = s.clone(),
+                        (other, _) => {
+                            return Err(err(*line, &format!(
+                                "unexpected connector bus key '{other}' -- a bus a socket brings out whole states signal and role"
+                            )));
+                        }
+                    }
+                }
+                At::ConnectorPin(index) => {
+                    let row = table.connectors[index].pins.last_mut().expect("open pin");
+                    match (key.as_str(), value) {
+                        ("signal", RawValue::Str(s)) => row.signal = s.clone(),
+                        ("pin", RawValue::Str(s)) => row.pin = s.clone(),
+                        (other, _) => {
+                            return Err(err(*line, &format!(
+                                "unexpected connector pin key '{other}' -- a single line a socket brings out states signal and pin"
+                            )));
+                        }
+                    }
+                }
             },
         }
     }
@@ -2534,6 +2782,145 @@ fn build_board(
                 "board {}: two memory regions are named '{}'",
                 table.board, region.name
             ));
+        }
+    }
+    for (at, row) in table.discriminators.iter().enumerate() {
+        if row.name.is_empty() {
+            return Err(format!("board {}: discriminator {at} states no name", table.board));
+        }
+        if table.discriminators.iter().filter(|other| other.name == row.name).count() > 1 {
+            return Err(format!(
+                "board {}: two discriminators are named '{}' -- a reading names the one it came from",
+                table.board, row.name
+            ));
+        }
+        let confirms_ok = row.confirms == "part"
+            || row
+                .confirms
+                .strip_prefix("memory:")
+                .is_some_and(|region| table.memory.iter().any(|m| m.name == region));
+        if !confirms_ok {
+            return Err(format!(
+                "board {}: discriminator '{}' confirms '{}', which is neither 'part' nor 'memory:<region>' naming a region this board declares",
+                table.board, row.name, row.confirms
+            ));
+        }
+        if row.reads.is_empty() {
+            return Err(format!(
+                "board {}: discriminator '{}' states no 'reads' -- a rung may not be claimed without saying what read earns it",
+                table.board, row.name
+            ));
+        }
+        if row.validation == "none" || !SOURCING_VALIDATION.contains(&row.validation.as_str()) {
+            return Err(format!(
+                "board {}: discriminator '{}' states validation '{}' -- a discriminator is 'identified' or 'exercised'",
+                table.board, row.name, row.validation
+            ));
+        }
+        if row.expect < 0 {
+            return Err(format!(
+                "board {}: discriminator '{}' states no 'expect' -- a read with no expected answer confirms nothing",
+                table.board, row.name
+            ));
+        }
+        if row.source.is_empty() {
+            return Err(format!(
+                "board {}: discriminator '{}' is not SOURCE-CITED",
+                table.board, row.name
+            ));
+        }
+        if row.validation == "identified" {
+            if let Some(region) = row
+                .confirms
+                .strip_prefix("memory:")
+                .and_then(|name| table.memory.iter().find(|m| m.name == name))
+            {
+                if let Some(identity) = region.fact("identity") {
+                    if identity != row.expect {
+                        return Err(format!(
+                            "board {}: discriminator '{}' expects 0x{:X}, but region '{}' records the identity its fitted device answered as 0x{identity:X} -- one number, two statements, and they disagree",
+                            table.board, row.name, row.expect, region.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (at, row) in table.connectors.iter().enumerate() {
+        if row.name.is_empty() {
+            return Err(format!("board {}: connector {at} states no name", table.board));
+        }
+        if table.connectors.iter().filter(|other| other.name == row.name).count() > 1 {
+            return Err(format!(
+                "board {}: two connectors are named '{}' -- a board with two sockets of one standard numbers them, because their side-band lines differ",
+                table.board, row.name
+            ));
+        }
+        if !CONNECTOR_STANDARDS.contains(&row.standard.as_str()) {
+            return Err(format!(
+                "board {}: connector '{}' follows standard '{}', which is not one of {} -- a socket names a standard some document defines",
+                table.board,
+                row.name,
+                row.standard,
+                CONNECTOR_STANDARDS.join("/")
+            ));
+        }
+        if row.source.is_empty() {
+            return Err(format!(
+                "board {}: connector '{}' is not SOURCE-CITED",
+                table.board, row.name
+            ));
+        }
+        if row.buses.is_empty() && row.pins.is_empty() {
+            return Err(format!(
+                "board {}: connector '{}' brings out neither a bus nor a pin -- a socket nothing reaches through is a name, not a fact",
+                table.board, row.name
+            ));
+        }
+        for bus in &row.buses {
+            if !CONNECTOR_BUS_SIGNALS.contains(&bus.signal.as_str()) {
+                return Err(format!(
+                    "board {}: connector '{}' brings out signal '{}', which is not one of {} -- a bus brought out whole is named for its kind",
+                    table.board,
+                    row.name,
+                    bus.signal,
+                    CONNECTOR_BUS_SIGNALS.join("/")
+                ));
+            }
+            if bus.role.is_empty() {
+                return Err(format!(
+                    "board {}: connector '{}' brings out '{}' but names no role -- a bus is named once, by the binding that serves it",
+                    table.board, row.name, bus.signal
+                ));
+            }
+            if row.buses.iter().filter(|other| other.signal == bus.signal).count() > 1 {
+                return Err(format!(
+                    "board {}: connector '{}' brings out '{}' twice -- one socket carries one bus of a kind",
+                    table.board, row.name, bus.signal
+                ));
+            }
+        }
+        for pin in &row.pins {
+            if pin.signal.is_empty() || pin.pin.is_empty() {
+                return Err(format!(
+                    "board {}: connector '{}' has a line stating {} -- a single line states both its socket position and the pin behind it",
+                    table.board,
+                    row.name,
+                    if pin.signal.is_empty() { "no signal" } else { "no pin" }
+                ));
+            }
+            if row.pins.iter().filter(|other| other.signal == pin.signal).count() > 1 {
+                return Err(format!(
+                    "board {}: connector '{}' names position '{}' twice -- a socket position is one hole",
+                    table.board, row.name, pin.signal
+                ));
+            }
+            if row.pins.iter().filter(|other| other.pin == pin.pin).count() > 1 {
+                return Err(format!(
+                    "board {}: connector '{}' brings {} out at two positions -- one pin reaches one hole",
+                    table.board, row.name, pin.pin
+                ));
+            }
         }
     }
     if let Some(default) = table.carriers.iter().find(|c| c.default) {
@@ -2868,6 +3255,47 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
                     board.board, device.name, device.role
                 ));
             }
+        }
+    }
+    for connector in &board.connectors {
+        let mut brought_out: Vec<(String, String)> = Vec::new();
+        for bus in &connector.buses {
+            let Some(binding) = bindings.iter().find(|b| b.role == bus.role) else {
+                return Err(format!(
+                    "board {}: connector '{}' brings out role '{}' but no binding declares it",
+                    board.board, connector.name, bus.role
+                ));
+            };
+            if binding.kind != bus.signal {
+                return Err(format!(
+                    "board {}: connector '{}' brings out '{}' over role '{}', which is a {} binding -- the socket's group and the bound kind are one fact",
+                    board.board, connector.name, bus.signal, bus.role, binding.kind
+                ));
+            }
+            for (signal, pin) in &binding.pins {
+                brought_out.push((pin.pin.clone(), format!("role '{}' as {signal}", bus.role)));
+            }
+        }
+        for line in &connector.pins {
+            if !part_row.has_pin(&line.pin) {
+                return Err(format!(
+                    "board {}: connector '{}' brings {} out at position {}, which is not in part {}'s pin list (if the pin exists on silicon, grow the parts row from the datasheet)",
+                    board.board, connector.name, line.pin, line.signal, part
+                ));
+            }
+            if let Some(owner) = part_row.reserved_by(&line.pin) {
+                return Err(format!(
+                    "board {}: connector '{}' brings {} out at position {}, but part {} RESERVES that pin for {} -- a program does not own it, so nothing plugged into the socket can be reached through it",
+                    board.board, connector.name, line.pin, line.signal, part, owner
+                ));
+            }
+            if let Some((_, by)) = brought_out.iter().find(|(pin, _)| *pin == line.pin) {
+                return Err(format!(
+                    "board {}: connector '{}' brings {} out both as position {} and through {} -- one wire, one statement",
+                    board.board, connector.name, line.pin, line.signal, by
+                ));
+            }
+            brought_out.push((line.pin.clone(), format!("position {}", line.signal)));
         }
     }
     Ok(ResolvedBoard { board, part, bindings, module_pins })
@@ -5314,7 +5742,7 @@ pub fn emit_board_csharp(
         }
     }
 
-    let rows_at = memory_rows(set, resolved)?;
+    let rows_at = board_fact_rows(set, resolved)?;
     for (at, row) in rows_at.iter().enumerate() {
         let documents = documents_something(&rows_at[at + 1..]);
         match row {
@@ -5388,6 +5816,92 @@ fn control_pin_group_base(set: &FamilySet, board: &str, pin: &str) -> Result<(i6
 ///
 /// An absent `_BASE` means the chip's own fixed window, which is chip truth and not the board's to
 /// repeat. An absent `_CONTROLLER` means the chip maps the region with no help.
+fn board_fact_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>, String> {
+    let mut rows = memory_rows(set, resolved)?;
+    rows.extend(discriminator_rows(&resolved.board));
+    rows.extend(connector_rows(set, resolved)?);
+    Ok(rows)
+}
+
+/// The sockets a removable module plugs into: which standard each follows, which buses it brings
+/// out whole, and which single lines it brings out by name.
+///
+/// A BUS IS EMITTED AS ITS ROLE AND A LINE AS ITS PORT WIRING, because those are the two different
+/// things a program needs. Reaching a module across a bus means opening the role the socket names;
+/// driving a socket's chip select or reading its interrupt means writing one bit of one port, and
+/// the base, index and mask for that are derived here rather than hand-composed by a driver.
+///
+/// A pin brought out here is EXPOSED, not owned. The same wire may carry a binding and reach a
+/// socket, which is the ordinary case rather than a conflict.
+fn connector_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>, String> {
+    let mut rows = Vec::new();
+    if resolved.board.connectors.is_empty() {
+        return Ok(rows);
+    }
+    section(
+        &mut rows,
+        "-- connectors: the sockets a removable module plugs into. The socket is board truth --\n\
+         it is on the schematic and identical on every unit -- and what is plugged into it is not,\n\
+         so no row here names a module. A socket brings out whole BUSES, each named by the binding\n\
+         role that serves it, and single LINES, each named by the standard's own name for that\n\
+         position and carrying the port wiring a driver needs to drive it. Which of a socket's\n\
+         protocols an attached module speaks is a property of the module, so a board that offers\n\
+         several states all of them and chooses none --"
+            .to_string(),
+    );
+    uint(&mut rows, "CONNECTOR_COUNT".to_string(), resolved.board.connectors.len().to_string());
+    for connector in &resolved.board.connectors {
+        let prefix = format!("CONNECTOR_{}", upper_snake(&connector.name));
+        text(&mut rows, format!("{prefix}_STANDARD"), &connector.standard);
+        for bus in &connector.buses {
+            text(&mut rows, format!("{prefix}_{}_ROLE", upper_snake(&bus.signal)), &bus.role);
+        }
+        for line in &connector.pins {
+            let (group_base, index) =
+                control_pin_group_base(set, &resolved.board.board, &line.pin)?;
+            let at = format!("{prefix}_{}", upper_snake(&line.signal));
+            uint(&mut rows, format!("{at}_PORT_BASE"), format!("0x{group_base:X}"));
+            uint(&mut rows, format!("{at}_PIN"), index.to_string());
+            uint(&mut rows, format!("{at}_MASK"), format!("0x{:X}", 1u64 << index));
+        }
+    }
+    Ok(rows)
+}
+
+/// What can be read from an attached board to confirm it is the one an image assumed.
+///
+/// Emitted as VALUES rather than left in the file, because the program that takes the readings is
+/// not the program that holds this table: a discriminator names the claim it reaches, the rung a
+/// successful read of its kind can establish, and the answer that confirms.
+fn discriminator_rows(board: &BoardTable) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if board.discriminators.is_empty() {
+        return rows;
+    }
+    section(
+        &mut rows,
+        "-- discriminators: what an attached board can be asked to confirm it is the board an\n\
+         image was built for. A chip identity register cannot answer this on its own, because the\n\
+         parts that separate one board from its sibling are soldered outside the die and a bare\n\
+         board answers the same identity as a populated one. So each row names the CLAIM it\n\
+         reaches -- `part`, or `memory:<region>` -- alongside the rung a successful read of its\n\
+         kind establishes: `identified` (it answered its identity register) or `exercised` (it\n\
+         produced measurements a driver decoded). A region's ACCESSIBLE size is reachable only at\n\
+         `exercised`: an identity read reports the fitted device, and a board may wire less of a\n\
+         device than it holds --"
+            .to_string(),
+    );
+    uint(&mut rows, "DISCRIMINATOR_COUNT".to_string(), board.discriminators.len().to_string());
+    for row in &board.discriminators {
+        let prefix = format!("DISCRIMINATOR_{}", upper_snake(&row.name));
+        text(&mut rows, format!("{prefix}_CONFIRMS"), &row.confirms);
+        text(&mut rows, format!("{prefix}_VALIDATION"), &row.validation);
+        uint(&mut rows, format!("{prefix}_EXPECT"), format!("0x{:X}", row.expect));
+        text(&mut rows, format!("{prefix}_READS"), &row.reads);
+    }
+    rows
+}
+
 fn memory_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>, String> {
     let board = &resolved.board;
     let mut rows = Vec::new();
@@ -6316,7 +6830,7 @@ pub fn emit_board_rust(
         }
     }
 
-    let rows_at = memory_rows(set, resolved)?;
+    let rows_at = board_fact_rows(set, resolved)?;
     for (at, row) in rows_at.iter().enumerate() {
         let documents = documents_something(&rows_at[at + 1..]);
         match row {
@@ -6842,7 +7356,7 @@ pub fn emit_board_swift(
         }
     }
 
-    let rows_at = memory_rows(set, resolved)?;
+    let rows_at = board_fact_rows(set, resolved)?;
     for row in rows_at.iter() {
         match row {
             Row::Blank => out.push('\n'),
@@ -7315,6 +7829,50 @@ pub fn emit_board_python(
         }
         out.push_str("}\n");
     }
+
+    if !resolved.board.discriminators.is_empty() {
+        out.push_str(
+            "\n# What an attached board can be asked, to confirm it is the board an image was built\n# for. A chip identity register cannot answer this alone: the parts that separate one board\n# from its sibling are soldered outside the die, so a bare board answers the same identity as\n# a populated one. Each row names the CLAIM it reaches -- \"part\", or \"memory:<region>\" -- and\n# the rung a successful read of its kind establishes. A region's ACCESSIBLE size is reachable\n# only at \"exercised\": an identity read reports the fitted device, and a board may wire less\n# of a device than it holds.\nDISCRIMINATORS = {\n",
+        );
+        for row in &resolved.board.discriminators {
+            out.push_str(&format!(
+                "    \"{}\": {{\"confirms\": \"{}\", \"validation\": \"{}\", \"expect\": 0x{:X}, \"reads\": \"{}\"}},\n",
+                row.name, row.confirms, row.validation, row.expect, row.reads
+            ));
+        }
+        out.push_str("}\n");
+    }
+
+    if !resolved.board.connectors.is_empty() {
+        out.push_str(
+            "\n# The sockets a removable module plugs into. The socket is board truth -- it is on the\n# schematic and identical on every unit -- and what is plugged into it is not, so no entry here\n# names a module. \"buses\" holds the roles a socket brings out whole; \"pins\" holds the single\n# lines, each under the standard's own name for that position. Which of a socket's protocols an\n# attached module speaks is a property of the module, so a board that offers several states all\n# of them and chooses none.\nCONNECTORS = {\n",
+        );
+        for connector in &resolved.board.connectors {
+            let buses: Vec<String> = connector
+                .buses
+                .iter()
+                .map(|bus| format!("\"{}\": \"{}\"", bus.signal, bus.role))
+                .collect();
+            let mut pins: Vec<String> = Vec::new();
+            for line in &connector.pins {
+                let (group_base, index) =
+                    control_pin_group_base(set, &resolved.board.board, &line.pin)?;
+                pins.push(format!(
+                    "\"{}\": {{\"port_base\": 0x{group_base:X}, \"pin\": {index}, \"mask\": 0x{:X}}}",
+                    line.signal,
+                    1u64 << index
+                ));
+            }
+            out.push_str(&format!(
+                "    \"{}\": {{\"standard\": \"{}\", \"buses\": {{{}}}, \"pins\": {{{}}}}},\n",
+                connector.name,
+                connector.standard,
+                buses.join(", "),
+                pins.join(", ")
+            ));
+        }
+        out.push_str("}\n");
+    }
     Ok(out)
 }
 
@@ -7504,13 +8062,26 @@ fn validate_device(part: &DeviceTable) -> Result<(), String> {
         .identity
         .as_ref()
         .ok_or_else(|| format!("{who} states no [identity] -- it is what tells two parts sharing a footprint apart"))?;
-    if identity.width == 0 {
-        return Err(format!("{who}: the identity register declares no width"));
-    }
-    if identity.values.is_empty() {
-        return Err(format!(
-            "{who}: the identity accepts no value -- a part states the SET its identity register may answer, and a part rejected for answering an unlisted value reads as no part at all"
-        ));
+    if identity.absent.is_empty() {
+        if identity.width == 0 {
+            return Err(format!("{who}: the identity register declares no width"));
+        }
+        if identity.values.is_empty() {
+            return Err(format!(
+                "{who}: the identity accepts no value -- a part states the SET its identity register may answer, and a part rejected for answering an unlisted value reads as no part at all"
+            ));
+        }
+    } else {
+        if identity.reg.value != 0 || identity.width != 0 || !identity.values.is_empty() {
+            return Err(format!(
+                "{who}: [identity] states 'absent' AND a register, width or value -- a part either has an identity or it does not, and stating both leaves a consumer to pick"
+            ));
+        }
+        if sourcing.validation == "identified" {
+            return Err(format!(
+                "{who}: [sourcing] validation is 'identified' while [identity] states the part has none -- there is no register to answer, so nothing could have earned that rung"
+            ));
+        }
     }
     if let Some(mapped) = part.registers.iter().find(|r| r.reg.value == identity.reg.value) {
         if mapped.width != identity.width {
@@ -7662,13 +8233,25 @@ fn device_rows(part: &DeviceTable) -> Result<Vec<Row>, String> {
     }
 
     let identity = part.identity.as_ref().expect("validated present");
-    section(
-        &mut rows,
-        "identity: the accepted values are a SET. A driver that accepts only one of them rejects a genuine part, and a rejected part reads as no part at all -- so on a mismatch, name the id received AND this set.".to_string(),
-    );
-    number(&mut rows, "IDENTITY_REG".to_string(), identity.reg);
-    uint(&mut rows, "IDENTITY_WIDTH".to_string(), identity.width.to_string());
-    uint(&mut rows, "IDENTITY_VALUE_COUNT".to_string(), identity.values.len().to_string());
+    if !identity.absent.is_empty() {
+        section(
+            &mut rows,
+            "identity: THIS PART HAS NONE, and that is a fact about the part rather than a gap in \
+             this table. There is no register to read, so nothing can confirm which part answered \
+             an address -- the `identified` validation rung is unreachable for it by construction, \
+             and confidence has to be earned by exercising it instead."
+                .to_string(),
+        );
+        text(&mut rows, "IDENTITY_ABSENT".to_string(), &identity.absent);
+    } else {
+        section(
+            &mut rows,
+            "identity: the accepted values are a SET. A driver that accepts only one of them rejects a genuine part, and a rejected part reads as no part at all -- so on a mismatch, name the id received AND this set.".to_string(),
+        );
+        number(&mut rows, "IDENTITY_REG".to_string(), identity.reg);
+        uint(&mut rows, "IDENTITY_WIDTH".to_string(), identity.width.to_string());
+        uint(&mut rows, "IDENTITY_VALUE_COUNT".to_string(), identity.values.len().to_string());
+    }
     for (at, value) in identity.values.iter().enumerate() {
         number(&mut rows, format!("IDENTITY_VALUE_{at}"), *value);
     }
@@ -7708,6 +8291,7 @@ fn device_rows(part: &DeviceTable) -> Result<Vec<Row>, String> {
         }
     }
 
+    if !part.registers.is_empty() {
     section(
         &mut rows,
         "registers: `_REG` is the address written on the wire -- an operand, NOT an offset to add to an instance base. Fields carry the shifted mask and its shift.".to_string(),
@@ -7724,6 +8308,7 @@ fn device_rows(part: &DeviceTable) -> Result<Vec<Row>, String> {
             uint(&mut rows, name.clone(), format!("0x{:X}", field.mask()));
             uint(&mut rows, format!("{name}_LSB"), field.lsb.to_string());
         }
+    }
     }
 
     if !part.enums.is_empty() {
@@ -8644,6 +9229,12 @@ base = 0x1000
     /// A board's WIRED CONTROL LINE naming a pin its part does not carry -- the third list stating
     /// pins about a part, and the last one nothing checked.
     ///
+    /// THE DEFECT, AND ITS SHAPE IS THE SAME ONE TWICE ALREADY: a binding's pins were held to the
+    /// present-list from the start, a pin-map row's joined them later, and an LED or a button row
+    /// was neither. It is not a harmless omission, because a control line EMITS: an LED row naming
+    /// a pin the part does not have produces a real port base and a real mask, so the firmware
+    /// writes a live register belonging to some other cell and the board simply does nothing.
+    ///
     /// Measured when this check landed: eight control lines across three rp2040 boards named pins
     /// that family's parts row did not carry, and every gate was green.
     #[test]
@@ -8688,6 +9279,14 @@ base = 0x1000
     }
 
     /// A board wiring a control line to a pin the PART RESERVES for something inside the package.
+    ///
+    /// THE DEFECT IS THAT EVERY EXISTING CHECK PASSES IT. A reserved pin IS in the present-list
+    /// -- the part carries it -- so the check above says yes. A control line needs no pin-map row,
+    /// so the unrouted shape is never consulted. Generation then composes a real port base and a
+    /// real mask, the firmware writes them, and the silicon ignores the write because the pin
+    /// belongs to an integrated peripheral. The board does nothing, which looks exactly like a
+    /// board with no LED.
+    ///
     #[test]
     fn a_reserved_pin_is_refused_to_a_board_and_to_a_binding() {
         let part = |reserved: Vec<(String, String)>| PartRow {
@@ -8758,6 +9357,12 @@ base = 0x1000
     /// THE RULE: a target is a selection an IMAGE makes over a part's cores, and
     /// one part admits several -- each core can be an individual target, and two cores "of the same
     /// architecture sharing the same memory space" can also be driven as ONE threaded system.
+    ///
+    /// SHARED MEMORY IS NOT SUFFICIENT, and the counter-example is real silicon rather than a
+    /// hypothetical: one part here puts either an Arm or a RISC-V core in each of two sockets, over
+    /// one address space, with atomics interoperating across the pair -- and its own manual says
+    /// that arrangement "requires two separate program images". So the test is BOTH conditions, and
+    /// this asserts each one can fail on its own.
     #[test]
     fn core_sockets_are_combinable_only_on_one_architecture_and_one_address_space() {
         let part = |cores: Vec<(&str, Vec<&str>)>, shared: Option<bool>| PartRow {

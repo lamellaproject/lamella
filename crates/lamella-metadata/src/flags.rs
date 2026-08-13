@@ -14,6 +14,9 @@ pub mod type_attr {
     pub const ABSTRACT: u32 = 0x0000_0080;
     /// The type is sealed.
     pub const SEALED: u32 = 0x0000_0100;
+    /// The type's initializer may run at or any time BEFORE first access to one of its static
+    /// fields, rather than exactly at a trigger (II.23.1.15; the semantics are I.8.9.5).
+    pub const BEFORE_FIELD_INIT: u32 = 0x0010_0000;
 }
 
 /// `FieldAttributes` bits (II.23.1.5).
@@ -54,7 +57,7 @@ pub mod method_attr {
 /// exactly one of `IL`, `Native`, or `Runtime` in a conforming image (II.15.4.3 / the
 /// MethodDef validity rules). `Runtime` -- "the implementation is provided by the
 /// runtime" -- is the standard seam for a method the runtime supplies (delegates,
-/// array `Get`/`Set`, and our BCL intrinsics). Note that `InternalCall` (0x1000) is a
+/// array `Get`/`Set`, and runtime-provided BCL members). Note that `InternalCall` (0x1000) is a
 /// *separate* bit that II.23.1.11 reserves as "shall be zero in conforming
 /// implementations"; it is deliberately not modeled here.
 pub mod method_impl {
@@ -85,6 +88,31 @@ pub fn type_is_nested(flags: u32) -> bool {
 #[must_use]
 pub fn type_is_interface(flags: u32) -> bool {
     flags & type_attr::CLASS_SEMANTICS_MASK == type_attr::INTERFACE
+}
+
+/// Whether a type's initializer has RELAXED timing (`beforefieldinit`).
+///
+/// # The distinction, and why an implementation cannot ignore it
+///
+/// ECMA-335 I.8.9.5 gives two rules, and which one applies is this bit:
+///
+/// * **Marked**: the initializer runs *at, or sometime before,* first access to any static field of
+///   the type. An implementation may run it as early as it likes -- including at startup.
+/// * **Not marked**: it is *triggered by* first access to a static field, first invocation of a
+///   static method, first invocation of an instance or virtual method of a VALUE type, or first
+///   invocation of any constructor.
+///
+/// So a type without this bit has asked for precise timing, and running its initializer early is a
+/// deviation whose only symptom is a side effect happening sooner than the program said. C# emits
+/// the bit for a type whose statics are field initializers and WITHHOLDS it for one with an explicit
+/// `static Foo()`, which is exactly how a C# author asks for the strict rule.
+///
+/// **Without this predicate an implementation cannot tell a conformant early initialization from
+/// a deviating one**, because both look like "the initializer ran". That is why it is modeled
+/// before the AOT tier's lazy trigger rather than after.
+#[must_use]
+pub fn type_is_before_field_init(flags: u32) -> bool {
+    flags & type_attr::BEFORE_FIELD_INIT != 0
 }
 
 /// Whether a type's flags mark it abstract.

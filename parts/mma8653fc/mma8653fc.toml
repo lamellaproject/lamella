@@ -1,0 +1,124 @@
+# PART: NXP (Freescale) MMA8653FC, a three-axis 10-bit accelerometer.
+#
+#
+# ITS DEVICE ID SHARES A REGISTER WITH OTHER PARTS IN THIS CATALOGUE. Register 0x0D is WHO_AM_I here
+# and on the FXOS8700CQ, which is this vendor's convention rather than a coincidence. That matters
+# because their addresses OVERLAP: this part is fixed at 0x1D and the FXOS8700CQ selects among 0x1C,
+# 0x1D, 0x1E and 0x1F. At 0x1D the two are separated by the VALUE alone -- 0x5A here, 0xC7 there --
+# which is the clean case, and it works only because the register agrees.
+
+[table]
+kind = "device"
+family = "mma8653fc"
+part = "mma8653fc"
+sources = [
+    "NXP MMA8653FC data sheet: register map ch 6.1 table, WHO_AM_I ch 6.4.3, I2C slave address and the SAD + read/write patterns ch 5.10, pin description table (the 7-bit device address).",
+]
+notes = [
+    "10-bit output, left justified across an MSB and an LSB register per axis: the six data bytes run from 0x01 to 0x06 and only the top two bits of each LSB register carry data.",
+    "The vendor's register map prints two address columns, one of which is the address plus one; the value carried here is the register's own address, which is the first column and the one every register description repeats.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own data sheet.
+#
+# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates and their codes, the 2/4/8 g
+# dynamic ranges and the counts-per-g each implies, the low-power and oversampling modes, the
+# orientation detection block, the freefall and motion detection block, the transient and pulse
+# blocks, and the auto-wake and sleep behavior. All are in the data sheet and none is transcribed.
+#
+# Validation is `none`. A physical part of this type has NOT answered through this table: a
+# micro:bit v1.3 was walked and something answered at this address, but an address is not an
+# identity and nothing has yet read the register below.
+
+[sourcing]
+facts = "primary"
+validation = "identified"
+evidence = "A physical part answered the identity register on a micro:bit v1.3B, over the nRF51's TWI0 at 100 kHz on the board's internal bus: register 0x0D read 0x5A at address 0x1D, the single value this table accepts at the single address it states, repeated across eight consecutive passes with 0 faulted of 112 addresses walked in each. THE NEGATIVE CONTROL RAN IN TWO PARTS, and neither alone would carry it. First, on that same bus in those same passes, reads of other parts' identity registers at addresses where nothing was fitted ABORTED every time -- so this bus reports an absence as an abort rather than as a byte. Second, the identical read of the identical register at the identical address, 0x0D at 0x1D, was run on a micro:bit v2, a board that does not fit this part, and ABORTED across ten consecutive passes; that arm is on a different controller of the same family, which is stated because it is what makes it a second arm rather than a repetition of the first. THE DOCUMENT AND THE BENCH AGREE INDEPENDENTLY: the board vendor's own hardware page names this part for this revision without giving any address, and the address it was found at came from this part's own data sheet. A SECOND CONTROL CAME FREE: the FXOS8700CQ, whose address range includes 0x1D and whose identity register is also 0x0D, was scored in the same passes and did not match -- so the value chooses the part where the register alone could not. EVERY NUMBER IN THE CHECK -- the address, the register and the accepted value -- was taken from this table's own emitted artifact by a bench program that includes it."
+
+# --- identity ------------------------------------------------------------------------------------
+
+[identity]
+reg = 0x0D
+width = 8
+values = [0x5A]
+notes = "The data sheet names this register's whole purpose in its title, Device ID (0x5A). The FXOS8700CQ answers 0xC7 at this same register address, so a reading here narrows to a vendor and the value chooses the part."
+
+# --- address: FIXED, with no strap -----------------------------------------------------------------
+#
+# One address, stated as standard, with no selection pin described. So two of these cannot share a
+# bus and no configuration exists to separate them.
+#
+# A NUMBER WORTH NOT CONFUSING: the composed read and write bytes are 0x3B and 0x3A -- this address
+# shifted up with the direction bit appended. They are not addresses in their own right, and the
+# data sheet prints them in the same table as the address itself.
+
+[address]
+bus = "i2c"
+base = 0x1D
+notes = "The data sheet gives the standard slave address as 0011101b, which it writes both as 0x1D and, in one place, as 0x01D. No pin is described that alters it. THE ADDRESS IS SHARED WITH PART OF THE FXOS8700CQ's RANGE, which selects among 0x1C to 0x1F -- so at this address the identity register is what separates the two."
+
+# --- buses -----------------------------------------------------------------------------------------
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "write-register-then-repeated-start-read"
+notes = "A read sends the register address in a write phase, then a repeated start turns the transfer around. The vendor describes exactly that sequence for a single-byte read."
+
+# --- registers ---------------------------------------------------------------------------------
+
+[registers.status]
+reg = 0x00
+width = 8
+access = "read-only"
+notes = "Data-ready status, or FIFO status depending on configuration."
+
+[registers.out_x]
+reg = 0x01
+width = 16
+access = "read-only"
+fields = { out_x_lsb = [0, 8], out_x_msb = [8, 8] }
+notes = "MSB FIRST. A 10-bit sample left justified: the MSB register holds the top 8 bits and only bits 7 and 6 of the LSB register carry data. A driver that read this as a plain 16-bit signed value would be wrong by a factor of 64 and would still look plausible."
+
+[registers.out_y]
+reg = 0x03
+width = 16
+access = "read-only"
+fields = { out_y_lsb = [0, 8], out_y_msb = [8, 8] }
+
+[registers.out_z]
+reg = 0x05
+width = 16
+access = "read-only"
+fields = { out_z_lsb = [0, 8], out_z_msb = [8, 8] }
+
+[registers.sysmod]
+reg = 0x0B
+width = 8
+access = "read-only"
+notes = "The current system mode."
+
+[registers.int_source]
+reg = 0x0C
+width = 8
+access = "read-only"
+notes = "Interrupt status."
+
+[registers.who_am_i]
+reg = 0x0D
+width = 8
+access = "read-only"
+fields = { who_am_i = [0, 8] }
+
+[registers.xyz_data_cfg]
+reg = 0x0E
+width = 8
+access = "read-write"
+notes = "Selects the dynamic range. Which codes name which range is not transcribed here."
+
+[measurement]
+burst_length = 6
+resolution_bits = "10, left justified across two registers per axis"

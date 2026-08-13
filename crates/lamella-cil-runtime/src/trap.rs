@@ -57,6 +57,11 @@ pub enum Trap {
     /// which is why it is a different trap: the field IS registered, so nothing about loading or
     /// binding is wrong -- the storage was allocated with a layout that does not match the type
     /// whose field is being read. **Look at how it was ALLOCATED, not at the field.**
+    ///
+    /// Reporting the two alike sends the reader to the wrong subsystem: a `new ArrayList()` that
+    /// allocates a fieldless native instance while the managed body reads `size` is a defect in the
+    /// ALLOCATOR, and "resolved to no field" -- said of a field that resolves perfectly well --
+    /// points at the loader instead.
     FieldSlotMissing {
         /// The field token the instruction named.
         field: Token,

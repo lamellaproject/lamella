@@ -40,13 +40,41 @@ pub enum LinkError {
         /// The window's capacity in bytes.
         cap: u32,
     },
+    /// THE IMAGE CARRIES MORE GENERIC INSTANTIATIONS THAN THE CODE MODEL BUDGETS FOR.
+    ///
+    /// The code model is *monomorphize value types, cap 7*, and **the cap means REFUSE, not
+    /// degrade** -- past it there is no fallback, because the alternative (sharing, which boxes) is
+    /// exactly what the RAM measurement disqualified. See [`INSTANTIATION_CAP`].
+    InstantiationCapExceeded {
+        /// How many distinct instantiations the image carries.
+        count: usize,
+        /// The budget.
+        cap: usize,
+        /// Their handles, ascending -- the identity a `__lamella_typedesc_<handle>` symbol carries.
+        /// Handles rather than spellings because the linker reads symbols, not metadata; the AOT's
+        /// `dump-descriptors` maps one to the other.
+        handles: Vec<u32>,
+    },
 }
+
+/// **THE INSTANTIATION BUDGET, AND IT IS WHOLE-IMAGE.** Not per definition: the flash and RAM the
+/// spike measured are properties of the image, so eight instantiations of one definition and one
+/// each of eight definitions cost the same and are budgeted the same.
+///
+/// 7, from the spike (`(M-S)(N) = 1,625.9*N - 4,983` over the value-type segment): monomorphizing
+/// is a net saving below N = 3.06 and first costs 5% of a 128 KB slot at N = 7.10.
+///
+/// It is a constant in this crate rather than a capability-profile knob: the profile does not reach
+/// the linker, and a number carried somewhere nothing enforces it is worth less than one in the
+/// wrong file.
+pub const INSTANTIATION_CAP: usize = 7;
 
 /// On ARM, a Thumb function symbol carries the Thumb state in its value's low bit (`answer` =
 /// `offset | 1`). The linker normalizes to the even byte offset for layout + reach math (BL keeps a
 /// halfword-even target); the Thumb bit is re-applied only to a Thumb executable's `e_entry`. On
 /// other machines, and for non-ARM, the value passes through. (Mixed ARM/Thumb interworking, which
-/// would need the bit to choose BL vs BLX, is out of scope -- our backend + `-mthumb` C are Thumb.)
+/// would need the bit to choose BL vs BLX, is out of scope -- the Lamella backend and `-mthumb` C
+/// both produce Thumb.)
 fn normalized_value(machine: Machine, value: u32) -> u32 {
     match machine {
         Machine::Arm => value & !1,
@@ -149,6 +177,71 @@ pub use lamella_elf::{
     EH_TAG_SYMBOL, STATICS_BASE_PREFIX, STATICS_END_SYMBOL, STATICS_START_SYMBOL,
 };
 
+/// Every generic instantiation the given objects CARRY, by handle, ascending.
+///
+/// **THE COUNT IS OF WHAT THE IMAGE CONTAINS, WHICH IS WHY IT IS TAKEN HERE AND NOT IN THE AOT.**
+/// A compile-time count -- the collector's closed set -- is an UPPER BOUND, and measured on a
+/// program that monomorphizes it overstates by 4x: eight instantiations declared, two reached, six
+/// dead-stripped to nothing. Budgeting against the compile-time number would refuse programs that
+/// pay for two, and an ordinary program writing `new List<T>()` eight times closes over 104
+/// instantiations while linking a handful.
+///
+/// Asking it of the objects has the property that makes it correct in both directions: a caller who
+/// dead-stripped first is counted on the survivors, and one who did not is counted on everything --
+/// which is right, because that caller's image really does carry everything. There is no phase to
+/// get wrong, because the question is about bytes rather than about intent.
+///
+/// An instantiation is SELF-IDENTIFYING in a symbol table: its descriptor is
+/// `__lamella_typedesc_<handle>` and its handle's table byte is
+/// [`lamella_ir::INSTANTIATION_HANDLE_TABLE`], which no ordinary type's handle carries. So this
+/// needs no manifest from the build and cannot drift from one.
+///
+/// **SCOPE, STATED BECAUSE A SILENT BOUND READS AS COVERAGE:** an instantiation with no
+/// descriptor is not counted. That is every INTERFACE instantiation -- around half the closed set
+/// of a real program -- which costs a tag and an itable entry and NO body. Whether the budget the
+/// spike calibrated (1,694 B per instantiation, measured on body-bearing value instantiations)
+/// should charge for those has not been measured, so they are excluded rather than guessed at.
+#[must_use]
+pub fn image_instantiations(objects: &[Object]) -> Vec<u32> {
+    let mut handles: BTreeSet<u32> = BTreeSet::new();
+    for obj in objects {
+        for s in &obj.symbols {
+            if !s.defined {
+                continue;
+            }
+            let Some(digits) = s.name.strip_prefix(lamella_elf::TYPE_DESC_PREFIX) else {
+                continue;
+            };
+            let Ok(handle) = digits.parse::<u32>() else {
+                continue;
+            };
+            if handle >> 24 == lamella_ir::INSTANTIATION_HANDLE_TABLE {
+                handles.insert(handle);
+            }
+        }
+    }
+    handles.into_iter().collect()
+}
+
+/// Refuses an image carrying more than `cap` generic instantiations. See [`image_instantiations`]
+/// for what is counted and [`INSTANTIATION_CAP`] for the budget.
+///
+/// **REFUSE, NOT DEGRADE.** Past the cap there is no fallback to switch to: the spike disqualified
+/// sharing on RAM (shared boxing crosses the 8 KB arena between N = 4 and N = 6), so a program over
+/// budget has no second code model waiting for it. A build that cannot fit its instantiations has to
+/// say so.
+pub fn check_instantiation_cap(objects: &[Object], cap: usize) -> Result<(), LinkError> {
+    let handles = image_instantiations(objects);
+    if handles.len() > cap {
+        return Err(LinkError::InstantiationCapExceeded {
+            count: handles.len(),
+            cap,
+            handles,
+        });
+    }
+    Ok(())
+}
+
 /// Function-level `--gc-sections`: builds the cross-object reference graph from `entry` -- following each
 /// reached symbol's relocations, a function's calls AND a data symbol's references (e.g. a type
 /// descriptor's vtable entries and base pointer) -- keeps the reachable functions, reachable descriptors,
@@ -166,6 +259,13 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
     stack.push(String::from(entry));
+    for obj in objects {
+        for s in &obj.symbols {
+            if s.defined && s.size > 0 && !s.name.is_empty() && kept_regardless(s) {
+                stack.push(s.name.clone());
+            }
+        }
+    }
     while let Some(name) = stack.pop() {
         if !reachable.insert(name.clone()) {
             continue;
@@ -194,6 +294,27 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
     out
 }
 
+/// Whether [`trim_object`] keeps this symbol WITHOUT asking whether anything reaches it.
+///
+/// **ANYTHING KEPT REGARDLESS MUST ALSO BE A REACHABILITY ROOT, AND THAT IS WHY THIS IS ONE
+/// FUNCTION RATHER THAN A CONDITION WRITTEN TWICE.** A symbol the trim keeps carries its
+/// relocations with it; if the walk never followed them, their targets can be dropped and the kept
+/// symbol is left pointing at nothing -- an undefined-symbol link error whose cause is two passes
+/// disagreeing about the same rule.
+///
+/// **This bug class has now appeared three times in this one function**: once for type descriptors
+/// (fixed by excluding them here), once for stack-map records (fixed by tying them to their
+/// function), and once for a string literal blob, whose relocation to `System.String`'s descriptor
+/// was never followed because the blob was KEPT without ever being REACHED. The first two were fixed
+/// by narrowing what is kept. The general statement is the other way round: **keep and root are the
+/// same set**, so [`garbage_collect`] seeds the walk from this predicate instead of restating it.
+fn kept_regardless(s: &lamella_elf::ParsedSymbol) -> bool {
+    if s.name.starts_with(STACKMAP_RECORD_PREFIX) {
+        return false;
+    }
+    s.kind != SymbolType::Func && !s.name.starts_with(TYPE_DESC_PREFIX)
+}
+
 /// Rebuilds `obj` keeping only reachable functions and reachable descriptors (plus all other data),
 /// re-laid-out. A referenced symbol not among the kept ones stays an undefined extern (the linker resolves
 /// it, or errors if genuinely missing).
@@ -207,8 +328,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
             if let Some(func) = s.name.strip_prefix(STACKMAP_RECORD_PREFIX) {
                 return reachable.contains(func);
             }
-            reachable.contains(&s.name)
-                || (s.kind != SymbolType::Func && !s.name.starts_with(TYPE_DESC_PREFIX))
+            reachable.contains(&s.name) || kept_regardless(s)
         })
         .collect();
     kept.sort_by_key(|&i| obj.symbols[i].value & !1);
@@ -381,6 +501,7 @@ fn link_with_base_ram(
     residents: &[(&str, u32)],
     ram: Option<(u32, u32)>,
 ) -> Result<LinkedImage, LinkError> {
+    check_instantiation_cap(objects, INSTANTIATION_CAP)?;
     let synthetic: Vec<Object> = stackmap_table_object(objects)
         .into_iter()
         .chain(gcmap_blob_object(objects))
@@ -396,6 +517,10 @@ fn link_with_base_ram(
 /// One function's contribution to the return-address stack map, as the backend's `.lamella_gcmap`
 /// fragment carries it: the owning function's symbol name, and each safepoint as its return address
 /// RELATIVE TO that function plus the entry's opaque tail.
+///
+/// The tail is never interpreted here. `lamella-elf`'s section note says why: one encoder writes an
+/// entry's shape and one collector reads it, and a linker that parsed it would be a third party to
+/// drift from.
 #[derive(Debug, Clone)]
 struct GcMapFragment {
     function: String,
@@ -523,6 +648,10 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
 /// safepoint as `u32 key` (the function's linked image offset plus the fragment's relative pc, which
 /// is exactly `runtime_return_addr - __lamella_text_base`) followed by its tail verbatim, sorted by
 /// key for the collector's binary search, behind a `u32 count`.
+///
+/// The result is byte-for-byte the format the GC ABI defines and
+/// `arm32::StackMaps::encode` still writes on the flat path. What moved is WHERE it is built, and
+/// therefore whether the addresses in it are true after a dead-strip.
 fn fill_gcmap_blob(text: &mut [u8], objects: &[Object], defined: &[Defined]) {
     let Some((blob_at, _)) = resolve_sym(defined, STACKMAP_BLOB_SYMBOL) else {
         return;
@@ -931,8 +1060,8 @@ fn encode_abs32_at(data: &mut [u8], site: u32, value: i64) -> Result<(), LinkErr
     Ok(())
 }
 
-/// On ARM, a Thumb function carries the Thumb bit in its symbol value's low bit (our backend +
-/// `gcc -mthumb` both set it for `STT_FUNC`); that bit is the `T` an `R_ARM_ABS32` reapplies. Data
+/// On ARM, a Thumb function carries the Thumb bit in its symbol value's low bit (the Lamella backend
+/// and `gcc -mthumb` both set it for `STT_FUNC`); that bit is the `T` an `R_ARM_ABS32` reapplies. Data
 /// symbols, and any symbol on a non-ARM target, are not Thumb.
 fn is_thumb_func(machine: Machine, value: u32) -> bool {
     machine == Machine::Arm && value & 1 == 1
@@ -1163,9 +1292,9 @@ fn apply_relocation(
     }
 }
 
-/// The relocation's addend `A`. RISC-V (and our own ARM objects) use explicit `RELA` addends; a
-/// `SHT_REL` ARM object (the `-mthumb` C toolchain's convention) stores the addend implicitly in the
-/// instruction field, so the linker extracts it from the call's current encoding.
+/// The relocation's addend `A`. RISC-V, and the ARM objects the Lamella backend emits, use explicit
+/// `RELA` addends; a `SHT_REL` ARM object (the `-mthumb` C toolchain's convention) stores the addend
+/// implicitly in the instruction field, so the linker extracts it from the call's current encoding.
 fn relocation_addend(text: &[u8], machine: Machine, site: u32, r: &ParsedRelocation) -> i64 {
     if r.implicit_addend {
         match (machine, r.kind) {
@@ -1240,6 +1369,7 @@ fn link_gc_inner(
     fold: bool,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
+    check_instantiation_cap(objects, INSTANTIATION_CAP)?;
     let machine = link_machine(objects)?;
     let mut funcs: Vec<(usize, String, u32, u32)> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
@@ -1916,6 +2046,11 @@ mod tests {
         rows
     }
 
+    /// THE INVARIANT THE RETURN-ADDRESS MAP NEVER HAD A GUARD FOR, AND THE ONE THAT MATTERS:
+    /// every key must be an offset INSIDE some surviving function, because a key is what a collector
+    /// matches a return address against. A map whose keys are anything else -- label ids, pre-layout
+    /// offsets, offsets into a text that dead-stripping has since repacked -- looks perfectly
+    /// well-formed and finds no frame.
     #[test]
     fn every_stack_map_key_lands_inside_a_surviving_function() {
         let text = alloc::vec![0u8; 16];
@@ -2427,6 +2562,78 @@ mod tests {
             .collect();
         assert!(defined.contains(&"f0"), "the entry is kept");
         assert!(defined.contains(&"rodata_blob"), "unreached non-descriptor data is kept wholesale");
+    }
+
+    /// DATA KEPT WHOLESALE IS ALSO A REACHABILITY ROOT, OR IT SURVIVES POINTING AT NOTHING.
+    ///
+    /// The test above pins that unreached non-descriptor data is KEPT. This pins the consequence
+    /// that rule has for the WALK: such a symbol carries its relocations with it, so anything it
+    /// names must be kept too. A string literal blob holds a relocation to `System.String`'s type
+    /// DESCRIPTOR -- and descriptors are the one data kind collected by reachability -- so before
+    /// the seed, the blob survived and its descriptor did not, which is an undefined symbol at
+    /// link time.
+    ///
+    /// **`f0` deliberately does NOT reference either symbol.** That is what makes this the
+    /// kept-but-unreached case rather than an ordinary reachable one; with a reference from `f0`
+    /// the descriptor would be kept for the wrong reason and the row would pass either way.
+    ///
+    /// Third instance of one bug class in `trim_object` -- descriptors, stack-map records, and now
+    /// a literal blob -- which is why the fix is a shared predicate (`kept_regardless`) rather than
+    /// a third special case.
+    #[test]
+    fn data_kept_wholesale_roots_the_descriptor_it_points_at() {
+        let obj = obj_arm(
+            &[0u8; 16],
+            &[
+                func("f0", 1, 4),
+                data("__lamella_str_0", 4, 4),
+                data("__lamella_typedesc_9", 8, 8),
+            ],
+            &[Relocation { offset: 4, symbol: 2, kind: arm::R_ARM_ABS32, addend: 0 }],
+        );
+        let trimmed = garbage_collect(&[obj], "f0");
+        let defined: Vec<&str> = trimmed
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(defined.contains(&"__lamella_str_0"), "the blob is kept wholesale, as before");
+        assert!(
+            defined.contains(&"__lamella_typedesc_9"),
+            "the descriptor the kept blob points at must be kept too -- otherwise the blob \
+             survives with a dangling relocation and the link fails on an undefined symbol. \
+             kept: {defined:?}"
+        );
+    }
+
+    /// The control for the row above: a descriptor NOTHING points at is still collected. Without
+    /// this, seeding every kept-wholesale symbol could have degenerated into "keep all descriptors"
+    /// and the row above would pass for a reason that costs flash in every image.
+    #[test]
+    fn an_unreferenced_descriptor_is_still_collected() {
+        let obj = obj_arm(
+            &[0u8; 16],
+            &[
+                func("f0", 1, 4),
+                data("__lamella_str_0", 4, 4),
+                data("__lamella_typedesc_9", 8, 8),
+            ],
+            &[],
+        );
+        let trimmed = garbage_collect(&[obj], "f0");
+        let defined: Vec<&str> = trimmed
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(defined.contains(&"__lamella_str_0"), "the blob is still kept wholesale");
+        assert!(
+            !defined.contains(&"__lamella_typedesc_9"),
+            "a descriptor nothing references is still collectable -- the seed must root what kept \
+             data POINTS AT, not every descriptor. kept: {defined:?}"
+        );
     }
 
     #[test]

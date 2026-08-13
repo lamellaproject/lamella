@@ -2215,15 +2215,9 @@ fn method_record_roots(
     let pinned = pinned_values(func, externs);
     let mut roots = Vec::new();
     for (v, ty) in func.value_types.iter().enumerate() {
-        let kind = match ty {
-            MirType::ObjectRef if pinned[v] => STACKMAP_KIND_PINNED,
-            MirType::ObjectRef => STACKMAP_KIND_OBJECT_REF,
-            MirType::ManagedPtr => STACKMAP_KIND_MANAGED_PTR,
-            MirType::PyValue => STACKMAP_KIND_TAGGED,
-            _ if crate::stackmaps::is_ref_cell(*ty) => STACKMAP_KIND_OBJECT_REF,
-            _ => continue,
-        };
-        roots.push(((offsets[v] / 4) as u16) | (kind << 14));
+        for (offset, kind) in crate::stackmaps::slot_roots(*ty, pinned[v]) {
+            roots.push((((offsets[v] + offset as i32) / 4) as u16) | (kind << 14));
+        }
     }
     roots
 }
@@ -2390,10 +2384,11 @@ fn lower_function_spilled(
 
     if relocate && has_safepoint {
         for (v, ty) in func.value_types.iter().enumerate() {
-            if (ty.is_gc_reference() || ty.is_tagged_value() || crate::stackmaps::is_ref_cell(*ty))
-                && !entry.params.contains(&ValueId(v as u32))
-            {
-                slot_store(enc, Reg::ZERO, offsets[v]);
+            if entry.params.contains(&ValueId(v as u32)) {
+                continue;
+            }
+            for (offset, _) in crate::stackmaps::slot_roots(*ty, false) {
+                slot_store(enc, Reg::ZERO, offsets[v] + offset as i32);
             }
         }
     }
@@ -5134,6 +5129,7 @@ mod tests {
                 MirType::ValueType {
                     handle: crate::stackmaps::REF_CELL_HANDLE,
                     size: 4,
+                    refs: lamella_ir::RefWords::at_word(0),
                 },
                 MirType::I32,
             ],
@@ -5570,6 +5566,7 @@ mod tests {
             vec![MirType::ValueType {
                 handle: lamella_ir::TypeHandle(0),
                 size,
+                refs: lamella_ir::RefWords::NONE,
             }]
         };
         assert_eq!(value_words(&types(1), ValueId(0)), 1);
@@ -5798,6 +5795,7 @@ mod tests {
         let flag = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 1,
+            refs: lamella_ir::RefWords::NONE,
         };
         let func = Function {
             params: vec![MirType::ObjectRef],
@@ -5858,6 +5856,7 @@ mod tests {
             MirType::ValueType {
                 handle: lamella_ir::TypeHandle(0),
                 size: 8,
+                refs: lamella_ir::RefWords::NONE,
             },
         ];
         assert!(is_pointer(&types, ValueId(0)));
@@ -6227,6 +6226,7 @@ mod tests {
         let s = MirType::ValueType {
             handle: TypeHandle(1),
             size: 12,
+            refs: lamella_ir::RefWords::NONE,
         };
         let make = Function {
             params: Vec::new(),
@@ -6277,6 +6277,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: TypeHandle(1),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let n = ValueId;
         let func = Function {
@@ -6325,6 +6326,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: TypeHandle(1),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let n = ValueId;
         let make = Function {

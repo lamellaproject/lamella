@@ -23,16 +23,25 @@ flash = 0x100000
 ram = 0x3C000
 source = "DS10916 Rev 5 ordering information (N = 216 pins, G = 1024 Kbytes flash, H = TFBGA) + RM0385 Rev 9 memory map (SRAM1 240 KB). The pin list is PARTIAL rather than the package's full set."
 # Every pin the family's map now names, stated as same-port ranges where the run is contiguous.
-# The high ports are the interesting claim -- F, G and H exist only on the larger packages -- and
+# The high ports are the interesting claim -- F, G, H and I exist only on the larger packages -- and
 # the evidence is not a table reading: an external memory was brought up on this exact part with
 # signals in all of them, which cannot happen through pins the package does not bring out.
+#
+# TWENTY-TWO OF THESE ARE CARRIED BY A SECOND KIND OF EVIDENCE, AND IT IS INDEPENDENT OF THE FIRST.
+# UM1907 Table 6 assigns each of them to a numbered position of a board header, which is a claim
+# only a package that brings the pin out can support: a board cannot route a pad the part does not
+# have to a hole a shield plugs into. That is what carries port I, which no binding here reaches
+# and which no external memory on this board uses. Twenty of the twenty-two are stated a third time
+# by that manual's own per-ball I/O assignment, Table 13; the two it does not carry are PB14 and
+# PB15, and its silence about them is not a contradiction of the table that names them.
 pins = [
-    "PA9",
-    "PB2", "PB6-PB9",
-    "PC3",
+    "PA0", "PA8-PA9", "PA15",
+    "PB2", "PB4", "PB6-PB9", "PB14-PB15",
+    "PC3", "PC6-PC7",
     "PD0-PD1", "PD8-PD15",
     "PE0-PE2", "PE7-PE15",
-    "PF0-PF5", "PF11-PF15",
-    "PG0-PG1", "PG4-PG5", "PG8", "PG15",
-    "PH3", "PH5", "PH7-PH8",
+    "PF0-PF15",
+    "PG0-PG1", "PG4-PG8", "PG15",
+    "PH3", "PH5-PH8",
+    "PI0-PI3",
 ]

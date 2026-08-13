@@ -22,9 +22,20 @@ pub mod product_id {
     ///
     /// Measured on a NUCLEO-C071RB before the document was found, and the two agree: the probe
     /// reports generation 2 (JTAG v45 / SWIM v30) and enumerates a debug interface and a virtual
-    /// COM port and nothing else.
+    /// COM port and nothing else. **That board offers NO drag-drop volume, so SWD is the only way
+    /// to program it** -- TN1235 lists mass storage as OPTIONAL for a V2EC, and this one ships with
+    /// it off. The mass-storage fallback every other on-board ST-Link here provides does not exist.
     pub const V2EC: u16 = 0x3752;
     /// An STLINK-V3 WITHOUT bridge functions -- the form embedded on demonstration boards.
+    ///
+    /// THIS ID CANNOT TELL AN **STLINK-V3E** FROM AN **STLINK-V3EC**, and no amount of
+    /// enumeration will. TN1235 assigns product ids by whether the BRIDGE is present ("374E or 3754
+    /// for STLINK-V3 without bridge functions"), while V3E and V3EC differ by the board's USB
+    /// connector -- a V3EC is the variant "managing a USB Type-C connection". Both report
+    /// generation 3. Measured before the document was found: a NUCLEO-H755ZI-Q and a
+    /// NUCLEO-U5A5ZJ-Q present this id with identical interface layouts, differing only in firmware
+    /// version. **So a directive that asks for "V3E and V3EC" separately is asking for a
+    /// distinction the USB bus does not carry; the connector on the board is the discriminator.**
     pub const V3E: u16 = 0x374e;
     /// The second id for an STLINK-V3 without bridge functions (TN1235).
     pub const V3_NO_BRIDGE_ALT: u16 = 0x3754;
@@ -32,15 +43,31 @@ pub mod product_id {
     /// carry a second virtual COM port.
     pub const V3S: u16 = 0x374f;
     /// The second id for an STLINK-V3 with bridge functions (TN1235).
+    ///
+    /// This was previously named for carrying two virtual COM ports, which is a CONSEQUENCE of
+    /// being a bridge-capable standalone probe rather than what the id means.
     pub const V3_BRIDGE_ALT: u16 = 0x3753;
     /// STLINK-V3PWR: a V3-family debug probe with an energy-measurement channel.
     ///
     /// Read off the device rather than recalled: it enumerates as a composite whose second virtual
     /// COM port names itself `STLink Virtual COM Port PWR`, which is the probe stating what it is.
     /// The DEBUG interface is an ordinary V3 one, so nothing above this constant changes.
+    ///
+    /// IT REPORTS MAJOR VERSION **4**, NOT 3, AND THAT IS CORRECT. A V3 reported `4` when read
+    /// and it was recorded as a suspected mis-decode of the APIv3 version reply; TN1235 settles it
+    /// the other way -- the major version ID is "4 for STLINK-V3PWR". Both gates that read this
+    /// field test `>=`, so the behaviour was right either way, but the doubt is retired: a V3PWR
+    /// really is a later major version than the rest of the V3 family.
     pub const V3PWR: u16 = 0x3757;
 
     /// Every V3-generation product id, so a caller can search the family rather than one member.
+    ///
+    /// DECLARED ONCE BECAUSE THE ALTERNATIVE ALREADY WENT WRONG TWICE. `--v3` once meant `V3E`
+    /// alone and answered "no ST-Link found on the USB bus -- plug one in" at a V3S that was
+    /// plugged in and enumerating; the list then lived in one example while the crate held the
+    /// constants, and a newly released V3PWR was invisible to every tool that had its own
+    /// copy. A family is a fact about the hardware, so it belongs beside the ids and not beside a
+    /// command-line flag.
     pub const V3_FAMILY: [u16; 5] = [V3E, V3_NO_BRIDGE_ALT, V3S, V3_BRIDGE_ALT, V3PWR];
 }
 
@@ -91,6 +118,10 @@ const MAX_NEGOTIATED_KHZ: u32 = 4000;
 /// NOWHERE in their own reply, so without it a failed transfer is indistinguishable from a good
 /// one -- the read returns whatever was last in the probe's buffer, and the write returns having
 /// done nothing.
+///
+/// A V3 DOES NOT ANSWER THIS FORM, AND DOES NOT SAY SO. Asked on an ST-Link/V3 it returns `0x42`
+/// -- to a good read, to a failed read, and before any transfer has happened at all. See
+/// [`DEBUG_APIV2_GETLASTRWSTATUS2`] and [`wide_status_supported`].
 const DEBUG_APIV2_GETLASTRWSTATUS: u8 = 0x3b;
 
 /// The wider transfer-status query, and the one every current probe actually answers.
@@ -122,6 +153,11 @@ const DEBUG_ERR_AP_STICKY_OVERRUN: u8 = 0x1a;
 const DEBUG_ERR_BAD_AP: u8 = 0x1d;
 
 /// Whether a probe of this firmware vintage answers [`DEBUG_APIV2_GETLASTRWSTATUS2`].
+///
+/// THE GENERATION IS CHECKED FIRST AND THE JTAG FIELD IS NOT CONSULTED ON A V3, WHICH IS THE
+/// WHOLE POINT OF WRITING IT THIS WAY. A V3's JTAG/SWD sub-version is not the V2 counter continued
+/// -- the bench V3S reports `1` -- so a plain `jtag >= 15` test rejects the very probes that ONLY
+/// answer the wide form, and does it silently.
 ///
 /// Split out from the transfer path so the DECISION is testable without a probe, the same reason
 /// [`rw_status_failure`] is.
@@ -327,6 +363,12 @@ impl StLink {
     /// serves its drag-drop drive, a standalone dongle sits in DFU -- and answers no debug command
     /// until switched. Leaves DFU first when found there, since the debug command that would do the
     /// switching is itself unavailable in DFU. Idempotent.
+    /// A V3 ALSO NEEDS A COMMUNICATION FREQUENCY FIRST, AND REFUSES DEBUG MODE WITHOUT ONE.
+    /// A V2/V2-1 carries a default and needs nothing; a V3 has none, so the same call that works on
+    /// every other probe answered `ST-Link refused to enter SWD debug mode` on a V3
+    /// with the target rail confirmed at 3.00 V -- a probe-side omission that reads exactly like a
+    /// dead target. Handled here rather than left to callers because every caller would need it and
+    /// the failure it prevents does not name itself.
     pub fn enter_swd(&mut self) -> Result<(), ProbeError> {
         if matches!(self.current_mode(), Ok(Mode::Dfu)) {
             self.exit_dfu()?;
@@ -382,6 +424,12 @@ impl StLink {
     }
 
     /// Picks a frequency from the ones the probe REPORTS, and sets it.
+    ///
+    /// It does not invent a rate. A number we chose could be one this probe does not offer, and
+    /// the refusal would look like the very failure this exists to fix; asking first means the value
+    /// is always one the probe named. Of those, the fastest at or below [`MAX_NEGOTIATED_KHZ`] --
+    /// bring-up runs over flying leads as often as over a board trace, and the top rate a probe can
+    /// name is not one every wire can carry.
     fn negotiate_com_freq(&mut self) -> Result<(), ProbeError> {
         let offered = self.com_frequencies()?;
         let chosen = offered
@@ -444,6 +492,13 @@ impl StLink {
     }
 
     /// Whether this probe answers the wider transfer-status query, asking the probe once.
+    ///
+    /// THE LOOKUP IS SAFE TO PERFORM BETWEEN A TRANSFER AND ITS STATUS CHECK, AND THAT WAS
+    /// MEASURED RATHER THAN ASSUMED, because if it were not, a lazily-resolved version would ERASE
+    /// the very answer it was resolved to obtain -- and would do it only on the first access of a
+    /// session, which is the hardest shape of bug to see. The sequence: a read deliberately failed
+    /// through a non-existent access port, then `GET_VERSION`, then the status re-read -- the
+    /// failure and its faulting address both survived unchanged (`0x1d at 0x08000000` either side).
     fn uses_wide_status(&mut self) -> bool {
         if let Some(known) = self.wide_status {
             return known;
@@ -456,6 +511,24 @@ impl StLink {
     }
 
     /// Asks the probe whether the last read or write completed, and turns "no" into an error.
+    ///
+    /// WHICH QUERY IS NOT A DETAIL -- IT IS THE DIFFERENCE BETWEEN READING MEMORY AND NOT. This
+    /// used to send `GETLASTRWSTATUS` unconditionally, and recorded that choosing between the two
+    /// forms was not worth a version check. It was: **an ST-Link/V3 answers the older form with
+    /// `0x42` -- to a good read, to a failed read, and before any transfer has happened at all.**
+    /// Every memory access through a V3 therefore returned correct data and was then thrown away by
+    /// this function, which is how "the V3 cannot read memory on an H7" came to be believed. It
+    /// could read it the whole time; nothing on the wire was ever wrong.
+    ///
+    /// AND THE OLD FORM CANNOT BE LEFT IN AS A HARMLESS FALLBACK FOR A V3, because a constant
+    /// answer fails in BOTH directions: `0x42` is not `OK`, so good transfers are rejected -- and
+    /// had the constant happened to be `0x80`, failed transfers would have been ACCEPTED, which is
+    /// the silent-stale-data defect this check exists to prevent. Measured, same probe and board:
+    /// a read through a non-existent access port returns the previous status byte AS DATA.
+    ///
+    /// The wider form's 12-byte reply also carries the faulting ADDRESS at offset 4. It is not
+    /// surfaced here because [`ProbeError::Device`] carries a fixed string; `stlink-mem-diagnose`
+    /// prints it, which is where a faulting address is actually read.
     fn check_last_rw_status(&mut self) -> Result<(), ProbeError> {
         let (opcode, reply_len) = if self.uses_wide_status() {
             (DEBUG_APIV2_GETLASTRWSTATUS2, 12)

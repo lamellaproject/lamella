@@ -121,4 +121,25 @@ public sealed class Nrf52833GpioDriver : GpioDriver
     {
         return PortBase(pinNumber) + PIN_CNF + (uint)((pinNumber & 31) * 4);
     }
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void AddCallbackForPinValueChangedEvent(
+        int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("nRF52833 pin-change events are not implemented");
+#else
+        throw new System.Exception("nRF52833 pin-change events are not implemented");
+#endif
+    }
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void RemoveCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("nRF52833 pin-change events are not implemented");
+#else
+        throw new System.Exception("nRF52833 pin-change events are not implemented");
+#endif
+    }
 }

@@ -19,6 +19,12 @@ pub struct TypeTable {
     by_namespace: BTreeMap<String, BTreeMap<String, Vec<Box<str>>>>,
 }
 
+/// What a [`TypeTable::shadow`] displaced: the entry that held the name, or `None` if the name was
+/// free. Opaque to its holder -- it exists to be handed back to [`TypeTable::unshadow`] and must
+/// not be read for anything else, because it is the ONLY copy of a real type's entry while the
+/// scope is open.
+pub type Shadowed = Option<Vec<Box<str>>>;
+
 impl TypeTable {
     /// An empty table.
     #[must_use]
@@ -44,10 +50,54 @@ impl TypeTable {
     /// Takes a type back out of scope.
     ///
     /// For a name that is in scope only for part of a compilation -- a generic declaration's type
-    /// parameters, which are types inside their own declaration and nowhere else.
+    /// parameters, which are types inside their own declaration and nowhere else. **The caller
+    /// must remove only what it added**, or a scoped insert that collided with a real type would
+    /// delete the real one on the way out. [`TypeTable::shadow`] is that discipline made
+    /// mechanical, and is what a scoped insert should use.
     pub fn remove(&mut self, namespace: &str, name: &str) {
         if let Some(names) = self.by_namespace.get_mut(namespace) {
             names.remove(name);
+        }
+    }
+
+    /// Brings `name` into scope for part of a compilation, **displacing whatever was there** and
+    /// handing it back for [`TypealTable::unshadow`](TypeTable::unshadow) to restore.
+    ///
+    /// **THIS IS THE ONE STATEMENT OF THE SHADOWING RULE**, and both halves of it matter:
+    ///
+    /// - **A type parameter SHADOWS a real type of the same name.** C# 20.1.1: a type parameter is
+    ///   a type inside its declaration, and a declaration that also has a real `T` in scope means
+    ///   `T` there, not the class. Resolving the class instead is not a message difference -- it
+    ///   silently binds a different type, and every signature built from it is wrong.
+    /// - **The displaced entry comes back.** The obvious way to get the first half -- insert
+    ///   unconditionally -- makes the exit path delete a real type for the rest of the
+    ///   compilation, which is why the previous shape guarded the insert instead and gave up
+    ///   shadowing to keep the exit safe. Saving the entry gets both.
+    ///
+    /// Returns `None` when nothing was displaced, which is the ordinary case.
+    #[must_use = "the displaced entry must be handed to `unshadow`, or a real type is lost"]
+    pub fn shadow(&mut self, namespace: &str, name: &str) -> Shadowed {
+        self.by_namespace
+            .entry(namespace.into())
+            .or_default()
+            .insert(name.into(), Vec::new())
+    }
+
+    /// Puts back what [`TypeTable::shadow`] displaced, ending the scope it opened.
+    ///
+    /// Restoring `None` REMOVES the name, which is correct: nothing was there before, so nothing
+    /// should be there after.
+    pub fn unshadow(&mut self, namespace: &str, name: &str, shadowed: Shadowed) {
+        let Some(names) = self.by_namespace.get_mut(namespace) else {
+            return;
+        };
+        match shadowed {
+            Some(displaced) => {
+                names.insert(name.into(), displaced);
+            }
+            None => {
+                names.remove(name);
+            }
         }
     }
 
@@ -62,6 +112,16 @@ impl TypeTable {
     /// The arities of `name` that ARE in scope in `namespace`, each with that declaration's
     /// type-parameter names -- the candidates for a use site whose own arity found nothing.
     /// An entry of arity 0 is the non-generic type of that name.
+    ///
+    /// **ORDERED BY ARITY, WHERE csc ORDERS BY DECLARATION.** Measured: with
+    /// `Multi<A,B,C>` declared before `Multi<T,U>`, csc's CS0305 names `Multi<A, B, C>` for a use of
+    /// ANY wrong arity -- so it quotes the first-declared candidate, not the lowest-arity one and
+    /// not the nearest. The [`crate::symbols::Model`] is a `BTreeMap` and has already lost
+    /// declaration order by the time this table is built, so matching that would cost a
+    /// declaration index on every type for a message in a program that declares one name at two
+    /// arities. **Identical to csc wherever exactly one candidate exists**, which is every
+    /// single-arity program; the divergence is recorded rather than hidden, and closing it means
+    /// carrying the order, not sorting differently here.
     #[must_use]
     pub fn candidates(&self, namespace: &str, name: &str) -> Vec<(usize, &[Box<str>])> {
         let Some(names) = self.by_namespace.get(namespace) else {
@@ -160,6 +220,14 @@ pub fn resolve_type(
 }
 
 /// Why a generic use site's DEFINITION cannot be used at `arity`, or `None` when it can.
+///
+/// **THERE IS NOW ONE SPELLING.** ECMA-335 II.10.7.2 mangles the arity into a generic type's
+/// metadata name, and `declaration::collect_types` collects a SOURCE-declared
+/// `Box<T>` the same way a reference assembly's `` List`1 `` already arrived -- so the lookup is a
+/// single exact key rather than a mangled probe with a bare fallback. **The bare fallback was what
+/// let a WRONG ARITY resolve**: `Box<int,int>` found `Box<T>`, and the binder went on to bind
+/// against a definition the program had not named.
+///
 /// The three answers are csc's, measured rather than reconstructed:
 ///
 /// | the name in scope | answer |
@@ -174,7 +242,7 @@ fn definition_refusal(
     arity: usize,
 ) -> Option<DiagnosticKind> {
     let (namespace, name) = split_name(definition);
-    let metadata_name = crate::symbols::metadata_type_name(name, arity);
+    let metadata_name = crate::symbols::definition_metadata_name(definition, arity);
     if table.contains(&namespace, &metadata_name) {
         return None;
     }
@@ -197,7 +265,12 @@ fn definition_refusal(
 
 /// A CS0305 candidate as csc quotes it: `Box<T>`, the simple name with the declared parameter
 /// names, `, `-separated.
-fn quote_candidate(name: &str, required: usize, parameters: &[Box<str>]) -> Box<str> {
+///
+/// **The parameters are the DECLARED names and are never synthesized.** A reference assembly
+/// whose `GenericParam` rows carry no names leaves them absent, and inventing `T1, T2` there would
+/// put a name in quotes that appears nowhere in any source -- so the arity form `Box<,>` stands in,
+/// which is at least a spelling C# itself uses for an unbound type.
+pub(crate) fn quote_candidate(name: &str, required: usize, parameters: &[Box<str>]) -> Box<str> {
     let mut text = String::from(name);
     text.push('<');
     if parameters.len() == required {
@@ -219,7 +292,7 @@ fn quote_candidate(name: &str, required: usize, parameters: &[Box<str>]) -> Box<
 
 /// Splits a dotted name into its namespace (the leading parts joined by `.`) and
 /// its simple name (the last part).
-fn split_name(parts: &[Box<str>]) -> (String, &str) {
+pub(crate) fn split_name(parts: &[Box<str>]) -> (String, &str) {
     match parts.split_last() {
         Some((name, namespace_parts)) => {
             let mut namespace = String::new();
@@ -342,6 +415,10 @@ mod tests {
         assert!(diagnostics[0].kind.to_string().contains("'Missing'"));
     }
 
+    /// **THE DEFECT THE ONE-SPELLING CHANGE EXISTS TO CLOSE.** A source-declared `Box<T>` used
+    /// as `Box<int,int>` must be CS0305 and not a resolution: a bare fallback finds the definition
+    /// with the arity unchecked, and the binder then proceeds against one the program never named.
+    /// The message is csc's, measured rather than reconstructed.
     #[test]
     fn a_wrong_arity_is_cs0305_and_names_the_candidate_csc_names() {
         let mut table = world();
@@ -404,6 +481,45 @@ mod tests {
         assert!(resolve_type(&table, &nested, &mut diagnostics, Span::empty_at(0)).is_error());
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code(), 246);
+    }
+
+    #[test]
+    fn a_shadow_displaces_a_real_type_and_gives_it_back() {
+        let mut table = TypeTable::new();
+        table.insert_generic("", "T", alloc::vec!["Original".into()]);
+        assert_eq!(
+            table.candidates("", "T"),
+            alloc::vec![(0usize, &["Original".into()][..])],
+            "the real type is in scope to begin with"
+        );
+
+        let displaced = table.shadow("", "T");
+        assert!(table.contains("", "T"), "the parameter is a type in its scope");
+        assert_eq!(
+            table.candidates("", "T"),
+            alloc::vec![(0usize, &[][..])],
+            "the PARAMETER is what resolves inside the declaration, not the class"
+        );
+
+        table.unshadow("", "T", displaced);
+        assert_eq!(
+            table.candidates("", "T"),
+            alloc::vec![(0usize, &["Original".into()][..])],
+            "the real type is back, with the parameter names it declared"
+        );
+    }
+
+    #[test]
+    fn a_shadow_over_a_free_name_leaves_it_free() {
+        let mut table = TypeTable::new();
+        let displaced = table.shadow("", "T");
+        assert!(displaced.is_none(), "nothing was there to displace");
+        assert!(table.contains("", "T"));
+        table.unshadow("", "T", displaced);
+        assert!(
+            !table.contains("", "T"),
+            "the name is free again once the declaration ends"
+        );
     }
 
     #[test]

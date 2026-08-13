@@ -2,6 +2,24 @@
 # The record carries the enable REGISTER OFFSET as data because ST spreads the gates across banked
 # enable registers, so [base, rcc_en_off, rcc_en_bit] states each gate in full. `-1` = the row
 # gates nothing (the RCC itself).
+#
+# THE BASES ARE NOT THE OTHER ST FAMILIES' BASES AND THE DIFFERENCE IS A WHOLE 384 MEGABYTES.
+# This part puts its GPIO ports and its RCC at 0x58020000 and above, in the D3 domain on AHB4,
+# where the vendor's F0, F4, F7 and L4 lines put them at 0x40020000 and 0x40023800. The USART, by
+# contrast, is where those lines would put it: USART3 sits at 0x40004800 on APB1. So a family that
+# copied "the ST layout" would place the serial port correctly and every GPIO write
+# into a reserved region -- and RM0399's own footnote to that table says accessing a reserved area
+# results in a bus error, which at least fails loudly rather than silently.
+#
+# THE ENABLE REGISTER HAS THREE ALIASES ON THIS PART AND THE SHARED ONE IS THE RIGHT ONE. Each
+# RCC enable register appears three times: RCC_AHB4ENR at offset 0x0E0, RCC_C1_AHB4ENR at 0x140
+# and RCC_C2_AHB4ENR at 0x1A0, and the same pattern holds for RCC_APB1LENR at 0x0E8/0x148/0x1A8.
+# The C1 and C2 forms let ONE core allocate a peripheral to the OTHER; the shared form allocates
+# to whichever core wrote it, because RM0399 says the hardware detects which CPU did the access in
+# order to allocate the peripheral to the right CPU. The offsets below are the shared ones, and
+# that is what makes them target-independent: the same emitted constant is correct whether the
+# image runs on the Cortex-M7 or on the Cortex-M4. Nothing about the multi-core split reaches this
+# table, and that is a finding rather than an omission.
 
 [table]
 kind = "instances"
@@ -52,6 +70,12 @@ block = "gpio"
 base = 0x58021000
 rcc_en_off = 0xE0   # RCC_AHB4ENR
 rcc_en_bit = 4      # GPIOEEN
+
+# PORTS I AND J EXIST ONLY ON THE LARGER PACKAGES, AND THEIR ENABLE BITS ARE WHERE THE ALPHABET
+# STOPS BEING A GUIDE. GPIOIEN and GPIOJEN sit at bits 8 and 9 of RCC_AHB4ENR, which does continue
+# the run A=0 through K=10 -- but the letters skip no position only because this register carries
+# nothing else below bit 11, and the same vendor's other lines put a port's enable bit in a
+# register whose low bits are already spent. Both were read from RM0399's per-bit descriptions.
 
 [[instances]]
 name = "gpioi"

@@ -4,15 +4,30 @@
 
 A C# toolchain built from scratch in Rust: a compiler, an interpreted runtime (VES/CLR), an ahead-of-time backend (Cortex-M, RISC-V, WebAssembly), and a base class library. The language and runtime are implemented directly from their ECMA standards.
 
-Lamella is a student project, built for learning and possible use in a thesis. It is free and open source under the [licenses below](#license).
+Lamella was born as a research project and for use in student theses. While its scope has outgrown those original purposes,
+that academic discipline continues--with standards' clauses cited beside the code implementing them.
 
-Bug reports are welcome: please [open an issue](https://github.com/lamellaproject/lamella/issues) on GitHub. Pull requests are not being accepted at this time. Please also be patient with response times; this is maintained on a student schedule.
+It is free and open source under the [licenses below](#license).
 
 ## Status
 
 Lamella is in development and is **not yet ready for use**. Code is being reviewed and will be published incrementally. 
 
 To be notified when releases are available, click **Watch** at the top of this repo, select **Custom**, and check **Releases**.
+
+## Contributing
+
+The Lamella Project encourages community collaboration.  Many Lamella repositories gladly accept pull requests under a contributor 
+agreement (to ensure that all code remains free to use, dual-licensed as Apache-2.0 / MIT).
+
+This specific core repository was developed clean-room: modification to its code are made by responding to community members' 
+requests.  If you find a bug, please feel welcome to [open an issue](https://github.com/lamellaproject/lamella/issues).
+
+## How this repo is managed
+
+Lamella is built by humans using traditional software engineering practices, in collaboration with frontier AI models.
+@lamella-mel, AI co-author for this project, will often interact with community members to help support and accelerate 
+their requests.
 
 ## About the name
 

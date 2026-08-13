@@ -67,8 +67,8 @@ pub struct LexOptions {
     pub version: LanguageVersion,
     /// Whether unsafe code is permitted -- csc's `/unsafe`. **Off by default, as csc's is**: an
     /// `unsafe` modifier or block written without it is `CS0227`. The knob does not change what is
-    /// PARSED (unsafe C# is fully implemented; the v1 scope is all of C# including unsafe), only
-    /// whether the compilation is allowed to contain it, which is a command-line policy rather
+    /// PARSED -- unsafe C# is fully implemented -- only whether the compilation is allowed to
+    /// contain it, which is a command-line policy rather
     /// than a language rule. A host that parses no command line -- a test harness, an in-process
     /// compile -- sets it explicitly for what it is compiling.
     pub unsafe_code: bool,
@@ -1460,8 +1460,8 @@ impl<'a> Lexer<'a> {
 /// suffix or sign) to `(lo, mid, hi, scale)` -- the 96-bit integer mantissa split into three `u32`
 /// and the power-of-ten scale, so the value is `mantissa x 10^-scale`. A literal too precise for
 /// that form (more than 28 fractional places, or more significant digits than 96 bits hold) is
-/// rounded to the NEAREST representable decimal, ties to even -- csc's behavior, probed against
-/// Roslyn 2026-07-16: `2.5e-28m` is `2e-28`, `4.5e-28m` is `4e-28`, `5e-29m` is a zero of scale
+/// rounded to the NEAREST representable decimal, ties to even -- csc's behavior, probed rather
+/// than assumed: `2.5e-28m` is `2e-28`, `4.5e-28m` is `4e-28`, `5e-29m` is a zero of scale
 /// 28, and `7922816251426433759354395033.59m` re-scales to `...034`. `None` only when even the
 /// rounded value is out of range (the integer part exceeds 96 bits). (The sign of `-2.5m` is a
 /// separate unary minus, folded later, not part of the literal.)

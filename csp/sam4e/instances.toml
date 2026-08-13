@@ -5,6 +5,15 @@
 # THE PORT ROWS SAY WHICH GROUP THEY ARE, RATHER THAN LEAVING IT TO THEIR NAMES. A pin named PD22
 # has to resolve to the base address of the port group that backs it, and this vendor calls that
 # group PIOD where others call theirs PORTD or GPIOD.
+#
+# THE PERIPHERAL IDS ARE NOT THE SAM4S's OR THE SAM4N's, AND THE BASE ADDRESSES ARE. That pair
+# of facts is why this is a separate family and not another parts row. All three series put PIOA at
+# 0x400E0E00, PIOB at 0x400E1000 and PIOC at 0x400E1200 -- and this series numbers those three 9,
+# 10 and 11 where the other two number them 11, 12 and 13. So id 11 selects PIOA on one series and
+# PIOC on this one, and id 9 is a UART there and a port controller here. An instance row is a
+# TUPLE: two series agreeing on one field of it are not the same family, and a shared table here
+# would not be merely incomplete, it would be contradictory. This series also has five port
+# controllers where they have three.
 
 [table]
 kind = "instances"

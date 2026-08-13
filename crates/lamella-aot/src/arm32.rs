@@ -2412,13 +2412,13 @@ fn lower_spilled_into(
             .value_types
             .iter()
             .enumerate()
-            .filter(|(v, ty)| {
-                (ty.is_gc_reference()
-                    || ty.is_tagged_value()
-                    || crate::stackmaps::is_ref_cell(**ty))
-                    && !entry_params.contains(&ValueId(*v as u32))
+            .filter(|(v, _)| !entry_params.contains(&ValueId(*v as u32)))
+            .flat_map(|(v, ty)| {
+                let base = offsets[v];
+                crate::stackmaps::slot_roots(*ty, false)
+                    .map(move |(offset, _)| base + offset as u16)
+                    .collect::<Vec<_>>()
             })
-            .map(|(v, _)| offsets[v])
             .collect();
         if !ref_slots.is_empty() {
             enc.movs_imm(Reg::R0, 0)
@@ -3899,6 +3899,12 @@ impl StackMaps {
     /// `u32 return_pc` followed by [`StackMapEntry::encode_tail`]. `ref_offsets` are unconditional
     /// `ObjectRef` roots; `tagged_offsets` are `PyValue` roots the collector traces by tag. The
     /// tagged fields are always present -- a C# image emits `ntagged = 0`.
+    ///
+    /// The OBJECT path no longer calls this. There, `return_pc` is only knowable after the linker
+    /// has dead-stripped and laid out the text, so the map is synthesized by `lamella-link` from the
+    /// [`lamella_elf::STACKMAP_GCMAP_SECTION`] fragments -- same bytes, same symbol, built where the
+    /// addresses are true. This stays the encoder for the FLAT path, which has no linker and whose
+    /// offsets are final at lowering time.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -3973,17 +3979,11 @@ fn method_record_roots(func: &Function, externs: &[alloc::string::String]) -> Ve
     let pinned = pinned_values(func, externs);
     let mut roots = Vec::new();
     for (v, ty) in func.value_types.iter().enumerate() {
-        let kind = match ty {
-            MirType::ObjectRef if pinned[v] => STACKMAP_KIND_PINNED,
-            MirType::ObjectRef => STACKMAP_KIND_OBJECT_REF,
-            MirType::ManagedPtr => STACKMAP_KIND_MANAGED_PTR,
-            MirType::PyValue => STACKMAP_KIND_TAGGED,
-            _ if crate::stackmaps::is_ref_cell(*ty) => STACKMAP_KIND_OBJECT_REF,
-            _ => continue,
-        };
-        roots.push((offsets[v] / 4) | (kind << 14));
+        for (offset, kind) in crate::stackmaps::slot_roots(*ty, pinned[v]) {
+            roots.push(((u32::from(offsets[v]) + offset) / 4) | (u32::from(kind) << 14));
+        }
     }
-    roots
+    roots.into_iter().map(|r| r as u16).collect()
 }
 
 /// Lowers a single function to ARM32 machine code. A function that calls another
@@ -6174,6 +6174,25 @@ mod tests {
         );
     }
 
+    /// **AN INSTANTIATION IS THE ONE HANDLE THAT MUST *NOT* QUALIFY BY ASSEMBLY, AND THE
+    /// ORDINARY HANDLE BESIDE IT IS THE CONTROL.**
+    ///
+    /// The `own` hash keeps two libraries' row 5 APART -- two different types sharing a token
+    /// number. `List<int>` named from a program and from a library is ONE type (assembly
+    /// qualification NONE, `generics-identity-and-sharing` s6.1.0, forced by the loader's
+    /// `(namespace, name)` interning), so it wants the reverse. Its handle comes from the canonical
+    /// SPELLING rather than a row, which is what makes an unqualified symbol the same string in
+    /// every build.
+    ///
+    /// **THE RULE IS ONLY SOUND BECAUSE AN INSTANTIATION HAS A TABLE BYTE OF ITS OWN**, `0x09` in
+    /// `lamella-ir`. A branch keyed on a byte an instantiation SHARED with a front end's synthesized
+    /// array would silently change every synthetic array's symbol in a library build as well. **The
+    /// two bytes differing is asserted here, because it is the precondition the rule rests on rather
+    /// than a fact about somewhere else.**
+    ///
+    /// A test that only checked the instantiation would pass under a `descriptor_symbol` that had
+    /// stopped qualifying ANYTHING -- which is why the ordinary handle is asserted in the same test,
+    /// under the same qualifiers.
     #[test]
     fn an_instantiations_descriptor_symbol_does_not_qualify_by_assembly() {
         assert_ne!(
@@ -6478,6 +6497,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let func = Function {
             params: Vec::new(),
@@ -6524,6 +6544,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let func = Function {
             params: Vec::new(),
@@ -6570,6 +6591,7 @@ mod tests {
         let flag = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 1,
+            refs: lamella_ir::RefWords::NONE,
         };
         let func = Function {
             params: vec![MirType::ObjectRef],
@@ -6616,6 +6638,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let func = Function {
             params: vec![point],
@@ -6643,6 +6666,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let main = Function {
             params: Vec::new(),
@@ -6689,6 +6713,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let make = Function {
             params: Vec::new(),
@@ -10000,6 +10025,15 @@ mod tests {
         }
     }
 
+    /// Checking "is the safepoint inside its function" against a two-function toy passes under BOTH
+    /// the fix and the defect, because a small label id is also a plausible small offset. **A LABEL
+    /// ID IS A COUNTER GLOBAL TO THE ENCODER; AN OFFSET IS FUNCTION-LOCAL.** So the place they must
+    /// diverge is a SMALL function that lowers LATE: by then the label counter has run far past
+    /// anything that could be an offset into it.
+    ///
+    /// `big` burns ~40 labels on a block chain; `small` then has one safepoint a few bytes in. Under
+    /// the raw-label defect `small`'s "return address" is a label index in the forties and its extent
+    /// is a couple of dozen bytes, so the range check fires. Under the fix it is the real offset.
     #[test]
     fn a_late_small_functions_safepoint_is_an_offset_and_not_a_label_id() {
         const CHAIN: usize = 40;
@@ -10617,6 +10651,7 @@ mod tests {
         let big = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let func = Function {
             params: Vec::new(),
@@ -10744,6 +10779,7 @@ mod tests {
                 MirType::ValueType {
                     handle: crate::stackmaps::REF_CELL_HANDLE,
                     size: 4,
+                    refs: lamella_ir::RefWords::at_word(0),
                 },
                 MirType::I32,
             ],

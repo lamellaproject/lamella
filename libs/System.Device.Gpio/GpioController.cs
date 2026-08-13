@@ -101,6 +101,21 @@ namespace System.Device.Gpio
         /// <summary>Toggles the current value of a pin.</summary>
         public void Toggle(int pinNumber) { _driver.Toggle(Logical(pinNumber)); }
 
+        /// <summary>Adds a callback that is invoked when <paramref name="pinNumber"/> has an event
+        /// of type <paramref name="eventTypes"/>.</summary>
+        public void RegisterCallbackForPinValueChangedEvent(
+            int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
+        {
+            _driver.AddCallbackForPinValueChangedEvent(Logical(pinNumber), eventTypes, callback);
+        }
+
+        /// <summary>Removes a callback that was being invoked for the pin at
+        /// <paramref name="pinNumber"/>.</summary>
+        public void UnregisterCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
+        {
+            _driver.RemoveCallbackForPinValueChangedEvent(Logical(pinNumber), callback);
+        }
+
         /// <summary>Disposes the controller and its driver.</summary>
         public void Dispose() { _driver.Dispose(); }
     }

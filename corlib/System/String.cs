@@ -8,6 +8,10 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public unsafe String(char* value) { }
         [Lamella.Runtime.RuntimeProvided] public unsafe String(char* value, int startIndex, int length) { }
 
+        [Lamella.Runtime.RuntimeProvided] public String(char[] value) { }
+        [Lamella.Runtime.RuntimeProvided] public String(char[] value, int startIndex, int length) { }
+        [Lamella.Runtime.RuntimeProvided] public String(char c, int count) { }
+
         public int Length { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
         [System.Runtime.CompilerServices.IndexerName("Chars")]
         public char this[int index] { [Lamella.Runtime.RuntimeProvided] get { return '\0'; } }

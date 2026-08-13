@@ -58,7 +58,7 @@ namespace System
             return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
         }
 
-        private static string Decimal(long value, int minDigits)
+        internal static string Decimal(long value, int minDigits)
         {
             bool negative = value < 0;
             long n = negative ? value : -value;

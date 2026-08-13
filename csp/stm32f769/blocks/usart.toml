@@ -1,5 +1,14 @@
 # BLOCK layout: the STM32F769 USART. PARTIAL -- the registers and fields a byte-at-a-time channel
 # needs, plus the ones that decide the frame. Offsets are instance-base-relative.
+#
+# THIS IS NOT THE STM32F4 USART, AND THE DIFFERENCE IS NOT COSMETIC. That part has a status
+# register at 0x00 and one data register serving both directions; this one has CR1 at 0x00, a
+# SEPARATE receive and transmit data register, and its status lives at 0x1C. A driver carried
+# across from an F4 writes its first byte into the control register, which disables the peripheral
+# it was configuring rather than transmitting anything.
+#
+# THE BAUD REGISTER IS A PLAIN DIVISOR HERE, which is the other break from the F4: no mantissa and
+# fraction split, no oversampling term in the arithmetic while OVER8 is 0. BRR = round(f_ck / baud).
 
 [table]
 kind = "block"

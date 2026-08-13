@@ -1,11 +1,29 @@
-//! The host networking seam: non-blocking sockets plus a readiness poll, behind a trait the embedder
-//! supplies (host = `std::net` + `mio`; a device = lwIP / an AT modem; a browser = WebSocket/fetch).
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
+
+//! The networking seam: non-blocking sockets plus a readiness poll, behind a trait the embedder
+//! supplies (host = `std::net` + `mio`; a device = lwIP / smoltcp / a Wi-Fi module / an AT modem; a
+//! browser = WebSocket/fetch).
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// A socket the backend hands out: an index into the backend's own table, opaque to the interpreter
-/// (it just passes the handle back to identify the socket). Kept distinct from a raw fd so the seam
-/// stays host-agnostic.
+/// Per-socket operation timeouts: shared behavior a language runtime composes, so two languages on
+/// one board answer "what does a receive timeout do here" the same way.
+///
+/// Deliberately not part of [`NetBackend`]. A timeout is implemented by waking a parked thread
+/// earlier, which is the scheduler's business -- no backend is asked and none would have anything
+/// to implement.
+pub mod timeout;
+
+/// One stack, several holders: a device brings its network up once at boot, and both a managed
+/// program and a debug session reaching the board over that network need it.
+pub mod shared;
+
+/// A socket the backend hands out: an index into the backend's own table, opaque to the caller
+/// (which just passes the handle back to identify the socket). Kept distinct from a raw fd so the
+/// seam stays host-agnostic.
 pub type SocketHandle = u32;
 
 /// What a watched socket is waiting to become.
@@ -27,8 +45,8 @@ pub enum NetResult<T> {
     Error,
 }
 
-/// The networking seam. `Debug` is a supertrait so the [`crate::interp::Vm`] -- which holds an
-/// `Option<Box<dyn NetBackend>>` -- still derives `Debug`.
+/// The networking seam. `Debug` is a supertrait so that a runtime holding an
+/// `Option<Box<dyn NetBackend>>` still derives `Debug`.
 pub trait NetBackend: core::fmt::Debug {
     /// Resolves a host name to its IP addresses -- each entry is the address bytes in network order
     /// (4 = IPv4, 16 = IPv6), in the host resolver's order. An empty vec means resolution failed. The

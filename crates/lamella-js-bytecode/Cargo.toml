@@ -1,0 +1,33 @@
+# The precompiled ECMAScript code format: encoder (host), in-place reader (device).
+#
+# THE DEFAULT BUILD HAS NO DEPENDENCIES AT ALL, INCLUDING NO `libm`. The reader is integer-only
+# by construction: the one `f64` it touches it hands over as eight bytes it never interprets. That
+# is not tidiness -- it is what keeps the device-side price honest, because a format crate that
+# drags in a math library charges the tier for arithmetic it does not do.
+[package]
+name = "lamella-js-bytecode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The precompiled ECMAScript code format: a host encoder and an allocation-free in-place reader a device can walk straight out of flash."
+publish = false
+
+[lib]
+name = "lamella_js_bytecode"
+path = "src/lib.rs"
+
+# NO DEPENDENCIES AND NO FEATURES. THIS IS THE BASE OF THE THREE CRATES.
+#
+# It holds the format and the in-place reader and it does not know what an AST is. The AST-aware
+# bridges -- the encoder, and the decoder that rebuilds an owned tree -- live in
+# `lamella-js-frontend`, which owns the AST and depends on this.
+#
+# That direction is the FAMILY's rather than this crate's invention: `lamella-py-bytecode` depends
+# on neither the Python frontend nor its runtime, and both depend on IT. This crate was briefly the
+# other way round, which was an inconsistency with the siblings AND a cycle waiting to happen --
+# the interpreter cannot consume a `Node` if the format crate already depends on the interpreter's
+# crate.
+#
+# The consequence worth stating: a device links THIS and gets a reader that cannot allocate,
+# because there is no `extern crate alloc` to reach for.

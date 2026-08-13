@@ -1396,9 +1396,9 @@ impl Encoder {
     /// range -- and re-points the load's label at the copy. Returns whether one moved.
     ///
     /// The island is `B over` (which skips the datum), word-align padding, then the 4-byte copy.
-    /// The original word is left where it was as harmless dead data: nothing loads it any more (its
-    /// label now names the copy), and a relocation that rode on it is replicated onto the live copy
-    /// while the orphaned one merely patches unread bytes. Only marked words move -- an `adr` to a
+    /// The original word is left where it was as harmless dead data: no load reaches it, because
+    /// its label now names the copy, and a relocation that rode on it is replicated onto the live
+    /// copy while the orphaned one merely patches unread bytes. Only marked words move -- an `adr` to a
     /// string or multi-word descriptor is never split this way and still hard-errors in
     /// [`Encoder::finish`] if it is out of reach.
     fn island_far_literal(&mut self) -> Result<bool, AssembleError> {

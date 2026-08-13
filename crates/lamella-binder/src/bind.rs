@@ -18,6 +18,12 @@ pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
             definition: parts.iter().cloned().collect(),
             arguments: arguments.iter().map(bind_type).collect(),
         },
+        TypeRefKind::Unbound { parts, arity } => TypeSymbol::Instantiation {
+            definition: parts.iter().cloned().collect(),
+            arguments: (0..*arity)
+                .map(|_| TypeSymbol::Special(SpecialType::Object))
+                .collect(),
+        },
         TypeRefKind::Array { element, rank } => bind_type(element).into_array(*rank),
         TypeRefKind::Pointer(element) => {
             TypeSymbol::Pointer(alloc::boxed::Box::new(bind_type(element)))

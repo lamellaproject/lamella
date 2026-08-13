@@ -1,0 +1,78 @@
+# PART: Texas Instruments TCA9548A, an eight-channel I2C switch.
+#
+# THE FIRST PART HERE THAT IS NOT A LEAF. Everything else in this directory answers a question about
+# itself or about the world; this one decides WHICH OTHER PARTS ARE REACHABLE. A device behind a
+# closed channel is invisible to every scan and reads exactly like a device that is not there, so a
+# bus carrying one of these is a tree rather than a flat set of addresses.
+#
+# THAT MAKES IT A SHAPE THE CONSUMING MODELS DO NOT HAVE. A `[[devices]]` row on a board is either
+# pin-wired or bus-wired at an address, and both describe a leaf; neither can say that a device gates
+# the reachability of others. Reconciling anything behind a channel therefore takes a WRITE before
+# the read, where every other claim in that design is settled by reading alone.
+
+[table]
+kind = "device"
+family = "tca9548a"
+part = "tca9548a"
+sources = [
+    "Texas Instruments TCA9548A datasheet SCPS207H: the feature list and functional description (eight bidirectional translating switches, channel selection through the I2C bus in any combination, power up with all switch channels deselected, a single 8-bit control register written or read to determine the selected channels); the target address figure and Table 7-1 address reference for the A0/A1/A2 strapping.",
+]
+notes = [
+    "The control register has NO SUB-ADDRESS. After the target address is acknowledged, the next byte written IS the control register -- there is no register index to send first, so a driver written around a register-addressed part sends a byte this one reads as a channel selection.",
+    "Any combination of channels may be open at once, not just one: the control byte is a mask with one bit per channel, so two channels open together merge their devices onto the bus and two devices sharing an address will collide.",
+    "A part behind a closed channel is unreachable rather than absent, and the two are indistinguishable from the trunk. Any survey of a bus carrying one of these must open each channel in turn or it reports on a population it never addressed.",
+]
+
+# --- sourcing --------------------------------------------------------------------------------
+#
+# `identified` is unreachable for this part by construction -- it has no identity register, only a
+# control register whose value is whatever was last written. A unit of this type acknowledged
+# address 0x70 on an I2C walk of this bench and its channel behaviour was then characterized by
+# experiment, which is the `exercised` shape; it is recorded as evidence below.
+
+[sourcing]
+facts = "primary"
+validation = "exercised"
+evidence = "A unit acknowledged 0x70 on a Raspberry Pi Pico 2 and was then made to demonstrate its whole control model, without reference to the datasheet: sweeping the control byte one bit at a time revealed a different set of devices behind each of the eight values, which is what establishes that the register is a MASK with one bit per channel rather than a channel number. With the control byte never written, the trunk showed the switch alone and nothing behind it, which is what establishes that the channels are closed after reset. Devices appeared and vanished from a channel as modules were plugged into and pulled out of the matching physical port across many passes, and one channel carried three devices at once. Every one of those behaviours is what SCPS207H states, arrived at from the bus rather than from the page."
+
+# --- identity: THERE IS NONE ---------------------------------------------------------------------
+
+[identity]
+absent = "SCPS207H describes no identity register: the part has one 8-bit control register, and what it reads back is the channel mask somebody last wrote rather than anything fixed. So a read cannot distinguish this part from any other device answering the same address, and cannot distinguish it from itself in a different state."
+
+# --- address -------------------------------------------------------------------------------------
+#
+# THREE STRAPS RATHER THAN ONE, which is what lets eight of these share a bus -- and is also why a
+# board carrying one has to say which it strapped rather than assuming the base.
+
+[address]
+bus = "i2c"
+base = 0x70
+notes = "SCPS207H target address figure: the top four bits are fixed at 1110 and the low three are the A2/A1/A0 pins, giving 0x70 through 0x77 as its Table 7-1 enumerates. A unit on this bench answered 0x70, the all-low strapping."
+
+[[address.straps]]
+pin = "A0"
+bit = 0
+low = 0x70
+high = 0x71
+
+[[address.straps]]
+pin = "A1"
+bit = 1
+low = 0x70
+high = 0x72
+
+[[address.straps]]
+pin = "A2"
+bit = 2
+low = 0x70
+high = 0x74
+
+# --- the bus, and a transfer with no register index --------------------------------------------------
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "direct-control-byte"
+notes = "SCPS207H functional description: 'After the successful acknowledgment of the target address ... a single 8-bit control register is written to or read from to determine the selected channels.' There is no register index in either direction -- the byte after the address IS the control register -- which is why this names its own protocol rather than reusing the register-addressed one."

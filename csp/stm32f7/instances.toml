@@ -15,6 +15,7 @@ sources = [
     "STM32F7 reference manual RM0385 Rev 9: memory map (FMC control registers 0xA0000000, QUADSPI 0xA0001000); RCC_AHB3ENR 5.3.12 (address offset 0x38, FMCEN bit 0, QSPIEN bit 1). Both rows confirmed on silicon by a cold bring-up of each controller.",
     "STM32F7 reference manual RM0385 Rev 9: memory map (GPIOC 0x40020800, GPIOD 0x40020C00, GPIOE 0x40021000, GPIOF 0x40021400, GPIOG 0x40021800, GPIOH 0x40021C00); RCC_AHB1ENR 5.3.10 (GPIOCEN bit 2 through GPIOHEN bit 7). Every one of the six ports carries a signal of an external memory proven on silicon.",
     "STM32F7 reference manual RM0385 Rev 9: memory map (I2C1 0x40005400, I2C3 0x40005C00); RCC_APB1ENR 5.3.13 (address offset 0x40, I2C1EN bit 21, I2C3EN bit 23). Both rows confirmed on silicon by walking every address of each bus.",
+    "STM32F7 reference manual RM0385 Rev 9: memory map (GPIOI 0x40022000); RCC_AHB1ENR 5.3.10 (GPIOIEN bit 8). Port I is on the larger packages only, and the 216-pin part brings four of its pins out to a board header.",
 ]
 notes = [
     "Every bit position here is taken from the reference manual's per-bit descriptions rather than from its register bit-map diagram: the diagram is a wide table whose columns do not survive a text conversion, and the per-bit prose states the same fact unambiguously.",
@@ -88,6 +89,17 @@ block = "gpio"
 base = 0x40021C00
 rcc_en_off = 0x30   # RCC_AHB1ENR
 rcc_en_bit = 7      # GPIOHEN
+
+# PORT I IS THE NINTH AND IT IS READ OFF THE SAME TWO PAGES AS THE EIGHT ABOVE, NOT STEPPED FROM
+# PORT H. Its base continues the 0x400 stride and its enable bit continues the port index, which is
+# exactly the agreement that makes a stepped value indistinguishable from a read one until a family
+# places a port somewhere else.
+[[instances]]
+name = "gpioi"
+block = "gpio"
+base = 0x40022000
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 8      # GPIOIEN
 
 [[instances]]
 name = "rcc"

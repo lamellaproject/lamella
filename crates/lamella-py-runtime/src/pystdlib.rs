@@ -10,10 +10,13 @@ pub const BUNDLED_MODULES: &[&str] = &[
     "heapq",
     "itertools",
     "json",
+    "lamella",
+    "lamella.clock",
     "operator",
     "os",
     "random",
     "re",
+    "socket",
     "string",
     "struct",
     "sys",
@@ -35,10 +38,13 @@ pub fn bundled_module(name: &str) -> Option<&'static str> {
         "heapq" => include_str!("../pystdlib/heapq.py"),
         "itertools" => include_str!("../pystdlib/itertools.py"),
         "json" => include_str!("../pystdlib/json.py"),
+        "lamella" => include_str!("../pystdlib/lamella_package.py"),
+        "lamella.clock" => include_str!("../pystdlib/lamella_clock.py"),
         "operator" => include_str!("../pystdlib/operator.py"),
         "os" => include_str!("../pystdlib/os.py"),
         "random" => include_str!("../pystdlib/random.py"),
         "re" => include_str!("../pystdlib/re.py"),
+        "socket" => include_str!("../pystdlib/socket.py"),
         "string" => include_str!("../pystdlib/string.py"),
         "struct" => include_str!("../pystdlib/struct.py"),
         "sys" => include_str!("../pystdlib/sys.py"),
@@ -72,7 +78,7 @@ mod tests {
 
     #[test]
     fn an_unknown_name_misses_rather_than_failing() {
-        assert!(bundled_module("socket").is_none());
         assert!(bundled_module("board").is_none());
+        assert!(bundled_module("no-such-module").is_none());
     }
 }

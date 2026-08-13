@@ -68,6 +68,22 @@ pub enum CilError {
     /// that needs more wants a heap-allocated exception object, which is a scope decision above this
     /// crate.
     ExceptionBindingEscapes,
+    /// A LOCAL OR ARGUMENT SLOT IS AN INSTANTIATION OF A VALUE TYPE (`Holder<int>`), which this
+    /// tier cannot type: the MIR type carries a SIZE and a trace map, and both need the substituted
+    /// layout that only monomorphizing value types produces.
+    ///
+    /// A refusal rather than a fallback, because the fallback was `int32` and it BUILT. Every word
+    /// it produced was wrong in the same direction: an eight-byte struct got a four-byte cell, so
+    /// the second field's store ran past the end of it; and the cell's identity was
+    /// `TypeHandle(0)`, the anonymous no-type handle, so two instantiations of one definition were
+    /// one type and that type was none. Neither is visible in a size, and no test that checks only
+    /// the arithmetic can see either.
+    ///
+    /// Carries the instantiation's canonical spelling so a failing build names what it refused.
+    GenericValueTypeSlot(alloc::string::String),
+    /// A `catch (T)` clause bound NO tag, so nothing in flight could ever match it and the handler
+    /// would be silently dead.
+    UnmatchableCatchType,
 }
 
 /// Which control-flow shape a [`CilError::UnsupportedControlFlow`] refused.
@@ -206,9 +222,15 @@ pub trait CallResolver {
         None
     }
 
-    /// The size in bytes of a value type (an `initobj` type-operand token), from its layout.
-    /// Defaults to `None`.
-    fn value_type_size(&self, _operand: &Operand) -> Option<u32> {
+    /// The stack-cell shape of a value type (an `initobj` type-operand token), from its layout: its
+    /// size in bytes AND which of its words hold object references. Defaults to `None`.
+    ///
+    /// **ONE CALL RATHER THAN TWO, AND THAT IS THE WHOLE REASON IT IS SHAPED THIS WAY.** These were
+    /// a size alone, and the trace map went unasked -- so a struct local holding a live reference
+    /// was laid with the right number of bytes and no GC map, and the reference was collectable
+    /// while live on a mark-compact heap (measured; `tests/fixtures/structroot.cs`). Two calls are
+    /// two chances to ask only the first.
+    fn value_type_cell(&self, _operand: &Operand) -> Option<(u32, lamella_ir::RefWords)> {
         None
     }
 
@@ -243,9 +265,14 @@ pub trait CallResolver {
     }
 
     /// A delegate `Invoke` a `callvirt` names: its explicit argument count (the signature params,
-    /// excluding the delegate receiver) and whether it returns a value, or `None` if the call is not a
-    /// delegate `Invoke`. The lowering loads `_methodPtr` and calls it indirectly. Defaults to `None`.
-    fn delegate_invoke_args(&self, _operand: &Operand) -> Option<(usize, bool)> {
+    /// excluding the delegate receiver) and the MIR type of its result (`None` for a void `Invoke`), or
+    /// `None` if the call is not a delegate `Invoke`. The lowering loads `_methodPtr` and calls it
+    /// indirectly. The result type comes from the `Invoke` SIGNATURE rather than being assumed: an
+    /// `ObjectRef` result recorded as an integer is a root the GC stack map does not contain, which is
+    /// the same defect [`mir_type`]'s generic-instantiation arm exists to prevent. Defaults to `None`.
+    ///
+    /// [`mir_type`]: crate::resolver
+    fn delegate_invoke_args(&self, _operand: &Operand) -> Option<(usize, Option<MirType>)> {
         None
     }
 
@@ -288,6 +315,30 @@ pub trait CallResolver {
     /// `MemberRef` -- and its offset within THAT region (the owner's dense slot numbering).
     /// Defaults to `None`.
     fn static_field_offset(&self, _operand: &Operand) -> Option<(StaticOwner, u32)> {
+        None
+    }
+
+    /// The INITIALIZATION THUNK to call before a trigger site, when the type the site names demands
+    /// precise timing. `None` means no check is emitted, and it covers two cases the caller must not
+    /// try to tell apart itself: the type has no initializer, or the type's initializer is
+    /// `beforefieldinit` (so it may run early and the site is free).
+    ///
+    /// A type declared by ANOTHER assembly answers [`TypeInitThunk::Extern`] rather than `None`: its
+    /// thunk is a function in the declaring assembly's own object, so this build names it by symbol
+    /// instead of by index. That is not an optional refinement -- the program's startup stops
+    /// chaining a referenced precise `.cctor` exactly because a trigger now owns it, so a site that
+    /// answered `None` here would leave the initializer with no caller at all.
+    ///
+    /// `trigger` says which of ECMA-335 I.8.9.5's four rules the site is, because the same token
+    /// tables serve sites that do and do not trigger -- an ordinary instance `call` names a method
+    /// exactly like a static one does. Deciding that here rather than at the call site keeps the rule
+    /// in one place: it has four cases across three opcodes, and a rule with several implementations
+    /// gains a new case in none of them.
+    ///
+    /// Defaults to `None`, which is the eager tier's behavior -- a lowering that never asks runs
+    /// every initializer from the startup chain instead, which is conformant only for the relaxed
+    /// types.
+    fn type_init_thunk(&self, _operand: &Operand, _trigger: InitTrigger) -> Option<TypeInitThunk> {
         None
     }
 
@@ -418,6 +469,21 @@ pub trait CallResolver {
         None
     }
 
+    /// Whether a `box` of this type token is a NO-OP -- the value on the stack is already an object
+    /// reference and no allocation happens.
+    ///
+    /// ECMA-335 III.4.1: boxing a REFERENCE type yields the reference unchanged. csc emits `box !0`
+    /// inside a generic body because `T` may be a value type at SOME instantiation; at a reference
+    /// instantiation there is nothing to box, and the resolver is the only thing that knows which
+    /// instantiation is in force.
+    ///
+    /// Defaults to `false`, which is the conservative answer: the caller then takes the ordinary
+    /// path, and a type that cannot be laid out refuses `BadOperand` rather than silently skipping
+    /// an allocation.
+    fn box_is_noop(&self, _operand: &Operand) -> bool {
+        false
+    }
+
     /// The interface-method identity tag a `callvirt` on an INTERFACE method dispatches through (the
     /// receiver type's itable is searched for it). `None` for a non-interface target -- which then
     /// falls to [`virtual_slot`](Self::virtual_slot) or a direct call. Defaults to None.
@@ -473,6 +539,46 @@ pub struct ArrayElement {
     /// baked at each access site; this is the same fact carried at RUN TIME, which is what an
     /// untyped `System.Array` body and a tracing collector need.
     pub element_kind: u32,
+}
+
+/// Which of ECMA-335 I.8.9.5's type-initializer triggers a site is, as the opcode reveals it.
+///
+/// The rule has four cases and the opcode does not decide them alone: a `call` is a trigger when its
+/// target is a static method or a `.ctor` and NOT when it is an ordinary instance method, and the
+/// same token that names one names the others. So a site reports the shape it can see -- what it is
+/// loading, calling, or constraining -- and [`CallResolver::type_init_thunk`] applies the rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InitTrigger {
+    /// First access to a static field: `ldsfld`, `stsfld`, `ldsflda`. The operand is a field token
+    /// and the type is the field's DECLARING type.
+    StaticField,
+    /// A method token, from `call`/`callvirt`/`newobj`. Covers two of the four rules -- first
+    /// invocation of a static method, and first invocation of any constructor -- because both are
+    /// read off the same token and neither is distinguishable by opcode.
+    Method,
+    /// First instance or virtual call on a VALUE type, seen through the `constrained.` prefix whose
+    /// operand is the value type's own token. csc emits the prefix at exactly this case.
+    ValueTypeCall,
+}
+
+/// WHERE the initialization thunk a trigger site must call lives -- in this build's own function
+/// table, or in the object of the assembly that declares the type.
+///
+/// The two arms are not two policies; they are one rule seen from either side of an assembly
+/// boundary. A thunk belongs to the assembly that DECLARES the type, because the flag word it tests
+/// lives in that assembly's static region and there must be exactly one of them: two assemblies each
+/// carrying their own flag for one type would each run the initializer once.
+///
+/// So a build that declares the type emits the thunk and calls it by index, and every other build
+/// calls the same function by the symbol its owner exports it under. That is what makes a referenced
+/// type's initializer run AT MOST ONCE across the whole link -- the property ECMA-335 I.8.9.5
+/// requires and the reason the caller cannot substitute a local copy.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypeInitThunk {
+    /// An index into the function table this build is producing -- the type is declared here.
+    Local(u32),
+    /// The exported symbol of a thunk in another assembly's object, called as an extern.
+    Extern(alloc::string::String),
 }
 
 /// A 2-D rectangular-array pseudo-method a `newobj`/`call` names (`int[,]::.ctor`/`Get`/`Set` on an
@@ -622,6 +728,11 @@ fn lower_with_source(
                     crate::stackmaps::REF_CELL_HANDLE
                 } else {
                     lamella_ir::TypeHandle(0)
+                },
+                refs: if elem == MirType::ObjectRef {
+                    lamella_ir::RefWords::at_word(0)
+                } else {
+                    lamella_ir::RefWords::NONE
                 },
                 size: elem.stack_slot_bytes(),
             },
@@ -1070,6 +1181,7 @@ fn lower_with_source(
                     MirType::ValueType {
                         handle: TypeHandle(0),
                         size: elem.stack_slot_bytes(),
+                        refs: lamella_ir::RefWords::NONE,
                     },
                 );
                 insts.push((cell, Inst::InitStruct));
@@ -1507,6 +1619,44 @@ fn new_value(value_types: &mut Vec<MirType>, ty: MirType) -> ValueId {
     let id = ValueId(value_types.len() as u32);
     value_types.push(ty);
     id
+}
+
+/// Emits the type-initializer check a trigger site requires, immediately before the operation itself.
+/// A no-op unless [`CallResolver::type_init_thunk`] names one, which it does only for a type that
+/// demands precise timing -- so an assembly with no such type lowers byte-identically.
+///
+/// It touches `insts` and never `stack`: the thunk takes nothing and returns nothing, and its result
+/// slot is a dead placeholder like every other void call this lowering emits. That is what makes the
+/// insertion safe at a site whose operands are already on the stack -- a `stsfld`'s value and a
+/// `call`'s arguments are evaluated first either way, and the trigger fires at the ACCESS, not at
+/// the evaluation of what is being stored or passed.
+///
+/// A cross-assembly thunk is an `Inst::PInvoke` on the owner's exported symbol -- the same shape the
+/// startup already uses to call a referenced `.cctor`, so the link resolves it with no new machinery.
+fn emit_type_init_check(
+    resolver: &dyn CallResolver,
+    operand: &Operand,
+    trigger: InitTrigger,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) {
+    let Some(thunk) = resolver.type_init_thunk(operand, trigger) else {
+        return;
+    };
+    let placeholder = new_value(value_types, MirType::I32);
+    insts.push((
+        placeholder,
+        match thunk {
+            TypeInitThunk::Local(callee) => Inst::Call {
+                callee,
+                args: Vec::new(),
+            },
+            TypeInitThunk::Extern(import) => Inst::PInvoke {
+                import: import.into(),
+                args: Vec::new(),
+            },
+        },
+    ));
 }
 
 /// The compile-time integer a stack value holds, if it is defined by a `ConstInt` in this block. Used to
@@ -2178,7 +2328,8 @@ fn apply_value_op(
         }
         Opcode::Sizeof => {
             let size = resolver
-                .value_type_size(&inst.operand)
+                .value_type_cell(&inst.operand)
+                .map(|(size, _)| size)
                 .ok_or(CilError::Unsupported(inst.opcode))?;
             push_const(value_types, stack, insts, i64::from(size));
         }
@@ -2201,6 +2352,7 @@ fn apply_value_op(
                 MirType::ValueType {
                     handle: TypeHandle(0),
                     size: bytes,
+                    refs: lamella_ir::RefWords::NONE,
                 },
             );
             insts.push((cell, Inst::InitStruct));
@@ -2448,23 +2600,39 @@ fn apply_value_op(
         }
         Opcode::Call | Opcode::Callvirt => {
             let constrained = pending_constrained.take();
-            if let Some((arg_count, has_result)) = resolver.delegate_invoke_args(&inst.operand) {
+            if let Some(operand) = &constrained {
+                emit_type_init_check(
+                    resolver,
+                    operand,
+                    InitTrigger::ValueTypeCall,
+                    value_types,
+                    insts,
+                );
+            }
+            emit_type_init_check(
+                resolver,
+                &inst.operand,
+                InitTrigger::Method,
+                value_types,
+                insts,
+            );
+            if let Some((arg_count, result_type)) = resolver.delegate_invoke_args(&inst.operand) {
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
                 }
                 args.reverse();
                 let delegate = stack.pop().ok_or(CilError::StackUnderflow)?;
-                let result = new_value(value_types, MirType::I32);
+                let result = new_value(value_types, result_type.unwrap_or(MirType::I32));
                 insts.push((
                     result,
                     Inst::InvokeDelegate {
                         delegate,
                         args,
-                        returns_value: has_result,
+                        returns_value: result_type.is_some(),
                     },
                 ));
-                if has_result {
+                if result_type.is_some() {
                     stack.push(result);
                 }
                 return Ok(());
@@ -2920,21 +3088,22 @@ fn apply_value_op(
         }
         Opcode::Initobj => match last_local_addr.take() {
             Some((AddrOf::Local(n), _)) => {
-                let size = resolver
-                    .value_type_size(&inst.operand)
+                let (size, refs) = resolver
+                    .value_type_cell(&inst.operand)
                     .ok_or(CilError::BadOperand)?;
                 let handle = match &inst.operand {
                     Operand::Token(token) => lamella_ir::TypeHandle(token.0),
                     _ => lamella_ir::TypeHandle(0),
                 };
-                let zeroed = new_value(value_types, MirType::ValueType { handle, size });
+                let zeroed = new_value(value_types, MirType::ValueType { handle, size, refs });
                 insts.push((zeroed, Inst::InitStruct));
                 *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
             }
             None => {
                 let addr = stack.pop().ok_or(CilError::StackUnderflow)?;
                 let size = resolver
-                    .value_type_size(&inst.operand)
+                    .value_type_cell(&inst.operand)
+                    .map(|(size, _)| size)
                     .or_else(|| {
                         resolver
                             .type_operand_mir(&inst.operand)
@@ -3400,6 +3569,13 @@ fn apply_value_op(
             stack.push(result);
         }
         Opcode::Ldsfld => {
+            emit_type_init_check(
+                resolver,
+                &inst.operand,
+                InitTrigger::StaticField,
+                value_types,
+                insts,
+            );
             let (owner, offset) = resolver
                 .static_field_offset(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
@@ -3410,6 +3586,13 @@ fn apply_value_op(
         }
         Opcode::Stsfld => {
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            emit_type_init_check(
+                resolver,
+                &inst.operand,
+                InitTrigger::StaticField,
+                value_types,
+                insts,
+            );
             let (owner, offset) = resolver
                 .static_field_offset(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
@@ -3417,6 +3600,13 @@ fn apply_value_op(
             insts.push((placeholder, Inst::StaticStore { owner, offset, value }));
         }
         Opcode::Newobj => {
+            emit_type_init_check(
+                resolver,
+                &inst.operand,
+                InitTrigger::Method,
+                value_types,
+                insts,
+            );
             if let Some(tag) = resolver.exception_tag(&inst.operand) {
                 push_const(value_types, stack, insts, i64::from(tag));
                 return Ok(());
@@ -3571,6 +3761,9 @@ fn apply_value_op(
             stack.push(result_value);
         }
         Opcode::Box => {
+            if resolver.box_is_noop(&inst.operand) {
+                return Ok(());
+            }
             let layout = resolver
                 .boxed_layout(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
@@ -3803,7 +3996,7 @@ fn catch_dispatch(
     } else {
         let tags = resolver.subtype_tags(&operand);
         if tags.is_empty() {
-            return Err(CilError::Unsupported(Opcode::Throw));
+            return Err(CilError::UnmatchableCatchType);
         }
         DispatchMatch::Tags(tags)
     };
@@ -4040,8 +4233,8 @@ enum CatchBinding {
 ///
 /// THE ENTRY STORE IS THE BINDING. A handler is entered with the exception on the evaluation stack,
 /// so csc's first instruction is `stloc n` for `catch (T e)` and `pop` for `catch (T)`. Anything else
-/// leading a handler is a shape this analysis does not model, and is treated as unread (the tag path,
-/// which is what shipped before this existed).
+/// leading a handler is a shape this analysis does not model: it is treated as unread, which routes
+/// the handler down the tag path.
 ///
 /// WHY THE SAFE SET IS AN ALLOWLIST AND NOT A BLOCKLIST. A frame object dangles the moment the
 /// reference outlives the frame, and the ways a reference can escape are open-ended (a field, an
@@ -4054,8 +4247,8 @@ enum CatchBinding {
 /// **A CALL IS RECEIVER-POSITION ONLY WHEN THE CALLEE IS NULLARY.** `ldloc e; callvirt get_Message()`
 /// reads `e` as the receiver; `ldloc e; call Console.WriteLine(object)` passes it as an ARGUMENT, and
 /// the two are indistinguishable by adjacency alone. So the arity comes from the resolved callee
-/// ([`CallInfo::args`] counts the receiver), never from the instruction's position. This is the same
-/// trap that made a `box` before a `callvirt` look like a receiver when it was the last argument.
+/// ([`CallInfo::args`] counts the receiver), never from the instruction's position. A `box` before a
+/// `callvirt` reads as a receiver under the same mistake, where it is in fact the last argument.
 fn classify_catch_binding(
     code: &[Instruction],
     handler: lamella_cil::InstructionRange,
@@ -4151,6 +4344,7 @@ fn materialize_catch_binding(
         MirType::ValueType {
             handle: crate::stackmaps::EXCEPTION_CELL_HANDLE,
             size: layout.size + 4,
+            refs: lamella_ir::RefWords::NONE,
         },
     );
     insts.push((cell, Inst::InitStruct));
@@ -5037,6 +5231,9 @@ fn null_passes_the_cast(
 /// `[MARK|rank@0][element_kind@4][type_tag@8][base_ptr@12][element_desc@16]`, the layout
 /// `resolver::string_descriptor_words` and the array-descriptor emitter both write and
 /// `tests/array_element_desc.rs` pins against a real assembly.
+///
+/// It is 0 when the build had no descriptor to name for the element type, which is a real emitted
+/// shape rather than a defect -- see the covariant-store check, which must not throw on it.
 const ARRAY_ELEMENT_DESC_OFFSET: i32 = 16;
 
 /// Builds a block that raises a builtin exception by name and routes it like a `throw`, returning
@@ -6536,8 +6733,8 @@ mod control_flow {
                     _ => None,
                 }
             }
-            fn value_type_size(&self, _: &Operand) -> Option<u32> {
-                Some(8)
+            fn value_type_cell(&self, _: &Operand) -> Option<(u32, lamella_ir::RefWords)> {
+                Some((8, lamella_ir::RefWords::NONE))
             }
         }
         let field = |row| Operand::Token(Token::new(0x04, row));
@@ -6570,6 +6767,7 @@ mod control_flow {
         let point = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let (func, _) = lower_method_typed(&body, &Fields, &[], &[point]).unwrap();
         let insts: Vec<_> = func.blocks[0].insts.iter().map(|(_, i)| i).collect();
@@ -6963,6 +7161,44 @@ mod tests {
     }
 
     #[test]
+    fn a_delegate_invoke_result_is_typed_by_its_signature() {
+        struct ObjectReturning;
+        impl CallResolver for ObjectReturning {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn delegate_invoke_args(&self, _operand: &Operand) -> Option<(usize, Option<MirType>)> {
+                Some((0, Some(MirType::ObjectRef)))
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldnull),
+                Instruction::new(Opcode::Callvirt, Operand::None),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &ObjectReturning).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let result = func.blocks[0]
+            .insts
+            .iter()
+            .find_map(|(id, i)| matches!(i, Inst::InvokeDelegate { .. }).then_some(*id))
+            .expect("the callvirt lowered to an InvokeDelegate");
+        assert_eq!(
+            func.value_types[result.index()],
+            MirType::ObjectRef,
+            "an object-returning delegate's result is a reference, not an integer"
+        );
+    }
+
+    #[test]
     fn lowers_in_place_struct_ctor() {
         struct Ctor;
         impl CallResolver for Ctor {
@@ -6978,6 +7214,7 @@ mod tests {
         let vec2 = MirType::ValueType {
             handle: lamella_ir::TypeHandle(0),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let body = MethodBodyImage {
             max_stack: 3,
@@ -7017,8 +7254,8 @@ mod tests {
             fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
                 None
             }
-            fn value_type_size(&self, _operand: &Operand) -> Option<u32> {
-                Some(8)
+            fn value_type_cell(&self, _operand: &Operand) -> Option<(u32, lamella_ir::RefWords)> {
+                Some((8, lamella_ir::RefWords::NONE))
             }
         }
         let token = Token::new(0x02, 7);
@@ -7037,7 +7274,7 @@ mod tests {
         let (func, _) = lower_method_debug_with(&body, &Sized).unwrap();
         assert!(func.value_types.iter().any(|t| matches!(
             t,
-            MirType::ValueType { handle, size: 8 } if handle.0 == token.0
+            MirType::ValueType { handle, size: 8, .. } if handle.0 == token.0
         )));
         assert!(lamella_ir::verify(&func).is_ok());
     }
@@ -7091,6 +7328,7 @@ mod tests {
                 Some(MirType::ValueType {
                     handle: lamella_ir::TypeHandle(0),
                     size: 8,
+                    refs: lamella_ir::RefWords::NONE,
                 })
             }
         }
@@ -7213,6 +7451,7 @@ mod tests {
         let point = MirType::ValueType {
             handle: lamella_ir::TypeHandle(2),
             size: 8,
+            refs: lamella_ir::RefWords::NONE,
         };
         let body = MethodBodyImage {
             max_stack: 2,

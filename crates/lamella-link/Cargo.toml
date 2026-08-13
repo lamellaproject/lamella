@@ -9,6 +9,12 @@ description = "Lamella's own static linker: resolve symbols, lay out sections, a
 
 [dependencies]
 lamella-elf = { path = "../lamella-elf" }
+# The HANDLE SPACE, for the instantiation cap: a generic instantiation's descriptor symbol is
+# identified by its handle's table byte, and that byte is allocated in `lamella-ir` because the
+# space is shared with every front end. A second copy of it here would be a second source of truth
+# for a frozen wire value, which is the one thing that must not exist -- and `lamella-ir` is a
+# LEAF, so the edge is cheap and cannot cycle.
+lamella-ir = { path = "../lamella-ir" }
 
 [lints]
 workspace = true

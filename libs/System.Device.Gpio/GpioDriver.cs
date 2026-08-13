@@ -38,6 +38,16 @@ namespace System.Device.Gpio
             Write(pinNumber, !Read(pinNumber));
         }
 
+        /// <summary>Adds a handler that is invoked when <paramref name="pinNumber"/> sees an event
+        /// of type <paramref name="eventTypes"/>.</summary>
+        protected internal abstract void AddCallbackForPinValueChangedEvent(
+            int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback);
+
+        /// <summary>Removes a handler that was being invoked for the pin at
+        /// <paramref name="pinNumber"/>.</summary>
+        protected internal abstract void RemoveCallbackForPinValueChangedEvent(
+            int pinNumber, PinChangeEventHandler callback);
+
         /// <summary>Disposes this instance, closing all open pins.</summary>
         public void Dispose()
         {

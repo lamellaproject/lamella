@@ -1,0 +1,26 @@
+# PART: the Arduino Modulino Vibro node.
+#
+# A vibration motor through a MOSFET, driven by the node's MCU. What answers on the bus is the node's FIRMWARE, so the interface is a property of a
+# software release rather than of a part. See `modulino.toml` for what that means for every member.
+
+[table]
+kind = "device"
+family = "modulino"
+part = "vibro"
+base = "modulino"
+sources = [
+    "Arduino Modulino Vibro user manual ABX00130, section 7.5 'I2C Address Reference': default address 0x3A, hardware address 0x1D, editable to any custom address in software.",
+]
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- a disagreement worth carrying ------------------------------------------------------------
+#
+# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS: 0x38 on this bench against 0x3A and 0x1D in the manual.
+
+[address]
+bus = "i2c"
+base = 0x1D
+notes = "Arduino ABX00130 section 7.5 prints TWO columns: 0x3A under the product's own name and 0x1D under 'Hardware I2C Address'. The second is the 7-bit address a bus scan sees and is the one stated here; the first is that value shifted up with the read/write bit appended, and writing it into a 7-bit field addresses something else. A node of this type answered address 0x38 on an I2C walk of a Raspberry Pi Pico 2. That establishes only that SOMETHING acknowledged that address: these nodes carry no identity register, so nothing read can say which one it was, and the address is software-assignable so it is not evidence of type either. It matches NEITHER column of the manual, which gives 0x3A and 0x1D."

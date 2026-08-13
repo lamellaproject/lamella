@@ -18,6 +18,36 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// drift.
 pub mod usb;
 
+/// Which carrier owns the one debug session a target has to give, when several can reach it at
+/// once. A pure decision -- no carrier, no input or output -- so the rule can be tested whole.
+pub mod session;
+
+/// Which pairing keys a target accepts, and when a replacement displaces the key it replaces.
+/// The rotation policy only -- no cryptography, which the caller supplies as a verifier.
+pub mod pairing;
+
+/// Carrying frames between two carriers, for a target a host cannot open directly. Forwards
+/// without interpreting and without reframing, so a message type it has never heard of crosses.
+pub mod relay;
+
+/// Identity for the TCP carrier -- the port a target serving Lamella Link listens on by default.
+///
+/// One home, for the same reason the USB identity has one: a host, a board's firmware and a relay
+/// daemon must agree, and a number written down in three places is a number that drifts.
+pub mod tcp {
+    /// The default TCP port for Lamella Link.
+    ///
+    /// Not registered with any numbering authority, and deliberately not one of the ports a
+    /// debug-adapter protocol already claims -- a board on a desk should not have to compete with
+    /// whatever else is listening. The value is the decimal reading of this project's USB vendor
+    /// id ([`super::usb::VID`]), so the two identities are the same number in two notations and
+    /// neither has to be memorized separately.
+    ///
+    /// It is a DEFAULT, not a requirement. A relay daemon forwarding several boards gives each one
+    /// its own port, and every tool that takes a target string takes an explicit port with it.
+    pub const DEFAULT_PORT: u16 = super::usb::VID;
+}
+
 /// The frame's leading sync magic ("LW" -- Lamella Wire). A receiver scans for it to find a frame
 /// boundary after attaching mid-stream or recovering from line noise.
 const SYNC: [u8; 2] = [0x4C, 0x57];
@@ -48,6 +78,20 @@ pub mod msg {
     pub const PING: u8 = 0x05;
     /// Liveness reply.
     pub const PONG: u8 = 0x06;
+    /// Target -> host, unsolicited: the session this carrier held has been taken by another one.
+    /// The payload is the new holder's [`super::session::ChannelClass`] as one byte.
+    ///
+    /// # Why the loser is told rather than left to find out
+    ///
+    /// A target that can be reached on several carriers at once has one session to give, and a
+    /// carrier can lose it while its host believes it still has it. Without this, that host
+    /// discovers the loss from its next operation being refused -- or, if it was only listening,
+    /// never discovers it at all and simply reports a target that went quiet.
+    ///
+    /// Naming the new holder's CLASS is the useful part: *a cable took it* tells a remote user
+    /// that somebody is at the board, which is a situation to wait out rather than a fault to
+    /// investigate.
+    pub const SESSION_REVOKED: u8 = 0x07;
 }
 
 /// What an [`msg::ERROR`] carries: why a frame was refused.
@@ -78,6 +122,31 @@ pub mod msg {
 pub mod error {
     /// The message type is not one this target implements. Byte 1 is that type.
     pub const UNKNOWN_MESSAGE_TYPE: u8 = 0x01;
+
+    /// Another carrier holds the debug session. Byte 1 is that carrier's
+    /// [`super::session::ChannelClass`].
+    ///
+    /// Distinct from every other refusal because the remedy is neither to stop asking nor to
+    /// reconnect: the request was well formed and the target implements it, and the answer will
+    /// change when the other carrier lets go. **A caller that reads this as a fault reports a
+    /// broken board where the truth is that a colleague has it plugged in.**
+    pub const SESSION_HELD: u8 = 0x02;
+
+    /// The payload refusing a request because another carrier of class `holder` holds the session.
+    #[must_use]
+    pub fn session_held(holder: u8) -> [u8; 2] {
+        [SESSION_HELD, holder]
+    }
+
+    /// The holding carrier's class byte from a [`session_held`] payload, or `None` when the
+    /// payload is some other refusal.
+    #[must_use]
+    pub fn session_holder(payload: &[u8]) -> Option<u8> {
+        match payload {
+            [SESSION_HELD, holder, ..] => Some(*holder),
+            _ => None,
+        }
+    }
 
     /// The payload refusing `msg_type` as unimplemented.
     #[must_use]
@@ -128,7 +197,22 @@ fn crc16(data: &[u8]) -> u16 {
 /// `None` when `payload` exceeds [`MAX_PAYLOAD`] -- such a payload has no representation on this
 /// wire, and there is nothing this function can return that would be one.
 ///
-/// # Why this refuses instead of truncating, having truncated for the protocol's whole life
+/// # Why this refuses instead of truncating
+///
+/// Clamping the length to `u16::MAX` and computing the CRC **over the truncated bytes** produces a
+/// perfectly well-formed frame: correct magic, consistent length, valid checksum, and silently
+/// missing content. Every integrity mechanism the framing has agrees it is fine, and the receiver
+/// has no way to tell -- a short payload and a truncated one are the same bytes.
+///
+/// **That is the worst failure shape available here**, and worse than the silence a refusal
+/// produces: silence is at least a symptom. A CRC that validates over incomplete data converts a
+/// sender's mistake into a receiver's wrong answer, and the receiver is the side that cannot
+/// possibly diagnose it.
+///
+/// It is reachable rather than theoretical. Callers that stream (the deploy, bundle and
+/// module-firmware ops) chunk and are fine, but a target building a `RUN_RESULT` from a deployed
+/// program's console output does not chunk -- a chatty program on a roomy part is one path to a
+/// payload this cannot carry.
 #[must_use]
 pub fn encode_frame(msg_type: u8, seq: u16, payload: &[u8]) -> Option<Vec<u8>> {
     if payload.len() > MAX_PAYLOAD {
@@ -361,6 +445,11 @@ impl Capabilities {
     /// It lives here rather than in each tool because a table of names kept next to its consumers
     /// is a second spelling of this list, and a second spelling goes stale silently: the bit that
     /// gets forgotten is always the newest one, which is the one someone is trying to see.
+    ///
+    /// **This list being INCOMPLETE is a survivable state and is handled, not asserted away.**
+    /// [`Capabilities::describe`] reports a set bit with no entry here as `unknown bit N` rather than
+    /// dropping it, so a capability added without a label is VISIBLE in the output instead of absent
+    /// from it. A name that is missing should cost a reader one puzzled moment, never a wrong answer.
     pub const NAMED: &'static [(u32, &'static str)] = &[
         (Self::DEBUG_BASIC, "DEBUG_BASIC"),
         (Self::BREAKPOINTS, "BREAKPOINTS"),
@@ -411,6 +500,12 @@ impl Capabilities {
     }
 
     /// The capabilities present in BOTH sets (what a session can use).
+    ///
+    /// **This answers "what may we DO", never "what is the target".** Some bits describe the
+    /// target alone -- whether its clock moves, whether it holds a resident corlib, what chip it
+    /// says it is -- and intersecting one of those with the host's own offer can only subtract a
+    /// true fact. Read [`Negotiated::target_caps`] for those; the loss is silent otherwise, because
+    /// it happens before any caller sees the value.
     #[must_use]
     pub fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
@@ -727,7 +822,10 @@ pub mod board_model {
 
     /// Arduino Portenta H7 (STM32H747XIH6 on Arduino's ABX00042) -- the same silicon as the
     /// NUCLEO-H755ZI-Q and the GIGA, on a module whose debug signals leave through its
-    /// high-density connectors rather than any header of its own. 
+    /// high-density connectors rather than any header of its own. Its datasheet covers three
+    /// products, and nothing a debug port can read separates them: the part is identical and the
+    /// difference is which components are populated. This number is the only discriminator, and it
+    /// has to be told rather than discovered.
     pub const ARDUINO_PORTENTA_H7: u16 = 35;
 
     /// Arduino UNO R4 Minima (Renesas R7FA4M1AB3CFM on Arduino's ABX00080) -- a vendor no other
@@ -738,7 +836,12 @@ pub mod board_model {
     pub const ARDUINO_UNO_R4_MINIMA: u16 = 34;
 
     /// Arduino UNO Q (STM32U585AII6TR on Arduino's ABX00162/ABX00173) -- a microcontroller sharing
-    /// one board with a Qualcomm QRB2210 application processor running Linux.
+    /// one board with a Qualcomm QRB2210 application processor running Linux. THE ONLY BOARD
+    /// HERE THAT CAN ANNOUNCE ITSELF OVER NO WIRE THIS PROTOCOL OWNS: its own USB does not reach
+    /// the connector, its LPUART1 lands on the application processor rather than on a bridge, and
+    /// it has no debug connector at all -- the application processor IS its debugger. So this
+    /// number identifies a board that a host reaches only THROUGH the Linux side, and its board
+    /// file states no carrier for exactly that reason.
     pub const ARDUINO_UNO_Q: u16 = 36;
 
     /// The display name for a `board_model` wire value, or `None` for an unrecognized code. This is the one
@@ -1046,6 +1149,42 @@ pub trait Transport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError>;
     /// Return the next received frame, or `None` if none is ready yet.
     fn poll(&mut self) -> Result<Option<Frame>, TransportError>;
+
+    /// Send one logical frame ONLY if the carrier can take it now.
+    ///
+    /// `Ok(true)` -- committed, exactly as [`Transport::send`]. `Ok(false)` -- the carrier would
+    /// have had to wait, and **nothing was written**, so the caller may drop the frame or try later
+    /// with the stream undisturbed. `Err` is a real failure, as ever.
+    ///
+    /// # Which frames belong here
+    ///
+    /// **A reply is worth waiting for; an unsolicited frame is not.** The peer that just sent a
+    /// request is demonstrably there, and blocking is what delivers the answer it is waiting on. But
+    /// a target telling a carrier that its session has been revoked, or asking one whether it is
+    /// still alive, is speaking to a host that may have walked away -- and on a carrier whose
+    /// transmit path is flow-controlled by the host reading it, that costs a full blocking write
+    /// while everything else the loop serves waits behind it.
+    ///
+    /// Measured on a SAMW25 with two live carriers: a liveness probe sent to a native-USB carrier
+    /// whose host had closed its handle -- the device still `Configured`, nothing draining the bulk
+    /// IN endpoint -- stalled the serve loop for about three and a half seconds, which was longer
+    /// than the claimant waiting on that very probe was prepared to wait. **The answer the probe
+    /// wanted was in the send all along: a carrier that will not take a packet is a carrier nobody
+    /// is reading.**
+    ///
+    /// # The default is the honest answer for most carriers
+    ///
+    /// It forwards to [`Transport::send`] and reports `true`, so a carrier that cannot block -- a
+    /// UART that writes into a register, an in-memory pipe, a queue with its own cap -- needs no
+    /// implementation and gives up nothing. Only a carrier with host-driven flow control has a
+    /// reason to override it.
+    ///
+    /// An implementor must keep the all-or-nothing promise: `Ok(false)` means the wire was not
+    /// touched. A half-written frame is worse than an unsent one, because the far side reassembles
+    /// by length and pays a resynchronization for the difference.
+    fn try_send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<bool, TransportError> {
+        self.send(msg_type, seq, payload).map(|()| true)
+    }
 }
 
 /// An in-memory [`Transport`] for tests / a host-side loopback: `send` encodes into `sent` (which a test
@@ -1142,10 +1281,12 @@ mod tests {
         assert!(reader.next_frame().is_none());
     }
 
-    /// The boundary, from both sides, because only one of them used to be wrong.
+    /// The boundary, from both sides, because only one of the two is easy to get right.
     ///
     /// A payload of exactly [`MAX_PAYLOAD`] is the largest this wire can carry and must still frame
-    /// and survive a round trip; one byte more has no representation and must be REFUSED.
+    /// and survive a round trip; one byte more has no representation and must be REFUSED. The old
+    /// code clamped instead, producing a frame whose CRC validated over truncated content -- so a
+    /// test that only checked "a big payload still returns bytes" passed on the defect.
     #[test]
     fn the_largest_payload_frames_and_one_byte_more_is_refused() {
         let largest = alloc::vec![0xA5u8; MAX_PAYLOAD];

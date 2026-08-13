@@ -74,3 +74,30 @@ kind = "gpio-in"            # family cannot yet derive.
 pin = "GP16"
 active = "low"
 source = "CircuitPython pins.c for this board: SD_CARD_DETECT = GPIO16"
+
+# --- the expansion socket -----------------------------------------------------------------------
+#
+# THE SOCKET IS STATED AS TWO SINGLE LINES RATHER THAN AS A BUS, AND THAT IS THE HONEST FORM HERE
+# RATHER THAN A WEAKER ONE. A bus a socket brings out whole is named by the binding role that
+# serves it, and this board has no i2c binding to name: csp/rp2040 carries no i2c pin-map rows and
+# no emission for the block, so a role written here would name nothing. What the board can support
+# either way is which two pads reach the socket, and that is what these rows say. A bus row joins
+# this connector when the family's i2c arm lands, and these two lines leave it -- one wire, one
+# statement, in whichever form is the stronger.
+#
+# THE SOCKET AND THE FEATHER HEADER ARE ONE BUS, not two. GP2 and GP3 reach both, so a module on
+# the socket shares an address space with anything wired to the header pins, and neither can be
+# addressed without the other.
+
+[[connectors]]
+name = "qt"
+standard = "stemma-qt"
+source = "Adafruit product 5980 (Feather RP2040 Adalogger) lists a STEMMA QT connector; the board's own CircuitPython pin map gives SDA = GPIO2 and SCL = GPIO3, which are the two signal pads of that four-pin part and are the same two the Feather header brings out"
+
+[[connectors.qt.pins]]
+signal = "sda"
+pin = "GP2"
+
+[[connectors.qt.pins]]
+signal = "scl"
+pin = "GP3"

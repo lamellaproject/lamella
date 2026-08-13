@@ -1,0 +1,189 @@
+# PART: Bosch BME688 temperature, pressure, humidity and gas sensor.
+#
+# The newer of the two members. It adds a third operating mode, a shared heater wait register, a
+# variant identifier, and THREE banks of measurement results where the BME680 holds one.
+#
+# WHAT A READER SHOULD TAKE FROM THIS FILE BEFORE ANY OTHER FACT IN IT: the identity value below is
+# the SAME value the BME680 answers, at the same register, in the same two-address range. Every
+# difference recorded in this file is invisible to the register this catalogue identifies parts by.
+
+[table]
+kind = "device"
+family = "bme68x"
+part = "bme688"
+base = "bme68x"
+sources = [
+    "Bosch BST-BME688-DS000 rev 1.3 (February 2024): memory map ch 5.2 table 22, variant and identity registers ch 5.3.2, gas control registers ch 5.3.4, measurement data registers ch 5.3.6, mode selection ch 5.3.1.3, memory map page selection table 21.",
+]
+notes = [
+    "The variant register at 0xF0 is the only documented register whose value differs between this part and the BME680, and the BME680 datasheet does not describe that address at all.",
+    "The memory map prints the field-0 gas result low byte at 0x2D with the bank label [2], which is inconsistent with the [0] label on the high byte directly above it at 0x2C and with the [2] bank's own low byte at 0x4F. The three banks are 17 bytes apart throughout, which places that register in bank 0; the label is a defect in the table rather than an irregular layout.",
+]
+
+# --- sourcing ------------------------------------------------------------------------------------
+#
+# Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
+#
+# WHAT THIS TABLE DELIBERATELY DOES NOT STATE, so that a reader can tell a fact from a gap:
+#   - the temperature, pressure and humidity trimming parameters and their compensation arithmetic;
+#   - the gas resistance conversion and the heater resistance calculation;
+#   - the parallel-mode scheduling rules that decide which bank a result lands in;
+#   - power figures, timing, and the measurement-duration table a non-blocking driver would need.
+# Each is present in the datasheet and none has been transcribed. Treat them as absent rather than
+# defaulted.
+#
+# Validation is `none`: no physical part of this type has answered anything.
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- identity: the value this part shares with its sibling ----------------------------------------
+#
+# THE SET HAS ONE MEMBER AND IT IS THE SIBLING'S MEMBER. A reading of 0x61 at 0xD0 on an address in
+# this range establishes that the part is a BME688 OR a BME680, and no further read of this register
+# will ever separate the two. Everything below that differs between them is reachable only after
+# something other than the identity register has decided which part is being talked to.
+
+[identity]
+reg = 0xD0
+width = 8
+values = [0x61]
+notes = "The BME680 answers this same value at this same register. What separates the two is the variant register below, which the BME680 datasheet does not describe."
+
+# --- the variant register, which is the only documented discriminator -----------------------------
+#
+# The one register whose value the two datasheets state differently. It is not the identity
+# register, and this catalogue's identity model has no way to say that a second register is what
+# settles a part's type.
+#
+# TWO REASONS IT IS A WEAKER DISCRIMINATOR THAN IT LOOKS, both from the vendor's own text:
+#   - the BME680 datasheet describes no register at this address, so the value that would mean
+#     "a BME680" is not stated anywhere by the part it would name;
+#   - this datasheet records that early engineering samples, marked 688E HR1, shipped WITHOUT a
+#     flashed variant identifier. So a genuine part of this type may not answer here either.
+# That is the same shape as an identity value that differs between production revisions, one
+# register over, with the field absent rather than merely different.
+
+[registers.variant_id]
+reg = 0xF0
+width = 8
+access = "read-only"
+fields = { variant_id = [0, 8] }
+notes = "Answers 0x01 on this part. Early engineering samples marked 688E HR1 have no flashed variant identifier, which the datasheet states in a note against its own sensor-identification section."
+
+# --- the gas enable bit, which is NOT where the sibling puts it -----------------------------------
+#
+# THE SHARPEST DIFFERENCE IN THE FAMILY AND THE ONE WITH THE QUIETEST FAILURE. Both members put
+# this register at 0x71 and both spell the field `run_gas`. This part places it at bit 5 and the
+# BME680 places it at bit 4. The datasheets give the two bits different names, `run_gas_h` here and
+# `run_gas_l` there, which is the vendor acknowledging the move.
+#
+# A driver that identified the part by its identity register -- the only discriminator this
+# catalogue models -- would enable the wrong bit on one of the two. Nothing reports an error: the
+# gas conversion simply never runs.
+
+[registers.ctrl_gas_1]
+reg = 0x71
+width = 8
+access = "read-write"
+fields = { nb_conv = [0, 4], run_gas = [5, 1] }
+notes = "Gas conversions are started only in an appropriate mode and only when run_gas is 1. In forced mode nb_conv selects which heater step is used, from 0 to 9; in parallel mode it states the number of steps in the profile, from 1 to 10, so the same field is read two ways depending on the mode."
+
+# --- the heater profile arrays, plus one register the BME680 does not have --------------------------
+#
+# Ten steps, each held in three parallel arrays of ten single-byte registers. The schema has no
+# array-of-registers shape, so each array states its FIRST element and the note states the stride
+# and the count. The registers ascend with the index.
+
+[registers.idac_heat_0]
+reg = 0x50
+width = 8
+access = "read-write"
+fields = { idac_heat = [0, 8] }
+notes = "The first of ten, idac_heat_0 through idac_heat_9 at 0x50 through 0x59, one byte each, ascending with the index. Holds an optional initial heater current."
+
+[registers.res_heat_0]
+reg = 0x5A
+width = 8
+access = "read-write"
+fields = { res_heat = [0, 8] }
+notes = "The first of ten, res_heat_0 through res_heat_9 at 0x5A through 0x63, one byte each, ascending with the index. Holds the target heater resistance as a register code. The conversion from a heater temperature to that code is NOT transcribed in this table."
+
+[registers.gas_wait_0]
+reg = 0x64
+width = 8
+access = "read-write"
+fields = { gas_wait = [0, 8] }
+notes = "The first of ten, gas_wait_0 through gas_wait_9 at 0x64 through 0x6D, one byte each, ascending with the index. Holds the heat-up duration."
+
+[registers.gas_wait_shared]
+reg = 0x6E
+width = 8
+access = "read-write"
+fields = { gas_wait_shared = [0, 8] }
+notes = "PRESENT ON THIS PART AND NOT ON THE BME680, whose memory map ends its heater block at 0x6D. It holds the heater wait shared across the steps of a parallel-mode profile, which is the mode the BME680 does not have."
+
+# --- three banks of measurement results, where the sibling has one ----------------------------------
+#
+# Bank 0 is stated here. Banks 1 and 2 repeat it at a stride of 17 bytes, so bank N begins at
+# 0x1D + 17 * N: 0x1D, 0x2E and 0x3F. Every register in this section is at a DIFFERENT ADDRESS from
+# the BME680's single bank except the four that happen to coincide, and the gas result is not among
+# them: this part puts it at 0x2C and 0x2D where the BME680 puts it at 0x2A and 0x2B.
+#
+# So a driver holding a BME688 while believing it holds a BME680 reads the gas result out of two
+# registers this datasheet does not describe, and the identity register told it nothing was wrong.
+
+[registers.meas_status_0]
+reg = 0x1D
+width = 8
+access = "read-only"
+fields = { gas_meas_index = [0, 4], measuring = [5, 1], gas_measuring = [6, 1], new_data = [7, 1] }
+notes = "Opens bank 0. new_data marks a completed conversion, so a polled driver reads this byte as the first of the burst rather than as a separate transaction."
+
+[registers.sub_meas_index_0]
+reg = 0x1E
+width = 8
+access = "read-only"
+fields = { sub_meas_index = [0, 8] }
+notes = "Bank 0's sub-measurement index. The BME680 has no register at this address."
+
+[registers.press]
+reg = 0x1F
+width = 24
+access = "read-only"
+fields = { press_xlsb = [4, 4], press_lsb = [8, 8], press_msb = [16, 8] }
+notes = "Bank 0. 20 bits, MSB first, left justified: the value is (msb << 12) | (lsb << 4) | (xlsb >> 4)."
+
+[registers.temp]
+reg = 0x22
+width = 24
+access = "read-only"
+fields = { temp_xlsb = [4, 4], temp_lsb = [8, 8], temp_msb = [16, 8] }
+notes = "Bank 0. 20 bits, MSB first, left justified, decoded like press."
+
+[registers.hum]
+reg = 0x25
+width = 16
+access = "read-only"
+fields = { hum_lsb = [0, 8], hum_msb = [8, 8] }
+notes = "Bank 0. 16 bits, MSB first: (msb << 8) | lsb. Unlike pressure and temperature it is not left justified."
+
+[registers.gas_r]
+reg = 0x2C
+width = 16
+access = "read-only"
+fields = { gas_range_r = [0, 4], heat_stab_r = [4, 1], gas_valid_r = [5, 1], gas_r = [6, 10] }
+notes = "Bank 0, AND TWO REGISTERS HIGHER THAN THE BME680 PUTS THE SAME READING. 10 bits of gas ADC reading packed above four bits of range and two status bits. A reading whose gas_valid_r is 0 has not been measured, and one whose heat_stab_r is 0 was taken before the heater settled."
+
+# --- modes: three, where the sibling has two ---------------------------------------------------------
+
+[enums.mode]
+sleep = 0
+forced = 1
+parallel = 2
+notes = "Forced performs a single temperature, pressure, humidity and gas cycle and returns to sleep, which is the mode a polled driver uses. Parallel has no counterpart on the BME680, and it is what the three result banks and the shared heater wait register exist to serve."
+
+[measurement]
+burst_length = 17
+resolution_bits = "20 for temperature and pressure, 16 for humidity, 10 for the gas reading"

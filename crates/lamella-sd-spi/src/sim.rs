@@ -41,6 +41,17 @@ pub struct SimCard {
     store: Vec<u8>,
     /// The 16-byte CSD this card reports to `CMD9`.
     csd: [u8; 16],
+    /// Whether this card OFFERS High Speed in `CMD6`'s group 1. A card can implement the command
+    /// and decline the function, which is the case that separates "asked and got it" from "asked
+    /// and was told no" -- and the one a test that only ever models a capable card cannot reach.
+    high_speed_offered: bool,
+    /// The group-1 function currently selected: 0 default speed, 1 High Speed. A successful mode-1
+    /// switch moves it, and every later status reports it, so a test can prove the switch STUCK
+    /// rather than merely that the card answered.
+    access_mode: u8,
+    /// The last rate the host ASKED the bus for. A sim has no divisor to clamp with, so this is the
+    /// request verbatim.
+    requested_clock_hz: u32,
     /// The sector a `CMD24` write is targeting, once its data block arrives.
     write_target: Option<u64>,
     /// Whether the write's start-block token has been seen (data bytes follow).
@@ -71,6 +82,9 @@ impl SimCard {
             ready: false,
             store: alloc::vec![0u8; STORE_SECTORS * SECTOR_SIZE],
             csd: default_csd(kind),
+            high_speed_offered: true,
+            access_mode: 0,
+            requested_clock_hz: 0,
             write_target: None,
             write_started: false,
             write_buf: Vec::new(),
@@ -89,6 +103,35 @@ impl SimCard {
         card.store = alloc::vec![0u8; store_sectors as usize * SECTOR_SIZE];
         card.csd = capacity_csd(kind, store_sectors);
         card
+    }
+
+    /// A card that implements `CMD6` and does NOT offer High Speed -- the reject column for the
+    /// bus-speed switch.
+    ///
+    /// It is a distinct card from an MMC, which refuses the command outright: this one answers
+    /// successfully, reports the function as unsupported, and leaves a mode-1 switch reporting
+    /// "no influence". **That is the shape a host can mistake for success**, so it is the one worth
+    /// having a card for.
+    #[must_use]
+    pub fn without_high_speed(kind: CardType) -> Self {
+        let mut card = SimCard::new(kind);
+        card.high_speed_offered = false;
+        card
+    }
+
+    /// The last bus rate the host asked for, in hertz.
+    #[must_use]
+    pub fn requested_clock_hz(&self) -> u32 {
+        self.requested_clock_hz
+    }
+
+    /// The group-1 function this card has selected: 0 default speed, 1 High Speed.
+    ///
+    /// The card's own state, not the host's belief about it -- which is what makes it worth
+    /// asserting separately from the clock the host went on to request.
+    #[must_use]
+    pub fn access_mode(&self) -> u8 {
+        self.access_mode
     }
 
     /// An empty slot: every read floats high (`0xFF`), so `CMD0` never sees an idle response.
@@ -263,6 +306,27 @@ impl SimCard {
                 self.outbox.push_back(0xFF);
                 self.outbox.push_back(0xFF);
             }
+            6 => {
+                if self.kind == CardType::Mmc {
+                    self.reply(&[r1::ILLEGAL_COMMAND]);
+                } else {
+                    let set = arg >> 31 != 0;
+                    let requested = (arg & 0xF) as u8;
+                    let grantable = requested == 0 || (requested == 1 && self.high_speed_offered);
+                    if set && grantable {
+                        self.access_mode = requested;
+                    }
+                    let status = self.switch_status(requested, grantable);
+                    self.outbox.push_back(0xFF);
+                    self.outbox.push_back(0x00);
+                    self.outbox.push_back(token::START_BLOCK);
+                    for byte in status {
+                        self.outbox.push_back(byte);
+                    }
+                    self.outbox.push_back(0xFF);
+                    self.outbox.push_back(0xFF);
+                }
+            }
             17 => {
                 let sector = self.decode_sector(arg);
                 self.outbox.push_back(0xFF);
@@ -287,6 +351,36 @@ impl SimCard {
             }
             _ => self.reply(&[r1::ILLEGAL_COMMAND]),
         }
+    }
+}
+
+impl SimCard {
+    /// The 64-byte `CMD6` function status this card reports: what it offers in each group, and
+    /// which function each group has selected.
+    ///
+    /// The layout is most-significant bit first over 512 bits, so group 1's support bitmap lands in
+    /// bytes 12 and 13 and its selection result in the low nibble of byte 16. Only group 1 is
+    /// modelled with any care; the rest offer their default function and nothing else, which is
+    /// what a card with no optional command system or driver strength reports.
+    fn switch_status(&self, requested: u8, grantable: bool) -> [u8; crate::switch::STATUS_LEN] {
+        let mut status = [0u8; crate::switch::STATUS_LEN];
+        status[0] = 0x00;
+        status[1] = 200;
+        status[12] = 0x00;
+        status[13] = if self.high_speed_offered { 0b11 } else { 0b01 };
+        for group in 2..=6usize {
+            status[13 - 2 * (group - 1)] = 0b01;
+        }
+        let result = if requested == crate::switch::NO_INFLUENCE {
+            self.access_mode
+        } else if grantable {
+            requested
+        } else {
+            crate::switch::NO_INFLUENCE
+        };
+        status[16] = result & 0xF;
+        status[17] = 1;
+        status
     }
 }
 
@@ -371,7 +465,9 @@ impl SdSpiBus for SimCard {
         self.cs_asserted = asserted;
     }
 
-    fn set_clock_hz(&mut self, _hz: u32) {}
+    fn set_clock_hz(&mut self, hz: u32) {
+        self.requested_clock_hz = hz;
+    }
 
     fn delay_ms(&mut self, _ms: u32) {}
 }
@@ -385,9 +481,9 @@ mod tests {
     fn capacity_csd_round_trips_for_both_families() {
         for &sectors in &[1024u64, 2048, 8192, 65536] {
             let block = capacity_csd(CardType::Sdhc, sectors);
-            assert_eq!(csd_sector_count(&block), Ok(sectors), "block-addressed {sectors}");
+            assert_eq!(csd_sector_count(&block, false), Ok(sectors), "block-addressed {sectors}");
             let byte = capacity_csd(CardType::Sd2, sectors);
-            assert_eq!(csd_sector_count(&byte), Ok(sectors), "byte-addressed {sectors}");
+            assert_eq!(csd_sector_count(&byte, false), Ok(sectors), "byte-addressed {sectors}");
         }
     }
 }

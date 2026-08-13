@@ -1,0 +1,80 @@
+# PART: Renesas HS3003, a relative-humidity and temperature sensor.
+#
+# THE PART THAT THIS MODEL COULD NOT DESCRIBE UNTIL IT GAINED A WAY TO SAY "NO IDENTITY". Its
+# datasheet describes no identity register anywhere -- there is no WHO_AM_I, no device id, no part
+# id -- and until an absent identity could be STATED, a table for it could not be written at all.
+#
+# IT IS ALSO NOT REGISTER-ADDRESSED, which is the second thing a reader would assume and be wrong
+# about. There is no register byte to write before a read. A measurement is requested by addressing
+# the part with a write bit AND NO DATA AT ALL, and the result is collected by a separate read.
+
+[table]
+kind = "device"
+family = "hs3xxx"
+part = "hs3003"
+sources = [
+    "Renesas HS3xxx datasheet R36DS0045EU0101 Rev.1.01 (17 June 2024): the slave address ch 7.2; the measurement-request and data-fetch protocol ch 7.5 and 7.6; the sleep-mode default and conversion behaviour ch 7.4; the status bits ch 7.8; the non-volatile resolution registers ch 7.9 and 7.10 and table 2.",
+]
+notes = [
+    "One of three parts the document covers -- HS3001, HS3002 and HS3003 -- which differ in accuracy grade and share this interface.",
+    "The part is factory-programmed to sleep. It converts only when a measurement is requested, and powers down again at the end of the cycle, so a reader that never sends a request waits forever on a part that is working correctly.",
+]
+
+# --- sourcing --------------------------------------------------------------------------------
+#
+# `none`, and unlike most parts at this rung that is not merely a matter of nobody having tried.
+# A device acknowledged 0x44 on an I2C walk of this bench, which establishes only that something
+# answered that address. THE RUNG ABOVE IS UNREACHABLE FOR THIS PART BY CONSTRUCTION -- `identified`
+# means one answered its identity register, and it has none. Confidence in this part can only come
+# from exercising it: requesting a measurement and decoding a plausible one.
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- identity: THERE IS NONE ---------------------------------------------------------------------
+#
+# Stated rather than omitted, for the same reason a reserved pin names its owner: an absence left as
+# a missing section cannot be told from a section somebody forgot to write, and the two call for
+# opposite responses. This one is a fact to design around.
+
+[identity]
+absent = "R36DS0045EU0101 Rev.1.01 describes no identity register: the part has no WHO_AM_I, device id or part id, and its interface is a measurement request followed by a data fetch rather than an addressable register map. Nothing on the bus can confirm WHICH part answered this address, so two parts of different types sharing 0x44 are indistinguishable to any reader."
+
+# --- address -------------------------------------------------------------------------------------
+#
+# NO STRAP, AND NO SOFTWARE SETTING EITHER -- a third address model, and the one the schema's
+# base-plus-straps shape fits least. The address is fixed in the part, and a different one is a
+# FACTORY option rather than anything a board or a program can change. So a board carrying two of
+# these cannot separate them by address at all; it needs two buses, or a multiplexer.
+
+[address]
+bus = "i2c"
+base = 0x44
+notes = "R36DS0045EU0101 Rev.1.01 ch 7.2: 'The HS3xxx series default I2C address is 44HEX. The device will respond only to this 7-bit address.' The same section adds that a custom I2C address can be provided on request -- a factory variant, not a strap and not a register, so it is not modelled here as a range this part can take."
+
+# --- the bus, and it is not the shape the other parts here use -------------------------------------
+#
+# `measurement-request-then-data-fetch` is a NEW named dispatch rather than a reuse of the
+# register-oriented one, because there is no register byte in either direction. A measurement
+# request is the slave address with a write bit and NOTHING AFTER IT; a data fetch is a plain read.
+# A driver written around `write-register-then-repeated-start-read` would send a byte this part
+# never expects.
+
+[buses.i2c]
+kind = "i2c"
+register_read_transform = "identity"
+register_write_transform = "identity"
+read_protocol = "measurement-request-then-data-fetch"
+notes = "R36DS0045EU0101 Rev.1.01 ch 7.5: 'Initiate the Measurement Request by sending the 7-bit slave address followed by an eighth bit = 0 (WRITE)' -- the request carries no data byte. Ch 7.6 collects the result with a separate read. Ch 7.4: the part is factory-programmed to sleep and converts only on request, so the two transfers are ordered and a fetch issued before the conversion completes returns the previous result flagged stale by the status bits of ch 7.8."
+
+# --- WHAT IS NOT HERE ------------------------------------------------------------------------------
+#
+# NO REGISTER MAP, because the part has no addressable one in the sense this model means. The
+# non-volatile resolution settings of ch 7.9 and 7.10 are reached through a programming-mode
+# SEQUENCE rather than by addressing a register, and a `[registers]` block would misdescribe them as
+# ordinary reads and writes.
+#
+# NO CONVERSION ARITHMETIC, though the document gives it in ch 7.7. The humidity and temperature
+# formulas are a measurement path rather than an identity or an address, and this table stops where
+# the part stops being findable -- nothing here has yet decoded a reading to check them against.

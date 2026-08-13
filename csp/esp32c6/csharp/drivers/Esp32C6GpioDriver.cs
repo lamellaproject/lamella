@@ -84,4 +84,25 @@ public sealed class Esp32C6GpioDriver : GpioDriver
         else Mmio.Write32(GPIO_OUT_W1TC, 1u << pinNumber);
     }
 
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void AddCallbackForPinValueChangedEvent(
+        int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("ESP32-C6 pin-change events are not implemented");
+#else
+        throw new System.Exception("ESP32-C6 pin-change events are not implemented");
+#endif
+    }
+
+    /// <summary>Not supported: this driver does not implement pin-change events.</summary>
+    protected override void RemoveCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
+    {
+#if LAMELLA_CORLIB_LINKED
+        throw new System.NotSupportedException("ESP32-C6 pin-change events are not implemented");
+#else
+        throw new System.Exception("ESP32-C6 pin-change events are not implemented");
+#endif
+    }
 }

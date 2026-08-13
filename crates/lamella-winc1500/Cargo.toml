@@ -5,10 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "DEVICE networking backend for the interpreter's NetBackend seam, targeting the Microchip ATWINC1500 Wi-Fi network CONTROLLER. The WINC hosts its own TCP/IP stack and exposes a socket API over SPI (its HIF protocol), so socket ops map straight onto NetBackend -- no smoltcp. Generic over a board's SPI bus + control pins (e.g. a SAMD21 SERCOM-SPI on the Arduino MKR1000)."
+description = "DEVICE networking backend for the shared NetBackend seam, targeting the Microchip ATWINC1500 Wi-Fi network CONTROLLER. The WINC hosts its own TCP/IP stack and exposes a socket API over SPI (its HIF protocol), so socket ops map straight onto NetBackend -- no smoltcp. Generic over a board's SPI bus + control pins (e.g. a SAMD21 SERCOM-SPI on the Arduino MKR1000)."
 
 [dependencies]
-lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+# The seam alone. A backend is not a language runtime's dependant: it implements a leaf trait, and
+# every runtime that binds that leaf gets this backend without either side knowing about the other.
+lamella-net-core = { path = "../lamella-net-core" }
 
 [dev-dependencies]
 # The winc-first-light example drives the module's SPI bit-banged over SWD PORT pokes -- first

@@ -1,0 +1,26 @@
+# PART: the Arduino Modulino Joystick node.
+#
+# An analogue joystick with a push button, read by the node's MCU. What answers on the bus is the node's FIRMWARE, so the interface is a property of a
+# software release rather than of a part. See `modulino.toml` for what that means for every member.
+
+[table]
+kind = "device"
+family = "modulino"
+part = "joystick"
+base = "modulino"
+sources = [
+    "Arduino Modulino Joystick user manual ABX00135, section 7.5 'I2C Address Reference': default address 0x40, hardware address 0x20, editable to any custom address in software.",
+]
+
+[sourcing]
+facts = "primary"
+validation = "none"
+
+# --- a disagreement worth carrying ------------------------------------------------------------
+#
+# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS: 0x2C on this bench against 0x40 and 0x20 in the manual. Measured by ISOLATION: unplugging this node emptied the multiplexer channel that had been answering 0x2C, with every other channel unchanged. It had earlier been reached only by elimination, which was the weakest basis in this family; it no longer is.
+
+[address]
+bus = "i2c"
+base = 0x20
+notes = "Arduino ABX00135 section 7.5 prints TWO columns: 0x40 under the product's own name and 0x20 under 'Hardware I2C Address'. The second is the 7-bit address a bus scan sees and is the one stated here; the first is that value shifted up with the read/write bit appended, and writing it into a 7-bit field addresses something else. A node of this type answered address 0x2C on an I2C walk of a Raspberry Pi Pico 2. That establishes only that SOMETHING acknowledged that address: these nodes carry no identity register, so nothing read can say which one it was, and the address is software-assignable so it is not evidence of type either. It matches NEITHER column of the manual, which gives 0x40 and 0x20. Confirmed by isolation: unplugging the node emptied that channel and left every other one unchanged."

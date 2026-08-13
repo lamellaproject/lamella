@@ -386,6 +386,7 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
         | BoundExprKind::NamespaceReference(_)
         | BoundExprKind::TypeOf(_)
         | BoundExprKind::SizeOf(_)
+        | BoundExprKind::DefaultValue(_)
         | BoundExprKind::Error => {}
         BoundExprKind::FieldAccess { receiver, .. }
         | BoundExprKind::PropertyAccess { receiver, .. }
@@ -487,22 +488,43 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
 type FieldSet = BTreeSet<(Box<str>, Box<str>)>;
 
 /// The dotted name of a field's declaring type, the key both a field access and a field
-/// declaration reduce to. Only a source-declared (`Named`) type owns a private field; any
-/// other form yields `None` and is simply not tracked (so never mis-warned).
+/// declaration reduce to.
+///
+/// **AN INSTANTIATION REDUCES TO ITS DEFINITION, BECAUSE A DECLARATION HAS NO OTHER FORM.** The
+/// census walks declarations, where `class Holder<T> { public T A; }` keys as `` Holder`1 ``; an
+/// ACCESS may arrive as `Holder<int>` or -- for a member the type names inside its own body -- as
+/// `` Holder<!0> ``. Answering `None` for those does not merely skip them: a declaration recorded
+/// with no matching access is a field nothing assigns, so the access being untracked is reported as
+/// **`CS0649` "never assigned" on a field the program assigns on the line above**. Measured against
+/// csc on `class Holder<T> { public T A, B; public Holder(T a, T b) { A = a; B = b; } }`, which csc
+/// compiles without a diagnostic.
+///
+/// Every other form -- an array, a pointer, a type parameter -- still yields `None`, which is
+/// correct rather than merely safe: none of them declares a field.
 pub(crate) fn field_type_key(ty: &TypeSymbol) -> Option<Box<str>> {
     match ty {
-        TypeSymbol::Named(parts) => {
-            let mut name = String::new();
-            for (index, part) in parts.iter().enumerate() {
-                if index > 0 {
-                    name.push('.');
-                }
-                name.push_str(part);
-            }
-            Some(name.into())
-        }
+        TypeSymbol::Named(parts) => Some(dotted(parts)),
+        TypeSymbol::Instantiation {
+            definition,
+            arguments,
+        } => match crate::symbols::definition_symbol(definition, arguments.len()) {
+            TypeSymbol::Named(parts) => Some(dotted(&parts)),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// A named type's parts joined with `.` -- `["N", "C"]` -> `N.C`.
+fn dotted(parts: &[Box<str>]) -> Box<str> {
+    let mut name = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            name.push('.');
+        }
+        name.push_str(part);
+    }
+    name.into()
 }
 
 /// Records every field read and write in `stmt`, keyed by the field's declaring type and
@@ -757,6 +779,7 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
         | BoundExprKind::NamespaceReference(_)
         | BoundExprKind::TypeOf(_)
         | BoundExprKind::SizeOf(_)
+        | BoundExprKind::DefaultValue(_)
         | BoundExprKind::Error => {}
         BoundExprKind::PropertyAccess { receiver, .. }
         | BoundExprKind::MethodGroup { receiver, .. } => collect_field_uses(receiver, reads, writes),
@@ -1624,6 +1647,7 @@ impl Analyzer<'_> {
             | BoundExprKind::NamespaceReference(_)
             | BoundExprKind::TypeOf(_)
             | BoundExprKind::SizeOf(_)
+            | BoundExprKind::DefaultValue(_)
             | BoundExprKind::Error => {}
             BoundExprKind::FieldAccess { receiver, .. }
             | BoundExprKind::PropertyAccess { receiver, .. }

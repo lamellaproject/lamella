@@ -2007,7 +2007,7 @@ mod gc_tests {
 mod tests {
     use super::*;
 
-    /// The WTF-8 byte forms, taken from the encoding rules rather than from our own encoder --
+    /// The WTF-8 byte forms, taken from the encoding rules rather than from the encoder under test --
     /// an expectation produced by the thing under test proves only that it is self-consistent.
     /// `U+D800` is the case the whole tier exists for: `1101 1000 0000 0000` laid into the
     /// three-byte frame `1110xxxx 10xxxxxx 10xxxxxx` gives `ED A0 80`, which is ill-formed
@@ -2074,7 +2074,7 @@ mod tests {
     }
 
     /// The well-formed tier's parity gap, PINNED rather than described in a comment: a lone
-    /// surrogate cannot be stored here, so the construction is REFUSED. It used to come back as
+    /// surrogate cannot be stored here, so the construction is REFUSED rather than coming back as
     /// U+FFFD, which is what this test asserted; the replacement was silent data loss at String
     /// construction, and this is the assertion that changed when it stopped.
     ///

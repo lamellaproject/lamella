@@ -432,8 +432,11 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(string_concat_object2),
     entry!(string_concat_object3),
     entry!(string_create_from_chars),
+    entry!(string_ctor_char_array),
+    entry!(string_ctor_char_array_range),
     entry!(string_ctor_char_ptr),
     entry!(string_ctor_char_ptr_range),
+    entry!(string_ctor_char_repeat),
     #[cfg(feature = "NETMFv4_4")]
     entry!(string_contains),
     #[cfg(feature = "NETMFv4_4")]
@@ -632,6 +635,21 @@ pub fn intrinsic_index_of(id: u32) -> Option<u16> {
 #[must_use]
 pub fn intrinsic_at(index: u16) -> Option<IntrinsicFn> {
     REGISTRY.get(index as usize).map(|(_, func)| *func)
+}
+
+/// The stable id at a registry `index` -- [`intrinsic_at`]'s companion, for a caller that needs to
+/// know WHICH intrinsic a baked method is rather than to call it.
+///
+/// A function pointer cannot answer that question: two intrinsics with identical bodies may be
+/// merged onto one address, and several of them exist deliberately (an identity anchor whose
+/// behavior is supplied by the interpreter has nothing in its body to tell it apart). The id is
+/// derived from the name, so it separates them.
+///
+/// Crate-private: [`Module::intrinsic_id`](crate::module::Module) is the form a caller wants, and
+/// an index is this module's own bookkeeping.
+#[must_use]
+pub(crate) fn id_at(index: u16) -> Option<u32> {
+    REGISTRY.get(index as usize).map(|(id, _)| *id)
 }
 
 /// A fingerprint of THIS build's registry (FNV-1a over the id sequence). A baked image records
