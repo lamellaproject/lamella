@@ -36,6 +36,18 @@ pub enum IteratorState {
     /// [`crate::object::Collection`]. Compacting would shift every later index under a live
     /// iterator's feet.
     Collection { target: Option<ObjectId>, index: usize, kind: IterationKind },
+    /// `matchAll`'s walk over a subject.
+    ///
+    /// It holds a CLONE of the pattern rather than the caller's, so iterating does not move a
+    /// cursor the caller is using and two concurrent walks do not interfere. The pattern is `None`
+    /// once the walk has finished, which is the same latch the array iterator uses and for the same
+    /// reason: an exhausted iterator answers `{done: true}` forever.
+    RegExpString {
+        pattern: Option<ObjectId>,
+        text: JsString,
+        global: bool,
+        code_point_mode: bool,
+    },
 }
 
 /// Which of the three views of an indexed collection an iterator yields.
@@ -260,7 +272,7 @@ pub(crate) fn iterate_to_list(
 /// theoretical when `Object.prototype` grew a `__proto__` accessor: an assignment consults the
 /// prototype chain, so a program that installs a `value` or `done` setter on `Object.prototype`
 /// would intercept every iteration result in the realm and leave the object empty.
-fn iter_result(interpreter: &mut Interpreter, value: JsValue, done: bool) -> JsValue {
+pub(crate) fn iter_result(interpreter: &mut Interpreter, value: JsValue, done: bool) -> JsValue {
     let id = interpreter.allocate(Object::new(Some(interpreter.intrinsics.object_prototype)));
     let _ = interpreter.create_data_property(id, PropertyKey::from_str("value"), value);
     let _ = interpreter.create_data_property(id, PropertyKey::from_str("done"), JsValue::Boolean(done));
@@ -482,7 +494,7 @@ fn install_string_iterator(interpreter: &mut Interpreter, iterator_symbol: &Prop
         };
         let prototype = interpreter.intrinsics.string_iterator_prototype;
         let mut object = Object::new(Some(prototype));
-        object.iterator_state = Some(IteratorState::String { text, index: 0, done: false });
+        object.iterator_state = Some(crate::Box::new(IteratorState::String { text, index: 0, done: false }));
         Completion::Normal(JsValue::Object(interpreter.allocate(object)))
     });
     interpreter
@@ -498,7 +510,8 @@ pub(crate) fn create_collection_iterator(
     prototype: ObjectId,
 ) -> Completion {
     let mut object = Object::new(Some(prototype));
-    object.iterator_state = Some(IteratorState::Collection { target: Some(target), index: 0, kind });
+    object.iterator_state =
+        Some(crate::Box::new(IteratorState::Collection { target: Some(target), index: 0, kind }));
     Completion::Normal(JsValue::Object(interpreter.allocate(object)))
 }
 
@@ -511,7 +524,7 @@ pub(crate) fn collection_iterator_next(
         return interpreter.type_error("next() requires a Map or Set Iterator");
     };
     let Some(IteratorState::Collection { target, index, kind }) =
-        interpreter.object(id).iterator_state.clone()
+        interpreter.object(id).iterator_state.as_deref().cloned()
     else {
         return interpreter.type_error("next() requires a Map or Set Iterator");
     };
@@ -545,7 +558,7 @@ pub(crate) fn collection_iterator_next(
 
 fn set_collection_target(interpreter: &mut Interpreter, id: ObjectId, target: Option<ObjectId>) {
     if let Some(IteratorState::Collection { target: slot, .. }) =
-        &mut interpreter.object_mut(id).iterator_state
+        interpreter.object_mut(id).iterator_state.as_deref_mut()
     {
         *slot = target;
     }
@@ -553,7 +566,7 @@ fn set_collection_target(interpreter: &mut Interpreter, id: ObjectId, target: Op
 
 fn set_collection_index(interpreter: &mut Interpreter, id: ObjectId, next: usize) {
     if let Some(IteratorState::Collection { index, .. }) =
-        &mut interpreter.object_mut(id).iterator_state
+        interpreter.object_mut(id).iterator_state.as_deref_mut()
     {
         *index = next;
     }
@@ -562,7 +575,7 @@ fn set_collection_index(interpreter: &mut Interpreter, id: ObjectId, next: usize
 /// `Symbol.toStringTag` on an iterator prototype is non-writable and **configurable**, which is
 /// neither of the two shapes the realm builder already had. Using `define_constant` would make it
 /// non-configurable and fail `verifyProperty` on every iterator test at once.
-fn define_to_string_tag(interpreter: &mut Interpreter, target: ObjectId, tag: &str) {
+pub(crate) fn define_to_string_tag(interpreter: &mut Interpreter, target: ObjectId, tag: &str) {
     interpreter.define_to_string_tag(target, tag);
 }
 
@@ -579,7 +592,8 @@ pub(crate) fn create_array_iterator(
     };
     let prototype = interpreter.intrinsics.array_iterator_prototype;
     let mut object = Object::new(Some(prototype));
-    object.iterator_state = Some(IteratorState::Array { target: Some(target), index: 0.0, kind });
+    object.iterator_state =
+        Some(crate::Box::new(IteratorState::Array { target: Some(target), index: 0.0, kind }));
     Completion::Normal(JsValue::Object(interpreter.allocate(object)))
 }
 
@@ -592,7 +606,7 @@ fn array_iterator_next(
         return interpreter.type_error("next() requires an Array Iterator");
     };
     let Some(IteratorState::Array { target, index, kind }) =
-        interpreter.object(id).iterator_state.clone()
+        interpreter.object(id).iterator_state.as_deref().cloned()
     else {
         return interpreter.type_error("next() requires an Array Iterator");
     };
@@ -647,7 +661,7 @@ fn exhaust_array(interpreter: &mut Interpreter, id: ObjectId, abrupt: Completion
 
 fn set_array_target(interpreter: &mut Interpreter, id: ObjectId, target: Option<ObjectId>) {
     if let Some(IteratorState::Array { target: slot, .. }) =
-        interpreter.object_mut(id).iterator_state.as_mut()
+        interpreter.object_mut(id).iterator_state.as_deref_mut()
     {
         *slot = target;
     }
@@ -655,7 +669,7 @@ fn set_array_target(interpreter: &mut Interpreter, id: ObjectId, target: Option<
 
 fn set_array_index(interpreter: &mut Interpreter, id: ObjectId, next: f64) {
     if let Some(IteratorState::Array { index, .. }) =
-        interpreter.object_mut(id).iterator_state.as_mut()
+        interpreter.object_mut(id).iterator_state.as_deref_mut()
     {
         *index = next;
     }
@@ -678,13 +692,13 @@ fn string_iterator_next(
         return interpreter.type_error("next() requires a String Iterator");
     };
     let Some(IteratorState::String { text, index, done }) =
-        interpreter.object(id).iterator_state.clone()
+        interpreter.object(id).iterator_state.as_deref().cloned()
     else {
         return interpreter.type_error("next() requires a String Iterator");
     };
     if done || index >= text.len() {
         if let Some(IteratorState::String { done, .. }) =
-            interpreter.object_mut(id).iterator_state.as_mut()
+            interpreter.object_mut(id).iterator_state.as_deref_mut()
         {
             *done = true;
         }
@@ -703,7 +717,7 @@ fn string_iterator_next(
     };
     let value = JsValue::String(JsString::from_units(&units[index..index + width]));
     if let Some(IteratorState::String { index: slot, .. }) =
-        interpreter.object_mut(id).iterator_state.as_mut()
+        interpreter.object_mut(id).iterator_state.as_deref_mut()
     {
         *slot = index + width;
     }

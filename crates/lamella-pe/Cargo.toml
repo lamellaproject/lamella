@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Managed PE and ECMA-335 metadata writer for the Lamella C# compiler."
+publish = false
 
 [dependencies]
 lamella-metadata = { path = "../lamella-metadata" }

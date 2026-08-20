@@ -1,8 +1,8 @@
-// Lamella managed corlib (from scratch). -- System.IO.Ports.SerialPort
-#if LAMELLA_SURFACE_SERIAL
+// System.IO.Ports (libs/, real .NET's own assembly name) -- System.IO.Ports.SerialPort
+#if LAMELLA_SURFACE_SERIAL && LAMELLA_SURFACE_NETFX_2_0
 namespace System.IO.Ports
 {
-    public class SerialPort : Stream
+    public class SerialPort
     {
         public const int InfiniteTimeout = -1;
 
@@ -15,6 +15,7 @@ namespace System.IO.Ports
         private int _readTimeout;
         private int _writeTimeout;
         private int _handle;
+        private Stream _baseStream;
 
         public SerialPort(string portName)
             : this(portName, 9600, Parity.None, 8, StopBits.One)
@@ -162,14 +163,10 @@ namespace System.IO.Ports
             get
             {
                 EnsureOpen();
-                return this;
+                if (_baseStream == null) _baseStream = new SerialStream(this);
+                return _baseStream;
             }
         }
-
-        public override bool CanRead { get { return true; } }
-        public override bool CanWrite { get { return true; } }
-        public override bool CanSeek { get { return false; } }
-        public bool CanTimeout { get { return true; } }
 
 #if LAMELLA_SURFACE_THREADS
 
@@ -251,7 +248,7 @@ namespace System.IO.Ports
 #endif
         }
 
-        public override int Read(byte[] buffer, int offset, int count)
+        public int Read(byte[] buffer, int offset, int count)
         {
             ValidateRange(buffer, offset, count);
             EnsureOpen();
@@ -260,7 +257,7 @@ namespace System.IO.Ports
             return read;
         }
 
-        public override void Write(byte[] buffer, int offset, int count)
+        public void Write(byte[] buffer, int offset, int count)
         {
             ValidateRange(buffer, offset, count);
             EnsureOpen();
@@ -274,7 +271,7 @@ namespace System.IO.Ports
             }
         }
 
-        public override void Flush()
+        internal void FlushPort()
         {
             EnsureOpen();
             int code = NativeSerial.Flush(_handle);
@@ -295,32 +292,28 @@ namespace System.IO.Ports
             if (code < 0) NativeSerial.Throw(code, _portName);
         }
 
-        public override long Length { get { throw new NotSupportedException("Seek is not supported on a serial port."); } }
-
-        public override long Position
+        public void Close()
         {
-            get { throw new NotSupportedException("Seek is not supported on a serial port."); }
-            set { throw new NotSupportedException("Seek is not supported on a serial port."); }
+            Dispose(true);
         }
 
-        public override long Seek(long offset, SeekOrigin origin)
+        public void Dispose()
         {
-            throw new NotSupportedException("Seek is not supported on a serial port.");
+            Dispose(true);
         }
 
-        public override void SetLength(long value)
-        {
-            throw new NotSupportedException("Seek is not supported on a serial port.");
-        }
-
-        protected override void Dispose(bool disposing)
+        protected virtual void Dispose(bool disposing)
         {
             if (_handle >= 0)
             {
                 NativeSerial.Close(_handle);
                 _handle = -1;
             }
-            base.Dispose(disposing);
+            if (_baseStream != null)
+            {
+                _baseStream.Dispose();
+                _baseStream = null;
+            }
         }
 
         private void EnsureOpen()

@@ -45,6 +45,7 @@ $DefaultSurface = @(
     'LAMELLA_SURFACE_NETFX_1_1',
     'LAMELLA_SURFACE_NETFX_2_0',
     'LAMELLA_SURFACE_NETFX_4_0',
+    'LAMELLA_SURFACE_NETFX_4_5',
     'LAMELLA_SURFACE_FILE_IO',
     'LAMELLA_SURFACE_SERIAL',
     'LAMELLA_SURFACE_STRING_COMPARISON',
@@ -60,13 +61,22 @@ $Assemblies = @(
     @{ name = 'System.Device.Model';                   references = @() },
     @{ name = 'System.Device.Pwm';                     references = @() },
     @{ name = 'System.Net.NetworkInformation';         references = @() },
+    # Real .NET's own assembly name, bare and unprefixed, because these are real .NET's types in real
+    # .NET's namespace: it ships System.IO.Ports out-of-band (dotnet/dotnet) rather than in its
+    # corlib, NETMF v4.4 has no SerialPort in mscorlib at all, and nanoFramework has it as a separate
+    # assembly of this same name. All three agree it does not belong in a core library, which is why
+    # it moved here. References only corlib -- these sources carry no `using` directives.
+    @{ name = 'System.IO.Ports';                       references = @() },
     @{ name = 'Lamella.Net.Time';                      references = @() },
     @{ name = 'Lamella.Net.Time.Nts';                  references = @('Lamella.Net.Time') },
     @{ name = 'Lamella.IO.Storage';                    references = @('System.Device.Gpio') },
     # The `nanoFramework.` prefix marks a compatibility surface: the types keep nanoFramework's
     # namespaces so unmodified nanoFramework source compiles, and the ASSEMBLY name is what says
     # this is not the authoritative .NET design.
-    @{ name = 'nanoFramework.System.Device.Adc';       references = @() },
+    # It references Lamella.Hardware and not the other way round: the AdcDriver seam and the
+    # AdcControllers binding ship from there, so a program reaching an ADC needs no compatibility
+    # assembly. This assembly holds the nanoFramework-shaped surface over that seam.
+    @{ name = 'nanoFramework.System.Device.Adc';       references = @('Lamella.Hardware') },
     @{ name = 'nanoFramework.System.IO.FileSystem';    references = @() }
 )
 
@@ -115,10 +125,11 @@ if ($Define -contains 'LAMELLA_SURFACE_NETFX_2_0' -or $Define -contains 'LAMELLA
 # Sorted, so the emitted metadata does not depend on the filesystem's enumeration order.
 #
 # EVERY CALLER MUST WRAP THIS IN @(). PowerShell unrolls a function's output onto the pipeline, so a
-# single-source assembly (Lamella.Hardware is one file) comes back as a bare STRING no matter what
-# this function does internally -- and a bare string splats one CHARACTER at a time into the
-# compiler's argument list (`lcsc: cannot read 'E'`). The array-subexpression has to be at the
-# assignment, which is why it is not hidden in here.
+# single-source assembly comes back as a bare STRING no matter what this function does internally --
+# and a bare string splats one CHARACTER at a time into the compiler's argument list
+# (`lcsc: cannot read 'E'`). The array-subexpression has to be at the assignment, which is why it is
+# not hidden in here. No assembly under libs/ has one source file today; the wrapping stays because
+# the next one added might.
 function Get-Sources($dir, [switch]$Recurse) {
     $files = if ($Recurse) { Get-ChildItem $dir -Filter *.cs -Recurse } else { Get-ChildItem $dir -Filter *.cs }
     $full = @($files | ForEach-Object { $_.FullName })

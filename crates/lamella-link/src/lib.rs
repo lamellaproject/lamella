@@ -52,9 +52,128 @@ pub enum LinkError {
         cap: usize,
         /// Their handles, ascending -- the identity a `__lamella_typedesc_<handle>` symbol carries.
         /// Handles rather than spellings because the linker reads symbols, not metadata; the AOT's
-        /// `dump-descriptors` maps one to the other.
+        /// descriptor dump maps one to the other.
         handles: Vec<u32>,
     },
+}
+
+/// Which producer would have defined a symbol the link could not resolve.
+///
+/// The backend emits three families of external name and defines none of them itself, so an
+/// unresolved one is a statement about a MISSING INPUT rather than about the program. The families
+/// are told apart by shape alone, which is all the linker has: it reads symbols, not metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndefinedProvider {
+    /// A runtime-support seam (`lamella_gc_alloc`, the soft-float builtins, the thread and string
+    /// helpers): supplied by the runtime-support archive built for the target ISA.
+    RuntimeSupport,
+    /// A managed method reached across an assembly boundary, spelled
+    /// `Namespace.Type.Method.<params>.<return>`: supplied by the assembly that declares the type,
+    /// which has to be built as a library object and included in the link.
+    ManagedAssembly,
+    /// A name the linker itself defines in a later pass (the statics windows, the type descriptors,
+    /// the EH tag). Undefined here means an internal defect rather than a missing input.
+    LinkerDefined,
+    /// A name in none of the shapes above.
+    Unknown,
+}
+
+/// Classifies an unresolved name by the shape the backend emitted it under.
+///
+/// Deliberately shape-based and total: every name reaches an arm, and the one arm that admits it
+/// cannot be wrong about the others. The internal library form (`L<hash>.f<rid>`, the duplicate-name
+/// demotion) contains a dot and would otherwise read as a managed method, so it is separated before
+/// the dot is consulted.
+fn undefined_provider(name: &str) -> UndefinedProvider {
+    if name.starts_with("__lamella_") {
+        return UndefinedProvider::LinkerDefined;
+    }
+    if name.starts_with("lamella_") {
+        return UndefinedProvider::RuntimeSupport;
+    }
+    let demoted = name.strip_prefix('L').is_some_and(|rest| {
+        rest.split_once(".f")
+            .is_some_and(|(hash, rid)| {
+                !hash.is_empty()
+                    && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    && !rid.is_empty()
+                    && rid.bytes().all(|b| b.is_ascii_digit())
+            })
+    });
+    if demoted {
+        return UndefinedProvider::Unknown;
+    }
+    if name.contains('.') {
+        return UndefinedProvider::ManagedAssembly;
+    }
+    UndefinedProvider::Unknown
+}
+
+impl core::fmt::Display for LinkError {
+    /// Renders the failure as a sentence naming a cause, because the alternative a caller reaches
+    /// for is the derived `Debug`, which prints a mangled symbol and nothing a reader can act on.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LinkError::UndefinedSymbol(name) => {
+                write!(f, "nothing in this link defines `{name}`")?;
+                match undefined_provider(name) {
+                    UndefinedProvider::RuntimeSupport => write!(
+                        f,
+                        " -- a runtime-support seam. The compiler emits calls to it and the \
+                         runtime-support archive for this target defines it, so a link given no \
+                         such archive cannot resolve it. Include the archive built for this \
+                         target's ISA. (`lamella_gc_alloc` is reached by any allocation at all: a \
+                         `new`, a boxed value, an array, a string join.)"
+                    ),
+                    UndefinedProvider::ManagedAssembly => write!(
+                        f,
+                        " -- a managed method in another assembly. Referencing that assembly at \
+                         COMPILE time lets the call bind, but the link needs its CODE too: build \
+                         the assembly as a library object and include it here."
+                    ),
+                    UndefinedProvider::LinkerDefined => write!(
+                        f,
+                        " -- a name the linker defines itself in a later pass, so this is an \
+                         internal defect rather than a missing input."
+                    ),
+                    UndefinedProvider::Unknown => Ok(()),
+                }
+            }
+            LinkError::MissingEntry(name) => {
+                write!(f, "no input object defines the entry symbol `{name}`")
+            }
+            LinkError::DuplicateSymbol(name) => {
+                write!(f, "two input objects define `{name}`")
+            }
+            LinkError::UnsupportedRelocation(kind) => {
+                write!(f, "relocation type {kind} is not handled by this linker")
+            }
+            LinkError::RelocationOutOfRange(kind) => write!(
+                f,
+                "a relocation of type {kind} resolved too far to fit its instruction encoding"
+            ),
+            LinkError::NoObjects => {
+                write!(f, "no input objects were given, so the target machine is unknown")
+            }
+            LinkError::MixedMachines => {
+                write!(f, "the input objects target different machines")
+            }
+            LinkError::AbsoluteNeedsBase => write!(
+                f,
+                "an absolute relocation needs the address the image will be placed at, but this \
+                 link is base-agnostic"
+            ),
+            LinkError::StaticsOverflow { needed, cap } => write!(
+                f,
+                "the managed statics need {needed} bytes against a {cap}-byte window"
+            ),
+            LinkError::InstantiationCapExceeded { count, cap, handles } => write!(
+                f,
+                "the image carries {count} generic instantiations against a cap of {cap} \
+                 (handles: {handles:?})"
+            ),
+        }
+    }
 }
 
 /// **THE INSTANTIATION BUDGET, AND IT IS WHOLE-IMAGE.** Not per definition: the flash and RAM the
@@ -790,8 +909,8 @@ fn link_with_base_inner(
             if !sym.defined || sym.name.is_empty() || sym.binding == Binding::Local {
                 continue;
             }
-            let addr = bases[oi] + normalized_value(machine, sym.value);
-            let thumb = is_thumb_func(machine, sym.value);
+            let (value, thumb) = symbol_target(machine, sym);
+            let addr = bases[oi] + value;
             match defined.iter().position(|(n, _, _)| *n == sym.name) {
                 Some(pos) => {
                     if sym.binding == Binding::Global {
@@ -1026,7 +1145,7 @@ fn link_carried_sections(
                         (base + sym.value, false)
                     }
                     None if sym.defined && (sym.name.is_empty() || sym.binding == Binding::Local) => {
-                        (bases[oi] + normalized_value(machine, sym.value), true)
+                        (bases[oi] + symbol_target(machine, sym).0, true)
                     }
                     None => {
                         let (addr, _) = resolve_sym(defined, &sym.name)
@@ -1063,8 +1182,36 @@ fn encode_abs32_at(data: &mut [u8], site: u32, value: i64) -> Result<(), LinkErr
 /// On ARM, a Thumb function carries the Thumb bit in its symbol value's low bit (the Lamella backend
 /// and `gcc -mthumb` both set it for `STT_FUNC`); that bit is the `T` an `R_ARM_ABS32` reapplies. Data
 /// symbols, and any symbol on a non-ARM target, are not Thumb.
+///
+/// Takes a value the caller has ALREADY established is a function address -- a resident supplied by
+/// the host under that name, or a symbol filtered on `SymbolType::Func`. For a symbol of unknown
+/// type the question is [`symbol_target`]'s, because parity does not answer it.
 fn is_thumb_func(machine: Machine, value: u32) -> bool {
     machine == Machine::Arm && value & 1 == 1
+}
+
+/// A symbol's image-relative value and whether an absolute reference to it carries the Thumb bit.
+///
+/// The Thumb bit lives in the low bit of an `STT_FUNC` symbol's value and ONLY there. For every
+/// other symbol type the low bit is part of the ADDRESS: `.rodata.str1.1` holds byte-aligned
+/// mergeable strings, so a string constant sits at an odd address as a matter of course, and
+/// `.rodata.cst8` is the same shape for constant pools.
+///
+/// Normalizing that bit away and ORing it back reproduces the address only when the addend is EVEN.
+/// With an ODD addend the reference lands one byte low, and nothing announces it -- the value is a
+/// plausible address one byte before the intended one, which for a `core::fmt` template is a
+/// leading NUL and an empty formatted result.
+///
+/// So the SYMBOL TYPE is the key and the parity is not: an odd value is Thumb state on a function
+/// and a byte offset on everything else.
+fn symbol_target(machine: Machine, sym: &lamella_elf::ParsedSymbol) -> (u32, bool) {
+    match sym.kind {
+        SymbolType::Func => (
+            normalized_value(machine, sym.value),
+            is_thumb_func(machine, sym.value),
+        ),
+        SymbolType::NoType | SymbolType::Section => (sym.value, false),
+    }
 }
 
 /// The assembly-hash suffix of a statics-REGION symbol name, or `None` for any other name. A
@@ -1202,10 +1349,8 @@ fn apply_relocation(
     let (target, target_is_thumb) = if sym.defined
         && (sym.name.is_empty() || sym.binding == Binding::Local)
     {
-        (
-            obj_base + normalized_value(machine, sym.value),
-            is_thumb_func(machine, sym.value),
-        )
+        let (value, thumb) = symbol_target(machine, sym);
+        (obj_base + value, thumb)
     } else {
         resolve_sym(defined, &sym.name).ok_or_else(|| LinkError::UndefinedSymbol(sym.name.clone()))?
     };
@@ -1786,6 +1931,73 @@ mod tests {
         ArchiveMember, Binding, Machine, Relocation, Section, Symbol, SymbolSection, SymbolType,
         arm, read_object, write_relocatable_object, write_relocatable_object_with_sections,
     };
+
+    /// Every name family the backend emits, classified. Written from the shapes actually observed
+    /// in emitted objects rather than from the classifier, so a family it cannot see is a failing
+    /// row here rather than a silent `Unknown` in a message.
+    #[test]
+    fn an_unresolved_name_is_classified_by_the_shape_the_backend_emitted_it_under() {
+        for name in [
+            "lamella_gc_alloc",
+            "lamella_char_to_string",
+            "lamella_fabs",
+            "lamella_thread_yield",
+        ] {
+            assert_eq!(
+                undefined_provider(name),
+                UndefinedProvider::RuntimeSupport,
+                "{name} is a runtime-support seam"
+            );
+        }
+        for name in [
+            "Lamella.Hardware.Mmio.Write32.II.v",
+            "System.Object.Equals.o.z",
+            "System.Object.GetHashCode..i",
+            "Lamella.Hardware.Mmio..ctor..v",
+        ] {
+            assert_eq!(
+                undefined_provider(name),
+                UndefinedProvider::ManagedAssembly,
+                "{name} is a managed method reached across an assembly boundary"
+            );
+        }
+        for name in ["__lamella_statics_7f58c4c2", "__lamella_typedesc_6ecd7930_33554521"] {
+            assert_eq!(
+                undefined_provider(name),
+                UndefinedProvider::LinkerDefined,
+                "{name} is defined by a later linker pass"
+            );
+        }
+        for name in ["L22f7906e.f2", "L22f7906e.f5"] {
+            assert_eq!(
+                undefined_provider(name),
+                UndefinedProvider::Unknown,
+                "{name} is an internal library symbol, not a managed method"
+            );
+        }
+        assert_eq!(undefined_provider("f0"), UndefinedProvider::Unknown);
+    }
+
+    /// The rendering, at the two families a user's composition mistake actually produces. Asserted
+    /// on content rather than on the whole string so wording can move without a test pinning it.
+    #[test]
+    fn an_undefined_symbol_renders_the_input_that_would_have_defined_it() {
+        let seam = LinkError::UndefinedSymbol(String::from("lamella_gc_alloc"));
+        let rendered = alloc::format!("{seam}");
+        assert!(rendered.contains("lamella_gc_alloc"), "{rendered}");
+        assert!(rendered.contains("runtime-support archive"), "{rendered}");
+
+        let managed = LinkError::UndefinedSymbol(String::from("Lamella.Hardware.Mmio.Write32.II.v"));
+        let rendered = alloc::format!("{managed}");
+        assert!(rendered.contains("library object"), "{rendered}");
+        assert!(rendered.contains("COMPILE"), "{rendered}");
+
+        assert_ne!(
+            alloc::format!("{seam}"),
+            alloc::format!("{managed}"),
+            "each family names its own missing input"
+        );
+    }
 
     /// What a carried-section relocation points at: a function in the loaded image, or another
     /// carried section (named by the nameless `STT_SECTION` symbol a real toolchain emits).
@@ -2380,6 +2592,63 @@ mod tests {
         assert_eq!(img.entry_offset, 0);
         assert_eq!(&img.text[0..4], &[0x00, 0xF0, 0x02, 0xF8]);
         assert!(img.symbols.iter().any(|(n, a)| n == "answer" && *a == 8));
+    }
+
+    /// The Thumb bit belongs to FUNCTION symbols. A data, section or untyped symbol whose value
+    /// happens to be odd is just an odd address: `.rodata.str1.1` is byte-aligned and mergeable, so
+    /// a string constant lands at an odd offset as a matter of course.
+    ///
+    /// Masking the low bit away and ORing it back is the identity only when the addend is EVEN.
+    /// With an odd addend the reference lands ONE BYTE LOW, which for a `core::fmt` template is a
+    /// leading NUL -- the formatter reads an empty template and writes nothing.
+    ///
+    /// Both rows assert the written word is `S + 1` AND that it is EVEN. The evenness is what pins
+    /// the fixture: it holds only while `S` is odd, so a layout change that moved the data to an
+    /// even address would fail here rather than pass without reproducing anything.
+    #[test]
+    fn an_odd_addressed_non_function_symbol_does_not_take_the_thumb_bit() {
+        let mut text = vec![0x70, 0x47, 0x00, 0x00];
+        text.extend_from_slice(&[0, 0, 0, 0]);
+        text.extend_from_slice(&[0, 0, 0, 0]);
+        text.push(b'.');
+        text.extend_from_slice(b"ab\0");
+        text.push(b'.');
+        text.extend_from_slice(b"cd\0");
+        assert_eq!(text.len(), 20);
+        let section_sym = Symbol {
+            name: "",
+            value: 13,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::Section,
+            section: SymbolSection::Text,
+        };
+        let obj = obj_arm(
+            &text,
+            &[func("f0", 1, 4), section_sym, data("str_pool", 17, 3)],
+            &[
+                Relocation { offset: 4, symbol: 1, kind: arm::R_ARM_ABS32, addend: 1 },
+                Relocation { offset: 8, symbol: 2, kind: arm::R_ARM_ABS32, addend: 1 },
+            ],
+        );
+        let base = 0x0800_0000u32;
+        let img = link_at_base(&[obj], "f0", base).unwrap();
+        let word = |off: usize| {
+            u32::from_le_bytes([
+                img.text[off],
+                img.text[off + 1],
+                img.text[off + 2],
+                img.text[off + 3],
+            ])
+        };
+        for (site, symbol_value, what) in [(4usize, 13u32, "section symbol"), (8, 17, "data symbol")]
+        {
+            assert_eq!(symbol_value % 2, 1, "the fixture places the {what} at an odd address");
+            let want = base + symbol_value + 1;
+            assert_eq!(word(site), want, "{what} + addend 1 is S + 1, not S");
+            assert_eq!(word(site) % 2, 0, "{what} + addend 1 is EVEN -- no Thumb bit on data");
+        }
+        assert!(img.symbols.iter().any(|(n, a)| n == "f0" && *a == 0));
     }
 
     #[test]

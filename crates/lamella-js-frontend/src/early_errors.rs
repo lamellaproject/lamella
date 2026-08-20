@@ -227,6 +227,11 @@ impl Checker<'_> {
     ///
     /// # WARNING: THE STRUCTURAL GAP THIS CLOSES, AND IT MADE FOUR CLUSTERS UNREACHABLE
     ///
+    /// A function EXPRESSION, an arrow body and an object method are reached through EXPRESSIONS,
+    /// so a walk over statements alone checks **none of them**: `(function () { break LABEL; })()`
+    /// inside a labelled loop is accepted, because the walk never descends into the function and
+    /// the `break` appears to have a loop above it.
+    ///
     /// A pass that silently visits a subset of the tree reports clean on the part it skipped, which
     /// is indistinguishable from that part being correct.
     fn expressions_of(&mut self, statement: &Statement) {
@@ -791,6 +796,10 @@ fn class_member_is_constructor(member: &crate::ast::ClassMember) -> bool {
 
 /// Whether a class member is a **special method**: 15.7.1's `SpecialMethod`, which a
 /// `constructor` may not be.
+///
+/// A GENERATOR IS THE ONLY ONE OF THE FOUR THIS PROFILE BUILDS. Async methods and async generators
+/// are refused where they are written, so a member carrying either flag never reaches here. The
+/// condition is written as the whole rule rather than as its one live case.
 #[must_use]
 pub(crate) fn class_member_is_special(member: &crate::ast::ClassMember) -> bool {
     member.function.is_generator || member.function.is_async

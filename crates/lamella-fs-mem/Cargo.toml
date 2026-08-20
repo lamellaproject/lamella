@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "In-memory file-system backend for the interpreter's FsBackend seam: a no_std path tree over the allocator. Pins the seam's semantics in unit tests independent of any host disk, and is the file-system story for embedders with no medium (a browser, a simulator)."
+publish = false
 
 [dependencies]
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }

@@ -30,9 +30,155 @@ fn error(message: &str) -> CompileError {
     }
 }
 
+/// Refuse a `global` / `nonlocal` that names something this scope has ALREADY bound.
+///
+/// CPython: *"name 'x' is assigned to before global declaration"*. The rule is POSITIONAL within one
+/// scope -- the declaration has to come before every binding of that name -- so it cannot be checked
+/// by the unordered `bound_names` walk beside it, which is what let `x = 1` followed by `global x`
+/// compile here and then bind the wrong thing.
+///
+/// A `def` or a `class` is a new scope, so the walk restarts inside one; its NAME is a binding in the
+/// scope that contains it. Control flow is not a scope, so an `if` body binds into the block it sits
+/// in, which is why `for x in ...` inside a branch still counts against a later `global x`.
+///
+/// The check only ever fires on source CPython also refuses, so it cannot cost a working program: a
+/// valid module never binds a name before declaring it global in the same scope.
+fn check_declarations_precede_bindings(body: &[Stmt]) -> Result<(), CompileError> {
+    let mut bound = BTreeSet::new();
+    walk_scope_for_declarations(body, &mut bound)
+}
+
+fn walk_scope_for_declarations(
+    body: &[Stmt],
+    bound: &mut BTreeSet<String>,
+) -> Result<(), CompileError> {
+    for stmt in body {
+        match &stmt.kind {
+            StmtKind::Global(names) | StmtKind::Nonlocal(names) => {
+                let word = if matches!(stmt.kind, StmtKind::Global(_)) {
+                    "global"
+                } else {
+                    "nonlocal"
+                };
+                for name in names {
+                    if bound.contains(name) {
+                        return Err(CompileError {
+                            message: alloc::format!(
+                                "line {}: name '{name}' is assigned to before {word} declaration",
+                                stmt.line
+                            ),
+                        });
+                    }
+                }
+            }
+            StmtKind::FuncDef(def) => {
+                bound.insert(def.name.clone());
+                let mut inner = BTreeSet::new();
+                walk_scope_for_declarations(&def.body, &mut inner)?;
+            }
+            StmtKind::ClassDef { name, body, .. } => {
+                bound.insert(name.clone());
+                let mut inner = BTreeSet::new();
+                walk_scope_for_declarations(body, &mut inner)?;
+            }
+            StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+                collect_stmt_bindings(stmt, bound);
+                walk_scope_for_declarations(body, bound)?;
+                walk_scope_for_declarations(orelse, bound)?;
+            }
+            StmtKind::For { body, orelse, .. }
+            | StmtKind::ForIter { body, orelse, .. }
+            | StmtKind::AsyncFor { body, orelse, .. } => {
+                collect_stmt_bindings(stmt, bound);
+                walk_scope_for_declarations(body, bound)?;
+                walk_scope_for_declarations(orelse, bound)?;
+            }
+            StmtKind::With { body, .. } | StmtKind::AsyncWith { body, .. } => {
+                collect_stmt_bindings(stmt, bound);
+                walk_scope_for_declarations(body, bound)?;
+            }
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                collect_stmt_bindings(stmt, bound);
+                walk_scope_for_declarations(body, bound)?;
+                for handler in handlers {
+                    walk_scope_for_declarations(&handler.body, bound)?;
+                }
+                walk_scope_for_declarations(orelse, bound)?;
+                walk_scope_for_declarations(finalbody, bound)?;
+            }
+            _ => collect_stmt_bindings(stmt, bound),
+        }
+    }
+    Ok(())
+}
+
+/// The names `stmt` binds in its OWN scope, not descending into blocks (the walk above does that in
+/// order). Anything that can introduce a name here has to be listed, because a name this misses is a
+/// declaration that wrongly passes -- the direction that keeps the over-accept rather than inventing
+/// a refusal.
+fn collect_stmt_bindings(stmt: &Stmt, bound: &mut BTreeSet<String>) {
+    let add_target = |target: &ast::AssignTarget, bound: &mut BTreeSet<String>| {
+        let mut names = Vec::new();
+        ast::target_bound_names(target, &mut names);
+        for n in names {
+            bound.insert(String::from(n));
+        }
+    };
+    match &stmt.kind {
+        StmtKind::Assign(a) => {
+            bound.insert(a.target.clone());
+        }
+        StmtKind::MultiAssign { targets, .. } | StmtKind::TupleAssign { targets, .. } => {
+            for t in targets {
+                add_target(t, bound);
+            }
+        }
+        StmtKind::For { target, .. } | StmtKind::AsyncFor { target, .. } => {
+            bound.insert(target.clone());
+        }
+        StmtKind::ForIter { target, .. } => {
+            bound.insert(target.clone());
+        }
+        StmtKind::With {
+            optional_target, ..
+        }
+        | StmtKind::AsyncWith {
+            optional_target, ..
+        } => {
+            if let Some(t) = optional_target {
+                add_target(t, bound);
+            }
+        }
+        StmtKind::Import { modules } => {
+            for (module, alias) in modules {
+                bound.insert(String::from(ast::import_bound_name(module, alias)));
+            }
+        }
+        StmtKind::ImportFrom { names, .. } => {
+            for (_, as_name) in names {
+                bound.insert(as_name.clone());
+            }
+        }
+        StmtKind::Try { handlers, .. } => {
+            for handler in handlers {
+                if let Some(name) = &handler.name {
+                    bound.insert(name.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compile a module AST to a [`bc::Module`]: each top-level `def` becomes a function
 /// code object, and the remaining top-level statements become the `<module>` body.
 pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, CompileError> {
+    check_declarations_precede_bindings(&ast.body)?;
     let sum_helper = synthesize_sum_helper(&ast.body);
     let min_helper = synthesize_extremum_helper(&ast.body, "min");
     let max_helper = synthesize_extremum_helper(&ast.body, "max");
@@ -1012,17 +1158,21 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
             }
         }
         StmtKind::With {
-            optional_name,
+            optional_target,
             body,
             ..
         }
         | StmtKind::AsyncWith {
-            optional_name,
+            optional_target,
             body,
             ..
         } => {
-            if let Some(name) = optional_name {
-                add_dynamic_local(name, names, types);
+            if let Some(target) = optional_target {
+                let mut bound = Vec::new();
+                ast::target_bound_names(target, &mut bound);
+                for name in bound {
+                    add_dynamic_local(name, names, types);
+                }
             }
             for s in body {
                 collect_locals_stmt(s, names, types);
@@ -2328,18 +2478,22 @@ fn gather_assignments_stmt(
             }
         }
         StmtKind::With {
-            optional_name,
+            optional_target,
             body,
             ..
         }
         | StmtKind::AsyncWith {
-            optional_name,
+            optional_target,
             body,
             ..
         } => {
-            if let Some(name) = optional_name {
-                if let Some(slot) = names.iter().position(|n| n == name) {
-                    pinned[slot] = true;
+            if let Some(target) = optional_target {
+                let mut bound = Vec::new();
+                ast::target_bound_names(target, &mut bound);
+                for name in bound {
+                    if let Some(slot) = names.iter().position(|n| n == name) {
+                        pinned[slot] = true;
+                    }
                 }
             }
             for s in body {
@@ -2919,14 +3073,14 @@ impl Compiler {
             }
             StmtKind::With {
                 context,
-                optional_name,
+                optional_target,
                 body,
-            } => self.compile_with(context, optional_name, body, false),
+            } => self.compile_with(context, optional_target, body, false),
             StmtKind::AsyncWith {
                 context,
-                optional_name,
+                optional_target,
                 body,
-            } => self.compile_with(context, optional_name, body, true),
+            } => self.compile_with(context, optional_target, body, true),
             StmtKind::Break => {
                 let (_, target, fin_depth, handler_depth) = self
                     .loops
@@ -3302,7 +3456,7 @@ impl Compiler {
     fn compile_with(
         &mut self,
         context: &Expr,
-        optional_name: &Option<String>,
+        optional_target: &Option<ast::AssignTarget>,
         body: &[Stmt],
         is_async: bool,
     ) -> Result<(), CompileError> {
@@ -3329,8 +3483,8 @@ impl Compiler {
             enter
         };
         self.compile_expr(&enter)?;
-        match optional_name {
-            Some(name) => self.emit_store_name(name),
+        match optional_target {
+            Some(target) => self.compile_unpack_target(target)?,
             None => self.asm.emit(bc::Op::PopTop),
         }
         let hit = self.alloc_temp();
@@ -5724,6 +5878,90 @@ xs.append(1, 2)
             f.ops.iter().any(|op| matches!(op, Op::StoreGlobal(_))),
             "count is written through the global namespace"
         );
+    }
+
+    #[test]
+    fn a_declaration_must_precede_every_binding_of_its_name() {
+        for (src, word) in [
+            ("def f():
+    x = 1
+    global x
+    return x
+", "global"),
+            ("x = 1
+global x
+", "global"),
+            ("def f():
+    for x in [1]:
+        pass
+    global x
+", "global"),
+            (
+                "def o():
+    y = 1
+    def i():
+        y = 2
+        nonlocal y
+    return i
+",
+                "nonlocal",
+            ),
+        ] {
+            let err = compile_src(src).unwrap_err();
+            assert!(
+                err.message.contains(&alloc::format!("before {word} declaration")),
+                "{src:?} gave {}",
+                err.message
+            );
+        }
+
+        assert!(compile_src("def f():
+    global x
+    x = 1
+    return x
+").is_ok());
+        assert!(compile_src("def f():
+    global x
+    return 1
+").is_ok());
+        assert!(
+            compile_src("def o():
+    y = 1
+    def i():
+        nonlocal y
+        y = 2
+    return i
+")
+                .is_ok()
+        );
+
+        assert!(compile_src("def f():
+    x = 1
+    def g():
+        global x
+        x = 2
+    return g
+").is_ok());
+        assert!(compile_src("x = 1
+class C:
+    global y
+    y = 2
+").is_ok());
+    }
+
+    #[test]
+    fn a_parameter_keeps_its_own_sharper_diagnostic() {
+        let err = compile_src("def f(a):
+    global a
+    return a
+").unwrap_err();
+        assert!(err.message.contains("parameter and global"), "{}", err.message);
+        let err = compile_src("def o():
+    def i(a):
+        nonlocal a
+    return i
+").unwrap_err();
+        assert!(err.message.contains("parameter and nonlocal"), "{}", err.message);
     }
 
     #[test]

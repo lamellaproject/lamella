@@ -1,6 +1,4 @@
 // nanoFramework.System.Device.Adc (a nanoFramework compatibility assembly) -- System.Device.Adc.AdcController.
-using Lamella.Hardware;
-
 namespace System.Device.Adc
 {
     /// <summary>Represents an analog-to-digital converter (ADC) controller on the system, in
@@ -22,7 +20,7 @@ namespace System.Device.Adc
     /// </remarks>
     public class AdcController
     {
-        private readonly AdcDriver _driver;
+        private readonly Lamella.Hardware.AdcDriver _driver;
         private readonly bool[] _open;
         private AdcChannelMode _channelMode;
 
@@ -32,7 +30,7 @@ namespace System.Device.Adc
         {
         }
 
-        internal AdcController(AdcDriver driver)
+        internal AdcController(Lamella.Hardware.AdcDriver driver)
         {
             _driver = driver;
             _open = new bool[driver.ChannelCount];
@@ -54,18 +52,40 @@ namespace System.Device.Adc
             get { return _channelMode; }
             set
             {
-                if (!_driver.IsChannelModeSupported(value))
+                if (!DriverSupports(value))
                 {
                     throw new System.ArgumentException("channel mode not supported");
                 }
-                _driver.SetChannelMode(value);
+                _driver.SetChannelMode(ToDriverMode(value));
                 _channelMode = value;
             }
         }
 
         public bool IsChannelModeSupported(AdcChannelMode channelMode)
         {
-            return _driver.IsChannelModeSupported(channelMode);
+            return DriverSupports(channelMode);
+        }
+
+        private bool DriverSupports(AdcChannelMode channelMode)
+        {
+            if (channelMode == AdcChannelMode.SingleEnded)
+            {
+                return _driver.IsChannelModeSupported(Lamella.Hardware.AdcChannelMode.SingleEnded);
+            }
+            if (channelMode == AdcChannelMode.Differential)
+            {
+                return _driver.IsChannelModeSupported(Lamella.Hardware.AdcChannelMode.Differential);
+            }
+            return false;
+        }
+
+        private static Lamella.Hardware.AdcChannelMode ToDriverMode(AdcChannelMode channelMode)
+        {
+            if (channelMode == AdcChannelMode.Differential)
+            {
+                return Lamella.Hardware.AdcChannelMode.Differential;
+            }
+            return Lamella.Hardware.AdcChannelMode.SingleEnded;
         }
 
         /// <summary>Opens a connection to the specified ADC channel. A channel is exclusive:

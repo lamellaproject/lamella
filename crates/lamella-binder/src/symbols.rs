@@ -112,6 +112,17 @@ pub struct PropertySymbol {
     pub has_getter: bool,
     /// Whether this declaration provides a `set` accessor.
     pub has_setter: bool,
+    /// The `get` accessor's EFFECTIVE accessibility -- its own access modifier (C# 2.0's 10.7.2)
+    /// when it carries one, else the property's. `None` when there is no `get` accessor.
+    ///
+    /// **KEPT PER ACCESSOR BECAUSE THE OVERRIDE RULE IS PER ACCESSOR.** An override must match the
+    /// base ACCESSOR's accessibility, not the base property's, and the two differ exactly when the
+    /// base wrote `private set`. Answering from [`PropertySymbol::accessibility`] there accepts an
+    /// override that narrows a setter -- which the CLR then refuses to load, so it is not an error
+    /// the runtime forgives.
+    pub getter_accessibility: Option<Accessibility>,
+    /// The `set` accessor's effective accessibility; see [`PropertySymbol::getter_accessibility`].
+    pub setter_accessibility: Option<Accessibility>,
     /// Whether the property is `required` (C# 11); see [`FieldSymbol::is_required`].
     ///
     /// **An imported property's answer comes from the Property TABLE, not from its accessors.**
@@ -407,6 +418,24 @@ pub struct TypeInfo {
     /// the candidate by its parameters -- *Using the generic type 'Box<T>' requires 1 type
     /// arguments* -- and a message that printed the arity instead would be a different message.
     pub type_parameters: Vec<Box<str>>,
+    /// Whether any declaration of this type carried the `partial` modifier (ECMA-334 4th ed
+    /// 17.1.4), so a second declaration of the same name MERGES into this one instead of replacing
+    /// it.
+    ///
+    /// **IT IS A PROPERTY OF THE TYPE, NOT OF ONE DECLARATION, WHICH IS WHY IT IS OR-ED.** A part
+    /// that omits `partial` is CS0260 -- an error the declaration pass reports -- and merging it
+    /// anyway is the recovery that keeps the rest of the compilation working from ONE type rather
+    /// than from a half of one.
+    pub is_partial: bool,
+    /// Whether the LAST entry in `constructors` is the IMPLICIT parameterless one (17.10.4) rather
+    /// than a declared constructor.
+    ///
+    /// **THE IMPLICIT CONSTRUCTOR IS THE TYPE'S, NOT A DECLARATION'S, AND PARTIAL TYPES ARE WHERE
+    /// THAT STOPS BEING A DISTINCTION WITHOUT A DIFFERENCE.** Collection adds one per declaration,
+    /// so merging two parts' lists gave a class TWO parameterless constructors and `new W()`
+    /// answered CS0121 -- ambiguous between a constructor and itself. Recording which entry is
+    /// implicit is what lets [`TypeInfo::merge_part`] re-apply the rule to the MERGED list.
+    pub synthesized_constructor: bool,
     /// The constraints on each declared type parameter (25.7), in the same order and ALWAYS the
     /// same length as `type_parameters` -- a parameter with no `where` clause gets an empty entry
     /// rather than a missing one.
@@ -638,6 +667,87 @@ impl TypeInfo {
             is_abstract: false,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
+            is_partial: false,
+            synthesized_constructor: false,
+        }
+    }
+
+    /// Joins another part's constructors, then re-applies 17.10.4 to the MERGED list: a class has
+    /// the implicit parameterless constructor only when NO part declares one, and a struct has it
+    /// alongside whatever the parts declare.
+    ///
+    /// Each part's own implicit entry is dropped first, because it was added on the strength of
+    /// that part's members alone -- the question the rule asks is about the type.
+    fn merge_constructors(
+        &mut self,
+        part_constructors: Vec<MethodSymbol>,
+        part_synthesized: bool,
+        part_kind: TypeKind,
+    ) {
+        let mut declared = core::mem::take(&mut self.constructors);
+        if self.synthesized_constructor {
+            declared.pop();
+        }
+        let mut incoming = part_constructors;
+        if part_synthesized {
+            incoming.pop();
+        }
+        declared.extend(incoming);
+        self.synthesized_constructor = false;
+        let is_static_class = self.kind == TypeKind::Class && self.is_abstract && self.is_sealed;
+        let _ = part_kind;
+        let wants = match self.kind {
+            TypeKind::Struct => !declared.iter().any(|one| one.parameters.is_empty()),
+            TypeKind::Class => declared.is_empty() && !is_static_class,
+            _ => false,
+        };
+        if wants {
+            declared.push(implicit_constructor());
+            self.synthesized_constructor = true;
+        }
+        self.constructors = declared;
+    }
+
+    /// Folds another PART of this partial type into it (17.1.4): the members join, the interface
+    /// list unions, and a fact stated by any part holds for the type.
+    ///
+    /// **EVERY CONFLICT THIS COULD HIDE IS REPORTED BY THE DECLARATION PASS, NOT HERE.** Parts of
+    /// different kinds (CS0261), with conflicting accessibility (CS0262), with different base
+    /// classes (CS0263), with differently named type parameters (CS0264) or inconsistent
+    /// constraints (CS0265) are all errors, and this keeps the FIRST part's answer for each so the
+    /// rest of the compilation has one type to work from rather than a contradiction. A model that
+    /// tried to arbitrate would answer differently from the diagnostic.
+    pub fn merge_part(&mut self, part: TypeInfo) {
+        self.is_partial |= part.is_partial;
+        for base in part.bases.into_iter().rev() {
+            if !self.bases.contains(&base) {
+                self.bases.insert(0, base);
+            }
+        }
+        if self.base.is_none() {
+            self.base = part.base;
+        }
+        self.fields.extend(part.fields);
+        self.properties.extend(part.properties);
+        self.methods.extend(part.methods);
+        self.undecodable_members.extend(part.undecodable_members);
+        self.events.extend(part.events);
+        self.merge_constructors(part.constructors, part.synthesized_constructor, part.kind);
+        self.is_sealed |= part.is_sealed;
+        self.is_abstract |= part.is_abstract;
+        self.accessibility = part.accessibility;
+        if self.type_parameters.is_empty() {
+            self.type_parameters = part.type_parameters;
+            self.type_parameter_constraints = part.type_parameter_constraints;
+            return;
+        }
+        for (index, constraints) in part.type_parameter_constraints.into_iter().enumerate() {
+            let Some(existing) = self.type_parameter_constraints.get_mut(index) else {
+                continue;
+            };
+            if *existing == TypeParameterConstraints::default() {
+                *existing = constraints;
+            }
         }
     }
 
@@ -749,6 +859,33 @@ pub struct Model {
     types: BTreeMap<(String, String), TypeInfo>,
 }
 
+/// The IMPLICIT parameterless constructor (17.10.4): public, no parameters.
+///
+/// The same shape `declaration::constructor(&[], Public)` builds, written here because
+/// [`TypeInfo::merge_part`] re-applies the rule after joining two parts and the declaration
+/// collector is upstream of it.
+fn implicit_constructor() -> MethodSymbol {
+    MethodSymbol {
+        explicit_interface: None,
+        name: ".ctor".into(),
+        return_type: TypeSymbol::Special(SpecialType::Void),
+        parameters: Vec::new(),
+        parameter_info: Vec::new(),
+        is_static: false,
+        is_params: false,
+        is_vararg: false,
+        is_virtual: false,
+        is_abstract: false,
+        is_override: false,
+        is_sealed: false,
+        accessibility: Accessibility::Public,
+        conditional: Vec::new(),
+        sets_required_members: false,
+        type_parameters: Vec::new(),
+        type_parameter_constraints: Vec::new(),
+    }
+}
+
 impl Model {
     /// An empty model.
     #[must_use]
@@ -760,6 +897,30 @@ impl Model {
     pub fn insert(&mut self, info: TypeInfo) {
         let key = (String::from(&*info.namespace), String::from(&*info.name));
         self.types.insert(key, info);
+    }
+
+    /// Adds a type, MERGING it into an earlier declaration of the same name when either carries
+    /// `partial` (17.1.4) -- the parts of one type, possibly in different files.
+    ///
+    /// **THE REPLACE ARM IS THE OLD BEHAVIOR AND HAS TO STAY**: an ordinary duplicate type is
+    /// CS0101 and every model built before partial types existed replaced on collision. Merging
+    /// one would change what an erroneous program's members resolve to, which is a diagnostic
+    /// difference in programs this compiler already refuses.
+    ///
+    /// An EXTERNAL type is never merged into: a reference assembly's type and a source type of the
+    /// same name are two types, and this compilation declares only one of them.
+    pub fn insert_or_merge(&mut self, info: TypeInfo) {
+        let key = (String::from(&*info.namespace), String::from(&*info.name));
+        match self.types.get_mut(&key) {
+            Some(existing)
+                if !existing.is_external && !info.is_external && (existing.is_partial || info.is_partial) =>
+            {
+                existing.merge_part(info);
+            }
+            _ => {
+                self.types.insert(key, info);
+            }
+        }
     }
 
     /// The type with the given namespace and name, if present.
@@ -1013,7 +1174,23 @@ impl Model {
     /// type exists, or the simple name is ambiguous -- base names are not yet resolved
     /// through `using` directives, so this stands in for that for a BCL base.
     fn resolve_base_of_kind(&self, base: &TypeSymbol, kind: TypeKind) -> Option<TypeSymbol> {
-        if self.get_by_symbol(base).is_some_and(|info| info.kind == kind) {
+        self.resolve_base_matching(base, |info| info.kind == kind)
+    }
+
+    /// Resolves a written base to a type in the model that satisfies `wanted`.
+    ///
+    /// **THE PREDICATE IS A PARAMETER BECAUSE THE QUESTION IS NOT ALWAYS ABOUT KIND.** The
+    /// kind-filtered forms below answer "which class / struct / interface is this", but CS0509 asks
+    /// about SEALEDNESS, and asking it through a kind filter is how `class D : SomeEnum { }` came to
+    /// have no candidate at all: an enum base is neither a class nor a struct, so the lookup
+    /// returned nothing and the rule never ran on a type that is sealed in every sense the language
+    /// has. A delegate base was invisible the same way.
+    fn resolve_base_matching(
+        &self,
+        base: &TypeSymbol,
+        wanted: impl Fn(&TypeInfo) -> bool,
+    ) -> Option<TypeSymbol> {
+        if self.get_by_symbol(base).is_some_and(|info| wanted(&info)) {
             return Some(base.clone());
         }
         let TypeSymbol::Named(parts) = base else {
@@ -1025,7 +1202,7 @@ impl Model {
         let simple = &*parts[0];
         let mut found: Option<TypeSymbol> = None;
         for ((namespace, name), info) in &self.types {
-            if &**name == simple && info.kind == kind {
+            if &**name == simple && wanted(info) {
                 if found.is_some() {
                     return None;
                 }
@@ -1035,16 +1212,19 @@ impl Model {
         found
     }
 
+    /// Resolves a written base to a SEALED type of any kind, for the CS0509 check.
+    ///
+    /// A sealed type is never a legal base, so this exists to NAME one in a diagnostic -- which the
+    /// class-only lookup cannot do, because a class is exactly the kind that usually IS legal. It
+    /// covers a struct, an enum, a delegate and a `sealed class` alike; all four are sealed, and
+    /// deriving from any of them is CS0509.
+    pub fn resolve_sealed_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
+        self.resolve_base_matching(base, |info| info.is_sealed)
+    }
+
     /// Resolves a written base to a class in the model -- the inheritance-chain base.
     pub fn resolve_class_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
         self.resolve_base_of_kind(base, TypeKind::Class)
-    }
-
-    /// Resolves a written base to a STRUCT in the model. A struct is never a legal base -- it is
-    /// implicitly sealed -- so this exists to NAME one in a diagnostic, which the class-only
-    /// lookup cannot do.
-    pub fn resolve_struct_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
-        self.resolve_base_of_kind(base, TypeKind::Struct)
     }
 
     /// Resolves a written base to an interface in the model -- the `InterfaceImpl` source
@@ -1090,6 +1270,14 @@ impl Model {
             .map(|(namespace, name)| (namespace.as_ref(), name.as_ref()))
     }
 
+    /// The type `(namespace, name)`, mutably -- for the signature-qualification pass, which
+    /// computes a declaration's qualified signature types under its own scope and writes them
+    /// back. `None` if the model holds no such type.
+    pub(crate) fn info_mut(&mut self, namespace: &str, name: &str) -> Option<&mut TypeInfo> {
+        self.types
+            .get_mut(&(String::from(namespace), String::from(name)))
+    }
+
     /// Marks the type `(namespace, name)` as nested in `enclosing` (its full name).
     pub fn set_enclosing(&mut self, namespace: &str, name: &str, enclosing: &str) {
         if let Some(info) = self
@@ -1099,6 +1287,82 @@ impl Model {
             info.enclosing = Some(enclosing.into());
         }
     }
+
+    /// Gives every NESTED type the type parameters of the types it is nested in, ahead of its own.
+    ///
+    /// **A NESTED TYPE HAS THE TYPE PARAMETERS OF EVERY TYPE IT IS NESTED IN (ECMA-335 II.9.2).**
+    /// `Cursor` inside `Box<T>` is a generic type of arity 1 whose parameter is `T`, and a
+    /// `Pair<U>` inside it has two, `T` then `U` -- enclosing first, its own after, which is the
+    /// order the GenericParam rows are numbered in and therefore the order every `!n` in a
+    /// signature counts from.
+    ///
+    /// A type READ from metadata already arrives this way, its GenericParam rows carrying the
+    /// redeclared parameters, so without this the two halves of the model disagree about one
+    /// language rule: an imported `List<T>.Enumerator` had a parameter and a declared
+    /// `Box<T>.Cursor` had none.
+    ///
+    /// **A POST-PASS, NOT A STEP OF COLLECTION, BECAUSE COLLECTION ORDER CANNOT SUPPLY IT.** A
+    /// nested type is inserted -- and its own nested types with it -- before its enclosing type is
+    /// marked as enclosing anything, so a type two deep read its parent's parameters while the
+    /// parent still had none. Measured: `Box<T>.Ring.Hub` came out at arity 0 while the emitter
+    /// gave it 1, and the two disagreeing halves produced an image that failed to verify.
+    ///
+    /// **IDEMPOTENT, AND DELIBERATELY SO**: it is called once per collected compilation and a
+    /// model may be collected into more than once. Each type's OWN parameters are the last
+    /// `mangled_arity(name)` of its current list (II.10.7.2 -- the name carries the arity the type
+    /// introduces itself), so the answer is rebuilt from the nesting structure rather than
+    /// accumulated, and a second call reproduces the first one's result.
+    ///
+    /// EXTERNAL types are left alone: one read from metadata already arrives with its GenericParam
+    /// rows carrying the redeclared parameters, and its enclosing type may not be in the model at
+    /// all -- rebuilding its list from a chain that cannot be walked would TRUNCATE it.
+    pub fn link_nested_type_parameters(&mut self) {
+        fn own(info: &TypeInfo) -> Vec<Box<str>> {
+            let arity = mangled_arity(&info.name);
+            let start = info.type_parameters.len().saturating_sub(arity);
+            info.type_parameters[start..].to_vec()
+        }
+        let mut rebuilt: Vec<((String, String), Vec<Box<str>>)> = Vec::new();
+        for (key, info) in &self.types {
+            if info.is_external || info.enclosing.is_none() {
+                continue;
+            }
+            let mut chain: Vec<Box<str>> = Vec::new();
+            let mut enclosing = info.enclosing.clone();
+            let mut seen: Vec<Box<str>> = Vec::new();
+            while let Some(full) = enclosing {
+                if seen.contains(&full) {
+                    break;
+                }
+                seen.push(full.clone());
+                let (namespace, name) = match full.rsplit_once('.') {
+                    Some((namespace, name)) => (namespace, name),
+                    None => ("", &*full),
+                };
+                let Some(outer) = self
+                    .types
+                    .get(&(String::from(namespace), String::from(name)))
+                else {
+                    break;
+                };
+                let mut outward = own(outer);
+                outward.extend(chain);
+                chain = outward;
+                enclosing = outer.enclosing.clone();
+            }
+            let mut parameters = chain;
+            parameters.extend(own(info));
+            if parameters != info.type_parameters {
+                rebuilt.push((key.clone(), parameters));
+            }
+        }
+        for (key, parameters) in rebuilt {
+            if let Some(info) = self.types.get_mut(&key) {
+                info.type_parameters = parameters;
+            }
+        }
+    }
+
 
     /// The symbol of the model type with the given simple name, when exactly one matches
     /// (a stand-in for `using`-directive resolution -- used by completion to resolve a
@@ -1117,46 +1381,12 @@ impl Model {
         found
     }
 
-    /// Rewrites every member signature's single-part named types to their canonical
-    /// fully-qualified form, so a type written `WeakReference` (resolved through a `using`)
-    /// is the SAME [`TypeSymbol`] as `System.WeakReference` -- one type, as conversions,
-    /// overload resolution, and identity all require. Source signatures arrive unqualified
-    /// (collected structurally by `bind_type`); reference signatures are already canonical, so
-    /// this is a no-op for them. Only UNAMBIGUOUS simple names are rewritten: a name declared in
-    /// two namespaces is left untouched for the using-aware use-site resolver. Run on the
-    /// complete model (references + source) before `link_bases`, so the base chain links canonical.
-    pub fn canonicalize_signatures(&mut self) {
-        let canon = self.signature_canon();
-        for info in self.types.values_mut() {
-            for base in &mut info.bases {
-                *base = canon.canonicalize(base);
-            }
-            for field in &mut info.fields {
-                field.ty = canon.canonicalize(&field.ty);
-            }
-            for property in &mut info.properties {
-                property.ty = canon.canonicalize(&property.ty);
-            }
-            for event in &mut info.events {
-                event.ty = canon.canonicalize(&event.ty);
-            }
-            for method in &mut info.methods {
-                method.return_type = canon.canonicalize(&method.return_type);
-                for parameter in &mut method.parameters {
-                    *parameter = canon.canonicalize(parameter);
-                }
-            }
-            for constructor in &mut info.constructors {
-                for parameter in &mut constructor.parameters {
-                    *parameter = canon.canonicalize(parameter);
-                }
-            }
-        }
-    }
-
     /// The unambiguous simple-name -> full-symbol canon over every known type (references plus
-    /// source), reusable for canonicalizing single-part signature names without rebuilding the
-    /// map. See [`SignatureCanon`]; this is the map [`canonicalize_signatures`] applies.
+    /// source). A BELT for consumers with no scope in reach (the emitter's token table keeps
+    /// one): symbols formed through the scoped qualification pass arrive fully qualified and
+    /// pass through it unchanged, and a name declared in two namespaces maps to `None` -- this
+    /// map can no longer be the DECIDER, because world-uniqueness answers the wrong type the
+    /// moment scope and the world disagree (#52). See [`SignatureCanon`].
     #[must_use]
     pub fn signature_canon(&self) -> SignatureCanon {
         let mut map: BTreeMap<String, Option<TypeSymbol>> = BTreeMap::new();
@@ -1257,21 +1487,35 @@ impl SignatureCanon {
 /// The mangling is applied for the LOOKUP and undone for the RESULT, deliberately: every consumer
 /// of a definition re-mangles from the argument count (`Model::get_by_symbol`, the emitter's token
 /// keys), so returning the mangled form would mangle it twice and resolve to nothing.
+///
+/// **A NESTED DEFINITION IS QUALIFIED BY ITS ROOT INSTEAD**, because a nested type is keyed under
+/// its enclosing type's FULL NAME rather than under a namespace, so no scope holds `Enumerator`
+/// and the only part `lookup` can answer for is the `` List`1 `` in front of it. The arity there is
+/// already mangled in -- it came from the written argument list -- so nothing is re-derived.
 pub(crate) fn canonical_definition(
     definition: &[Box<str>],
     arity: usize,
     lookup: impl Fn(&str) -> Option<TypeSymbol>,
 ) -> Box<[Box<str>]> {
-    let [only] = definition else {
+    let Some((last, leading)) = definition.split_last() else {
         return definition.into();
     };
+    if let [root, between @ ..] = leading {
+        let Some(TypeSymbol::Named(qualified)) = lookup(root) else {
+            return definition.into();
+        };
+        let mut parts: Vec<Box<str>> = qualified.to_vec();
+        parts.extend(between.iter().cloned());
+        parts.push(last.clone());
+        return parts.into();
+    }
     let Some(TypeSymbol::Named(qualified)) = lookup(&definition_metadata_name(definition, arity))
     else {
         return definition.into();
     };
     let mut parts: Vec<Box<str>> = qualified.to_vec();
-    if let Some(last) = parts.last_mut() {
-        *last = only.clone();
+    if let Some(qualified_last) = parts.last_mut() {
+        *qualified_last = last.clone();
     }
     parts.into()
 }
@@ -1325,6 +1569,43 @@ fn symbol_from_key(namespace: &str, name: &str) -> TypeSymbol {
 mod tests {
     use super::*;
     use crate::special::SpecialType;
+
+    /// A NESTED definition is qualified BY ITS ROOT, because the root is the only part a scope can
+    /// hold: `Enumerator` is keyed under `` List`1 ``'s full name and under no namespace at all.
+    ///
+    /// **THE ROWS THAT DISCRIMINATE ARE THE LAST TWO.** A definition whose leading part names
+    /// nothing in scope must be returned UNTOUCHED -- an already-qualified name, or one led by a
+    /// namespace -- because qualifying it a second time is the failure this arm can produce.
+    #[test]
+    fn a_nested_definition_is_qualified_by_its_root() {
+        let parts = |dotted: &str| -> Vec<Box<str>> { dotted.split('.').map(Box::from).collect() };
+        let scope = |name: &str| -> Option<TypeSymbol> {
+            match name {
+                "List`1" => Some(TypeSymbol::Named(
+                    parts("System.Collections.Generic.List`1").into(),
+                )),
+                "Box`1" => Some(TypeSymbol::Named(parts("App.Box`1").into())),
+                _ => None,
+            }
+        };
+        let canon = |dotted: &str, arity: usize| -> Vec<String> {
+            canonical_definition(&parts(dotted), arity, scope)
+                .iter()
+                .map(|part| part.to_string())
+                .collect()
+        };
+        assert_eq!(
+            canon("List`1.Enumerator", 1),
+            ["System", "Collections", "Generic", "List`1", "Enumerator"]
+        );
+        assert_eq!(canon("Box`1.Ring.Hub", 1), ["App", "Box`1", "Ring", "Hub"]);
+        assert_eq!(canon("Box", 1), ["App", "Box"]);
+        assert_eq!(
+            canon("System.Collections.Generic.List`1.Enumerator", 1),
+            ["System", "Collections", "Generic", "List`1", "Enumerator"]
+        );
+        assert_eq!(canon("Unknown`1.Inner", 1), ["Unknown`1", "Inner"]);
+    }
 
     #[test]
     fn a_definition_is_mangled_with_the_arity_it_declares_not_its_instantiation_s() {

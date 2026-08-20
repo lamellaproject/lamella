@@ -738,6 +738,18 @@ pub struct Module {
     /// `TypeDef` token (its `Type` handle), so `Object.GetType()` on a reference instance can
     /// hand back the same handle `typeof` / `Type.Name` use.
     type_handles: BTreeMap<TypeId, u64>,
+    /// For each `System.Nullable<T>` instantiation, the asm-folded handle of its UNDERLYING type
+    /// `T`, keyed by the instantiation's own [`TypeId`]. Empty for every other type, and for a
+    /// module whose program names no nullable at all.
+    ///
+    /// ECMA-335 4th ed special-cases `System.Nullable<T>` in the instruction set -- `box` (III.4.1)
+    /// yields a NULL REFERENCE or a boxed **T** rather than a boxed `Nullable<T>`, `unbox` /
+    /// `unbox.any` (III.4.32, III.4.33) recover one FROM a boxed T, and `castclass` / `isinst`
+    /// (III.4.3, III.4.6) succeed when the operand is a boxed T. Every one of those arms needs the
+    /// same two facts: is this type a nullable, and what is `T`. This answers both at once, and the
+    /// `Some` is the "is a nullable" half.
+    ///
+    nullable_underlying: BTreeMap<TypeId, u64>,
     /// A `callvirt` token mapped to its target's `(signature key, arg count)`, for
     /// dispatching interface / abstract methods whose target has no vtable slot (and
     /// may have no resolvable body).
@@ -1330,6 +1342,9 @@ struct FrozenTables {
     method_attrs: SortedTokenTable,
     /// The frozen `member_type_handle` (member handle -> its type's handle, split u32s).
     member_type_handle: SortedWideTable,
+    /// The frozen `nullable_underlying` (a `Nullable<T>` instantiation's [`TypeId`], widened to a
+    /// `u64` key -> `T`'s asm-folded handle, split u32s).
+    nullable_underlying: SortedWideTable,
     /// The frozen `reflect_types` (type handle -> namespace/full-name ids, `Is*` flag bits,
     /// base handle), 28-byte records.
     reflect_types: SortedReflectTable,
@@ -2056,6 +2071,7 @@ impl FrozenTables {
         pair(out, self.assembly_names.offset, self.assembly_names.entries);
         pair(out, self.assembly_types.offset, self.assembly_types.entries);
         pair(out, self.enum_constants.offset, self.enum_constants.entries);
+        pair(out, self.nullable_underlying.offset, self.nullable_underlying.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
@@ -2151,6 +2167,15 @@ impl FrozenTables {
         sorted!(assembly_names, SortedTokenTable);
         sorted!(assembly_types, SortedWideTable);
         sorted!(enum_constants, SortedWideTable);
+
+        macro_rules! trailing {
+            ($field:ident, $kind:ident) => {
+                if let Some((offset, entries)) = pair(bytes) {
+                    frozen.$field = $kind { offset, entries };
+                }
+            };
+        }
+        trailing!(nullable_underlying, SortedWideTable);
         Some((frozen, cursor))
     }
 }
@@ -3095,6 +3120,17 @@ impl Module {
                     .map(|(key, handle)| (key, (handle >> 32) as u32, handle as u32)),
             );
             frozen.member_type_handle = SortedWideTable::write(arena, records);
+        }
+        if !self.nullable_underlying.is_empty() {
+            let mut records = frozen.nullable_underlying.entries_of(arena);
+            records.extend(
+                core::mem::take(&mut self.nullable_underlying)
+                    .into_iter()
+                    .map(|(type_id, handle)| {
+                        (u64::from(type_id), (handle >> 32) as u32, handle as u32)
+                    }),
+            );
+            frozen.nullable_underlying = SortedWideTable::write(arena, records);
         }
         frozen.catch_type_tags = drain(arena, frozen.catch_type_tags, &mut self.catch_type_tags, |tag| {
             tag
@@ -4214,6 +4250,7 @@ impl Module {
         });
         self.by_token = by_token_after;
         self.type_handles.retain(|id, _| type_kept(id));
+        self.nullable_underlying.retain(|id, _| type_kept(id));
     }
 
     /// A rough per-structure breakdown of the module's resident heap (content + per-entry header
@@ -4295,6 +4332,7 @@ impl Module {
             + self.static_fields.len()
             + self.type_tokens.len()
             + self.type_handles.len()
+            + self.nullable_underlying.len()
             + self.vararg_sites.len()
             + self.explicit_overrides.len()
             + self.delegate_invokes.len()
@@ -4366,6 +4404,7 @@ impl Module {
             ("static_fields", self.static_fields.len()),
             ("type_tokens", self.type_tokens.len()),
             ("type_handles", self.type_handles.len()),
+            ("nullable_underlying", self.nullable_underlying.len()),
             ("vararg_sites", self.vararg_sites.len()),
             ("explicit_overrides", self.explicit_overrides.len()),
             ("delegate_invokes", self.delegate_invokes.len()),
@@ -5275,6 +5314,52 @@ impl Module {
         }
     }
 
+    /// Whether `type_id` is a value type (a struct / primitive / enum), as recorded at load.
+    ///
+    /// [`Module::method_declares_value_type`] asks the same question of a METHOD's declaring type
+    /// and is the older caller; this is the direct form, for a token whose type is in hand.
+    #[must_use]
+    pub fn type_is_value_type(&self, type_id: TypeId) -> bool {
+        #[cfg(feature = "code-in-place")]
+        if self.baked.is_some() {
+            return self
+                .baked_type_record(type_id)
+                .is_some_and(|(_, flags, _, _)| flags & 1 != 0);
+        }
+        self.types
+            .get(type_id as usize)
+            .is_some_and(|info| info.value_type)
+    }
+
+    /// The zero value of the PRIMITIVE `type_id` is, if a corlib registered that type for a
+    /// [`Value`] kind.
+    ///
+    /// The inverse of [`Module::primitive_type_token`], over the same four recorded tokens. Only
+    /// the kinds whose zero DIFFERS need an entry: `bool`, `char`, `byte` and `short` all load as
+    /// `Value::Int32`, so a primitive this cannot name still takes the `Int32` zero its caller
+    /// falls back to.
+    ///
+    #[must_use]
+    pub fn primitive_zero_of_type(&self, type_id: TypeId) -> Option<Value> {
+        let is = |token: Option<u64>| {
+            token.and_then(|handle| self.type_id_by_handle(handle)) == Some(type_id)
+        };
+        if is(self.primitive_int64_token) {
+            return Some(Value::Int64(0));
+        }
+        if is(self.primitive_native_int_token) {
+            return Some(Value::NativeInt(0));
+        }
+        #[cfg(feature = "float")]
+        if is(self.primitive_float_token) {
+            return Some(Value::Float(0.0));
+        }
+        if is(self.primitive_int32_token) {
+            return Some(Value::Int32(0));
+        }
+        None
+    }
+
     /// Whether `method`'s declaring type is a value type. A `callvirt` that resolves to such a
     /// method on a boxed receiver must hand `this` as a managed pointer into the box (III.4.2),
     /// not the box reference itself, so the body's `ldarg.0; ldind.*` reads the boxed value.
@@ -5335,6 +5420,31 @@ impl Module {
     #[must_use]
     pub fn type_handle_of(&self, type_id: TypeId) -> Option<u64> {
         self.frozen.type_handles.get(&self.arena, type_id).or_else(|| self.type_handles.get(&type_id).copied())
+    }
+
+    /// Records that `type_id` is an instantiation of `System.Nullable<T>` whose underlying type
+    /// `T` has the asm-folded handle `underlying`.
+    ///
+    /// Bound where the instantiation's identity is created, so every token that later names it --
+    /// a closed `TypeSpec` in a program, a synthetic token in a rewritten body -- reaches the same
+    /// answer through [`Module::type_id_of`].
+    pub fn bind_nullable_underlying(&mut self, type_id: TypeId, underlying: u64) {
+        self.nullable_underlying.insert(type_id, underlying);
+    }
+
+    /// The asm-folded handle of `T` when `type_id` is an instantiation of `System.Nullable<T>`,
+    /// else `None`.
+    ///
+    /// `Some` IS the "this type is a nullable" test, which is what the four instruction-set arms
+    /// that special-case one (III.4.1 `box`, III.4.3 `castclass`, III.4.6 `isinst`, III.4.32 /
+    /// III.4.33 `unbox` / `unbox.any`) ask first.
+    #[must_use]
+    pub fn nullable_underlying(&self, type_id: TypeId) -> Option<u64> {
+        self.frozen
+            .nullable_underlying
+            .get(&self.arena, u64::from(type_id))
+            .map(|(high, low)| (u64::from(high) << 32) | u64::from(low))
+            .or_else(|| self.nullable_underlying.get(&type_id).copied())
     }
 
     /// The [`TypeId`] a type token in assembly `asm` names, if it is a same-module type.

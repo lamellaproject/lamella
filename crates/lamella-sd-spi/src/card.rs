@@ -476,6 +476,29 @@ impl<B: SdSpiBus> SdCard<B> {
     /// Two ways to answer `false` and neither is a fault: the card has no `CMD6` at all, or it
     /// accepted the command and declined to switch.
     ///
+    /// # Expect `false` over SPI, and do not read it as a deficient card
+    ///
+    /// Measured on two SD cards fifteen years apart -- a 4 GB and a 32 GB UHS-I -- **both report
+    /// function group 1 support as `0x8001`, with the High Speed bit clear**, while answering the
+    /// command normally and reporting command class 10 present. The two agree to the byte.
+    ///
+    /// That matches how the wider ecosystem treats this bus. Two independent implementations that
+    /// are not derived from each other -- Apache NuttX's MMC/SD SPI driver, and ChaN's long-standing
+    /// MMC-over-SPI write-up -- **do not issue `CMD6` in SPI mode at all**; both take the clock
+    /// ceiling from the CSD's `TRAN_SPEED` and clip it to what the host can drive, and ChaN's states
+    /// plainly that a card in SPI mode works up to 20/25 MHz. The High Speed access mode belongs to
+    /// the SD bus rather than to SPI.
+    ///
+    /// So a host on SPI should plan around `TRAN_SPEED` as a real ceiling and treat a successful
+    /// switch as a bonus, not as the path to 50 MHz. Getting past that ceiling on a board means the
+    /// native SD controller and its wider bus, which is a different peripheral rather than a faster
+    /// setting of this one.
+    ///
+    /// This is stated as the weight of the available evidence and not as a certainty: the two
+    /// sources agree and the measurements agree with them, but neither source says the switch is
+    /// FORBIDDEN over SPI, and the specification has not been consulted to confirm it. Keeping the
+    /// call here costs one command and is what makes a card that does grant it observable.
+    ///
     /// The result nibble is the only gate on the outcome, and reading it is not optional. Mode 1
     /// against an unsupported function is legal and harmless: the card answers OK, writes
     /// [`switch::NO_INFLUENCE`] and stays where it was. A driver that took the OK for the answer

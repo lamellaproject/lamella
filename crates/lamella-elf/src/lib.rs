@@ -1001,6 +1001,119 @@ pub enum ElfError {
     NotArchive,
     /// A malformed archive member header (bad terminator, a non-decimal size, a dangling long name).
     BadArchive,
+    /// Not an ELF32, little-endian EXECUTABLE (`ET_EXEC`) -- [`flat_image`] was handed something
+    /// else, most often a relocatable object that has not been linked yet.
+    NotExecutableElf32,
+    /// The executable declares no loadable bytes: either no `PT_LOAD` segment at all, or only
+    /// segments whose file size is zero. See [`flat_image`] for why this is an error.
+    NoLoadableContent,
+}
+
+/// A linked executable flattened into the bytes a flasher writes, and the address they go at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatImage {
+    /// The lowest physical address any loadable segment claims -- where the image begins in the
+    /// part's address space.
+    pub base: u32,
+    /// The image itself. Gaps between segments are zero-filled, so the bytes are contiguous from
+    /// [`FlatImage::base`] and can be written in one pass.
+    pub bytes: Vec<u8>,
+}
+
+/// Flatten a linked ELF32 executable into the image a flasher writes to the part.
+///
+/// This is what `objcopy -O binary` produces, computed in-tree so that turning a build into a
+/// flashable file needs no external toolchain. Segments are taken by PHYSICAL address (`p_paddr`),
+/// which is the one that matters on a microcontroller: a part whose initialized data is copied
+/// from flash to RAM at startup declares a virtual address in RAM and a physical address in flash,
+/// and it is the flash address the programmer needs.
+///
+/// # Why an empty image is an error
+///
+/// A link that produces no loadable content does not report itself as a failure -- the file is a
+/// valid ELF, and the tools that read it are happy. Flattening it silently yields zero bytes, and
+/// whatever consumes those bytes goes on to write a well-formed artifact that flashes nothing. So
+/// this refuses with [`ElfError::NoLoadableContent`] rather than returning an empty image.
+///
+/// # Examples
+///
+/// ```
+/// # use lamella_elf::{flat_image, write_executable_arm_thumb};
+/// let elf = write_executable_arm_thumb(&[0x00, 0xBF, 0x00, 0xBF], 0, 0x1000);
+/// let image = flat_image(&elf).unwrap();
+/// assert_eq!(image.base, 0x1000);
+/// assert!(image.bytes.ends_with(&[0x00, 0xBF, 0x00, 0xBF]));
+/// ```
+pub fn flat_image(bytes: &[u8]) -> Result<FlatImage, ElfError> {
+    const PT_LOAD: u32 = 1;
+    const ET_EXEC: u16 = 2;
+    const PHDR_SIZE: usize = 32;
+
+    let u16_at = |o: usize| -> Result<u16, ElfError> {
+        bytes
+            .get(o..o + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or(ElfError::Truncated)
+    };
+    let u32_at = |o: usize| -> Result<u32, ElfError> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or(ElfError::Truncated)
+    };
+
+    if bytes.len() < EHDR_SIZE as usize
+        || bytes[..4] != [0x7F, b'E', b'L', b'F']
+        || bytes[4] != 1
+        || bytes[5] != 1
+        || u16_at(16)? != ET_EXEC
+    {
+        return Err(ElfError::NotExecutableElf32);
+    }
+
+    let phoff = u32_at(28)? as usize;
+    let phentsize = u16_at(42)? as usize;
+    let phnum = u16_at(44)? as usize;
+    if phentsize < PHDR_SIZE {
+        return Err(ElfError::Truncated);
+    }
+
+    let mut loads: Vec<(u32, &[u8])> = Vec::new();
+    for i in 0..phnum {
+        let p = phoff + i * phentsize;
+        if u32_at(p)? != PT_LOAD {
+            continue;
+        }
+        let offset = u32_at(p + 4)? as usize;
+        let paddr = u32_at(p + 12)?;
+        let filesz = u32_at(p + 16)? as usize;
+        if filesz == 0 {
+            continue;
+        }
+        let data = bytes
+            .get(offset..offset + filesz)
+            .ok_or(ElfError::Truncated)?;
+        loads.push((paddr, data));
+    }
+    if loads.is_empty() {
+        return Err(ElfError::NoLoadableContent);
+    }
+
+    let base = loads.iter().map(|(a, _)| *a).min().expect("non-empty");
+    let end = loads
+        .iter()
+        .map(|(a, d)| u64::from(*a) + d.len() as u64)
+        .max()
+        .expect("non-empty");
+    let span = usize::try_from(end - u64::from(base)).map_err(|_| ElfError::Truncated)?;
+
+    let mut out = Vec::new();
+    out.resize(span, 0u8);
+    for (paddr, data) in loads {
+        let at = (paddr - base) as usize;
+        out[at..at + data.len()].copy_from_slice(data);
+    }
+    Ok(FlatImage { base, bytes: out })
 }
 
 /// A symbol parsed from an object's `.symtab`.

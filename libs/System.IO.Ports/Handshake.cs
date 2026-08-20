@@ -1,5 +1,5 @@
-// Lamella managed corlib (from scratch). -- System.IO.Ports.Handshake
-#if LAMELLA_SURFACE_SERIAL
+// System.IO.Ports (libs/, real .NET's own assembly name) -- System.IO.Ports.Handshake
+#if LAMELLA_SURFACE_SERIAL && LAMELLA_SURFACE_NETFX_2_0
 namespace System.IO.Ports
 {
     public enum Handshake

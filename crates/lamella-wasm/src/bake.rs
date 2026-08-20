@@ -1,7 +1,7 @@
 //! In-page BAKING (feature `bake`): a wasm ABI over the loader's `write_baked`, so the browser IDE
 //! (Studio) turns a compiled app plus its assemblies into a self-contained `.lmli` flash image
 //! client-side -- the deploy half of the browser hardware story (compile in-page -> bake in-page ->
-//! deploy over WebSerial). It mirrors the host `bake-library-image` example: load (unfrozen) ->
+//! deploy over WebSerial). It mirrors the host library-image bake: load (unfrozen) ->
 //! optionally trim to the reachable set -> validate the capability profile -> `write_baked`.
 
 #![allow(unsafe_code)]

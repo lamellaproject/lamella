@@ -18,7 +18,7 @@ macro_rules! entry {
 
 /// Every intrinsic this build compiles, as `(stable id, function)`.
 static REGISTRY: &[(u32, IntrinsicFn)] = &[
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(activator_create_instance),
     #[cfg(feature = "varargs")]
     entry!(arg_iterator_cookie),
@@ -33,11 +33,11 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(array_get_value),
     entry!(array_rank),
     entry!(array_set_value),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(assembly_full_name),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(assembly_get_type),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(assembly_get_types),
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
@@ -56,28 +56,28 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(boolean_to_string),
     entry!(buffer_block_copy),
     entry!(buffer_byte_length),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_is_digit),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_is_letter),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_is_letter_or_digit),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_is_lower),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_is_upper),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_is_white_space),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_to_lower),
     entry!(char_to_string),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(char_to_upper),
     entry!(clock_is_set),
     entry!(clock_set_ticks),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(collection_contains),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(collection_push),
     entry!(console_write),
     entry!(console_write_bool),
@@ -103,7 +103,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(console_write_line_uint64),
     #[cfg(feature = "float")]
     entry!(console_write_single),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(constructor_invoke),
     #[cfg(feature = "NETMFv4_4")]
     entry!(convert_to_boolean_int),
@@ -159,15 +159,15 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(exception_ctor),
     entry!(exception_get_message),
     entry!(exception_runtime_message),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(field_get_raw_constant),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(field_get_value),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(field_is_literal),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(field_is_static),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(field_set_value),
     entry!(fs_close),
     entry!(fs_create_dir),
@@ -197,31 +197,31 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(interlocked_compare_exchange),
     entry!(intptr_from_raw_value),
     entry!(intptr_to_raw_value),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(list_add),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(list_clear),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(list_get_count),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(list_get_item),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(list_insert),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(list_remove_at),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(list_set_item),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(map_add),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(map_contains),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(map_get_count),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(map_get_item),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(map_remove),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(map_set_item),
     entry!(marshal_alloc_hglobal),
     entry!(marshal_free_hglobal),
@@ -330,7 +330,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(md_array_get_length),
     entry!(md_array_length),
     entry!(md_array_set),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(member_get_type),
     entry!(mmio_read32),
     entry!(mmio_write32),
@@ -338,25 +338,25 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(mmio_write8),
     entry!(mmio_read16),
     entry!(mmio_write16),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_invoke),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_is_abstract),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_is_final),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_is_public),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_is_static),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_is_virtual),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_parameter_count),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_parameter_custom_attributes),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_parameter_name),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(method_parameter_type),
     entry!(monitor_enter),
     entry!(monitor_exit),
@@ -379,13 +379,13 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(object_get_type),
     entry!(object_reference_equals),
     entry!(object_to_string),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(queue_dequeue),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(queue_peek),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(reflect_handle_equals),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(reflect_handle_not_equals),
     #[cfg(feature = "finalizers")]
     entry!(reregister_finalize),
@@ -418,9 +418,9 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(socket_udp_bind),
     entry!(socket_udp_recv_from),
     entry!(socket_udp_send_to),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(stack_peek),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "collections")]
     entry!(stack_pop),
     entry!(storage_is_mounted),
     entry!(storage_mount_ram),
@@ -437,51 +437,51 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(string_ctor_char_ptr),
     entry!(string_ctor_char_ptr_range),
     entry!(string_ctor_char_repeat),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_contains),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_ends_with),
     entry!(string_equals),
     entry!(string_get_chars),
     entry!(string_get_length),
     entry!(string_get_pinnable_reference),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_index_of_char),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_index_of_string),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_insert),
     entry!(string_intern),
     entry!(string_is_interned),
     entry!(string_is_null_or_empty),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_join),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_last_index_of_char),
     entry!(string_not_equals),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_pad_left),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_pad_right),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_remove),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_replace_char),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_replace_string),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_split_char),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_starts_with),
     entry!(string_substring),
     entry!(string_substring_len),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_to_char_array),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_to_lower),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_to_upper),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "text")]
     entry!(string_trim),
     #[cfg(feature = "finalizers")]
     entry!(suppress_finalize),
@@ -511,39 +511,39 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(tls_write_plain),
     entry!(tls_write_tls),
     entry!(type_from_handle),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_get_assembly),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_get_base_type),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_get_constructor),
     entry!(type_get_field),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_get_fields),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_get_full_name),
     entry!(type_get_method),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_get_methods),
     entry!(type_get_name),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_get_namespace),
     entry!(type_get_property),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_abstract),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_array),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_class),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_enum),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_interface),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_not_public),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_public),
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     entry!(type_is_value_type),
     entry!(type_property_custom_attributes),
     #[cfg(feature = "finalizers")]

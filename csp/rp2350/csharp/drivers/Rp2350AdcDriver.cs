@@ -1,6 +1,5 @@
 // A Lamella.Hardware.AdcDriver for the RP2350 on-chip SAR ADC, over Lamella.Hardware.Mmio --
 using System;
-using System.Device.Adc;
 using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;

@@ -30,8 +30,6 @@ pub enum LexErrorKind {
     /// profile excludes Annex B. Refusing is loud; accepting them would make `010` evaluate to
     /// 8 on a tier that claims not to implement the annex.
     LegacyOctal,
-    /// A code point the identifier tables cannot classify. See [`crate::unicode`].
-    UnsupportedIdentifierCharacter(char, &'static str),
     /// A `BigInt` literal, recognized and refused.
     BigIntNotInProfile,
 }
@@ -106,7 +104,7 @@ impl<'a> Lexer<'a> {
                 let (name, had_escape) = self.scan_identifier_name(start)?;
                 Ok(self.finish(TokenKind::PrivateName(name), start, saw_line_terminator, had_escape))
             }
-            _ if self.starts_identifier(ch)? => {
+            _ if self.starts_identifier(ch) => {
                 let (name, had_escape) = self.scan_identifier_name(start)?;
                 Ok(self.finish(TokenKind::Identifier(name), start, saw_line_terminator, had_escape))
             }
@@ -206,47 +204,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn starts_identifier(&self, ch: char) -> Result<bool, LexError> {
-        if ch == '\\' {
-            return Ok(true);
-        }
-        match unicode::is_id_start(ch) {
-            Ok(answer) => Ok(answer),
-            Err(unsupported) => Err(LexError {
-                kind: LexErrorKind::UnsupportedIdentifierCharacter(
-                    unsupported.code_point,
-                    unsupported.reason,
-                ),
-                span: Span::new(self.cursor.offset(), self.identifier_run_end()),
-            }),
-        }
-    }
-
-    /// Where the identifier-shaped run at the cursor ends.
-    ///
-    /// # WARNING: A REFUSAL MUST COVER ITS WHOLE CONSTRUCT, EVEN WHEN IT CANNOT UNDERSTAND IT
-    ///
-    /// A non-ASCII identifier refusal that spans the ONE code point it cannot classify lets
-    /// recovery resume on the second character of the same identifier and refuse again, and again
-    /// -- one published absence arriving as a stream of them, and a report grouped by kind showing
-    /// a program riddled with lexical errors instead of one unsupported name.
-    ///
-    /// Identifier-shaped is deliberately generous here: anything that is not whitespace, a line
-    /// terminator, or ASCII punctuation. Which non-ASCII code points continue an identifier is
-    /// exactly what this engine cannot say -- that is the whole gap -- so the run is bounded by
-    /// what certainly does NOT.
-    fn identifier_run_end(&self) -> usize {
-        let mut probe = self.cursor;
-        while let Some(ch) = probe.peek() {
-            let ends_it = is_whitespace(ch)
-                || is_line_terminator(ch)
-                || (ch.is_ascii() && !ch.is_ascii_alphanumeric() && ch != '$' && ch != '_');
-            if ends_it {
-                break;
-            }
-            probe.next();
-        }
-        probe.offset()
+    fn starts_identifier(&self, ch: char) -> bool {
+        ch == '\\' || unicode::is_id_start(ch)
     }
 
     /// Scans an `IdentifierName`, returning its value and whether any escape was used.
@@ -271,25 +230,13 @@ impl<'a> Lexer<'a> {
                 } else {
                     unicode::is_id_continue(decoded)
                 };
-                match ok {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(LexError {
-                            kind: LexErrorKind::InvalidEscape(
-                                "a \\u escape in an identifier must denote an identifier character",
-                            ),
-                            span: Span::new(escape_start, self.cursor.offset()),
-                        })
-                    }
-                    Err(unsupported) => {
-                        return Err(LexError {
-                            kind: LexErrorKind::UnsupportedIdentifierCharacter(
-                                unsupported.code_point,
-                                unsupported.reason,
-                            ),
-                            span: Span::new(escape_start, self.cursor.offset()),
-                        })
-                    }
+                if !ok {
+                    return Err(LexError {
+                        kind: LexErrorKind::InvalidEscape(
+                            "a \\u escape in an identifier must denote an identifier character",
+                        ),
+                        span: Span::new(escape_start, self.cursor.offset()),
+                    });
                 }
                 name.push(decoded);
                 had_escape = true;
@@ -301,23 +248,12 @@ impl<'a> Lexer<'a> {
             } else {
                 unicode::is_id_continue(ch)
             };
-            match allowed {
-                Ok(true) => {
-                    name.push(ch);
-                    self.cursor.next();
-                    first = false;
-                }
-                Ok(false) => break,
-                Err(unsupported) => {
-                    return Err(LexError {
-                        kind: LexErrorKind::UnsupportedIdentifierCharacter(
-                            unsupported.code_point,
-                            unsupported.reason,
-                        ),
-                        span: Span::new(start, self.identifier_run_end()),
-                    })
-                }
+            if !allowed {
+                break;
             }
+            name.push(ch);
+            self.cursor.next();
+            first = false;
         }
         if name.is_empty() {
             return Err(LexError {
@@ -774,13 +710,10 @@ impl<'a> Lexer<'a> {
         self.cursor.next();
         let flags_start = self.cursor.offset();
         while let Some(ch) = self.cursor.peek() {
-            match unicode::is_id_continue(ch) {
-                Ok(true) => {
-                    self.cursor.next();
-                }
-                Ok(false) => break,
-                Err(_) => break,
+            if !unicode::is_id_continue(ch) {
+                break;
             }
+            self.cursor.next();
         }
         let flags = self.cursor.source()[flags_start..self.cursor.offset()].to_string();
         Ok((body, flags))
@@ -954,10 +887,7 @@ impl<'a> Lexer<'a> {
     /// the token stream silently splits into two valid tokens and a malformed program parses.
     fn reject_identifier_immediately_after(&mut self, start: usize) -> Result<(), LexError> {
         let Some(ch) = self.cursor.peek() else { return Ok(()) };
-        let offending = match unicode::is_id_start(ch) {
-            Ok(answer) => answer,
-            Err(_) => true,
-        };
+        let offending = unicode::is_id_start(ch);
         if offending || ch.is_ascii_digit() {
             return Err(LexError {
                 kind: LexErrorKind::InvalidNumber(

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Lamella's ahead-of-time backend driver: lowers the middle IR to target machine code."
+publish = false
 
 [dependencies]
 lamella-ir = { path = "../lamella-ir" }
@@ -24,6 +25,7 @@ lamella-token = { path = "../lamella-token" }
 lamella-elf = { path = "../lamella-elf" }
 
 [dev-dependencies]
+lamella-flash-format = { path = "../lamella-flash-format" }
 lamella-link = { path = "../lamella-link" }
 lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }

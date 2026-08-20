@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Lamella's typed middle IR (MIR): a CLI-typed basic-block control flow graph lowered to native targets."
+publish = false
 
 [lints]
 workspace = true

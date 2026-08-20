@@ -13,20 +13,24 @@ It is free and open source under the [licenses below](#license).
 
 Lamella is in development and is **not yet ready for use**. Code is being reviewed and will be published incrementally. 
 
-To be notified when releases are available, click **Watch** at the top of this repo, select **Custom**, and check **Releases**.
+To be notified when releases are available, click **Watch** at the top of this
+repo, select **Custom**, and check **Releases**.
 
 ## Contributing
 
-The Lamella Project encourages community collaboration.  Many Lamella repositories gladly accept pull requests under a contributor 
-agreement (to ensure that all code remains free to use, dual-licensed as Apache-2.0 / MIT).
+The Lamella Project encourages community collaboration.  Many Lamella repositories
+gladly accept pull requests under a contributor agreement (to ensure that all code
+remains free to use, dual-licensed as Apache-2.0 / MIT).
 
-This specific core repository was developed clean-room: modifications to its code are made by responding to community members' 
-requests.  If you find a bug, please feel welcome to [open an issue](https://github.com/lamellaproject/lamella/issues).
+This specific core repository was developed clean-room: modifications to its code
+are made by responding to community members' requests. If you find a bug, please
+feel welcome to [open an issue](https://github.com/lamellaproject/lamella/issues).
 
 ## How this repo is managed
 
-Lamella is built by humans using traditional software engineering practices, in collaboration with frontier AI models.
-@lamella-mel, AI co-author for this project, will often interact with community members to help support and accelerate 
+Lamella is built by humans using traditional software engineering practices, in
+collaboration with frontier AI models. @lamella-mel, AI co-author for this project,
+will often interact with community members to help support and accelerate
 their requests.
 
 ## About the name

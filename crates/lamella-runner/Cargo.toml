@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "The Lamella Link debug + REPL RUNNER core, shared by the host reference runner, the browser (wasm) runner, and the on-device firmware: run_program (load the managed corlib + run a program + capture its output) + the serve_one request handler + the host driver helpers, over the lamella-wire Transport seam. no_std + alloc so it rides onto a microcontroller."
+publish = false
 
 [dependencies]
 lamella-wire = { path = "../lamella-wire" }

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "A no-GC bump allocator for bare-metal Lamella targets (a #[global_allocator])."
+publish = false
 
 [lints]
 workspace = true

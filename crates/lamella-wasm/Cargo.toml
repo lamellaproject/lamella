@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Embedding the Lamella interpreter (WebAssembly and other hosts): run an assembly, capture its result."
 
 # cdylib produces the host-agnostic .wasm; rlib lets the core be used natively and tested.
+publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 

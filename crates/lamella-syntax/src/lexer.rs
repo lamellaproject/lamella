@@ -22,6 +22,26 @@ pub struct Tokenized {
     /// The preprocessor symbols defined by `#define` and not later `#undef`'d (9.5.3) -- the
     /// set a `[Conditional("X")]` call is checked against to decide inclusion (24.4.2).
     pub defined_symbols: BTreeSet<Box<str>>,
+    /// Every `#pragma warning disable|restore` in this file, in source order.
+    ///
+    /// **THE LEXER CANNOT APPLY THESE ITSELF, WHICH IS WHY THEY TRAVEL.** The warnings a pragma
+    /// suppresses are the BINDER's (`CS0169`, `CS0649`, ...), reported long after scanning, and
+    /// they are suppressed by POSITION rather than by file -- a `restore` half way down puts the
+    /// warning back for everything below it. So the directives ride out to the compilation, which
+    /// is the one place that has both the regions and the diagnostics.
+    pub pragma_warnings: Vec<PragmaWarning>,
+}
+
+/// One `#pragma warning disable|restore`, and the position it takes effect from (9.5.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PragmaWarning {
+    /// The offset the directive starts at; it governs everything from here to the next one.
+    pub position: u32,
+    /// `true` for `disable`, `false` for `restore`.
+    pub disable: bool,
+    /// The warning numbers named, or EMPTY for the bare form that means every warning -- which is
+    /// what `#pragma warning disable` with no list does, measured against csc.
+    pub codes: Vec<u16>,
 }
 
 /// Scans `source` into a complete [`Tokenized`] stream.
@@ -123,9 +143,11 @@ pub fn tokenize_with(source: &str, options: LexOptions) -> Tokenized {
         }
     }
     let defined_symbols = core::mem::take(&mut lexer.defined_symbols);
+    let pragma_warnings = core::mem::take(&mut lexer.pragma_warnings);
     Tokenized {
         tokens,
         defined_symbols,
+        pragma_warnings,
         diagnostics: lexer.into_diagnostics(),
     }
 }
@@ -150,6 +172,9 @@ pub struct Lexer<'a> {
     /// The conditional compilation symbols currently defined (9.5.1), as built up
     /// by `#define` and torn down by `#undef` while scanning.
     defined_symbols: BTreeSet<Box<str>>,
+    /// Every `#pragma warning disable|restore` seen in an INCLUDED region, in source order --
+    /// one inside a skipped `#if` never happened, exactly as a `#define` there never happened.
+    pragma_warnings: Vec<PragmaWarning>,
     /// The stack of open `#if`/`#region` constructs, innermost last (9.5.4). Its
     /// top decides whether source is currently being included or skipped.
     conditionals: Vec<Conditional>,
@@ -192,6 +217,7 @@ enum DirectiveKind {
     Warning,
     Region,
     EndRegion,
+    Pragma,
 }
 
 impl DirectiveKind {
@@ -209,6 +235,7 @@ impl DirectiveKind {
             "warning" => DirectiveKind::Warning,
             "region" => DirectiveKind::Region,
             "endregion" => DirectiveKind::EndRegion,
+            "pragma" => DirectiveKind::Pragma,
             _ => return None,
         })
     }
@@ -246,6 +273,7 @@ impl<'a> Lexer<'a> {
             line_start: true,
             seen_token: false,
             defined_symbols: BTreeSet::new(),
+            pragma_warnings: Vec::new(),
             conditionals: Vec::new(),
             options: LexOptions::default(),
         }
@@ -328,7 +356,8 @@ impl<'a> Lexer<'a> {
             self.seen_token = true;
         }
 
-        Token::new(kind, Span::new(start as u32, self.position as u32))
+        let verbatim = c == '@' && matches!(kind, TokenKind::Identifier(_));
+        Token::with_verbatim(kind, Span::new(start as u32, self.position as u32), verbatim)
     }
 
     /// Whether source at the current position is being included rather than
@@ -369,6 +398,7 @@ impl<'a> Lexer<'a> {
             Some(DirectiveKind::Error) => self.scan_error_or_warning(start, active, true),
             Some(DirectiveKind::Warning) => self.scan_error_or_warning(start, active, false),
             Some(DirectiveKind::Line) => self.scan_line(start),
+            Some(DirectiveKind::Pragma) => self.scan_pragma(start, active),
             None => {
                 self.report(DiagnosticKind::PreprocessorDirectiveExpected, start);
                 self.consume_to_line_end();
@@ -531,6 +561,97 @@ impl<'a> Lexer<'a> {
 
     /// Processes a `#line` directive (9.5.7), validating its indicator: a line
     /// number with an optional file name, or `default`.
+    /// Processes a `#pragma` (9.5.8), which in C# 2.0 means `warning disable|restore [codes]` and
+    /// `checksum`.
+    ///
+    /// **A PRAGMA IS ADVICE, SO AN UNKNOWN ONE IS A WARNING AND NOT AN ERROR** -- csc's `CS1633`,
+    /// measured. The alternative, refusing the file, would make this compiler reject source every
+    /// other one accepts over a directive whose whole purpose is to be ignorable.
+    ///
+    /// The suppression list is COLLECTED here and applied nowhere near here: the warnings it
+    /// silences are the binder's, and they are silenced by POSITION, so the directives ride out on
+    /// [`Tokenized::pragma_warnings`] to the compilation that has both.
+    ///
+    /// A pragma inside a SKIPPED `#if` region is not recorded, for the same reason a `#define`
+    /// there is not: it is not part of this compilation.
+    ///
+    fn scan_pragma(&mut self, start: usize, active: bool) {
+        if !self.options.version.supports(Feature::PragmaDirective) {
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: Feature::PragmaDirective.description(),
+                    required: Feature::PragmaDirective.introduced_in().required_name(),
+                    current: self.options.version,
+                },
+                start,
+            );
+            self.consume_to_line_end();
+            return;
+        }
+        self.skip_inline_whitespace();
+        let kind = self.read_pp_symbol();
+        match kind.as_str() {
+            "warning" => {
+                self.skip_inline_whitespace();
+                let action = self.read_pp_symbol();
+                let disable = match action.as_str() {
+                    "disable" => true,
+                    "restore" => false,
+                    _ => {
+                        self.consume_to_line_end();
+                        return;
+                    }
+                };
+                let codes = self.read_pragma_warning_codes();
+                if active {
+                    self.pragma_warnings.push(PragmaWarning {
+                        position: start as u32,
+                        disable,
+                        codes,
+                    });
+                }
+            }
+            "checksum" => self.consume_to_line_end(),
+            _ => {
+                self.report(DiagnosticKind::UnrecognizedPragma, start);
+                self.consume_to_line_end();
+            }
+        }
+    }
+
+    /// The warning numbers on a `#pragma warning` line: decimal, or csc's `CS0649` spelling, comma
+    /// separated. An EMPTY list is the bare `#pragma warning disable`, which means every warning.
+    fn read_pragma_warning_codes(&mut self) -> Vec<u16> {
+        let mut codes = Vec::new();
+        loop {
+            self.skip_inline_whitespace();
+            match self.peek() {
+                None => break,
+                Some(c) if c == '\r' || c == '\n' => break,
+                Some(',') => {
+                    self.position += 1;
+                }
+                Some(c) if c.is_ascii_digit() || c.is_ascii_alphabetic() => {
+                    let text_start = self.position;
+                    while self
+                        .peek()
+                        .is_some_and(|c| c.is_ascii_alphanumeric())
+                    {
+                        self.position += 1;
+                    }
+                    let text = &self.source[text_start..self.position];
+                    let digits = text.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+                    if let Ok(code) = digits.parse::<u16>() {
+                        codes.push(code);
+                    }
+                }
+                Some(_) => self.position += 1,
+            }
+        }
+        self.consume_to_line_end();
+        codes
+    }
+
     fn scan_line(&mut self, start: usize) {
         self.skip_inline_whitespace();
         if self.peek().is_some_and(|c| c.is_ascii_digit()) {
@@ -1874,10 +1995,84 @@ mod tests {
         assert_eq!(kinds("_x1"), vec![ident("_x1"), TokenKind::EndOfFile]);
     }
 
+    /// `#pragma warning` is COLLECTED rather than applied here: the warnings it silences are the
+    /// binder's, so the lexer's whole job is to record what was said and where. Each row is a
+    /// spelling csc accepts, and the empty code list is the bare form that means every warning.
+    #[test]
+    fn pragma_warning_directives_are_collected_with_their_codes() {
+        let two = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let source = "#pragma warning disable 169, CS0649
+class C { }
+#pragma warning restore
+";
+        let scanned = tokenize_with(source, two.clone());
+        assert!(scanned.diagnostics.is_empty(), "{:?}", scanned.diagnostics);
+        assert_eq!(scanned.pragma_warnings.len(), 2);
+        assert!(scanned.pragma_warnings[0].disable);
+        assert_eq!(scanned.pragma_warnings[0].codes, vec![169, 649]);
+        assert_eq!(scanned.pragma_warnings[0].position, 0);
+        assert!(!scanned.pragma_warnings[1].disable);
+        assert!(scanned.pragma_warnings[1].codes.is_empty());
+        let skipped = tokenize_with(
+            "#if UNDEFINED
+#pragma warning disable 169
+#endif
+class C { }
+",
+            two.clone(),
+        );
+        assert!(skipped.pragma_warnings.is_empty());
+        let unknown = tokenize_with("#pragma nonsense
+class C { }
+", two);
+        assert_eq!(
+            unknown.diagnostics.iter().map(Diagnostic::code).collect::<Vec<_>>(),
+            [1633]
+        );
+        let one = tokenize_with("#pragma warning disable 169
+class C { }
+", LexOptions::default());
+        assert_eq!(
+            one.diagnostics.iter().map(Diagnostic::code).collect::<Vec<_>>(),
+            [8022]
+        );
+        assert!(one.pragma_warnings.is_empty());
+    }
+
     #[test]
     fn verbatim_identifier_drops_the_at_and_is_never_a_keyword() {
         assert_eq!(kinds("@class"), vec![ident("class"), TokenKind::EndOfFile]);
         assert_eq!(kinds("@foo"), vec![ident("foo"), TokenKind::EndOfFile]);
+    }
+
+    #[test]
+    fn a_verbatim_identifier_is_flagged_and_a_plain_one_is_not() {
+        let tokens = tokenize("@foo bar @class").tokens;
+        let identifiers: Vec<(Box<str>, bool)> = tokens
+            .into_iter()
+            .filter_map(|token| match token.kind {
+                TokenKind::Identifier(text) => Some((text, token.verbatim)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            identifiers,
+            vec![
+                (Box::from("foo"), true),
+                (Box::from("bar"), false),
+                (Box::from("class"), true),
+            ]
+        );
+        let escape = tokenize("@\\u0069f").tokens;
+        assert!(matches!(&escape[0].kind, TokenKind::Identifier(text) if &**text == "if"));
+        assert!(escape[0].verbatim);
+        let other = tokenize("class @\"text\"").tokens;
+        assert!(other.iter().all(|token| {
+            matches!(token.kind, TokenKind::Identifier(_)) || !token.verbatim
+        }));
     }
 
     #[test]

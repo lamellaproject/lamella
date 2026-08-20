@@ -291,6 +291,7 @@ dependencies = [
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
  "lamella-elf",
+ "lamella-flash-format",
  "lamella-generics",
  "lamella-ir",
  "lamella-link",
@@ -363,7 +364,22 @@ dependencies = [
 name = "lamella-cli"
 version = "0.0.0"
 dependencies = [
+ "lamella-aot",
+ "lamella-assemble",
  "lamella-bsp-gen",
+ "lamella-cmsis-dap",
+ "lamella-cmsis-dap-nrf",
+ "lamella-debug-backend",
+ "lamella-load",
+ "lamella-metadata",
+ "lamella-probe",
+ "lamella-probe-core",
+ "lamella-py-bytecode",
+ "lamella-py-frontend",
+ "lamella-py-runtime",
+ "lamella-syntax",
+ "lamella-wire",
+ "lamella-wire-host",
 ]
 
 [[package]]
@@ -498,6 +514,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-flash-format"
+version = "0.0.0"
+dependencies = [
+ "lamella-elf",
+]
+
+[[package]]
 name = "lamella-fs-fat"
 version = "0.0.0"
 dependencies = [
@@ -542,6 +565,8 @@ name = "lamella-js-frontend"
 version = "0.0.0"
 dependencies = [
  "lamella-js-bytecode",
+ "lamella-regexp",
+ "lamella-unicode",
  "libm",
 ]
 
@@ -551,6 +576,14 @@ version = "0.0.0"
 dependencies = [
  "lamella-elf",
  "lamella-ir",
+]
+
+[[package]]
+name = "lamella-linkd"
+version = "0.0.0"
+dependencies = [
+ "lamella-wire",
+ "lamella-wire-host",
 ]
 
 [[package]]
@@ -655,6 +688,7 @@ dependencies = [
  "lamella-aot",
  "lamella-asm-arm32",
  "lamella-elf",
+ "lamella-flash-format",
  "lamella-ir",
  "lamella-link",
  "lamella-py-bytecode",
@@ -677,6 +711,13 @@ dependencies = [
 [[package]]
 name = "lamella-reactor"
 version = "0.0.0"
+
+[[package]]
+name = "lamella-regexp"
+version = "0.0.0"
+dependencies = [
+ "lamella-unicode",
+]
 
 [[package]]
 name = "lamella-repl"
@@ -712,10 +753,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-sd-core"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-sd-sdmmc"
+version = "0.0.0"
+dependencies = [
+ "lamella-sd-core",
+]
+
+[[package]]
 name = "lamella-sd-spi"
 version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
+ "lamella-sd-core",
+]
+
+[[package]]
+name = "lamella-sdmmc-stm32"
+version = "0.0.0"
+dependencies = [
+ "lamella-mmio",
+ "lamella-sd-core",
+ "lamella-sd-sdmmc",
 ]
 
 [[package]]
@@ -852,6 +914,7 @@ version = "0.0.0"
 dependencies = [
  "lamella-assemble",
  "lamella-debug-backend",
+ "lamella-flash-format",
  "lamella-load",
  "lamella-metadata",
  "lamella-runner",

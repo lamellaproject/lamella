@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Loads an ECMA-335 assembly into a runnable lamella-cil-runtime module."
+publish = false
 
 [dependencies]
 lamella-cil = { path = "../lamella-cil" }
@@ -29,9 +30,17 @@ default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transce
 #
 # It is a capability rather than an always-on because it links the closure walk and the canonical
 # speller, and a profile with no use for generics should not carry them.
-generics = ["dep:lamella-generics"]
+generics = ["dep:lamella-generics", "lamella-cil-runtime/generics"]
 bcl = ["lamella-cil-runtime/bcl"]
-NETMFv4_4 = ["bcl", "lamella-cil-runtime/NETMFv4_4"]
+NETMFv4_4 = ["bcl", "reflection", "text", "collections", "lamella-cil-runtime/NETMFv4_4"]
+# The collection types beyond the array. See lamella-cil-runtime.
+collections = ["lamella-cil-runtime/collections"]
+# The richer text surface. See lamella-cil-runtime. Selecting it here binds the Char and
+# String intrinsics beyond the floor; without it those members keep their managed bodies.
+text = ["lamella-cil-runtime/text"]
+# The metadata inspection surface. See lamella-cil-runtime. Selecting it here binds the
+# reflection intrinsics; without it those members keep their managed placeholder bodies.
+reflection = ["lamella-cil-runtime/reflection"]
 exceptions = ["lamella-cil-runtime/exceptions"]
 gc = ["lamella-cil-runtime/gc"]
 finalizers = ["gc", "lamella-cil-runtime/finalizers"]

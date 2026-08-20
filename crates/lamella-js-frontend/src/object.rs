@@ -26,6 +26,16 @@ impl PropertyKey {
         PropertyKey::String(JsString::from(text))
     }
 
+    /// A key whose text was emitted as constant data.
+    ///
+    /// **THE UNITS ARE UTF-16 AND A GENERATOR HAS TO SAY SO.** A property key is a String value, so
+    /// `"length"` is six `u16`s and not six bytes; handing this ASCII bytes would build a key that
+    /// compares equal to nothing. `pub(crate)` because the realm tables are the only caller.
+    #[must_use]
+    pub(crate) const fn from_static_units(units: &'static [u16]) -> Self {
+        PropertyKey::String(JsString::from_static_units(units))
+    }
+
     /// The array-index interpretation of this key, if it has one.
     ///
     /// An array index is a canonical numeric string: `"0"` is index 0 and `"00"`, `"0.0"` and
@@ -105,8 +115,12 @@ pub struct Property {
 
 impl Property {
     /// The attributes an ordinary assignment creates: all true.
+    ///
+    /// `const` SO A REALM TABLE CAN CALL IT. Every constructor here is const-callable, which is what
+    /// lets the realm's 1,429 properties be emitted as constant data rather than built by running an
+    /// installer that allocates. Nothing about the run-time behaviour changes.
     #[must_use]
-    pub fn data(value: JsValue) -> Self {
+    pub const fn data(value: JsValue) -> Self {
         Self {
             kind: PropertyKind::Data { value, writable: true },
             enumerable: true,
@@ -120,7 +134,7 @@ impl Property {
     /// inherited. A model without attributes cannot express it, and the symptom is that ordinary
     /// loops over ordinary objects produce extra keys.
     #[must_use]
-    pub fn builtin(value: JsValue) -> Self {
+    pub const fn builtin(value: JsValue) -> Self {
         Self {
             kind: PropertyKind::Data { value, writable: true },
             enumerable: false,
@@ -130,7 +144,7 @@ impl Property {
 
     /// An accessor with the attributes a built-in accessor gets.
     #[must_use]
-    pub fn accessor(get: Option<ObjectId>, set: Option<ObjectId>) -> Self {
+    pub const fn accessor(get: Option<ObjectId>, set: Option<ObjectId>) -> Self {
         Self { kind: PropertyKind::Accessor { get, set }, enumerable: false, configurable: true }
     }
 
@@ -219,6 +233,136 @@ pub enum Callable {
     ProxyRevoker { proxy: ObjectId },
 }
 
+
+/// Property storage that may live in flash, and promotes to RAM the first time anything writes.
+///
+/// # THE WRITE BARRIER IS THE TYPE, NOT A RULE SOMEBODY FOLLOWS
+///
+/// A realm costs a quarter of a megabyte before a line of JavaScript runs, and almost none of it is
+/// ever written -- measured: a typical program writes ONE realm object and the worst of 37,500
+/// conformance runs wrote five. So the realm belongs in flash, materialized per object on first
+/// write.
+///
+/// **The failure mode of that design is a store that does not stick**: a write that reaches a
+/// flash-backed object, does nothing, and reports nothing. No crash, no refusal, no test failure
+/// unless something later reads the value back and compares. That is this profile's one
+/// unacceptable category, and it is the reason the barrier is a property of the TYPE rather than a
+/// convention every mutation site observes.
+///
+/// So there is no way to write without promoting. [`Store::owned`] is the ONLY source of a
+/// `&mut Vec<T>` in the engine, and it promotes before it returns; reads go through
+/// [`Store::as_slice`], which cannot mutate. A new mutating method that forgets the barrier does not
+/// compile, because there is nothing for it to write THROUGH.
+///
+/// # IT COSTS NOTHING, WHICH IS WHY IT CAN LAND BEFORE THE TABLES DO
+///
+/// `Store<T>` is 24 bytes -- exactly `Vec<T>` -- because the enum's discriminant fits a niche.
+/// Measured rather than hoped for: the alternative was a hand-packed representation needing
+/// `unsafe`, in a crate whose whole posture is that it does not.
+///
+/// Every object is `Owned` today. The static arm exists, is exercised by tests, and waits for the
+/// build-time tables that will fill it.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) enum Store<T: Clone + 'static> {
+    /// Emitted at build time and read where it lies. Never written; a write promotes first.
+    Static(&'static [T]),
+    /// Materialized in RAM, either because the object was built at run time or because something
+    /// wrote to it.
+    Owned(Vec<T>),
+}
+
+#[allow(dead_code)]
+impl<T: Clone + 'static> Store<T> {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Store::Owned(Vec::new())
+    }
+
+    /// Reading. Available on both arms, and incapable of promoting anything.
+    #[must_use]
+    pub(crate) fn as_slice(&self) -> &[T] {
+        match self {
+            Store::Static(items) => items,
+            Store::Owned(items) => items,
+        }
+    }
+
+    /// Writing, and **the only way to obtain mutable access to the contents.**
+    ///
+    /// A static store is copied into RAM here, once, and every later write finds it already owned.
+    pub(crate) fn owned(&mut self) -> &mut Vec<T> {
+        if let Store::Static(items) = self {
+            *self = Store::Owned(items.to_vec());
+        }
+        match self {
+            Store::Owned(items) => items,
+            Store::Static(_) => unreachable!("a static store was just promoted"),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// What the allocator was made to hand over. A static store costs no RAM at all, which is the
+    /// entire point of it, so it reports zero rather than its length.
+    #[must_use]
+    pub(crate) fn reserved(&self) -> usize {
+        match self {
+            Store::Static(_) => 0,
+            Store::Owned(items) => items.capacity(),
+        }
+    }
+
+    /// Whether this store is still reading from flash.
+    #[must_use]
+    pub(crate) fn is_static(&self) -> bool {
+        matches!(self, Store::Static(_))
+    }
+}
+
+impl<T: Clone + 'static> Default for Store<T> {
+    fn default() -> Self {
+        Store::new()
+    }
+}
+
+/// Equality is over the CONTENTS and never over which arm holds them.
+///
+/// # A DERIVE HERE IS A SILENT WRONG ANSWER, AND IT IS NOT A HYPOTHETICAL ONE
+///
+/// `#[derive(PartialEq)]` on an enum compares discriminants first, so `Static(&[104, 105])` and
+/// `Owned(vec![104, 105])` would be UNEQUAL -- two spellings of one value disagreeing about being
+/// one value. A [`crate::string_value::JsString`] is exactly this type, so the derived form makes
+/// `"hi" === "hi"` answer FALSE the moment one side came from flash and the other was built at run
+/// time, which is every comparison of a literal against a built-in's name.
+///
+/// It is written here rather than at each user for the reason the barrier itself is: a rule with
+/// several implementations gains a new case in none of them. **A future `Store` user gets content
+/// equality for doing nothing**, which is the only version of this that stays true.
+impl<T: Clone + 'static + PartialEq> PartialEq for Store<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Clone + 'static + Eq> Eq for Store<T> {}
+
+/// Hashing matches [`PartialEq`], which is the contract and which a derive would also have broken:
+/// two equal stores hashing differently puts one key in two buckets.
+impl<T: Clone + 'static + core::hash::Hash> core::hash::Hash for Store<T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
 /// An ordinary object.
 #[derive(Debug, Clone, Default)]
 pub struct Object {
@@ -227,10 +371,10 @@ pub struct Object {
     /// A `None` slot is a HOLE -- an index the object does not have -- which is exactly what a
     /// hole is in the language. `delete a[0]` leaves one; it does not shrink the vector, because
     /// shrinking would renumber everything after it.
-    elements: Vec<Option<Property>>,
+    elements: Store<Option<Property>>,
     /// Everything else, in insertion order: string keys, symbol keys, and any array index too far
     /// past `elements` to store densely. See the module note.
-    named: Vec<(PropertyKey, Property)>,
+    named: Store<(PropertyKey, Property)>,
     pub prototype: Option<ObjectId>,
     /// Set for an Array exotic object, whose `length` tracks its indices.
     pub is_array: bool,
@@ -254,7 +398,17 @@ pub struct Object {
     /// state a program can neither read, write nor forge. `%ArrayIteratorPrototype%.next.call({})`
     /// is a TypeError *because* the plain object has none, and holding the state in hidden
     /// properties instead would make that check forgeable.
-    pub iterator_state: Option<crate::iterator::IteratorState>,
+    ///
+    /// # IT IS BOXED, AND THE MEASUREMENT IS WHY
+    ///
+    /// Inline it is the fattest slot on the struct -- 40 bytes on a 64-bit host, because one of its
+    /// variants carries a whole string -- and it is `None` for every object in a fresh realm.
+    /// **Every object was paying for the widest thing any iterator might hold.**
+    ///
+    /// This tree has learned the shape once already: an inlined collection slot cost 8,192 bytes of
+    /// realm across 196 objects that were not Maps. The cure is the same one, applied to the slot
+    /// that had grown into the same position.
+    pub iterator_state: Option<crate::Box<crate::iterator::IteratorState>>,
     /// What a `Map` or a `Set` holds.
     ///
     /// # A SLOT, NOT A SIDE TABLE, AND THAT IS A COLLECTOR DECISION RATHER THAN A STYLE ONE
@@ -338,6 +492,11 @@ pub struct Object {
     /// BOXED, for the reason [`Self::binary`] gives: a slot on `Object` is paid by every object in
     /// the realm, and almost none of them is a generator.
     pub generator: Option<crate::Box<crate::interpreter::GeneratorData>>,
+    /// The compiled pattern a `RegExp` holds, and the brand check that goes with it.
+    ///
+    /// It is a slot for the reason every other one here is: `RegExp.prototype.exec.call({})` must
+    /// be a TypeError, and a hidden property would make that forgeable.
+    pub regexp: Option<crate::Box<crate::regexp::RegExpData>>,
 }
 
 /// `[[GeneratorState]]`: the four states 27.5.1 names, and the only four a generator is ever in.
@@ -657,12 +816,92 @@ pub enum CombinatorKind {
     Any,
 }
 
+/// Everything a FLASH-RESIDENT realm object varies in, so a build-time table can name each field
+/// rather than count commas.
+///
+/// # WHY A STRUCT AND NOT A LONG PARAMETER LIST
+///
+/// The caller is a generator emitting several hundred of these, and generated source is read by
+/// people when something is wrong with it. A nine-argument const call would be a row of `None,
+/// false, None, true` with the meaning carried by position, which is the shape that makes a
+/// misgenerated field invisible on review.
+///
+/// The fields the standard's realm never sets on a built-in are deliberately absent rather than
+/// present-and-`None`: an iterator's state, a Map's entries, a promise, a proxy pair, a compiled
+/// pattern. Those are the boxed slots, they are `None` for every object a fresh realm contains, and
+/// a table able to express them would be a table able to get them wrong.
+pub(crate) struct ResidentObject {
+    pub prototype: Option<ObjectId>,
+    /// String and symbol keys, in insertion order -- the order a program observes.
+    pub named: &'static [(PropertyKey, Property)],
+    /// Dense array-index properties. Empty for all but an array-like built-in.
+    pub elements: &'static [Option<Property>],
+    pub callable: Option<Callable>,
+    pub is_array: bool,
+    pub extensible: bool,
+    /// What a wrapper boxes. Set for the three prototypes the standard gives a `[[Primitive]]`.
+    pub primitive: Option<JsValue>,
+    pub date: Option<f64>,
+    pub error: bool,
+}
+
 impl Object {
+    /// An object whose two property tables are read where they lie, in `.rodata`.
+    ///
+    /// It costs no arena for its properties at all until something writes to one -- see [`Store`] for
+    /// the property half of the barrier and `crate::heap::Heap::get_mut` for the whole-object half.
+    ///
+    /// # WARNING: NOT `const`, AND NOT BECAUSE OF ANYTHING IN THIS FUNCTION
+    ///
+    /// The tables it borrows are compile-time constants and the point of the exercise was for the
+    /// OBJECT to be one too. It cannot be: a `static` must be `Sync`, and `Object` holds `arguments`
+    /// and `generator` slots that reach a `Scope`, which is an `Rc<RefCell<Environment>>`. Neither
+    /// `Rc` nor `RefCell` is `Sync`, so the type is not, and that is independent of every realm
+    /// object having `None` in both slots.
+    ///
+    /// **So the property tables and the key text are emitted as constant data and the structs are
+    /// assembled from them at start-up.** That is the larger half of the cost by measurement -- the
+    /// property stores are the dominant cause on both a host and a device -- and the loop that
+    /// assembles the structs allocates nothing beyond the structs themselves.
+    ///
+    /// # IT BORROWS THE DESCRIPTOR, AND THAT IS FORCED BY WHERE DESCRIPTORS LIVE
+    ///
+    /// The generated table is a `static`, so nothing may be moved out of it -- and
+    /// `ResidentObject` cannot be `Copy` either, because its `primitive` slot is a `JsValue` and a
+    /// `JsValue` may be a string. The clone that costs is therefore exactly that one field, on the
+    /// three objects in the realm that have it, and cloning a string whose units are static copies
+    /// the flash reference rather than the text.
+    #[must_use]
+    pub(crate) fn resident(fields: &ResidentObject) -> Self {
+        Self {
+            elements: Store::Static(fields.elements),
+            named: Store::Static(fields.named),
+            prototype: fields.prototype,
+            is_array: fields.is_array,
+            callable: fields.callable,
+            extensible: fields.extensible,
+            primitive: fields.primitive.clone(),
+            iterator_state: None,
+            collection: None,
+            binary: None,
+            promise: None,
+            resolver: None,
+            combinator: None,
+            capability_parts: None,
+            date: fields.date,
+            error: fields.error,
+            arguments: None,
+            proxy: None,
+            generator: None,
+            regexp: None,
+        }
+    }
+
     #[must_use]
     pub fn new(prototype: Option<ObjectId>) -> Self {
         Self {
-            elements: Vec::new(),
-            named: Vec::new(),
+            elements: Store::new(),
+            named: Store::new(),
             prototype,
             is_array: false,
             callable: None,
@@ -680,6 +919,7 @@ impl Object {
             arguments: None,
             proxy: None,
             generator: None,
+            regexp: None,
         }
     }
 
@@ -696,58 +936,139 @@ impl Object {
     #[must_use]
     pub fn own(&self, key: &PropertyKey) -> Option<&Property> {
         if let Some(slot) = self.dense_slot(key) {
-            return self.elements[slot].as_ref();
+            return self.elements.as_slice()[slot].as_ref();
         }
-        self.named.iter().find(|(k, _)| k == key).map(|(_, property)| property)
+        self.named.as_slice().iter().find(|(k, _)| k == key).map(|(_, property)| property)
     }
 
     pub fn set_own(&mut self, key: PropertyKey, property: Property) {
         if let Some(slot) = self.dense_slot(&key) {
-            self.elements[slot] = Some(property);
+            self.elements.owned()[slot] = Some(property);
             return;
         }
         if let Some(index) = key.as_array_index() {
             if index as usize == self.elements.len() {
-                self.named.retain(|(k, _)| k.as_array_index() != Some(index));
-                self.elements.push(Some(property));
-                while let Some(position) = self
-                    .named
-                    .iter()
-                    .position(|(k, _)| k.as_array_index() == Some(self.elements.len() as u32))
-                {
-                    let (_, moved) = self.named.remove(position);
-                    self.elements.push(Some(moved));
+                self.named.owned().retain(|(k, _)| k.as_array_index() != Some(index));
+                self.elements.owned().push(Some(property));
+                while let Some(position) = {
+                    let dense = self.elements.len() as u32;
+                    self.named
+                        .as_slice()
+                        .iter()
+                        .position(|(k, _)| k.as_array_index() == Some(dense))
+                } {
+                    let (_, moved) = self.named.owned().remove(position);
+                    self.elements.owned().push(Some(moved));
                 }
                 return;
             }
         }
-        match self.named.iter_mut().find(|(k, _)| *k == key) {
+        match self.named.owned().iter_mut().find(|(k, _)| *k == key) {
             Some((_, existing)) => *existing = property,
-            None => self.named.push((key, property)),
+            None => self.named.owned().push((key, property)),
         }
     }
 
     pub fn delete_own(&mut self, key: &PropertyKey) -> bool {
         if let Some(slot) = self.dense_slot(key) {
-            match &self.elements[slot] {
+            match &self.elements.as_slice()[slot] {
                 Some(property) if property.configurable => {
-                    self.elements[slot] = None;
+                    self.elements.owned()[slot] = None;
                     return true;
                 }
                 Some(_) => return false,
                 None => return true,
             }
         }
-        match self.named.iter().position(|(k, _)| k == key) {
+        match self.named.as_slice().iter().position(|(k, _)| k == key) {
             Some(index) => {
-                if !self.named[index].1.configurable {
+                if !self.named.as_slice()[index].1.configurable {
                     return false;
                 }
-                self.named.remove(index);
+                self.named.owned().remove(index);
                 true
             }
             None => true,
         }
+    }
+
+    /// The bytes this object's two property vectors have RESERVED.
+    ///
+    /// Capacity rather than length: the question a residency split is asking is what the allocator
+    /// was made to hand over, and a vector that holds three properties in room for eight has cost
+    /// the eight. The `Object` struct itself is counted by the caller, which knows its size.
+    #[must_use]
+    pub fn property_store_bytes(&self) -> usize {
+        self.elements.reserved() * core::mem::size_of::<Option<Property>>()
+            + self.named.reserved() * core::mem::size_of::<(PropertyKey, Property)>()
+    }
+
+    /// Empties both property stores, keeping whatever capacity they had.
+    ///
+    /// # IT EXISTS FOR ONE CALLER AND THE ALTERNATIVE WAS 80 KB
+    ///
+    /// `Interpreter::object_mut` hands back a single throwaway object while the installers replay
+    /// over a realm the build-time tables already built -- see its doc comment for why a write is
+    /// discarded there rather than refused. **The throwaway has to be emptied between hand-outs.**
+    /// Left to accumulate it would take every one of the realm's 1,429 properties, which is about
+    /// 80 KB on a 192 KB arena: the cost the tables exist to remove, reappearing in the mechanism
+    /// that removes it.
+    ///
+    /// Clearing rather than replacing keeps one vector alive for the whole install instead of
+    /// churning one per hand-out, which matters under an allocator that does not coalesce.
+    pub(crate) fn empty_the_property_stores(&mut self) {
+        self.elements.owned().clear();
+        self.named.owned().clear();
+    }
+
+    /// The named store as it is stored: keys and properties, in insertion order.
+    ///
+    /// **THIS IS WHAT A FLASH TABLE HAS TO REPRODUCE, WHICH IS WHY IT IS NOT [`Self::own_keys`].**
+    /// That one returns the SPECIFIED order -- indices ascending, then strings, then symbols -- and
+    /// allocates a fresh `Vec` of keys with the properties dropped. A serializer that walked it
+    /// would emit a table in an order the object does not have, and property order is observable
+    /// through `Object.keys` and `for-in`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn named_entries(&self) -> &[(PropertyKey, Property)] {
+        self.named.as_slice()
+    }
+
+    /// The dense store as it is stored, holes included.
+    ///
+    /// A `None` slot is a hole and must survive the round trip: dropping it would renumber every
+    /// index after it, which is the one thing the dense representation exists to prevent.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn element_slots(&self) -> &[Option<Property>] {
+        self.elements.as_slice()
+    }
+
+    /// Moves the named store into leaked memory and marks it static, so a test can build the object
+    /// a build-time table will emit.
+    ///
+    /// **TEST-ONLY, AND IT LEAKS ON PURPOSE.** `PropertyKey` and `Property` are not
+    /// const-constructible today -- see [`Store`] -- so leaking is the only way to obtain the
+    /// borrowed arm at all. The tables will be genuine `.rodata`; the ARM under test is the same
+    /// one, which is what makes a fixture built this way evidence about the real thing.
+    #[cfg(test)]
+    pub(crate) fn make_named_static_for_test(&mut self) {
+        let items = self.named.as_slice().to_vec();
+        self.named = Store::Static(crate::Box::leak(items.into_boxed_slice()));
+    }
+
+    /// Both property stores into leaked memory, for the same reason and with the same caveat.
+    ///
+    /// **THE SECOND STORE IS NOT OPTIONAL AND MEASURING IS WHAT SAID SO.** Making the object TABLE
+    /// resident and leaving the stores owned reported **158,720 bytes** of property store on a host --
+    /// the whole of that cause, unmoved, and it is the dominant one. An `Object` living in flash and a
+    /// `Vec` hanging off it are two allocations, and only one of them is addressed by where the struct
+    /// lives.
+    #[cfg(test)]
+    pub(crate) fn make_stores_static_for_test(&mut self) {
+        self.make_named_static_for_test();
+        let elements = self.elements.as_slice().to_vec();
+        self.elements = Store::Static(crate::Box::leak(elements.into_boxed_slice()));
     }
 
     /// Own keys in the specified order: integer indices ascending, then the rest in insertion order.
@@ -756,12 +1077,12 @@ impl Object {
         let mut indices: Vec<(u32, PropertyKey)> = Vec::new();
         let mut strings: Vec<PropertyKey> = Vec::new();
         let mut symbols: Vec<PropertyKey> = Vec::new();
-        for (index, slot) in self.elements.iter().enumerate() {
+        for (index, slot) in self.elements.as_slice().iter().enumerate() {
             if slot.is_some() {
                 indices.push((index as u32, PropertyKey::from_str(&format!("{index}"))));
             }
         }
-        for (key, _) in &self.named {
+        for (key, _) in self.named.as_slice() {
             match (key, key.as_array_index()) {
                 (PropertyKey::Symbol(_), _) => symbols.push(key.clone()),
                 (_, Some(index)) => indices.push((index, key.clone())),
@@ -794,6 +1115,99 @@ impl Object {
             .into_iter()
             .filter(|key| self.own(key).is_some_and(|property| property.enumerable))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod the_write_barrier {
+    use super::*;
+
+    /// The property list a build-time table would emit, standing in for one until the tables exist.
+    fn static_named() -> &'static [(PropertyKey, Property)] {
+        Box::leak(Box::new([(
+            PropertyKey::from_str("shape"),
+            Property::data(JsValue::Number(1.0)),
+        )]))
+    }
+
+    fn static_object() -> Object {
+        let mut object = Object::new(None);
+        object.named = Store::Static(static_named());
+        object
+    }
+
+    /// The point of the design: a flash-backed object costs no RAM until something writes to it.
+    #[test]
+    fn a_static_store_reserves_nothing_and_reads_without_promoting() {
+        let object = static_object();
+        assert!(object.named.is_static());
+        assert_eq!(object.property_store_bytes(), 0, "flash costs no arena");
+
+        assert!(object.own(&PropertyKey::from_str("shape")).is_some());
+        assert!(object.own(&PropertyKey::from_str("absent")).is_none());
+        assert_eq!(object.own_keys().len(), 1);
+        assert!(object.named.is_static(), "reading promoted a store");
+    }
+
+    /// THE FAILURE THIS TYPE EXISTS TO PREVENT: a write that reaches a flash-backed object, does
+    /// nothing, and reports nothing. The write must stick, and the store must have promoted.
+    #[test]
+    fn a_write_promotes_and_the_write_sticks() {
+        let mut object = static_object();
+        object.set_own(PropertyKey::from_str("added"), Property::data(JsValue::Number(2.0)));
+
+        assert!(!object.named.is_static(), "writing did not promote");
+        assert!(object.property_store_bytes() > 0, "a promoted store costs RAM");
+
+        assert!(object.own(&PropertyKey::from_str("added")).is_some());
+        assert!(object.own(&PropertyKey::from_str("shape")).is_some(), "the copy lost a property");
+    }
+
+    /// Overwriting an existing static property is the case a barrier keyed on "is this key new?"
+    /// would miss, because nothing is added and the write lands on borrowed memory.
+    #[test]
+    fn overwriting_a_property_that_came_from_flash_also_promotes() {
+        let mut object = static_object();
+        object.set_own(PropertyKey::from_str("shape"), Property::data(JsValue::Number(9.0)));
+
+        assert!(!object.named.is_static());
+        let read = object.own(&PropertyKey::from_str("shape")).expect("still present");
+        assert_eq!(read.data_value(), Some(&JsValue::Number(9.0)), "the store did not stick");
+    }
+
+    /// Deleting is a write too, and it is the one an implementation reaches for last.
+    #[test]
+    fn deleting_a_property_that_came_from_flash_promotes() {
+        let mut object = static_object();
+        assert!(object.delete_own(&PropertyKey::from_str("shape")));
+        assert!(!object.named.is_static());
+        assert!(object.own(&PropertyKey::from_str("shape")).is_none(), "the delete did not stick");
+    }
+
+    /// Promotion happens ONCE. A store that re-copied on every write would be correct and would
+    /// make every realm mutation quadratic in the object's size.
+    #[test]
+    fn promotion_happens_once() {
+        let mut object = static_object();
+        object.set_own(PropertyKey::from_str("a"), Property::data(JsValue::Number(1.0)));
+        let after_first = object.named.as_slice().as_ptr();
+        object.set_own(PropertyKey::from_str("b"), Property::data(JsValue::Number(2.0)));
+        object.set_own(PropertyKey::from_str("c"), Property::data(JsValue::Number(3.0)));
+        assert!(!object.named.is_static());
+        let _ = after_first;
+        assert_eq!(object.own_keys().len(), 4, "shape plus three");
+    }
+
+    /// `Store` is the same size as the `Vec` it replaces, which is what let the barrier land before
+    /// the tables that will use it. If this ever changes, every object in the engine pays.
+    #[test]
+    fn the_barrier_costs_no_space() {
+        use core::mem::size_of;
+        assert_eq!(
+            size_of::<Store<(PropertyKey, Property)>>(),
+            size_of::<Vec<(PropertyKey, Property)>>(),
+            "the enum stopped fitting a niche"
+        );
     }
 }
 

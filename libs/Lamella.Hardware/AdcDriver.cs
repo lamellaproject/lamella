@@ -1,6 +1,4 @@
-// Lamella.Hardware -- the ADC chip-driver seam, in the nanoFramework.System.Device.Adc assembly.
-using System.Device.Adc;
-
+// Lamella.Hardware -- the ADC chip-driver seam.
 namespace Lamella.Hardware
 {
     /// <summary>Base class for ADC drivers: convert analog inputs to digital counts.</summary>

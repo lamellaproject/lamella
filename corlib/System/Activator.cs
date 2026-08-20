@@ -4,6 +4,8 @@ namespace System
 {
     public sealed class Activator
     {
+        private Activator() { }
+
         [Lamella.Runtime.RuntimeProvided] public static object CreateInstance(Type type) { return null; }
     }
 }

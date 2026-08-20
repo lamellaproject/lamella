@@ -209,7 +209,14 @@ impl Session {
                 defined_symbols: BTreeSet::new(),
             };
             collect_into(&mut model, &unit);
-            model.canonicalize_signatures();
+            let mut binder = lamella_binder::Binder::with_model(model);
+            lamella_binder::program::qualify_declared_signatures(
+                &mut binder,
+                &unit.usings,
+                &unit.members,
+                "",
+            );
+            model = binder.into_model();
             model.link_bases();
         }
         model

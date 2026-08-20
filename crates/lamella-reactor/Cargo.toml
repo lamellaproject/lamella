@@ -12,6 +12,7 @@ description = "The shared scheduler reactor: the single block point a runtime's 
 # (lamella-cil-runtime), a sibling language runtime, and the AOT native scheduler each supply a
 # `ReactorEnv` and share this one algorithm -- which is the property that keeps a socket park and a
 # sleep park landing in the same wait on every tier.
+publish = false
 [dependencies]
 
 [lints]

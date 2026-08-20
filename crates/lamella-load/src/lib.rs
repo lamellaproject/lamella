@@ -105,34 +105,41 @@ use lamella_cil_runtime::intrinsics::{arg_iterator_cookie, arg_iterator_get, arg
 use lamella_cil_runtime::intrinsics::{
     reregister_finalize, suppress_finalize, wait_for_pending_finalizers,
 };
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 use lamella_cil_runtime::intrinsics::{
-    boolean_parse, char_is_digit, char_is_letter, char_is_letter_or_digit, char_is_lower,
     activator_create_instance, assembly_full_name, assembly_get_type, assembly_get_types,
-    field_get_value, field_set_value, member_get_type,
-    method_invoke, method_is_abstract, method_is_final, method_is_public, method_is_static,
+    constructor_invoke, field_get_raw_constant, field_get_value, field_is_literal,
+    field_is_static, field_set_value, member_get_type, method_invoke, method_is_abstract,
+    method_is_final, method_is_public, method_is_static, method_is_virtual,
     method_parameter_count, method_parameter_custom_attributes, method_parameter_name,
-    method_parameter_type,
-    constructor_invoke, field_get_raw_constant, field_is_literal, field_is_static,
-    method_is_virtual, reflect_handle_equals, reflect_handle_not_equals,
-    type_get_base_type, type_get_constructor,
-    char_is_upper, char_is_white_space, char_to_lower, char_to_upper, collection_contains,
-    collection_push, convert_to_boolean_int, convert_to_byte_int, convert_to_char_int, int32_parse,
-    int64_parse, list_add, list_clear, list_get_count, list_get_item, list_insert, list_remove_at,
-    list_set_item, map_add, map_contains, map_get_count, map_get_item, map_remove, map_set_item,
-    math_abs_int32, math_abs_int64, math_max_int32, math_max_int64, math_min_int32, math_min_int64,
-    math_sign_int32, math_sign_int64, queue_dequeue, queue_peek, stack_peek, stack_pop,
-    string_contains, string_ends_with,
+    method_parameter_type, reflect_handle_equals, reflect_handle_not_equals, type_get_assembly,
+    type_get_base_type, type_get_constructor, type_get_field, type_get_fields,
+    type_get_full_name, type_get_method, type_get_methods, type_get_namespace,
+    type_get_property, type_is_abstract, type_is_array, type_is_class, type_is_enum,
+    type_is_interface, type_is_not_public, type_is_public, type_is_value_type,
+};
+#[cfg(feature = "text")]
+use lamella_cil_runtime::intrinsics::{
+    char_is_digit, char_is_letter, char_is_letter_or_digit, char_is_lower, char_is_upper,
+    char_is_white_space, char_to_lower, char_to_upper, string_contains, string_ends_with,
     string_index_of_char, string_index_of_string, string_insert, string_join,
     string_last_index_of_char, string_pad_left, string_pad_right, string_remove,
     string_replace_char, string_replace_string, string_split_char, string_starts_with,
-    string_to_char_array, string_to_lower, string_to_upper, string_trim, type_get_assembly,
-    type_get_field, type_get_fields, type_get_full_name, type_get_method, type_get_methods,
-    type_get_namespace, type_get_property, type_is_abstract,
-    type_is_array, type_is_class,
-    type_is_enum, type_is_interface, type_is_not_public, type_is_public, type_is_value_type,
+    string_to_char_array, string_to_lower, string_to_upper, string_trim,
+};
+#[cfg(feature = "collections")]
+use lamella_cil_runtime::intrinsics::{
+    collection_contains, collection_push, list_add, list_clear, list_get_count, list_get_item,
+    list_insert, list_remove_at, list_set_item, map_add, map_contains, map_get_count,
+    map_get_item, map_remove, map_set_item, queue_dequeue, queue_peek, stack_peek, stack_pop,
 };
 #[cfg(feature = "NETMFv4_4")]
+use lamella_cil_runtime::intrinsics::{
+    boolean_parse, convert_to_boolean_int, convert_to_byte_int, convert_to_char_int,
+    int32_parse, int64_parse, math_abs_int32, math_abs_int64, math_max_int32, math_max_int64,
+    math_min_int32, math_min_int64, math_sign_int32, math_sign_int64,
+};
+#[cfg(feature = "reflection")]
 use lamella_cil_runtime::intrinsics::type_property_custom_attributes;
 #[cfg(feature = "float")]
 use lamella_cil_runtime::intrinsics::{
@@ -156,7 +163,7 @@ use lamella_cil_runtime::intrinsics::{
 use lamella_cil_runtime::module::{
     AttrValue, BoxedPrimitive, LoadedAttribute, RawCil, VarargSite, asm_key,
 };
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 use lamella_cil_runtime::module::{
     MethodParam, ReflectField, ReflectMethod, ReflectType, param_attr_key,
 };
@@ -193,6 +200,14 @@ pub enum LoadError {
     NoEntryPoint,
     /// The entry-point token names no method that has an IL body.
     EntryHasNoBody,
+    /// The library assemblies reference each other in a cycle, so no load order can put every
+    /// library after the ones it references.
+    ///
+    /// Reported rather than worked around: the loader binds each assembly's references against the
+    /// names loaded so far, so one member of a cycle always loads before a name it needs. Refusing
+    /// is the honest answer -- the alternative is an image where some of those calls silently
+    /// resolve to nothing.
+    CircularLibraryReferences,
 }
 
 impl fmt::Display for LoadError {
@@ -200,6 +215,10 @@ impl fmt::Display for LoadError {
         formatter.write_str(match self {
             LoadError::NoEntryPoint => "assembly has no entry point",
             LoadError::EntryHasNoBody => "entry point has no IL body",
+            LoadError::CircularLibraryReferences => {
+                "the library assemblies reference each other in a cycle, so no order loads each \
+                 one after the libraries it references"
+            }
         })
     }
 }
@@ -1234,7 +1253,13 @@ const LAZY_CORLIB_ASM: u8 = 0;
 /// reaching something, so both consult this one classification rather than each carrying a list of
 /// opcodes that would have to be kept in step by hand.
 enum Reaches {
-    /// A `call` / `callvirt` / `newobj` target: the member itself has to resolve.
+    /// A `call` / `callvirt` / `newobj` / `ldftn` / `ldvirtftn` target: the member itself has to
+    /// resolve.
+    ///
+    /// A function pointer names a member as surely as a call does. The difference is only WHEN the
+    /// member is invoked, and a delegate built here and called later is the case that makes the two
+    /// opcode families indistinguishable for reachability: a method whose only reference is a
+    /// delegate construction has to be materialized just the same.
     Member,
     /// A type named directly. A reached TYPE is as much a reference as a reached member:
     /// `box System.Int32` then a `callvirt` on the box resolves its receiver type THROUGH that
@@ -1254,7 +1279,9 @@ enum Reaches {
 /// The single classification both materialization walks consult ([`Reaches`]).
 fn reaches(opcode: Opcode) -> Reaches {
     match opcode {
-        Opcode::Call | Opcode::Callvirt | Opcode::Newobj => Reaches::Member,
+        Opcode::Call | Opcode::Callvirt | Opcode::Newobj | Opcode::Ldftn | Opcode::Ldvirtftn => {
+            Reaches::Member
+        }
         Opcode::Box
         | Opcode::Unbox
         | Opcode::UnboxAny
@@ -2190,7 +2217,9 @@ fn collect_body_tokens(tokens: &mut BodyTokens, opcode: Opcode, operand: Token) 
         Opcode::Ldstr => {
             tokens.strings.insert(operand);
         }
-        Opcode::Call | Opcode::Callvirt if operand.table() == METHOD_SPEC => {
+        Opcode::Call | Opcode::Callvirt | Opcode::Ldftn | Opcode::Ldvirtftn
+            if operand.table() == METHOD_SPEC =>
+        {
             tokens.generic_calls.insert(operand);
         }
         Opcode::Newobj => {
@@ -2682,9 +2711,14 @@ pub fn load_with_corlib_and_library<'c, 'l, 'p>(
 /// asm N+1. Every cross-assembly reference -- a program `newobj` of a library type, a virtual
 /// call into a library base, a static call, a library's own call into corlib or a sibling
 /// library -- resolves by name through the shared indices, exactly as a two-assembly load
-/// resolves a program's references to corlib. Resolution is name-keyed, so the library ORDER
-/// never changes what binds -- only which assembly id each image gets. This is the deploy
-/// shape for a driver or protocol stack: the corlib, the device/net API assemblies, the app.
+/// resolves a program's references to corlib. This is the deploy shape for a driver or protocol
+/// stack: the corlib, the device/net API assemblies, the app.
+///
+/// **The library ORDER you pass does not change what binds** -- only which assembly id each image
+/// gets. That holds because this function SORTS them ([`library_load_order`]), so each library
+/// loads after the ones it references; it does not hold of the underlying single pass, which binds
+/// each assembly's references against the names loaded so far.
+///
 ///
 /// # Errors
 /// [`LoadError::NoEntryPoint`] if the program names no entry point;
@@ -2769,6 +2803,60 @@ pub fn load_with_corlib_monomorphized<'c, 'p>(
     load_with_corlib_and_libraries_lowered(corlib, &[], program, instantiations)
 }
 
+/// The order to LOAD `libraries` in, so each one loads after every library it references.
+///
+/// # Why the loader sorts instead of trusting the caller
+///
+/// `load_assembly` does two things in one pass over an assembly: it DECLARES that assembly's names
+/// into the shared indices, and it BINDS that assembly's own references against the indices as they
+/// stand at that moment. So a library loaded before one it references cannot bind to it -- the
+/// names are not there yet -- and the calls are left resolving to nothing.
+///
+/// **That is silent.** The image loads, the program runs if it never reaches those calls, and only
+/// `Module::validate_profile` reports them. Measured on this tree's own fixtures: `Lamella.Net.Time`
+/// then `Lamella.Net.Time.Nts` gives ZERO violations, and the same two swapped gives THREE, in
+/// `NtsClient.ProtectedSync` and `NtsClient.Fail`. An outside builder loading a board support
+/// assembly before its dependencies got 18, and shipped an image whose GPIO constructor called
+/// nothing.
+///
+/// Sorting here rather than asking callers to topologically sort is what makes
+/// [`load_with_corlib_and_libraries`]'s documented contract -- that order never changes what binds
+/// -- TRUE. It was previously false, and stated.
+///
+/// # What it does not attempt
+///
+/// A reference to a name that is not among `libraries` (corlib, or an assembly the caller did not
+/// pass) is ignored: corlib always loads first, and a genuinely missing assembly is a binding
+/// failure that `validate_profile` already names better than an ordering error could.
+fn library_load_order(libraries: &[SourceAssembly<'_>]) -> Result<Vec<usize>, LoadError> {
+    let names: Vec<Option<&str>> = libraries.iter().map(|lib| lib.assembly_name()).collect();
+    let mut needs: Vec<Vec<usize>> = alloc::vec![Vec::new(); libraries.len()];
+    for (position, library) in libraries.iter().enumerate() {
+        for reference in library.assembly_refs() {
+            let Some(wanted) = reference.name() else {
+                continue;
+            };
+            for (other, name) in names.iter().enumerate() {
+                if other != position && *name == Some(wanted) {
+                    needs[position].push(other);
+                }
+            }
+        }
+    }
+    let mut placed = alloc::vec![false; libraries.len()];
+    let mut order = Vec::with_capacity(libraries.len());
+    while order.len() < libraries.len() {
+        let next = (0..libraries.len())
+            .find(|&i| !placed[i] && needs[i].iter().all(|&dep| placed[dep]));
+        let Some(next) = next else {
+            return Err(LoadError::CircularLibraryReferences);
+        };
+        placed[next] = true;
+        order.push(next);
+    }
+    Ok(order)
+}
+
 /// The one loading core. `instantiations` are the PROGRAM's closed generic instantiations; an empty
 /// slice is the ordinary (non-monomorphizing) load.
 ///
@@ -2791,6 +2879,11 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
     if program.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint);
     }
+    let ordered: alloc::vec::Vec<SourceAssembly<'l>> = {
+        let order = library_load_order(libraries)?;
+        order.into_iter().map(|position| libraries[position].clone()).collect()
+    };
+    let libraries: &[SourceAssembly<'l>] = &ordered;
     let mut module = Module::new();
     let mut index = NameIndex::new();
     let mut type_index = TypeNameIndex::new();
@@ -3698,8 +3791,8 @@ fn bind_recognized_generic_call(
 }
 
 /// The parameter count of a `System.Collections.ArrayList` constructor, if this member is one,
-/// so `newobj` can allocate an empty list. Always `None` without the NETMFv4_4-profile surface.
-#[cfg(feature = "NETMFv4_4")]
+/// so `newobj` can allocate an empty list. Always `None` without the collections capability.
+#[cfg(feature = "collections")]
 fn list_ctor(
     namespace: &str,
     type_name: &str,
@@ -3716,7 +3809,7 @@ fn list_ctor(
     }
 }
 
-#[cfg(not(feature = "NETMFv4_4"))]
+#[cfg(not(feature = "collections"))]
 fn list_ctor(
     _namespace: &str,
     _type_name: &str,
@@ -3800,7 +3893,7 @@ fn bcl_intrinsic(
     if namespace == "System.Reflection" && type_name == "MemberInfo" && method == "get_Name" {
         return Some(intrinsic!(type_get_name));
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" {
         match method {
             "op_Equality" => return Some(intrinsic!(reflect_handle_equals)),
@@ -3818,7 +3911,7 @@ fn bcl_intrinsic(
             _ => None,
         };
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" && type_name == "FieldInfo" {
         match (method, parameters_of(signature)) {
             ("GetValue", [SigType::Object]) => return Some(intrinsic!(field_get_value)),
@@ -3830,24 +3923,24 @@ fn bcl_intrinsic(
             _ => {}
         }
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection"
         && (type_name == "MethodBase" || type_name == "MethodInfo")
         && method == "Invoke"
     {
         return Some(intrinsic!(method_invoke));
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" && type_name == "ConstructorInfo" && method == "Invoke" {
         if let [SigType::SzArray(_)] = parameters_of(signature) {
             return Some(intrinsic!(constructor_invoke));
         }
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" && type_name == "MethodInfo" && method == "get_ReturnType" {
         return Some(intrinsic!(member_get_type));
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" && type_name == "MethodBase" {
         match method {
             "get_IsPublic" => return Some(intrinsic!(method_is_public)),
@@ -3864,7 +3957,7 @@ fn bcl_intrinsic(
             _ => {}
         }
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(feature = "reflection")]
     if namespace == "System.Reflection" && type_name == "Assembly" {
         match method {
             "GetType" if matches!(parameters_of(signature), [SigType::String]) => {
@@ -4163,63 +4256,63 @@ fn bcl_intrinsic(
         ("WeakReference", "WriteWeakCell") => Some(intrinsic!(weak_write_cell)),
         ("Type", "GetTypeFromHandle") => Some(intrinsic!(type_from_handle)),
         ("Type", "get_Name") => Some(intrinsic!(type_get_name)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_FullName") => Some(intrinsic!(type_get_full_name)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_Namespace") => Some(intrinsic!(type_get_namespace)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_Assembly") => Some(intrinsic!(type_get_assembly)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_BaseType") => Some(intrinsic!(type_get_base_type)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsEnum") => Some(intrinsic!(type_is_enum)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsValueType") => Some(intrinsic!(type_is_value_type)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsClass") => Some(intrinsic!(type_is_class)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsInterface") => Some(intrinsic!(type_is_interface)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsAbstract") => Some(intrinsic!(type_is_abstract)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsPublic") => Some(intrinsic!(type_is_public)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsNotPublic") => Some(intrinsic!(type_is_not_public)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "get_IsArray") => Some(intrinsic!(type_is_array)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "op_Equality") => Some(intrinsic!(reflect_handle_equals)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "op_Inequality") => Some(intrinsic!(reflect_handle_not_equals)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "HandleEquals") => Some(intrinsic!(reflect_handle_equals)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "GetField") => match parameters_of(signature) {
             [SigType::String] | [SigType::String, _] => Some(intrinsic!(type_get_field)),
             _ => None,
         },
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "GetFields") => Some(intrinsic!(type_get_fields)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "GetMethods") => Some(intrinsic!(type_get_methods)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "GetMethod") => match parameters_of(signature) {
             [SigType::String] | [SigType::String, _] => Some(intrinsic!(type_get_method)),
             _ => None,
         },
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "GetProperty") => match parameters_of(signature) {
             [SigType::String] | [SigType::String, _] => Some(intrinsic!(type_get_property)),
             _ => None,
         },
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "GetPropertyCustomAttributes") => Some(intrinsic!(type_property_custom_attributes)),
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Type", "GetConstructor") => match parameters_of(signature) {
             [SigType::SzArray(_)] => Some(intrinsic!(type_get_constructor)),
             _ => None,
         },
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         ("Activator", "CreateInstance") => match parameters_of(signature) {
             [_] => Some(intrinsic!(activator_create_instance)),
             _ => None,
@@ -4362,11 +4455,11 @@ fn bcl_intrinsic(
     if base.is_some() {
         return base;
     }
-    #[cfg(feature = "NETMFv4_4")]
+    #[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
     {
         extended::extended_intrinsic(type_name, method, signature)
     }
-    #[cfg(not(feature = "NETMFv4_4"))]
+    #[cfg(not(any(feature = "NETMFv4_4", feature = "text", feature = "collections")))]
     {
         None
     }
@@ -4793,7 +4886,7 @@ fn record_custom_attributes(
         let type_token = Token::new(TYPE_DEF, (local_index + 1) as u32);
         let type_handle = asm_key(asm, type_token.0);
         record_target_attributes(assembly, module, asm, type_handle, type_token);
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         if let Some(type_name) = type_def.name() {
             module.bind_type_name(asm, type_token, String::from(type_name.name));
             let full_name = if type_name.namespace.is_empty() {
@@ -4838,12 +4931,12 @@ fn record_custom_attributes(
                 },
             );
         }
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         let mut reflect_fields = Vec::new();
         for field in type_def.fields() {
             let handle = asm_key(asm, field.token().0);
             record_target_attributes(assembly, module, asm, handle, field.token());
-            #[cfg(feature = "NETMFv4_4")]
+            #[cfg(feature = "reflection")]
             if let Some(name) = field.name() {
                 module.bind_type_field_name(type_handle, name, handle);
                 module.bind_type_name(asm, field.token(), String::from(name));
@@ -4869,15 +4962,15 @@ fn record_custom_attributes(
                 }
             }
         }
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         module.bind_type_fields(type_handle, reflect_fields);
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         let mut reflect_methods = Vec::new();
         for method in type_def.methods() {
             let token = Token::new(METHOD_DEF, method.rid());
             let handle = asm_key(asm, token.0);
             record_target_attributes(assembly, module, asm, handle, token);
-            #[cfg(feature = "NETMFv4_4")]
+            #[cfg(feature = "reflection")]
             for param in method.params() {
                 record_target_attributes(
                     assembly,
@@ -4887,7 +4980,7 @@ fn record_custom_attributes(
                     param.token(),
                 );
             }
-            #[cfg(feature = "NETMFv4_4")]
+            #[cfg(feature = "reflection")]
             if let Some(name) = method.name() {
                 module.bind_type_method_name(type_handle, name, handle);
                 module.bind_type_name(asm, token, String::from(name));
@@ -4944,12 +5037,12 @@ fn record_custom_attributes(
                 }
             }
         }
-        #[cfg(feature = "NETMFv4_4")]
+        #[cfg(feature = "reflection")]
         module.bind_type_methods(type_handle, reflect_methods);
         for property in type_def.properties() {
             let handle = asm_key(asm, property.token().0);
             record_target_attributes(assembly, module, asm, handle, property.token());
-            #[cfg(feature = "NETMFv4_4")]
+            #[cfg(feature = "reflection")]
             if let Some(name) = property.name() {
                 module.bind_type_property_name(type_handle, name, handle);
             }
@@ -5119,7 +5212,7 @@ fn split_reflection_name(reflection_name: &str) -> (&str, &str) {
 /// module stores for `FieldInfo.GetRawConstantValue`: bool/char keep their identity (they must
 /// box as Boolean/Char, not bare ints), integers ride sign-extended with a wide flag, floats
 /// per width (dropped to null on a no-float build -- no corpus does this), strings as UTF-16.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn field_constant_of(constant: ConstantValue) -> lamella_cil_runtime::module::FieldConstant {
     use lamella_cil_runtime::module::FieldConstant;
     match constant {
@@ -6032,14 +6125,60 @@ fn bind_call_targets(
 /// the interface method -- cannot reach it by signature; this map provides the dispatch.
 /// `type_defs()` yields rows in order, so the local index `i` is the global `type_offset + i`.
 fn bind_explicit_overrides(module: &mut Module, assembly: &Assembly, asm: u8, type_offset: usize) {
+    let mut rows_by_member: BTreeMap<String, Vec<Token>> = BTreeMap::new();
+    for row in 1..=u32::from(u16::MAX) {
+        let Some(member) = assembly.member_ref(row) else {
+            break;
+        };
+        if let Some(key) = member_ref_row_identity(assembly, &member) {
+            rows_by_member.entry(key).or_default().push(Token::new(MEMBER_REF, row));
+        }
+    }
     for (local, type_def) in assembly.type_defs().enumerate() {
         let type_id = (type_offset + local) as TypeId;
         for (body_token, declaration_token) in type_def.method_impls() {
-            if let Some(body) = module.resolve(asm, body_token) {
-                module.add_explicit_override(asm, type_id, declaration_token, body);
+            let Some(body) = module.resolve(asm, body_token) else {
+                continue;
+            };
+            module.add_explicit_override(asm, type_id, declaration_token, body);
+            if declaration_token.table() != MEMBER_REF {
+                continue;
+            }
+            let identity = assembly
+                .member_ref(declaration_token.row())
+                .and_then(|member| member_ref_row_identity(assembly, &member));
+            let Some(identity) = identity else {
+                continue;
+            };
+            for token in rows_by_member.get(&identity).map(Vec::as_slice).unwrap_or(&[]) {
+                module.add_explicit_override(asm, type_id, *token, body);
             }
         }
     }
+}
+
+/// What a `MemberRef` row MEANS -- its parent, name and signature -- as a comparable key, so two
+/// rows denoting one member group together however the table spelled them.
+///
+/// The parent contributes its `TypeSpec` SIGNATURE where it has one and its qualified NAME
+/// otherwise: a constructed interface has no name to compare and two `TypeSpec` rows carrying the
+/// same instantiation must still group.
+fn member_ref_row_identity(assembly: &Assembly, member: &lamella_metadata::MemberRef<'_>) -> Option<String> {
+    let parent = member.parent();
+    let parent_key = if parent.table() == TYPE_SPEC {
+        alloc::format!("{:?}", assembly.type_spec_signature(parent)?)
+    } else {
+        let (namespace, name) = assembly.type_token_full_name(parent)?;
+        type_key(&namespace, &name)
+    };
+    let name = member.name()?;
+    let signature = member.method_signature();
+    let arity = signature.as_ref().map_or(0, |sig| sig.generic_param_count);
+    let params = signature.map(|sig| sig.parameters).unwrap_or_default();
+    Some(alloc::format!(
+        "{parent_key}|{}",
+        sig_encode(assembly, name, &params, arity, &[])
+    ))
 }
 
 /// How a type's base resolves for vtable construction: a same-assembly base (a local index
@@ -6449,10 +6588,11 @@ fn string_ctor_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u
 /// The NETMFv4_4-profile BCL bindings beyond the Kernel Profile, gated by
 /// `NETMFv4_4`: the overload pickers plus the `extended_intrinsic` dispatch `bcl_intrinsic`
 /// delegates to.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
 mod extended {
     use super::*;
 
+    #[cfg(feature = "text")]
     /// `String.IndexOf(char)` / `IndexOf(string)` -- the ordinal-search overloads.
     fn string_index_of_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
@@ -6462,6 +6602,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// `String.LastIndexOf(char)`.
     fn string_last_index_of_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
@@ -6470,6 +6611,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// A one-string-argument predicate (`StartsWith` / `EndsWith` / `Contains`), ordinal.
     fn string_one_string_predicate(
         intrinsic: (IntrinsicFn, u32),
@@ -6481,6 +6623,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// A parameterless string-returning transform (`ToUpper` / `ToLower` / `Trim`); the
     /// culture/char-set overloads are not modeled.
     fn string_no_arg_transform(
@@ -6493,6 +6636,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// `String.Replace(char, char)` / `Replace(string, string)`.
     fn string_replace_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
@@ -6502,6 +6646,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `Math.Abs(int)` / `Abs(long)` -- the integer overloads (float/double need libm).
     fn math_abs_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
@@ -6525,6 +6670,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// A binary `Math` overload (`Max` / `Min`) over two ints or two longs.
     fn math_binary_overload(
         int32: (IntrinsicFn, u32),
@@ -6551,6 +6697,7 @@ mod extended {
     #[cfg(not(all(feature = "NETMFv4_4", feature = "float")))]
     const MATH_MIN_F64: Option<(IntrinsicFn, u32)> = None;
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `Math.Sign(int)` / `Sign(long)` -- both return an `int`.
     fn math_sign_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
@@ -6562,6 +6709,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// A one-`char` `System.Char` method (classification or ASCII casing).
     fn char_one_arg_overload(
         intrinsic: (IntrinsicFn, u32),
@@ -6573,6 +6721,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// A single-`string`-argument static method (`Int32.Parse`, `Boolean.Parse`, ...). The
     /// format-provider / number-styles overloads are not modeled.
     fn one_string_overload(
@@ -6585,6 +6734,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Convert.ToString(value)`: dispatch to the primitive's `ToString` rendering by
     /// the argument type (each is a Kernel/base intrinsic reused for the static conversion).
     fn convert_to_string_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
@@ -6601,6 +6751,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// `String.PadLeft(int)` / `PadLeft(int, char)` (and the `PadRight` pair).
     fn string_pad_overload(
         intrinsic: (IntrinsicFn, u32),
@@ -6612,6 +6763,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// `String.Insert(int, string)`.
     fn string_insert_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
@@ -6620,6 +6772,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// `String.Remove(int)` / `Remove(int, int)`.
     fn string_remove_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
@@ -6640,6 +6793,7 @@ mod extended {
         None
     }
 
+    #[cfg(feature = "collections")]
     /// The `get_Count` / `Contains` / `Clear` methods shared by `Stack` and `Queue` (both
     /// are array-backed, so they reuse the list intrinsics).
     fn collection_shared(method: &str, signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
@@ -6660,86 +6814,107 @@ mod extended {
         signature: Option<&MethodSig>,
     ) -> Option<(IntrinsicFn, u32)> {
         match (type_name, method) {
+            #[cfg(feature = "collections")]
             ("ArrayList", "Add") => match parameters_of(signature) {
                 [SigType::Object] => Some(intrinsic!(list_add)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("ArrayList", "get_Item") => match parameters_of(signature) {
                 [SigType::I4] => Some(intrinsic!(list_get_item)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("ArrayList", "set_Item") => match parameters_of(signature) {
                 [SigType::I4, SigType::Object] => Some(intrinsic!(list_set_item)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("ArrayList", "get_Count") => match parameters_of(signature) {
                 [] => Some(intrinsic!(list_get_count)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("ArrayList", "Clear") => match parameters_of(signature) {
                 [] => Some(intrinsic!(list_clear)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("ArrayList", "RemoveAt") => match parameters_of(signature) {
                 [SigType::I4] => Some(intrinsic!(list_remove_at)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("ArrayList", "Insert") => match parameters_of(signature) {
                 [SigType::I4, SigType::Object] => Some(intrinsic!(list_insert)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Hashtable", "Add") => match parameters_of(signature) {
                 [SigType::Object, SigType::Object] => Some(intrinsic!(map_add)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Hashtable", "get_Item") => match parameters_of(signature) {
                 [SigType::Object] => Some(intrinsic!(map_get_item)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Hashtable", "set_Item") => match parameters_of(signature) {
                 [SigType::Object, SigType::Object] => Some(intrinsic!(map_set_item)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Hashtable", "get_Count") => match parameters_of(signature) {
                 [] => Some(intrinsic!(map_get_count)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Hashtable", "Contains" | "ContainsKey") => match parameters_of(signature) {
                 [SigType::Object] => Some(intrinsic!(map_contains)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Hashtable", "Remove") => match parameters_of(signature) {
                 [SigType::Object] => Some(intrinsic!(map_remove)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Hashtable", "Clear") => match parameters_of(signature) {
                 [] => Some(intrinsic!(list_clear)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Stack", "Push") => match parameters_of(signature) {
                 [SigType::Object] => Some(intrinsic!(collection_push)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Stack", "Pop") => match parameters_of(signature) {
                 [] => Some(intrinsic!(stack_pop)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Stack", "Peek") => match parameters_of(signature) {
                 [] => Some(intrinsic!(stack_peek)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Queue", "Enqueue") => match parameters_of(signature) {
                 [SigType::Object] => Some(intrinsic!(collection_push)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Queue", "Dequeue") => match parameters_of(signature) {
                 [] => Some(intrinsic!(queue_dequeue)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Queue", "Peek") => match parameters_of(signature) {
                 [] => Some(intrinsic!(queue_peek)),
                 _ => None,
             },
+            #[cfg(feature = "collections")]
             ("Stack" | "Queue", "get_Count" | "Contains" | "Clear") => {
                 collection_shared(method, signature)
             }
@@ -6755,25 +6930,42 @@ mod extended {
         signature: Option<&MethodSig>,
     ) -> Option<(IntrinsicFn, u32)> {
         match (type_name, method) {
+            #[cfg(feature = "text")]
             ("String", "IndexOf") => string_index_of_overload(signature),
+            #[cfg(feature = "text")]
             ("String", "LastIndexOf") => string_last_index_of_overload(signature),
+            #[cfg(feature = "text")]
             ("String", "StartsWith") => string_one_string_predicate(intrinsic!(string_starts_with), signature),
+            #[cfg(feature = "text")]
             ("String", "EndsWith") => string_one_string_predicate(intrinsic!(string_ends_with), signature),
+            #[cfg(feature = "text")]
             ("String", "Contains") => string_one_string_predicate(intrinsic!(string_contains), signature),
+            #[cfg(feature = "text")]
             ("String", "ToUpper") => string_no_arg_transform(intrinsic!(string_to_upper), signature),
+            #[cfg(feature = "text")]
             ("String", "ToLower") => string_no_arg_transform(intrinsic!(string_to_lower), signature),
+            #[cfg(feature = "text")]
             ("String", "Trim") => string_no_arg_transform(intrinsic!(string_trim), signature),
+            #[cfg(feature = "text")]
             ("String", "Replace") => string_replace_overload(signature),
+            #[cfg(feature = "text")]
             ("String", "PadLeft") => string_pad_overload(intrinsic!(string_pad_left), signature),
+            #[cfg(feature = "text")]
             ("String", "PadRight") => string_pad_overload(intrinsic!(string_pad_right), signature),
+            #[cfg(feature = "text")]
             ("String", "Insert") => string_insert_overload(signature),
+            #[cfg(feature = "text")]
             ("String", "Remove") => string_remove_overload(signature),
+            #[cfg(feature = "text")]
             ("String", "ToCharArray") => string_no_arg_transform(intrinsic!(string_to_char_array), signature),
+            #[cfg(feature = "text")]
             ("String", "Equals") => string_one_string_predicate(intrinsic!(string_equals), signature),
+            #[cfg(feature = "text")]
             ("String", "Split") => match parameters_of(signature) {
                 [SigType::Char, SigType::ValueType(_)] => Some(intrinsic!(string_split_char)),
                 _ => None,
             },
+            #[cfg(feature = "text")]
             ("String", "Join") => match parameters_of(signature) {
                 [SigType::String, SigType::SzArray(element)]
                     if matches!(element.as_ref(), SigType::String) =>
@@ -6782,13 +6974,17 @@ mod extended {
                 }
                 _ => None,
             },
+            #[cfg(feature = "NETMFv4_4")]
             ("Math", "Abs") => math_abs_overload(signature),
+            #[cfg(feature = "NETMFv4_4")]
             ("Math", "Max") => {
                 math_binary_overload(intrinsic!(math_max_int32), intrinsic!(math_max_int64), MATH_MAX_F64, signature)
             }
+            #[cfg(feature = "NETMFv4_4")]
             ("Math", "Min") => {
                 math_binary_overload(intrinsic!(math_min_int32), intrinsic!(math_min_int64), MATH_MIN_F64, signature)
             }
+            #[cfg(feature = "NETMFv4_4")]
             ("Math", "Sign") => math_sign_overload(signature),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Floor") => math_unary_f64_overload(intrinsic!(math_floor_f64), signature),
@@ -6843,39 +7039,56 @@ mod extended {
                 [SigType::R8, SigType::R8] => Some(intrinsic!(math_ieee_remainder_f64)),
                 _ => None,
             },
+            #[cfg(feature = "text")]
             ("Char", "IsDigit") => char_one_arg_overload(intrinsic!(char_is_digit), signature),
+            #[cfg(feature = "text")]
             ("Char", "IsLetter") => char_one_arg_overload(intrinsic!(char_is_letter), signature),
+            #[cfg(feature = "text")]
             ("Char", "IsLetterOrDigit") => {
                 char_one_arg_overload(intrinsic!(char_is_letter_or_digit), signature)
             }
+            #[cfg(feature = "text")]
             ("Char", "IsWhiteSpace") => char_one_arg_overload(intrinsic!(char_is_white_space), signature),
+            #[cfg(feature = "text")]
             ("Char", "IsUpper") => char_one_arg_overload(intrinsic!(char_is_upper), signature),
+            #[cfg(feature = "text")]
             ("Char", "IsLower") => char_one_arg_overload(intrinsic!(char_is_lower), signature),
+            #[cfg(feature = "text")]
             ("Char", "ToUpper") => char_one_arg_overload(intrinsic!(char_to_upper), signature),
+            #[cfg(feature = "text")]
             ("Char", "ToLower") => char_one_arg_overload(intrinsic!(char_to_lower), signature),
+            #[cfg(feature = "NETMFv4_4")]
             ("Int32", "Parse") => one_string_overload(intrinsic!(int32_parse), signature),
+            #[cfg(feature = "NETMFv4_4")]
             ("Int64", "Parse") => one_string_overload(intrinsic!(int64_parse), signature),
+            #[cfg(feature = "NETMFv4_4")]
             ("Boolean", "Parse") => one_string_overload(intrinsic!(boolean_parse), signature),
+            #[cfg(feature = "NETMFv4_4")]
             ("Convert", "ToInt32") => match parameters_of(signature) {
                 [SigType::String] => Some(intrinsic!(int32_parse)),
                 #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
                 [SigType::R8] => Some(intrinsic!(convert_to_int32_double)),
                 _ => None,
             },
+            #[cfg(feature = "NETMFv4_4")]
             ("Convert", "ToInt64") => one_string_overload(intrinsic!(int64_parse), signature),
+            #[cfg(feature = "NETMFv4_4")]
             ("Convert", "ToBoolean") => match parameters_of(signature) {
                 [SigType::String] => Some(intrinsic!(boolean_parse)),
                 [SigType::I4] => Some(intrinsic!(convert_to_boolean_int)),
                 _ => None,
             },
+            #[cfg(feature = "NETMFv4_4")]
             ("Convert", "ToChar") => match parameters_of(signature) {
                 [SigType::I4] => Some(intrinsic!(convert_to_char_int)),
                 _ => None,
             },
+            #[cfg(feature = "NETMFv4_4")]
             ("Convert", "ToByte") => match parameters_of(signature) {
                 [SigType::I4] => Some(intrinsic!(convert_to_byte_int)),
                 _ => None,
             },
+            #[cfg(feature = "NETMFv4_4")]
             ("Convert", "ToString") => convert_to_string_overload(signature),
             _ => None,
         }

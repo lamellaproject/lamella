@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_py_bytecode::CodeObject;
+use lamella_py_bytecode::{CodeObject, Functions};
 
 use lamella_net_core::{Interest, NetBackend, NetResult, SocketHandle};
 use crate::bigint::BigInt;
@@ -313,7 +313,7 @@ pub fn call_stdlib_kw(
     id: u32,
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -892,7 +892,7 @@ fn build_math_module(model: &mut ObjectModel) -> Result<Value, Trap> {
 pub fn call_stdlib(
     id: u32,
     args: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -1795,7 +1795,7 @@ mod tests {
     #[cfg(feature = "float")]
     fn call_f(f: StdlibFn, args: &[f64], model: &mut ObjectModel) -> f64 {
         let vals: Vec<Value> = args.iter().map(|&a| model.new_float(a).unwrap()).collect();
-        let r = call_stdlib(f.id(), &vals, &[], model, 0).unwrap();
+        let r = call_stdlib(f.id(), &vals, &Functions::default(), model, 0).unwrap();
         model.as_f64(r).unwrap()
     }
 
@@ -1828,30 +1828,30 @@ mod tests {
     fn math_int_returning_functions() {
         let mut m = model();
         let three_seven = m.new_float(3.7).unwrap();
-        let r = call_stdlib(StdlibFn::MathFloor.id(), &[three_seven], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathFloor.id(), &[three_seven], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(3));
         let three_two = m.new_float(3.2).unwrap();
-        let r = call_stdlib(StdlibFn::MathCeil.id(), &[three_two], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathCeil.id(), &[three_two], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(4));
         let neg = m.new_float(-3.7).unwrap();
-        let r = call_stdlib(StdlibFn::MathTrunc.id(), &[neg], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathTrunc.id(), &[neg], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(-3));
-        let r = call_stdlib(StdlibFn::MathFloor.id(), &[fixnum(5)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathFloor.id(), &[fixnum(5)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(5));
-        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(5)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(5)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(120));
-        let r = call_stdlib(StdlibFn::MathGcd.id(), &[fixnum(12), fixnum(18)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathGcd.id(), &[fixnum(12), fixnum(18)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(6));
-        let r = call_stdlib(StdlibFn::MathLcm.id(), &[fixnum(4), fixnum(6)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathLcm.id(), &[fixnum(4), fixnum(6)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(12));
-        let r = call_stdlib(StdlibFn::MathIsqrt.id(), &[fixnum(17)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathIsqrt.id(), &[fixnum(17)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(4));
     }
 
     #[test]
     fn factorial_promotes_to_bigint() {
         let mut m = model();
-        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(25)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(25)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.repr(r), "15511210043330985984000000");
     }
 
@@ -1863,12 +1863,12 @@ mod tests {
         let mut m = model();
         for value in [3.5_f64, -3.5, 1e300, 5e-324, 0.5] {
             let x = m.new_float(value).unwrap();
-            let pair = call_stdlib(StdlibFn::MathFrexp.id(), &[x], &[], &mut m, 0).unwrap();
+            let pair = call_stdlib(StdlibFn::MathFrexp.id(), &[x], &Functions::default(), &mut m, 0).unwrap();
             let parts = m.seq_value(pair).cloned().unwrap();
             let mantissa = m.as_f64(parts[0]).unwrap();
             assert!((0.5..1.0).contains(&libm::fabs(mantissa)), "mantissa {mantissa} of {value}");
             let back =
-                call_stdlib(StdlibFn::MathLdexp.id(), &[parts[0], parts[1]], &[], &mut m, 0).unwrap();
+                call_stdlib(StdlibFn::MathLdexp.id(), &[parts[0], parts[1]], &Functions::default(), &mut m, 0).unwrap();
             assert_eq!(m.as_f64(back), Some(value));
         }
     }
@@ -1880,13 +1880,13 @@ mod tests {
     fn ldexp_accepts_every_integer_tier_and_refuses_a_float() {
         let mut m = model();
         let one = m.new_float(1.0).unwrap();
-        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, Value::TRUE], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, Value::TRUE], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_f64(r), Some(2.0));
-        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, Value::FALSE], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, Value::FALSE], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_f64(r), Some(1.0));
         let half = m.new_float(1.5).unwrap();
         assert!(matches!(
-            call_stdlib(StdlibFn::MathLdexp.id(), &[one, half], &[], &mut m, 0),
+            call_stdlib(StdlibFn::MathLdexp.id(), &[one, half], &Functions::default(), &mut m, 0),
             Err(Trap::TypeError)
         ));
     }
@@ -1899,13 +1899,13 @@ mod tests {
         let mut m = model();
         let one = m.new_float(1.0).unwrap();
         assert!(matches!(
-            call_stdlib(StdlibFn::MathLdexp.id(), &[one, fixnum(2000)], &[], &mut m, 0),
+            call_stdlib(StdlibFn::MathLdexp.id(), &[one, fixnum(2000)], &Functions::default(), &mut m, 0),
             Err(Trap::Overflow)
         ));
-        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, fixnum(-2000)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[one, fixnum(-2000)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_f64(r), Some(0.0));
         let inf = m.new_float(f64::INFINITY).unwrap();
-        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[inf, fixnum(2000)], &[], &mut m, 0).unwrap();
+        let r = call_stdlib(StdlibFn::MathLdexp.id(), &[inf, fixnum(2000)], &Functions::default(), &mut m, 0).unwrap();
         assert_eq!(m.as_f64(r), Some(f64::INFINITY));
     }
 
@@ -1915,7 +1915,7 @@ mod tests {
     fn modf_splits_fraction_then_integer() {
         let mut m = model();
         let x = m.new_float(-3.5).unwrap();
-        let pair = call_stdlib(StdlibFn::MathModf.id(), &[x], &[], &mut m, 0).unwrap();
+        let pair = call_stdlib(StdlibFn::MathModf.id(), &[x], &Functions::default(), &mut m, 0).unwrap();
         let parts = m.seq_value(pair).cloned().unwrap();
         assert_eq!(m.as_f64(parts[0]), Some(-0.5));
         assert_eq!(m.as_f64(parts[1]), Some(-3.0));
@@ -1928,10 +1928,10 @@ mod tests {
         let inf = m.new_float(f64::INFINITY).unwrap();
         let nan = m.new_float(f64::NAN).unwrap();
         let one = m.new_float(1.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathIsinf.id(), &[inf], &[], &mut m, 0).unwrap(), Value::TRUE);
-        assert_eq!(call_stdlib(StdlibFn::MathIsnan.id(), &[nan], &[], &mut m, 0).unwrap(), Value::TRUE);
-        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[one], &[], &mut m, 0).unwrap(), Value::TRUE);
-        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[inf], &[], &mut m, 0).unwrap(), Value::FALSE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsinf.id(), &[inf], &Functions::default(), &mut m, 0).unwrap(), Value::TRUE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsnan.id(), &[nan], &Functions::default(), &mut m, 0).unwrap(), Value::TRUE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[one], &Functions::default(), &mut m, 0).unwrap(), Value::TRUE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[inf], &Functions::default(), &mut m, 0).unwrap(), Value::FALSE);
     }
 
     #[cfg(feature = "float")]
@@ -1939,18 +1939,18 @@ mod tests {
     fn math_domain_errors() {
         let mut m = model();
         let neg = m.new_float(-1.0).unwrap();
-        let err = call_stdlib(StdlibFn::MathSqrt.id(), &[neg], &[], &mut m, 0).unwrap_err();
+        let err = call_stdlib(StdlibFn::MathSqrt.id(), &[neg], &Functions::default(), &mut m, 0).unwrap_err();
         assert_eq!(err, Trap::ValueError);
         let zero = m.new_float(0.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathLog.id(), &[zero], &[], &mut m, 0).unwrap_err(), Trap::ValueError);
-        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(-1)], &[], &mut m, 0).unwrap_err();
+        assert_eq!(call_stdlib(StdlibFn::MathLog.id(), &[zero], &Functions::default(), &mut m, 0).unwrap_err(), Trap::ValueError);
+        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(-1)], &Functions::default(), &mut m, 0).unwrap_err();
         assert_eq!(r, Trap::ValueError);
         let half = m.new_float(3.5).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathFactorial.id(), &[half], &[], &mut m, 0).unwrap_err(), Trap::TypeError);
+        assert_eq!(call_stdlib(StdlibFn::MathFactorial.id(), &[half], &Functions::default(), &mut m, 0).unwrap_err(), Trap::TypeError);
         let two = m.new_float(2.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathAcos.id(), &[two], &[], &mut m, 0).unwrap_err(), Trap::ValueError);
+        assert_eq!(call_stdlib(StdlibFn::MathAcos.id(), &[two], &Functions::default(), &mut m, 0).unwrap_err(), Trap::ValueError);
         let big = m.new_float(10000.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathExp.id(), &[big], &[], &mut m, 0).unwrap_err(), Trap::Overflow);
+        assert_eq!(call_stdlib(StdlibFn::MathExp.id(), &[big], &Functions::default(), &mut m, 0).unwrap_err(), Trap::Overflow);
     }
 
     #[cfg(feature = "float")]

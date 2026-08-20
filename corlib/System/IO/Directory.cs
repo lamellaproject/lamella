@@ -70,7 +70,7 @@ namespace System.IO
         }
     }
 
-    public class DirectoryInfo
+    public sealed class DirectoryInfo
     {
         private string _path;
 

@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Collections.BitArray
 namespace System.Collections
 {
-    public class BitArray
+    public sealed class BitArray
     {
         private int[] bits;
         private int length;

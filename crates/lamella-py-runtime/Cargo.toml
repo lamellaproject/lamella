@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Lamella's Python runtime: the bytecode interpreter, the dynamic object model, and built-ins."
+publish = false
 
 [features]
 default = ["gc-collect", "float", "complex", "bundled-stdlib", "introspection"]
@@ -31,9 +32,16 @@ lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 lamella-reactor = { path = "../lamella-reactor" }
 lamella-net-core = { path = "../lamella-net-core" }
 # The shared Unicode Character Database properties: str predicates (isalpha/isspace/...)
-# classify code points exactly as CPython, from one tree-shakeable table. The str predicates use
-# only the categories tier, so opt out of `normalization` (and `alloc` in the crate).
-lamella-unicode = { path = "../lamella-unicode", default-features = false }
+# classify code points exactly as CPython, from one tree-shakeable table.
+# `normalization` is on for ONE THING IN IT -- `full_case_fold`, the `C`+`F` rows of CaseFolding.txt
+# that `str.casefold()` needs. The feature name is wider than what a Python image links: measured on
+# `same54-py` (thumbv7em, flash profile), turning it on grew the loadable image 495,784 -> 506,288
+# bytes, +10,504, which is the fold tables and 56 bytes of code. The NFC/NFD decomposition and
+# composition tables (~134 KiB) are in the same tier and the linker drops every one of them, because
+# nothing here calls `normalize`. A narrower `folding` feature would name the cost honestly, and it
+# would change what this line SPELLS rather than what the image WEIGHS -- the tables the linker
+# already drops do not come back either way.
+lamella-unicode = { path = "../lamella-unicode", default-features = false, features = ["normalization"] }
 # The shared code-point byte codec. A Python `str` is a sequence of CODE POINTS and a Rust `String`
 # is a sequence of SCALAR VALUES; the difference between those two sets is exactly the surrogate
 # block, so the string arena holds WTF-8 bytes rather than a `String`. This crate is the ONE

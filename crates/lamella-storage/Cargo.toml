@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Storage composition glue: brings up a memory card (SD/MMC over SPI) and mounts it as a FAT filesystem backend for the interpreter's fs seam. The native seam a managed mount call crosses -- it wires lamella-sd-spi (the block device) to lamella-fs-fat (the file system) and hands back the boxed FsBackend, naming neither a board below nor an exception above."
+publish = false
 
 [dependencies]
 # The fs seam the composed backend installs into. `default-features = false` keeps this glue off the

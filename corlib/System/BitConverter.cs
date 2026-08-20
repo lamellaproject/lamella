@@ -3,6 +3,8 @@ namespace System
 {
     public sealed class BitConverter
     {
+        private BitConverter() { }
+
         public static readonly bool IsLittleEndian = true;
 
 #if LAMELLA_SURFACE_FLOAT

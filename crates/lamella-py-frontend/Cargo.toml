@@ -6,12 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Lamella's Python 3 front end: lexer, parser, our versioned bytecode, and the typed Python-to-MIR lowering."
+publish = false
 
 [dependencies]
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 lamella-ir = { path = "../lamella-ir" }
 
 [dev-dependencies]
+lamella-flash-format = { path = "../lamella-flash-format" }
 lamella-aot = { path = "../lamella-aot" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32" }
 lamella-elf = { path = "../lamella-elf" }

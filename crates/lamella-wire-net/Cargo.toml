@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Lamella Link over TCP, for the side of the link that has no std: the wire's frame codec driven over the non-blocking NetBackend socket seam. A board serving Lamella Link over its own Wi-Fi, and an on-board Linux daemon relaying to a microcontroller beside it, are the same transport reached two ways."
+publish = false
 
 [dependencies]
 # The protocol: the frame codec, the Transport seam, TransportError. Depends on nothing itself.

@@ -15,7 +15,7 @@ use lamella_token::Token;
 use super::{
     FIELD, FieldNameIndex, MEMBER_REF, METHOD_DEF, METHOD_SPEC, TYPE_DEF, TYPE_REF, TYPE_SPEC,
     TypeNameIndex,
-    arg_count, cast_elem_of_sig, default_field_value, full_type_name,
+    arg_count, cast_elem_of_sig, default_field_value, is_special_reference_base,
     type_key, type_name_key,
 };
 
@@ -31,6 +31,44 @@ const SYNTHETIC_TABLE: u8 = 0x7E;
 /// instantiation of the program's own definition needs no check on its arguments -- there is one
 /// assembly there and nothing to rebase.
 const PROGRAM_SOURCE: usize = 0;
+
+/// The name a DEFINITION is keyed by in this pass -- asked of the shared crate's speller rather
+/// than spelled a second time here.
+///
+/// # Why this is not [`super::full_type_name`], which every one of these sites used to call
+///
+/// Every name this pass matches a definition against was written by
+/// `lamella_generics::type_def_full_name`: an [`Instantiation`]'s `definition`, a
+/// `lamella_generics::MethodPair`'s `declaring`, and the names the closure walk answers to. That
+/// function spells a NESTED type as its enclosing chain joined with `+`, prefixed by the OUTERMOST
+/// type's namespace. [`super::full_type_name`] spells the row's OWN namespace and name, and a
+/// nested `TypeDef`'s namespace is empty (II.22.32) -- so it answers a bare `Cursor` where the
+/// set holds `` Box`1+Cursor ``. **The two agree for every top-level type and disagree for
+/// every nested one.**
+///
+/// **AND THE DISAGREEMENT IS SILENT.** A lookup that misses leaves the call site marked, the load
+/// succeeds, and the program traps at run time on a call nothing reported. Measured on a
+/// `class Box<T>` with four nested types: 4 `DefinitionNotHere` + 11 `InstantiationNotInSet`
+/// refusals for a program whose every instantiation WAS in the set, and a
+/// `UnresolvedCall(0x0A000012)` on `` Box`1[System.Int32] ``'s own `Drive` -- a method that is not
+/// nested in anything.
+///
+/// # Why the capability-off build answers `None`
+///
+/// Without `generics` the instantiation set is always EMPTY -- every `load_with_corlib*` entry
+/// point passes one -- so no definition is ever looked up and there is no key to spell. Answering
+/// `None` keeps ONE speller in the tree rather than growing a second one for the build that cannot
+/// consult it.
+#[cfg(feature = "generics")]
+fn definition_key(assembly: &Assembly<'_>, token: Token) -> Option<String> {
+    lamella_generics::type_def_full_name(assembly, token)
+}
+
+/// The capability-off answer: there is no instantiation set to key against. See the enabled arm.
+#[cfg(not(feature = "generics"))]
+fn definition_key(_assembly: &Assembly<'_>, _token: Token) -> Option<String> {
+    None
+}
 
 /// The closed instantiation set `program` requires, collected and spelled by the SHARED collector
 /// both tiers consume.
@@ -510,6 +548,16 @@ struct Emitted {
     /// The `MethodId` of each of the definition's methods, by declaration order. `None` where the
     /// definition's method has no body to duplicate (abstract, or runtime-supplied).
     methods: Vec<Option<MethodId>>,
+    /// Whether the definition is a STRUCT, so this instantiation is a value type.
+    ///
+    /// # Why it is carried rather than re-derived where it is needed
+    ///
+    /// Three things downstream ask it -- the type's own flag, and the `newobj` mark at each of the
+    /// two call-site binders -- and each of them would otherwise reach back through
+    /// `(source, def_row)` to the `TypeDef` and re-apply the rule. **A rule with several
+    /// implementations gains a new case in none of them**, and this one has a case already: the two
+    /// CLI bases that extend a value type and are themselves references.
+    is_value_type: bool,
 }
 
 /// A definition's method as this pass needs to see it.
@@ -555,10 +603,8 @@ pub(crate) fn monomorphize<'pe>(
         let mut row = 0u32;
         for type_def in source.assembly.type_defs() {
             row += 1;
-            if let Some(name) = type_def.name() {
-                definition_rows
-                    .entry(full_type_name(name))
-                    .or_insert((position, row));
+            if let Some(name) = definition_key(&source.assembly, type_def.token()) {
+                definition_rows.entry(name).or_insert((position, row));
             }
         }
     }
@@ -581,6 +627,14 @@ pub(crate) fn monomorphize<'pe>(
         let type_id = module.add_type(Vec::new());
         module.bind_type_full_name(type_id, want.name.clone());
         lowering.types.push((want.name.clone(), type_id));
+        let is_value_type = sources[source]
+            .assembly
+            .type_def(def_row)
+            .is_some_and(|type_def| {
+                type_def.is_value_type() && !is_special_reference_base(type_def.name())
+            });
+        module.set_type_is_value_type(type_id, is_value_type);
+        bind_nullable_underlying(module, program, type_index, want, type_id, source);
         emitted.push((
             index,
             Emitted {
@@ -590,6 +644,7 @@ pub(crate) fn monomorphize<'pe>(
                 own_field_slots: Vec::new(),
                 own_static_slots: Vec::new(),
                 methods: Vec::new(),
+                is_value_type,
             },
         ));
     }
@@ -690,7 +745,7 @@ pub(crate) fn monomorphize<'pe>(
                                 SigType::Class(token) | SigType::ValueType(token) => *token,
                                 _ => return None,
                             };
-                            let name = assembly.type_token_name(definition_token).map(full_type_name)?;
+                            let name = definition_key(assembly, definition_token)?;
                             let target =
                                 find_instantiation(instantiations, &emitted, &name, &arguments)?;
                             Some(emitted[target].1.type_id)
@@ -1160,9 +1215,7 @@ fn lower_method_pairs<'pe>(
         let rows = declaring_rows.get_or_insert_with(|| declaring_row_map(assembly));
         let declaring = rows
             .get(&definition.row())
-            .and_then(|&type_row| assembly.type_def(type_row))
-            .and_then(|type_def| type_def.name())
-            .map(full_type_name);
+            .and_then(|&type_row| definition_key(assembly, Token::new(TYPE_DEF, type_row)));
         let (Some(declaring), Some(name)) = (declaring, method.name()) else {
             lowering
                 .refusals
@@ -1216,9 +1269,7 @@ fn lower_method_pairs<'pe>(
         let rows = declaring_rows.get_or_insert_with(|| declaring_row_map(assembly));
         let label = rows
             .get(&def_row)
-            .and_then(|&type_row| assembly.type_def(type_row))
-            .and_then(|type_def| type_def.name())
-            .map(full_type_name)
+            .and_then(|&type_row| definition_key(assembly, Token::new(TYPE_DEF, type_row)))
             .zip(method.name())
             .and_then(|(declaring, name)| {
                 method_pair_label(assembly, &declaring, name, &site.arguments)
@@ -1419,7 +1470,7 @@ fn locate_program_pair(
     pair: &lamella_generics::MethodPair,
 ) -> Option<u32> {
     for type_def in assembly.type_defs() {
-        if type_def.name().map(full_type_name).as_deref() != Some(pair.declaring.as_ref()) {
+        if definition_key(assembly, type_def.token()).as_deref() != Some(pair.declaring.as_ref()) {
             continue;
         }
         for method in type_def.methods() {
@@ -1451,12 +1502,12 @@ fn locate_program_pair(
 ///
 /// # Why `can_walk` is asked before the closure is believed
 ///
-/// The closure looks a definition up by NAME, and its speller and this crate's are two
-/// implementations: `lamella_generics` spells a nested type `Outer+Nested` with the OUTERMOST
-/// namespace, [`full_type_name`] spells the row's own namespace and name. They agree for every
-/// top-level type and disagree for a nested one. **A name the closure cannot find yields ZERO
-/// overrides and no error**, which would emit the seed's body alone and read as a complete answer.
-/// Asking whether the walk can see the declaring type turns that into a refusal at bake time.
+/// The closure looks a definition up by NAME, and **a name the closure cannot find yields ZERO
+/// overrides and no error** -- which would emit the seed's body alone and read as a complete
+/// answer. Asking whether the walk can see the declaring type turns that into a refusal at bake
+/// time. What it guards is a declaring type in an assembly the walk was not given; a name SPELLED
+/// differently on the two sides cannot arise, because every lookup here asks [`definition_key`]
+/// and that is the closure's own speller.
 #[cfg(feature = "generics")]
 #[allow(clippy::too_many_arguments)]
 fn expand_virtual_rows<'pe>(
@@ -1488,9 +1539,7 @@ fn expand_virtual_rows<'pe>(
         let name: String = method.name().unwrap_or("").into();
         let declaring = rows
             .get(def_row)
-            .and_then(|&type_row| assembly.type_def(type_row))
-            .and_then(|type_def| type_def.name())
-            .map(full_type_name);
+            .and_then(|&type_row| definition_key(assembly, Token::new(TYPE_DEF, type_row)));
         let (Some(declaring), Some(signature)) = (declaring, method.signature()) else {
             lowering.refusals.push(Refusal::VirtualGenericDeclarationUnreadable {
                 token: token.0,
@@ -1542,9 +1591,7 @@ fn expand_virtual_rows<'pe>(
             }
             let owner = rows
                 .get(&row)
-                .and_then(|&type_row| assembly.type_def(type_row))
-                .and_then(|type_def| type_def.name())
-                .map(full_type_name);
+                .and_then(|&type_row| definition_key(assembly, Token::new(TYPE_DEF, type_row)));
             let (Some(owner), Some(declared_name)) = (owner, declared.name()) else {
                 refused = true;
                 break;
@@ -1995,11 +2042,115 @@ fn base_type_of<'pe>(
     }
 }
 
+/// The full name, with its arity backtick, of the one generic definition ECMA-335 special-cases in
+/// the instruction set.
+const NULLABLE_DEFINITION: &str = "System.Nullable`1";
+
+/// Records `Nullable<T>`'s underlying type on the instantiation it just created, so the four
+/// instruction-set arms that special-case a nullable can find `T`.
+///
+/// # Why the whole special case reduces to one recorded handle
+///
+/// ECMA-335 4th ed gives `System.Nullable<T>` its own clause in `box` (III.4.1), `castclass`
+/// (III.4.3), `isinst` (III.4.6), `unbox` (III.4.32) and `unbox.any` (III.4.33), and every one of
+/// them turns on the same two questions: is the operand type a nullable, and what is `T`. Recorded
+/// here, `Some(handle)` answers both -- and it is recorded where the type IDENTITY is created
+/// rather than where a token names it, because a token that names an instantiation is minted in
+/// more than one place while the identity is minted exactly once.
+///
+/// A definition whose name is not `Nullable<T>`, or a type argument no loaded assembly declares,
+/// records nothing: the arms then treat the type as the ordinary value type it looks like, which is
+/// the behavior every instantiation had before this.
+///
+/// # Why the PROGRAM's own `System.Nullable<T>` is excluded
+///
+/// A program may declare a type of that exact name -- csc allows it with CS0436 and binds the
+/// program's -- and .NET does NOT give the shadow the runtime's special case, because the CLI
+/// identifies the type from the core library rather than by name. Measured, on a program declaring
+/// its own `System.Nullable<Point>`: .NET boxes an instance into a boxed
+/// `` System.Nullable`1[Point] `` and the following `(Point)` cast throws
+/// *"Unable to cast object of type 'System.Nullable`1[Point]' to type 'Point'"* -- so III.4.1's
+/// nullable clause did not apply to it. Keying on the name alone would make this tier answer 7654321
+/// where .NET throws.
+fn bind_nullable_underlying<'pe>(
+    module: &mut Module,
+    program: &Assembly<'pe>,
+    type_index: &TypeNameIndex,
+    want: &Instantiation,
+    type_id: TypeId,
+    source: usize,
+) {
+    if source == PROGRAM_SOURCE
+        || want.definition != NULLABLE_DEFINITION
+        || want.arguments.len() != 1
+    {
+        return;
+    }
+    let key = match &want.arguments[0] {
+        argument @ (SigType::Boolean
+        | SigType::Char
+        | SigType::I1
+        | SigType::U1
+        | SigType::I2
+        | SigType::U2
+        | SigType::I4
+        | SigType::U4
+        | SigType::I8
+        | SigType::U8
+        | SigType::R4
+        | SigType::R8
+        | SigType::IntPtr
+        | SigType::UIntPtr) => type_key("System", primitive_display_name(argument)),
+        SigType::Class(token) | SigType::ValueType(token) => {
+            match program.type_token_name(*token) {
+                Some(name) => type_name_key(name),
+                None => return,
+            }
+        }
+        _ => return,
+    };
+    let Some(&underlying_id) = type_index.get(&key) else {
+        return;
+    };
+    if let Some(handle) = module.type_handle_of(underlying_id) {
+        module.bind_nullable_underlying(type_id, handle);
+    }
+}
+
+/// Marks a bound `.ctor` token as constructing a VALUE TYPE, so `newobj` builds the struct in
+/// place instead of allocating a heap instance (III.4.2).
+///
+/// # Why the ordinary marking pass cannot reach these tokens
+///
+/// `mark_value_type_ctors` runs while each assembly LOADS, and answers for a `MemberRef` by
+/// resolving it and asking what its method declares. An instantiation's `.ctor` is bound by THIS
+/// pass, which runs after every assembly has loaded -- so at marking time the token resolves to
+/// nothing and is silently left on the reference path. The mark therefore belongs beside the
+/// binding, which is the only point where both halves are known.
+///
+/// A non-`.ctor` member is left alone: the mark is read only by `newobj`, and a `call` to an
+/// instance method of a struct addresses a receiver it did not create.
+fn mark_value_type_newobj(
+    module: &mut Module,
+    asm: u8,
+    token: Token,
+    member_name: &str,
+    is_value_type: bool,
+) {
+    if is_value_type && member_name == ".ctor" {
+        module.mark_value_type_ctor(asm, token);
+    }
+}
+
 /// Finds the instantiation of `definition` with exactly `arguments`.
 ///
-/// Matched STRUCTURALLY, on the decoded arguments, rather than through a name this pass would
-/// have had to spell. A comparison is the one form of identity that cannot drift from someone
-/// else's spelling rule.
+/// The ARGUMENTS are matched STRUCTURALLY, on their decoded signatures, rather than through a name
+/// this pass would have had to spell. A comparison is the one form of identity that cannot drift
+/// from someone else's spelling rule.
+///
+/// **THE DEFINITION HALF IS STILL A NAME, AND IT IS NOT THIS PASS'S TO SPELL.** `definition` must
+/// come from [`definition_key`], which is the speller that wrote every
+/// [`Instantiation::definition`] this searches.
 fn find_instantiation(
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
@@ -2134,10 +2285,7 @@ fn bind_open_token<'pe>(
                 SigType::Class(token) | SigType::ValueType(token) => *token,
                 _ => return Err(unbound()),
             };
-            let definition_name = assembly
-                .type_token_name(definition_token)
-                .map(full_type_name)
-                .ok_or_else(unbound)?;
+            let definition_name = definition_key(assembly, definition_token).ok_or_else(unbound)?;
             let substituted: Vec<SigType> = arguments
                 .iter()
                 .map(|argument| substitute_with(argument, type_arguments, method_arguments))
@@ -2194,6 +2342,7 @@ fn bind_open_token<'pe>(
                 .flatten()
                 .ok_or_else(unbound)?;
             module.bind_token(asm, synthetic, id);
+            mark_value_type_newobj(module, asm, synthetic, name, target_entry.is_value_type);
             if let Some(key) = substituted_sig_key(
                 target_assembly,
                 name,
@@ -2244,10 +2393,7 @@ fn bind_type_operand<'pe>(
                 SigType::Class(token) | SigType::ValueType(token) => *token,
                 _ => return Err(unbound()),
             };
-            let definition_name = assembly
-                .type_token_name(definition_token)
-                .map(full_type_name)
-                .ok_or_else(unbound)?;
+            let definition_name = definition_key(assembly, definition_token).ok_or_else(unbound)?;
             let target = find_instantiation(instantiations, emitted, &definition_name, arguments)
                 .ok_or_else(|| Refusal::InstantiationNotInSet {
                     instantiation: owner.into(),
@@ -2395,7 +2541,7 @@ fn bind_closed_type_specs<'pe>(
             SigType::Class(token) | SigType::ValueType(token) => *token,
             _ => continue,
         };
-        let Some(name) = assembly.type_token_name(definition_token).map(full_type_name) else {
+        let Some(name) = definition_key(assembly, definition_token) else {
             continue;
         };
         let Some(target) = find_instantiation(instantiations, emitted, &name, arguments) else {
@@ -2493,8 +2639,7 @@ fn bind_closed_member_refs<'pe>(
             SigType::Class(token) | SigType::ValueType(token) => *token,
             _ => continue,
         };
-        let Some(definition_name) = assembly.type_token_name(definition_token).map(full_type_name)
-        else {
+        let Some(definition_name) = definition_key(assembly, definition_token) else {
             continue;
         };
         let Some(target) = find_instantiation(instantiations, emitted, &definition_name, &arguments)
@@ -2566,6 +2711,7 @@ fn bind_closed_member_refs<'pe>(
         };
         if let Some(id) = id {
             module.bind_token(asm, token, id);
+            mark_value_type_newobj(module, asm, token, name, entry.is_value_type);
         }
         let key = substituted_sig_key(
             definition_assembly,

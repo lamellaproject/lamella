@@ -324,6 +324,30 @@ pub struct CompClause {
     pub conditions: Vec<Expr>,
 }
 
+/// Every name `target` BINDS, appended to `out` in source order.
+///
+/// A target binds more than one name as soon as it is a sequence -- `as (a, b)`, `as [a, *rest]` --
+/// and binds NONE when it stores THROUGH a container: `d['k']` and `o.x` mutate an object that
+/// already exists, so the names inside them are USES rather than bindings.
+///
+/// Three separate walks need this answer -- the local collector, the type-inference pass that pins
+/// a dynamic slot, and the editor completion list -- and each of them used to read the single name
+/// a `with` target was allowed to be. Once a target can be a sequence, a walk that reads one name
+/// binds too FEW, which is the direction that produces a wrong answer rather than a missing
+/// feature: a slot nothing pinned is a slot inference will give a static type.
+pub(crate) fn target_bound_names<'a>(target: &'a AssignTarget, out: &mut Vec<&'a str>) {
+    match target {
+        AssignTarget::Name(name) => out.push(name),
+        AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {}
+        AssignTarget::Tuple(targets) => {
+            for t in targets {
+                target_bound_names(t, out);
+            }
+        }
+        AssignTarget::Starred(inner) => target_bound_names(inner, out),
+    }
+}
+
 /// A target of a tuple-unpacking assignment `a, b[i], c.x, (d, e) = seq`: a bare name, a subscript,
 /// an attribute, or a nested tuple/list target (unpacked recursively).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,14 +549,19 @@ pub enum StmtKind {
         /// The `finally` clause; empty if absent.
         finalbody: Vec<Stmt>,
     },
-    /// A `with context [as name]:` statement (a single context manager). Desugars at compile time
+    /// A `with context [as target]:` statement (a single context manager). Desugars at compile time
     /// to the `__enter__` / `try` / `finally` / `__exit__` protocol.
     With {
         /// The context-manager expression: evaluated once; its `__enter__` runs on entry and
         /// `__exit__` on exit (including on exception).
         context: Expr,
-        /// The optional `as name` target, bound to `__enter__`'s result.
-        optional_name: Option<String>,
+        /// The optional `as` target, bound to `__enter__`'s result.
+        ///
+        /// The FULL target grammar, not a name: `with open(p) as f`, `as (a, b)`, `as [a, *rest]`,
+        /// `as d['k']` and `as obj.attr` are all legal Python and all reach here. It was
+        /// `Option<String>` while the parser read a bare name, which made `with` the narrowest of
+        /// this file's three target positions for no reason in the language.
+        optional_target: Option<AssignTarget>,
         /// The `with` body.
         body: Vec<Stmt>,
     },
@@ -550,13 +579,14 @@ pub enum StmtKind {
         /// The `else` clause -- run when the iterator is exhausted, not when a `break` left the loop.
         orelse: Vec<Stmt>,
     },
-    /// An `async with context [as name]:` statement (a single context manager). The same PEP 343
+    /// An `async with context [as target]:` statement (a single context manager). The same PEP 343
     /// protocol as [`StmtKind::With`], but `__aenter__` / `__aexit__` and both awaited.
     AsyncWith {
         /// The context-manager expression, evaluated once.
         context: Expr,
-        /// The optional `as name` target, bound to the awaited `__aenter__`'s result.
-        optional_name: Option<String>,
+        /// The optional `as` target, bound to the awaited `__aenter__`'s result -- the same full
+        /// target grammar as [`StmtKind::With`]'s.
+        optional_target: Option<AssignTarget>,
         /// The `async with` body.
         body: Vec<Stmt>,
     },

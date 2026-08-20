@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "The probe-neutral debug seam: the ADIv5 DP/AP access trait, the architecture-neutral target-access trait the flash and diagnostic algorithms consume, and the ARM bridge between them."
+publish = false
 
 [lints]
 workspace = true

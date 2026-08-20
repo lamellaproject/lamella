@@ -21,7 +21,7 @@ lcsc=""
 # Each name gates `#if` regions in the sources. A smaller set builds a smaller BCL -- but it must
 # match the cargo features the runtime is built with, because a method whose intrinsic was compiled
 # out keeps its placeholder body and silently returns zero rather than failing to load.
-define="LAMELLA_SURFACE_FLOAT;LAMELLA_SURFACE_MATH_TRANSCENDENTAL;LAMELLA_SURFACE_GC;LAMELLA_SURFACE_VARARGS;LAMELLA_SURFACE_TYPED_REFERENCES;LAMELLA_SURFACE_DECIMAL;LAMELLA_SURFACE_THREADS;LAMELLA_SURFACE_WAIT_HANDLES;LAMELLA_SURFACE_NET;LAMELLA_SURFACE_NET_TLS;LAMELLA_NET_2_0;LAMELLA_SURFACE_NETFX_1_1;LAMELLA_SURFACE_NETFX_2_0;LAMELLA_SURFACE_NETFX_4_0;LAMELLA_SURFACE_FILE_IO;LAMELLA_SURFACE_SERIAL;LAMELLA_SURFACE_STRING_COMPARISON;LAMELLA_SURFACE_REFLECTION"
+define="LAMELLA_SURFACE_FLOAT;LAMELLA_SURFACE_MATH_TRANSCENDENTAL;LAMELLA_SURFACE_GC;LAMELLA_SURFACE_VARARGS;LAMELLA_SURFACE_TYPED_REFERENCES;LAMELLA_SURFACE_DECIMAL;LAMELLA_SURFACE_THREADS;LAMELLA_SURFACE_WAIT_HANDLES;LAMELLA_SURFACE_NET;LAMELLA_SURFACE_NET_TLS;LAMELLA_NET_2_0;LAMELLA_SURFACE_NETFX_1_1;LAMELLA_SURFACE_NETFX_2_0;LAMELLA_SURFACE_NETFX_4_0;LAMELLA_SURFACE_NETFX_4_5;LAMELLA_SURFACE_FILE_IO;LAMELLA_SURFACE_SERIAL;LAMELLA_SURFACE_STRING_COMPARISON;LAMELLA_SURFACE_REFLECTION"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -44,10 +44,13 @@ assemblies=(
     "System.Device.Model|"
     "System.Device.Pwm|"
     "System.Net.NetworkInformation|"
+    # Bare, unprefixed: real .NET's own assembly name for real .NET's types. See build-managed.ps1's
+    # entry for the three-way argument. References only corlib.
+    "System.IO.Ports|"
     "Lamella.Net.Time|"
     "Lamella.Net.Time.Nts|Lamella.Net.Time"
     "Lamella.IO.Storage|System.Device.Gpio"
-    "nanoFramework.System.Device.Adc|"
+    "nanoFramework.System.Device.Adc|Lamella.Hardware"
     "nanoFramework.System.IO.FileSystem|"
 )
 

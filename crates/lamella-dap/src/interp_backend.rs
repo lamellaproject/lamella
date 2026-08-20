@@ -48,7 +48,7 @@ pub struct InterpreterBackend {
 }
 
 /// The process exit code an entry method's return maps to: its `int` return, or 0 for a `void` (or
-/// non-`int`) entry -- matching the non-debug run path's convention (`run_bytes`, `run-with-corlib`).
+/// non-`int`) entry -- matching the non-debug run path's convention (`run_bytes`).
 fn exit_code_of(returned: &Option<Value>) -> i32 {
     match returned {
         Some(Value::Int32(code)) => *code,

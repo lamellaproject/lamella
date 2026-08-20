@@ -2669,7 +2669,10 @@ fn build_board(
                     let plan = table.plans.last_mut().expect("open");
                     let pll_chosen = |k: &str| {
                         k.starts_with("pll_")
-                            && (k.ends_with("_fbdiv") || k.ends_with("_postdiv1") || k.ends_with("_postdiv2"))
+                            && (k.ends_with("_fbdiv")
+                                || k.ends_with("_postdiv1")
+                                || k.ends_with("_postdiv2")
+                                || matches!(k, "pll_m" | "pll_n" | "pll_p" | "pll_q"))
                     };
                     match (key.as_str(), value) {
                         ("name", RawValue::Str(s)) => plan.name = s.clone(),
@@ -3127,6 +3130,135 @@ fn validate_bindings(
     Ok(())
 }
 
+/// State-and-verify for an STM32 main-PLL operating point: the plan states the divisors AND the
+/// rates they produce, and this refuses unless the vendor's own arithmetic and ranges both hold.
+///
+/// A plan that states no `pll_n` is not this shape (a bare-oscillator plan states a rate and no
+/// tree) and passes untouched. Every bound below is the manual's, quoted in the message that
+/// enforces it, so a refusal names the caution it is applying rather than a bare number.
+fn verify_plan_stm32_pll(board: &str, plan: &Plan) -> Result<(), String> {
+    let Some(n) = plan.rate("pll_n") else { return Ok(()) };
+    let name = &plan.name;
+    let need = |key: &str| -> Result<i64, String> {
+        plan.rate(key).ok_or_else(|| {
+            format!("{board}: plan '{name}' states pll_n but no {key} -- an operating point states its whole tree or none of it")
+        })
+    };
+    let input = match (plan.rate("hsi_hz"), plan.rate("hse_hz")) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{board}: plan '{name}' states BOTH hsi_hz and hse_hz -- the PLL runs from one source and the row must say which"
+            ))
+        }
+        (Some(hz), None) | (None, Some(hz)) => hz,
+        (None, None) => {
+            return Err(format!(
+                "{board}: plan '{name}' states pll_n but neither hsi_hz nor hse_hz -- the PLL input has no rate"
+            ))
+        }
+    };
+    let m = need("pll_m")?;
+    let p = need("pll_p")?;
+
+    if !(2..=63).contains(&m) {
+        return Err(format!(
+            "{board}: plan '{name}' states pll_m {m}, outside the 2 to 63 the divider encodes"
+        ));
+    }
+    if input % m != 0 {
+        return Err(format!(
+            "{board}: plan '{name}': PLL input {input} is not divisible by pll_m {m}, so the VCO input rate this row implies is not the rate it would run at"
+        ));
+    }
+    let vco_in = input / m;
+    if !(1_000_000..=2_000_000).contains(&vco_in) {
+        return Err(format!(
+            "{board}: plan '{name}': pll_m {m} puts the VCO input at {vco_in} Hz, outside the 1 to 2 MHz the manual requires (2 MHz is the recommended value, to limit jitter)"
+        ));
+    }
+    if !(50..=432).contains(&n) {
+        return Err(format!(
+            "{board}: plan '{name}' states pll_n {n}, outside the 50 to 432 the multiplier encodes"
+        ));
+    }
+    let vco = vco_in * n;
+    if !(100_000_000..=432_000_000).contains(&vco) {
+        return Err(format!(
+            "{board}: plan '{name}': VCO input {vco_in} * pll_n {n} = {vco} Hz, outside the 100 to 432 MHz the manual requires"
+        ));
+    }
+    if !matches!(p, 2 | 4 | 6 | 8) {
+        return Err(format!(
+            "{board}: plan '{name}' states pll_p {p}; the field encodes only 2, 4, 6 and 8"
+        ));
+    }
+    let derived_sysclk = vco / p;
+    let stated_sysclk = need("sysclk_hz")?;
+    if derived_sysclk != stated_sysclk {
+        return Err(format!(
+            "{board}: plan '{name}' states sysclk_hz {stated_sysclk} but VCO {vco} / pll_p {p} = {derived_sysclk} (state-and-verify)"
+        ));
+    }
+    if stated_sysclk > 216_000_000 {
+        return Err(format!(
+            "{board}: plan '{name}' reaches {stated_sysclk} Hz, above the 216 MHz ceiling the manual sets for this domain"
+        ));
+    }
+
+    if let Some(q) = plan.rate("pll_q") {
+        if !(2..=15).contains(&q) {
+            return Err(format!(
+                "{board}: plan '{name}' states pll_q {q}, outside the 2 to 15 the divider encodes"
+            ));
+        }
+        if vco % q != 0 {
+            return Err(format!(
+                "{board}: plan '{name}': VCO {vco} is not divisible by pll_q {q}, so the 48 MHz domain would not be exact"
+            ));
+        }
+        let derived_48 = vco / q;
+        if let Some(stated_48) = plan.rate("pll48_hz") {
+            if derived_48 != stated_48 {
+                return Err(format!(
+                    "{board}: plan '{name}' states pll48_hz {stated_48} but VCO {vco} / pll_q {q} = {derived_48} (state-and-verify)"
+                ));
+            }
+        }
+        if derived_48 > 48_000_000 {
+            return Err(format!(
+                "{board}: plan '{name}' clocks the 48 MHz domain at {derived_48} Hz; the manual requires the SD/MMC and random number generator clocks to be at or below 48 MHz"
+            ));
+        }
+    } else if plan.rate("pll48_hz").is_some() {
+        return Err(format!(
+            "{board}: plan '{name}' states pll48_hz but no pll_q -- the rate is stated with nothing deriving it"
+        ));
+    }
+
+    for (key, max, bus) in
+        [("pclk_hz", 108_000_000_i64, "APB2"), ("pclk1_hz", 54_000_000_i64, "APB1")]
+    {
+        let Some(pclk) = plan.rate(key) else { continue };
+        if pclk <= 0 || stated_sysclk % pclk != 0 {
+            return Err(format!(
+                "{board}: plan '{name}' states {key} {pclk}, which does not divide sysclk {stated_sysclk} -- {bus} is reached by a prescaler, not by an independent rate"
+            ));
+        }
+        let div = stated_sysclk / pclk;
+        if !matches!(div, 1 | 2 | 4 | 8 | 16) {
+            return Err(format!(
+                "{board}: plan '{name}' states {key} {pclk}, which is sysclk / {div}; the {bus} prescaler encodes only 1, 2, 4, 8 and 16"
+            ));
+        }
+        if pclk > max {
+            return Err(format!(
+                "{board}: plan '{name}' clocks {bus} at {pclk} Hz, above its {max} Hz maximum"
+            ));
+        }
+    }
+    Ok(())
+}
+
 
 /// A fully resolved board: the parsed board plus its inherited module bindings and host part.
 #[derive(Clone, Debug)]
@@ -3224,6 +3356,9 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
                 board.board
             ));
         }
+    }
+    for plan in &board.plans {
+        verify_plan_stm32_pll(&board.board, plan)?;
     }
     for carrier in &board.carriers {
         if !carrier.role.is_empty() && !bindings.iter().any(|b| b.role == carrier.role) {

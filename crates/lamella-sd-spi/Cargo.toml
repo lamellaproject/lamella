@@ -6,12 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "A memory-card block device over SPI: the SD/SPI protocol layer and its BlockDevice backend, generic over a board-supplied SPI bus."
+publish = false
 
 [dependencies]
 # The BlockDevice seam this crate implements. `default-features = false` keeps a peripheral crate
 # off the interpreter's BCL/GC/float surface -- the same shape `lamella-net-smoltcp` uses to reach
 # the NetBackend seam in this crate.
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+# The bus-independent CARD protocol -- command indices, the init constants, the CMD6 encoding and
+# the CSD decode -- shared with the native SDMMC transport. Dependency-free by construction.
+lamella-sd-core = { path = "../lamella-sd-core" }
 
 [features]
 default = ["write"]

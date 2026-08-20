@@ -97,28 +97,24 @@ impl LineIndex {
 /// predicate for what a string literal may contain -- see the module note.
 #[must_use]
 pub fn is_line_terminator(ch: char) -> bool {
-    matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+    lamella_regexp::js::is_line_terminator(ch as u32)
 }
 
 /// Whether a code point is `WhiteSpace`.
 ///
-/// `<TAB> <VT> <FF> <ZWNBSP>` plus everything in Unicode category **Zs**. The Zs members are
-/// enumerated rather than looked up in a table because there are eleven of them and they are stable
-/// -- unlike ID_Start/ID_Continue, which are tens of thousands of code points and are the reason
-/// `unicode.rs` exists. **U+FEFF is whitespace anywhere, not just at the start**: it is
-/// `<ZWNBSP>`, and treating it as a byte-order mark only at offset zero rejects legal programs.
+/// # THE SET LIVES IN THE REGULAR-EXPRESSION CRATE, AND THAT IS NOT WHERE A READER WOULD LOOK
+///
+/// It is the same eleven code points a pattern's `\s` matches, from the same clause, and the two
+/// were written out twice -- here for the tokenizer and there for the class -- which is the shape
+/// this tree keeps paying for. Only one of them could be the definition, and the dependency runs
+/// this way: the engine consumes the matcher, so the matcher is the one that can be read from both
+/// sides.
+///
+/// **U+FEFF is whitespace anywhere, not just at the start**: it is `<ZWNBSP>`, and treating it as a
+/// byte-order mark only at offset zero rejects legal programs.
 #[must_use]
 pub fn is_whitespace(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{0009}'
-        | '\u{000B}'
-        | '\u{000C}'
-        | '\u{FEFF}'
-        | '\u{0020}' | '\u{00A0}' | '\u{1680}'
-        | '\u{2000}'..='\u{200A}'
-        | '\u{202F}' | '\u{205F}' | '\u{3000}'
-    )
+    lamella_regexp::js::is_white_space(ch as u32)
 }
 
 /// A code-point cursor over the source.

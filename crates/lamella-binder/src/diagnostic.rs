@@ -301,6 +301,11 @@ impl GenericMember {
     }
 }
 
+/// What a binder diagnostic IS, one variant per rule the binder enforces.
+///
+/// Each variant carries the parts its message needs rather than a formatted string, so the code
+/// (`DiagnosticKind::code`) and the text (`Display`) are derived from one place and cannot drift
+/// apart. The codes are csc's, because a code is a search key a user takes to a search engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiagnosticKind {
@@ -314,6 +319,50 @@ pub enum DiagnosticKind {
         /// The unresolved name.
         name: Box<str>,
     },
+    /// `CS0818`: an implicitly typed local has no initializer to infer its type from -- `var x;`
+    /// (C# 3.0 spec, 8.5.1: *"The local-variable-declarator must include a
+    /// local-variable-initializer"*).
+    ImplicitlyTypedLocalNotInitialized,
+    /// `CS0819`: an implicitly typed local declaration declares more than one variable --
+    /// `var x = 1, y = 2;` (C# 3.0 spec, 8.5.1: *"The local-variable-declaration cannot include
+    /// multiple local-variable-declarators"*).
+    ///
+    /// **The restriction is not redundant with inference**, which is the reading that makes it look
+    /// arbitrary: `var x = 1, y = "s";` has a perfectly good type for each declarator. 8.5.1 makes
+    /// one declaration one type, so the second spelling would have to mean two.
+    ImplicitlyTypedLocalMultipleDeclarators,
+    /// `CS0820`: an implicitly typed local is initialized with a bare array initializer --
+    /// `var y = {1, 2, 3};` (C# 3.0 spec, 8.5.1: *"The local-variable-initializer must be an
+    /// expression"*).
+    ///
+    /// An `array-initializer` is a separate production from `expression` and has no type of its
+    /// own; it takes one from the declared type, which is precisely what is missing here.
+    /// `var y = new[] {1, 2, 3};` is the spelling that works, and it works because
+    /// `array-creation-expression` IS an expression.
+    ImplicitlyTypedLocalArrayInitializer,
+    /// `CS0815`: an implicitly typed local's initializer has no compile-time type to infer from
+    /// (C# 3.0 spec, 8.5.1: *"The initializer expression must have a compile-time type"*).
+    ImplicitlyTypedLocalBadValue {
+        /// What the initializer is, as csc names it in the message: `<null>` for the null literal,
+        /// `void` for a call to a void method. **Angle brackets and all** -- csc writes
+        /// `Cannot assign <null> to an implicitly-typed variable`, measured.
+        value: Box<str>,
+    },
+    /// `CS0822`: a local CONSTANT declared `var` -- `const var x = 1;`.
+    ///
+    /// A separate code from the four above because 8.5.1's restrictions do not reach it: a
+    /// `local-constant-declaration` is `const type constant-declarators`, and its `type` is a
+    /// *type*, never a `local-variable-type`. So `var` is not admitted by the grammar there at all,
+    /// and csc reports the dedicated code rather than a restriction violation.
+    ImplicitlyTypedLocalConstant,
+    /// `CS0825`: `var` written where the grammar has no `local-variable-type` -- a field, a
+    /// parameter, a return type, or an array element type such as `var[]`.
+    ///
+    /// **This is what stands in place of a `CS0246` the programmer could not act on.** `var` in
+    /// those positions is an ordinary unresolved type name, so the unrepaired message asks whether
+    /// a using directive or an assembly reference is missing -- pointing at the imports for a word
+    /// that is a contextual keyword and could never have been imported.
+    VarOutsideLocalDeclaration,
     /// `CS0305`: a generic TYPE or METHOD was used with the wrong number of type arguments. It IS
     /// in scope -- at a different arity -- so this is what stands in place of a CS0246 the
     /// programmer could not act on.
@@ -817,6 +866,42 @@ pub enum DiagnosticKind {
     /// `CS0201`: an expression that is not assignment, call, increment, decrement,
     /// or object creation was used as a statement.
     IllegalStatementExpression,
+    /// `CS0260`: a declaration of a type is missing the `partial` modifier while another
+    /// declaration of the same type carries one (17.1.4).
+    MissingPartialModifier {
+        /// The type's name as csc quotes it -- `W`, or `W<T>` for a generic one.
+        name: Box<str>,
+    },
+    /// `CS0261`: the parts of a partial type do not all declare the same KIND.
+    PartialDeclarationsDifferentKinds {
+        /// The type's name as csc quotes it.
+        name: Box<str>,
+    },
+    /// `CS0262`: two parts of a partial type state different accessibilities.
+    PartialDeclarationsConflictingAccessibility {
+        /// The type's name as csc quotes it.
+        name: Box<str>,
+    },
+    /// `CS0263`: two parts of a partial type name different base classes.
+    PartialDeclarationsDifferentBases {
+        /// The type's name as csc quotes it.
+        name: Box<str>,
+    },
+    /// `CS0264`: the parts of a generic partial type declare differently named type parameters,
+    /// or the same names in a different order.
+    PartialDeclarationsTypeParameterNames {
+        /// The type's name as csc quotes it, with its parameters -- `W<T>`.
+        name: Box<str>,
+    },
+    /// `CS0265`: two parts of a generic partial type constrain one type parameter differently.
+    /// A part that writes NO `where` clause for a parameter is not in conflict with one that
+    /// does (measured against csc); only two DIFFERENT clauses are.
+    PartialDeclarationsInconsistentConstraints {
+        /// The type's name as csc quotes it, with its parameters -- `W<T>`.
+        name: Box<str>,
+        /// The type parameter whose constraints differ.
+        parameter: Box<str>,
+    },
     /// `CS0101`: the namespace already contains a definition for this type name (a
     /// duplicate type declaration -- C# 1.0 has no partial types).
     DuplicateTypeInNamespace {
@@ -998,6 +1083,46 @@ pub enum DiagnosticKind {
         /// The method name.
         member: Box<str>,
     },
+    /// `CS0273`: an accessor's own access modifier is not STRICTLY more restrictive than the
+    /// property or indexer it belongs to (10.7.2).
+    ///
+    /// **`protected` AND `internal` ARE INCOMPARABLE, NOT EQUAL**, so `protected int P` with an
+    /// `internal set` is this error and so is the reverse -- measured against csc over the whole
+    /// five-by-five lattice. Equal accessibility is an error too: the modifier has to NARROW.
+    AccessorAccessibilityNotMoreRestrictive {
+        /// The accessor's qualified name (`C.P.set`).
+        accessor: Box<str>,
+        /// The property or indexer's qualified name (`C.P`).
+        property: Box<str>,
+    },
+    /// `CS0274`: both accessors of one property or indexer carry an access modifier.
+    ///
+    /// One of the two must keep the property's own accessibility, or the property would have no
+    /// declared accessibility that any of its accessors uses.
+    AccessorAccessibilityOnBothAccessors {
+        /// The property or indexer's qualified name (`C.P`).
+        property: Box<str>,
+    },
+    /// `CS0276`: an accessor carries an access modifier on a property or indexer that declares only
+    /// one accessor -- there is nothing for it to be more restrictive *than* in a useful sense, and
+    /// the property's own modifier already says it.
+    AccessorAccessibilityNeedsBothAccessors {
+        /// The property or indexer's qualified name (`C.P`).
+        property: Box<str>,
+    },
+    /// `CS0442`: a `private` accessor on an ABSTRACT property (an interface's included, since its
+    /// members are implicitly abstract) -- no derived type could ever implement it.
+    AbstractPropertyHasPrivateAccessor {
+        /// The accessor's qualified name (`I.P.set`).
+        accessor: Box<str>,
+    },
+    /// `CS8051`: an automatically implemented property declares a `set` accessor and no `get`.
+    ///
+    /// **THE RULE IS NOT SYMMETRIC.** `int P { get; }` is a legal *readonly* auto-property (C# 6.0);
+    /// `int P { set; }` is refused at EVERY version, because the backing field it would generate
+    /// could then only be written and never read -- measured against csc at ISO-2, 3, 5, 6 and
+    /// latest, which reports this at all five.
+    AutoPropertyMustHaveGetAccessor,
     /// `CS0501`: a non-abstract, non-extern method in a class or struct declares no body.
     MethodMustHaveBody {
         /// The method's qualified signature (`C.M()`).
@@ -1462,6 +1587,53 @@ pub enum DiagnosticKind {
         /// Another candidate's full name.
         second: Box<str>,
     },
+    /// `CS1983`: an async method's return type is not `void`, `Task` or `Task<T>` (15.15.1).
+    /// The text is csc's CURRENT one, measured -- it names task-like types and the async stream
+    /// interfaces this compiler does not have, because the message is a search key and csc's is
+    /// what a search finds.
+    AsyncReturnType,
+    /// `CS1988`: an async method with a `ref` or `out` parameter (15.15.1). csc's text says
+    /// "ref, in or out" -- `in` parameters are far above this rung, but the text is verbatim.
+    AsyncByRefParameter,
+    /// `CS1997`: a `return` with a value in an async method that returns `Task` -- the task
+    /// carries no result, so the body returns nothing (15.15.2); csc quotes the method.
+    AsyncReturnWithValue {
+        /// The enclosing method's name, as `check_return` renders method names.
+        method: Box<str>,
+    },
+    /// `CS4008`: `await` on a `void`-returning call -- there is no value to await.
+    CannotAwaitVoid,
+    /// `CS4001`: `await` on an expression with no type at all -- the null literal (csc renders
+    /// it `<null>`; anonymous functions would land here too, when they exist).
+    CannotAwaitExpression {
+        /// What was awaited, as csc quotes it (`<null>`).
+        description: Box<str>,
+    },
+    /// `CS1986`: the operand's type HAS a `GetAwaiter` and none of them is suitable -- static,
+    /// or taking parameters (12.8.8.2 wants an accessible parameterless non-generic instance
+    /// method). Measured: csc reports this for a static `GetAwaiter`; a total absence is CS1061
+    /// instead, reported through the member-missing kind.
+    AwaitRequiresSuitableGetAwaiter {
+        /// The operand's type.
+        type_name: Box<str>,
+    },
+    /// `CS4027`: the awaiter type does not implement `INotifyCompletion` (12.8.8.2). Measured:
+    /// `'A' does not implement 'INotifyCompletion'`.
+    AwaiterMustImplementINotifyCompletion {
+        /// The awaiter type (`GetAwaiter()`'s return type).
+        awaiter: Box<str>,
+    },
+    /// `CS1985`: `await` in a catch clause, below C# 6 (measured at 5, and measured CLEAN at 6;
+    /// the asymmetry with [`DiagnosticKind::AwaitInFinally`]'s wording is csc's own).
+    AwaitInCatch,
+    /// `CS1984`: `await` in the body of a finally clause, below C# 6.
+    AwaitInFinally,
+    /// `CS1996`: `await` in the body of a lock statement, at every version.
+    AwaitInLock,
+    /// `CS4009`: a `void`- or `int`-returning entry point marked `async` -- measured, and
+    /// distinct from the 'async main' GATE, which is what a `Task`-returning async `Main`
+    /// draws instead (that one is a real C# 7.1 feature; this one is never legal).
+    AsyncVoidEntryPoint,
 }
 
 impl DiagnosticKind {
@@ -1472,6 +1644,12 @@ impl DiagnosticKind {
             DiagnosticKind::FeatureNotInThisBuild { .. } => 1,
             DiagnosticKind::TypeNotFound { .. } => 246,
             DiagnosticKind::NameNotFound { .. } => 103,
+            DiagnosticKind::ImplicitlyTypedLocalBadValue { .. } => 815,
+            DiagnosticKind::ImplicitlyTypedLocalNotInitialized => 818,
+            DiagnosticKind::ImplicitlyTypedLocalMultipleDeclarators => 819,
+            DiagnosticKind::ImplicitlyTypedLocalArrayInitializer => 820,
+            DiagnosticKind::ImplicitlyTypedLocalConstant => 822,
+            DiagnosticKind::VarOutsideLocalDeclaration => 825,
             DiagnosticKind::GenericArityMismatch { .. } => 305,
             DiagnosticKind::TypeArgumentsCannotBeInferred { .. } => 411,
             DiagnosticKind::TypeArgumentMustBeReferenceType { .. } => 452,
@@ -1542,6 +1720,12 @@ impl DiagnosticKind {
             DiagnosticKind::DuplicateLocal { .. } => 128,
             DiagnosticKind::LocalShadowsEnclosing { .. } => 136,
             DiagnosticKind::IllegalStatementExpression => 201,
+            DiagnosticKind::MissingPartialModifier { .. } => 260,
+            DiagnosticKind::PartialDeclarationsDifferentKinds { .. } => 261,
+            DiagnosticKind::PartialDeclarationsConflictingAccessibility { .. } => 262,
+            DiagnosticKind::PartialDeclarationsDifferentBases { .. } => 263,
+            DiagnosticKind::PartialDeclarationsTypeParameterNames { .. } => 264,
+            DiagnosticKind::PartialDeclarationsInconsistentConstraints { .. } => 265,
             DiagnosticKind::DuplicateTypeInNamespace { .. } => 101,
             DiagnosticKind::DuplicateMember { .. } => 102,
             DiagnosticKind::DuplicateParameterName { .. } => 100,
@@ -1578,6 +1762,11 @@ impl DiagnosticKind {
             DiagnosticKind::UnreferencedLabel => 164,
             DiagnosticKind::AbstractMethodWithBody { .. } => 500,
             DiagnosticKind::MethodMustHaveBody { .. } => 501,
+            DiagnosticKind::AutoPropertyMustHaveGetAccessor => 8051,
+            DiagnosticKind::AccessorAccessibilityNotMoreRestrictive { .. } => 273,
+            DiagnosticKind::AccessorAccessibilityOnBothAccessors { .. } => 274,
+            DiagnosticKind::AccessorAccessibilityNeedsBothAccessors { .. } => 276,
+            DiagnosticKind::AbstractPropertyHasPrivateAccessor { .. } => 442,
             DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
             DiagnosticKind::InterfaceMemberModifier { .. } => 8703,
             DiagnosticKind::AbstractMemberInNonAbstractType { .. } => 513,
@@ -1643,6 +1832,17 @@ impl DiagnosticKind {
             DiagnosticKind::OutParameterNotAssigned { .. } => 177,
             DiagnosticKind::NamespaceMemberNotFound { .. } => 234,
             DiagnosticKind::AmbiguousReference { .. } => 104,
+            DiagnosticKind::AsyncReturnType => 1983,
+            DiagnosticKind::AsyncByRefParameter => 1988,
+            DiagnosticKind::AsyncReturnWithValue { .. } => 1997,
+            DiagnosticKind::CannotAwaitVoid => 4008,
+            DiagnosticKind::CannotAwaitExpression { .. } => 4001,
+            DiagnosticKind::AwaitRequiresSuitableGetAwaiter { .. } => 1986,
+            DiagnosticKind::AwaiterMustImplementINotifyCompletion { .. } => 4027,
+            DiagnosticKind::AwaitInCatch => 1985,
+            DiagnosticKind::AwaitInFinally => 1984,
+            DiagnosticKind::AwaitInLock => 1996,
+            DiagnosticKind::AsyncVoidEntryPoint => 4009,
         }
     }
 
@@ -1675,6 +1875,32 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NameNotFound { name } => {
                 write!(f, "The name '{name}' does not exist in the current context")
             }
+            DiagnosticKind::ImplicitlyTypedLocalBadValue { value } => {
+                write!(f, "Cannot assign {value} to an implicitly-typed variable")
+            }
+            DiagnosticKind::ImplicitlyTypedLocalNotInitialized => {
+                write!(f, "Implicitly-typed variables must be initialized")
+            }
+            DiagnosticKind::ImplicitlyTypedLocalMultipleDeclarators => {
+                write!(
+                    f,
+                    "Implicitly-typed variables cannot have multiple declarators"
+                )
+            }
+            DiagnosticKind::ImplicitlyTypedLocalArrayInitializer => {
+                write!(
+                    f,
+                    "Cannot initialize an implicitly-typed variable with an array initializer"
+                )
+            }
+            DiagnosticKind::ImplicitlyTypedLocalConstant => {
+                write!(f, "Implicitly-typed variables cannot be constant")
+            }
+            DiagnosticKind::VarOutsideLocalDeclaration => write!(
+                f,
+                "The contextual keyword 'var' may only appear within a local variable \
+                 declaration or in script code"
+            ),
             DiagnosticKind::GenericArityMismatch {
                 candidate,
                 required,
@@ -2008,6 +2234,34 @@ impl fmt::Display for DiagnosticKind {
                 "Only assignment, call, increment, decrement, and new object \
                  expressions can be used as a statement"
             ),
+            DiagnosticKind::MissingPartialModifier { name } => write!(
+                f,
+                "Missing partial modifier on declaration of type '{name}'; another partial \
+                 declaration of this type exists"
+            ),
+            DiagnosticKind::PartialDeclarationsDifferentKinds { name } => write!(
+                f,
+                "Partial declarations of '{name}' must be all classes, all record classes, all \
+                 structs, all unions, all record structs, or all interfaces"
+            ),
+            DiagnosticKind::PartialDeclarationsConflictingAccessibility { name } => write!(
+                f,
+                "Partial declarations of '{name}' have conflicting accessibility modifiers"
+            ),
+            DiagnosticKind::PartialDeclarationsDifferentBases { name } => write!(
+                f,
+                "Partial declarations of '{name}' must not specify different base classes"
+            ),
+            DiagnosticKind::PartialDeclarationsTypeParameterNames { name } => write!(
+                f,
+                "Partial declarations of '{name}' must have the same type parameter names in the \
+                 same order"
+            ),
+            DiagnosticKind::PartialDeclarationsInconsistentConstraints { name, parameter } => write!(
+                f,
+                "Partial declarations of '{name}' have inconsistent constraints for type \
+                 parameter '{parameter}'"
+            ),
             DiagnosticKind::DuplicateTypeInNamespace { namespace, name } => write!(
                 f,
                 "The namespace '{namespace}' already contains a definition for '{name}'"
@@ -2140,6 +2394,28 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::AbstractMethodWithBody { member } => write!(
                 f,
                 "'{member}' cannot declare a body because it is marked abstract"
+            ),
+            DiagnosticKind::AutoPropertyMustHaveGetAccessor => {
+                write!(f, "Auto-implemented properties must have get accessors.")
+            }
+            DiagnosticKind::AccessorAccessibilityNotMoreRestrictive { accessor, property } => write!(
+                f,
+                "The accessibility modifier of the '{accessor}' accessor must be more restrictive \
+                 than the property or indexer '{property}'"
+            ),
+            DiagnosticKind::AccessorAccessibilityOnBothAccessors { property } => write!(
+                f,
+                "Cannot specify accessibility modifiers for both accessors of the property or \
+                 indexer '{property}'"
+            ),
+            DiagnosticKind::AccessorAccessibilityNeedsBothAccessors { property } => write!(
+                f,
+                "'{property}': accessibility modifiers on accessors may only be used if the \
+                 property or indexer has both a get and a set accessor"
+            ),
+            DiagnosticKind::AbstractPropertyHasPrivateAccessor { accessor } => write!(
+                f,
+                "'{accessor}': abstract properties cannot have private accessors"
             ),
             DiagnosticKind::MethodMustHaveBody { method } => write!(
                 f,
@@ -2436,6 +2712,39 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "'{name}' is an ambiguous reference between '{first}' and '{second}'"
             ),
+            DiagnosticKind::AsyncReturnType => f.write_str(
+                "The return type of an async method must be void, Task, Task<T>, a task-like \
+                 type, IAsyncEnumerable<T>, or IAsyncEnumerator<T>",
+            ),
+            DiagnosticKind::AsyncByRefParameter => {
+                f.write_str("Async methods cannot have ref, in or out parameters")
+            }
+            DiagnosticKind::AsyncReturnWithValue { method } => write!(
+                f,
+                "Since '{method}' is an async method that returns 'Task', a return keyword must \
+                 not be followed by an object expression"
+            ),
+            DiagnosticKind::CannotAwaitVoid => f.write_str("Cannot await 'void'"),
+            DiagnosticKind::CannotAwaitExpression { description } => {
+                write!(f, "Cannot await '{description}'")
+            }
+            DiagnosticKind::AwaitRequiresSuitableGetAwaiter { type_name } => write!(
+                f,
+                "'await' requires that the type {type_name} have a suitable 'GetAwaiter' method"
+            ),
+            DiagnosticKind::AwaiterMustImplementINotifyCompletion { awaiter } => {
+                write!(f, "'{awaiter}' does not implement 'INotifyCompletion'")
+            }
+            DiagnosticKind::AwaitInCatch => f.write_str("Cannot await in a catch clause"),
+            DiagnosticKind::AwaitInFinally => {
+                f.write_str("Cannot await in the body of a finally clause")
+            }
+            DiagnosticKind::AwaitInLock => {
+                f.write_str("Cannot await in the body of a lock statement")
+            }
+            DiagnosticKind::AsyncVoidEntryPoint => {
+                f.write_str("A void or int returning entry point cannot be async")
+            }
         }
     }
 }

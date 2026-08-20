@@ -169,6 +169,25 @@ pub fn is_lowercase(cp: u32) -> bool {
 }
 
 /// Whether `cp` has the `Cased` derived property (a character that participates in case --
+/// Whether `cp` has the `ID_Start` derived property.
+///
+/// **`ID_Start` AND `XID_Start` ARE NOT INTERCHANGEABLE AND THE DIFFERENCE IS NOT ROUNDING.**
+/// They disagree on 23 code points, and `ID_Continue`/`XID_Continue` on 19. Substituting one
+/// for the other accepts identifiers a standard rejects AND rejects identifiers it accepts, in
+/// both directions, on a small specific set -- which is why both pairs ship rather than one.
+///
+/// ECMAScript identifiers are built from `ID_Start`/`ID_Continue` (ECMA-262 12.7.1); the `X`
+/// forms are the ones closed under NFKC, which is what other languages ask for.
+#[must_use]
+pub fn is_id_start(cp: u32) -> bool {
+    in_ranges(tables::ID_START, cp)
+}
+
+/// Whether `cp` has the `ID_Continue` derived property. See [`is_id_start`].
+#[must_use]
+pub fn is_id_continue(cp: u32) -> bool {
+    in_ranges(tables::ID_CONTINUE, cp)
+}
 /// uppercase, lowercase, or titlecase).
 #[must_use]
 pub fn is_cased(cp: u32) -> bool {
@@ -280,6 +299,68 @@ pub fn decomposition(cp: u32) -> Option<(bool, &'static [u32])> {
     let (_, offset, len, is_compat) = tables::DECOMP_INDEX[i];
     let start = offset as usize;
     Some((is_compat != 0, &tables::DECOMP_DATA[start..start + len as usize]))
+}
+
+/// Simple case folding: the `C` and `S` rows of `CaseFolding.txt`.
+///
+/// # THE STATUSES ARE SEPARATE TABLES, AND THAT IS THE DESIGN RATHER THAN AN ACCIDENT
+///
+/// `CaseFolding.txt` defines four statuses and **no single fold is correct for every caller**.
+/// Simple folding is `C`+`S` and full folding is `C`+`F`, and they genuinely disagree: U+1E9E
+/// folds to `ss` under full and to U+00DF under simple, and **both answers are right for the
+/// standard that asks for them.** A crate exposing one `fold()` would be correct for one
+/// consumer and wrong for another on part of its own table.
+///
+/// So the statuses ship as data and each caller selects. That also decides the cost: a consumer
+/// linking only this function never pays for the `F` tables, because they are separate statics.
+///
+/// `None` means the code point folds to itself; the caller keeps what it had.
+#[must_use]
+pub fn simple_case_fold(cp: u32) -> Option<u32> {
+    fold_run(tables::FOLD_COMMON, cp).or_else(|| fold_run(tables::FOLD_SIMPLE, cp))
+}
+
+/// What a full case fold produced.
+///
+/// # TWO SHAPES, BECAUSE A FULL FOLD MAY BE LONGER THAN ITS INPUT
+///
+/// Most folds are one code point to one; 104 of them expand, and U+1E9E folding to `ss` is the
+/// reason this type exists rather than a bare slice. A crate reaching a microcontroller cannot
+/// return an owned buffer, and the single case has nothing `'static` to borrow from -- so the
+/// distinction is carried by the type instead of by a convention the caller has to remember.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullFold {
+    /// The fold is one code point.
+    Single(u32),
+    /// The fold is several, in order.
+    Several(&'static [u32]),
+}
+
+/// Full case folding: the `C` and `F` rows of `CaseFolding.txt`.
+///
+/// See [`simple_case_fold`] for why the statuses are separate tables. `None` means the code
+/// point folds to itself.
+#[must_use]
+pub fn full_case_fold(cp: u32) -> Option<FullFold> {
+    if let Ok(i) = tables::FOLD_FULL_INDEX.binary_search_by(|&(c, _, _)| c.cmp(&cp)) {
+        let (_, offset, len) = tables::FOLD_FULL_INDEX[i];
+        let start = offset as usize;
+        return Some(FullFold::Several(&tables::FOLD_FULL_DATA[start..start + len as usize]));
+    }
+    fold_run(tables::FOLD_COMMON, cp).map(FullFold::Single)
+}
+/// The one-to-one fold `cp` has in `runs`, if any.
+///
+/// The runs are `(start, count, delta)` with a stride of one, and **the delta is `i32` because it
+/// does not fit a narrower field**: it ranges over roughly -42,561..35,267. A narrower one would
+/// truncate into a plausible wrong code point rather than failing.
+fn fold_run(runs: &[(u32, u32, i32)], cp: u32) -> Option<u32> {
+    let i = runs.partition_point(|&(start, _, _)| start <= cp).checked_sub(1)?;
+    let (start, count, delta) = runs[i];
+    if cp < start || cp >= start + count {
+        return None;
+    }
+    Some((cp as i64 + i64::from(delta)) as u32)
 }
 
 /// Normalizes `s` to `form` (UAX #15). Allocates the result.
@@ -431,5 +512,78 @@ mod tests {
         assert_eq!(normalize("D\u{0307}\u{0323}", Nfc), "\u{1e0c}\u{0307}");
         assert_eq!(combining_class(0x0300), 230);
         assert_eq!(combining_class(0x0041), 0);
+    }
+}
+
+#[cfg(test)]
+mod case_folding {
+    use super::*;
+
+    /// THE WITNESS THAT DECIDED THE SHAPE OF THIS TABLE.
+    ///
+    /// U+1E9E LATIN CAPITAL LETTER SHARP S has BOTH an `F` row and an `S` row, and they
+    /// disagree: full folding gives `ss` and simple folding gives U+00DF. **Both are correct**,
+    /// for the standards that ask for them -- which is why one `fold()` could not serve every
+    /// caller and the statuses ship as data instead.
+    #[test]
+    fn one_code_point_has_two_correct_folds() {
+        assert_eq!(simple_case_fold(0x1E9E), Some(0x00DF), "simple: capital sharp s -> sharp s");
+        assert_eq!(
+            full_case_fold(0x1E9E),
+            Some(FullFold::Several(&[0x0073, 0x0073])),
+            "full: capital sharp s -> ss"
+        );
+    }
+
+    /// The common rows are the overwhelming majority and both folds must read them.
+    #[test]
+    fn the_common_rows_serve_both_folds() {
+        assert_eq!(simple_case_fold(0x0041), Some(0x0061), "A -> a, simple");
+        assert_eq!(full_case_fold(0x0041), Some(FullFold::Single(0x0061)), "A -> a, full");
+        assert_eq!(simple_case_fold(0x03C2), Some(0x03C3), "final sigma -> sigma");
+        assert_eq!(simple_case_fold(0x03A3), Some(0x03C3), "capital sigma -> sigma");
+    }
+
+    /// A code point that folds to itself answers `None` in both, and a caller keeps what it had.
+    #[test]
+    fn a_code_point_with_no_fold_answers_none() {
+        for cp in [0x0061_u32, 0x0030, 0x65E5, 0x1F600] {
+            assert_eq!(simple_case_fold(cp), None, "U+{cp:04X} simple");
+            assert_eq!(full_case_fold(cp), None, "U+{cp:04X} full");
+        }
+    }
+
+    /// THE RUN DECODING, CHECKED AT ITS EDGES RATHER THAN IN THE MIDDLE.
+    ///
+    /// A `(start, count, delta)` run is decoded by arithmetic, so the failure to look for is one
+    /// code point past either end being folded as though it were inside.
+    #[test]
+    fn a_run_does_not_leak_past_its_ends() {
+        assert_eq!(simple_case_fold(0x0041), Some(0x0061), "first of the run");
+        assert_eq!(simple_case_fold(0x005A), Some(0x007A), "last of the run");
+        assert_eq!(simple_case_fold(0x0040), None, "one before the run");
+        assert_eq!(simple_case_fold(0x005B), None, "one after the run");
+    }
+
+    /// Every emitted fold target is a legal scalar value, which a truncated delta would break.
+    ///
+    /// The deltas do not fit a narrower field than `i32` -- they span roughly -42,561..35,267 --
+    /// and a truncation would land on a plausible wrong code point rather than failing, so the
+    /// whole table is walked rather than sampled.
+    #[test]
+    fn every_fold_lands_on_a_real_code_point() {
+        let mut folded = 0usize;
+        for cp in 0..=0x10FFFF_u32 {
+            if let Some(target) = simple_case_fold(cp) {
+                folded += 1;
+                assert!(char::from_u32(target).is_some(), "U+{cp:04X} folds outside the scalars");
+            }
+            if let Some(FullFold::Several(seq)) = full_case_fold(cp) {
+                for target in seq {
+                    assert!(char::from_u32(*target).is_some(), "a full fold left the scalars");
+                }
+            }
+        }
+        assert_eq!(folded, 1484, "the C+S rows are 1,453 + 31");
     }
 }

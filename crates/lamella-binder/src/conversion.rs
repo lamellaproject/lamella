@@ -22,11 +22,40 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
     if matches!(from, TypeSymbol::Special(SpecialType::Null)) {
         return is_reference_type(model, to)
             || matches!(to, TypeSymbol::Special(SpecialType::Null))
-            || matches!(to, TypeSymbol::Pointer(_));
+            || matches!(to, TypeSymbol::Pointer(_))
+            || nullable_underlying(to).is_some();
+    }
+    if let Some(to_underlying) = nullable_underlying(to) {
+        if nullable_underlying(from).is_some() {
+            return from == to;
+        }
+        return from == to_underlying || has_implicit_conversion(from, to_underlying);
     }
     has_implicit_conversion(from, to)
         || reference_conversion(model, from, to)
         || delegate_to_base(model, from, to)
+}
+
+/// The UNDERLYING type of `T?`, or `None` when `ty` is not a nullable value type.
+///
+/// `T?` is `System.Nullable<T>` and they denote the same type (ECMA-334 4th ed 11.4), so this is a
+/// question about the definition's NAME -- the binder holds no separate nullable representation and
+/// this is the one place that recognizes the shape.
+#[must_use]
+pub(crate) fn nullable_underlying(ty: &TypeSymbol) -> Option<&TypeSymbol> {
+    let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = ty
+    else {
+        return None;
+    };
+    if arguments.len() != 1 {
+        return None;
+    }
+    matches!(&definition[..], [namespace, name]
+        if &**namespace == "System" && &**name == "Nullable")
+    .then(|| &arguments[0])
 }
 
 /// Every delegate type derives from `System.MulticastDelegate` (and so `System.Delegate`),

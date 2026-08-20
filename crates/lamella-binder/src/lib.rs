@@ -51,6 +51,6 @@ pub use statement::{
 pub use symbols::{
     Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, SignatureCanon,
     TypeInfo, TypeKind, definition_metadata_name, definition_symbol, mangled_arity,
-    metadata_type_name,
+    metadata_type_name, unmangled_type_name,
 };
 pub use types::TypeSymbol;

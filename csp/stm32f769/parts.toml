@@ -37,6 +37,9 @@ flash = 0x200000
 ram = 0x5C000
 pins = [
     "PA0", "PA9-PA10",
+    "PB3-PB4",
+    "PD6-PD7",
+    "PG9-PG10",
     "PJ5", "PJ13",
 ]
-source = "DS11532 Rev 9 ordering information (N = 216 pins, I = 2048 Kbytes flash, H = TFBGA) + RM0410 Rev 5 memory map (SRAM1 368 KB). The pin list is PARTIAL rather than the package's 216: PA9 and PA10 carry the virtual COM port, PA0 the user button, and PJ5 and PJ13 the two user LEDs -- and PORT J is the claim worth stating, because it exists only on the large packages and a part row that named it without evidence would be describing a package this board does not have. DS11532 Rev 9 Table 13 carries a row for PA0, PA9 and PA10, and UM2033 Rev 5 Table 4 assigns the two LEDs to port J by name."
+source = "DS11532 Rev 9 ordering information (N = 216 pins, I = 2048 Kbytes flash, H = TFBGA) + RM0410 Rev 5 memory map (SRAM1 368 KB). The pin list is PARTIAL rather than the package's 216: PA9 and PA10 carry the virtual COM port, PA0 the user button, PJ5 and PJ13 the two user LEDs, and PB3, PB4, PD6, PD7, PG9 and PG10 the six lines of the microSD socket -- and PORT J is the claim worth stating, because it exists only on the large packages and a part row that named it without evidence would be describing a package this board does not have. DS11532 Rev 9 Table 13 carries a row for every pin named here, and UM2033 Rev 5 Table 4 assigns the two LEDs to port J by name while its Table 14 assigns the six SDMMC2 lines to CN5."

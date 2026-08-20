@@ -3,10 +3,10 @@
 use crate::bind::{bind_type, parameter_symbol};
 use crate::bound::{Binder, literal_int_value};
 use crate::declaration::{
-    accessibility_of, collect_into, declared_type_name, is_constant_form, model_const_values,
-    qualified_type_name, resolve_const_expr, resolve_constants,
+    accessibility_of, collect_into, declared_full_name, declared_type_name, is_constant_form,
+    model_const_values, qualified_type_name, resolve_const_expr, resolve_constants,
 };
-use crate::diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition, compiling_version};
+use crate::diagnostic::{Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition};
 use lamella_syntax::version::{Feature, LanguageVersion};
 use crate::reference::load_assembly;
 use crate::special::SpecialType;
@@ -140,10 +140,10 @@ pub fn bind_compilation_unit_with_options(
         load_assembly(&mut model, reference);
     }
     collect_into(&mut model, unit);
-    model.canonicalize_signatures();
-    model.link_bases();
-    resolve_constants(&mut model, core::slice::from_ref(unit));
     let mut binder = Binder::with_model(model);
+    qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
+    binder.model_mut().link_bases();
+    resolve_constants(binder.model_mut(), core::slice::from_ref(unit));
     apply_bind_options(&mut binder, options);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
@@ -164,10 +164,10 @@ pub fn bind_compilation_unit_with_model(
     mut model: Model,
 ) -> Vec<Diagnostic> {
     collect_into(&mut model, unit);
-    model.canonicalize_signatures();
-    model.link_bases();
-    resolve_constants(&mut model, core::slice::from_ref(unit));
     let mut binder = Binder::with_model(model);
+    qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
+    binder.model_mut().link_bases();
+    resolve_constants(binder.model_mut(), core::slice::from_ref(unit));
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
@@ -179,17 +179,83 @@ pub fn bind_compilation_unit_with_model(
     diagnostics
 }
 
-/// The set of type names already declared in each namespace, so a second declaration of
-/// the same name in the same namespace is CS0101. Keyed by the dotted namespace (empty
-/// for the global namespace); spans the whole compilation (a namespace may be reopened).
-type DeclaredTypes = alloc::collections::BTreeMap<String, alloc::collections::BTreeSet<Box<str>>>;
+/// What an earlier declaration of a type name STATED, so a later declaration of the same name can
+/// be judged against it -- CS0101 for an ordinary duplicate, and CS0260 through CS0265 for the
+/// parts of a partial type (17.1.4).
+///
+/// **THE PARTS ARE COMPARED AGAINST THE FIRST ONE RATHER THAN ALL-PAIRS**, which is csc's shape:
+/// each rule is reported once per type, and the fields a part omits are FILLED IN from it so a
+/// third part is judged against everything stated so far.
+struct DeclaredType {
+    /// Whether the declaration carried `partial`.
+    is_partial: bool,
+    /// A class/struct/interface's kind. `None` for an enum, a delegate or a namespace -- none of
+    /// which can be partial, so a collision with one is an ordinary CS0101.
+    kind: Option<TypeKind>,
+    /// The accessibility this declaration WROTE, if any. A part may omit it (17.1.4), which is
+    /// why this is an `Option` rather than `accessibility_of`'s answer.
+    accessibility: Option<Accessibility>,
+    /// Its written base CLASS, resolved against the model. Interfaces are not compared: the parts'
+    /// interface lists UNION, which is what makes splitting an implementation across files useful.
+    base: Option<TypeSymbol>,
+    /// Its type parameter names, in declaration order.
+    type_parameters: Vec<Box<str>>,
+    /// Its constraints, by parameter, in the same order.
+    constraints: Vec<crate::symbols::TypeParameterConstraints>,
+    /// The declaration's span, for a rule csc reports against the FIRST part.
+    span: lamella_syntax::span::Span,
+    /// The name csc quotes: `W`, or `W<T>` for a generic one.
+    quoted: Box<str>,
+    /// Which rules have already been reported for this name, so a third part does not repeat a
+    /// message the second one already drew.
+    reported: PartialReported,
+    /// The FIELD, PROPERTY and EVENT names the parts so far declare -- the space in which nothing
+    /// overloads (10.3), so a repeat in a later part is CS0102.
+    names: alloc::collections::BTreeSet<Box<str>>,
+    /// The method and constructor signatures the parts so far declare, each rendered as
+    /// `name(type, type)`. A repeat is CS0111; a different parameter list is an ordinary overload,
+    /// which a partial type may perfectly well split across its parts.
+    ///
+    /// Kept as a STRING because `TypeSymbol` has no total order to key a set by, and the rendering
+    /// is the canonicalized one -- so `int` and `System.Int32` are one signature, not two.
+    signatures: alloc::collections::BTreeSet<String>,
+}
 
-/// CS0101: a namespace already contains a definition for a type name (16.3). Every type
-/// declared DIRECTLY in a namespace (a class/struct/interface, enum, or delegate) is
-/// recorded; a second one of the same name -- even in a reopened namespace block -- is a
-/// duplicate. A duplicate NESTED type is CS0102 instead, reported elsewhere, so this walk
-/// does not descend into a type's members. C# 1.0 has no partial types, so any repeat is an
-/// error.
+/// The rules already reported for one type name, so each is stated once however many parts there
+/// are.
+#[derive(Default)]
+struct PartialReported {
+    missing: bool,
+    kind: bool,
+    accessibility: bool,
+    base: bool,
+    parameters: bool,
+    constraints: bool,
+}
+
+/// The type names already declared in each namespace, with what each stated. Keyed by the dotted
+/// namespace (empty for the global namespace) then by the type's METADATA name; spans the whole
+/// compilation (a namespace may be reopened, and a partial type may span files).
+///
+/// **THE INNER KEY IS THE ARITY-MANGLED NAME.** Arity is part of a type's identity (25.5.1), so
+/// `W<T>`, `W<T,U>` and `W` are THREE types in one namespace and each has its own entry. It is also
+/// what keeps `partial class W<T>` from merging into `partial class W<T,U>`.
+type DeclaredTypes =
+    alloc::collections::BTreeMap<String, alloc::collections::BTreeMap<String, DeclaredType>>;
+
+/// The DECLARATION SPACE of each namespace (16.3): CS0101 for a second declaration of a type name,
+/// and CS0260 through CS0265 where the declarations are PARTS of one partial type (17.1.4).
+///
+/// Every type declared DIRECTLY in a namespace (a class/struct/interface, enum, or delegate) is
+/// recorded; a second one of the same name -- even in a reopened namespace block, or in another
+/// file -- meets the one before it here. A duplicate NESTED type is CS0102 instead, reported
+/// elsewhere, so this walk does not descend into a type's members.
+///
+/// **A PARTIAL PART IS NOT A DUPLICATE, AND A NON-PARTIAL ONE BESIDE IT IS NOT CS0101 EITHER.**
+/// Measured against csc: one part carrying `partial` makes every other declaration of that name a
+/// PART, so the one missing the modifier answers CS0260 rather than "already contains a
+/// definition". CS0101 survives for the case it was written for -- two declarations, neither
+/// partial -- and for a collision with an enum or delegate, which cannot be partial at all.
 fn report_duplicate_types(
     binder: &mut Binder,
     members: &[NamespaceMember],
@@ -197,7 +263,7 @@ fn report_duplicate_types(
     declared: &mut DeclaredTypes,
 ) {
     for member in members {
-        let (name, span) = match member {
+        let (name, key, incoming) = match member {
             NamespaceMember::Namespace(declaration) => {
                 let inner = join_namespace(namespace, &declaration.name);
                 report_duplicate_types(binder, &declaration.members, &inner, declared);
@@ -205,19 +271,43 @@ fn report_duplicate_types(
                     declared
                         .entry(String::from(namespace))
                         .or_default()
-                        .insert(outermost.clone());
+                        .entry(String::from(&**outermost))
+                        .or_insert_with(|| DeclaredType::plain(outermost, declaration.span));
                 }
                 continue;
             }
-            NamespaceMember::Type(declaration) => (&declaration.name, declaration.span),
-            NamespaceMember::Enum(declaration) => (&declaration.name, declaration.span),
-            NamespaceMember::Delegate(declaration) => (&declaration.name, declaration.span),
+            NamespaceMember::Type(declaration) => (
+                declaration.name.clone(),
+                crate::symbols::metadata_type_name(
+                    &declaration.name,
+                    declaration.type_parameters.len(),
+                ),
+                DeclaredType::of_type(binder.model(), declaration),
+            ),
+            NamespaceMember::Enum(declaration) => (
+                declaration.name.clone(),
+                String::from(&*declaration.name),
+                DeclaredType::plain(&declaration.name, declaration.span),
+            ),
+            NamespaceMember::Delegate(declaration) => (
+                declaration.name.clone(),
+                String::from(&*declaration.name),
+                DeclaredType::plain(&declaration.name, declaration.span),
+            ),
         };
-        if !declared
-            .entry(String::from(namespace))
-            .or_default()
-            .insert(name.clone())
-        {
+        let mut contributed = match member {
+            NamespaceMember::Type(declaration) => part_members(binder, declaration),
+            _ => Vec::new(),
+        };
+        let space = declared.entry(String::from(namespace)).or_default();
+        let Some(earlier) = space.get_mut(&key) else {
+            let mut first = incoming;
+            first.record_members(core::mem::take(&mut contributed));
+            space.insert(key, first);
+            continue;
+        };
+        let both_can_be_parts = earlier.kind.is_some() && incoming.kind.is_some();
+        if !both_can_be_parts || (!earlier.is_partial && !incoming.is_partial) {
             binder.report(Diagnostic::new(
                 DiagnosticKind::DuplicateTypeInNamespace {
                     namespace: if namespace.is_empty() {
@@ -225,12 +315,324 @@ fn report_duplicate_types(
                     } else {
                         namespace.into()
                     },
-                    name: name.clone(),
+                    name,
+                },
+                incoming.span,
+            ));
+            continue;
+        }
+        let type_name = earlier.quoted.clone();
+        report_partial_conflicts(binder, earlier, incoming);
+        for contribution in contributed {
+            match contribution {
+                PartMember::Name(name, span) => {
+                    if !earlier.names.insert(name.clone()) {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::DuplicateMember {
+                                type_name: type_name.clone(),
+                                member: name,
+                            },
+                            span,
+                        ));
+                    }
+                }
+                PartMember::Signature(name, types, span) => {
+                    if !earlier.signatures.insert(alloc::format!("{name}({types})")) {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::DuplicateMethod {
+                                type_name: type_name.clone(),
+                                member: name,
+                            },
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Judges one PART of a partial type against everything the earlier parts stated, reporting each
+/// rule at most once per type, and folds what this part adds into the record.
+///
+/// **WHICH PART A RULE IS REPORTED AGAINST IS csc's, MEASURED RATHER THAN CHOSEN.** CS0260 lands on
+/// the declaration missing the modifier, whichever it is; CS0261 and CS0263 on the LATER part;
+/// CS0262, CS0264 and CS0265 on the FIRST. A single placement for all six would move four of them.
+fn report_partial_conflicts(binder: &mut Binder, earlier: &mut DeclaredType, part: DeclaredType) {
+    let quoted = earlier.quoted.clone();
+    if !earlier.reported.missing {
+        let offender = if part.is_partial {
+            (!earlier.is_partial).then_some(earlier.span)
+        } else {
+            Some(part.span)
+        };
+        if let Some(span) = offender {
+            earlier.reported.missing = true;
+            binder.report(Diagnostic::new(
+                DiagnosticKind::MissingPartialModifier {
+                    name: quoted.clone(),
                 },
                 span,
             ));
         }
     }
+    if !earlier.reported.kind && earlier.kind != part.kind {
+        earlier.reported.kind = true;
+        binder.report(Diagnostic::new(
+            DiagnosticKind::PartialDeclarationsDifferentKinds {
+                name: quoted.clone(),
+            },
+            part.span,
+        ));
+    }
+    match (earlier.accessibility, part.accessibility) {
+        (Some(first), Some(second)) if first != second => {
+            if !earlier.reported.accessibility {
+                earlier.reported.accessibility = true;
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::PartialDeclarationsConflictingAccessibility {
+                        name: quoted.clone(),
+                    },
+                    earlier.span,
+                ));
+            }
+        }
+        (None, Some(second)) => earlier.accessibility = Some(second),
+        _ => {}
+    }
+    match (&earlier.base, &part.base) {
+        (Some(first), Some(second)) if first != second => {
+            if !earlier.reported.base {
+                earlier.reported.base = true;
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::PartialDeclarationsDifferentBases {
+                        name: quoted.clone(),
+                    },
+                    part.span,
+                ));
+            }
+        }
+        (None, Some(_)) => earlier.base = part.base.clone(),
+        _ => {}
+    }
+    if !earlier.reported.parameters && earlier.type_parameters != part.type_parameters {
+        earlier.reported.parameters = true;
+        binder.report(Diagnostic::new(
+            DiagnosticKind::PartialDeclarationsTypeParameterNames {
+                name: quoted.clone(),
+            },
+            earlier.span,
+        ));
+        return;
+    }
+    let default = crate::symbols::TypeParameterConstraints::default();
+    for (index, parameter) in earlier.type_parameters.iter().enumerate() {
+        let first = earlier.constraints.get(index).unwrap_or(&default);
+        let second = part.constraints.get(index).unwrap_or(&default);
+        if *first == default {
+            if let Some(slot) = earlier.constraints.get_mut(index) {
+                *slot = second.clone();
+            }
+            continue;
+        }
+        if *second == default || first == second {
+            continue;
+        }
+        if !earlier.reported.constraints {
+            earlier.reported.constraints = true;
+            binder.report(Diagnostic::new(
+                DiagnosticKind::PartialDeclarationsInconsistentConstraints {
+                    name: quoted.clone(),
+                    parameter: parameter.clone(),
+                },
+                earlier.span,
+            ));
+        }
+    }
+}
+
+impl DeclaredType {
+    /// Records what a declaration contributes to its type's declaration space, so a LATER part is
+    /// judged against it. Nothing is reported here: the first part's own internal duplicates are
+    /// `validate_type`'s to find.
+    fn record_members(&mut self, members: Vec<PartMember>) {
+        for member in members {
+            match member {
+                PartMember::Name(name, _) => {
+                    self.names.insert(name);
+                }
+                PartMember::Signature(name, types, _) => {
+                    self.signatures.insert(alloc::format!("{name}({types})"));
+                }
+            }
+        }
+    }
+
+    /// The record for a declaration that cannot be partial -- an enum, a delegate, or a namespace
+    /// occupying the name.
+    fn plain(name: &str, span: lamella_syntax::span::Span) -> DeclaredType {
+        DeclaredType {
+            is_partial: false,
+            kind: None,
+            accessibility: None,
+            base: None,
+            type_parameters: Vec::new(),
+            constraints: Vec::new(),
+            span,
+            quoted: Box::from(name),
+            reported: PartialReported::default(),
+            names: alloc::collections::BTreeSet::new(),
+            signatures: alloc::collections::BTreeSet::new(),
+        }
+    }
+
+    /// The record for a class, struct or interface declaration.
+    fn of_type(model: &Model, declaration: &TypeDecl) -> DeclaredType {
+        let type_parameters: Vec<Box<str>> = declaration
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect();
+        let base = declaration
+            .bases
+            .iter()
+            .find_map(|written| model.resolve_class_base(&crate::bind::bind_type(written)));
+        DeclaredType {
+            is_partial: declaration
+                .modifiers
+                .iter()
+                .any(|modifier| matches!(modifier, Modifier::Partial)),
+            kind: Some(declaration.kind),
+            accessibility: written_accessibility(&declaration.modifiers),
+            base,
+            constraints: crate::declaration::constraints_by_parameter(
+                &type_parameters,
+                &declaration.constraints,
+            ),
+            quoted: quoted_type_name(&declaration.name, &type_parameters),
+            type_parameters,
+            span: declaration.span,
+            reported: PartialReported::default(),
+            names: alloc::collections::BTreeSet::new(),
+            signatures: alloc::collections::BTreeSet::new(),
+        }
+    }
+}
+
+/// One member of a type, as the cross-part duplicate check compares them: a name that does not
+/// overload, or a signature that does.
+enum PartMember {
+    /// A field, property or event: a name in the space where nothing overloads (10.3).
+    Name(Box<str>, Span),
+    /// A method or constructor: its name and its canonicalized parameter types, rendered.
+    Signature(Box<str>, String, Span),
+}
+
+/// The members one declaration contributes to its type's declaration space, for the CROSS-PART
+/// duplicate check.
+///
+/// **THE WITHIN-ONE-DECLARATION CHECK ALREADY EXISTS AND IS NOT REPEATED HERE.** `validate_type`
+/// walks a declaration's own members for CS0102 and CS0111; what no per-declaration walk can see is
+/// a member declared in ANOTHER part -- possibly another file -- which csc reports just the same.
+/// An explicit interface implementation is exempt for the reason it is exempt there: 20.4.1 lets it
+/// repeat a simple name.
+fn part_members(binder: &mut Binder, declaration: &TypeDecl) -> Vec<PartMember> {
+    let mut members = Vec::new();
+    for member in &declaration.members {
+        match member {
+            Member::Field { declarators, .. } => {
+                for declarator in declarators {
+                    members.push(PartMember::Name(declarator.name.clone(), declarator.span));
+                }
+            }
+            Member::Property {
+                name,
+                span,
+                explicit_interface: None,
+                ..
+            } => members.push(PartMember::Name(name.clone(), *span)),
+            Member::EventField { declarators, .. } => {
+                for declarator in declarators {
+                    members.push(PartMember::Name(declarator.name.clone(), declarator.span));
+                }
+            }
+            Member::Method {
+                name,
+                parameters,
+                span,
+                explicit_interface: None,
+                ..
+            } => {
+                let types = bound_parameter_types(binder, parameters);
+                members.push(PartMember::Signature(name.clone(), types, *span));
+            }
+            Member::Constructor {
+                modifiers,
+                parameters,
+                span,
+                ..
+            } if !modifiers.iter().any(|m| matches!(m, Modifier::Static)) => {
+                let types = bound_parameter_types(binder, parameters);
+                members.push(PartMember::Signature(declaration.name.clone(), types, *span));
+            }
+            _ => {}
+        }
+    }
+    members
+}
+
+/// A member's parameter types as overload resolution compares them, rendered into one key --
+/// canonicalized, so `int` and `System.Int32` are one signature and not two.
+fn bound_parameter_types(binder: &mut Binder, parameters: &[Parameter]) -> String {
+    let mut key = String::new();
+    for parameter in parameters {
+        if !key.is_empty() {
+            key.push(',');
+        }
+        key.push_str(
+            &binder
+                .canonicalize(&crate::bind::parameter_symbol(parameter))
+                .to_string(),
+        );
+    }
+    key
+}
+
+/// The name csc quotes for a type in a partial-declaration diagnostic: `W` for a non-generic one
+/// and `W<T>` for a generic one, with the parameters as DECLARED.
+///
+/// [`quote_candidate`] alone cannot serve: it exists for CS0305, where the type is generic by
+/// construction, so it always writes the angle brackets and a non-generic type comes out `W<>` --
+/// a spelling that names nothing.
+fn quoted_type_name(name: &str, type_parameters: &[Box<str>]) -> Box<str> {
+    if type_parameters.is_empty() {
+        return Box::from(name);
+    }
+    quote_candidate(name, type_parameters.len(), type_parameters)
+}
+
+/// The accessibility a declaration's modifiers STATE, or `None` when they state none. Distinct
+/// from `accessibility_of`, which answers what the accessibility IS and so cannot tell an omitted
+/// modifier from a written `private` -- the difference 17.1.4 turns on.
+fn written_accessibility(modifiers: &[Modifier]) -> Option<Accessibility> {
+    let mut stated: Option<Accessibility> = None;
+    for modifier in modifiers {
+        let one = match modifier {
+            Modifier::Public => Accessibility::Public,
+            Modifier::Private => Accessibility::Private,
+            Modifier::Internal => Accessibility::Internal,
+            Modifier::Protected => Accessibility::Protected,
+            _ => continue,
+        };
+        stated = Some(match (stated, one) {
+            (Some(Accessibility::Protected), Accessibility::Internal)
+            | (Some(Accessibility::Internal), Accessibility::Protected) => {
+                Accessibility::ProtectedInternal
+            }
+            (_, one) => one,
+        });
+    }
+    stated
 }
 
 /// CS0017: a program declares more than one entry point when two or more of its types have a
@@ -365,10 +767,12 @@ pub fn bind_compilation_units_with_options(
     for unit in units {
         collect_into(&mut model, unit);
     }
-    model.canonicalize_signatures();
-    model.link_bases();
-    resolve_constants(&mut model, units);
     let mut binder = Binder::with_model(model);
+    for unit in units {
+        qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
+    }
+    binder.model_mut().link_bases();
+    resolve_constants(binder.model_mut(), units);
     apply_bind_options(&mut binder, options);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     let mut per_unit: Vec<Vec<Diagnostic>> = units
@@ -390,6 +794,136 @@ pub fn bind_compilation_units_with_options(
     }
     withhold_body_diagnostics_after_declaration_error(&mut per_unit);
     per_unit
+}
+
+/// Qualifies every SOURCE-DECLARED signature type in the model to the full name it means in ITS
+/// OWN DECLARATION'S SCOPE (10.8) -- the enclosing type, the current namespace, the global
+/// namespace, and the file's `using`s, through [`Binder::canonicalize`]'s scope walk.
+///
+/// **THIS REPLACED the model-wide `canonicalize_signatures` WORLD-UNIQUENESS RULE, AND THE
+/// DIFFERENCE WAS #52.** That pass qualified a single-part signature name only when EXACTLY ONE
+/// type in the whole model (references included) carried the simple name -- so the moment a
+/// referenced assembly declared a same-named type in a namespace nobody imported, the signature
+/// stayed raw while expression positions resolved, and one file's `Marker` got two identities
+/// split by syntactic position (CS0029/CS0115 on programs csc compiles). Scope is per
+/// DECLARATION, so this pass is driven by the unit's AST -- the model alone no longer knows
+/// which file, and which `using`s, a type came from.
+///
+/// Runs after [`collect_into`] and BEFORE [`Model::link_bases`], so the base chain links over
+/// qualified names. The walk mirrors [`bind_namespace_body`]'s scope entry (and the emitter's
+/// `emit_namespace` mirrors both) -- reporting nothing: an alias with a bad target, a duplicate
+/// alias, an unresolvable name are all the bind walk's diagnostics to make.
+pub fn qualify_declared_signatures(
+    binder: &mut Binder,
+    usings: &[UsingDirective],
+    members: &[NamespaceMember],
+    namespace: &str,
+) {
+    let scope = binder.import_scope();
+    for using in usings {
+        match &using.kind {
+            UsingKind::Namespace(name) => binder.import_namespace(&dotted(name)),
+            UsingKind::Alias { name, target } => {
+                let aliased = TypeSymbol::Named(target.parts.iter().cloned().collect());
+                binder.import_alias(name, aliased);
+            }
+        }
+    }
+    let mut prefix = String::new();
+    for part in namespace.split('.').filter(|part| !part.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(part);
+        binder.import_namespace(&prefix);
+    }
+    for member in members {
+        match member {
+            NamespaceMember::Namespace(declaration) => {
+                let inner = join_namespace(namespace, &declaration.name);
+                qualify_declared_signatures(binder, &declaration.usings, &declaration.members, &inner);
+            }
+            NamespaceMember::Type(declaration) => {
+                qualify_type_declaration(binder, namespace, declaration);
+            }
+            NamespaceMember::Delegate(declaration) => {
+                qualify_model_info(binder, namespace, &declaration.name);
+            }
+            NamespaceMember::Enum(declaration) => {
+                qualify_model_info(binder, namespace, &declaration.name);
+            }
+        }
+    }
+    binder.restore_import_scope(scope);
+}
+
+/// Qualifies one type declaration's model signatures under its scope, then recurses into its
+/// nested type declarations -- which are keyed under the enclosing type's FULL NAME standing in
+/// for the namespace, exactly as `collect_nested_types` registered them.
+fn qualify_type_declaration(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    let type_parameters =
+        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    binder.enter_type(declared_symbol(namespace, declaration));
+    qualify_model_info(binder, namespace, &declared_type_name(declaration));
+    binder.exit_type();
+    let enclosing_full = declared_full_name(namespace, declaration);
+    for member in &declaration.members {
+        if let Member::NestedType(nested) = member {
+            match nested.as_ref() {
+                NamespaceMember::Type(inner) => {
+                    qualify_type_declaration(binder, &enclosing_full, inner);
+                }
+                NamespaceMember::Delegate(inner) => {
+                    qualify_model_info(binder, &enclosing_full, &inner.name);
+                }
+                NamespaceMember::Enum(inner) => {
+                    qualify_model_info(binder, &enclosing_full, &inner.name);
+                }
+                NamespaceMember::Namespace(_) => {}
+            }
+        }
+    }
+    binder.exit_type_parameters(type_parameters);
+}
+
+/// Rewrites the signature positions of the model type at `(namespace, name)` through the scoped
+/// [`Binder::canonicalize`]: the base list, field/property/event types, and every method's and
+/// constructor's return and parameter types -- with the METHOD's own type parameters entered
+/// around its rewrite, so `T Id<T>(T x)` keeps its `T`s raw rather than capturing a model type
+/// spelled the same way.
+fn qualify_model_info(binder: &mut Binder, namespace: &str, name: &str) {
+    let Some(mut info) = binder.model().get(namespace, name).cloned() else {
+        return;
+    };
+    info.bases = info.bases.iter().map(|base| binder.canonicalize(base)).collect();
+    for field in &mut info.fields {
+        field.ty = binder.canonicalize(&field.ty);
+    }
+    for property in &mut info.properties {
+        property.ty = binder.canonicalize(&property.ty);
+    }
+    for event in &mut info.events {
+        event.ty = binder.canonicalize(&event.ty);
+    }
+    for method in &mut info.methods {
+        let method_parameters = binder.enter_type_parameter_names(&method.type_parameters);
+        method.return_type = binder.canonicalize(&method.return_type);
+        for parameter in &mut method.parameters {
+            *parameter = binder.canonicalize(parameter);
+        }
+        if let Some(explicit) = &method.explicit_interface {
+            method.explicit_interface = Some(binder.canonicalize(explicit));
+        }
+        binder.exit_type_parameters(method_parameters);
+    }
+    for constructor in &mut info.constructors {
+        for parameter in &mut constructor.parameters {
+            *parameter = binder.canonicalize(parameter);
+        }
+    }
+    if let Some(slot) = binder.model_mut().info_mut(namespace, name) {
+        *slot = info;
+    }
 }
 
 fn bind_namespace_body(
@@ -430,16 +964,36 @@ fn bind_namespace_body(
                 let inner = join_namespace(namespace, &declaration.name);
                 bind_namespace_body(binder, &declaration.usings, &declaration.members, &inner);
             }
-            NamespaceMember::Type(declaration) => bind_type_bodies(binder, namespace, declaration),
-            NamespaceMember::Delegate(declaration) => {
-                check_delegate_accessibility(binder, namespace, declaration);
-            }
-            NamespaceMember::Enum(declaration) => {
-                validate_enum_members(binder, namespace, declaration);
+            NamespaceMember::Type(_) | NamespaceMember::Delegate(_) | NamespaceMember::Enum(_) => {
+                bind_namespace_member(binder, namespace, member);
             }
         }
     }
     binder.restore_import_scope(scope);
+}
+
+/// The validations a namespace member receives, WHEREVER IT IS DECLARED.
+///
+/// **A TYPE NESTED IN A TYPE IS THE SAME DECLARATION IN A DIFFERENT PLACE, AND THIS FUNCTION IS
+/// WHAT MAKES THAT TRUE.** The nested walk used to recurse only into `NamespaceMember::Type`, so a
+/// nested DELEGATE and a nested ENUM reached no validation at all -- measured against csc:
+/// `class C { public abstract delegate void D(); }` and `class C { public abstract enum E { A } }`
+/// are both CS0106 there and were both silent here, while the identical declarations one scope out
+/// were reported correctly. A member's legality is not a property of where it sits.
+///
+/// The `Namespace` arm is absent because a namespace cannot be declared inside a type; the
+/// namespace walk handles its own recursion, which is a different question (an import scope).
+fn bind_namespace_member(binder: &mut Binder, namespace: &str, member: &NamespaceMember) {
+    match member {
+        NamespaceMember::Type(declaration) => bind_type_bodies(binder, namespace, declaration),
+        NamespaceMember::Delegate(declaration) => {
+            check_delegate_accessibility(binder, namespace, declaration);
+        }
+        NamespaceMember::Enum(declaration) => {
+            validate_enum_members(binder, namespace, declaration);
+        }
+        NamespaceMember::Namespace(_) => {}
+    }
 }
 
 /// Validates each `enum` member's initializer (21.4): it must be a compile-time constant (CS0133),
@@ -476,6 +1030,7 @@ fn validate_enum_members(binder: &mut Binder, namespace: &str, declaration: &Enu
             Modifier::Abstract => "abstract",
             Modifier::Sealed => "sealed",
             Modifier::Static => "static",
+            Modifier::Partial => "partial",
             Modifier::Readonly => "readonly",
             Modifier::Volatile => "volatile",
             Modifier::Virtual => "virtual",
@@ -483,6 +1038,7 @@ fn validate_enum_members(binder: &mut Binder, namespace: &str, declaration: &Enu
             Modifier::Extern => "extern",
             Modifier::Const => "const",
             Modifier::Required => "required",
+            Modifier::Async => "async",
         };
         binder.report(Diagnostic::new(
             DiagnosticKind::ModifierNotValidForItem {
@@ -589,6 +1145,7 @@ fn invalid_delegate_modifier(modifier: &Modifier) -> Option<&'static str> {
         Modifier::Virtual => Some("virtual"),
         Modifier::Override => Some("override"),
         Modifier::Static => Some("static"),
+        Modifier::Async => Some("async"),
         _ => None,
     }
 }
@@ -776,6 +1333,7 @@ fn validate_constraint_type(binder: &mut Binder, reference: &lamella_syntax::ast
 
 fn validate_volatile_fields(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     let type_full = qualified_type_name(namespace, &declaration.name);
+    binder.enter_type(declared_symbol(namespace, declaration));
     for member in &declaration.members {
         let Member::Field {
             modifiers,
@@ -804,6 +1362,7 @@ fn validate_volatile_fields(binder: &mut Binder, namespace: &str, declaration: &
             ));
         }
     }
+    binder.exit_type();
 }
 
 /// The declaration rules for a `required` member (C# 11), measured against csc one compilation per
@@ -1144,7 +1703,7 @@ fn validate_event_types(binder: &mut Binder, namespace: &str, declaration: &Type
         else {
             continue;
         };
-        let resolved = binder.resolve_named_type(&bind_type(ty), ty.span);
+        let resolved = binder.resolve_type_ref(ty);
         if resolved.is_error() {
             continue;
         }
@@ -1867,16 +2426,10 @@ fn validate_interface_members(binder: &mut Binder, declaration: &TypeDecl) {
         return;
     }
     let default_implementation = |binder: &mut Binder, span| {
-        binder.report(Diagnostic::new(
-            DiagnosticKind::FeatureRequiresLaterVersion {
-                feature: lamella_syntax::version::Feature::DefaultInterfaceImplementation
-                    .description()
-                    .into(),
-                required: "8.0".into(),
-                    current: compiling_version(),
-            },
+        binder.gate_feature(
+            lamella_syntax::version::Feature::DefaultInterfaceImplementation,
             span,
-        ));
+        );
     };
     for member in &declaration.members {
         let modifiers = match member {
@@ -1956,16 +2509,10 @@ fn validate_constructors(binder: &mut Binder, declaration: &TypeDecl) {
             && parameters.is_empty()
             && !modifiers.iter().any(|m| matches!(m, Modifier::Static))
         {
-            binder.report(Diagnostic::new(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: lamella_syntax::version::Feature::ParameterlessStructConstructor
-                        .description()
-                        .into(),
-                    required: "10.0".into(),
-                        current: compiling_version(),
-                },
+            binder.gate_feature(
+                lamella_syntax::version::Feature::ParameterlessStructConstructor,
                 *span,
-            ));
+            );
         }
         if !modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
             continue;
@@ -1979,6 +2526,137 @@ fn validate_constructors(binder: &mut Binder, declaration: &TypeDecl) {
             binder.report(Diagnostic::new(
                 DiagnosticKind::StaticConstructorAccessibility {
                     member: method_signature(&declaration.name, &declaration.name, parameters),
+                },
+                *span,
+            ));
+        }
+    }
+}
+
+/// CS0106 for `async` anywhere but a method (15.15: the modifier belongs to methods and
+/// anonymous functions alone). MEASURED on a field, a property and a delegate declaration --
+/// each is exactly `The modifier 'async' is not valid for this item` -- and a constructor never
+/// reaches here, because `async C()` parses as a method `C` of type `async` (also measured,
+/// CS0246 + CS0542). A method's own async validity (CS1983's return-type rule, CS1988) is the
+/// binder's method checking, not this walk.
+/// The async method DECLARATION rules of 15.15.1, each measured against csc: the return type is
+/// `void`, `Task` or `Task<T>` (CS1983 otherwise, csc's current text), no `ref` or `out`
+/// parameters (CS1988), and the two phase-split refusals by name -- a `Task<T>` return and a
+/// generic async method are both permitted-but-unbuilt (LAM0001) until phase 2. Lives HERE, on
+/// the AST, because a parameter's mode and a method's own type-parameter list are declaration
+/// facts `bind_method`'s signature never carries. Guarded on the dialect supporting async at
+/// all: below C# 5 the parser's one modifier gate is the whole report (measured).
+fn validate_async_method_signatures(binder: &mut Binder, declaration: &TypeDecl) {
+    if !binder.language_version().supports(Feature::AsyncFunction) {
+        return;
+    }
+    for member in &declaration.members {
+        let Member::Method {
+            modifiers,
+            return_type,
+            type_parameters,
+            parameters,
+            span,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if !modifiers.iter().any(|m| matches!(m, Modifier::Async)) {
+            continue;
+        }
+        let return_symbol = binder.canonicalize(&bind_type(return_type));
+        if !return_symbol.is_void() {
+            if crate::bound::is_system_task_of_t(&return_symbol) {
+                binder.gate_feature(Feature::AsyncTaskOfT, *span);
+            } else if !crate::bound::is_system_task(&return_symbol) {
+                binder.report(Diagnostic::new(DiagnosticKind::AsyncReturnType, *span));
+            }
+        }
+        if parameters.iter().any(|parameter| {
+            matches!(
+                parameter.modifier,
+                Some(ParameterModifier::Ref) | Some(ParameterModifier::Out)
+            )
+        }) {
+            binder.report(Diagnostic::new(DiagnosticKind::AsyncByRefParameter, *span));
+        }
+        if !type_parameters.is_empty() || !declaration.type_parameters.is_empty() {
+            binder.gate_feature(Feature::AsyncGenericMethod, *span);
+        }
+    }
+}
+
+/// The async ENTRY-POINT rules, measured: `static async void Main()` (or `int`) is CS4009 `A
+/// void or int returning entry point cannot be async` at every dialect that has async at all,
+/// and `static async Task Main()` is the separately-gated 'async main' feature -- CS8026 at
+/// C# 5 asking for 7.1, LAM0001 from 7.1 up while unbuilt. Guarded on the dialect supporting
+/// async functions, since below 5 the parser's one modifier gate is the whole report.
+fn validate_async_entry_points(binder: &mut Binder, declaration: &TypeDecl) {
+    if !binder.language_version().supports(Feature::AsyncFunction) {
+        return;
+    }
+    for member in &declaration.members {
+        let Member::Method {
+            modifiers,
+            return_type,
+            name,
+            parameters,
+            span,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if &**name != "Main"
+            || !modifiers.iter().any(|m| matches!(m, Modifier::Static))
+            || !modifiers.iter().any(|m| matches!(m, Modifier::Async))
+        {
+            continue;
+        }
+        let entry_shaped = parameters.is_empty()
+            || (parameters.len() == 1
+                && matches!(&bind_type(&parameters[0].ty),
+                    TypeSymbol::Array { element, rank: 1 }
+                        if matches!(&**element, TypeSymbol::Special(SpecialType::String))));
+        if !entry_shaped {
+            continue;
+        }
+        let return_symbol = binder.canonicalize(&bind_type(return_type));
+        if return_symbol.is_void() || matches!(return_symbol, TypeSymbol::Special(SpecialType::Int32))
+        {
+            binder.report(Diagnostic::new(DiagnosticKind::AsyncVoidEntryPoint, *span));
+        } else if crate::bound::is_system_task(&return_symbol) {
+            binder.gate_feature(Feature::AsyncMain, *span);
+        }
+    }
+}
+
+fn validate_async_modifiers(binder: &mut Binder, declaration: &TypeDecl) {
+    if declaration.modifiers.iter().any(|m| matches!(m, Modifier::Async)) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::ModifierNotValidForItem {
+                modifier: "async".into(),
+            },
+            declaration.span,
+        ));
+    }
+    for member in &declaration.members {
+        let (modifiers, span) = match member {
+            Member::Method { .. } => continue,
+            Member::Field { modifiers, span, .. }
+            | Member::Property { modifiers, span, .. }
+            | Member::Indexer { modifiers, span, .. }
+            | Member::EventField { modifiers, span, .. }
+            | Member::Event { modifiers, span, .. }
+            | Member::Constructor { modifiers, span, .. } => (modifiers, span),
+            Member::NestedType(_) => continue,
+            _ => continue,
+        };
+        if modifiers.iter().any(|m| matches!(m, Modifier::Async)) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ModifierNotValidForItem {
+                    modifier: "async".into(),
                 },
                 *span,
             ));
@@ -2023,6 +2701,8 @@ fn validate_destructors(binder: &mut Binder, declaration: &TypeDecl) {
                 Modifier::Volatile => "volatile",
                 Modifier::Const => "const",
                 Modifier::Required => "required",
+                Modifier::Partial => "partial",
+                Modifier::Async => "async",
             };
             binder.report(Diagnostic::new(
                 DiagnosticKind::ModifierNotValidForItem {
@@ -2136,6 +2816,9 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     validate_top_level_type_modifiers(binder, namespace, declaration);
     validate_static_member_modifiers(binder, declaration);
     validate_destructors(binder, declaration);
+    validate_async_modifiers(binder, declaration);
+    validate_async_method_signatures(binder, declaration);
+    validate_async_entry_points(binder, declaration);
     validate_constructors(binder, declaration);
     validate_interface_members(binder, declaration);
     validate_event_types(binder, namespace, declaration);
@@ -2340,25 +3023,184 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     }
     if declaration.kind != TypeKind::Interface {
         for member in &declaration.members {
-            let Member::Property {
-                modifiers,
-                getter,
-                setter,
-                span,
-                ..
-            } = member
-            else {
-                continue;
+            let (modifiers, getter, setter, span, name) = match member {
+                Member::Property {
+                    modifiers,
+                    getter,
+                    setter,
+                    span,
+                    name,
+                    ..
+                } => (
+                    modifiers,
+                    getter,
+                    setter,
+                    span,
+                    alloc::format!("{}.{name}", declaration.name),
+                ),
+                Member::Indexer {
+                    modifiers,
+                    getter,
+                    setter,
+                    span,
+                    parameters,
+                    ..
+                } => (
+                    modifiers,
+                    getter,
+                    setter,
+                    span,
+                    alloc::format!(
+                        "{}.this[{}]",
+                        declaration.name,
+                        parameter_type_list(parameters)
+                    ),
+                ),
+                _ => continue,
             };
             let bodyless_allowed = modifiers
                 .iter()
                 .any(|modifier| matches!(modifier, Modifier::Abstract | Modifier::Extern));
-            let has_bodyless_accessor = [getter, setter]
+            if bodyless_allowed {
+                continue;
+            }
+            let bodyless = |accessor: &Option<lamella_syntax::ast::Accessor>| {
+                accessor
+                    .as_ref()
+                    .is_some_and(|accessor| accessor.body.is_none())
+            };
+            let (bodyless_get, bodyless_set) = (bodyless(getter), bodyless(setter));
+            if !bodyless_get && !bodyless_set {
+                continue;
+            }
+            let is_indexer = matches!(member, Member::Indexer { .. });
+            let auto = !is_indexer
+                && bodyless_get == getter.is_some()
+                && bodyless_set == setter.is_some();
+            if auto {
+                let feature = if getter.is_some() && setter.is_some() {
+                    Feature::AutoProperties
+                } else if setter.is_none() {
+                    Feature::ReadonlyAutoProperty
+                } else {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::AutoPropertyMustHaveGetAccessor,
+                        *span,
+                    ));
+                    Feature::AutoProperties
+                };
+                binder.gate_feature(feature, *span);
+                continue;
+            }
+            for (is_bodyless, accessor) in [(bodyless_get, "get"), (bodyless_set, "set")] {
+                if is_bodyless {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::MethodMustHaveBody {
+                            method: alloc::format!("{name}.{accessor}").into(),
+                        },
+                        *span,
+                    ));
+                }
+            }
+        }
+    }
+    {
+        for member in &declaration.members {
+            let (modifiers, getter, setter, explicit_interface, name) = match member {
+                Member::Property {
+                    modifiers,
+                    getter,
+                    setter,
+                    explicit_interface,
+                    name,
+                    ..
+                } => (
+                    modifiers,
+                    getter,
+                    setter,
+                    explicit_interface.as_ref(),
+                    alloc::format!("{}.{name}", declaration.name),
+                ),
+                Member::Indexer {
+                    modifiers,
+                    getter,
+                    setter,
+                    parameters,
+                    ..
+                } => (
+                    modifiers,
+                    getter,
+                    setter,
+                    None,
+                    alloc::format!(
+                        "{}.this[{}]",
+                        declaration.name,
+                        parameter_type_list(parameters)
+                    ),
+                ),
+                _ => continue,
+            };
+            let modified = [(getter, "get"), (setter, "set")]
                 .into_iter()
-                .flatten()
-                .any(|accessor| accessor.body.is_none());
-            if !bodyless_allowed && has_bodyless_accessor {
-                binder.gate_feature(Feature::AutoProperties, *span);
+                .filter_map(|(accessor, which)| {
+                    accessor
+                        .as_ref()
+                        .filter(|accessor| !accessor.modifiers.is_empty())
+                        .map(|accessor| (accessor, which))
+                })
+                .collect::<Vec<_>>();
+            let Some((accessor, which)) = modified.first().copied() else {
+                continue;
+            };
+            binder.gate_feature(Feature::AccessorAccessibility, accessor.span);
+            if explicit_interface.is_some() {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::ModifierNotValidForItem {
+                        modifier: accessibility_of(&accessor.modifiers).keyword().into(),
+                    },
+                    accessor.span,
+                ));
+                continue;
+            }
+            if modified.len() > 1 {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::AccessorAccessibilityOnBothAccessors {
+                        property: name.clone().into(),
+                    },
+                    accessor.span,
+                ));
+                continue;
+            }
+            if getter.is_none() || setter.is_none() {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::AccessorAccessibilityNeedsBothAccessors {
+                        property: name.clone().into(),
+                    },
+                    accessor.span,
+                ));
+                continue;
+            }
+            let declared = accessibility_of(&accessor.modifiers);
+            if declared == Accessibility::Private
+                && (modifiers.contains(&Modifier::Abstract)
+                    || declaration.kind == TypeKind::Interface)
+            {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::AbstractPropertyHasPrivateAccessor {
+                        accessor: alloc::format!("{name}.{which}").into(),
+                    },
+                    accessor.span,
+                ));
+                continue;
+            }
+            if !is_more_restrictive_than(declared, accessibility_of(modifiers)) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::AccessorAccessibilityNotMoreRestrictive {
+                        accessor: alloc::format!("{name}.{which}").into(),
+                        property: name.clone().into(),
+                    },
+                    accessor.span,
+                ));
             }
         }
     }
@@ -2414,12 +3256,30 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 declaration.span,
             ));
         }
-        let base_candidate = class_bases.first().cloned().or_else(|| {
+        let resolvable: Vec<TypeSymbol> = {
+            let mut kept = Vec::new();
+            for reference in &declaration.bases {
+                let symbol = bind_type(reference);
+                if !binder
+                    .resolve_named_type_quietly(&symbol, reference.span)
+                    .is_error()
+                {
+                    kept.push(symbol);
+                }
+            }
+            kept
+        };
+        let base_candidate = {
             let model = binder.model();
-            written
+            resolvable
                 .iter()
-                .find_map(|base| model.resolve_struct_base(base))
-        });
+                .find_map(|base| model.resolve_class_base(base))
+                .or_else(|| {
+                    resolvable
+                        .iter()
+                        .find_map(|base| model.resolve_sealed_base(base))
+                })
+        };
         if let Some(base) = &base_candidate {
             let derives_from_sealed = binder
                 .model()
@@ -2633,6 +3493,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
         };
         check_params_usage(binder, parameters);
     }
+    binder.enter_type(enclosing.clone());
     let container_mask = {
         let model = binder.model();
         model
@@ -2992,7 +3853,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     }
     binder.enter_type(enclosing.clone());
     for base in &declaration.bases {
-        binder.resolve_named_type(&bind_type(base), base.span);
+        binder.resolve_type_ref(base);
     }
     for member in &declaration.members {
         let signature_parameters = match member {
@@ -3009,7 +3870,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             | Member::Method { return_type: ty, .. }
             | Member::Property { ty, .. }
             | Member::Operator { return_type: ty, .. } => {
-                binder.resolve_named_type(&bind_type(ty), ty.span);
+                binder.resolve_type_ref(ty);
             }
             _ => {}
         }
@@ -3042,7 +3903,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             | Member::ConversionOperator { parameters, .. }
             | Member::Indexer { parameters, .. } => {
                 for parameter in parameters {
-                    binder.resolve_named_type(&bind_type(&parameter.ty), parameter.ty.span);
+                    binder.resolve_type_ref(&parameter.ty);
                     report_restricted_parameter(binder, parameter);
                 }
             }
@@ -3077,6 +3938,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     &params,
                     &out_parameter_names(parameters),
                     is_static_member(modifiers),
+                    modifiers.iter().any(|m| matches!(m, Modifier::Async)),
                     body,
                 );
                 binder.exit_type_parameters(method_parameters);
@@ -3096,6 +3958,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     &params,
                     &[],
                     true,
+                    false,
                     body,
                 );
             }
@@ -3114,6 +3977,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     &params,
                     &[],
                     true,
+                    false,
                     body,
                 );
             }
@@ -3135,6 +3999,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     &params,
                     &out_parameter_names(parameters),
                     is_static_member(modifiers),
+                    false,
                     body,
                 );
             }
@@ -3156,6 +4021,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                         &[],
                         &[],
                         is_static,
+                        false,
                         body,
                     );
                 }
@@ -3167,6 +4033,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                         &[(Box::from("value"), property_ty.clone())],
                         &[],
                         is_static,
+                        false,
                         body,
                     );
                 }
@@ -3193,6 +4060,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                             &value,
                             &[],
                             is_static,
+                            false,
                             body,
                         );
                     }
@@ -3215,6 +4083,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                         &indices,
                         &[],
                         false,
+                        false,
                         body,
                     );
                 }
@@ -3228,6 +4097,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                         &indices,
                         &[],
                         false,
+                        false,
                         body,
                     );
                 }
@@ -3239,7 +4109,9 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 span: member_span,
                 ..
             } => {
+                binder.enter_type(enclosing.clone());
                 let field_ty = binder.canonicalize(&bind_type(ty));
+                binder.exit_type();
                 let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
                 for declarator in declarators {
                     let access = binder
@@ -3298,15 +4170,13 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     &[],
                     &[],
                     false,
+                    false,
                     body,
                 );
             }
             Member::NestedType(nested) => {
-                if let NamespaceMember::Type(nested_decl) = nested.as_ref() {
-                    let enclosing_full =
-                        crate::declaration::declared_full_name(namespace, declaration);
-                    bind_type_bodies(binder, &enclosing_full, nested_decl);
-                }
+                let enclosing_full = crate::declaration::declared_full_name(namespace, declaration);
+                bind_namespace_member(binder, &enclosing_full, nested.as_ref());
             }
             _ => {}
         }
@@ -3319,10 +4189,15 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     }
     check_constant_cycles(binder, declaration);
     binder.check_base_constructor_call(&enclosing, declaration);
+    let signature_scope =
+        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    binder.enter_type(enclosing.clone());
     binder.check_interface_implementations(&enclosing, declaration);
     binder.check_overrides_have_base(&enclosing, declaration);
     binder.check_property_overrides_have_base(&enclosing, declaration);
     binder.check_abstract_implementations(&enclosing, declaration);
+    binder.exit_type();
+    binder.exit_type_parameters(signature_scope);
 }
 
 /// CS0110: reports a const field whose value evaluation is circular. The declaration-order fold
@@ -3765,6 +4640,26 @@ fn type_is_resolvable(model: &Model, ty: &TypeSymbol, type_parameters: &[Box<str
     }
 }
 
+/// Whether `accessor` is STRICTLY more restrictive than `property`, which is what 10.7.2 requires of
+/// an accessor's own access modifier.
+///
+/// **`protected` AND `internal` ARE INCOMPARABLE, NOT EQUAL, AND EQUAL IS NOT ENOUGH EITHER.** Both
+/// facts fall out of one rank if `protected` and `internal` share it: `<` then rejects
+/// protected-under-internal and internal-under-protected (same rank) and rejects a modifier that
+/// merely repeats the property's. Measured against csc over the whole five-by-five lattice, and the
+/// two incomparable cells are the ones a plain ordering gets wrong.
+fn is_more_restrictive_than(accessor: Accessibility, property: Accessibility) -> bool {
+    fn rank(accessibility: Accessibility) -> u8 {
+        match accessibility {
+            Accessibility::Public => 4,
+            Accessibility::ProtectedInternal => 3,
+            Accessibility::Protected | Accessibility::Internal => 2,
+            Accessibility::Private => 0,
+        }
+    }
+    rank(accessor) < rank(property)
+}
+
 /// Appends a (possibly dotted) namespace declaration name to the enclosing one.
 fn join_namespace(outer: &str, name: &QualifiedName) -> String {
     let mut joined = String::from(outer);
@@ -3791,6 +4686,7 @@ fn dotted(name: &QualifiedName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::CodeNamespace;
     use alloc::vec::Vec;
     use lamella_syntax::parser::parse_compilation_unit;
 
@@ -3839,6 +4735,559 @@ mod tests {
                 .collect();
         codes.sort_unstable_by_key(|&(_, code)| code);
         codes
+    }
+
+    /// A member's legality is not a property of WHERE it is declared, and the nested walk used to
+    /// make it one: it recursed into nested TYPE declarations only, so a nested delegate and a
+    /// nested enum reached no validation at all while the identical declaration one scope out was
+    /// reported. Both spellings of each pair are asserted, because a fix that reported everywhere
+    /// would pass the nested half alone.
+    ///
+    /// Measured against csc (ISO-1) before the fix: `class C { public abstract delegate void D(); }`
+    /// and `class C { public abstract enum E { A } }` are CS0106 there and were silent here.
+    /// `a ?? b` (14.13): the result type comes from a CONVERSION between the operands, and the
+    /// left operand must be a reference type. Every row was scored against csc first -- the two
+    /// error codes are its, byte for byte.
+    /// A BODYLESS ACCESSOR IS FOUR DIFFERENT ANSWERS, and each was measured against csc at ISO-2,
+    /// 3, 5, 6 and latest before it was written here. The four are asserted together because the
+    /// shapes are told apart by ONE predicate: a rule that decided "auto-property" by "some
+    /// accessor is bodyless" passes any one row alone and fails three of the others.
+    ///
+    /// The last two rows are where csc CANNOT oracle this rung. Modern csc reads a half-written
+    /// property as C# 14's `field` keyword and reports that feature's gate; a compiler with no
+    /// `field` keyword has only 10.7.2's rule -- an accessor without a body is permitted for an
+    /// abstract or extern accessor and for those of an automatically implemented property -- so
+    /// CS0501 is the answer at every rung lcsc compiles, and these rows cannot live in
+    /// `tools/corpus-invalid`, whose harness holds every code against csc's.
+    /// An access modifier on an ACCESSOR (C# 2.0's 10.7.2). Every row was scored against csc at
+    /// ISO-1, ISO-2, 5 and latest before it was written here, and the two incomparable cells of the
+    /// accessibility lattice are the ones a plain ordering gets wrong.
+    #[test]
+    fn an_accessor_carries_its_own_accessibility_under_the_property_s() {
+        use crate::diagnostic::CodeNamespace;
+        let v2 = LanguageVersion::CSharp2;
+        let clean: Vec<(CodeNamespace, u16)> = Vec::new();
+        let property = |property: &str, accessor: &str| {
+            alloc::format!(
+                "public class C {{ int f; {property} int P {{ get {{ return f; }} \
+                 {accessor} set {{ f = value; }} }} }}"
+            )
+        };
+        for (declared, accessor) in [
+            ("public", "private"),
+            ("public", "protected"),
+            ("public", "internal"),
+            ("protected internal", "protected"),
+        ] {
+            assert_eq!(
+                sorted_codes_parsed_at(&property(declared, accessor), v2),
+                clean,
+                "{accessor} under {declared} narrows and is legal"
+            );
+        }
+        assert_eq!(
+            sorted_codes_parsed_at(&property("protected", "internal"), v2),
+            [(CodeNamespace::Cs, 273)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(&property("internal", "protected"), v2),
+            [(CodeNamespace::Cs, 273)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(&property("public", "public"), v2),
+            [(CodeNamespace::Cs, 273)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(&property("private", "public"), v2),
+            [(CodeNamespace::Cs, 273)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { int f; public int P { private get { return f; } \
+                 protected set { f = value; } } }",
+                v2
+            ),
+            [(CodeNamespace::Cs, 274)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { int f; public int P { private get { return f; } } }",
+                v2
+            ),
+            [(CodeNamespace::Cs, 276)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public interface I { int P { get; private set; } }", v2),
+            [(CodeNamespace::Cs, 442)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public interface I { int P { get; set; } } \
+                 public class C : I { int f; int I.P { get { return f; } \
+                 private set { f = value; } } }",
+                v2
+            ),
+            [(CodeNamespace::Cs, 106)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public abstract class B { public abstract int P { get; protected set; } } \
+                 public class D : B { int f; public override int P { get { return f; } \
+                 protected set { f = value; } } }",
+                v2
+            ),
+            clean,
+            "matching the base accessor is legal"
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public abstract class B { public abstract int P { get; protected set; } } \
+                 public class D : B { int f; public override int P { get { return f; } \
+                 set { f = value; } } }",
+                v2
+            ),
+            [(CodeNamespace::Cs, 507)],
+            "an override that omits the base's modifier WIDENS the accessor"
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public abstract class B { public abstract int P { get; set; } } \
+                 public class D : B { int f; public override int P { get { return f; } \
+                 private set { f = value; } } }",
+                v2
+            ),
+            [(CodeNamespace::Cs, 507)],
+            "and one that adds a modifier NARROWS it"
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { int f; public int P { get { return f; } set { f = value; } } }",
+                v2
+            ),
+            clean
+        );
+    }
+
+    #[test]
+    fn a_bodyless_accessor_is_an_auto_property_only_in_the_shape_that_is_one() {
+        use crate::diagnostic::CodeNamespace;
+        let v3 = LanguageVersion::CSharp3;
+        let clean: Vec<(CodeNamespace, u16)> = Vec::new();
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public int P { get; set; } }", v3),
+            clean
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public int P { get; } }", v3),
+            [(CodeNamespace::Cs, 8024)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public int P { set; } }", v3),
+            [(CodeNamespace::Cs, 8051)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { int f; public int P { get; set { f = value; } } }",
+                v3
+            ),
+            [(CodeNamespace::Cs, 501)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public int this[int i] { get; set; } }", v3),
+            [(CodeNamespace::Cs, 501), (CodeNamespace::Cs, 501)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public abstract class C { public abstract int P { get; set; } }",
+                v3
+            ),
+            clean
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public interface I { int P { get; set; } }", v3),
+            clean
+        );
+    }
+
+    #[test]
+    fn null_coalescing_types_its_result_from_the_operand_conversions() {
+        use crate::diagnostic::CodeNamespace;
+        let v2 = LanguageVersion::CSharp2;
+        let clean: Vec<(CodeNamespace, u16)> = Vec::new();
+        assert_eq!(
+            sorted_codes_parsed_at("public class P { public string Go(string s) { return s ?? \"x\"; } }", v2),
+            clean
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class P { public object Go(int n) { object o = null; return o ?? n; } }", v2),
+            clean
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class P { public object Go(string s) { return s ?? new object(); } }", v2),
+            clean
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class P { public string Go(object o) { return o ?? \"x\"; } }", v2),
+            [(CodeNamespace::Cs, 266)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class P { public int Go(int a) { return a ?? 2; } }", v2),
+            [(CodeNamespace::Cs, 19)]
+        );
+    }
+
+    #[test]
+    fn a_nested_delegate_and_a_nested_enum_are_validated_like_top_level_ones() {
+        assert_eq!(sorted_codes("public abstract delegate void D();"), [106]);
+        assert_eq!(sorted_codes("class C { public abstract delegate void D(); }"), [106]);
+        assert_eq!(sorted_codes("public abstract enum E { A }"), [106]);
+        assert_eq!(sorted_codes("class C { public abstract enum E { A } }"), [106]);
+        assert_eq!(sorted_codes("public delegate void D();"), []);
+        assert_eq!(sorted_codes("class C { public delegate void D(); }"), []);
+        assert_eq!(sorted_codes("public enum E { A }"), []);
+        assert_eq!(sorted_codes("class C { public enum E { A } }"), []);
+    }
+
+    #[test]
+    fn an_async_method_binds_clean_at_a_dialect_that_permits_it() {
+        use crate::diagnostic::CodeNamespace;
+        let v4 = LanguageVersion::CSharp4;
+        let v5 = LanguageVersion::CSharp5;
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { public object x; public async void M() { await this.x; } }",
+                v5
+            ),
+            [(CodeNamespace::Cs, 1061)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public async void M() { } }", v4),
+            []
+        );
+    }
+
+    #[test]
+    fn async_is_cs0106_on_everything_that_is_not_a_method() {
+        use crate::diagnostic::CodeNamespace;
+        let v5 = LanguageVersion::CSharp5;
+
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { async int f; }", v5),
+            [(CodeNamespace::Cs, 106)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { async int P { get { return 1; } } }", v5),
+            [(CodeNamespace::Cs, 106)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { async delegate void D(); }", v5),
+            [(CodeNamespace::Cs, 106)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public delegate void H(); public class C { async event H E; }",
+                v5
+            ),
+            [(CodeNamespace::Cs, 106)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public async class D { }", v5),
+            [(CodeNamespace::Cs, 106)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { async class D { } }", v5),
+            [(CodeNamespace::Cs, 106)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public async void M() { } }", v5),
+            []
+        );
+    }
+
+    /// The corlib shapes the async rows bind against, declared IN-PROGRAM because these tests
+    /// bind with no references: the non-generic `Task`, the two completion interfaces, and
+    /// `Action`. Shaped like the real corlib's (`Task.GetAwaiter()` returning a struct awaiter
+    /// that implements `ICriticalNotifyCompletion`, which INHERITS `INotifyCompletion` -- the
+    /// inheritance is load-bearing: 12.8.8.2 asks for `INotifyCompletion` and the corlib's `TaskAwaiter`
+    /// only names the critical one).
+    const ASYNC_WORLD: &str = "
+        namespace System { public delegate void Action(); }
+        namespace System.Runtime.CompilerServices {
+            public interface INotifyCompletion { void OnCompleted(System.Action continuation); }
+            public interface ICriticalNotifyCompletion : INotifyCompletion {
+                void UnsafeOnCompleted(System.Action continuation);
+            }
+            public struct TaskAwaiter : ICriticalNotifyCompletion {
+                public bool IsCompleted { get { return true; } }
+                public void GetResult() { }
+                public void OnCompleted(System.Action continuation) { }
+                public void UnsafeOnCompleted(System.Action continuation) { }
+            }
+        }
+        namespace System.Threading.Tasks {
+            public class Task {
+                public System.Runtime.CompilerServices.TaskAwaiter GetAwaiter() {
+                    return new System.Runtime.CompilerServices.TaskAwaiter();
+                }
+            }
+        }
+    ";
+
+    fn async_program(body: &str) -> String {
+        let mut program = String::from(ASYNC_WORLD);
+        program.push_str(body);
+        program
+    }
+
+    #[test]
+    fn an_async_method_checks_its_declaration_against_15_15_1() {
+        use crate::diagnostic::CodeNamespace;
+        let v5 = LanguageVersion::CSharp5;
+        let lam = (CodeNamespace::Lam, 1);
+
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public async int M() { return 1; } }", v5),
+            [(CodeNamespace::Cs, 1983)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class C { public async System.Threading.Tasks.Task M() { return 1; } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 1997)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class C { public async System.Threading.Tasks.Task M() { if (1 == 1) { return; } } }"
+                ),
+                v5
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class C { public async System.Threading.Tasks.Task M(ref int x) { } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 1988)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("public class C { public async void M() { return 1; } }", v5),
+            [(CodeNamespace::Cs, 127)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program("public class C { public async System.Threading.Tasks.Task M<T>() { } }"),
+                v5
+            ),
+            [lam]
+        );
+    }
+
+    #[test]
+    fn an_await_binds_the_awaiter_pattern_and_refuses_with_measured_codes() {
+        use crate::diagnostic::CodeNamespace;
+        let v5 = LanguageVersion::CSharp5;
+        let lam = (CodeNamespace::Lam, 1);
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class C { public async void M() { await new System.Threading.Tasks.Task(); } }"
+                ),
+                v5
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class W { public A GetAwaiter() { return new A(); } }
+                     public class A : System.Runtime.CompilerServices.INotifyCompletion {
+                         public bool IsCompleted { get { return true; } }
+                         public void OnCompleted(System.Action continuation) { }
+                         public int GetResult() { return 42; }
+                     }
+                     public class C { public async void M() { int x = await new W(); x = x + 1; } }"
+                ),
+                v5
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program("public class C { public async void M() { await 5; } }"),
+                v5
+            ),
+            [(CodeNamespace::Cs, 1061)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class W { public static int GetAwaiter() { return 0; } }
+                     public class C { public async void M() { await new W(); } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 1986)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class W { public A GetAwaiter() { return new A(); } }
+                     public class A {
+                         public bool IsCompleted { get { return true; } }
+                         public void GetResult() { }
+                     }
+                     public class C { public async void M() { await new W(); } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 4027)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class W { public A GetAwaiter() { return new A(); } }
+                     public class A : System.Runtime.CompilerServices.INotifyCompletion {
+                         public void OnCompleted(System.Action continuation) { }
+                         public void GetResult() { }
+                     }
+                     public class C { public async void M() { await new W(); } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 117)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class W { public A GetAwaiter() { return new A(); } }
+                     public class A : System.Runtime.CompilerServices.INotifyCompletion {
+                         public void OnCompleted(System.Action continuation) { }
+                         public bool IsCompleted { get { return true; } }
+                     }
+                     public class C { public async void M() { await new W(); } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 117)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class C { public static void V() { } public async void M() { await V(); } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 4008)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program("public class C { public async void M() { await null; } }"),
+                v5
+            ),
+            [(CodeNamespace::Cs, 4001)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class C { public static object T() { return null; } public static void N() { await T(); } }",
+                v5
+            ),
+            [(CodeNamespace::Cs, 1061)]
+        );
+    }
+
+    #[test]
+    fn an_await_refuses_the_measured_statement_contexts() {
+        use crate::diagnostic::CodeNamespace;
+        let v5 = LanguageVersion::CSharp5;
+        let v6 = LanguageVersion::CSharp6;
+        let lam = (CodeNamespace::Lam, 1);
+        let task_await = "await new System.Threading.Tasks.Task();";
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(&alloc::format!(
+                    "public class C {{ public async void M() {{ try {{ }} catch {{ {task_await} }} }} }}"
+                )),
+                v5
+            ),
+            [(CodeNamespace::Cs, 1985)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(&alloc::format!(
+                    "public class C {{ public async void M() {{ try {{ }} finally {{ {task_await} }} }} }}"
+                )),
+                v5
+            ),
+            [(CodeNamespace::Cs, 1984)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(&alloc::format!(
+                    "public class C {{ public async void M() {{ object o = new object(); lock (o) {{ {task_await} }} }} }}"
+                )),
+                v5
+            ),
+            [(CodeNamespace::Cs, 1996)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(&alloc::format!(
+                    "public class C {{ public async void M() {{ try {{ }} catch {{ {task_await} }} }} }}"
+                )),
+                v6
+            ),
+            [lam]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(&alloc::format!(
+                    "public class C {{ public async void M() {{ try {{ {task_await} }} finally {{ }} }} }}"
+                )),
+                v5
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn an_async_entry_point_draws_the_measured_pair() {
+        use crate::diagnostic::CodeNamespace;
+        let v5 = LanguageVersion::CSharp5;
+        let lam = (CodeNamespace::Lam, 1);
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class P { public static async void Main() { } }",
+                v5
+            ),
+            [(CodeNamespace::Cs, 4009)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &async_program(
+                    "public class P { public static async System.Threading.Tasks.Task Main() { } }"
+                ),
+                v5
+            ),
+            [(CodeNamespace::Cs, 8026)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "public class P { public static async void Main(int x) { } }",
+                v5
+            ),
+            []
+        );
     }
 
     #[test]
@@ -6093,6 +7542,106 @@ mod tests {
     }
 
     #[test]
+    fn a_simple_name_shared_by_two_namespaces_binds_the_scope_local_type_in_every_position() {
+        assert_eq!(
+            sorted_codes(
+                "namespace Some.Where { public enum Marker { A = 0 } } \
+                 namespace Other.Place { public enum Marker { B = 0 } \
+                 public class User { \
+                     private Marker _field; \
+                     public Marker Prop { get { return _field; } } \
+                     public Marker Give() { return _field; } \
+                     public void Take(Marker m) { _field = m; } \
+                     public static int Core(out Marker r) { r = Marker.B; return 1; } \
+                     public int Use() { Marker r; return Core(out r); } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "namespace Some.Where { public enum Marker { A = 0 } } \
+                 namespace Other.Place { public class User { private Marker _field; } }"
+            ),
+            [246]
+        );
+    }
+
+    #[test]
+    fn an_override_signature_qualifies_a_simple_name_by_scope_not_by_world_uniqueness() {
+        use crate::symbols::{Accessibility, MethodSymbol, Model, TypeInfo, TypeKind};
+
+        fn object_model() -> Model {
+            let mut model = Model::new();
+            let object = TypeInfo::new("System", "Object", TypeKind::Class);
+            model.insert(object);
+            model
+        }
+        let codes = |unit: &str| {
+            let unit = parse_compilation_unit(unit).unit;
+            let mut codes: Vec<u16> = bind_compilation_unit_with_model(&unit, object_model())
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "namespace Some.Where { public enum Marker { A = 0 } } \
+                 namespace Other.Place { public enum Marker { B = 0 } \
+                 public abstract class Base { \
+                     public abstract bool Take(Marker m); \
+                     public abstract Marker Give(); } \
+                 public class Derived : Base { \
+                     public override bool Take(Marker m) { return m == Marker.B; } \
+                     public override Marker Give() { return Marker.B; } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "namespace Some.Where { public enum Marker { A = 0 } } \
+                 namespace Other.Place { public enum Marker { B = 0 } \
+                 public class Base { public virtual bool Take(Marker m) { return false; } } \
+                 public class Derived : Base { \
+                     public override bool Take(Marker m) { return m == Marker.B; } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "namespace Some.Where { public enum Kind { A = 0 } } \
+                 public abstract class Base { public abstract bool Use(Derived.Kind k); } \
+                 public class Derived : Base { \
+                     public enum Kind { P = 0 } \
+                     public override bool Use(Kind k) { return k == Kind.P; } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "namespace Some.Where { public enum Marker { A = 0 } } \
+                 namespace Other.Place { public enum Marker { B = 0 } \
+                 public class Base { public virtual bool Take(Marker m) { return false; } } \
+                 public class Derived : Base { \
+                     public override bool Take(int m) { return m == 0; } } }"
+            ),
+            [115]
+        );
+        assert_eq!(
+            codes(
+                "namespace Some.Where { public enum Marker { A = 0 } } \
+                 namespace Other.Place { public enum Marker { B = 0 } \
+                 public class Base { public virtual Marker Give() { return Marker.B; } } \
+                 public class Derived : Base { \
+                     public override int Give() { return 0; } } }"
+            ),
+            [508]
+        );
+    }
+
+    #[test]
     fn duplicate_type_in_namespace_is_cs0101() {
         assert_eq!(sorted_codes("class C {} class C {}"), [101]);
         assert_eq!(sorted_codes("class C {} struct C {}"), [101]);
@@ -6625,6 +8174,204 @@ mod tests {
         assert_eq!(
             bind("class P { void M() { Console.WriteLine(\"hi\"); } }"),
             [103]
+        );
+    }
+
+    /// The diagnostic half of implicitly typed locals (C# 3.0 spec, 8.5.1 and 8.8.4).
+    ///
+    /// **THE OTHER HALF IS `tools/csharp3-parity.ps1`, AND NEITHER INSTRUMENT CAN DO THIS ONE'S
+    /// JOB.** That harness compiles and RUNS each probe, which is the only way to see which type
+    /// was inferred -- but when both compilers reject a program it scores them SAME and cannot tell
+    /// `CS0818` from the `CS0246` this feature existed to stop reporting. So the codes are pinned
+    /// here and the inferred types are pinned there.
+    ///
+    /// **EVERY ROW WAS MEASURED AGAINST csc BEFORE IT WAS WRITTEN DOWN**, one compilation each,
+    /// including the rows expected to PASS -- a refusal that is too WIDE is invisible in a table
+    /// made only of refusals, and the three contextual-keyword rows at the end are exactly where
+    /// that would have happened.
+    #[test]
+    fn implicitly_typed_locals_report_cscs_codes() {
+        use crate::diagnostic::CodeNamespace;
+        let v3 = LanguageVersion::CSharp3;
+        let cs = |code| (CodeNamespace::Cs, code);
+
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static int M() { var x = 5; return x; } }", v3),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "class P { static int M() { var t = 0; for (var i = 0; i < 2; i++) { t = t + i; } return t; } }",
+                v3
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "class P { static int M(int[] a) { var t = 0; foreach (var n in a) { t = t + n; } return t; } }",
+                v3
+            ),
+            []
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static void M() { var x; } }", v3),
+            [cs(818)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static int M() { var x = 1, y = 2; return x + y; } }", v3),
+            [cs(819)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static void M() { var y = { 1, 2, 3 }; } }", v3),
+            [cs(820)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static void M() { var z = null; } }", v3),
+            [cs(815)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static void N() { } static void M() { var v = N(); } }", v3),
+            [cs(815)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static void M() { const var c = 1; } }", v3),
+            [cs(822)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static var f = 1; }", v3),
+            [cs(825)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static void N(var p) { } }", v3),
+            [cs(825)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static var N() { return 1; } }", v3),
+            [cs(825)]
+        );
+
+        assert_eq!(
+            sorted_codes_parsed_at("class var { } class P { static var M() { return new var(); } }", v3),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class var { } class P { public static var f = null; }", v3),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at("class P { static int M() { int var = 3; var x = 5; return var + x; } }", v3),
+            []
+        );
+    }
+
+    /// `using` accepts a resource whose `IDisposable` comes from a BASE CLASS (15.13 / CS1674).
+    ///
+    ///
+    /// **THE LAST TWO ROWS ARE THE POINT.** Widening a walk until the failing case passes also
+    /// makes every case pass, and a table of things that should compile cannot tell the two apart.
+    /// A type that implements nothing must STILL be refused, and so must one whose base implements
+    /// some other interface.
+    #[test]
+    fn using_accepts_a_resource_that_inherits_idisposable() {
+        use crate::diagnostic::CodeNamespace;
+        let corlib = "namespace System { public interface IDisposable { void Dispose(); } } ";
+        let v1 = LanguageVersion::CSharp1;
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &alloc::format!(
+                    "{corlib} class R : System.IDisposable {{ public void Dispose() {{ }} }} \
+                     class P {{ static void M() {{ using (R r = new R()) {{ }} }} }}"
+                ),
+                v1
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &alloc::format!(
+                    "{corlib} class B : System.IDisposable {{ public void Dispose() {{ }} }} \
+                     class R : B {{ }} \
+                     class P {{ static void M() {{ using (R r = new R()) {{ }} }} }}"
+                ),
+                v1
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &alloc::format!(
+                    "{corlib} class B : System.IDisposable {{ public void Dispose() {{ }} }} \
+                     class M1 : B {{ }} class R : M1 {{ }} \
+                     class P {{ static void M() {{ using (R r = new R()) {{ }} }} }}"
+                ),
+                v1
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &alloc::format!(
+                    "{corlib} class R {{ }} \
+                     class P {{ static void M() {{ using (R r = new R()) {{ }} }} }}"
+                ),
+                v1
+            ),
+            [(CodeNamespace::Cs, 1674)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(
+                &alloc::format!(
+                    "{corlib} interface IOther {{ void Other(); }} \
+                     class B : IOther {{ public void Other() {{ }} }} \
+                     class R : B {{ }} \
+                     class P {{ static void M() {{ using (R r = new R()) {{ }} }} }}"
+                ),
+                v1
+            ),
+            [(CodeNamespace::Cs, 1674)]
+        );
+    }
+
+    /// The rung gate for implicitly typed locals: C# 3.0, refused below it by NAME.
+    ///
+    /// **The message is csc's, measured at both rungs rather than transcribed**, and the CODE is a
+    /// function of the version being compiled -- `CS8022` at C# 1, `CS8023` at C# 2 -- so a single
+    /// hard-coded code would be right for one rung and wrong for the other.
+    ///
+    /// `foreach` gates under the SAME feature name. csc calls an iteration variable an
+    /// "implicitly typed local variable" here, measured; a second `Feature` variant reading
+    /// "iteration variable" would have produced a message no csc user ever sees.
+    #[test]
+    fn implicitly_typed_locals_are_gated_below_csharp3() {
+        use crate::diagnostic::CodeNamespace;
+        let local = "class P { static int M() { var x = 5; return x; } }";
+        let each = "class P { static int M(int[] a) { int t = 0; foreach (var n in a) { t = t + n; } return t; } }";
+
+        assert_eq!(
+            sorted_codes_parsed_at(local, LanguageVersion::CSharp1),
+            [(CodeNamespace::Cs, 8022)]
+        );
+        assert_eq!(
+            sorted_codes_parsed_at(local, LanguageVersion::CSharp2),
+            [(CodeNamespace::Cs, 8023)]
+        );
+        assert_eq!(sorted_codes_parsed_at(local, LanguageVersion::CSharp3), []);
+        assert_eq!(
+            sorted_codes_parsed_at(each, LanguageVersion::CSharp1),
+            [(CodeNamespace::Cs, 8022)]
+        );
+        assert_eq!(sorted_codes_parsed_at(each, LanguageVersion::CSharp3), []);
+
+        assert_eq!(
+            sorted_codes_parsed_at(
+                "class var { } class P { static var M() { return new var(); } }",
+                LanguageVersion::CSharp1
+            ),
+            []
         );
     }
 }

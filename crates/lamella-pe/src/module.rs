@@ -90,6 +90,10 @@ pub struct ImageBuilder {
     /// The `#GUID` heap index of the module's MVID, so [`ImageBuilder::set_content_id`]
     /// can fill it once the content it is derived from is known.
     mvid: u32,
+    /// Methods added through [`ImageBuilder::add_method_deferred_body`] whose bytes have not
+    /// landed yet. [`ImageBuilder::finish`] refuses while any remain: an RVA of 0 is a method
+    /// that traps on first call, and nothing downstream could attribute that to the add site.
+    deferred_bodies: Vec<Token>,
 }
 
 impl ImageBuilder {
@@ -114,6 +118,7 @@ impl ImageBuilder {
             method_debug: Vec::new(),
             pdb_id: derive_pdb_id(module_name),
             mvid: 0,
+            deferred_bodies: Vec::new(),
         };
 
         let mvid = builder.guids.add([0; 16]);
@@ -750,6 +755,66 @@ impl ImageBuilder {
         Token::new(table::METHOD_DEF, row)
     }
 
+    /// [`Module::add_method`] with the BODY deferred: the `MethodDef` row is added now -- so its
+    /// token exists and the owning type's method run stays contiguous -- and the code bytes
+    /// arrive later through [`Module::set_method_body`]. The one consumer is the async lowering:
+    /// an async method's stub references its state machine's members, and the machine's rows are
+    /// appended after every source type, so the stub's ROW must exist long before its BYTES can.
+    ///
+    /// The RVA is written as 0 until the body lands; [`Module::finish`]'s caller never sees that
+    /// state because [`Module::set_method_body`] tracks the debt -- see `deferred_bodies`.
+    pub fn add_method_deferred_body(
+        &mut self,
+        name: &str,
+        signature: &[u8],
+        flags: u16,
+        impl_flags: u16,
+        parameters: &[Box<str>],
+    ) -> Token {
+        let name = self.strings.intern(name);
+        let signature = self.blobs.intern(signature);
+        let first_param = self.tables.row_count(table::PARAM) + 1;
+        let row = self.tables.add_row(
+            table::METHOD_DEF,
+            alloc::vec![
+                Column::U32(0),
+                Column::U16(impl_flags),
+                Column::U16(flags),
+                Column::StringRef(name),
+                Column::BlobRef(signature),
+                Column::Index(table::PARAM, first_param),
+            ],
+        );
+        self.add_param_rows(parameters);
+        self.method_debug.push(MethodDebug {
+            sequence_points: Vec::new(),
+            local_signature: 0,
+            locals: Vec::new(),
+            scope_length: 0,
+            document: 0,
+        });
+        let token = Token::new(table::METHOD_DEF, row);
+        self.deferred_bodies.push(token);
+        token
+    }
+
+    /// Lands the body of a method added through [`Module::add_method_deferred_body`]: appends
+    /// the bytes to the body stream and patches the row's RVA. Panics on a method that was not
+    /// deferred, because patching an already-placed body would strand its old bytes silently.
+    pub fn set_method_body(&mut self, method: Token, body: &[u8]) {
+        let position = self
+            .deferred_bodies
+            .iter()
+            .position(|deferred| *deferred == method)
+            .expect("set_method_body: the method's body was not deferred");
+        self.deferred_bodies.swap_remove(position);
+        align4(&mut self.bodies);
+        let rva = TEXT_RVA + CLI_HEADER_SIZE + self.bodies.len() as u32;
+        self.bodies.extend_from_slice(body);
+        self.tables
+            .set_cell(table::METHOD_DEF, method.row(), 0, Column::U32(rva));
+    }
+
     /// Adds a `Param` row (II.22.33) per parameter -- `Flags=0`, `Sequence` 1..N, `Name`
     /// -- so a debugger/PDB consumer can show argument names instead of `argN`. The rows
     /// follow the just-added `MethodDef` whose `ParamList` points at the first of them.
@@ -1039,6 +1104,12 @@ impl ImageBuilder {
         is_dll: bool,
         debug_entries: Vec<(u32, Vec<u8>)>,
     ) -> Vec<u8> {
+        assert!(
+            self.deferred_bodies.is_empty(),
+            "finish: {} deferred method body(ies) never landed (rows {:?})",
+            self.deferred_bodies.len(),
+            self.deferred_bodies
+        );
         align4(&mut self.bodies);
         self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
         self.tables.sort_by_coded_column(table::METHOD_SEMANTICS, 2);

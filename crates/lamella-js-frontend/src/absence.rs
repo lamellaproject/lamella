@@ -12,13 +12,8 @@ pub enum Absence {
     PromiseFinally,
     Eval,
     FunctionConstructor,
-    StringReplaceRegExp,
-    StringMatch,
-    StringMatchAll,
-    StringSearch,
     StringNormalize,
     MathRandom,
-    RegExpLiteral,
 }
 
 impl Absence {
@@ -30,13 +25,8 @@ impl Absence {
             Absence::PromiseFinally => "promise-finally",
             Absence::Eval => "eval",
             Absence::FunctionConstructor => "function-constructor",
-            Absence::StringReplaceRegExp => "string-replace-regexp",
-            Absence::StringMatch => "string-match",
-            Absence::StringMatchAll => "string-match-all",
-            Absence::StringSearch => "string-search",
             Absence::StringNormalize => "string-normalize",
             Absence::MathRandom => "math-random",
-            Absence::RegExpLiteral => "regexp-literal",
         }
     }
 
@@ -50,17 +40,10 @@ impl Absence {
             Absence::FunctionConstructor => {
                 "the Function constructor compiles source at run time and is not in this profile"
             }
-            Absence::StringReplaceRegExp => {
-                "String.prototype.replace with a RegExp is not in this profile"
-            }
-            Absence::StringMatch => "String.prototype.match is not in this profile",
-            Absence::StringMatchAll => "String.prototype.matchAll is not in this profile",
-            Absence::StringSearch => "String.prototype.search is not in this profile",
             Absence::StringNormalize => "String.prototype.normalize is not in this profile",
             Absence::MathRandom => {
                 "Math.random needs a per-realm entropy source and is not in this profile"
             }
-            Absence::RegExpLiteral => "RegExp literals are not in this profile",
         }
     }
 
@@ -108,13 +91,8 @@ impl Absence {
             Absence::PromiseFinally,
             Absence::Eval,
             Absence::FunctionConstructor,
-            Absence::StringReplaceRegExp,
-            Absence::StringMatch,
-            Absence::StringMatchAll,
-            Absence::StringSearch,
             Absence::StringNormalize,
             Absence::MathRandom,
-            Absence::RegExpLiteral,
         ]
     }
 }
@@ -148,10 +126,8 @@ pub enum SyntaxAbsence {
     Yield,
     AsyncFunctions,
     BigIntLiterals,
-    NonAsciiIdentifiers,
     AnnexBStringEscapes,
     AnnexBBlockScopedFunctions,
-    RegExpLiterals,
 }
 
 impl SyntaxAbsence {
@@ -162,10 +138,8 @@ impl SyntaxAbsence {
             SyntaxAbsence::Yield => "yield",
             SyntaxAbsence::AsyncFunctions => "async-functions",
             SyntaxAbsence::BigIntLiterals => "bigint-literals",
-            SyntaxAbsence::NonAsciiIdentifiers => "non-ascii-identifiers",
             SyntaxAbsence::AnnexBStringEscapes => "annexb-string-escapes",
             SyntaxAbsence::AnnexBBlockScopedFunctions => "annexb-block-scoped-functions",
-            SyntaxAbsence::RegExpLiterals => "regexp-literals",
         }
     }
 
@@ -183,17 +157,9 @@ impl SyntaxAbsence {
             }
             SyntaxAbsence::AsyncFunctions => "async functions and methods",
             SyntaxAbsence::BigIntLiterals => "BigInt literals, whose arithmetic is a second numeric tower",
-            SyntaxAbsence::NonAsciiIdentifiers => {
-                "non-ASCII identifiers: ID_Start/ID_Continue tables live in the Unicode home and \
-                 XID_Start/XID_Continue are NOT the same set, so substituting them would be \
-                 silently wrong"
-            }
             SyntaxAbsence::AnnexBStringEscapes => "Annex B legacy octal and \\8 \\9 string escapes",
             SyntaxAbsence::AnnexBBlockScopedFunctions => {
                 "Annex B block-scoped function declarations in sloppy code"
-            }
-            SyntaxAbsence::RegExpLiterals => {
-                "RegExp literals and the whole RegExp surface, excluded by path in the profile"
             }
         }
     }
@@ -207,10 +173,8 @@ impl SyntaxAbsence {
             SyntaxAbsence::Yield,
             SyntaxAbsence::AsyncFunctions,
             SyntaxAbsence::BigIntLiterals,
-            SyntaxAbsence::NonAsciiIdentifiers,
             SyntaxAbsence::AnnexBStringEscapes,
             SyntaxAbsence::AnnexBBlockScopedFunctions,
-            SyntaxAbsence::RegExpLiterals,
         ]
     }
 }
@@ -262,6 +226,11 @@ pub fn published_list() -> String {
     );
     for absence in SyntaxAbsence::all() {
         out.push_str(&format!("- `{}` -- {}\n", absence.id(), absence.reason()));
+    }
+
+    out.push_str("\n## Refused when a REGULAR EXPRESSION is compiled\n\n");
+    for absent in lamella_regexp::js::ErrorKind::absences() {
+        out.push_str(&format!("- `{}` -- {}\n", absent.id, absent.reason));
     }
 
     out.push_str("\n## Excluded from the corpus before a test is RUN\n\n");

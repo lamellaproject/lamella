@@ -72,6 +72,9 @@ pub(crate) mod early_errors;
 pub(crate) mod eval;
 pub(crate) mod generator;
 pub(crate) mod generator_transform;
+/// The object table and the whole-object write barrier -- what an `ObjectId` resolves to, and why
+/// a realm object can live in flash. WARNING: nothing to do with the `lamella-heap` ALLOCATOR.
+pub(crate) mod heap;
 pub mod interpreter;
 pub(crate) mod iterator;
 pub(crate) mod json;
@@ -85,7 +88,22 @@ pub(crate) mod promise;
 /// The thirteen internal methods, and the routing that lets a proxy be found part-way up a
 /// prototype chain -- see the module docs for why that reaches outside this file.
 pub(crate) mod proxy;
+/// GENERATED: the realm's objects and properties as constant data, read where they lie rather
+/// than built by an installer that allocates. See its own header, and `realm_tables` for what
+/// writes and checks it.
+pub(crate) mod realm;
+/// The realm rendered as text, the emitter that writes `realm`, and the gate that compares both
+/// against the realm the installers build -- so that a change to the order built-ins are
+/// registered in cannot silently repoint a generated table.
+///
+/// TEST-ONLY, AND DELIBERATELY: rendering and emitting the realm are development activities, and a
+/// device image that carried a serializer for its own contents would be paying flash for a gate.
+#[cfg(test)]
+mod realm_tables;
 pub(crate) mod reflect;
+/// `RegExp` and the `lastIndex` protocol. The MATCHER is not here: it is shared with the other
+/// languages in this tree, and this module is the ECMAScript object around it.
+pub(crate) mod regexp;
 pub mod source;
 pub mod string_value;
 pub mod token;

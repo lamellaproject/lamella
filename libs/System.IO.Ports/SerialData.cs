@@ -1,5 +1,5 @@
-// Lamella managed corlib (from scratch). -- System.IO.Ports.SerialData
-#if LAMELLA_SURFACE_SERIAL && LAMELLA_SURFACE_THREADS
+// System.IO.Ports (libs/, real .NET's own assembly name) -- System.IO.Ports.SerialData
+#if LAMELLA_SURFACE_SERIAL && LAMELLA_SURFACE_NETFX_2_0 && LAMELLA_SURFACE_THREADS
 namespace System.IO.Ports
 {
     /// <summary>Specifies the type of character that was received on the serial port of the

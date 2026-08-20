@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
     CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind, SwitchLabel,
-    SwitchSection, TypeRef, UnaryOperator, UsingResource, VariableDeclarator,
+    SwitchSection, TypeRef, TypeRefKind, UnaryOperator, UsingResource, VariableDeclarator,
 };
 use lamella_syntax::span::Span;
 
@@ -328,7 +328,12 @@ impl Binder {
                 body,
             } => {
                 let collection = self.bind_expression(collection);
-                let element_type = self.resolve_named_type(&bind_type(ty), ty.span);
+                let element_type = if self.is_implicitly_typed(ty) {
+                    self.gate_feature(Feature::ImplicitlyTypedLocalVariable, ty.span);
+                    self.for_each_inferred_element_type(&collection, ty.span)
+                } else {
+                    self.resolve_type_ref(ty)
+                };
                 let single_dimension_array = matches!(collection.ty, TypeSymbol::Array { rank: 1, .. });
                 self.enter_readonly_local(name, "foreach iteration variable");
                 let enumerable = if single_dimension_array {
@@ -699,7 +704,7 @@ impl Binder {
         let exception_type = catch
             .exception_type
             .as_ref()
-            .map(|ty| self.resolve_named_type(&bind_type(ty), ty.span));
+            .map(|ty| self.resolve_type_ref(ty));
         if let (Some(resolved), Some(written)) = (&exception_type, &catch.exception_type) {
             if self.is_provably_not_exception(resolved) {
                 self.report(Diagnostic::new(
@@ -962,7 +967,9 @@ impl Binder {
             },
             span,
         };
+        self.enter_lock();
         let bound_body = self.bind_statement(body);
+        self.exit_lock();
         let guarded = BoundStmt {
             kind: BoundStmtKind::Try {
                 body: Box::new(bound_body),
@@ -993,7 +1000,7 @@ impl Binder {
         if self.model().get_by_symbol(ty).is_none() {
             return;
         }
-        let implements = self.transitive_interfaces(ty).iter().any(|interface| {
+        let implements = self.interfaces_including_inherited(ty).iter().any(|interface| {
             self.model()
                 .get_by_symbol(interface)
                 .is_some_and(|info| &*info.namespace == "System" && &*info.name == "IDisposable")
@@ -1014,9 +1021,12 @@ impl Binder {
         let mut resources: alloc::vec::Vec<(Box<str>, TypeSymbol)> = Vec::new();
         match resource {
             UsingResource::Declaration { ty, declarators } => {
-                let resource_ty = self.resolve_named_type(&bind_type(ty), ty.span);
-                self.check_disposable(&resource_ty, ty.span);
                 let kind = self.bind_local(ty, declarators);
+                let resource_ty = match &kind {
+                    BoundStmtKind::Local { ty, .. } => ty.clone(),
+                    _ => TypeSymbol::Error,
+                };
+                self.check_disposable(&resource_ty, ty.span);
                 resource_decls.push(BoundStmt { kind, span: ty.span });
                 for declarator in declarators {
                     resources.push((declarator.name.clone(), resource_ty.clone()));
@@ -1173,7 +1183,7 @@ impl Binder {
         init: &Expr,
         body: &Stmt,
     ) -> BoundStmtKind {
-        let pointer_ty = self.resolve_named_type(&bind_type(ty), ty.span);
+        let pointer_ty = self.resolve_type_ref(ty);
         let element = match &pointer_ty {
             TypeSymbol::Pointer(inner) => (**inner).clone(),
             _ => TypeSymbol::Error,
@@ -1234,27 +1244,16 @@ impl Binder {
     }
 
     fn bind_local(&mut self, ty: &TypeRef, declarators: &[VariableDeclarator]) -> BoundStmtKind {
-        let declared = self.resolve_named_type(&bind_type(ty), ty.span);
+        if self.is_implicitly_typed(ty) {
+            return self.bind_implicitly_typed_local(ty, declarators);
+        }
+        let declared = self.resolve_type_ref(ty);
         if declared.is_void() {
             self.report(Diagnostic::new(DiagnosticKind::VoidLocal, ty.span));
         }
         let mut bound = Vec::with_capacity(declarators.len());
         for declarator in declarators {
-            if self.local_in_current_scope(&declarator.name) {
-                self.report(Diagnostic::new(
-                    DiagnosticKind::DuplicateLocal {
-                        name: declarator.name.clone(),
-                    },
-                    declarator.span,
-                ));
-            } else if self.local_in_enclosing_scope(&declarator.name) {
-                self.report(Diagnostic::new(
-                    DiagnosticKind::LocalShadowsEnclosing {
-                        name: declarator.name.clone(),
-                    },
-                    declarator.span,
-                ));
-            }
+            self.check_local_name_available(declarator);
             let initializer = declarator.initializer.as_ref().map(|expr| {
                 if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
                     let (lengths, elements) = match self.bind_rectangular_array(expr, &declared, &[]) {
@@ -1285,6 +1284,232 @@ impl Binder {
         }
     }
 
+    /// Reports `CS0128` (a local of this name is already declared in this scope) or `CS0136` (it
+    /// shadows one in an enclosing scope) for `declarator`, if either applies (15.5.1).
+    ///
+    /// Shared by all three declaration binders -- explicit local, implicitly typed local, local
+    /// constant. It was written out at two of them, and a copied block is invisible to whoever adds
+    /// the third: extracting it is what makes "every local declaration checks its name" true by
+    /// construction rather than by inspection.
+    fn check_local_name_available(&mut self, declarator: &VariableDeclarator) {
+        if self.local_in_current_scope(&declarator.name) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::DuplicateLocal {
+                    name: declarator.name.clone(),
+                },
+                declarator.span,
+            ));
+        } else if self.local_in_enclosing_scope(&declarator.name) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::LocalShadowsEnclosing {
+                    name: declarator.name.clone(),
+                },
+                declarator.span,
+            ));
+        }
+    }
+
+    /// Whether `ty` is the contextual keyword `var` standing for an inferred type, rather than a
+    /// type name (C# 3.0 spec, 8.5.1).
+    ///
+    /// **THE TEST IS "DOES IT RESOLVE", NOT "IS IT SPELLED `var`", AND THE CLAUSE SAYS SO IN
+    /// TERMS**: a declaration is implicitly typed when the `local-variable-type` is `var` *"and no
+    /// type named var is in scope"*. A program that declares its own `class var` goes on meaning
+    /// that class at every `var x = ...` in it -- csc compiles such a program, measured -- so
+    /// keying on the spelling would silently change what an existing program means, which is the
+    /// one thing a contextual keyword exists to avoid.
+    ///
+    /// **BARE ONLY.** `var[]`, `var*`, `var?`, `N.var` and `var<T>` are ordinary type references
+    /// that happen to name something called `var`; none of them IS a `local-variable-type` of
+    /// `var`. Measured against csc, which reports `CS0825` for `var[] a = ...` rather than any
+    /// inference failure -- so those spellings fall through to
+    /// [`Binder::resolve_named_type`](crate::bound::Binder::resolve_named_type) and are refused
+    /// there.
+    ///
+    /// The resolution is QUIET because this is a question and not the place an absence gets
+    /// reported: the `var` that does not resolve is about to become an inferred type, and the one
+    /// that does resolve is reported, if at all, by the ordinary path that follows.
+    ///
+    /// **A VERBATIM `@var` IS NOT THIS KEYWORD AND NEVER WAS.** 6.4.4 lets a contextual keyword be
+    /// forced back to an ordinary identifier with `@`, so `@var x = 5;` names a type -- csc reports
+    /// CS0246, measured -- while `var x = 5;` infers. The lexer drops the `@` (9.4.2, correctly:
+    /// the identifier it denotes is `var`, and it has to bind to a type actually called that), so
+    /// the name alone cannot say which was written; `TypeRef::verbatim_name` is the parser
+    /// recording what only the parser can see. Until it existed this compiler ACCEPTED that
+    /// program.
+    fn is_implicitly_typed(&mut self, ty: &TypeRef) -> bool {
+        if ty.verbatim_name {
+            return false;
+        }
+        let TypeRefKind::Name(parts) = &ty.kind else {
+            return false;
+        };
+        let [only] = &parts[..] else {
+            return false;
+        };
+        if &**only != "var" {
+            return false;
+        }
+        self.resolve_named_type_quietly(&bind_type(ty), ty.span)
+            .is_error()
+    }
+
+    /// The type of an implicitly typed iteration variable -- `foreach (var v in collection)`
+    /// (C# 3.0 spec, 8.8.4: *"its type is taken to be the element type of the foreach statement"*).
+    ///
+    /// **8.8.4's determination, in its order**, and it is the SAME determination
+    /// [`Binder::bind_for_each_enumerable`](Self::bind_for_each_enumerable) makes below -- an array
+    /// yields its element type, and anything else yields the type of `Current` on whatever
+    /// `GetEnumerator` returns. Asking here and binding there must agree, because the desugaring
+    /// inserts a cast from `Current` to this type; a disagreement would be a cast that narrows.
+    ///
+    /// **NOT the C# 4.0 rule.** Later editions add a `dynamic` case to this clause -- if the
+    /// collection is `dynamic` the inferred type is `dynamic` rather than `object` -- and rename
+    /// the result the *iteration type*. Neither belongs at this rung: `dynamic` does not exist in
+    /// C# 3.0, and this feature is C# 3.0's.
+    ///
+    /// The lookup is QUIET because `bind_for_each_enumerable` performs it again for real a few
+    /// lines later. Without that, a collection whose `GetEnumerator` does not resolve would draw
+    /// every overload-resolution diagnostic of the attempt twice.
+    fn for_each_inferred_element_type(
+        &mut self,
+        collection: &BoundExpr,
+        span: Span,
+    ) -> TypeSymbol {
+        if let TypeSymbol::Array { element, .. } = &collection.ty {
+            return (**element).clone();
+        }
+        if collection.ty.is_error() {
+            return TypeSymbol::Error;
+        }
+        self.quietly(|binder| {
+            let Some(get_enumerator) =
+                binder.resolve_instance_method(&collection.ty, "GetEnumerator", span)
+            else {
+                return TypeSymbol::Error;
+            };
+            let enumerator_type = get_enumerator.return_type;
+            binder
+                .resolve_property_getter(&enumerator_type, "Current", span)
+                .map_or_else(
+                    || {
+                        TypeSymbol::Special(SpecialType::Object)
+                    },
+                    |current| current.return_type,
+                )
+        })
+    }
+
+    /// Binds an implicitly typed local declaration -- `var x = expr;` (C# 3.0 spec, 8.5.1).
+    ///
+    /// The local's type is the initializer's, and nothing downstream changes: 8.5.1's *"precisely
+    /// equivalent to the following explicitly typed declarations"* is literal, so this produces the
+    /// same [`BoundStmtKind::Local`] an explicit type produces and no emitter can tell which
+    /// spelling it came from. That is also why the feature needs no emit path of its own.
+    ///
+    /// **THE FOUR RESTRICTIONS ARE 8.5.1's, IN ITS ORDER, AND THE FIFTH IS NOT ENFORCED HERE.**
+    /// 8.5.1 also says the initializer *"cannot refer to the declared variable itself"*, for which
+    /// csc reports `CS0841`. We refuse `var v = v;` too, but as `CS0103` -- the name is not in
+    /// scope yet, because a local is declared AFTER its initializer binds. That is a refusal with
+    /// the wrong code rather than an acceptance, and it is shared with the explicit path (`int x =
+    /// x;` is `CS0103` here and `CS0165` in csc), so it is a property of when locals enter scope
+    /// and not of this feature.
+    ///
+    /// **A SECOND PATH THROUGH A DECISION IS WHERE THE FIRST PATH'S REFUSALS GO MISSING**, so the
+    /// explicit path's are enumerated here rather than left to be noticed: the name-availability
+    /// check is SHARED ([`Binder::check_local_name_available`](Self::check_local_name_available));
+    /// `CS1547` (a `void` local) cannot arise, because `void` is not a type an expression has and
+    /// the void initializer is refused as `CS0815` first; and the assignability check and its
+    /// conversion are absent because the target type IS the initializer's, which makes the
+    /// conversion the identity.
+    fn bind_implicitly_typed_local(
+        &mut self,
+        ty: &TypeRef,
+        declarators: &[VariableDeclarator],
+    ) -> BoundStmtKind {
+        self.gate_feature(Feature::ImplicitlyTypedLocalVariable, ty.span);
+        if declarators.len() > 1 {
+            self.report(Diagnostic::new(
+                DiagnosticKind::ImplicitlyTypedLocalMultipleDeclarators,
+                ty.span,
+            ));
+        }
+        let mut declared = TypeSymbol::Error;
+        let mut bound = Vec::with_capacity(declarators.len());
+        for (index, declarator) in declarators.iter().enumerate() {
+            self.check_local_name_available(declarator);
+            let initializer = self.bind_inferred_initializer(declarator);
+            if index == 0 {
+                declared = initializer
+                    .as_ref()
+                    .map_or(TypeSymbol::Error, |value| value.ty.clone());
+            }
+            self.declare_local(&declarator.name, declared.clone());
+            bound.push(BoundDeclarator {
+                name: declarator.name.clone(),
+                initializer,
+            });
+        }
+        BoundStmtKind::Local {
+            ty: declared,
+            declarators: bound,
+        }
+    }
+
+    /// Binds the initializer of an implicitly typed local, or reports why its type cannot be
+    /// inferred (C# 3.0 spec, 8.5.1).
+    ///
+    /// Every diagnostic here is at the DECLARATOR, which is csc's position for all three -- the
+    /// fault is that this variable has no type, and the initializer may be absent entirely.
+    ///
+    /// **`None` MEANS "NO INITIALIZER WAS WRITTEN", NOT "THIS FAILED", AND THE DISTINCTION IS A
+    /// DIAGNOSTIC ONE.** A declarator with no initializer leaves the local unassigned, so a later
+    /// read of it is `CS0165`; a declarator WITH one that had no inferable type leaves the local
+    /// assigned to something unusable, and csc reports the inference failure alone. Returning
+    /// `None` for both made `var z = null;` report `CS0815` **and** a `CS0165` on the next line --
+    /// a second error, in another statement, blaming the variable for the first one. So a failed
+    /// inference still yields a value: [`BoundExprKind::Error`], the recovery expression, whose
+    /// type is `Error` and which no emitter sees because the program is already refused.
+    fn bind_inferred_initializer(&mut self, declarator: &VariableDeclarator) -> Option<BoundExpr> {
+        let unusable = || {
+            Some(BoundExpr {
+                kind: BoundExprKind::Error,
+                ty: TypeSymbol::Error,
+            })
+        };
+        let Some(expr) = declarator.initializer.as_ref() else {
+            self.report(Diagnostic::new(
+                DiagnosticKind::ImplicitlyTypedLocalNotInitialized,
+                declarator.span,
+            ));
+            return None;
+        };
+        if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::ImplicitlyTypedLocalArrayInitializer,
+                declarator.span,
+            ));
+            return unusable();
+        }
+        let value = self.bind_expression(expr);
+        if value.ty.is_error() {
+            return Some(value);
+        }
+        let value_name = match &value.ty {
+            TypeSymbol::Special(SpecialType::Null) => Some("<null>"),
+            ty if ty.is_void() => Some("void"),
+            _ => None,
+        };
+        if let Some(name) = value_name {
+            self.report(Diagnostic::new(
+                DiagnosticKind::ImplicitlyTypedLocalBadValue { value: name.into() },
+                declarator.span,
+            ));
+            return unusable();
+        }
+        Some(value)
+    }
+
     /// Binds a local constant declaration `const T x = value;` (15.5.1): each initializer is a
     /// constant expression (14.15) folded at compile time and bound to the name, which then reads
     /// as that constant. A local constant has no storage, so the declaration emits nothing (an
@@ -1294,23 +1519,17 @@ impl Binder {
         ty: &TypeRef,
         declarators: &[VariableDeclarator],
     ) -> BoundStmtKind {
-        let declared = self.resolve_named_type(&bind_type(ty), ty.span);
+        let declared = if self.is_implicitly_typed(ty) {
+            self.report(Diagnostic::new(
+                DiagnosticKind::ImplicitlyTypedLocalConstant,
+                ty.span,
+            ));
+            TypeSymbol::Error
+        } else {
+            self.resolve_type_ref(ty)
+        };
         for declarator in declarators {
-            if self.local_in_current_scope(&declarator.name) {
-                self.report(Diagnostic::new(
-                    DiagnosticKind::DuplicateLocal {
-                        name: declarator.name.clone(),
-                    },
-                    declarator.span,
-                ));
-            } else if self.local_in_enclosing_scope(&declarator.name) {
-                self.report(Diagnostic::new(
-                    DiagnosticKind::LocalShadowsEnclosing {
-                        name: declarator.name.clone(),
-                    },
-                    declarator.span,
-                ));
-            }
+            self.check_local_name_available(declarator);
             let value = declarator.initializer.as_ref().map(|expr| {
                 let bound = self.bind_expression(expr);
                 self.check_assignable(&bound, &declared, declarator.span);
@@ -1363,9 +1582,11 @@ fn section_anchor(section: &SwitchSection, fallback: Span) -> Span {
 }
 
 /// Whether a bound expression is one C# allows to stand alone as a statement
-/// (15.6): assignment, invocation, object/array creation, or pre/post
-/// increment/decrement. `checked`/`unchecked` wrappers and a binding error are
-/// admitted conservatively, so an odd-but-legal form is a gap, not a false CS0201.
+/// (15.6): assignment, invocation, object/array creation, pre/post
+/// increment/decrement -- or an `await` expression, which ECMA-334 5th ed 13.7 adds to the
+/// list (`await t;` discards the result, exactly as a call statement does). `checked`/
+/// `unchecked` wrappers and a binding error are admitted conservatively, so an
+/// odd-but-legal form is a gap, not a false CS0201.
 fn is_statement_expression(kind: &BoundExprKind) -> bool {
     matches!(
         kind,
@@ -1378,6 +1599,7 @@ fn is_statement_expression(kind: &BoundExprKind) -> bool {
                 operator: UnaryOperator::PreIncrement | UnaryOperator::PreDecrement,
                 ..
             }
+            | BoundExprKind::Await { .. }
             | BoundExprKind::Checked(_)
             | BoundExprKind::Unchecked(_)
             | BoundExprKind::Error
@@ -1412,6 +1634,17 @@ mod tests {
         assert_eq!(codes("switch (1) { case 0: while (true) { } }"), []);
         assert_eq!(codes("switch (1) { case 0: while (true) { break; } }"), [8070]);
         assert_eq!(codes("switch (1) { case 0: goto case 1; case 1: break; }"), []);
+    }
+
+    /// `@var` is the identifier `var` (9.4.2), so it is an ordinary type name in every position --
+    /// including the one where the keyword would otherwise take over. With no type of that name
+    /// declared it is CS0246, csc's answer, and NOT the CS0825 the resolver reserves for the
+    /// contextual keyword: that message is a claim about a keyword this spelling deliberately is
+    /// not. Until the parser recorded the prefix, the same source INFERRED a type and compiled.
+    #[test]
+    fn a_verbatim_var_is_an_ordinary_type_name() {
+        assert_eq!(codes("@var v = 42;"), [246]);
+        assert_eq!(codes("var v = 42;"), [8022]);
     }
 
     #[test]

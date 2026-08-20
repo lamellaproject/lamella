@@ -81,7 +81,7 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly) {
 ///
 /// **AN UNREADABLE CONSTRAINT BECOMES ABSENCE, WHICH UNDER-REPORTS.** A token whose type this
 /// binder cannot name yields nothing rather than a guess, so a call that violates it is a MISSED
-/// diagnostic and never a false one -- the same direction `is_sealed` takes for an imported type.
+/// diagnostic and never a false one.
 fn decode_constraints(
     assembly: &Assembly,
     entry: Option<&(u32, Vec<lamella_token::Token>)>,
@@ -162,6 +162,7 @@ fn type_info(
 
     let mut info = TypeInfo::new(namespace, name, kind);
     info.is_external = true;
+    info.is_sealed = type_def.is_sealed();
     info.enclosing = enclosing;
     info.assembly = assembly.assembly_name().map(Box::from);
     if let Some(base) = base {
@@ -252,6 +253,17 @@ fn type_info(
                     .map(|name| (name, symbol.parameters[0].clone()))
             });
         if let Some((property_name, ty)) = property {
+            if let Some(existing) = info
+                .properties
+                .iter_mut()
+                .find(|property| &*property.name == property_name)
+            {
+                if method_name.starts_with("get_") {
+                    existing.getter_accessibility.get_or_insert(symbol.accessibility);
+                } else if method_name.starts_with("set_") {
+                    existing.setter_accessibility.get_or_insert(symbol.accessibility);
+                }
+            }
             if info.find_property(property_name).is_none() {
                 info.properties.push(PropertySymbol {
                     name: property_name.into(),
@@ -264,6 +276,12 @@ fn type_info(
                     is_sealed: symbol.is_sealed,
                     has_getter: method_name.starts_with("get_"),
                     has_setter: method_name.starts_with("set_"),
+                    getter_accessibility: method_name
+                        .starts_with("get_")
+                        .then_some(symbol.accessibility),
+                    setter_accessibility: method_name
+                        .starts_with("set_")
+                        .then_some(symbol.accessibility),
                     is_required: required_properties.contains(&property_name),
                 });
             }

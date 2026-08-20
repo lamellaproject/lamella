@@ -15,7 +15,7 @@ use lamella_binder::{
     bind_compilation_unit_with_dialect, bind_type, collect_into, load_assembly,
     parameter_symbol, resolve_constants,
 };
-use lamella_cil::{Instruction, MethodBodyImage, encode_with_offsets, write_method_body};
+use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, encode_with_offsets, write_method_body};
 use lamella_metadata::signature::element;
 use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_name};
 use lamella_pe::{
@@ -93,7 +93,18 @@ const FIELD_STATIC: u16 = 0x0010;
 const FIELD_INITONLY: u16 = 0x0020;
 const FIELD_LITERAL: u16 = 0x0040;
 const FIELD_HAS_DEFAULT: u16 = 0x8000;
-const CTOR_FLAGS: u16 = 0x0006 | 0x0800 | 0x1000;
+const CTOR_SHARED_FLAGS: u16 = METHOD_HIDEBYSIG | 0x0800 | 0x1000;
+
+/// A constructor's `MethodDef` flags, from the modifiers it was DECLARED with.
+///
+/// **AN IMPLICIT CONSTRUCTOR IS NOT ALWAYS PUBLIC, AND REASONING ABOUT THIS GETS IT WRONG.** 10.10.4
+/// gives the default constructor the accessibility `public` EXCEPT on an `abstract` class, where it
+/// is `protected` -- there is nothing to instantiate from outside, only to chain to. Callers pass
+/// the synthesized modifier list that says so rather than relying on this to guess, so the rule
+/// lives at the one site that knows whether the type is abstract.
+fn ctor_flags(modifiers: &[Modifier]) -> u16 {
+    member_visibility(modifiers) | CTOR_SHARED_FLAGS
+}
 const CCTOR_FLAGS: u16 = 0x0001 | METHOD_STATIC | METHOD_HIDEBYSIG | 0x0800 | 0x1000;
 const SPECIAL_NAME: u16 = 0x0800;
 const SETTER_VALUE_PARAMETER: &str = "value";
@@ -265,6 +276,7 @@ pub fn compile_source_with(
         };
     }
     let debug = emit_debug.then_some((source, source_path));
+    let pragmas = parsed.pragma_warnings.clone();
     let mut compiled = compile(
         &parsed.unit,
         module_name,
@@ -281,7 +293,47 @@ pub fn compile_source_with(
         diagnostics.append(&mut compiled.diagnostics);
         compiled.diagnostics = diagnostics;
     }
+    compiled.diagnostics = without_suppressed_warnings(compiled.diagnostics, &pragmas);
     compiled
+}
+
+/// Drops the warnings a file's `#pragma warning disable` regions suppress (9.5.8).
+///
+/// **A PRAGMA SUPPRESSES BY POSITION, NOT BY FILE**, so each diagnostic is tested against the LAST
+/// directive before it: `disable 649` then `restore 649` half way down puts CS0649 back for
+/// everything below. A bare `#pragma warning disable` names no codes and means every warning,
+/// which is why an empty list is a wildcard rather than a no-op.
+///
+/// **ERRORS ARE NEVER SUPPRESSED**, whatever a pragma says -- csc ignores a `disable` naming an
+/// error's number, and so does this: a directive that could silence an error would be a way to
+/// ship a program the compiler refused.
+fn without_suppressed_warnings(
+    diagnostics: Vec<Diagnostic>,
+    pragmas: &[lamella_syntax::lexer::PragmaWarning],
+) -> Vec<Diagnostic> {
+    if pragmas.is_empty() {
+        return diagnostics;
+    }
+    diagnostics
+        .into_iter()
+        .filter(|diagnostic| {
+            if diagnostic.is_error() {
+                return true;
+            }
+            let at = diagnostic.span.start;
+            let code = diagnostic.code;
+            let mut suppressed = false;
+            for pragma in pragmas {
+                if pragma.position > at {
+                    break;
+                }
+                if pragma.codes.is_empty() || pragma.codes.contains(&code) {
+                    suppressed = pragma.disable;
+                }
+            }
+            !suppressed
+        })
+        .collect()
 }
 
 fn compile(
@@ -366,6 +418,8 @@ pub fn compile_sources_with(
     let language_version = options.version;
     let embed_pdb = options.embed_pdb;
     let unsafe_option_missing = !options.unsafe_code;
+    let mut pragmas: Vec<Vec<lamella_syntax::lexer::PragmaWarning>> =
+        Vec::with_capacity(sources.len());
     for (source, _path) in sources {
         let parsed = parse_compilation_unit_with(source, options.clone());
         let parse_diagnostics: Vec<Diagnostic> = parsed
@@ -375,6 +429,7 @@ pub fn compile_sources_with(
             .collect();
         syntax_error |= parse_diagnostics.iter().any(Diagnostic::is_error);
         diagnostics.push(parse_diagnostics);
+        pragmas.push(parsed.pragma_warnings);
         units.push(parsed.unit);
     }
     if syntax_error {
@@ -401,6 +456,10 @@ pub fn compile_sources_with(
             unit_diagnostics.iter().map(Diagnostic::from_binder).collect();
         any_error |= bound.iter().any(Diagnostic::is_error);
         per_unit.extend(bound);
+    }
+    for (per_unit, file_pragmas) in diagnostics.iter_mut().zip(&pragmas) {
+        let suppressed = without_suppressed_warnings(core::mem::take(per_unit), file_pragmas);
+        *per_unit = suppressed;
     }
     let debug = emit_debug.then_some(sources);
     let Some(program) = ValidatedProgram::from_clean_bind(&units, references, any_error) else {
@@ -435,12 +494,14 @@ pub fn compile_sources_with(
 }
 
 /// The binder model for `units` over their references: the reference types first,
-/// then every unit's own, with single-part signature names canonicalized and the base chain
-/// linked across the whole. The canonicalize step matches the diagnostic path
-/// ([`bind_compilation_unit_with_references`], via the binder crate); without it a method
-/// parameter written as a single-part reference type (`void F(Type t)`, resolved through a
-/// `using`) stays unqualified and never matches a qualified argument, so the emit-time call
-/// resolution silently fails ("a call that did not resolve").
+/// then every unit's own, with signature names qualified TO WHAT THEY MEAN IN THEIR OWN SCOPE
+/// and the base chain linked across the whole. The qualification step matches the diagnostic
+/// path ([`bind_compilation_unit_with_references`], via the binder crate's
+/// `qualify_declared_signatures`); without it a method parameter written as a single-part
+/// reference type (`void F(Type t)`, resolved through a `using`) stays unqualified and never
+/// matches a qualified argument, so the emit-time call resolution silently fails ("a call that
+/// did not resolve") -- and a simple name shared by two namespaces resolves to the WRONG one or
+/// to none.
 fn reference_model(units: &[CompilationUnit], references: &[Assembly]) -> Model {
     let mut model = Model::new();
     for reference in references {
@@ -449,7 +510,16 @@ fn reference_model(units: &[CompilationUnit], references: &[Assembly]) -> Model 
     for unit in units {
         collect_into(&mut model, unit);
     }
-    model.canonicalize_signatures();
+    let mut binder = Binder::with_model(model);
+    for unit in units {
+        lamella_binder::program::qualify_declared_signatures(
+            &mut binder,
+            &unit.usings,
+            &unit.members,
+            "",
+        );
+    }
+    let mut model = binder.into_model();
     model.link_bases();
     resolve_constants(&mut model, units);
     model
@@ -492,9 +562,20 @@ fn build_image(
     let units = program.units;
     let references = program.references;
     let model = reference_model(units, references);
-    let mut tokens = assign_tokens(units, model.signature_canon());
-    tokens.set_native_interop(native_interop);
     let mut binder = Binder::with_model(model);
+    let contexts: Vec<DebugContext> = debug
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, (source, _))| DebugContext {
+            source,
+            lines: LineMap::new(source),
+            document: index as u32 + 1,
+        })
+        .collect();
+    let partials = index_partial_types(units, &contexts);
+    let mut tokens = assign_tokens(units, &mut binder, &partials);
+    tokens.set_native_interop(native_interop);
     mark_external_value_types(binder.model(), &mut tokens);
     let mut image = ImageBuilder::new(module_name, assembly_name);
     if let Some(sources) = debug {
@@ -510,16 +591,6 @@ fn build_image(
     let object =
         declared_system_type(&tokens, "Object").unwrap_or_else(|| image.object_type());
     let mut entry_point = None;
-    let contexts: Vec<DebugContext> = debug
-        .into_iter()
-        .flatten()
-        .enumerate()
-        .map(|(index, (source, _))| DebugContext {
-            source,
-            lines: LineMap::new(source),
-            document: index as u32 + 1,
-        })
-        .collect();
     for (index, unit) in units.iter().enumerate() {
         binder.set_defined_symbols(unit.defined_symbols.clone());
         emit_namespace(
@@ -532,7 +603,12 @@ fn build_image(
             &unit.members,
             "",
             contexts.get(index),
+            &partials,
         )?;
+    }
+    let pending_async = core::mem::take(&mut tokens.pending_async);
+    for pending in pending_async {
+        emit_async_machine(&mut image, &mut binder, &mut tokens, pending)?;
     }
     for unit in units {
         emit_global_attributes(&mut image, &binder, &mut tokens, &unit.global_attributes);
@@ -1299,6 +1375,7 @@ pub(crate) fn build_bootstrap_delta(
         span: None,
         arguments: Vec::new(),
         leading_body: 0,
+        zero_initialize: None,
     };
     let empty = BoundStmt {
         kind: BoundStmtKind::Block(Vec::new()),
@@ -1325,7 +1402,14 @@ pub(crate) fn build_bootstrap_delta(
     let body_bytes = write_method_body(&body_image)
         .map_err(|_| crate::EmitError::Unsupported("bootstrap .ctor body could not be written"))?;
     let ctor_sig = method_signature(true, &[], &TypeSig::Void);
-    image.add_method(".ctor", &ctor_sig, &body_bytes, CTOR_FLAGS, IL_MANAGED, &[]);
+    image.add_method(
+        ".ctor",
+        &ctor_sig,
+        &body_bytes,
+        ctor_flags(&[Modifier::Public]),
+        IL_MANAGED,
+        &[],
+    );
     Ok(image.finish(Token::new(0, 0), true))
 }
 
@@ -1356,15 +1440,19 @@ pub(crate) fn build_submission_delta(
         let mut next_type = 1u32;
         let mut next_field = 0u32;
         let mut next_method = 0u32;
+        let mut binder = Binder::with_model(model.clone());
+        let partials = PartialIndex::new();
         collect_tokens(
             &mut tokens,
+            &mut binder,
             &mut next_type,
             &mut next_field,
             &mut next_method,
+            &[],
             type_members,
             "",
+            &partials,
         );
-        let mut binder = Binder::with_model(model.clone());
         let mut entry_point = None;
         emit_namespace(
             &mut image,
@@ -1376,6 +1464,7 @@ pub(crate) fn build_submission_delta(
             type_members,
             "",
             None,
+            &partials,
         )?;
     }
 
@@ -1448,6 +1537,7 @@ struct DebugContext<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_namespace(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -1458,6 +1548,7 @@ fn emit_namespace(
     members: &[NamespaceMember],
     namespace: &str,
     debug: Option<&DebugContext>,
+    partials: &PartialIndex<'_>,
 ) -> Result<(), crate::EmitError> {
     let scope = binder.import_scope();
     for using in usings {
@@ -1479,6 +1570,10 @@ fn emit_namespace(
     for member in members {
         match member {
             NamespaceMember::Type(declaration) => {
+                if is_later_partial_part(partials, namespace, declaration) {
+                    continue;
+                }
+                let later = continuation_parts(partials, namespace, declaration).unwrap_or(&[]);
                 emit_type(
                     image,
                     binder,
@@ -1488,29 +1583,37 @@ fn emit_namespace(
                     namespace,
                     declaration,
                     debug,
+                    None,
+                    later,
+                    partials,
                 )?;
                 let enclosing_full = lamella_binder::declared_full_name(namespace, declaration);
-                for member in &declaration.members {
-                    if let Member::NestedType(nested) = member {
-                        if matches!(
-                            nested.as_ref(),
-                            NamespaceMember::Type(_)
-                                | NamespaceMember::Enum(_)
-                                | NamespaceMember::Delegate(_)
-                        ) {
-                            emit_namespace(
-                                image,
-                                binder,
-                                object,
-                                tokens,
-                                entry_point,
-                                &[],
-                                core::slice::from_ref(nested.as_ref()),
-                                &enclosing_full,
-                                debug,
-                            )?;
-                        }
-                    }
+                emit_nested_types(
+                    image,
+                    binder,
+                    object,
+                    tokens,
+                    entry_point,
+                    &enclosing_full,
+                    declaration,
+                    debug,
+                    partials,
+                )?;
+                for part in later {
+                    let part_scope = enter_part(binder, part);
+                    let emitted = emit_nested_types(
+                        image,
+                        binder,
+                        object,
+                        tokens,
+                        entry_point,
+                        &enclosing_full,
+                        part.declaration,
+                        part.debug,
+                        partials,
+                    );
+                    leave_part(binder, part_scope);
+                    emitted?;
                 }
             }
             NamespaceMember::Namespace(declaration) => {
@@ -1525,6 +1628,7 @@ fn emit_namespace(
                     &declaration.members,
                     &inner,
                     debug,
+                    partials,
                 )?;
             }
             NamespaceMember::Delegate(declaration) => {
@@ -1537,6 +1641,80 @@ fn emit_namespace(
     }
     binder.restore_import_scope(scope);
     Ok(())
+}
+
+/// Emits the types NESTED in one declaration, depth-first under the enclosing type's full name.
+///
+/// Split out of [`emit_namespace`] so a PARTIAL type can run it once per part: a nested type
+/// declared in the second part of `partial class Outer` is Outer's nested type just as much as one
+/// declared in the first, and the walk that reached it before skipped every later part whole.
+#[allow(clippy::too_many_arguments)]
+fn emit_nested_types(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    object: Token,
+    tokens: &mut Tokens,
+    entry_point: &mut Option<Token>,
+    enclosing_full: &str,
+    declaration: &TypeDecl,
+    debug: Option<&DebugContext>,
+    partials: &PartialIndex<'_>,
+) -> Result<(), crate::EmitError> {
+    for member in &declaration.members {
+        if let Member::NestedType(nested) = member {
+            if matches!(
+                nested.as_ref(),
+                NamespaceMember::Type(_) | NamespaceMember::Enum(_) | NamespaceMember::Delegate(_)
+            ) {
+                emit_namespace(
+                    image,
+                    binder,
+                    object,
+                    tokens,
+                    entry_point,
+                    &[],
+                    core::slice::from_ref(nested.as_ref()),
+                    enclosing_full,
+                    debug,
+                    partials,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Brings one partial part's FILE CONTEXT into the binder for the length of its emission: its
+/// `using` directives and aliases, and its `#define` set. Returns the import scope to restore.
+///
+/// **A PART IN ANOTHER FILE WAS BOUND UNDER THAT FILE'S SCOPE, AND EMISSION RE-RESOLVES.** A member
+/// whose body names `Console` under its own file's `using System;` has to find it here too, and a
+/// name its file did NOT import must not resolve just because the first part's file did.
+fn enter_part(binder: &mut Binder, part: &PartialPart<'_>) -> PartScope {
+    let imports = binder.import_scope();
+    let defined = binder.replace_defined_symbols(part.defined_symbols.clone());
+    for using in part.usings {
+        match &using.kind {
+            UsingKind::Namespace(name) => binder.import_namespace(&join_namespace("", name)),
+            UsingKind::Alias { name, target } => {
+                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
+            }
+        }
+    }
+    PartScope { imports, defined }
+}
+
+/// What [`enter_part`] displaced, to be handed to [`leave_part`].
+struct PartScope {
+    imports: (usize, usize),
+    defined: alloc::collections::BTreeSet<Box<str>>,
+}
+
+/// Puts back the file context [`enter_part`] displaced. The walk that reached the part is still
+/// inside ANOTHER file's unit, and every type after it there is entitled to that file's scope.
+fn leave_part(binder: &mut Binder, scope: PartScope) {
+    binder.restore_import_scope(scope.imports);
+    binder.set_defined_symbols(scope.defined);
 }
 
 /// Emits one declaration's `GenericParam` rows (II.22.20) WITH their constraint flag word, plus a
@@ -1613,34 +1791,49 @@ fn emit_generic_parameters(
 
 /// Emits an interface as a `TypeDef` with no base, no constructor, and abstract
 /// methods (II.22.37 semantics). Implementing classes get an `InterfaceImpl` row.
+///
+/// `continuation` carries the row a PARTIAL interface's first part already wrote, for the same
+/// reason [`emit_type_inner`] takes one: the parts are one type, and a second `TypeDef` of the same
+/// name is an image the CLR refuses to load.
 fn emit_interface(
     image: &mut ImageBuilder,
     binder: &Binder,
     tokens: &mut Tokens,
     namespace: &str,
     declaration: &TypeDecl,
-) -> Result<(), crate::EmitError> {
-    let nil = Token::new(TYPE_DEF, 0);
-    let type_token = image.add_type(namespace, &declared_type_name(declaration), nil, INTERFACE_FLAGS);
+    continuation: Option<Token>,
+) -> Result<Token, crate::EmitError> {
     let enclosing = declared_type_symbol(namespace, declaration);
-    emit_generic_parameters(
-        image,
-        tokens,
-        type_token,
-        &declaration.type_parameters.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
-        &declaration.constraints,
-    );
-    let own = declared_type_symbol(namespace, declaration);
-    let direct: Vec<TypeSymbol> = binder
-        .model()
-        .get_by_symbol(&own)
-        .map(|info| {
-            info.bases
-                .iter()
-                .filter_map(|base| binder.model().resolve_interface_base(base))
-                .collect()
-        })
-        .unwrap_or_default();
+    let type_token = match continuation {
+        Some(token) => token,
+        None => {
+            let nil = Token::new(TYPE_DEF, 0);
+            let token =
+                image.add_type(namespace, &declared_type_name(declaration), nil, INTERFACE_FLAGS);
+            emit_generic_parameters(
+                image,
+                tokens,
+                token,
+                &type_parameter_names(binder, &enclosing, declaration),
+                &declaration.constraints,
+            );
+            token
+        }
+    };
+    let direct: Vec<TypeSymbol> = if continuation.is_some() {
+        Vec::new()
+    } else {
+        binder
+            .model()
+            .get_by_symbol(&enclosing)
+            .map(|info| {
+                info.bases
+                    .iter()
+                    .filter_map(|base| binder.model().resolve_interface_base(base))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let mut interfaces: Vec<TypeSymbol> = Vec::new();
     for interface in direct {
         collect_interface_closure(binder.model(), interface, &mut interfaces);
@@ -1671,12 +1864,14 @@ fn emit_interface(
             }
             let parameter_sigs: Vec<TypeSig> = parameters
                 .iter()
-                .map(|parameter| member_type_sig(tokens, &enclosing, &parameter_symbol(parameter)))
+                .map(|parameter| {
+                    member_type_sig(tokens, &enclosing, &binder.canonicalize(&parameter_symbol(parameter)))
+                })
                 .collect::<Result<_, _>>()?;
             let signature = method_signature(
                 true,
                 &parameter_sigs,
-                &member_type_sig(tokens, &enclosing, &bind_type(return_type))?,
+                &member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(return_type)))?,
             );
             let method =
                 image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS, &parameter_names(parameters));
@@ -1689,7 +1884,7 @@ fn emit_interface(
             ty, name, getter, setter, ..
         } = member
         {
-            let property_ty = bind_type(ty);
+            let property_ty = binder.canonicalize(&bind_type(ty));
             let element = member_type_sig(tokens, &enclosing, &property_ty)?;
             let property = image.add_property(name, &property_signature(true, &[], &element), 0);
             if getter.is_some() {
@@ -1724,10 +1919,12 @@ fn emit_interface(
         } = member
         {
             let name = indexer_name(attributes);
-            let element = member_type_sig(tokens, &enclosing, &bind_type(ty))?;
+            let element = member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(ty)))?;
             let indices: Vec<TypeSig> = parameters
                 .iter()
-                .map(|parameter| member_type_sig(tokens, &enclosing, &bind_type(&parameter.ty)))
+                .map(|parameter| {
+                    member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(&parameter.ty)))
+                })
                 .collect::<Result<_, _>>()?;
             let property =
                 image.add_property(&name, &property_signature(true, &indices, &element), 0);
@@ -1768,7 +1965,7 @@ fn emit_interface(
             ty, declarators, ..
         } = member
         {
-            let event_ty = bind_type(ty);
+            let event_ty = binder.canonicalize(&bind_type(ty));
             let event_type_token =
                 tokens
                     .type_token(&event_ty)
@@ -1799,7 +1996,7 @@ fn emit_interface(
     if let Some(first) = first_event {
         image.add_event_map(type_token, first);
     }
-    Ok(())
+    Ok(type_token)
 }
 
 /// Emits a delegate as a sealed class extending `System.MulticastDelegate`, with its
@@ -1817,14 +2014,14 @@ fn emit_delegate(
     let inherited = enclosing_type_parameters(binder, &named_symbol(namespace, &declaration.name));
     mint_signature_type(
         binder,
-        &bind_type(&declaration.return_type),
+        &binder.canonicalize(&bind_type(&declaration.return_type)),
         &[],
         &inherited,
         image,
         tokens,
     )?;
     for parameter in &declaration.parameters {
-        mint_signature_type(binder, &bind_type(&parameter.ty), &[], &inherited, image, tokens)?;
+        mint_signature_type(binder, &binder.canonicalize(&bind_type(&parameter.ty)), &[], &inherited, image, tokens)?;
     }
     let base = system_base(image, tokens, "MulticastDelegate");
     image.add_type(namespace, &declaration.name, base, DELEGATE_TYPE_FLAGS);
@@ -1836,12 +2033,12 @@ fn emit_delegate(
         DELEGATE_CTOR_FLAGS,
         &[DELEGATE_CTOR_TARGET.into(), DELEGATE_CTOR_METHOD.into()],
     );
-    let return_sig = type_sig(tokens, &bind_type(&declaration.return_type))?;
+    let return_sig = type_sig(tokens, &binder.canonicalize(&bind_type(&declaration.return_type)))?;
     let parameter_sigs: Vec<TypeSig> = declaration
         .parameters
         .iter()
         .map(|parameter| {
-            let base = type_sig(tokens, &bind_type(&parameter.ty))?;
+            let base = type_sig(tokens, &binder.canonicalize(&bind_type(&parameter.ty)))?;
             Ok(
                 if matches!(
                     parameter.modifier,
@@ -2049,6 +2246,7 @@ fn base_class_ctor(image: &mut ImageBuilder, tokens: &Tokens, base_class: &TypeS
 /// called `T` for the rest of the compilation. Same shape, and same reason, as the binder's own
 /// `bind_type_bodies` / `bind_type_bodies_inner` split.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_type(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -2058,9 +2256,13 @@ fn emit_type(
     namespace: &str,
     declaration: &TypeDecl,
     debug: Option<&DebugContext>,
+    continuation: Option<Token>,
+    later: &[PartialPart<'_>],
+    partials: &PartialIndex<'_>,
 ) -> Result<(), crate::EmitError> {
     let entered =
         binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let outer = binder.replace_current_type(Some(declared_type_symbol(namespace, declaration)));
     let emitted = emit_type_inner(
         image,
         binder,
@@ -2070,11 +2272,23 @@ fn emit_type(
         namespace,
         declaration,
         debug,
+        continuation,
+        later,
+        partials,
     );
+    binder.replace_current_type(outer);
     binder.exit_type_parameters(entered);
     emitted
 }
 
+/// Emits one type: its `TypeDef` row and every row its members own.
+///
+/// **`continuation` IS WHAT MAKES SEVERAL DECLARATIONS ONE TYPE.** For the FIRST part of a partial
+/// type it is `None` and this writes the `TypeDef`, its generic parameters, its `NestedClass` row
+/// and its attributes; for a LATER part it carries the token that row already has, and only the
+/// part's MEMBERS are emitted -- into the ranges the first part opened. `later` is the remaining
+/// parts, which this emits immediately after its own members, each under its own file's context,
+/// because a row written between them would end the type's range (II.22.37).
 #[allow(clippy::too_many_arguments)]
 fn emit_type_inner(
     image: &mut ImageBuilder,
@@ -2085,29 +2299,13 @@ fn emit_type_inner(
     namespace: &str,
     declaration: &TypeDecl,
     debug: Option<&DebugContext>,
+    continuation: Option<Token>,
+    later: &[PartialPart<'_>],
+    partials: &PartialIndex<'_>,
 ) -> Result<(), crate::EmitError> {
     let is_struct = declaration.kind == TypeKind::Struct;
     let enclosing = declared_type_symbol(namespace, declaration);
-    let own_parameters: Vec<Box<str>> = declaration
-        .type_parameters
-        .iter()
-        .map(|parameter| parameter.name.clone())
-        .collect();
-    let inherited_parameters = enclosing_type_parameters(binder, &enclosing);
-    if !inherited_parameters.is_empty() {
-        let holds_static_state = declaration.members.iter().any(|member| match member {
-            Member::Field { modifiers, .. } | Member::EventField { modifiers, .. } => {
-                modifiers.contains(&Modifier::Static) && !modifiers.contains(&Modifier::Const)
-            }
-            Member::Constructor { modifiers, .. } => modifiers.contains(&Modifier::Static),
-            _ => false,
-        });
-        if holds_static_state {
-            return Err(crate::EmitError::Unsupported(
-                "static state in a type nested inside a generic type",
-            ));
-        }
-    }
+    let own_parameters = type_parameter_names(binder, &enclosing, declaration);
     for index in 0..own_parameters.len() as u32 {
         if tokens.var_spec(index).is_none() {
             let spec = image.type_spec(&type_signature(&TypeSig::Var(index)));
@@ -2119,11 +2317,31 @@ fn emit_type_inner(
             binder,
             &declaration.members,
             &own_parameters,
-            &inherited_parameters,
+            &[],
             image,
             tokens,
         )?;
-        return emit_interface(image, binder, tokens, namespace, declaration);
+        let interface_token =
+            emit_interface(image, binder, tokens, namespace, declaration, continuation)?;
+        for part in later {
+            let part_scope = enter_part(binder, part);
+            let emitted = emit_type(
+                image,
+                binder,
+                object,
+                tokens,
+                entry_point,
+                namespace,
+                part.declaration,
+                part.debug,
+                Some(interface_token),
+                &[],
+                partials,
+            );
+            leave_part(binder, part_scope);
+            emitted?;
+        }
+        return Ok(());
     }
     let (base_class, nested_in): (Option<TypeSymbol>, Option<Box<str>>) = {
         let info = binder.model().get_by_symbol(&enclosing);
@@ -2134,79 +2352,100 @@ fn emit_type_inner(
         (if is_struct { None } else { base }, enclosing_of)
     };
     let is_system_object = namespace == "System" && &*declaration.name == "Object";
-    let (base, flags) = if is_struct {
-        (system_base(image, tokens, "ValueType"), PUBLIC_STRUCT)
-    } else if is_system_object {
-        (Token::new(TYPE_DEF, 0), PUBLIC_CLASS)
-    } else {
-        let base_token = base_class
-            .as_ref()
-            .and_then(|symbol| {
-                tokens.type_token(symbol).or_else(|| {
-                    split_type_name(symbol)
-                        .map(|(namespace, name)| image.type_ref(&namespace, &name))
-                })
-            })
-            .unwrap_or(object);
-        (base_token, PUBLIC_CLASS)
-    };
-    let (metadata_namespace, mut flags) = if nested_in.is_some() {
-        ("", (flags & !0x0000_0007) | nested_visibility(&declaration.modifiers))
-    } else {
-        let visibility = if declaration.modifiers.contains(&Modifier::Public) {
-            0x0000_0001
-        } else {
-            0x0000_0000
-        };
-        (namespace, (flags & !0x0000_0007) | visibility)
-    };
-    if declaration.modifiers.contains(&Modifier::Abstract) {
-        flags |= TYPE_ABSTRACT;
-    }
-    if declaration.modifiers.contains(&Modifier::Static) {
-        flags |= TYPE_ABSTRACT | TYPE_SEALED;
-    }
-    let declares_static_constructor = declaration.members.iter().any(|member| {
-        matches!(
-            member,
-            Member::Constructor { modifiers, .. } if modifiers.contains(&Modifier::Static)
-        )
-    });
-    if !declares_static_constructor {
-        flags |= TYPE_BEFORE_FIELD_INIT;
-    }
-    let type_token = image.add_type(metadata_namespace, &declared_type_name(declaration), base, flags);
-    emit_generic_parameters(
-        image,
-        tokens,
-        type_token,
-        &declaration.type_parameters.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
-        &declaration.constraints,
-    );
-    if let Some(enclosing_full) = &nested_in {
-        if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
-            image.add_nested_class(type_token, enclosing_token);
+    let type_token = match continuation {
+        Some(token) => {
+            emit_attributes(image, binder, tokens, &enclosing, token, &declaration.attributes);
+            token
         }
-    }
-    emit_attributes(image, binder, tokens, &enclosing, type_token, &declaration.attributes);
+        None => {
+        let (base, flags) = if is_struct {
+            (system_base(image, tokens, "ValueType"), PUBLIC_STRUCT)
+        } else if is_system_object {
+            (Token::new(TYPE_DEF, 0), PUBLIC_CLASS)
+        } else {
+            let base_token = base_class
+                .as_ref()
+                .and_then(|symbol| {
+                    tokens.type_token(symbol).or_else(|| {
+                        split_type_name(symbol)
+                            .map(|(namespace, name)| image.type_ref(&namespace, &name))
+                    })
+                })
+                .unwrap_or(object);
+            (base_token, PUBLIC_CLASS)
+        };
+        let merged = merged_modifiers(declaration, later);
+        let modifiers = merged.as_slice();
+        let (metadata_namespace, mut flags) = if nested_in.is_some() {
+            ("", (flags & !0x0000_0007) | nested_visibility(modifiers))
+        } else {
+            let visibility = if modifiers.contains(&Modifier::Public) {
+                0x0000_0001
+            } else {
+                0x0000_0000
+            };
+            (namespace, (flags & !0x0000_0007) | visibility)
+        };
+        if modifiers.contains(&Modifier::Abstract) {
+            flags |= TYPE_ABSTRACT;
+        }
+        if modifiers.contains(&Modifier::Sealed) {
+            flags |= TYPE_SEALED;
+        }
+        if modifiers.contains(&Modifier::Static) {
+            flags |= TYPE_ABSTRACT | TYPE_SEALED;
+        }
+        let declares_static_constructor = core::iter::once(declaration)
+            .chain(later.iter().map(|part| part.declaration))
+            .flat_map(|part| part.members.iter())
+            .any(|member| {
+                matches!(
+                    member,
+                    Member::Constructor { modifiers, .. } if modifiers.contains(&Modifier::Static)
+                )
+            });
+        if !declares_static_constructor {
+            flags |= TYPE_BEFORE_FIELD_INIT;
+        }
+        let type_token = image.add_type(metadata_namespace, &declared_type_name(declaration), base, flags);
+        emit_generic_parameters(
+            image,
+            tokens,
+            type_token,
+            &own_parameters,
+            &declaration.constraints,
+        );
+        if let Some(enclosing_full) = &nested_in {
+            if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
+                image.add_nested_class(type_token, enclosing_token);
+            }
+        }
+        emit_attributes(image, binder, tokens, &enclosing, type_token, &declaration.attributes);
+        type_token
+        }
+    };
     mint_member_signature_types(
         binder,
         &declaration.members,
         &own_parameters,
-        &inherited_parameters,
+        &[],
         image,
         tokens,
     )?;
-    let direct_interfaces: Vec<TypeSymbol> = binder
-        .model()
-        .get_by_symbol(&enclosing)
-        .map(|info| {
-            info.bases
-                .iter()
-                .filter_map(|base| binder.model().resolve_interface_base(base))
-                .collect()
-        })
-        .unwrap_or_default();
+    let direct_interfaces: Vec<TypeSymbol> = if continuation.is_some() {
+        Vec::new()
+    } else {
+        binder
+            .model()
+            .get_by_symbol(&enclosing)
+            .map(|info| {
+                info.bases
+                    .iter()
+                    .filter_map(|base| binder.model().resolve_interface_base(base))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let mut interfaces: Vec<TypeSymbol> = Vec::new();
     for interface in direct_interfaces {
         collect_interface_closure(binder.model(), interface, &mut interfaces);
@@ -2242,6 +2481,39 @@ fn emit_type_inner(
                 }
             }
         }
+        if let Member::Property {
+            modifiers,
+            ty,
+            name,
+            getter,
+            setter,
+            explicit_interface,
+            ..
+        } = member
+        {
+            if is_auto_property(
+                modifiers,
+                getter.as_ref(),
+                setter.as_ref(),
+                declaration.kind == TypeKind::Interface,
+            ) {
+                let field_ty = binder.canonicalize(&bind_type(ty));
+                let signature = field_signature(&member_type_sig(tokens, &enclosing, &field_ty)?);
+                let flags = FIELD_PRIVATE
+                    | if modifiers.contains(&Modifier::Static) {
+                        FIELD_STATIC
+                    } else {
+                        0
+                    };
+                let field = image.add_field(
+                    &backing_field_name(explicit_interface.as_ref(), name),
+                    &signature,
+                    flags,
+                );
+                emit_compiler_generated_marker(image, tokens, field);
+                emit_debugger_browsable_never(image, tokens, field);
+            }
+        }
         if let Member::EventField {
             modifiers,
             ty,
@@ -2249,7 +2521,7 @@ fn emit_type_inner(
             ..
         } = member
         {
-            let signature = field_signature(&type_sig(tokens, &bind_type(ty))?);
+            let signature = field_signature(&type_sig(tokens, &binder.canonicalize(&bind_type(ty)))?);
             let flags = FIELD_PRIVATE
                 | if modifiers.contains(&Modifier::Static) {
                     FIELD_STATIC
@@ -2262,8 +2534,9 @@ fn emit_type_inner(
         }
     }
     if !is_struct
-        && !declares_instance_constructor(declaration)
-        && !declaration.modifiers.contains(&Modifier::Static)
+        && continuation.is_none()
+        && !any_part_declares_instance_constructor(declaration, later)
+        && !any_part_is_static(declaration, later)
     {
         let base_ctor = if is_system_object {
             None
@@ -2273,12 +2546,20 @@ fn emit_type_inner(
             Some(object_base_ctor(image, tokens))
         };
         let body = Stmt::new(StmtKind::Block(Vec::new()), declaration.span);
+        let implicit_accessibility = if merged_modifiers(declaration, later)
+            .contains(&Modifier::Abstract)
+        {
+            [Modifier::Protected]
+        } else {
+            [Modifier::Public]
+        };
         let token = emit_constructor(
             image,
             binder,
             &enclosing,
             tokens,
             declaration,
+            &implicit_accessibility,
             &[],
             false,
             None,
@@ -2310,6 +2591,7 @@ fn emit_type_inner(
             &[],
             &body,
             true,
+            false,
             false,
             CCTOR_FLAGS,
             None,
@@ -2367,7 +2649,7 @@ fn emit_type_inner(
                 ..
             } if find_dll_import(name, attributes).is_some() => {
                 emit_pinvoke_method(
-                    image, tokens, modifiers, name, return_type, parameters, attributes,
+                    image, binder, tokens, modifiers, name, return_type, parameters, attributes,
                 )?;
             }
             Member::Method {
@@ -2382,7 +2664,7 @@ fn emit_type_inner(
             } if modifiers.contains(&Modifier::Abstract) => {
                 let token =
                     emit_abstract_method(
-                        image, tokens, &enclosing, modifiers, name, return_type, parameters,
+                        image, binder, tokens, &enclosing, modifiers, name, return_type, parameters,
                     )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
@@ -2450,7 +2732,7 @@ fn emit_type_inner(
                 attributes,
                 ..
             } if !is_static_constructor(modifiers) => {
-                let base_ctor = if is_struct || is_system_object {
+                let base_ctor = if is_struct || is_system_object || initializer.is_some() {
                     None
                 } else if let Some(symbol) = base_class.as_ref() {
                     Some(base_class_ctor(image, tokens, symbol))
@@ -2463,6 +2745,7 @@ fn emit_type_inner(
                     &enclosing,
                     tokens,
                     declaration,
+                    modifiers,
                     parameters,
                     *is_vararg,
                     initializer.as_ref(),
@@ -2570,8 +2853,7 @@ fn emit_type_inner(
             ..
         } = member
         {
-            let event_ty = bind_type(ty);
-            let is_static = modifiers.contains(&Modifier::Static);
+            let event_ty = binder.canonicalize(&bind_type(ty));
             for declarator in declarators {
                 let event = emit_event(
                     image,
@@ -2580,7 +2862,7 @@ fn emit_type_inner(
                     &enclosing,
                     &declarator.name,
                     &event_ty,
-                    is_static,
+                    modifiers,
                     debug,
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, event, attributes);
@@ -2598,7 +2880,7 @@ fn emit_type_inner(
             ..
         } = member
         {
-            let event_ty = bind_type(ty);
+            let event_ty = binder.canonicalize(&bind_type(ty));
             let event = emit_custom_event(
                 image,
                 binder,
@@ -2609,7 +2891,7 @@ fn emit_type_inner(
                 adder.as_ref().and_then(|accessor| accessor.body.as_ref()),
                 remover.as_ref().and_then(|accessor| accessor.body.as_ref()),
                 explicit_interface.as_ref(),
-                modifiers.contains(&Modifier::Static),
+                modifiers,
                 debug,
             )?;
             emit_attributes(image, binder, tokens, &enclosing, event, attributes);
@@ -2618,6 +2900,24 @@ fn emit_type_inner(
     }
     if let Some(first) = first_event {
         image.add_event_map(type_token, first);
+    }
+    for part in later {
+        let part_scope = enter_part(binder, part);
+        let emitted = emit_type(
+            image,
+            binder,
+            object,
+            tokens,
+            entry_point,
+            namespace,
+            part.declaration,
+            part.debug,
+            Some(type_token),
+            &[],
+            partials,
+        );
+        leave_part(binder, part_scope);
+        emitted?;
     }
     Ok(())
 }
@@ -2637,9 +2937,10 @@ fn emit_event(
     enclosing: &TypeSymbol,
     name: &str,
     event_ty: &TypeSymbol,
-    is_static: bool,
+    modifiers: &[Modifier],
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
+    let is_static = modifiers.contains(&Modifier::Static);
     let void = TypeSymbol::Special(SpecialType::Void);
     let interface_impl = binder.member_implements_interface(
         enclosing,
@@ -2654,7 +2955,7 @@ fn emit_event(
             | METHOD_HIDEBYSIG
             | SPECIAL_NAME
     } else {
-        METHOD_PUBLIC
+        member_visibility(modifiers)
             | SPECIAL_NAME
             | METHOD_HIDEBYSIG
             | if is_static { METHOD_STATIC } else { 0 }
@@ -2674,6 +2975,7 @@ fn emit_event(
         &event_accessor_body(name, AssignmentOperator::Add),
         is_static,
         false,
+        false,
         flags,
         None,
         debug,
@@ -2691,6 +2993,7 @@ fn emit_event(
         &[],
         &event_accessor_body(name, AssignmentOperator::Subtract),
         is_static,
+        false,
         false,
         flags,
         None,
@@ -2727,9 +3030,10 @@ fn emit_custom_event(
     add_body: Option<&lamella_syntax::ast::Stmt>,
     remove_body: Option<&lamella_syntax::ast::Stmt>,
     explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
-    is_static: bool,
+    modifiers: &[Modifier],
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
+    let is_static = modifiers.contains(&Modifier::Static);
     let void = TypeSymbol::Special(SpecialType::Void);
     let is_static = is_static && explicit_interface.is_none();
     let flags = if explicit_interface.is_some() {
@@ -2740,7 +3044,7 @@ fn emit_custom_event(
             | METHOD_HIDEBYSIG
             | SPECIAL_NAME
     } else {
-        METHOD_PUBLIC
+        member_visibility(modifiers)
             | SPECIAL_NAME
             | METHOD_HIDEBYSIG
             | if is_static { METHOD_STATIC } else { 0 }
@@ -2757,7 +3061,7 @@ fn emit_custom_event(
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let token = emit_method_body(
             image, binder, tokens, enclosing, &[], &[], &method_name, &void, &params, &[], body, is_static,
-            false, flags, None, debug,
+            false, false, flags, None, debug,
         )?;
         if let Some(interface) = explicit_interface {
             emit_explicit_interface_impl(
@@ -2823,6 +3127,7 @@ fn event_accessor_body(field: &str, operator: AssignmentOperator) -> Stmt {
 /// dispatches to the overriding method in a derived type.
 fn emit_abstract_method(
     image: &mut ImageBuilder,
+    binder: &Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     modifiers: &[Modifier],
@@ -2832,12 +3137,14 @@ fn emit_abstract_method(
 ) -> Result<Token, crate::EmitError> {
     let parameter_sigs: Vec<TypeSig> = parameters
         .iter()
-        .map(|parameter| member_type_sig(tokens, &enclosing, &parameter_symbol(parameter)))
+        .map(|parameter| {
+            member_type_sig(tokens, &enclosing, &binder.canonicalize(&parameter_symbol(parameter)))
+        })
         .collect::<Result<_, _>>()?;
     let signature = method_signature(
         true,
         &parameter_sigs,
-        &member_type_sig(tokens, &enclosing, &bind_type(return_type))?,
+        &member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(return_type)))?,
     );
     let flags = member_visibility(modifiers) | slot_flags(modifiers);
     let method = image.add_abstract_method(name, &signature, flags, &parameter_names(parameters));
@@ -2922,10 +3229,11 @@ fn emit_one_method_in_scope(
     let method_type_parameters: Vec<Box<str>> =
         type_parameters.iter().map(|p| p.name.clone()).collect();
     let method_constraints = constraints;
-    let return_symbol = bind_type(return_type);
+    let is_async = modifiers.contains(&Modifier::Async);
+    let return_symbol = binder.canonicalize(&bind_type(return_type));
     let params: Vec<(Box<str>, TypeSymbol)> = parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
+        .map(|parameter| (parameter.name.clone(), binder.canonicalize(&bind_type(&parameter.ty))))
         .collect();
     let byref_flags = byref_flags(parameters);
     if let Some(interface) = explicit_interface {
@@ -2945,12 +3253,16 @@ fn emit_one_method_in_scope(
             &byref_flags,
             body,
             false,
+            is_async,
             is_vararg,
             flags,
             None,
             debug,
         )?;
-        let signature_params: Vec<TypeSymbol> = parameters.iter().map(parameter_symbol).collect();
+        let signature_params: Vec<TypeSymbol> = parameters
+            .iter()
+            .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+            .collect();
         emit_explicit_interface_impl(
             image,
             binder,
@@ -2999,6 +3311,7 @@ fn emit_one_method_in_scope(
         &byref_flags,
         body,
         is_static,
+        is_async,
         is_vararg,
         flags,
         None,
@@ -3295,6 +3608,7 @@ fn string_literal_value(expr: &Expr) -> Option<String> {
 /// boundary the target cannot honor.
 fn emit_pinvoke_method(
     image: &mut ImageBuilder,
+    binder: &Binder,
     tokens: &mut Tokens,
     modifiers: &[Modifier],
     name: &str,
@@ -3315,7 +3629,7 @@ fn emit_pinvoke_method(
     let parameter_sigs: Vec<TypeSig> = parameters
         .iter()
         .map(|parameter| {
-            let base = type_sig(tokens, &bind_type(&parameter.ty))?;
+            let base = type_sig(tokens, &binder.canonicalize(&bind_type(&parameter.ty)))?;
             Ok(
                 if matches!(
                     parameter.modifier,
@@ -3328,7 +3642,7 @@ fn emit_pinvoke_method(
             )
         })
         .collect::<Result<Vec<_>, crate::EmitError>>()?;
-    let return_sig = type_sig(tokens, &bind_type(return_type))?;
+    let return_sig = type_sig(tokens, &binder.canonicalize(&bind_type(return_type)))?;
     let signature = method_signature(false, &parameter_sigs, &return_sig);
     let flags =
         member_visibility(modifiers) | METHOD_STATIC | METHOD_HIDEBYSIG | METHOD_PINVOKE_IMPL;
@@ -3350,6 +3664,7 @@ fn emit_constructor(
     enclosing: &TypeSymbol,
     tokens: &mut Tokens,
     declaration: &TypeDecl,
+    modifiers: &[Modifier],
     parameters: &[Parameter],
     is_vararg: bool,
     initializer: Option<&ConstructorInitializer>,
@@ -3360,14 +3675,55 @@ fn emit_constructor(
 ) -> Result<Token, crate::EmitError> {
     let params: Vec<(Box<str>, TypeSymbol)> = parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
+        .map(|parameter| (parameter.name.clone(), binder.canonicalize(&bind_type(&parameter.ty))))
         .collect();
     let base_prologue = || base_ctor.map(|ctor| ConstructorPrologue {
         ctor,
         span: header_span,
         arguments: Vec::new(),
         leading_body: 0,
+        zero_initialize: None,
     });
+    let zero_initialize = match initializer {
+        Some(init)
+            if init.kind == ConstructorInitializerKind::This
+                && init.arguments.is_empty()
+                && tokens.is_struct(enclosing) =>
+        {
+            self_type_token(image, tokens, enclosing)
+        }
+        _ => None,
+    };
+    if let Some(ty) = zero_initialize {
+        let prologue = ConstructorPrologue {
+            ctor: image.object_ctor(),
+            span: initializer.map(|init| init.span),
+            arguments: Vec::new(),
+            leading_body: 0,
+            zero_initialize: Some(ty),
+        };
+        let ctor = emit_method_body(
+            image,
+            binder,
+            tokens,
+            enclosing,
+            &[],
+            &[],
+            ".ctor",
+            &TypeSymbol::Special(SpecialType::Void),
+            &params,
+            &byref_flags(parameters),
+            body,
+            false,
+            false,
+            is_vararg,
+            ctor_flags(modifiers),
+            Some(&prologue),
+            debug,
+        )?;
+        emit_param_array_marker(image, tokens, ctor, parameters);
+        return Ok(ctor);
+    }
     let mut prologue = match initializer {
         Some(init) => Some(
             binder
@@ -3391,6 +3747,7 @@ fn emit_constructor(
                         span: Some(init.span),
                         arguments,
                         leading_body: 0,
+                        zero_initialize: None,
                     }
                 })
                 .ok_or(crate::EmitError::Unsupported(
@@ -3426,8 +3783,9 @@ fn emit_constructor(
         &byref_flags(parameters),
         &body,
         false,
+        false,
         is_vararg,
-        CTOR_FLAGS,
+        ctor_flags(modifiers),
         prologue.as_ref(),
         debug,
     )?;
@@ -3451,7 +3809,7 @@ fn emit_destructor(
 ) -> Result<Token, crate::EmitError> {
     let void = TypeSymbol::Special(SpecialType::Void);
     let bound =
-        binder.bind_method(Some(enclosing.clone()), "Finalize", void.clone(), &[], &[], false, body);
+        binder.bind_method(Some(enclosing.clone()), "Finalize", void.clone(), &[], &[], false, false, body);
     let bound = wrap_finalizer(bound, &base_finalizer_reference(base_class, tokens));
     let finalize = emit_bound_body(
         image,
@@ -3568,6 +3926,7 @@ fn emit_method_body(
     byref_flags: &[bool],
     body: &lamella_syntax::ast::Stmt,
     is_static: bool,
+    is_async: bool,
     is_vararg: bool,
     flags: u16,
     prologue: Option<&ConstructorPrologue>,
@@ -3583,8 +3942,58 @@ fn emit_method_body(
         params,
         &[],
         is_static,
+        is_async,
         body,
     );
+    if is_async {
+        let returns_task = !return_symbol.is_void();
+        let machine_index = tokens.next_async_index(enclosing);
+        let machine_name = format!("<{name}>d__{machine_index}");
+        let lowering = crate::awaitlower::lower_async_method(
+            enclosing,
+            &machine_name,
+            is_static,
+            returns_task,
+            params,
+            &bound,
+        )?;
+        let scope = GenericScope {
+            method: &[],
+            declaring: &[],
+        };
+        let parameter_sigs: Vec<TypeSig> = params
+            .iter()
+            .enumerate()
+            .map(|(index, (_, ty))| {
+                let sig = open_type_sig(tokens, ty, scope)?;
+                Ok(if byref_flags.get(index).copied().unwrap_or(false) {
+                    TypeSig::ByRef(Box::new(sig))
+                } else {
+                    sig
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let return_sig = open_type_sig(tokens, return_symbol, scope)?;
+        let signature = method_signature(!is_static, &parameter_sigs, &return_sig);
+        let stub_token = image.add_method_deferred_body(
+            name,
+            &signature,
+            flags,
+            IL_MANAGED,
+            &bound_parameter_names(params),
+        );
+        tokens.pending_async.push(PendingAsync {
+            stub_token,
+            lowering,
+            enclosing: enclosing.clone(),
+            params: params.to_vec(),
+            byref_flags: byref_flags.to_vec(),
+            return_symbol: return_symbol.clone(),
+            is_static,
+            flags,
+        });
+        return Ok(stub_token);
+    }
     emit_bound_body(
         image,
         tokens,
@@ -3656,6 +4065,51 @@ fn emit_bound_body(
         flags,
         prologue,
         debug,
+        None,
+    );
+    tokens.restore_body_scope(saved);
+    emitted
+}
+
+/// [`emit_bound_body`] into a `MethodDef` ROW THAT ALREADY EXISTS -- one added through
+/// [`ImageBuilder::add_method_deferred_body`], whose row had to precede its bytes. Two callers,
+/// both the async lowering's: the STUB (its row sits in the source type's method run, its body
+/// names the machine's members, and the machine's rows land after every source type) and
+/// `MoveNext` itself (its body takes `ldftn` of its OWN token for the resumption delegate).
+#[allow(clippy::too_many_arguments)]
+fn emit_bound_body_into(
+    into: Token,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    name: &str,
+    return_symbol: &TypeSymbol,
+    params: &[(Box<str>, TypeSymbol)],
+    byref_flags: &[bool],
+    bound: &BoundStmt,
+    is_static: bool,
+    flags: u16,
+    debug: Option<&DebugContext>,
+) -> Result<Token, crate::EmitError> {
+    let declaring_parameters = tokens.type_parameters(enclosing).to_vec();
+    let saved = tokens.enter_body_scope(&[], &declaring_parameters);
+    let emitted = emit_bound_body_in_scope(
+        image,
+        tokens,
+        &declaring_parameters,
+        &[],
+        &[],
+        name,
+        return_symbol,
+        params,
+        byref_flags,
+        bound,
+        is_static,
+        false,
+        flags,
+        None,
+        debug,
+        Some(into),
     );
     tokens.restore_body_scope(saved);
     emitted
@@ -3680,6 +4134,7 @@ fn emit_bound_body_in_scope(
     flags: u16,
     prologue: Option<&ConstructorPrologue>,
     debug: Option<&DebugContext>,
+    deferred: Option<Token>,
 ) -> Result<Token, crate::EmitError> {
     mint_references(bound, image, tokens);
     if let Some(prologue) = prologue {
@@ -3766,6 +4221,10 @@ fn emit_bound_body_in_scope(
     let body_bytes = write_method_body(&body_image)
         .map_err(|_| crate::EmitError::Unsupported("method body could not be written"))?;
 
+    if let Some(token) = deferred {
+        return land_deferred_body(image, token, &body_bytes, method_debug);
+    }
+
     let parameter_sigs: Vec<TypeSig> = params
         .iter()
         .enumerate()
@@ -3804,6 +4263,143 @@ fn emit_bound_body_in_scope(
         image.set_method_debug(method, debug);
     }
     Ok(method)
+}
+
+/// One async method awaiting its machine: everything `emit_async_machine` needs once every
+/// source type's rows are placed. Queued on [`Tokens`] by `emit_method_body`'s async arm.
+#[derive(Debug)]
+pub(crate) struct PendingAsync {
+    /// The async method's own `MethodDef`, added with a deferred body in its type's method run.
+    pub(crate) stub_token: Token,
+    /// The rewrite: machine shape, `MoveNext` body, stub body.
+    pub(crate) lowering: crate::awaitlower::AsyncLowering,
+    /// The declaring type, for the `NestedClass` row and the stub's emission scope.
+    pub(crate) enclosing: TypeSymbol,
+    /// The stub's frame facts, fixed when its row was added.
+    pub(crate) params: Vec<(Box<str>, TypeSymbol)>,
+    pub(crate) byref_flags: Vec<bool>,
+    pub(crate) return_symbol: TypeSymbol,
+    pub(crate) is_static: bool,
+    pub(crate) flags: u16,
+}
+
+/// Emits one queued async lowering: the machine (a private sealed nested class -- its TypeDef,
+/// fields, default `.ctor` and `MoveNext`), then the STUB's deferred body, which can only encode
+/// now that the machine's tokens exist. `MoveNext` itself is added deferred too: its body takes
+/// `ldftn` of its OWN token for the resumption delegate.
+fn emit_async_machine(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    pending: PendingAsync,
+) -> Result<(), crate::EmitError> {
+    let PendingAsync {
+        stub_token,
+        lowering,
+        enclosing,
+        params,
+        byref_flags,
+        return_symbol,
+        is_static,
+        flags,
+    } = pending;
+    let machine = &lowering.machine_symbol;
+    let base = system_base(image, tokens, "Object");
+    let machine_token = image.add_type("", &lowering.machine_name, base, 0x0000_0003 | TYPE_SEALED);
+    tokens.insert_type(machine, machine_token);
+    if let Some(enclosing_token) = tokens.type_token(&enclosing) {
+        image.add_nested_class(machine_token, enclosing_token);
+    }
+    for (field_name, field_ty) in &lowering.fields {
+        mint_signature_type(binder, field_ty, &[], &[], image, tokens)?;
+        let signature = field_signature(&type_sig(tokens, field_ty)?);
+        let token = image.add_field(field_name, &signature, FIELD_PUBLIC);
+        tokens.insert_field(machine, field_name, token);
+    }
+    let ctor_prologue = ConstructorPrologue {
+        ctor: object_base_ctor(image, tokens),
+        span: None,
+        arguments: Vec::new(),
+        leading_body: 0,
+        zero_initialize: None,
+    };
+    let empty_body = BoundStmt {
+        kind: lamella_binder::BoundStmtKind::Block(Vec::new()),
+        span: lamella_syntax::span::Span::empty_at(0),
+    };
+    let ctor_token = emit_bound_body(
+        image,
+        tokens,
+        machine,
+        &[],
+        &[],
+        ".ctor",
+        &TypeSymbol::Special(SpecialType::Void),
+        &[],
+        &[],
+        &empty_body,
+        false,
+        false,
+        ctor_flags(&[Modifier::Public]),
+        Some(&ctor_prologue),
+        None,
+    )?;
+    tokens.insert_method(machine, ".ctor", &[], ctor_token);
+    let move_next_signature = method_signature(true, &[], &TypeSig::Void);
+    let move_next_token = image.add_method_deferred_body(
+        "MoveNext",
+        &move_next_signature,
+        METHOD_PUBLIC | METHOD_HIDEBYSIG,
+        IL_MANAGED,
+        &[],
+    );
+    tokens.insert_method(machine, "MoveNext", &[], move_next_token);
+    mint_references(&lowering.move_next_body, image, tokens);
+    emit_bound_body_into(
+        move_next_token,
+        image,
+        tokens,
+        machine,
+        "MoveNext",
+        &TypeSymbol::Special(SpecialType::Void),
+        &[],
+        &[],
+        &lowering.move_next_body,
+        false,
+        METHOD_PUBLIC | METHOD_HIDEBYSIG,
+        None,
+    )?;
+    mint_references(&lowering.stub_body, image, tokens);
+    emit_bound_body_into(
+        stub_token,
+        image,
+        tokens,
+        &enclosing,
+        "<async stub>",
+        &return_symbol,
+        &params,
+        &byref_flags,
+        &lowering.stub_body,
+        is_static,
+        flags,
+        None,
+    )?;
+    Ok(())
+}
+
+/// The tail [`emit_bound_body_in_scope`] takes when the row pre-exists: land the bytes, fill the
+/// debug row, and hand the same token back.
+fn land_deferred_body(
+    image: &mut ImageBuilder,
+    token: Token,
+    body_bytes: &[u8],
+    method_debug: Option<MethodDebug>,
+) -> Result<Token, crate::EmitError> {
+    image.set_method_body(token, body_bytes);
+    if let Some(debug) = method_debug {
+        image.set_method_debug(token, debug);
+    }
+    Ok(token)
 }
 
 /// Builds a method's [`MethodDebug`]: its sequence points (instruction byte offsets
@@ -3884,7 +4480,7 @@ fn emit_property(
     explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
-    let property_ty = bind_type(ty);
+    let property_ty = binder.canonicalize(&bind_type(ty));
     let is_static = explicit_interface.is_none() && modifiers.contains(&Modifier::Static);
     let is_abstract = modifiers.contains(&Modifier::Abstract);
 
@@ -3895,6 +4491,17 @@ fn emit_property(
     let signature = property_signature(!is_static, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
     let property = image.add_property(&property_name, &signature, 0);
     let void = TypeSymbol::Special(SpecialType::Void);
+    let backing = if is_auto_property(modifiers, getter, setter, false) {
+        auto_backing_field(
+            image,
+            tokens,
+            enclosing,
+            &backing_field_name(explicit_interface, name),
+            &property_ty,
+        )
+    } else {
+        None
+    };
 
     if let Some(getter) = getter {
         let accessor = accessor_name("get_", name);
@@ -3902,6 +4509,7 @@ fn emit_property(
             binder,
             enclosing,
             modifiers,
+            &getter.modifiers,
             is_static,
             explicit_interface.is_some(),
             &accessor,
@@ -3911,7 +4519,7 @@ fn emit_property(
         let token = if let Some(body) = &getter.body {
             let token = emit_method_body(
                 image, binder, tokens, enclosing, &[], &[], &method_name, &property_ty, &[], &[], body,
-                is_static, false, flags, None, debug,
+                is_static, false, false, flags, None, debug,
             )?;
             if let Some(interface) = explicit_interface {
                 emit_explicit_interface_impl(
@@ -3923,6 +4531,27 @@ fn emit_property(
         } else if is_abstract {
             let signature = method_signature(true, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
             Some(image.add_abstract_method(&method_name, &signature, flags, &[]))
+        } else if let Some(field) = backing {
+            let signature =
+                method_signature(!is_static, &[], &member_type_sig(tokens, enclosing, &property_ty)?);
+            let token = emit_auto_accessor(
+                image,
+                &method_name,
+                &signature,
+                flags,
+                &[],
+                field,
+                is_static,
+                false,
+            )?;
+            emit_compiler_generated_marker(image, tokens, token);
+            if let Some(interface) = explicit_interface {
+                emit_explicit_interface_impl(
+                    image, binder, tokens, enclosing, interface, &accessor, &[], &property_ty,
+                    token,
+                )?;
+            }
+            Some(token)
         } else {
             None
         };
@@ -3937,6 +4566,7 @@ fn emit_property(
             binder,
             enclosing,
             modifiers,
+            &setter.modifiers,
             is_static,
             explicit_interface.is_some(),
             &accessor,
@@ -3947,7 +4577,7 @@ fn emit_property(
         let token = if let Some(body) = &setter.body {
             let token = emit_method_body(
                 image, binder, tokens, enclosing, &[], &[], &method_name, &void, &params, &[], body,
-                is_static, false, flags, None, debug,
+                is_static, false, false, flags, None, debug,
             )?;
             if let Some(interface) = explicit_interface {
                 emit_explicit_interface_impl(
@@ -3967,6 +4597,37 @@ fn emit_property(
             let signature =
                 method_signature(true, &[member_type_sig(tokens, enclosing, &property_ty)?], &TypeSig::Void);
             Some(image.add_abstract_method(&method_name, &signature, flags, &bound_parameter_names(&params)))
+        } else if let Some(field) = backing {
+            let signature = method_signature(
+                !is_static,
+                &[member_type_sig(tokens, enclosing, &property_ty)?],
+                &TypeSig::Void,
+            );
+            let token = emit_auto_accessor(
+                image,
+                &method_name,
+                &signature,
+                flags,
+                &bound_parameter_names(&params),
+                field,
+                is_static,
+                true,
+            )?;
+            emit_compiler_generated_marker(image, tokens, token);
+            if let Some(interface) = explicit_interface {
+                emit_explicit_interface_impl(
+                    image,
+                    binder,
+                    tokens,
+                    enclosing,
+                    interface,
+                    &accessor,
+                    &[property_ty.clone()],
+                    &void,
+                    token,
+                )?;
+            }
+            Some(token)
         } else {
             None
         };
@@ -3978,15 +4639,197 @@ fn emit_property(
     Ok(property)
 }
 
+/// Whether a property is an AUTOMATICALLY IMPLEMENTED one (C# 3.0 10.7.3): BOTH accessors present
+/// and BOTH written without a body, on a member that is not abstract, extern, or an interface's.
+///
+/// **BOTH, NOT EITHER.** A getter-only `{ get; }` is C# 6.0's readonly auto-property, whose backing
+/// field is `initonly`, and a half-written `{ get; set { ... } }` is not an auto-property at all --
+/// the binder refuses each with its own diagnostic, and this predicate is what keeps the emitter
+/// from synthesizing a field for either.
+fn is_auto_property(
+    modifiers: &[Modifier],
+    getter: Option<&lamella_syntax::ast::Accessor>,
+    setter: Option<&lamella_syntax::ast::Accessor>,
+    is_interface: bool,
+) -> bool {
+    if is_interface
+        || modifiers
+            .iter()
+            .any(|modifier| matches!(modifier, Modifier::Abstract | Modifier::Extern))
+    {
+        return false;
+    }
+    matches!((getter, setter), (Some(get), Some(set)) if get.body.is_none() && set.body.is_none())
+}
+
+/// The metadata name of an auto-property's backing field: csc's `<Name>k__BackingField`, and
+/// `<IHas.N>k__BackingField` for an explicit interface implementation -- measured.
+///
+/// **NOT A LEGAL C# IDENTIFIER, ON PURPOSE.** The angle brackets are what keep it from colliding
+/// with anything the program can declare, and copying csc's spelling exactly is what lets a
+/// debugger, a serializer or a reflection-based tool recognize the field for what it is.
+///
+/// The interface qualifier is not decoration either: a type may explicitly implement `N` from two
+/// different interfaces AND declare its own `N`, which is three distinct auto-properties whose
+/// backing fields would otherwise share one name.
+fn backing_field_name(
+    explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
+    property: &str,
+) -> String {
+    match explicit_interface {
+        Some(interface) => alloc::format!(
+            "<{}>k__BackingField",
+            explicit_interface_member_name(interface, property)
+        ),
+        None => alloc::format!("<{property}>k__BackingField"),
+    }
+}
+
+/// The token a synthesized accessor must use to reach its own backing field, which is NOT always
+/// the `FieldDef` the pre-pass reserved.
+///
+/// **INSIDE A GENERIC TYPE A `FieldDef` OPERAND IS UNVERIFIABLE IL.** `ldarg.0` in an instance
+/// method of `Bag<T>` has type `Bag<!0>`, and a `ldfld` naming the OPEN definition does not match
+/// it (II.9.7). The runtime runs it anyway -- which is what makes this worth stating: the program
+/// passes its behavioral test and `ilverify` refuses the assembly. So a generic type's own field is
+/// reached through a `MemberRef` parented on the `TypeSpec` for `Bag<!0>`, as csc emits it.
+///
+/// Returns the plain `FieldDef` for a non-generic type, and `None` when the pre-pass reserved no
+/// field at all -- which is the caller's signal that this property is not an auto-property.
+fn auto_backing_field(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    name: &str,
+    field_ty: &TypeSymbol,
+) -> Option<Token> {
+    let definition = tokens.field(enclosing, name)?;
+    let parameters = tokens.type_parameters(enclosing).to_vec();
+    if parameters.is_empty() {
+        return Some(definition);
+    }
+    let parent = self_type_token(image, tokens, enclosing)?;
+    let signature = open_type_sig(
+        tokens,
+        field_ty,
+        GenericScope {
+            method: &[],
+            declaring: &parameters,
+        },
+    );
+    match signature {
+        Ok(signature) => Some(image.member_ref(parent, name, &field_signature(&signature))),
+        Err(_) => Some(definition),
+    }
+}
+
+/// Synthesizes an AUTO-PROPERTY accessor -- the whole of what `{ get; set; }` means. The getter
+/// reads the backing field and the setter writes it; there is nothing else in either body.
+///
+/// ```text
+/// instance getter:  ldarg.0; ldfld  <backing>;         ret
+/// instance setter:  ldarg.0; ldarg.1; stfld <backing>; ret
+/// static   getter:  ldsfld <backing>;                  ret
+/// static   setter:  ldarg.0; stsfld <backing>;         ret
+/// ```
+///
+/// The setter's value argument is slot 1 on an instance accessor (slot 0 is `this`) and slot 0 on
+/// a static one, which is the only difference between the two pairs beyond the field opcode.
+#[allow(clippy::too_many_arguments)]
+fn emit_auto_accessor(
+    image: &mut ImageBuilder,
+    method_name: &str,
+    signature: &[u8],
+    flags: u16,
+    parameter_names: &[Box<str>],
+    field: Token,
+    is_static: bool,
+    is_setter: bool,
+) -> Result<Token, crate::EmitError> {
+    let mut code = Vec::new();
+    if !is_static {
+        code.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+    }
+    if is_setter {
+        code.push(Instruction::new(
+            Opcode::Ldarg,
+            Operand::Variable(u16::from(!is_static)),
+        ));
+        code.push(Instruction::new(
+            if is_static { Opcode::Stsfld } else { Opcode::Stfld },
+            Operand::Token(field),
+        ));
+    } else {
+        code.push(Instruction::new(
+            if is_static { Opcode::Ldsfld } else { Opcode::Ldfld },
+            Operand::Token(field),
+        ));
+    }
+    code.push(Instruction::simple(Opcode::Ret));
+    let body_image = MethodBodyImage {
+        max_stack: max_stack(&code).max(1),
+        init_locals: false,
+        local_var_sig: None,
+        code: code.into_boxed_slice(),
+        handlers: Box::new([]),
+    };
+    let body_bytes = write_method_body(&body_image).map_err(|_| {
+        crate::EmitError::Unsupported("an auto-property accessor body could not be written")
+    })?;
+    Ok(image.add_method(
+        method_name,
+        signature,
+        &body_bytes,
+        flags,
+        IL_MANAGED,
+        parameter_names,
+    ))
+}
+
+/// The token naming the type a body is INSIDE, where an instruction operand needs one: the
+/// `TypeDef` for an ordinary type, and the `TypeSpec` for `C<!0, !1, ...>` when the type is
+/// generic -- because inside `Bag<T>`, `this` has type `Bag<!0>` and not the open definition.
+fn self_type_token(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+) -> Option<Token> {
+    let parameters = tokens.type_parameters(enclosing).to_vec();
+    if parameters.is_empty() {
+        return tokens.type_token(enclosing);
+    }
+    let TypeSymbol::Named(parts) = enclosing else {
+        return tokens.type_token(enclosing);
+    };
+    let mut definition_parts = parts.clone();
+    if let Some(last) = definition_parts.last_mut() {
+        *last = lamella_binder::unmangled_type_name(last);
+    }
+    let arguments: Box<[TypeSymbol]> = parameters
+        .iter()
+        .map(|parameter| TypeSymbol::Named(Box::from([parameter.clone()])))
+        .collect();
+    let instantiation = TypeSymbol::Instantiation {
+        definition: definition_parts.clone(),
+        arguments: arguments.clone(),
+    };
+    let saved = tokens.enter_body_scope(&[], &parameters);
+    let spec = mint_type_spec(&instantiation, &definition_parts, &arguments, image, tokens);
+    tokens.restore_body_scope(saved);
+    spec.or_else(|| tokens.type_token(enclosing))
+}
+
 /// The method flags for a property/indexer accessor `accessor` (`get_X`/`set_X`) with `params`.
 /// An explicit-interface accessor is a private sealed virtual (20.4.1). Otherwise it is a sealed
 /// virtual (`public virtual final newslot`) only when it implicitly implements an interface member
 /// -- its name + signature match one -- so an accessor implementing nothing stays non-virtual even
 /// on an interface-implementing type (its vtable-slot flags follow its own modifiers).
+#[allow(clippy::too_many_arguments)]
 fn property_accessor_flags(
     binder: &Binder,
     enclosing: &TypeSymbol,
     modifiers: &[Modifier],
+    accessor_modifiers: &[Modifier],
     is_static: bool,
     explicit: bool,
     accessor: &str,
@@ -4010,7 +4853,12 @@ fn property_accessor_flags(
             | METHOD_HIDEBYSIG
             | SPECIAL_NAME
     } else {
-        let mut flags = METHOD_PUBLIC | SPECIAL_NAME;
+        let visibility = if accessor_modifiers.is_empty() {
+            modifiers
+        } else {
+            accessor_modifiers
+        };
+        let mut flags = member_visibility(visibility) | SPECIAL_NAME;
         if is_static {
             flags |= METHOD_STATIC;
         } else {
@@ -4040,10 +4888,10 @@ fn emit_indexer(
     setter: Option<&lamella_syntax::ast::Accessor>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
-    let element_ty = bind_type(ty);
+    let element_ty = binder.canonicalize(&bind_type(ty));
     let index_params: Vec<(Box<str>, TypeSymbol)> = parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
+        .map(|parameter| (parameter.name.clone(), binder.canonicalize(&bind_type(&parameter.ty))))
         .collect();
     let is_abstract = modifiers.contains(&Modifier::Abstract);
     let index_param_types: Vec<TypeSymbol> =
@@ -4059,12 +4907,13 @@ fn emit_indexer(
     if let Some(getter) = getter {
         let getter_name = accessor_name("get_", name);
         let flags = property_accessor_flags(
-            binder, enclosing, modifiers, false, false, &getter_name, &index_param_types,
+            binder, enclosing, modifiers, &getter.modifiers, false, false, &getter_name,
+            &index_param_types,
         );
         let token = if let Some(body) = &getter.body {
             Some(emit_method_body(
                 image, binder, tokens, enclosing, &[], &[], &getter_name, &element_ty, &index_params, &[],
-                body, false, false, flags, None, debug,
+                body, false, false, false, flags, None, debug,
             )?)
         } else if is_abstract {
             let signature = method_signature(true, &index_sigs, &element_sig);
@@ -4090,12 +4939,13 @@ fn emit_indexer(
         let mut setter_param_types = index_param_types.clone();
         setter_param_types.push(element_ty.clone());
         let flags = property_accessor_flags(
-            binder, enclosing, modifiers, false, false, &setter_name, &setter_param_types,
+            binder, enclosing, modifiers, &setter.modifiers, false, false, &setter_name,
+            &setter_param_types,
         );
         let token = if let Some(body) = &setter.body {
             Some(emit_method_body(
                 image, binder, tokens, enclosing, &[], &[], &setter_name, &void, &params, &[],
-                body, false, false, flags, None, debug,
+                body, false, false, false, flags, None, debug,
             )?)
         } else if is_abstract {
             let mut signature_params = index_sigs.clone();
@@ -4140,6 +4990,33 @@ fn indexer_name(attributes: &[AttributeSection]) -> String {
         }
     }
     String::from("Item")
+}
+
+/// Records an indexer accessor's `MethodDef` under the name it is EMITTED as -- `get_Chars` for
+/// an indexer carrying `[IndexerName("Chars")]` -- beside the `get_Item` the model synthesizes for
+/// every indexer regardless. The token pre-pass calls this for both accessors; see the reasoning
+/// there for why one member is reachable under two spellings at all.
+///
+/// A no-op when the two names agree (every indexer with no `[IndexerName]`), and a no-op when the
+/// emitted name is already taken: a type declaring both a renamed indexer and an ordinary method
+/// of the accessor's name is a member collision for the binder to report, and overwriting here
+/// would answer it by silently retargeting the method's call sites.
+fn alias_renamed_accessor(
+    tokens: &mut Tokens,
+    declaring: &TypeSymbol,
+    prefix: &str,
+    indexer: &str,
+    parameters: &[TypeSymbol],
+    token: Token,
+) {
+    if indexer == "Item" {
+        return;
+    }
+    let emitted = accessor_name(prefix, indexer);
+    if tokens.method(declaring, &emitted, parameters).is_some() {
+        return;
+    }
+    tokens.insert_method(declaring, &emitted, parameters, token);
 }
 
 /// Emits `[System.Reflection.DefaultMemberAttribute("Item")]` on a type that declares an
@@ -4241,6 +5118,48 @@ fn synthesized_attribute_ctor(
 /// `required` has no metadata flag of its own (II.22.15/II.22.34 have no bit for it), so this
 /// attribute IS the encoding -- which is why a consumer that does not decode custom attributes
 /// reads every imported member as not-required.
+/// `[System.Runtime.CompilerServices.CompilerGenerated]` on a member the COMPILER wrote -- an
+/// auto-property's backing field and its two accessors.
+///
+/// **IT IS NOT DECORATION: it is how a tool tells a synthesized member from a declared one.** A
+/// serializer that walks fields, a debugger deciding what to show, and a reflection-based mapper
+/// all key on it, and csc puts it on every one of the three.
+fn emit_compiler_generated_marker(image: &mut ImageBuilder, tokens: &mut Tokens, target: Token) {
+    let Some(constructor) = synthesized_attribute_ctor(
+        image,
+        tokens,
+        "System.Runtime.CompilerServices",
+        "CompilerGeneratedAttribute",
+        &[],
+    ) else {
+        return;
+    };
+    image.add_custom_attribute(target, constructor, &[0x01, 0x00, 0x00, 0x00]);
+}
+
+/// `[System.Diagnostics.DebuggerBrowsable(DebuggerBrowsableState.Never)]` on an auto-property's
+/// backing field, as csc emits: a debugger then shows the PROPERTY and not the field behind it,
+/// which is the whole reason the field has a name no program can type.
+///
+/// The argument is an enum, so its blob is the underlying `int32` -- `Never` is 0 (II.23.3).
+fn emit_debugger_browsable_never(image: &mut ImageBuilder, tokens: &mut Tokens, target: Token) {
+    let state = named_symbol("System.Diagnostics", "DebuggerBrowsableState");
+    let Some(constructor) = synthesized_attribute_ctor(
+        image,
+        tokens,
+        "System.Diagnostics",
+        "DebuggerBrowsableAttribute",
+        core::slice::from_ref(&state),
+    ) else {
+        return;
+    };
+    image.add_custom_attribute(
+        target,
+        constructor,
+        &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    );
+}
+
 fn emit_required_member_marker(image: &mut ImageBuilder, tokens: &mut Tokens, target: Token) {
     let Some(constructor) = synthesized_attribute_ctor(
         image,
@@ -4399,7 +5318,7 @@ fn emit_field(
     ty: &lamella_syntax::ast::TypeRef,
     declarators: &[VariableDeclarator],
 ) -> Result<(), crate::EmitError> {
-    let field_ty = bind_type(ty);
+    let field_ty = binder.canonicalize(&bind_type(ty));
     let signature = field_signature(&member_type_sig(tokens, enclosing, &field_ty)?);
     let visibility = member_visibility(modifiers);
     let is_const = modifiers.contains(&Modifier::Const);
@@ -4710,10 +5629,13 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
         BoundExprKind::ObjectCreation {
             arguments,
             constructor,
-            initializer: _,
+            initializer,
         } => {
             for argument in arguments {
                 mint_in_expr(argument, image, tokens);
+            }
+            if let Some(initializer) = initializer {
+                mint_in_initializer(initializer, image, tokens);
             }
             if let Some(constructor) = constructor {
                 if let (_, Some(extras)) = crate::expr::split_vararg_arguments(arguments) {
@@ -4726,9 +5648,12 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 } else {
                     constructor.parameters.clone()
                 };
-                if tokens
-                    .method(&constructor.declaring_type, &constructor.name, &def_key)
-                    .is_none()
+                let initobj_creation =
+                    constructor.parameters.is_empty() && is_value_type(&constructor.declaring_type, tokens);
+                if !initobj_creation
+                    && tokens
+                        .method(&constructor.declaring_type, &constructor.name, &def_key)
+                        .is_none()
                 {
                     mint_member_ref(constructor, image, tokens);
                 }
@@ -4913,6 +5838,10 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             mint_in_expr(when_true, image, tokens);
             mint_in_expr(when_false, image, tokens);
         }
+        BoundExprKind::NullCoalescing { left, right } => {
+            mint_in_expr(left, image, tokens);
+            mint_in_expr(right, image, tokens);
+        }
         BoundExprKind::TypeTest { operand, target, .. } => {
             mint_in_expr(operand, image, tokens);
             if is_value_type(&operand.ty, tokens) {
@@ -4956,9 +5885,6 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
     }
 }
 
-/// Mints a `MemberRef` for an external (BCL) method `method`: a `TypeRef` to its
-/// declaring type, then a `MemberRef` with its encoded signature, recorded in the
-/// token table. Skipped (left for emission to report) if a type cannot be encoded.
 /// Whether `ty` is `string`.
 fn is_string(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Special(SpecialType::String))
@@ -5032,6 +5958,97 @@ fn string_equality_reference() -> lamella_binder::MethodReference {
     }
 }
 
+/// Mints a `MemberRef` for an external (BCL) method `method`: a `TypeRef` to its
+/// declaring type, then a `MemberRef` with its encoded signature, recorded in the
+/// token table. Skipped (left for emission to report) if a type cannot be encoded.
+/// Mints the tokens an OBJECT or COLLECTION INITIALIZER needs (C# 3.0 7.6.10.2/3), which the
+/// expression walk cannot reach: an initializer is not an expression, it hangs off one.
+///
+/// **A VALUE IN AN INITIALIZER IS AN ORDINARY EXPRESSION AND NEEDS EXACTLY WHAT ONE ANYWHERE ELSE
+/// NEEDS.** Skip the walk and the refusals that follow are clean, specific and wrong: a string
+/// literal reports that it was never interned, a `new` reports a constructor outside this module.
+/// Each names a real precondition, and each rejects a program the rest of the feature builds.
+///
+/// The TARGETS need tokens too, and for the same reason a plain assignment's do: a field on an
+/// external type is a `FieldRef` and a property is a `MemberRef` to its `set_`/`get_` accessor.
+/// A member this module declares already has one from the pre-pass and is skipped.
+///
+/// ONE SHAPE IS NOT REACHED FROM HERE: a collection initializer whose `Add` is declared by an
+/// INSTANTIATED external type (`new List<string> { "a" }`). That row's parent is a `TypeSpec` and
+/// its signature is the DEFINITION's, and the definition cannot be recovered from the substituted
+/// one -- see [`lamella_binder::MethodInstantiation`], *substitution is not invertible*. The open
+/// signature has to arrive from the binder, as a call's does; the emit site refuses by name until
+/// it can.
+fn mint_in_initializer(
+    initializer: &lamella_binder::BoundInitializer,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    match initializer {
+        lamella_binder::BoundInitializer::Collection(elements) => {
+            for element in elements {
+                mint_in_expr(element, image, tokens);
+            }
+        }
+        lamella_binder::BoundInitializer::Object(members) => {
+            for member in members {
+                match &member.value {
+                    lamella_binder::BoundMemberInitializerValue::Expression(value) => {
+                        mint_in_expr(value, image, tokens);
+                    }
+                    lamella_binder::BoundMemberInitializerValue::Nested(nested) => {
+                        mint_in_initializer(nested, image, tokens);
+                    }
+                }
+                match &member.target {
+                    lamella_binder::BoundInitializerTarget::Field(field) => {
+                        if field.constant.is_none()
+                            && tokens.field(&field.declaring_type, &field.name).is_none()
+                        {
+                            mint_field_ref(field, image, tokens);
+                        }
+                    }
+                    lamella_binder::BoundInitializerTarget::Property {
+                        setter_declaring_type,
+                        ty,
+                    } => {
+                        let nested = matches!(
+                            member.value,
+                            lamella_binder::BoundMemberInitializerValue::Nested(_)
+                        );
+                        let (prefix, parameters, return_type) = if nested {
+                            ("get_", Vec::new(), ty.clone())
+                        } else {
+                            (
+                                "set_",
+                                alloc::vec![ty.clone()],
+                                TypeSymbol::Special(SpecialType::Void),
+                            )
+                        };
+                        let accessor = lamella_binder::MethodReference {
+                            declaring_type: setter_declaring_type.clone(),
+                            name: accessor_name(prefix, &member.name).into(),
+                            parameters,
+                            return_type,
+                            is_static: false,
+                            is_vararg: false,
+                            instantiation: None,
+                            declaring_instantiation: None,
+                        };
+                        if tokens
+                            .method(&accessor.declaring_type, &accessor.name, &accessor.parameters)
+                            .is_none()
+                        {
+                            mint_member_ref(&accessor, image, tokens);
+                        }
+                    }
+                    lamella_binder::BoundInitializerTarget::Unresolved => {}
+                }
+            }
+        }
+    }
+}
+
 fn mint_member_ref(
     method: &lamella_binder::MethodReference,
     image: &mut ImageBuilder,
@@ -5039,6 +6056,12 @@ fn mint_member_ref(
 ) {
     if let Some(declaring) = method.declaring_instantiation.as_deref() {
         mint_instantiated_member_ref(method, declaring, image, tokens);
+        return;
+    }
+    if tokens
+        .type_token(&method.declaring_type)
+        .is_some_and(|token| token.table() == TYPE_DEF)
+    {
         return;
     }
     let Some((namespace, name)) = split_type_name(&method.declaring_type) else {
@@ -5893,25 +6916,46 @@ fn is_type_parameter(ty: &TypeSymbol, scope: ParameterScope<'_>) -> bool {
 /// declaring none of them itself, so it is the one context where a name can be a type parameter of
 /// the program and not a parameter of the declaration being emitted. Every caller wants that
 /// distinction; none of them wants to walk the chain.
+/// A type's parameter names in the order their `!n` positions count from: the ENCLOSING chain's
+/// first, then the ones this declaration writes.
+///
+/// **ECMA-335 II.9.2: A NESTED TYPE HAS THE TYPE PARAMETERS OF EVERY TYPE IT IS NESTED IN.** So
+/// `struct Cursor` inside `class Box<T>` is a generic type of arity 1 whose parameter is `T`, and
+/// `T` written in one of its members is `!0` OF CURSOR. Numbering it against Cursor's own list --
+/// which is empty -- finds no position for it at all.
+///
+/// The name keeps only the arity the type introduces itself (`Cursor`, `` Pair`1 ``, II.10.7.2);
+/// the rest is read back off the enclosing parts by `definition_metadata_name`, which is what
+/// makes the two spellings agree.
+fn type_parameter_names(
+    binder: &Binder,
+    enclosing: &TypeSymbol,
+    declaration: &TypeDecl,
+) -> Vec<Box<str>> {
+    enclosing_type_parameters(binder, enclosing)
+        .into_iter()
+        .chain(
+            declaration
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone()),
+        )
+        .collect()
+}
+
 fn enclosing_type_parameters(binder: &Binder, ty: &TypeSymbol) -> Vec<Box<str>> {
-    let mut names: Vec<Box<str>> = Vec::new();
-    let mut enclosing = binder
+    let Some(enclosing) = binder
         .model()
         .get_by_symbol(ty)
-        .and_then(|info| info.enclosing.clone());
-    let mut seen: Vec<Box<str>> = Vec::new();
-    while let Some(full) = enclosing {
-        if seen.contains(&full) {
-            break;
-        }
-        seen.push(full.clone());
-        let Some(info) = binder.model().get_by_symbol(&type_symbol_from_dotted(&full)) else {
-            break;
-        };
-        names.extend(info.type_parameters.iter().cloned());
-        enclosing = info.enclosing.clone();
-    }
-    names
+        .and_then(|info| info.enclosing.clone())
+    else {
+        return Vec::new();
+    };
+    binder
+        .model()
+        .get_by_symbol(&type_symbol_from_dotted(&enclosing))
+        .map(|info| info.type_parameters.to_vec())
+        .unwrap_or_default()
 }
 
 fn mint_signature_type(
@@ -5961,7 +7005,12 @@ fn mint_signature_type(
     if !needs_ref || tokens.type_token(syntactic).is_some() {
         return Ok(());
     }
-    if let Some((namespace, name)) = split_type_name(&binder.resolve_type(syntactic)) {
+    let resolved = binder.resolve_type(syntactic);
+    if let Some(defined) = tokens.type_token(&resolved) {
+        tokens.insert_type(syntactic, defined);
+        return Ok(());
+    }
+    if let Some((namespace, name)) = split_type_name(&resolved) {
         let token = image.type_ref(&namespace, &name);
         tokens.insert_type(syntactic, token);
     }
@@ -6017,14 +7066,14 @@ fn mint_member_signature_types(
             | Member::Property { ty, .. }
             | Member::EventField { ty, .. }
             | Member::Event { ty, .. } => {
-                mint(&bind_type(ty), &[], image, tokens)?;
+                mint(&binder.canonicalize(&bind_type(ty)), &[], image, tokens)?;
             }
             Member::Indexer {
                 ty, parameters, ..
             } => {
-                mint(&bind_type(ty), &[], image, tokens)?;
+                mint(&binder.canonicalize(&bind_type(ty)), &[], image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
+                    mint(&binder.canonicalize(&bind_type(&parameter.ty)), &[], image, tokens)?;
                 }
             }
             Member::Method {
@@ -6037,9 +7086,9 @@ fn mint_member_signature_types(
                     .iter()
                     .map(|parameter| parameter.name.clone())
                     .collect();
-                mint(&bind_type(return_type), &own, image, tokens)?;
+                mint(&binder.canonicalize(&bind_type(return_type)), &own, image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &own, image, tokens)?;
+                    mint(&binder.canonicalize(&bind_type(&parameter.ty)), &own, image, tokens)?;
                 }
             }
             Member::Operator {
@@ -6047,22 +7096,22 @@ fn mint_member_signature_types(
                 parameters,
                 ..
             } => {
-                mint(&bind_type(return_type), &[], image, tokens)?;
+                mint(&binder.canonicalize(&bind_type(return_type)), &[], image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
+                    mint(&binder.canonicalize(&bind_type(&parameter.ty)), &[], image, tokens)?;
                 }
             }
             Member::ConversionOperator {
                 target, parameters, ..
             } => {
-                mint(&bind_type(target), &[], image, tokens)?;
+                mint(&binder.canonicalize(&bind_type(target)), &[], image, tokens)?;
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
+                    mint(&binder.canonicalize(&bind_type(&parameter.ty)), &[], image, tokens)?;
                 }
             }
             Member::Constructor { parameters, .. } => {
                 for parameter in parameters {
-                    mint(&bind_type(&parameter.ty), &[], image, tokens)?;
+                    mint(&binder.canonicalize(&bind_type(&parameter.ty)), &[], image, tokens)?;
                 }
             }
             _ => {}
@@ -6408,6 +7457,61 @@ fn needs_static_constructor(declaration: &TypeDecl) -> bool {
 
 /// Whether the type declares an INSTANCE constructor (a static constructor does not
 /// suppress the implicit default instance one).
+/// Whether ANY part of the type declares an instance constructor, so the implicit parameterless
+/// one is not synthesized (17.10.4).
+///
+/// **THE QUESTION IS ABOUT THE TYPE AND THE PARTS ARE NOT INDEPENDENT.** A `partial class` whose
+/// first part writes `W(int)` and whose second writes nothing has ONE constructor, not two, and
+/// asking each declaration on its own emitted a parameterless `.ctor` for every part that happened
+/// to declare none -- rows csc does not write, and the method tokens after them all shifted.
+fn any_part_declares_instance_constructor(
+    declaration: &TypeDecl,
+    later: &[PartialPart<'_>],
+) -> bool {
+    declares_instance_constructor(declaration)
+        || later
+            .iter()
+            .any(|part| declares_instance_constructor(part.declaration))
+}
+
+/// Every modifier written on ANY part of a partial type, as one list.
+///
+/// **A PARTIAL TYPE'S MODIFIERS ARE THE UNION OF ITS PARTS' (17.1.4), SO A QUESTION ABOUT ONE HAS
+/// TO BE ASKED OF EVERY PART.** Asking the declaration in hand answers about one part and reads
+/// exactly like an answer about the type, which is why this went unnoticed in FOUR bits at once:
+/// `partial class Q { }` + `abstract partial class Q { }` emitted a type that was not abstract, and
+/// `partial class V { }` + `public partial class V { }` emitted one that was not public -- so a
+/// type the source declares public shipped as `NotPublic` and every consumer outside the assembly
+/// saw CS0122 or CS0246 for a type that is right there.
+///
+/// **THE RETURN IS A LIST, NOT A PREDICATE, BECAUSE THE CALLER ASKS SEVERAL QUESTIONS.** Visibility
+/// alone is four modifiers wide (`nested_visibility` reads `public`/`protected`/`internal`/
+/// `private` together), and a per-modifier predicate would have to be threaded through it; handing
+/// over the merged list instead makes the union the DEFAULT at that site rather than something each
+/// new bit has to remember to opt into.
+///
+/// `TypeInfo::merge` unions `is_sealed` and `is_abstract` on the binder's side and cites this same
+/// clause -- the binder had the rule right the whole time, and only the emitter read one part.
+fn merged_modifiers(declaration: &TypeDecl, later: &[PartialPart<'_>]) -> Vec<Modifier> {
+    let mut merged = declaration.modifiers.clone();
+    for part in later {
+        for modifier in &part.declaration.modifiers {
+            if !merged.contains(modifier) {
+                merged.push(*modifier);
+            }
+        }
+    }
+    merged
+}
+
+/// Whether ANY part carries `static`, which suppresses the implicit constructor for the whole type.
+fn any_part_is_static(declaration: &TypeDecl, later: &[PartialPart<'_>]) -> bool {
+    declaration.modifiers.contains(&Modifier::Static)
+        || later
+            .iter()
+            .any(|part| part.declaration.modifiers.contains(&Modifier::Static))
+}
+
 fn declares_instance_constructor(declaration: &TypeDecl) -> bool {
     declaration.members.iter().any(|member| {
         matches!(member, Member::Constructor { modifiers, .. } if !is_static_constructor(modifiers))
@@ -6671,377 +7775,682 @@ fn mentions_type_parameter(ty: &TypeSymbol, type_parameters: &[Box<str>]) -> boo
 /// (from the binder model) is installed first so the single-part signature names this
 /// records key the same as the binder's qualified ones -- set before any insert, so
 /// look-ups (also canonicalized) agree.
-fn assign_tokens(units: &[CompilationUnit], canon: lamella_binder::SignatureCanon) -> Tokens {
+/// One declaration of a partial type, with the per-file context its members were bound under.
+///
+/// Emission RE-RESOLVES the names in a member's signature and body, so a part declared in another
+/// file has to be emitted under that file's `using` directives, `#define` set and debug document --
+/// not under the file that happens to hold the first part.
+struct PartialPart<'a> {
+    declaration: &'a TypeDecl,
+    usings: &'a [UsingDirective],
+    defined_symbols: &'a alloc::collections::BTreeSet<Box<str>>,
+    debug: Option<&'a DebugContext<'a>>,
+}
+
+/// Every declaration of each PARTIAL type in the compilation, in source order, keyed by the
+/// declaration scope and the type's metadata name.
+///
+/// **THE PARTS OF ONE TYPE ARE EMITTED BACK TO BACK, AND THAT IS WHAT MAKES ONE `TypeDef` OUT OF
+/// THEM.** A `TypeDef` row records the FIRST of its fields and methods (II.22.37) and its ranges
+/// end where the next type's begin, so a type's rows have to be contiguous in the flat tables.
+/// Emitting the second part where the walk happens to reach it wrote a SECOND `TypeDef` of the same
+/// name, and the CLR refuses to load that: *BadImageFormatException: Duplicate type with name 'W'*.
+/// Measured by building it.
+///
+/// The key's first half is the declaration SCOPE -- a namespace, or the enclosing type's full name
+/// for a nested part -- and the second is the arity-mangled name (II.10.7.2), so
+/// `partial class W<T>` and `partial class W<T,U>` index apart, as the two types they are.
+type PartialIndex<'a> = alloc::collections::BTreeMap<(String, String), Vec<PartialPart<'a>>>;
+
+/// Builds the [`PartialIndex`] for a whole compilation. Non-partial declarations are absent by
+/// design: a declaration colliding with a partial one is CS0260, and emission runs only after an
+/// error-free bind.
+fn index_partial_types<'a>(
+    units: &'a [CompilationUnit],
+    contexts: &'a [DebugContext<'a>],
+) -> PartialIndex<'a> {
+    let mut index = PartialIndex::new();
+    for (position, unit) in units.iter().enumerate() {
+        index_partial_members(&mut index, &unit.members, "", unit, contexts.get(position));
+    }
+    index
+}
+
+fn index_partial_members<'a>(
+    index: &mut PartialIndex<'a>,
+    members: &'a [NamespaceMember],
+    scope: &str,
+    unit: &'a CompilationUnit,
+    debug: Option<&'a DebugContext<'a>>,
+) {
+    for member in members {
+        match member {
+            NamespaceMember::Namespace(declaration) => {
+                let inner = join_namespace(scope, &declaration.name);
+                index_partial_members(index, &declaration.members, &inner, unit, debug);
+            }
+            NamespaceMember::Type(declaration) => {
+                if declaration.modifiers.contains(&Modifier::Partial) {
+                    index
+                        .entry((String::from(scope), partial_key_name(declaration)))
+                        .or_default()
+                        .push(PartialPart {
+                            declaration,
+                            usings: &unit.usings,
+                            defined_symbols: &unit.defined_symbols,
+                            debug,
+                        });
+                }
+                let enclosing = lamella_binder::declared_full_name(scope, declaration);
+                for nested in &declaration.members {
+                    if let Member::NestedType(nested) = nested {
+                        index_partial_members(
+                            index,
+                            core::slice::from_ref(nested.as_ref()),
+                            &enclosing,
+                            unit,
+                            debug,
+                        );
+                    }
+                }
+            }
+            NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
+        }
+    }
+}
+
+/// A partial declaration's key name: its arity-mangled metadata name (II.10.7.2).
+fn partial_key_name(declaration: &TypeDecl) -> String {
+    lamella_binder::metadata_type_name(&declaration.name, declaration.type_parameters.len())
+}
+
+/// The parts of `declaration` AFTER the first, or an empty slice when it is not a partial type or
+/// is not the first part.
+///
+/// **A LATER PART ANSWERS EMPTY AND IS SKIPPED BY ITS CALLER**, which is what keeps the type from
+/// being emitted twice: the whole type is emitted where its FIRST part stands.
+fn continuation_parts<'a, 'b>(
+    index: &'b PartialIndex<'a>,
+    scope: &str,
+    declaration: &TypeDecl,
+) -> Option<&'b [PartialPart<'a>]> {
+    let parts = index.get(&(String::from(scope), partial_key_name(declaration)))?;
+    let first = parts.first()?;
+    if !core::ptr::eq(first.declaration, declaration) {
+        return None;
+    }
+    Some(&parts[1..])
+}
+
+/// Whether `declaration` is a partial part that some EARLIER declaration already emitted.
+fn is_later_partial_part(index: &PartialIndex<'_>, scope: &str, declaration: &TypeDecl) -> bool {
+    index
+        .get(&(String::from(scope), partial_key_name(declaration)))
+        .and_then(|parts| parts.first())
+        .is_some_and(|first| !core::ptr::eq(first.declaration, declaration))
+}
+
+fn assign_tokens(
+    units: &[CompilationUnit],
+    binder: &mut Binder,
+    partials: &PartialIndex<'_>,
+) -> Tokens {
     let mut tokens = Tokens::new();
-    tokens.set_canon(canon);
+    tokens.set_canon(binder.model().signature_canon());
     let mut next_type = 1u32;
     let mut next_field = 0u32;
     let mut next_method = 0u32;
     for unit in units {
         collect_tokens(
             &mut tokens,
+            binder,
             &mut next_type,
             &mut next_field,
             &mut next_method,
+            &unit.usings,
             &unit.members,
             "",
+            partials,
         );
     }
     tokens
 }
 
-fn collect_tokens(
+/// Reserves the tokens ONE type's rows will take, in the order [`emit_type_inner`] writes them.
+///
+/// **`continuation` AND `later` MIRROR EMISSION EXACTLY, AND THE MIRROR IS THE POINT.** A member's
+/// `Field`/`MethodDef` token is reserved here and used when its row is written; if the two walks
+/// visit members in different orders, a token names another member's row and nothing about the
+/// image looks wrong until it runs. So the parts of a partial type are gathered here in the same
+/// back-to-back order emission gathers them, and a LATER part reserves no `TypeDef` row of its own.
+#[allow(clippy::too_many_arguments)]
+fn collect_type_tokens(
     tokens: &mut Tokens,
+    binder: &mut Binder,
     next_type: &mut u32,
     next_field: &mut u32,
     next_method: &mut u32,
+    namespace: &str,
+    declaration: &TypeDecl,
+    continuation: bool,
+    later: &[PartialPart<'_>],
+    partials: &PartialIndex<'_>,
+) {
+    let declaring = declared_type_symbol(namespace, declaration);
+    let declaration_type_parameters = binder
+        .enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    binder.enter_type(declaring.clone());
+    if !continuation {
+        *next_type += 1;
+        tokens.insert_type(&declaring, Token::new(TYPE_DEF, *next_type));
+    }
+    tokens.insert_type_parameters(
+        &declaring,
+        type_parameter_names(binder, &declaring, declaration),
+    );
+    let is_struct = declaration.kind == TypeKind::Struct;
+    let is_interface = declaration.kind == TypeKind::Interface;
+    let is_cil_primitive =
+        matches!(&declaring, TypeSymbol::Special(s) if *s != SpecialType::Decimal);
+    if is_struct && !is_cil_primitive {
+        tokens.insert_struct(&declaring);
+    }
+    if is_interface {
+        tokens.insert_interface(&declaring);
+    }
+    for member in &declaration.members {
+        if let Member::Field { declarators, .. } = member {
+            for declarator in declarators {
+                *next_field += 1;
+                tokens.insert_field(
+                    &declaring,
+                    &declarator.name,
+                    Token::new(FIELD, *next_field),
+                );
+            }
+        }
+        if let Member::Property {
+            modifiers,
+            name,
+            getter,
+            setter,
+            explicit_interface,
+            ..
+        } = member
+        {
+            if is_auto_property(
+                modifiers,
+                getter.as_ref(),
+                setter.as_ref(),
+                is_interface,
+            ) {
+                *next_field += 1;
+                tokens.insert_field(
+                    &declaring,
+                    &backing_field_name(explicit_interface.as_ref(), name),
+                    Token::new(FIELD, *next_field),
+                );
+            }
+        }
+        if let Member::EventField { declarators, .. } = member {
+            if !is_interface {
+                for declarator in declarators {
+                    *next_field += 1;
+                    tokens.insert_field(
+                        &declaring,
+                        &declarator.name,
+                        Token::new(FIELD, *next_field),
+                    );
+                }
+            }
+        }
+    }
+    if !is_struct
+        && !is_interface
+        && !continuation
+        && !any_part_declares_instance_constructor(declaration, later)
+        && !any_part_is_static(declaration, later)
+    {
+        *next_method += 1;
+        tokens.insert_method(
+            &declaring,
+            ".ctor",
+            &[],
+            Token::new(METHOD_DEF, *next_method),
+        );
+    }
+    if needs_static_constructor(declaration) {
+        *next_method += 1;
+        tokens.insert_method(
+            &declaring,
+            ".cctor",
+            &[],
+            Token::new(METHOD_DEF, *next_method),
+        );
+    }
+    for member in &declaration.members {
+        match member {
+            Member::Method {
+                modifiers,
+                name,
+                type_parameters,
+                parameters,
+                is_vararg,
+                body,
+                explicit_interface,
+                attributes,
+                ..
+            } if body.is_some()
+                || is_interface
+                || modifiers.contains(&Modifier::Abstract)
+                || find_dll_import(name, attributes).is_some() =>
+            {
+                *next_method += 1;
+                let method_type_parameter_names: Vec<Box<str>> = type_parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect();
+                let method_type_parameters =
+                    binder.enter_type_parameter_names(&method_type_parameter_names);
+                let mut params: Vec<TypeSymbol> = parameters
+                    .iter()
+                    .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+                    .collect();
+                binder.exit_type_parameters(method_type_parameters);
+                if *is_vararg {
+                    params.push(crate::expr::arglist_marker_symbol());
+                }
+                let token = Token::new(METHOD_DEF, *next_method);
+                match explicit_interface {
+                    Some(interface) => tokens.insert_method(
+                        &declaring,
+                        &explicit_interface_member_name(interface, name),
+                        &params,
+                        token,
+                    ),
+                    None => {
+                        tokens.insert_method(&declaring, name, &params, token);
+                        if modifiers.contains(&Modifier::Virtual)
+                            || modifiers.contains(&Modifier::Override)
+                            || modifiers.contains(&Modifier::Abstract)
+                        {
+                            tokens.insert_virtual_method(&declaring, name, &params);
+                        }
+                    }
+                }
+            }
+            Member::Operator {
+                operator,
+                parameters,
+                ..
+            } => {
+                *next_method += 1;
+                let params: Vec<TypeSymbol> = parameters
+                    .iter()
+                    .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+                    .collect();
+                tokens.insert_method(
+                    &declaring,
+                    operator.method_name(parameters.len()),
+                    &params,
+                    Token::new(METHOD_DEF, *next_method),
+                );
+            }
+            Member::ConversionOperator {
+                direction,
+                target,
+                parameters,
+                ..
+            } => {
+                *next_method += 1;
+                let params: Vec<TypeSymbol> = parameters
+                    .iter()
+                    .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+                    .collect();
+                let token = Token::new(METHOD_DEF, *next_method);
+                tokens.insert_method(&declaring, direction.method_name(), &params, token);
+                tokens.insert_method(
+                    &declaring,
+                    &crate::tokens::conversion_key_name(
+                        direction.method_name(),
+                        &binder.canonicalize(&bind_type(target)),
+                    ),
+                    &params,
+                    token,
+                );
+            }
+            Member::Constructor {
+                modifiers,
+                parameters,
+                is_vararg,
+                ..
+            } if !is_static_constructor(modifiers) => {
+                *next_method += 1;
+                let mut params: Vec<TypeSymbol> = parameters
+                    .iter()
+                    .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+                    .collect();
+                if *is_vararg {
+                    params.push(crate::expr::arglist_marker_symbol());
+                }
+                tokens.insert_method(
+                    &declaring,
+                    ".ctor",
+                    &params,
+                    Token::new(METHOD_DEF, *next_method),
+                );
+            }
+            Member::Destructor { .. } => {
+                *next_method += 1;
+                tokens.insert_method(
+                    &declaring,
+                    "Finalize",
+                    &[],
+                    Token::new(METHOD_DEF, *next_method),
+                );
+            }
+            _ => {}
+        }
+    }
+    for member in &declaration.members {
+        if let Member::Property {
+            modifiers,
+            ty,
+            name,
+            getter,
+            setter,
+            explicit_interface,
+            ..
+        } = member
+        {
+            let property_ty = binder.canonicalize(&bind_type(ty));
+            let is_auto = is_auto_property(
+                modifiers,
+                getter.as_ref(),
+                setter.as_ref(),
+                is_interface,
+            );
+            if getter
+                .as_ref()
+                .is_some_and(|a| {
+                    a.body.is_some()
+                        || is_interface
+                        || is_auto
+                        || modifiers.contains(&Modifier::Abstract)
+                })
+            {
+                *next_method += 1;
+                tokens.insert_method(
+                    &declaring,
+                    &explicit_accessor_name(
+                        explicit_interface.as_ref(),
+                        &accessor_name("get_", name),
+                    ),
+                    &[],
+                    Token::new(METHOD_DEF, *next_method),
+                );
+            }
+            if setter
+                .as_ref()
+                .is_some_and(|a| {
+                    a.body.is_some()
+                        || is_interface
+                        || is_auto
+                        || modifiers.contains(&Modifier::Abstract)
+                })
+            {
+                *next_method += 1;
+                tokens.insert_method(
+                    &declaring,
+                    &explicit_accessor_name(
+                        explicit_interface.as_ref(),
+                        &accessor_name("set_", name),
+                    ),
+                    &[property_ty],
+                    Token::new(METHOD_DEF, *next_method),
+                );
+            }
+        }
+        if let Member::Indexer {
+            modifiers,
+            ty,
+            parameters,
+            getter,
+            setter,
+            attributes,
+            ..
+        } = member
+        {
+            let emitted = |accessor: &Option<lamella_syntax::ast::Accessor>| {
+                accessor.as_ref().is_some_and(|a| {
+                    a.body.is_some()
+                        || is_interface
+                        || modifiers.contains(&Modifier::Abstract)
+                })
+            };
+            let indices: Vec<TypeSymbol> = parameters
+                .iter()
+                .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
+                .collect();
+            let accessor = indexer_name(attributes);
+            if emitted(getter) {
+                *next_method += 1;
+                let token = Token::new(METHOD_DEF, *next_method);
+                tokens.insert_method(&declaring, "get_Item", &indices, token);
+                alias_renamed_accessor(tokens, &declaring, "get_", &accessor, &indices, token);
+            }
+            if emitted(setter) {
+                *next_method += 1;
+                let token = Token::new(METHOD_DEF, *next_method);
+                let mut parameters = indices;
+                parameters.push(binder.canonicalize(&bind_type(ty)));
+                tokens.insert_method(&declaring, "set_Item", &parameters, token);
+                alias_renamed_accessor(tokens, &declaring, "set_", &accessor, &parameters, token);
+            }
+        }
+    }
+    for member in &declaration.members {
+        if let Member::EventField {
+            ty, declarators, ..
+        } = member
+        {
+            let event_ty = binder.canonicalize(&bind_type(ty));
+            for declarator in declarators {
+                for prefix in ["add_", "remove_"] {
+                    *next_method += 1;
+                    tokens.insert_method(
+                        &declaring,
+                        &accessor_name(prefix, &declarator.name),
+                        &[event_ty.clone()],
+                        Token::new(METHOD_DEF, *next_method),
+                    );
+                }
+            }
+        }
+        if let Member::Event {
+            ty,
+            name,
+            adder,
+            remover,
+            explicit_interface,
+            ..
+        } = member
+        {
+            let event_ty = binder.canonicalize(&bind_type(ty));
+            for (prefix, present) in [("add_", adder.is_some()), ("remove_", remover.is_some())] {
+                if present {
+                    *next_method += 1;
+                    tokens.insert_method(
+                        &declaring,
+                        &explicit_accessor_name(
+                            explicit_interface.as_ref(),
+                            &accessor_name(prefix, name),
+                        ),
+                        &[event_ty.clone()],
+                        Token::new(METHOD_DEF, *next_method),
+                    );
+                }
+            }
+        }
+    }
+    binder.exit_type();
+    binder.exit_type_parameters(declaration_type_parameters);
+    for part in later {
+        let part_scope = enter_part(binder, part);
+        collect_type_tokens(
+            tokens,
+            binder,
+            next_type,
+            next_field,
+            next_method,
+            namespace,
+            part.declaration,
+            true,
+            &[],
+            partials,
+        );
+        leave_part(binder, part_scope);
+    }
+    if continuation {
+        return;
+    }
+    let enclosing_full = lamella_binder::declared_full_name(namespace, declaration);
+    for member in &declaration.members {
+        if let Member::NestedType(nested) = member {
+            if matches!(
+                nested.as_ref(),
+                NamespaceMember::Type(_)
+                    | NamespaceMember::Enum(_)
+                    | NamespaceMember::Delegate(_)
+            ) {
+                collect_tokens(
+                    tokens,
+                    binder,
+                    next_type,
+                    next_field,
+                    next_method,
+                    &[],
+                    core::slice::from_ref(nested.as_ref()),
+                    &enclosing_full,
+                    partials,
+                );
+            }
+        }
+    }
+    for part in later {
+        let part_scope = enter_part(binder, part);
+        collect_nested_tokens(
+            tokens,
+            binder,
+            next_type,
+            next_field,
+            next_method,
+            namespace,
+            part.declaration,
+            partials,
+        );
+        leave_part(binder, part_scope);
+    }
+}
+
+/// The nested-type half of [`collect_type_tokens`], for the parts after the first.
+#[allow(clippy::too_many_arguments)]
+fn collect_nested_tokens(
+    tokens: &mut Tokens,
+    binder: &mut Binder,
+    next_type: &mut u32,
+    next_field: &mut u32,
+    next_method: &mut u32,
+    namespace: &str,
+    declaration: &TypeDecl,
+    partials: &PartialIndex<'_>,
+) {
+    let enclosing_full = lamella_binder::declared_full_name(namespace, declaration);
+    for member in &declaration.members {
+        if let Member::NestedType(nested) = member {
+            if matches!(
+                nested.as_ref(),
+                NamespaceMember::Type(_)
+                    | NamespaceMember::Enum(_)
+                    | NamespaceMember::Delegate(_)
+            ) {
+                collect_tokens(
+                    tokens,
+                    binder,
+                    next_type,
+                    next_field,
+                    next_method,
+                    &[],
+                    core::slice::from_ref(nested.as_ref()),
+                    &enclosing_full,
+                    partials,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_tokens(
+    tokens: &mut Tokens,
+    binder: &mut Binder,
+    next_type: &mut u32,
+    next_field: &mut u32,
+    next_method: &mut u32,
+    usings: &[UsingDirective],
     members: &[NamespaceMember],
     namespace: &str,
+    partials: &PartialIndex<'_>,
 ) {
+    let scope = binder.import_scope();
+    for using in usings {
+        match &using.kind {
+            UsingKind::Namespace(name) => binder.import_namespace(&join_namespace("", name)),
+            UsingKind::Alias { name, target } => {
+                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
+            }
+        }
+    }
+    let mut prefix = String::new();
+    for part in namespace.split('.').filter(|part| !part.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(part);
+        binder.import_namespace(&prefix);
+    }
     for member in members {
         match member {
             NamespaceMember::Type(declaration) => {
-                let declaring = declared_type_symbol(namespace, declaration);
-                *next_type += 1;
-                tokens.insert_type(&declaring, Token::new(TYPE_DEF, *next_type));
-                tokens.insert_type_parameters(
-                    &declaring,
-                    declaration
-                        .type_parameters
-                        .iter()
-                        .map(|parameter| parameter.name.clone())
-                        .collect(),
+                if is_later_partial_part(partials, namespace, declaration) {
+                    continue;
+                }
+                let later = continuation_parts(partials, namespace, declaration).unwrap_or(&[]);
+                collect_type_tokens(
+                    tokens,
+                    binder,
+                    next_type,
+                    next_field,
+                    next_method,
+                    namespace,
+                    declaration,
+                    false,
+                    later,
+                    partials,
                 );
-                let is_struct = declaration.kind == TypeKind::Struct;
-                let is_interface = declaration.kind == TypeKind::Interface;
-                let is_cil_primitive =
-                    matches!(&declaring, TypeSymbol::Special(s) if *s != SpecialType::Decimal);
-                if is_struct && !is_cil_primitive {
-                    tokens.insert_struct(&declaring);
-                }
-                if is_interface {
-                    tokens.insert_interface(&declaring);
-                }
-                for member in &declaration.members {
-                    if let Member::Field { declarators, .. } = member {
-                        for declarator in declarators {
-                            *next_field += 1;
-                            tokens.insert_field(
-                                &declaring,
-                                &declarator.name,
-                                Token::new(FIELD, *next_field),
-                            );
-                        }
-                    }
-                    if let Member::EventField { declarators, .. } = member {
-                        if !is_interface {
-                            for declarator in declarators {
-                                *next_field += 1;
-                                tokens.insert_field(
-                                    &declaring,
-                                    &declarator.name,
-                                    Token::new(FIELD, *next_field),
-                                );
-                            }
-                        }
-                    }
-                }
-                if !is_struct
-                    && !is_interface
-                    && !declares_instance_constructor(declaration)
-                    && !declaration.modifiers.contains(&Modifier::Static)
-                {
-                    *next_method += 1;
-                    tokens.insert_method(
-                        &declaring,
-                        ".ctor",
-                        &[],
-                        Token::new(METHOD_DEF, *next_method),
-                    );
-                }
-                if needs_static_constructor(declaration) {
-                    *next_method += 1;
-                    tokens.insert_method(
-                        &declaring,
-                        ".cctor",
-                        &[],
-                        Token::new(METHOD_DEF, *next_method),
-                    );
-                }
-                for member in &declaration.members {
-                    match member {
-                        Member::Method {
-                            modifiers,
-                            name,
-                            type_parameters,
-                            parameters,
-                            is_vararg,
-                            body,
-                            explicit_interface,
-                            attributes,
-                            ..
-                        } if body.is_some()
-                            || is_interface
-                            || modifiers.contains(&Modifier::Abstract)
-                            || find_dll_import(name, attributes).is_some() =>
-                        {
-                            *next_method += 1;
-                            let mut params: Vec<TypeSymbol> =
-                                parameters.iter().map(parameter_symbol).collect();
-                            if *is_vararg {
-                                params.push(crate::expr::arglist_marker_symbol());
-                            }
-                            let token = Token::new(METHOD_DEF, *next_method);
-                            match explicit_interface {
-                                Some(interface) => tokens.insert_method(
-                                    &declaring,
-                                    &explicit_interface_member_name(interface, name),
-                                    &params,
-                                    token,
-                                ),
-                                None => {
-                                    tokens.insert_method(&declaring, name, &params, token);
-                                    if modifiers.contains(&Modifier::Virtual)
-                                        || modifiers.contains(&Modifier::Override)
-                                        || modifiers.contains(&Modifier::Abstract)
-                                    {
-                                        tokens.insert_virtual_method(&declaring, name, &params);
-                                    }
-                                }
-                            }
-                        }
-                        Member::Operator {
-                            operator,
-                            parameters,
-                            ..
-                        } => {
-                            *next_method += 1;
-                            let params: Vec<TypeSymbol> =
-                                parameters.iter().map(parameter_symbol).collect();
-                            tokens.insert_method(
-                                &declaring,
-                                operator.method_name(parameters.len()),
-                                &params,
-                                Token::new(METHOD_DEF, *next_method),
-                            );
-                        }
-                        Member::ConversionOperator {
-                            direction,
-                            target,
-                            parameters,
-                            ..
-                        } => {
-                            *next_method += 1;
-                            let params: Vec<TypeSymbol> =
-                                parameters.iter().map(parameter_symbol).collect();
-                            let token = Token::new(METHOD_DEF, *next_method);
-                            tokens.insert_method(&declaring, direction.method_name(), &params, token);
-                            tokens.insert_method(
-                                &declaring,
-                                &crate::tokens::conversion_key_name(
-                                    direction.method_name(),
-                                    &bind_type(target),
-                                ),
-                                &params,
-                                token,
-                            );
-                        }
-                        Member::Constructor {
-                            modifiers,
-                            parameters,
-                            is_vararg,
-                            ..
-                        } if !is_static_constructor(modifiers) => {
-                            *next_method += 1;
-                            let mut params: Vec<TypeSymbol> =
-                                parameters.iter().map(parameter_symbol).collect();
-                            if *is_vararg {
-                                params.push(crate::expr::arglist_marker_symbol());
-                            }
-                            tokens.insert_method(
-                                &declaring,
-                                ".ctor",
-                                &params,
-                                Token::new(METHOD_DEF, *next_method),
-                            );
-                        }
-                        Member::Destructor { .. } => {
-                            *next_method += 1;
-                            tokens.insert_method(
-                                &declaring,
-                                "Finalize",
-                                &[],
-                                Token::new(METHOD_DEF, *next_method),
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                for member in &declaration.members {
-                    if let Member::Property {
-                        modifiers,
-                        ty,
-                        name,
-                        getter,
-                        setter,
-                        explicit_interface,
-                        ..
-                    } = member
-                    {
-                        let property_ty = bind_type(ty);
-                        if getter
-                            .as_ref()
-                            .is_some_and(|a| {
-                                a.body.is_some()
-                                    || is_interface
-                                    || modifiers.contains(&Modifier::Abstract)
-                            })
-                        {
-                            *next_method += 1;
-                            tokens.insert_method(
-                                &declaring,
-                                &explicit_accessor_name(
-                                    explicit_interface.as_ref(),
-                                    &accessor_name("get_", name),
-                                ),
-                                &[],
-                                Token::new(METHOD_DEF, *next_method),
-                            );
-                        }
-                        if setter
-                            .as_ref()
-                            .is_some_and(|a| {
-                                a.body.is_some()
-                                    || is_interface
-                                    || modifiers.contains(&Modifier::Abstract)
-                            })
-                        {
-                            *next_method += 1;
-                            tokens.insert_method(
-                                &declaring,
-                                &explicit_accessor_name(
-                                    explicit_interface.as_ref(),
-                                    &accessor_name("set_", name),
-                                ),
-                                &[property_ty],
-                                Token::new(METHOD_DEF, *next_method),
-                            );
-                        }
-                    }
-                    if let Member::Indexer {
-                        modifiers,
-                        ty,
-                        parameters,
-                        getter,
-                        setter,
-                        ..
-                    } = member
-                    {
-                        let emitted = |accessor: &Option<lamella_syntax::ast::Accessor>| {
-                            accessor.as_ref().is_some_and(|a| {
-                                a.body.is_some()
-                                    || is_interface
-                                    || modifiers.contains(&Modifier::Abstract)
-                            })
-                        };
-                        let indices: Vec<TypeSymbol> =
-                            parameters.iter().map(parameter_symbol).collect();
-                        if emitted(getter) {
-                            *next_method += 1;
-                            tokens.insert_method(
-                                &declaring,
-                                "get_Item",
-                                &indices,
-                                Token::new(METHOD_DEF, *next_method),
-                            );
-                        }
-                        if emitted(setter) {
-                            *next_method += 1;
-                            let mut parameters = indices;
-                            parameters.push(bind_type(ty));
-                            tokens.insert_method(
-                                &declaring,
-                                "set_Item",
-                                &parameters,
-                                Token::new(METHOD_DEF, *next_method),
-                            );
-                        }
-                    }
-                }
-                for member in &declaration.members {
-                    if let Member::EventField {
-                        ty, declarators, ..
-                    } = member
-                    {
-                        let event_ty = bind_type(ty);
-                        for declarator in declarators {
-                            for prefix in ["add_", "remove_"] {
-                                *next_method += 1;
-                                tokens.insert_method(
-                                    &declaring,
-                                    &accessor_name(prefix, &declarator.name),
-                                    &[event_ty.clone()],
-                                    Token::new(METHOD_DEF, *next_method),
-                                );
-                            }
-                        }
-                    }
-                    if let Member::Event {
-                        ty,
-                        name,
-                        adder,
-                        remover,
-                        explicit_interface,
-                        ..
-                    } = member
-                    {
-                        let event_ty = bind_type(ty);
-                        for (prefix, present) in [("add_", adder.is_some()), ("remove_", remover.is_some())] {
-                            if present {
-                                *next_method += 1;
-                                tokens.insert_method(
-                                    &declaring,
-                                    &explicit_accessor_name(
-                                        explicit_interface.as_ref(),
-                                        &accessor_name(prefix, name),
-                                    ),
-                                    &[event_ty.clone()],
-                                    Token::new(METHOD_DEF, *next_method),
-                                );
-                            }
-                        }
-                    }
-                }
-                let enclosing_full = lamella_binder::declared_full_name(namespace, declaration);
-                for member in &declaration.members {
-                    if let Member::NestedType(nested) = member {
-                        if matches!(
-                            nested.as_ref(),
-                            NamespaceMember::Type(_)
-                                | NamespaceMember::Enum(_)
-                                | NamespaceMember::Delegate(_)
-                        ) {
-                            collect_tokens(
-                                tokens,
-                                next_type,
-                                next_field,
-                                next_method,
-                                core::slice::from_ref(nested.as_ref()),
-                                &enclosing_full,
-                            );
-                        }
-                    }
-                }
             }
             NamespaceMember::Namespace(declaration) => {
                 let inner = join_namespace(namespace, &declaration.name);
                 collect_tokens(
                     tokens,
+                    binder,
                     next_type,
                     next_field,
                     next_method,
+                    &declaration.usings,
                     &declaration.members,
                     &inner,
+                    partials,
                 );
             }
             NamespaceMember::Enum(declaration) => {
@@ -7074,7 +8483,7 @@ fn collect_tokens(
                 let params: Vec<TypeSymbol> = declaration
                     .parameters
                     .iter()
-                    .map(parameter_symbol)
+                    .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
                     .collect();
                 tokens.insert_method(
                     &declaring,
@@ -7085,6 +8494,7 @@ fn collect_tokens(
             }
         }
     }
+    binder.restore_import_scope(scope);
 }
 
 /// A named-type symbol from a dotted full name (e.g. `"Outer"` or `"N.Outer"`), matching
@@ -8711,6 +10121,133 @@ mod tests {
     /// type kinds.
     ///
     /// The `StaticFieldInit` row is the one that decides the implementation: it HAS a `.cctor`
+    /// **`sealed` IS TWO FAULTS WITH ONE SYMPTOM, SO THE TEST IS A ROUND TRIP.** The emitter never
+    /// wrote `TYPE_SEALED` for a `sealed class` and the importer never read one back, and either
+    /// alone is invisible: fixing the emit leaves lcsc unable to see its own output, and fixing the
+    /// import leaves it nothing to see. So this compiles source, asserts the BYTES carry the flag,
+    /// then loads those same bytes as a reference assembly and asserts the MODEL carries it.
+    ///
+    /// **THE OTHER KINDS ARE HERE BECAUSE THE IMPORT SIDE REACHES ALL OF THEM AT ONCE.** A struct,
+    /// an enum and a delegate are sealed in metadata by their own emit paths, and deriving from any
+    /// of them across an assembly boundary compiled before the flag was read -- so a test that
+    /// covered only `sealed class` would credit one row of four.
+    #[test]
+    fn sealed_survives_the_assembly_boundary_in_both_directions() {
+        let image = image_of_gated_source(
+            "namespace Lib {
+                 public sealed class Shut { public int A; }
+                 public class Open { public int B; }
+                 public struct Val { public int C; }
+                 public enum Kind { A }
+                 public delegate void Ping();
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let emitted_sealed = |name: &str| -> bool {
+            assembly
+                .type_defs()
+                .find(|t| t.name().is_some_and(|n| n.name == name))
+                .unwrap_or_else(|| panic!("{name} is in the image"))
+                .flags()
+                & TYPE_SEALED
+                != 0
+        };
+        assert!(emitted_sealed("Shut"), "a `sealed class` emits II.23.1.15's sealed bit");
+        assert!(!emitted_sealed("Open"), "and an unsealed one does not -- the control");
+        let mut model = Model::new();
+        lamella_binder::load_assembly(&mut model, &assembly);
+        let modelled_sealed = |name: &str| -> bool {
+            model
+                .get("Lib", name)
+                .unwrap_or_else(|| panic!("{name} loaded from the reference"))
+                .is_sealed
+        };
+        assert!(modelled_sealed("Shut"), "the importer reads the flag back");
+        assert!(!modelled_sealed("Open"), "and reads its absence -- the control");
+        assert!(modelled_sealed("Val"), "a struct is sealed in metadata and now says so");
+        assert!(modelled_sealed("Kind"), "so is an enum");
+        assert!(modelled_sealed("Ping"), "so is a delegate");
+    }
+
+    /// **A PARTIAL TYPE'S FLAGS ARE THE UNION OF ITS PARTS' MODIFIERS (17.1.4), AND READING THE
+    /// FIRST PART'S LIST ALONE IS AN ANSWER ABOUT ONE PART THAT LOOKS LIKE AN ANSWER ABOUT THE
+    /// TYPE.** Four bits were decided that way and all four were wrong for the same reason.
+    ///
+    /// **VISIBILITY IS THE ONE THAT MATTERS MOST, AND IT IS NOT A FLAG NOBODY READS.**
+    /// `partial class V { }` + `public partial class V { }` emitted `NotPublic`, so a type the
+    /// source declares public was invisible outside its own assembly -- CS0122 or CS0246 at every
+    /// consumer, for a type that is right there. The nested form emitted `NestedPrivate` for a
+    /// `public` nested type, which is the same failure one level in. `abstract` dropped to an
+    /// instantiable class, and `static` produced a type carrying neither flag while
+    /// `any_part_is_static` had ALREADY suppressed its constructor from any part -- so two halves
+    /// of one type disagreed inside one image.
+    ///
+    /// **THE FIRST-PART ROWS ARE THE CONTROL AND THEY WERE ALWAYS GREEN**, which is why nothing
+    /// caught this: the matrix's `partial-type` probe splits MEMBERS across parts and not
+    /// MODIFIERS, so every instrument in the tree wrote the modifier where the emitter looked.
+    /// Every row measured from csc on this same source.
+    #[test]
+    fn a_partial_types_flags_are_the_union_of_its_parts_modifiers() {
+        let image = image_of_gated_source(
+            "namespace App {
+                 public abstract partial class FirstAbstract { public int A; }
+                 public partial class FirstAbstract { public int B; }
+                 public partial class LaterAbstract { public int C; }
+                 public abstract partial class LaterAbstract { public int D; }
+                 public static partial class FirstStatic { public static int E() { return 1; } }
+                 public partial class FirstStatic { public static int F() { return 2; } }
+                 public partial class LaterStatic { public static int G() { return 1; } }
+                 public static partial class LaterStatic { public static int H() { return 2; } }
+                 public partial class FirstPublic { public int I; }
+                 partial class FirstPublic { public int J; }
+                 partial class LaterPublic { public int K; }
+                 public partial class LaterPublic { public int L; }
+                 public class Host {
+                     partial class LaterNested { public int M; }
+                     public partial class LaterNested { public int N; }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the image parses");
+        let flags_of = |name: &str| -> u32 {
+            assembly
+                .type_defs()
+                .find(|t| t.name().is_some_and(|n| n.name == name))
+                .unwrap_or_else(|| panic!("{name} is in the image"))
+                .flags()
+        };
+        let shape = |name: &str| -> (bool, bool) {
+            let flags = flags_of(name);
+            ((flags & TYPE_ABSTRACT) != 0, (flags & TYPE_SEALED) != 0)
+        };
+        let visibility = |name: &str| -> u32 { flags_of(name) & 0x0000_0007 };
+        assert_eq!(shape("FirstAbstract"), (true, false), "abstract on the first part");
+        assert_eq!(shape("FirstStatic"), (true, true), "static on the first part is abstract+sealed");
+        assert_eq!(visibility("FirstPublic"), 0x01, "public on the first part");
+        assert_eq!(
+            shape("LaterAbstract"),
+            (true, false),
+            "an `abstract` written on a later part is the type's, not that part's"
+        );
+        assert_eq!(
+            shape("LaterStatic"),
+            (true, true),
+            "a `static` written on a later part likewise -- and its constructor was already \
+             suppressed from any part, so the flags were the half that disagreed"
+        );
+        assert_eq!(
+            visibility("LaterPublic"),
+            0x01,
+            "a `public` written on a later part -- this one shipped NotPublic, so the type was \
+             unreachable from any other assembly"
+        );
+        assert_eq!(
+            visibility("LaterNested"),
+            0x02,
+            "and NestedPublic for the nested form, which shipped NestedPrivate"
+        );
+    }
+
     /// (synthesized for its initializers) and KEEPS the flag. Keying off the presence of a `.cctor`
     /// would clear it for nearly every type that has one -- the exact outcome this change exists to
     /// stop. Only an explicitly DECLARED `static C()` is the request for precise timing.
@@ -9614,6 +11151,451 @@ mod tests {
         for slot in pointer_slots {
             assert!(!slot.pinned, "the pointer slot must not be pinned: {slot:?}");
         }
+    }
+
+    /// TWO INSTANTIATIONS OF ONE NESTED TYPE ARE TWO TYPES, and neither converts to the other.
+    ///
+    /// **THIS IS THE HALF THAT MADE THE PARSE SAFE TO LAND, AND WITHOUT IT THE PARSE IS A
+    /// MISCOMPILE.** Until `Box<int>.Cursor` could be written at all, a nested type was nameable
+    /// only from INSIDE its enclosing type, where its arguments are never in question -- so no
+    /// program could hold two instantiations of one nested type and assign between them. Accepting
+    /// the name while the binder built the OPEN definition from it would have made both
+    /// `` Box`1.Cursor ``, accepted the assignment, and stored a `Cursor<int>` into a
+    /// `Cursor<string>` slot.
+    ///
+    /// The message is csc's, measured on this exact source at `/langversion:ISO-2`:
+    /// *Cannot implicitly convert type 'Box<int>.Cursor' to 'Box<string>.Cursor'*. The QUOTED
+    /// SPELLING is half the assertion: a symbol that spelled itself `` Box`1.Cursor<int> `` would
+    /// refuse correctly and then name a type that appears in no source, and CS0029 exists to be
+    /// read beside the program.
+    /// A NESTED GENERIC TYPE NAMED BARE takes its enclosing type's arguments too -- `Pair<string>`
+    /// written inside `Box<T>` is `Box<T>.Pair<string>`, arity 2, enclosing first (II.9.2).
+    ///
+    /// **ASSERTED THROUGH A REFUSAL, BECAUSE A CLEAN COMPILE CANNOT SEE THIS.** A resolution that
+    /// dropped the enclosing argument still compiles -- it just names a different type, and every
+    /// use inside the declaration agrees with itself. The witness is a caller in another
+    /// instantiation: if `Make()` returned anything but `Box<int>.Pair<string>`, the assignment
+    /// below would either be accepted or refused with a different pair of names.
+    ///
+    /// The message is csc's, measured on this source at `/langversion:ISO-2`.
+    #[test]
+    fn a_nested_generic_named_bare_takes_its_enclosing_type_s_arguments() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let source = "public class Box<T> { \
+                 public class Pair<U> { public U b; } \
+                 public Pair<string> Make() { return new Pair<string>(); } } \
+             class Program { static int Main() { \
+                 Box<INSTANTIATION>.Pair<string> q = new Box<int>().Make(); \
+                 return q.b == null ? 0 : 1; } }";
+
+        let unit = parse_compilation_unit_with(&source.replace("INSTANTIATION", "int"), options.clone())
+            .unit;
+        let result = compile(
+            &unit,
+            "bare.dll",
+            "bare",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp2,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+
+        let unit = parse_compilation_unit_with(&source.replace("INSTANTIATION", "long"), options).unit;
+        let result = compile(
+            &unit,
+            "bare2.dll",
+            "bare2",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp2,
+        );
+        let errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.is_error())
+            .collect();
+        assert_eq!(errors.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(errors[0].code, 29);
+        assert_eq!(
+            &*errors[0].message,
+            "Cannot implicitly convert type 'Box<int>.Pair<string>' to 'Box<long>.Pair<string>'"
+        );
+    }
+
+    #[test]
+    fn two_instantiations_of_one_nested_type_do_not_convert() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let unit = parse_compilation_unit_with(
+            "public class Box<T> { public struct Cursor { public int n; } }              class Program { static int Main() {                  Box<int>.Cursor a = new Box<int>.Cursor();                  Box<string>.Cursor b = a;                  return b.n; } }",
+            options.clone(),
+        )
+        .unit;
+        let result = compile(
+            &unit,
+            "id.dll",
+            "id",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp2,
+        );
+        let errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.is_error())
+            .collect();
+        assert_eq!(errors.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(errors[0].code, 29);
+        assert_eq!(
+            &*errors[0].message,
+            "Cannot implicitly convert type 'Box<int>.Cursor' to 'Box<string>.Cursor'"
+        );
+        assert!(result.image.is_none(), "an errored compilation emits nothing");
+
+        let same = parse_compilation_unit_with(
+            "public class Box<T> { public struct Cursor { public int n; } }              class Program { static int Main() {                  Box<int>.Cursor a = new Box<int>.Cursor();                  Box<int>.Cursor b = a;                  return b.n; } }",
+            options,
+        )
+        .unit;
+        let result = compile(
+            &same,
+            "id2.dll",
+            "id2",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp2,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn a_nested_type_carries_its_enclosing_type_s_parameters() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let unit = parse_compilation_unit_with(
+            "public class Box<T> { \
+                 public struct Cursor { public T held; } \
+                 public class Pair<U> { public T first; public U second; } \
+                 public struct Ring { public struct Hub { public T deep; } } } \
+             public class Plain { public struct Inner { public int n; } }",
+            options,
+        )
+        .unit;
+        let result = compile(
+            &unit,
+            "n.dll",
+            "n",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp2,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let parameters_of = |name: &str| -> Vec<String> {
+            let ty = assembly
+                .find_type("", name)
+                .unwrap_or_else(|| panic!("type {name} is missing"));
+            let owner = ty.token().row() << 1;
+            let mut found: Vec<(u32, String)> = assembly
+                .generic_params()
+                .filter(|(_, _, parameter_owner, _)| *parameter_owner == owner)
+                .map(|(number, _, _, parameter_name)| {
+                    (number, parameter_name.unwrap_or_default().to_string())
+                })
+                .collect();
+            found.sort_by_key(|(number, _)| *number);
+            found.into_iter().map(|(_, name)| name).collect()
+        };
+        assert_eq!(parameters_of("Box`1"), ["T"]);
+        assert_eq!(parameters_of("Cursor"), ["T"]);
+        assert_eq!(parameters_of("Pair`1"), ["T", "U"]);
+        assert_eq!(parameters_of("Hub"), ["T"]);
+        assert_eq!(parameters_of("Inner"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_property_accessor_takes_the_accessibility_the_language_gives_it() {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let unit = parse_compilation_unit_with(
+            "class C { int f; \
+                 private int Priv { get { return f; } set { f = value; } } \
+                 internal int Int { get { return f; } set { f = value; } } \
+                 protected int Prot { get { return f; } set { f = value; } } \
+                 public int Pub { get { return f; } set { f = value; } } \
+                 public int Narrowed { get { return f; } private set { f = value; } } \
+                 protected internal int Both { get { return f; } internal set { f = value; } } }",
+            options,
+        )
+        .unit;
+        let result = compile(
+            &unit,
+            "a.dll",
+            "a",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp2,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let ty = assembly.find_type("", "C").expect("the C type");
+        let access_of = |name: &str| -> u32 {
+            ty.methods()
+                .find(|method| method.name() == Some(name))
+                .unwrap_or_else(|| panic!("method {name} is missing"))
+                .flags()
+                & 0x0007
+        };
+        const PRIVATE: u32 = 0x0001;
+        const ASSEMBLY: u32 = 0x0003;
+        const FAMILY: u32 = 0x0004;
+        const FAM_OR_ASSEM: u32 = 0x0005;
+        const PUBLIC: u32 = 0x0006;
+        for (property, expected) in [
+            ("Priv", PRIVATE),
+            ("Int", ASSEMBLY),
+            ("Prot", FAMILY),
+            ("Pub", PUBLIC),
+        ] {
+            assert_eq!(access_of(&alloc::format!("get_{property}")), expected, "get_{property}");
+            assert_eq!(access_of(&alloc::format!("set_{property}")), expected, "set_{property}");
+        }
+        assert_eq!(access_of("get_Narrowed"), PUBLIC);
+        assert_eq!(access_of("set_Narrowed"), PRIVATE);
+        assert_eq!(access_of("get_Both"), FAM_OR_ASSEM);
+        assert_eq!(access_of("set_Both"), ASSEMBLY);
+    }
+
+    #[test]
+    fn an_auto_property_gets_a_backing_field_and_two_synthesized_accessors() {
+        use lamella_cil::Opcode;
+        let unit = parse_compilation_unit(
+            "class C { public int Value { get; set; } \
+                 public static int Count { get; set; } \
+                 int m; public int Manual { get { return m; } set { m = value; } } }",
+        )
+        .unit;
+        let result = compile(
+            &unit,
+            "ap.dll",
+            "ap",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp3,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let ty = assembly.find_type("", "C").expect("the C type");
+
+        const GENERATED: &str = "System.Runtime.CompilerServices.CompilerGeneratedAttribute";
+        const BROWSABLE: &str = "System.Diagnostics.DebuggerBrowsableAttribute";
+
+        let field_named = |name: &str| {
+            ty.fields()
+                .find(|field| field.name() == Some(name))
+                .unwrap_or_else(|| panic!("field {name} is missing"))
+        };
+        let value_field = field_named("<Value>k__BackingField");
+        assert_eq!(value_field.flags() & 0x0007, u32::from(FIELD_PRIVATE));
+        assert!(
+            !value_field.is_static(),
+            "an instance property's backing field is an instance one"
+        );
+        assert_eq!(
+            attribute_names_on(&assembly, value_field.token()),
+            [BROWSABLE, GENERATED]
+        );
+        assert!(
+            field_named("<Count>k__BackingField").is_static(),
+            "a static property's backing field is static"
+        );
+        assert!(
+            ty.fields()
+                .all(|field| field.name() != Some("<Manual>k__BackingField")),
+            "a property with written accessors gets NO backing field"
+        );
+
+        let opcodes = |name: &str| -> Vec<Opcode> {
+            ty.methods()
+                .find(|method| method.name() == Some(name))
+                .unwrap_or_else(|| panic!("method {name} is missing"))
+                .body()
+                .unwrap_or_else(|| panic!("method {name} has no body"))
+                .code
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .collect()
+        };
+        assert_eq!(
+            opcodes("get_Value"),
+            [Opcode::Ldarg, Opcode::Ldfld, Opcode::Ret]
+        );
+        assert_eq!(
+            opcodes("set_Value"),
+            [Opcode::Ldarg, Opcode::Ldarg, Opcode::Stfld, Opcode::Ret]
+        );
+        assert_eq!(opcodes("get_Count"), [Opcode::Ldsfld, Opcode::Ret]);
+        assert_eq!(
+            opcodes("set_Count"),
+            [Opcode::Ldarg, Opcode::Stsfld, Opcode::Ret]
+        );
+
+        for accessor in ["get_Value", "set_Value", "get_Count", "set_Count"] {
+            let method = ty
+                .methods()
+                .find(|method| method.name() == Some(accessor))
+                .expect("the accessor");
+            assert_eq!(
+                attribute_names_on(&assembly, method.token()),
+                [GENERATED],
+                "{accessor} is compiler-written and says so"
+            );
+            assert_ne!(
+                method.flags() & u32::from(SPECIAL_NAME),
+                0,
+                "{accessor} is an accessor, so it is specialname"
+            );
+        }
+        assert_eq!(
+            attribute_names_on(
+                &assembly,
+                ty.methods()
+                    .find(|method| method.name() == Some("get_Manual"))
+                    .expect("get_Manual")
+                    .token()
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_generic_auto_property_reaches_its_field_through_a_type_spec() {
+        use lamella_cil::Operand;
+        let options = LexOptions {
+            version: LanguageVersion::CSharp3,
+            ..LexOptions::default()
+        };
+        let unit =
+            parse_compilation_unit_with("class Bag<T> { public T Item { get; set; } }", options)
+                .unit;
+        let result = compile(
+            &unit,
+            "b.dll",
+            "b",
+            &[],
+            None,
+            false,
+            false,
+            false,
+            LanguageVersion::CSharp3,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let ty = assembly.find_type("", "Bag`1").expect("the Bag type");
+        for accessor in ["get_Item", "set_Item"] {
+            let code = ty
+                .methods()
+                .find(|method| method.name() == Some(accessor))
+                .expect("the accessor")
+                .body()
+                .expect("a body")
+                .code;
+            let field = code
+                .iter()
+                .find_map(|instruction| match instruction.operand {
+                    Operand::Token(token) => Some(token),
+                    _ => None,
+                })
+                .expect("a field operand");
+            assert_eq!(
+                field.table(),
+                lamella_metadata::tables::table::MEMBER_REF,
+                "{accessor}'s field operand is a MemberRef over the type's own instantiation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_struct_constructor_chaining_to_this_zero_initializes_rather_than_calling() {
+        use lamella_cil::Opcode;
+        let unit = parse_compilation_unit(
+            "struct Cell { public int A; public int B;                  public Cell(int a) : this() { A = a; }                  public Cell(int a, int b) : this(a) { B = b; } }              class Holder { public int N; public Holder(int n) : this() { N = n; } public Holder() { } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "s.dll", "s");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let opcodes = |type_name: &str, parameters: usize| -> Vec<Opcode> {
+            assembly
+                .find_type("", type_name)
+                .expect("the type")
+                .methods()
+                .filter(|method| method.name() == Some(".ctor"))
+                .find(|method| {
+                    method
+                        .signature()
+                        .is_some_and(|signature| signature.parameters.len() == parameters)
+                })
+                .expect("the constructor")
+                .body()
+                .expect("a body")
+                .code
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .collect()
+        };
+        assert_eq!(
+            &opcodes("Cell", 1)[..2],
+            [Opcode::Ldarg, Opcode::Initobj],
+            "`: this()` on a struct zero-initializes"
+        );
+        assert_eq!(
+            &opcodes("Cell", 2)[..3],
+            [Opcode::Ldarg, Opcode::Ldarg, Opcode::Call],
+            "`: this(args)` on a struct still calls the constructor it names"
+        );
+        assert_eq!(
+            &opcodes("Holder", 1)[..2],
+            [Opcode::Ldarg, Opcode::Call],
+            "`: this()` on a CLASS calls the parameterless constructor"
+        );
     }
 
     #[test]
@@ -10554,6 +12536,270 @@ mod tests {
         }
     }
 
+    /// A STRUCT HAS NO PREDEFINED `==`, AND SAYING IT DID WAS A WRONG ANSWER RATHER THAN A LOOSE
+    /// ONE (14.9).
+    ///
+    /// **THE REFUSAL IS THE FIX FOR A MISCOMPILE, WHICH IS WHY IT IS ASSERTED AS ONE.** Before it,
+    /// `a == b` on a struct declaring no `operator ==` compiled and compared THE FIRST FIELD: two
+    /// structs differing only in a later field answered EQUAL, and two `System.Nullable<int>`
+    /// holding 40 and 2 answered EQUAL because what was compared was `HasValue`. csc refuses every
+    /// one of these programs, so there was no oracle to notice until one was RUN.
+    ///
+    /// The accepting rows are the half that decides: an enum, a string, a class and a struct that
+    /// DOES declare the operator all keep their comparison, and each is a rule this could take away
+    /// without a single refusing row noticing.
+    #[test]
+    fn a_struct_has_no_predefined_equality() {
+        let cases: [(&str, &[u16], &str); 8] = [
+            (
+                "struct Plain { public int v; } \
+                 class P { static bool M(Plain a, Plain b) { return a == b; } }",
+                &[19],
+                "Operator '==' cannot be applied to operands of type 'Plain' and 'Plain'",
+            ),
+            (
+                "struct Pair<T> { public int v; } \
+                 class P { static bool M(Pair<string> a, Pair<string> b) { return a == b; } }",
+                &[19],
+                "Operator '==' cannot be applied to operands of type 'Pair<string>' and \
+                 'Pair<string>'",
+            ),
+            (
+                "struct Pair<T> { public int v; } \
+                 class P { static bool M(Pair<string> a) { return a == null; } }",
+                &[19],
+                "Operator '==' cannot be applied to operands of type 'Pair<string>' and '<null>'",
+            ),
+            (
+                "struct Pair<T> { public int v; } \
+                 class P { static bool M(Pair<string> a, Pair<string> b) { return a != b; } }",
+                &[19],
+                "Operator '!=' cannot be applied to operands of type 'Pair<string>' and \
+                 'Pair<string>'",
+            ),
+            ("enum E { A, B } class P { static bool M(E a, E b) { return a == b; } }", &[], ""),
+            ("class P { static bool M(string a, string b) { return a == b; } }", &[], ""),
+            ("class C { } class P { static bool M(C a, C b) { return a == b; } }", &[], ""),
+            (
+                "struct Money { public int v; \
+                     public static bool operator ==(Money a, Money b) { return a.v == b.v; } \
+                     public static bool operator !=(Money a, Money b) { return a.v != b.v; } \
+                     public override bool Equals(object o) { return true; } \
+                     public override int GetHashCode() { return v; } } \
+                 class P { static bool M(Money a, Money b) { return a == b; } }",
+                &[],
+                "",
+            ),
+        ];
+        for (source, expected, message) in cases {
+            let result = compile_source_with(
+                source,
+                "e.cs",
+                "e.dll",
+                "e",
+                &[],
+                false,
+                LexOptions {
+                    version: LanguageVersion::CSharp2,
+                    ..LexOptions::default()
+                },
+            );
+            let errors: Vec<&Diagnostic> = result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.is_error())
+                .collect();
+            let codes: Vec<u16> = errors.iter().map(|diagnostic| diagnostic.code).collect();
+            assert_eq!(codes, expected, "for {source}");
+            if let Some(first) = errors.first() {
+                assert_eq!(&*first.message, message, "for {source}");
+            }
+        }
+    }
+
+    /// THE SEVEN WAYS PARTS OF ONE TYPE CAN CONTRADICT EACH OTHER, each measured against csc on the
+    /// same source at `/langversion:ISO-2` -- code and sentence.
+    ///
+    /// **THE ACCEPTING ROWS ARE HALF THE TABLE AND THEY ARE THE HALF THAT DECIDES.** A check that
+    /// refuses too much passes every error row: a `where` clause on ONE part, a lone `partial`
+    /// declaration with no second part, and a part that states no accessibility are all LEGAL, and
+    /// each is a rule this could get backwards without a single error row noticing.
+    #[test]
+    fn the_parts_of_a_partial_type_must_agree() {
+        let cases: [(&str, &[u16], &str); 11] = [
+            (
+                "public partial class W { } public class W { }",
+                &[260],
+                "Missing partial modifier on declaration of type 'W'; another partial declaration \
+                 of this type exists",
+            ),
+            (
+                "public partial class W { } public partial struct W { }",
+                &[261],
+                "Partial declarations of 'W' must be all classes, all record classes, all structs, \
+                 all unions, all record structs, or all interfaces",
+            ),
+            (
+                "public partial class W { } internal partial class W { }",
+                &[262],
+                "Partial declarations of 'W' have conflicting accessibility modifiers",
+            ),
+            (
+                "public class A { } public class B { } \
+                 public partial class W : A { } public partial class W : B { }",
+                &[263],
+                "Partial declarations of 'W' must not specify different base classes",
+            ),
+            (
+                "public partial class W<T> { } public partial class W<U> { }",
+                &[264],
+                "Partial declarations of 'W<T>' must have the same type parameter names in the \
+                 same order",
+            ),
+            (
+                "public partial class W<T> where T : class { } \
+                 public partial class W<T> where T : struct { }",
+                &[265],
+                "Partial declarations of 'W<T>' have inconsistent constraints for type parameter \
+                 'T'",
+            ),
+            (
+                "partial public class W { }",
+                &[267],
+                "The 'partial' modifier can only appear immediately before 'class', 'record', \
+                 'struct', 'interface', 'event', an instance constructor name, or a method or \
+                 property return type",
+            ),
+            (
+                "public partial class W { int a; } public partial class W { int a; }",
+                &[102],
+                "The type 'W' already contains a definition for 'a'",
+            ),
+            (
+                "public partial class W { public W() { } } public partial class W { public W() { } }",
+                &[111],
+                "Type 'W' already defines a member called 'W' with the same parameter types",
+            ),
+            (
+                "public partial class W<T> where T : class { } public partial class W<T> { }",
+                &[],
+                "",
+            ),
+            (
+                "public partial class W { } partial class W { }",
+                &[],
+                "",
+            ),
+        ];
+        for (source, expected, message) in cases {
+            let result = compile_source_with(
+                source,
+                "p.cs",
+                "p.dll",
+                "p",
+                &[],
+                false,
+                LexOptions {
+                    version: LanguageVersion::CSharp2,
+                    ..LexOptions::default()
+                },
+            );
+            let errors: Vec<&Diagnostic> = result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.is_error())
+                .collect();
+            let codes: Vec<u16> = errors.iter().map(|diagnostic| diagnostic.code).collect();
+            assert_eq!(codes, expected, "for {source}");
+            if let Some(first) = errors.first() {
+                assert_eq!(&*first.message, message, "for {source}");
+            }
+        }
+    }
+
+    /// A PARTIAL TYPE SPLIT ACROSS FILES IS ONE `TypeDef` WITH BOTH FILES' MEMBERS, AND EACH PART
+    /// BINDS UNDER ITS OWN FILE'S `using` DIRECTIVES.
+    ///
+    /// **THE `TypeDef` COUNT IS THE ASSERTION THAT MATTERS AND A CLEAN COMPILE DOES NOT MAKE IT.**
+    /// Emitting each part where the walk reaches it produces an image that assembles: it is the CLR
+    /// that refuses it, with `BadImageFormatException: Duplicate type with name 'Widget'`. A test
+    /// that only checked for diagnostics passed under exactly that defect.
+    ///
+    /// Each file imports a namespace the other does not and uses it, so a merge that emitted both
+    /// parts under one file's scope would fail to resolve one of them. No BCL type appears: this
+    /// compilation has no references, and the point is the merge rather than the corlib.
+    #[test]
+    fn a_partial_type_split_across_files_is_one_typedef() {
+        let a = "using N; \
+                 namespace N { public class Ten { public static int Get() { return 10; } } } \
+                 public partial class Widget { \
+                     private int a; \
+                     public void SetA(int v) { a = v + Ten.Get(); } \
+                     public int A() { return a; } }";
+        let b = "using M; \
+                 namespace M { public class Two { public static int Get() { return 2; } } } \
+                 public partial class Widget { \
+                     private int b; \
+                     public void SetB(int v) { b = v + Two.Get(); } \
+                     public int Sum() { return a + b; } }";
+        let sources = [(a, "a.cs"), (b, "b.cs")];
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let result = compile_sources_with(&sources, "w.dll", "w", &[], false, options);
+        assert!(
+            result.diagnostics.iter().all(|per_file| per_file.is_empty()),
+            "{:?}",
+            result.diagnostics
+        );
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+        let widgets = assembly
+            .types()
+            .filter(|ty| ty.name == "Widget")
+            .count();
+        assert_eq!(widgets, 1, "one TypeDef per type, not one per part");
+        let widget = assembly.find_type("", "Widget").expect("the Widget type");
+        let mut fields: Vec<&str> = widget.fields().filter_map(|field| field.name()).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["a", "b"], "both files' fields land in the one type");
+        let mut methods: Vec<&str> = widget.methods().filter_map(|method| method.name()).collect();
+        methods.sort_unstable();
+        assert_eq!(methods, [".ctor", "A", "SetA", "SetB", "Sum"]);
+    }
+
+    /// A part that names something only ANOTHER part's file imported does not resolve, and the
+    /// diagnostic lands on the file that wrote it.
+    ///
+    /// **THE CONTROL FOR THE TEST ABOVE.** Merging the parts into one file's scope would make this
+    /// program compile, and nothing else in the suite would notice: it is a program that must be
+    /// REFUSED, and a merge is exactly the change that would start accepting it.
+    #[test]
+    fn a_partial_part_does_not_inherit_another_file_s_usings() {
+        let a = "using N; \
+                 namespace N { public class Ten { public static int Get() { return 10; } } } \
+                 public partial class Widget { public int A() { return Ten.Get(); } }";
+        let b = "public partial class Widget { public int B() { return Ten.Get(); } }";
+        let sources = [(a, "a.cs"), (b, "b.cs")];
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let result = compile_sources_with(&sources, "w.dll", "w", &[], false, options);
+        assert!(
+            result.diagnostics[0].is_empty(),
+            "a.cs imported N: {:?}",
+            result.diagnostics[0]
+        );
+        let codes: Vec<u16> = result.diagnostics[1]
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(codes, [103], "b.cs did not: {:?}", result.diagnostics[1]);
+        assert!(result.image.is_none());
+    }
+
     #[test]
     fn multi_document_pdb_attributes_each_method_to_its_own_file() {
         let a = "class A { static int Alpha() { int ax = 1; return ax; } }";
@@ -11280,6 +13526,196 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == 103),
             "binder cascade was not suppressed: {:?}",
             result.diagnostics
+        );
+    }
+
+    /// The self-`TypeRef` mechanism the corlib ratchet counts, reduced to one struct: a member
+    /// written inside its own namespace names its neighbour BARE (`S Create()`), the signature
+    /// minter's SYNTACTIC key misses the token table -- which registered the full name -- and
+    /// the old fall-through minted a `TypeRef` into the default scope for a type defined forty
+    /// rows up. The fix re-asks with the RESOLVED symbol and aliases the syntactic key to the
+    /// def token; this holds it at the one-struct scale the ratchet cannot localize.
+    /// The emit half of that defect: a simple name shared by two namespaces must serialize as the
+    /// SCOPE-LOCAL type's TypeDef, never as a raw simple name. The raw name missed the (fully
+    /// keyed) enum registry, so the field serialized CLASS where the enum is a VALUETYPE, and
+    /// the image failed to LOAD on .NET with a value-type mismatch -- a build that succeeds and
+    /// an artifact that cannot run.
+    #[test]
+    fn a_simple_name_shared_by_two_namespaces_emits_the_scope_local_identity() {
+        let compilation = compile_source(
+            "namespace Some.Where { public enum Marker { A = 0 } } \
+             namespace Other.Place { public enum Marker { B = 5 } \
+             public class P { private static Marker _f; \
+                 static int Main() { _f = Marker.B; return (int)_f; } } }",
+            "test.cs",
+            "test.dll",
+            "test",
+            &[],
+            false,
+        );
+        assert!(
+            compilation.diagnostics.iter().all(|d| !d.is_error()),
+            "unexpected diagnostics: {:?}",
+            compilation.diagnostics
+        );
+        let image = compilation.image.expect("the colliding-name program compiles to an image");
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let marker_refs: alloc::vec::Vec<String> = assembly
+            .type_refs()
+            .filter_map(|r| r.name())
+            .filter(|n| n.name == "Marker")
+            .map(|n| alloc::format!("{}.{}", n.namespace, n.name))
+            .collect();
+        assert!(
+            marker_refs.is_empty(),
+            "a local enum leaked into a TypeRef: {marker_refs:?}"
+        );
+        let field_sig = assembly
+            .type_defs()
+            .find(|def| def.name().is_some_and(|n| n.name == "P"))
+            .and_then(|def| def.fields().find(|f| f.name() == Some("_f")))
+            .and_then(|f| f.signature())
+            .expect("P._f has a readable signature");
+        assert!(
+            matches!(field_sig, lamella_metadata::SigType::ValueType(_)),
+            "an enum field must serialize VALUETYPE, got {field_sig:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_mention_inside_its_own_namespace_mints_no_self_type_ref() {
+        let compilation = compile_source(
+            "namespace N { public struct S { private int _x;
+                 public static S Create() { S v = new S(); v._x = 1; return v; }
+                 public S Twin() { return Create(); } } }",
+            "test.cs",
+            "test.dll",
+            "test",
+            &[],
+            false,
+        );
+        assert!(
+            compilation.diagnostics.iter().all(|d| !d.is_error()),
+            "unexpected diagnostics: {:?}",
+            compilation.diagnostics
+        );
+        let image = compilation.image.expect("the struct compiles to an image");
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let defined: alloc::vec::Vec<(String, String)> = assembly
+            .type_defs()
+            .filter_map(|def| def.name())
+            .map(|n| (n.namespace.to_string(), n.name.to_string()))
+            .collect();
+        let self_refs: alloc::vec::Vec<String> = assembly
+            .type_refs()
+            .filter_map(|r| r.name())
+            .filter(|n| defined.iter().any(|(ns, name)| ns == n.namespace && name == n.name))
+            .map(|n| format!("{}.{}", n.namespace, n.name))
+            .collect();
+        assert!(
+            self_refs.is_empty(),
+            "the image references types it defines: {self_refs:?}"
+        );
+    }
+
+    /// The other three self-reference mechanisms, at one-file scale -- each one reached by a
+    /// DIFFERENT door, which is why the corlib ratchet counted three rows after the struct-`.ctor`
+    /// fix closed the first two.
+    ///
+    /// **An operator lowering names its BCL member outright and used to mint unconditionally.**
+    /// `a + b` is `String.Concat`, `typeof(T)` is `Type.GetTypeFromHandle`; in a module that
+    /// DEFINES `System.String` and `System.Type` those are this module's own `MethodDef`s, and the
+    /// reference gave each type a second identity scoped to an `mscorlib` `AssemblyRef` the image
+    /// is not. Measured on the corlib: 108 `Concat` rows and 2 `GetTypeFromHandle` rows, every one
+    /// of them resolving correctly here (every resolver in this compiler keys on (namespace,
+    /// name)) and none of them
+    /// resolving for csc, which refused the artifact as a core library with CS0518.
+    ///
+    /// **A renamed indexer arrives through a NAME, not through a missing guard.** `s[i]` lowers to
+    /// a hard-named `get_Chars`, while the token pre-pass reserves an indexer's accessor under the
+    /// model's synthetic `get_Item` -- so the guard that WAS there asked a question the table could
+    /// not answer, and minted.
+    ///
+    /// **A constructor with an explicit chain used to pay for the implicit one anyway.** The base
+    /// call was computed before the initializer was consulted, and computing it MINTS a reference
+    /// to the base's PARAMETERLESS constructor -- which a base like `Handle(bool, bool)` does not
+    /// have, so the rows named a member nothing declares and nothing called.
+    ///
+    /// Both halves are asserted, because they fail independently: no `TypeRef` may name a type
+    /// this module defines, AND no `MemberRef` may name one of these members however its parent is
+    /// spelled (a `MemberRef` may hang off a `TypeDef`, which the first assertion cannot see).
+    #[test]
+    fn a_module_defining_the_bcl_types_its_lowerings_name_mints_no_reference_to_them() {
+        let compilation = compile_source(
+            "namespace System { \
+                 public class Attribute { } \
+                 public struct RuntimeTypeHandle { } \
+                 public sealed class String { \
+                     [System.Runtime.CompilerServices.IndexerName(\"Chars\")] \
+                     public char this[int index] { get { return 'x'; } } \
+                     public static string Concat(string a, string b) { return b; } } \
+                 public class Type { \
+                     public static Type GetTypeFromHandle(RuntimeTypeHandle handle) { return null; } } } \
+             namespace System.Runtime.CompilerServices { \
+                 public sealed class IndexerNameAttribute : System.Attribute { \
+                     public IndexerNameAttribute(string indexerName) { } } } \
+             namespace P { \
+                 public abstract class Handle { internal Handle(bool a, bool b) { } } \
+                 public sealed class Event : Handle { public Event(bool state) : base(state, true) { } } \
+                 public class Q { \
+                     public static string Join(string a, string b) { return a + b; } \
+                     public static char First(string s) { return s[0]; } \
+                     public static object Reflect() { return typeof(Q); } } }",
+            "test.cs",
+            "test.dll",
+            "test",
+            &[],
+            false,
+        );
+        assert!(
+            compilation.diagnostics.iter().all(|d| !d.is_error()),
+            "unexpected diagnostics: {:?}",
+            compilation.diagnostics
+        );
+        let image = compilation.image.expect("the corlib-shaped program compiles to an image");
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let defined: alloc::vec::Vec<(String, String)> = assembly
+            .type_defs()
+            .filter_map(|def| def.name())
+            .map(|n| (n.namespace.to_string(), n.name.to_string()))
+            .collect();
+        let self_refs: alloc::vec::Vec<String> = assembly
+            .type_refs()
+            .filter_map(|r| r.name())
+            .filter(|n| defined.iter().any(|(ns, name)| ns == n.namespace && name == n.name))
+            .map(|n| format!("{}.{}", n.namespace, n.name))
+            .collect();
+        assert!(
+            self_refs.is_empty(),
+            "the image references types it defines: {self_refs:?}"
+        );
+        let defined_tokens: alloc::vec::Vec<Token> =
+            assembly.type_defs().map(|def| def.token()).collect();
+        let referenced: alloc::vec::Vec<String> = assembly
+            .member_refs()
+            .filter(|member| {
+                let parent = member.parent();
+                match parent.table() {
+                    TYPE_DEF => defined_tokens.contains(&parent),
+                    TYPE_REF => assembly
+                        .type_ref(parent.row())
+                        .and_then(|r| r.name())
+                        .is_some_and(|n| {
+                            defined.iter().any(|(ns, name)| ns == n.namespace && name == n.name)
+                        }),
+                    _ => false,
+                }
+            })
+            .map(|member| member.name().unwrap_or("<unnamed>").to_string())
+            .collect();
+        assert!(
+            referenced.is_empty(),
+            "a member of a type this module defines was referenced rather than called: {referenced:?}"
         );
     }
 }

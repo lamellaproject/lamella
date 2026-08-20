@@ -1,0 +1,17 @@
+[package]
+name = "lamella-flash-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Emit the firmware file formats a bootloader accepts by drag-and-drop: Intel HEX for DAPLink volumes (micro:bit and friends) and Microsoft UF2 for RP2040 / RP2350 BOOTSEL. Copying one file onto the board's USB mass-storage volume is the whole deployment step -- no probe, no vendor tool, no driver install."
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+lamella-elf = { path = "../lamella-elf" }

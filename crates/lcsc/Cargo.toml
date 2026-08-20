@@ -10,6 +10,7 @@ description = "The Lamella C# compiler driver: source files to a managed assembl
 # The compiler driver is a host CLI, so std is allowed here (unlike the no_std
 # front-end libraries). It reads files, decodes them the way csc does, compiles,
 # and reports diagnostics.
+publish = false
 [dependencies]
 lamella-syntax = { path = "../lamella-syntax" }
 lamella-assemble = { path = "../lamella-assemble" }

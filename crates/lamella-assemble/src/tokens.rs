@@ -80,8 +80,20 @@ fn definition_of(ty: &TypeSymbol) -> TypeSymbol {
 
 /// The metadata tokens of the module's members and the strings it loads, keyed by
 /// identity (member references are minted into the same table for external calls).
+///
+/// It also carries the ASYNC EMISSION QUEUE (`pending_async`, `async_counters`): a state machine
+/// discovered mid-way through its enclosing type cannot be emitted there -- a type's field and
+/// method rows must be contiguous -- so the lowering is stashed and drained by `build_image`
+/// after every source type. This struct is the one context that already rides every emission
+/// call, which is what makes it the queue's home rather than a seventh parameter.
 #[derive(Debug, Default)]
 pub struct Tokens {
+    /// Async methods whose machines and stub bodies land after the source types; see
+    /// `compile::emit_async_machine`.
+    pub(crate) pending_async: Vec<crate::compile::PendingAsync>,
+    /// Per-enclosing-type counter over async methods, so `<M>d__N` names two same-named
+    /// overloads apart. Keyed like `types`.
+    pub(crate) async_counters: BTreeMap<String, usize>,
     types: BTreeMap<String, Token>,
     methods: BTreeMap<String, Token>,
     fields: BTreeMap<String, Token>,
@@ -483,6 +495,18 @@ impl Tokens {
     }
 
     /// Records `token` as the field named by this identity.
+    /// The next `<M>d__N` index for an async method of `enclosing` -- a per-type counter, so two
+    /// same-named overloads get distinct machines.
+    pub(crate) fn next_async_index(&mut self, enclosing: &TypeSymbol) -> usize {
+        let counter = self.async_counters.entry(type_key(enclosing)).or_insert(0);
+        let index = *counter;
+        *counter += 1;
+        index
+    }
+
+    /// Records the token for a field of `declaring`, keyed by the pair, so a use site can name it.
+    /// The token is a `Field` row for a field this module declares and a `MemberRef` for one it
+    /// only references -- the caller decides which, and the key is the same either way.
     pub fn insert_field(&mut self, declaring: &TypeSymbol, name: &str, token: Token) {
         self.fields.insert(field_key(&self.canonical(declaring), name), token);
     }

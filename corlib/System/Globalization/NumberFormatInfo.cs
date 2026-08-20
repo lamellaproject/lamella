@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Globalization.NumberFormatInfo
 namespace System.Globalization
 {
-    public class NumberFormatInfo : System.IFormatProvider
+    public sealed class NumberFormatInfo : System.IFormatProvider
     {
         private static NumberFormatInfo _invariant;
 

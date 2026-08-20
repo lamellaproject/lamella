@@ -44,6 +44,14 @@ bench-counters = []
 # RP2350, which is 99% of what the parser costs on its own.
 eval = []
 
+# Records which REALM objects a program ever writes, for the residency work's mutation census.
+#
+# It exists as a feature rather than a runtime flag because it puts a branch and a set insertion on
+# `object_mut`, which is the single hottest accessor in the engine -- a build being TIMED must not
+# carry it, for the same reason `bench-counters` is off by default. It answers one question: is the
+# set of realm objects a program mutates small enough that a copy-on-write realm is justified?
+mutation-census = []
+
 [dependencies]
 libm = { version = "0.2.16", default-features = false }
 
@@ -57,6 +65,27 @@ libm = { version = "0.2.16", default-features = false }
 # consume a `Node`, which a format crate depending on this one could never allow.
 lamella-js-bytecode = { path = "../lamella-js-bytecode" }
 
+# THE REGULAR-EXPRESSION ENGINE, WHICH IS SHARED RATHER THAN THIS ENGINE'S. Backtracking order,
+# capture lifetime and the empty-repetition rule are the same machine in every language that
+# inherited Perl's model, so the matcher and the compiled program live in one crate and each
+# language contributes only its own grammar. `lamella-regexp`'s `js` feature is that grammar.
+#
+# THE FEATURE IS NAMED HERE RATHER THAN DEFAULTED THERE, and that is the shared crate's contract:
+# it ships no grammar unless a consumer asks, so a consumer that wants the bare matcher does not
+# compile this one's parser to get it. This line is also what puts the grammar's own tests into the
+# workspace build, since nothing else in the tree selects it.
+lamella-regexp = { path = "../lamella-regexp", features = ["js"] }
+
+# THE CANONICAL UNICODE HOME, FOR THE IDENTIFIER ALPHABET. `IdentifierStart` and `IdentifierPart`
+# rest on ID_Start and ID_Continue, and those tables are generated from the UCD once and read by
+# all three languages -- so this crate reads them rather than carrying a copy, which would be a
+# divergent configuration of the same data.
+#
+# IT IS ID_Start/ID_Continue SPECIFICALLY. XID_Start/XID_Continue live in the same crate and are
+# NOT the same set; substituting them accepts and rejects the wrong programs, silently, in both
+# directions. See `src/unicode.rs`.
+lamella-unicode = { path = "../lamella-unicode" }
+
 # NO DEPENDENCIES AT ANY LEVEL -- not runtime, and deliberately none for development either.
 # The tests and examples that need a corpus or an instrumented allocator are a separate package, so
-# that a consumer of this crate resolves exactly two things: libm, and the format crate below.
+# that a consumer of this crate resolves only the four runtime dependencies above.

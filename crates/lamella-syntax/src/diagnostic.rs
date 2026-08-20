@@ -82,6 +82,10 @@ pub enum DiagnosticKind {
         /// The text following `#error` on the directive line.
         message: Box<str>,
     },
+    /// `CS1633`: a `#pragma` this compiler does not recognize. A WARNING, as in csc: the
+    /// directive is ignored and compilation continues, because a pragma is advice to the compiler
+    /// and an unknown one is advice it cannot take.
+    UnrecognizedPragma,
     /// A `#warning` directive, carrying its message text (9.5.5).
     WarningDirective {
         /// The text following `#warning` on the directive line.
@@ -108,6 +112,10 @@ pub enum DiagnosticKind {
         /// The offending token's source spelling, for example `}` or `;`.
         token: Box<str>,
     },
+    /// A `partial` modifier stood somewhere other than immediately before the declaration's
+    /// keyword (ECMA-334 4th ed 17.1.4). `partial public class C` is this; `public partial class C`
+    /// is not.
+    PartialModifierPosition,
     /// The same declaration modifier appeared twice (clause 10.2.2 / 17.2).
     DuplicateModifier {
         /// The repeated modifier's keyword, for example `public`.
@@ -186,6 +194,23 @@ pub enum DiagnosticKind {
     /// An `__arglist` parameter marker appeared in a declaration that cannot be
     /// vararg -- a delegate, an operator, or an indexer (csc CS1669).
     ArglistNotValidInThisContext,
+    /// `CS4033`: the `await` operator outside an async method (ECMA-334 5th ed, 12.8.8.1).
+    ///
+    /// MEASURED in three shapes (statement, initializer, and inside `Main`): csc reports 4033 --
+    /// the "async method" wording -- for every one lcsc can produce, because 4032's wording
+    /// belongs to async lambdas, which do not exist here. Raised by the parser, which owns the
+    /// context bit; the operand still parses and binds, so an unawaitable operand reports its
+    /// own diagnostic beside this one exactly as csc does.
+    AwaitOutsideAsync,
+    /// `CS4003`: `await` used as a declared identifier inside an async method (12.8.8.1, which
+    /// reserves the word there and offers `@await` as the escape).
+    AwaitAsIdentifier,
+    /// `CS1994`: the `async` modifier on a method with no body (`abstract async Task M();`).
+    /// MEASURED: the one diagnostic csc reports for that program, text with a trailing period.
+    AsyncRequiresBody,
+    /// `CS4004`: `await` inside an `unsafe { }` block (measured). Parser-raised, because the
+    /// parser lowers the block to a plain one and is the last stage that can see it.
+    AwaitInUnsafe,
 }
 
 impl DiagnosticKind {
@@ -210,6 +235,7 @@ impl DiagnosticKind {
             DiagnosticKind::EndIfDirectiveExpected => 1027,
             DiagnosticKind::UnexpectedDirective => 1028,
             DiagnosticKind::ErrorDirective { .. } => 1029,
+            DiagnosticKind::UnrecognizedPragma => 1633,
             DiagnosticKind::WarningDirective { .. } => 1030,
             DiagnosticKind::SymbolAfterFirstToken => 1032,
             DiagnosticKind::EndRegionDirectiveExpected => 1038,
@@ -224,6 +250,7 @@ impl DiagnosticKind {
             DiagnosticKind::CloseBraceExpected => 1513,
             DiagnosticKind::InvalidTokenInMemberDeclaration { .. } => 1519,
             DiagnosticKind::DuplicateModifier { .. } => 1004,
+            DiagnosticKind::PartialModifierPosition => 267,
             DiagnosticKind::OpenBraceExpected => 1514,
             DiagnosticKind::ExpectedCatchOrFinally => 1524,
             DiagnosticKind::TypeDeclarationExpected => 1518,
@@ -237,6 +264,10 @@ impl DiagnosticKind {
             DiagnosticKind::FileScopedNamespaceMustPrecedeMembers => 8956,
             DiagnosticKind::ArglistMustBeLast => 257,
             DiagnosticKind::ArglistNotValidInThisContext => 1669,
+            DiagnosticKind::AwaitOutsideAsync => 4033,
+            DiagnosticKind::AwaitAsIdentifier => 4003,
+            DiagnosticKind::AsyncRequiresBody => 1994,
+            DiagnosticKind::AwaitInUnsafe => 4004,
         }
     }
 
@@ -244,7 +275,9 @@ impl DiagnosticKind {
     #[must_use]
     pub fn severity(&self) -> Severity {
         match self {
-            DiagnosticKind::WarningDirective { .. } => Severity::Warning,
+            DiagnosticKind::UnrecognizedPragma | DiagnosticKind::WarningDirective { .. } => {
+                Severity::Warning
+            }
             _ => Severity::Error,
         }
     }
@@ -279,6 +312,7 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::EndIfDirectiveExpected => f.write_str("#endif directive expected"),
             DiagnosticKind::UnexpectedDirective => f.write_str("Unexpected preprocessor directive"),
             DiagnosticKind::ErrorDirective { message } => write!(f, "#error: '{message}'"),
+            DiagnosticKind::UnrecognizedPragma => f.write_str("Unrecognized #pragma directive"),
             DiagnosticKind::WarningDirective { message } => write!(f, "#warning: '{message}'"),
             DiagnosticKind::SymbolAfterFirstToken => {
                 f.write_str("Cannot define/undefine preprocessor symbols after first token in file")
@@ -311,6 +345,11 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::DuplicateModifier { modifier } => {
                 write!(f, "Duplicate '{modifier}' modifier")
             }
+            DiagnosticKind::PartialModifierPosition => f.write_str(
+                "The 'partial' modifier can only appear immediately before 'class', 'record', \
+                 'struct', 'interface', 'event', an instance constructor name, or a method or \
+                 property return type",
+            ),
             DiagnosticKind::OpenBraceExpected => f.write_str("{ expected"),
             DiagnosticKind::ExpectedCatchOrFinally => {
                 f.write_str("Expected catch or finally")
@@ -358,6 +397,17 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::ArglistNotValidInThisContext => {
                 write!(f, "__arglist is not valid in this context")
             }
+            DiagnosticKind::AwaitOutsideAsync => f.write_str(
+                "The 'await' operator can only be used within an async method. Consider marking \
+                 this method with the 'async' modifier and changing its return type to 'Task'.",
+            ),
+            DiagnosticKind::AwaitAsIdentifier => f.write_str(
+                "'await' cannot be used as an identifier within an async method or lambda expression",
+            ),
+            DiagnosticKind::AsyncRequiresBody => {
+                f.write_str("The 'async' modifier can only be used in methods that have a body.")
+            }
+            DiagnosticKind::AwaitInUnsafe => f.write_str("Cannot await in an unsafe context"),
         }
     }
 }

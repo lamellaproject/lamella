@@ -395,8 +395,12 @@ impl Capabilities {
     /// This bit says the path exists; the hash says it is the right one.
     pub const RESIDENT_CORLIB: u32 = 1 << 13;
     /// The target implements the BUNDLE message types (`lamella_runner::bundle`) -- an artifact it
-    /// loads through a different front end than a baked image. RESERVED: no firmware advertises this
-    /// bit yet.
+    /// loads through a different front end than a baked image.
+    ///
+    /// **Advertised by the micro:bit v2 Python serve (`microbit-v2-py`), which sets this bit and no
+    /// other**: that tier has no CIL runtime, no baked image and no source-level debugger, so a bit
+    /// set there that nothing implements would turn a clean refusal into a request accepted and then
+    /// unanswerable.
     ///
     /// **This is what a host should gate on, in preference to sending the op and reading the answer.**
     /// Both work -- an unimplemented type is refused with [`msg::ERROR`] naming it (see [`error`]) rather

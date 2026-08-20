@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.StackOverflowException
 namespace System
 {
-    public class StackOverflowException : SystemException
+    public sealed class StackOverflowException : SystemException
     {
         public StackOverflowException() : base() { }
         public StackOverflowException(string message) : base(message) { }

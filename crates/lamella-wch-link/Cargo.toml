@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "WCH-Link (RV mode) debug-probe host: the vendor USB command protocol wrapping a from-scratch RISC-V Debug Module core."
+publish = false
 
 [dependencies]
 # The host USB transport reuses the shared bulk backend (WinUSB on Windows, usbfs on Linux); it opens

@@ -1,0 +1,69 @@
+# The shared regular-expression substrate: one backtracking matcher, one compiled program format,
+# and a syntax front end per language.
+#
+# THE SPLIT IS BETWEEN SEMANTICS AND SURFACE, AND IT IS NOT ARBITRARY. Backtracking order, capture
+# lifetime, greedy-versus-lazy commitment and the empty-repetition rule are the same machine in
+# every language that inherited Perl's model; the concrete grammar, the flag letters and the escape
+# vocabulary are not. So the matcher and the program format are shared and the PARSER is not, which
+# is why `js` is a feature rather than the crate's only content.
+#
+# It is a separate crate rather than a module inside a language front end because every language
+# that inherited Perl's model wants its own grammar over the SAME matcher. A matcher copied per
+# front end diverges silently: the copies keep compiling, and only the backtracking order tells you
+# they stopped agreeing.
+[package]
+name = "lamella-regexp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A backtracking regular-expression engine for constrained devices: one matcher, one compiled program, and a syntax front end per language."
+publish = false
+
+[lib]
+name = "lamella_regexp"
+path = "src/lib.rs"
+
+# NO DEPENDENCIES, AND THE MATCHER IS INTEGER-ONLY BY CONSTRUCTION. Nothing here converts a number
+# or measures a duration, so there is no call for a math library, and a device linking this pays for
+# the matcher alone.
+[features]
+# NO GRAMMAR BY DEFAULT: EACH CONSUMER SELECTS ITS OWN, EXPLICITLY.
+#
+# A shared crate must not hand a dialect to a consumer that did not ask for one. With a language
+# switched on here, anything wanting the bare matcher compiles that language's parser to get it --
+# 41 KB of source for a front end it will never call, on parts where the whole engine has to fit in
+# 256 KB. The grammars are what differ between languages; the matcher is what does not.
+#
+# THE PRICE IS THAT A SUITE BEHIND A FEATURE RUNS ZERO TESTS WHILE REPORTING GREEN, and this crate
+# has one: `tests/js_matching.rs` opens with `#![cfg(feature = "js")]`, so with the grammar off it
+# builds to an empty binary and prints a passing line. Measured on this manifest, both arms:
+#
+#     cargo test -p lamella-regexp     lib 15, js_matching  0  -- 23 tests absent, and it says `ok`
+#     cargo test --workspace           lib 19, js_matching 19  -- all 38 run
+#
+# So `-p` on its own covers the substrate and NOT the grammar, and the shortfall is invisible in its
+# own output. What covers both is the workspace build: the engine consuming this crate names `js`,
+# and cargo resolves one feature set across the packages it builds together. Four of the lib tests
+# are inside the grammar module, which is why that count moves as well as the integration suite's.
+#
+# So the rule for a second grammar is the same: add the feature, and add a consumer that selects it
+# in a build somebody runs. A grammar nothing selects is a grammar nobody compiles.
+default = []
+
+# The ECMA-262 pattern grammar and its flag set.
+js = []
+
+# THE ONE DEPENDENCY, AND IT BUYS A NARROWER REFUSAL RATHER THAN A FEATURE.
+#
+# A case-insensitive pattern used to refuse the moment a literal reached beyond ASCII. That refusal
+# is right in KIND -- substituting a near-enough fold is a silent wrong answer -- and it was far
+# wider than the gap it protects, because **the overwhelming majority of non-ASCII code points have
+# no case at all**, so `i` is a no-op for them and the pattern is matchable exactly as written.
+# Deciding that needs one predicate: the `Cased` derived property.
+#
+# That property has ONE shared home and this crate does not keep a private copy. Two copies of a
+# Unicode dataset are a divergent configuration of one dataset, and the answer to "is this code
+# point cased?" must not depend on which crate asked.
+[dependencies]
+lamella-unicode = { path = "../lamella-unicode" }

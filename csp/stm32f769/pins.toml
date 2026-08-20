@@ -16,9 +16,11 @@ kind = "pins"
 family = "stm32f769"
 sources = [
     "STM32F765xx/STM32F767xx/STM32F768Ax/STM32F769xx datasheet DS11532 Rev 9, Table 13 'alternate function mapping' (page 89), whose sixteen function columns are headed by AF number: the AF7 column is headed SPI2/I2S2/SPI3/I2S3/USART1/2/3/UART5/DFSDM1/SPDIF, and PA9's AF7 cell is USART1_TX while PA10's is USART1_RX",
+    "STM32F765xx/STM32F767xx/STM32F768Ax/STM32F769xx datasheet DS11532 Rev 9, Table 13 'alternate function mapping': the AF10 column is headed SAI2/QUADSPI/SDMMC2/DFSDM1/OTG2_HS/OTG1_FS/LCD and carries SDMMC2_D2 and SDMMC2_D3; the AF11 column is headed I2C4/CAN3/SDMMC2/ETH and carries SDMMC2_CK, SDMMC2_CMD, SDMMC2_D0 and SDMMC2_D1",
 ]
 notes = [
-    "Only the two cells the board's virtual COM port claims are stated. The user LEDs and the user button are plain GPIO rather than muxed functions, so they carry no row here -- a pin driven by the port itself has no alternate function to select, and a row asserting one would be a claim the board does not make.",
+    "Two groups of cells are stated: the pair a virtual COM port claims, and the six an SD/MMC socket claims. A part's LEDs and buttons are plain GPIO rather than muxed functions, so they carry no row here -- a pin driven by the port itself has no alternate function to select, and a row asserting one would be a claim the part does not make.",
+    "WHICH pins a given socket or header actually reaches is a wiring fact and is not stated here. This table says only which controller a pin CAN be muxed to, and at which function number.",
 ]
 
 # --- USART1: the virtual COM port ------------------------------------------------------------
@@ -36,3 +38,58 @@ function = "AF7"
 instance = "usart1"
 signal = "rx"
 source = "DS11532 Rev 9 Table 13: PA10's AF7 cell is USART1_RX. UM2033 Rev 5 gives PA10 the signal name USART1_RX against the label VCP_RX, so the board and the part agree on the pair without either being read from the other."
+
+# --- SDMMC2 ----------------------------------------------------------------------------------
+#
+# THE SIX LINES DO NOT SHARE ONE ALTERNATE FUNCTION. D2 and D3 are AF10; CK, CMD, D0 and D1 are
+# AF11. SDMMC2 appears in TWO function columns of the mapping table -- AF10 headed
+# SAI2/QUADSPI/SDMMC2/DFSDM1/OTG2_HS/OTG1_FS/LCD, and AF11 headed I2C4/CAN3/SDMMC2/ETH -- and the
+# split is by SIGNAL rather than by port. A driver that selected one function for all six would
+# mux four lines and leave two unconnected, which is a fault that hides: transfers on a single
+# data line keep working and four-line transfers return corrupt blocks.
+#
+# PB3 AND PB4 CARRY JTDO/TRACESWO AND NJTRST AT AF0. Both are free whenever the debug port is in
+# its two-wire mode, so a design can have either those two data lines or instruction trace, and
+# not both.
+
+[[pins]]
+pin = "PB3"
+function = "AF10"
+instance = "sdmmc2"
+signal = "d2"
+source = "DS11532 Rev 9 Table 13: PB3's AF10 cell is SDMMC2_D2."
+
+[[pins]]
+pin = "PB4"
+function = "AF10"
+instance = "sdmmc2"
+signal = "d3"
+source = "DS11532 Rev 9 Table 13: PB4's AF10 cell is SDMMC2_D3."
+
+[[pins]]
+pin = "PD6"
+function = "AF11"
+instance = "sdmmc2"
+signal = "ck"
+source = "DS11532 Rev 9 Table 13: PD6's AF11 cell is SDMMC2_CK."
+
+[[pins]]
+pin = "PD7"
+function = "AF11"
+instance = "sdmmc2"
+signal = "cmd"
+source = "DS11532 Rev 9 Table 13: PD7's AF11 cell is SDMMC2_CMD."
+
+[[pins]]
+pin = "PG9"
+function = "AF11"
+instance = "sdmmc2"
+signal = "d0"
+source = "DS11532 Rev 9 Table 13: PG9's AF11 cell is SDMMC2_D0, on a row that converts whole and can be counted against the AF13, AF14 and AF15 columns."
+
+[[pins]]
+pin = "PG10"
+function = "AF11"
+instance = "sdmmc2"
+signal = "d1"
+source = "DS11532 Rev 9 Table 13: PG10's AF11 cell is SDMMC2_D1. This row rests on a weaker reading of the mapping table than the other five: PG10's row wraps and its cells cannot be counted, so the AF number is corroborated instead by the datasheet's pin-description table, which lists PG10's functions in AF order as SAI2_SD_B then SDMMC2_D1 -- the same AF10-then-AF11 adjacency that PG9's countable row demonstrates -- and by PG11's countable row, which places a second SDMMC2_D2 in the AF10 column and so agrees that only D2 and D3 live there. Were it wrong, the symptom would be a four-line data fault with single-line transfers healthy."

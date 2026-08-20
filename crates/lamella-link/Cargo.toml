@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Lamella's own static linker: resolve symbols, lay out sections, apply relocations."
+publish = false
 
 [dependencies]
 lamella-elf = { path = "../lamella-elf" }

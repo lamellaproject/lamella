@@ -1,66 +1,24 @@
-//! The identifier alphabet, and an honest hole in it.
+//! The identifier alphabet, read from the one table all three languages share.
 
-
-/// Whether a code point may START an identifier, or why this scanner cannot say.
-///
-/// `Err` is not "no". It is **"this scanner cannot answer"**, which is a different fact and has to
-/// stay different -- collapsing it to `false` would report a conforming program as a syntax error
-/// with no way to tell that apart from a genuine one.
-pub fn is_id_start(ch: char) -> Result<bool, Unsupported> {
+/// Whether a code point may START an identifier.
+#[must_use]
+pub fn is_id_start(ch: char) -> bool {
     if ch.is_ascii() {
-        return Ok(ch.is_ascii_alphabetic() || ch == '$' || ch == '_');
+        return ch.is_ascii_alphabetic() || ch == '$' || ch == '_';
     }
-    if definitely_not_an_identifier_character(ch) {
-        return Ok(false);
-    }
-    Err(refusal(ch))
+    lamella_unicode::is_id_start(ch as u32)
 }
 
-/// Code points that are non-ASCII but still answerable, because they belong to categories DISJOINT
-/// from ID_Start and ID_Continue.
-///
-/// # THE DEFECT THIS EXISTS TO FIX, FOUND BY A TEST RATHER THAN BY READING
-///
-/// Refusing to classify is right when the answer is genuinely unknown. It is WRONG when the code
-/// point merely ENDS an identifier -- and `a<U+2028>b` is a perfectly ordinary program where U+2028
-/// terminates `a`. The first version refused there, so a legal program became a lexical error, and
-/// the "refuse rather than guess" rule had quietly turned into "reject anything unfamiliar".
-///
-/// Line terminators and whitespace are in categories (Zl, Zp, Zs, Cc) that ID_Start and ID_Continue
-/// do not draw from at all, so `false` here is a fact rather than a guess -- which is the only
-/// standard a member of this list has to meet.
-fn definitely_not_an_identifier_character(ch: char) -> bool {
-    crate::source::is_line_terminator(ch) || crate::source::is_whitespace(ch)
-}
-
-/// Whether a code point may CONTINUE an identifier, or why we cannot say.
-pub fn is_id_continue(ch: char) -> Result<bool, Unsupported> {
+/// Whether a code point may CONTINUE an identifier.
+#[must_use]
+pub fn is_id_continue(ch: char) -> bool {
     if ch.is_ascii() {
-        return Ok(ch.is_ascii_alphanumeric() || ch == '$' || ch == '_');
+        return ch.is_ascii_alphanumeric() || ch == '$' || ch == '_';
     }
     if ch == '\u{200C}' || ch == '\u{200D}' {
-        return Ok(true);
+        return true;
     }
-    if definitely_not_an_identifier_character(ch) {
-        return Ok(false);
-    }
-    Err(refusal(ch))
-}
-
-/// A code point this scanner declines to classify.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unsupported {
-    pub code_point: char,
-    pub reason: &'static str,
-}
-
-fn refusal(code_point: char) -> Unsupported {
-    Unsupported {
-        code_point,
-        reason: "non-ASCII identifiers need ID_Start/ID_Continue tables, which this frontend does \
-                 not carry. It will not substitute XID_Start/XID_Continue, which differ: that would \
-                 silently accept and reject the wrong programs. Absent and listed, never wrong.",
-    }
+    lamella_unicode::is_id_continue(ch as u32)
 }
 
 #[cfg(test)]
@@ -70,57 +28,81 @@ mod tests {
     #[test]
     fn the_ascii_alphabet_is_exact() {
         for ch in ['a', 'Z', '$', '_'] {
-            assert_eq!(is_id_start(ch), Ok(true), "{ch:?} starts an identifier");
+            assert!(is_id_start(ch), "{ch:?} starts an identifier");
         }
         for ch in ['0', '9'] {
-            assert_eq!(is_id_start(ch), Ok(false), "{ch:?} cannot START one");
-            assert_eq!(is_id_continue(ch), Ok(true), "but it can continue one");
+            assert!(!is_id_start(ch), "{ch:?} cannot START one");
+            assert!(is_id_continue(ch), "but it can continue one");
         }
         for ch in ['+', ' ', '-', '.'] {
-            assert_eq!(is_id_start(ch), Ok(false));
-            assert_eq!(is_id_continue(ch), Ok(false));
+            assert!(!is_id_start(ch));
+            assert!(!is_id_continue(ch));
         }
     }
 
-    /// THE POINT OF THIS MODULE. A code point we cannot classify must not answer `false`: that
-    /// would report a conforming program as a syntax error, indistinguishably from a genuine one.
+    /// A non-ASCII letter is an ordinary identifier character, answered from the canonical table.
     #[test]
-    fn an_unclassifiable_code_point_refuses_rather_than_answering_no() {
-        let result = is_id_start('\u{00E9}');
-        assert!(result.is_err(), "the answer is 'cannot say', which is not 'no'");
-        assert_eq!(result.unwrap_err().code_point, '\u{00E9}', "and it names the code point");
+    fn a_non_ascii_letter_is_an_identifier_character() {
+        assert!(is_id_start('\u{00E9}'), "LATIN SMALL LETTER E WITH ACUTE");
+        assert!(is_id_continue('\u{00E9}'));
+        assert!(is_id_start('\u{4E00}'), "CJK UNIFIED IDEOGRAPH-4E00");
+        assert!(is_id_start('\u{05D0}'), "HEBREW LETTER ALEF");
     }
 
-    /// ZWNJ/ZWJ come from the GRAMMAR rather than from ID_Continue, so they are answerable without
-    /// the tables -- and answering them costs nothing while refusing them would be wrong.
+    /// A combining mark CONTINUES an identifier and cannot START one. The two properties are
+    /// distinct sets and this is the cheapest case that tells them apart.
     #[test]
-    fn the_grammars_own_additions_are_answered_not_refused() {
-        assert_eq!(is_id_continue('\u{200C}'), Ok(true), "ZWNJ");
-        assert_eq!(is_id_continue('\u{200D}'), Ok(true), "ZWJ");
-        assert!(is_id_start('\u{200C}').is_err(), "but neither may START an identifier");
+    fn a_combining_mark_continues_but_does_not_start() {
+        assert!(!is_id_start('\u{0301}'), "COMBINING ACUTE ACCENT");
+        assert!(is_id_continue('\u{0301}'));
     }
 
-    /// THE DEFECT THIS GUARDS, and it was live: refusing is right when the answer is unknown and
-    /// WRONG when the code point merely ends the identifier. `a<U+2028>b` is an ordinary program.
-    /// The first version rejected it, turning "refuse rather than guess" into "reject anything
-    /// unfamiliar" -- which fails conforming programs, the exact failure mode the rule exists to
-    /// prevent.
+    /// The grammar's own additions are answered here, and the table's agreement is checked rather
+    /// than assumed -- so the redundancy is a measured fact, and this test names what changed if a
+    /// future UCD ever drops them while the engine keeps answering correctly.
+    ///
     #[test]
-    fn a_code_point_that_merely_ends_an_identifier_is_answered_not_refused() {
+    fn the_grammars_own_additions_are_answered_whatever_the_table_says() {
+        assert!(is_id_continue('\u{200C}'), "ZWNJ");
+        assert!(is_id_continue('\u{200D}'), "ZWJ");
+        assert!(!is_id_start('\u{200C}'), "but neither may START an identifier");
+        assert!(!is_id_start('\u{200D}'));
+        assert!(lamella_unicode::is_id_continue(0x200C), "and the table agrees today");
+        assert!(lamella_unicode::is_id_continue(0x200D));
+        assert!(!lamella_unicode::is_id_start(0x200C), "in both directions");
+    }
+
+    /// A code point that merely ENDS an identifier answers `false`, because `a<U+2028>b` is an
+    /// ordinary program. Zl, Zp, Zs and Cc are disjoint from both properties, so the table answers
+    /// it directly.
+    ///
+    #[test]
+    fn a_code_point_that_merely_ends_an_identifier_answers_no() {
         for terminator in ['\u{2028}', '\u{2029}', '\u{00A0}', '\u{3000}', '\u{FEFF}'] {
-            assert_eq!(
-                is_id_continue(terminator),
-                Ok(false),
-                "{terminator:?} ends an identifier; that is a fact, not a guess"
-            );
-            assert_eq!(is_id_start(terminator), Ok(false));
+            assert!(!is_id_continue(terminator), "{terminator:?} ends an identifier");
+            assert!(!is_id_start(terminator));
         }
     }
 
+    /// THE FAST PATH IS A SECOND IMPLEMENTATION AND THIS IS WHAT STOPS IT DRIFTING.
+    ///
+    /// Both halves return a plain `bool`, so a disagreement between the ASCII branch and the table
+    /// would be a wrong answer with no diagnostic anywhere. The equality is asserted over all 128
+    /// ASCII code points against the table plus exactly the members the grammar adds -- which also
+    /// pins those additions: if `_` ever entered ID_Start upstream, the `start` line fails here
+    /// rather than silently becoming redundant.
     #[test]
-    fn the_refusal_says_why_and_names_the_substitution_it_refuses_to_make() {
-        let reason = is_id_start('\u{4E00}').unwrap_err().reason;
-        assert!(reason.contains("ID_Start"), "names what is missing");
-        assert!(reason.contains("XID_Start"), "and names the wrong answer it declines to give");
+    fn the_ascii_fast_path_equals_the_table() {
+        for cp in 0u32..128 {
+            let ch = char::from_u32(cp).expect("ASCII");
+            let table_start = lamella_unicode::is_id_start(cp) || ch == '$' || ch == '_';
+            let table_continue = lamella_unicode::is_id_continue(cp) || ch == '$';
+            assert_eq!(is_id_start(ch), table_start, "start disagrees at U+{cp:04X} ({ch:?})");
+            assert_eq!(
+                is_id_continue(ch),
+                table_continue,
+                "continue disagrees at U+{cp:04X} ({ch:?})"
+            );
+        }
     }
 }

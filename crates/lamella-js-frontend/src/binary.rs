@@ -46,7 +46,7 @@ fn install_array_buffer(interpreter: &mut Interpreter) {
         Completion::Normal(JsValue::Boolean(is_view))
     });
 
-    accessor(interpreter, prototype, "byteLength", |interpreter, this, _| {
+    accessor(interpreter, prototype, "byteLength", "get byteLength", |interpreter, this, _| {
         match buffer_bytes(interpreter, &this) {
             Ok((_, detached)) if detached => Completion::Normal(JsValue::Number(0.0)),
             Ok((length, _)) => Completion::Normal(JsValue::Number(length as f64)),
@@ -177,19 +177,19 @@ fn install_data_view(interpreter: &mut Interpreter) {
     interpreter.define_global("DataView", JsValue::Object(constructor));
     to_string_tag(interpreter, prototype, "DataView");
 
-    accessor(interpreter, prototype, "buffer", |interpreter, this, _| {
+    accessor(interpreter, prototype, "buffer", "get buffer", |interpreter, this, _| {
         match view_of(interpreter, &this) {
             Ok((buffer, _, _)) => Completion::Normal(JsValue::Object(buffer)),
             Err(abrupt) => abrupt,
         }
     });
-    accessor(interpreter, prototype, "byteLength", |interpreter, this, _| {
+    accessor(interpreter, prototype, "byteLength", "get byteLength", |interpreter, this, _| {
         match view_window(interpreter, &this) {
             Ok((_, _, length)) => Completion::Normal(JsValue::Number(length as f64)),
             Err(abrupt) => abrupt,
         }
     });
-    accessor(interpreter, prototype, "byteOffset", |interpreter, this, _| {
+    accessor(interpreter, prototype, "byteOffset", "get byteOffset", |interpreter, this, _| {
         match view_window(interpreter, &this) {
             Ok((_, offset, _)) => Completion::Normal(JsValue::Number(offset as f64)),
             Err(abrupt) => abrupt,
@@ -505,13 +505,19 @@ fn relative_index(
     Ok(resolved.max(0.0).min(length as f64) as usize)
 }
 
+/// One accessor on an `ArrayBuffer` or `DataView` prototype.
+///
+/// **THE GETTER'S OWN NAME IS PASSED IN RATHER THAN COMPOSED**, for the reason the typed-array
+/// installer gives: a built-in's `name` is a `&'static str`, `f.name` is observable, and the
+/// committed realm rendering records every one of these verbatim.
 fn accessor(
     interpreter: &mut Interpreter,
     target: ObjectId,
-    name: &str,
+    name: &'static str,
+    getter_name: &'static str,
     get: crate::interpreter::NativeFn,
 ) {
-    let getter = interpreter.native_function(&crate::format!("get {name}"), 0, get);
+    let getter = interpreter.native_function(getter_name, 0, get);
     interpreter.object_mut(target).set_own(
         PropertyKey::from_str(name),
         Property {

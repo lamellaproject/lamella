@@ -325,6 +325,9 @@ pub fn emit_expression(
             when_true,
             when_false,
         } => emit_conditional(condition, when_true, when_false, frame, tokens, out),
+        BoundExprKind::NullCoalescing { left, right } => {
+            emit_null_coalescing(left, right, frame, tokens, out)
+        }
         BoundExprKind::TypeOf(target) => emit_typeof(target, tokens, out),
         BoundExprKind::SizeOf(target) => emit_sizeof(target, tokens, out),
         BoundExprKind::DefaultValue(target) => emit_default_value(target, frame, tokens, out),
@@ -464,6 +467,9 @@ pub fn emit_expression(
                 "this assignment target is not lowered as an expression yet",
             )),
         },
+        BoundExprKind::Await { .. } => Err(EmitError::Unsupported(
+            "an await expression is not lowered yet (the async state machine is in flight)",
+        )),
         _ => Err(EmitError::Unsupported(
             "this expression form is not lowered yet",
         )),
@@ -515,6 +521,40 @@ fn emit_conditional(
     out.push(Instruction::new(Opcode::Br, Operand::Target(0)));
     out[to_else].operand = Operand::Target(out.len() as u32);
     emit_expression(when_false, frame, tokens, out)?;
+    out[to_end].operand = Operand::Target(out.len() as u32);
+    Ok(())
+}
+
+/// Lowers `left ?? right` (14.13) as csc does: the left value is evaluated ONCE, duplicated, and
+/// kept when it is not null.
+///
+/// ```text
+/// <left>          the value under test
+/// dup             a copy for the test, so the value survives it
+/// brtrue  end     not null: the copy on the stack IS the result
+/// pop             null: drop it
+/// <right>
+/// end:
+/// ```
+///
+/// **THE `dup` IS WHAT MAKES THIS ONE EVALUATION**, which is the whole difference from the
+/// desugaring `left != null ? left : right`: that one emits `left` twice, so any side effect in it
+/// happens twice. The binder converted both operands to the result type already, and for a
+/// reference type that conversion emits nothing -- which is why the duplicated value needs no
+/// further work on the non-null path.
+fn emit_null_coalescing(
+    left: &BoundExpr,
+    right: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    emit_expression(left, frame, tokens, out)?;
+    out.push(Instruction::simple(Opcode::Dup));
+    let to_end = out.len();
+    out.push(Instruction::new(Opcode::Brtrue, Operand::Target(0)));
+    out.push(Instruction::simple(Opcode::Pop));
+    emit_expression(right, frame, tokens, out)?;
     out[to_end].operand = Operand::Target(out.len() as u32);
     Ok(())
 }

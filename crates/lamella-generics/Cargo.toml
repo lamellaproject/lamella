@@ -11,6 +11,7 @@ description = "The closed generic instantiation set a program uses, and the cano
 # The alternative was a second implementation of a v1-frozen wire value in the other tier, which
 # would not fail loudly -- two spellings agreeing on `Pair`2[System.Int32,System.String]` and
 # diverging on the first NESTED or ARRAY argument is a type that exists twice.
+publish = false
 [dependencies]
 lamella-cil = { path = "../lamella-cil" }
 lamella-ir = { path = "../lamella-ir" }

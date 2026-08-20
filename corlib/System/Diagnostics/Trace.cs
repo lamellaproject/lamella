@@ -3,6 +3,8 @@ namespace System.Diagnostics
 {
     public sealed class Trace
     {
+        private Trace() { }
+
         private static TraceListenerCollection _listeners;
         private static int _indentLevel;
         private static int _indentSize = 4;

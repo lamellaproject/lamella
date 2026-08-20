@@ -3173,9 +3173,20 @@ impl Session {
                 Ok(Status::Running)
             }
             Flow::InitObj { location, kind } => {
-                let defaults = module
-                    .type_id_of(asm, kind)
-                    .and_then(|type_id| module.type_field_defaults(type_id));
+                let type_id = module.type_id_of(asm, kind);
+                let defaults = type_id.and_then(|type_id| module.type_field_defaults(type_id));
+                if defaults.as_ref().is_none_or(|fields| fields.is_empty())
+                    && !module.is_enum_by_handle(asm_key(asm, kind.0))
+                {
+                    if let Some(zero) = type_id.and_then(|id| module.primitive_zero_of_type(id)) {
+                        write_location_value(frames, vm, location, zero)?;
+                        return Ok(Status::Running);
+                    }
+                    if type_id.is_some_and(|type_id| !module.type_is_value_type(type_id)) {
+                        write_location_value(frames, vm, location, Value::Null)?;
+                        return Ok(Status::Running);
+                    }
+                }
                 let value = match defaults {
                     Some(defaults) if module.is_enum_by_handle(asm_key(asm, kind.0)) => {
                         defaults.into_iter().next().unwrap_or(Value::Int32(0))
@@ -5248,6 +5259,25 @@ fn step(
                 frame.stack.push(value);
                 return Ok(Flow::Next);
             }
+            if let Some(underlying) =
+                module.and_then(|module| nullable_underlying_of(module, asm, token))
+            {
+                let Value::Struct(fields) = &value else {
+                    return Err(Trap::TypeMismatch(Opcode::Box));
+                };
+                let (Some(has_value), Some(inner)) = (fields.first(), fields.get(1)) else {
+                    return Err(Trap::TypeMismatch(Opcode::Box));
+                };
+                if !has_value.is_truthy() {
+                    frame.stack.push(Value::Null);
+                    return Ok(Flow::Next);
+                }
+                let inner = inner.clone();
+                check_alloc_budget(vm)?;
+                let reference = vm.heap_mut().alloc_boxed(underlying, inner);
+                frame.stack.push(Value::Object(reference));
+                return Ok(Flow::Next);
+            }
             check_alloc_budget(vm)?;
             let reference = vm.heap_mut().alloc_boxed(asm_key(asm, token.0), value);
             frame.stack.push(Value::Object(reference));
@@ -5255,6 +5285,15 @@ fn step(
         Opcode::Unbox => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Unbox))?;
             let token = token_operand(instruction)?;
+            if let Some(underlying) = nullable_underlying_of(module, asm, token) {
+                let source = frame.pop()?;
+                let value = nullable_from_boxed(module, vm, asm, token, underlying, &source)
+                    .ok_or(Trap::InvalidCast)?;
+                check_alloc_budget(vm)?;
+                let object = vm.heap_mut().alloc_boxed(asm_key(asm, token.0), value);
+                frame.stack.push(Value::ByRef(Location::Boxed { object }));
+                return Ok(Flow::Next);
+            }
             let reference = object_ref(frame.pop()?, Opcode::Unbox)?;
             if !unbox_matches(module, asm, vm, reference, token) {
                 return Err(Trap::InvalidCast);
@@ -5266,6 +5305,13 @@ fn step(
         Opcode::UnboxAny => {
             let module = module.ok_or(Trap::Unsupported(Opcode::UnboxAny))?;
             let token = token_operand(instruction)?;
+            if let Some(underlying) = nullable_underlying_of(module, asm, token) {
+                let source = frame.pop()?;
+                let value = nullable_from_boxed(module, vm, asm, token, underlying, &source)
+                    .ok_or(Trap::InvalidCast)?;
+                frame.stack.push(value);
+                return Ok(Flow::Next);
+            }
             let reference = object_ref(frame.pop()?, Opcode::UnboxAny)?;
             match vm.heap().boxed_value(reference) {
                 Some(value) => {
@@ -6753,6 +6799,80 @@ fn resolve_callvirt(
     static_method
 }
 
+/// The asm-folded handle of `T` when the type `token` names is an instantiation of
+/// `System.Nullable<T>`, else `None` -- the one question the four special-cased instruction arms
+/// (III.4.1 `box`, III.4.3 `castclass`, III.4.6 `isinst`, III.4.32 / III.4.33 `unbox` /
+/// `unbox.any`) ask, in the form all four need the answer in.
+///
+/// Recorded per TYPE at load rather than per token, so a closed `TypeSpec` in a program and a
+/// synthetic token in a rewritten generic body reach the same answer.
+#[cfg(feature = "generics")]
+fn nullable_underlying_of(module: &Module, asm: u8, token: Token) -> Option<u64> {
+    module
+        .type_id_of(asm, token)
+        .and_then(|type_id| module.nullable_underlying(type_id))
+}
+
+/// Always `None` without the monomorphizer, because a `Nullable<T>` is an INSTANTIATION and there
+/// is no pass to create one -- so every arm that asks this is unreachable rather than merely idle.
+///
+/// # Why the gate is one function rather than a `cfg` on each arm
+///
+/// Four arms ask this question and each keeps its `if let Some(underlying) = ...` unchanged; with
+/// the constant `None` the branch folds away and `nullable_from_boxed` loses its only caller, so
+/// the whole rule set leaves the build through dead-code elimination rather than through four
+/// conditionally-compiled blocks that could drift apart.
+#[cfg(not(feature = "generics"))]
+fn nullable_underlying_of(_module: &Module, _asm: u8, _token: Token) -> Option<u64> {
+    None
+}
+
+/// The `Nullable<T>` instance `unbox` / `unbox.any` recover from `source`, or `None` when
+/// III.4.32's InvalidCastException applies ("valuetype is a Nullable<T> and obj is not a boxed T").
+///
+/// `token` names the `Nullable<T>` instantiation and `underlying` is `T`'s handle. A null reference
+/// yields the type's own zero -- the same value `initobj` writes, read from the same field defaults,
+/// so `(int?)(object)null` and `default(int?)` cannot disagree.
+fn nullable_from_boxed(
+    module: &Module,
+    vm: &Vm,
+    asm: u8,
+    token: Token,
+    underlying: u64,
+    source: &Value,
+) -> Option<Value> {
+    if matches!(source, Value::Null) {
+        let defaults = module
+            .type_id_of(asm, token)
+            .and_then(|type_id| module.type_field_defaults(type_id))?;
+        return Some(Value::Struct(defaults.into_boxed_slice()));
+    }
+    let Value::Object(reference) = source else {
+        return None;
+    };
+    let boxed = vm.heap().boxed_value(*reference)?;
+    if !boxed_is_underlying(module, vm.heap().boxed_type_token(*reference)?, underlying) {
+        return None;
+    }
+    Some(Value::Struct(alloc::vec![Value::Int32(1), boxed].into_boxed_slice()))
+}
+
+/// Whether a box tagged `box_handle` holds the `underlying` type -- the "obj is a boxed T" test
+/// every nullable arm makes.
+///
+fn boxed_is_underlying(module: &Module, box_handle: u64, underlying: u64) -> bool {
+    if box_handle == underlying {
+        return true;
+    }
+    match (
+        module.type_id_by_handle(box_handle),
+        module.type_id_by_handle(underlying),
+    ) {
+        (Some(from_box), Some(want)) => from_box == want,
+        _ => false,
+    }
+}
+
 /// Whether `value` can be `castclass`/`isinst` to `token`'s type: null matches; a
 /// reference matches when its runtime type is a subtype of the target OR implements the
 /// target interface.
@@ -6766,13 +6886,20 @@ fn resolve_callvirt(
 ///   interface its value type declares -- so a boxed `int` is precisely *not* a `string` /
 ///   an unrelated class, but IS castable to an interface it implements;
 /// - a heap **string** matches `System.String`, `System.Object`, or an interface the
-///   `System.String` type declares, and nothing else.
+///   `System.String` type declares, and nothing else;
+/// - a target that is a `Nullable<T>` matches a boxed **T**, per III.4.3 and III.4.6.
 fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) -> bool {
     let reference = match value {
         Value::Null => return true,
         Value::Object(reference) => *reference,
         _ => return false,
     };
+    if let Some(underlying) = nullable_underlying_of(module, asm, token) {
+        return vm
+            .heap()
+            .boxed_type_token(reference)
+            .is_some_and(|box_handle| boxed_is_underlying(module, box_handle, underlying));
+    }
     let target_type_id = module.type_id_of(asm, token);
     if let Some(runtime) = vm.heap().type_of(reference) {
         return match target_type_id {
@@ -8691,6 +8818,178 @@ mod tests {
             super::run(&baked, &mut vm, entry, Vec::new()),
             Ok(Some(Value::Int32(7))),
             "after boot_baked the static holds what its constructor wrote"
+        );
+    }
+
+    /// A module holding `System.Nullable<T>` over one value type, wired exactly as the loader
+    /// wires a real one: the instantiation is a two-field value type (`hasValue`, then `value`)
+    /// and `bind_nullable_underlying` records `T`'s handle against its `TypeId`.
+    ///
+    /// # Why these two rules are tested from hand-built IL and not from a fixture
+    ///
+    /// `castclass` and `unbox` with a `Nullable<T>` operand are **unreachable from C#**. Roslyn
+    /// lowers `o as int?` / `o is int?` to `isinst` and `(int?)o` to `unbox.any`, so no source any
+    /// compiler accepts produces either instruction against a nullable -- a fixture population
+    /// cannot contain one. III.4.3 and III.4.32 still specify them, an IL producer may emit them,
+    /// and an arm nothing exercises is an arm nobody has run.
+    ///
+    /// The underlying type gets TWO tokens bound to it, because a box's tag is not always the
+    /// handle recorded as `T`: a value boxed in one assembly and tested in another carries two
+    /// different tokens for one type, and a same-handle test would answer `false` for it.
+    fn nullable_program(code: Vec<Instruction>) -> (Module, MethodId) {
+        let int_def = Token(0x0200_0001);
+        let nullable_spec = Token(0x1B00_0001);
+        let mut module = Module::new();
+
+        let int_type = module.add_type(vec![]);
+        module.set_type_is_value_type(int_type, true);
+        module.bind_type_token(0, int_def, int_type);
+        module.bind_type_token(0, Token(0x0100_0007), int_type);
+
+        let nullable = module.add_type(vec![Value::Int32(0), Value::Int32(0)]);
+        module.set_type_is_value_type(nullable, true);
+        module.bind_type_token(0, nullable_spec, nullable);
+        module.bind_nullable_underlying(nullable, asm_key(0, int_def.0));
+
+        let main = module.add_method_image(0, method(code), 0);
+        (module, main)
+    }
+
+    /// III.4.32 with a nullable operand type: `unbox` cannot hand back an interior pointer into the
+    /// box (a boxed `Nullable<T>` is a boxed **T**, which has no `Nullable<T>` inside it), so the
+    /// standard's own note says an implementation "must manufacture a new Nullable<T> on the heap
+    /// and compute the address to the newly allocated object". `ldobj` through that pointer reads
+    /// the manufactured instance.
+    #[test]
+    fn unbox_of_a_nullable_manufactures_an_instance_and_points_at_it() {
+        let (module, main) = nullable_program(
+            vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::new(Opcode::Box, Operand::Token(Token(0x0200_0001))),
+                Instruction::new(Opcode::Unbox, Operand::Token(Token(0x1B00_0001))),
+                Instruction::new(Opcode::Ldobj, Operand::Token(Token(0x1B00_0001))),
+                ret(),
+            ],
+        );
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Struct(
+                vec![Value::Int32(1), Value::Int32(42)].into_boxed_slice()
+            ))),
+            "a boxed T unboxes to an instance holding it, with HasValue true"
+        );
+    }
+
+    /// The other half of III.4.32's exception list, and the half that separates a nullable operand
+    /// from every other one: NullReferenceException is specified for "obj is null and valuetype is
+    /// a NON-nullable value type". A nullable gets an instance whose `HasValue` is false instead --
+    /// the type's own field defaults, the same value `initobj` writes.
+    #[test]
+    fn unbox_of_a_nullable_from_null_is_an_instance_with_no_value() {
+        let (module, main) = nullable_program(
+            vec![
+                Instruction::simple(Opcode::Ldnull),
+                Instruction::new(Opcode::Unbox, Operand::Token(Token(0x1B00_0001))),
+                Instruction::new(Opcode::Ldobj, Operand::Token(Token(0x1B00_0001))),
+                ret(),
+            ],
+        );
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Struct(
+                vec![Value::Int32(0), Value::Int32(0)].into_boxed_slice()
+            ))),
+            "null is not the NullReference site here -- it is HasValue false"
+        );
+    }
+
+    /// III.4.32's InvalidCastException clause, verbatim: thrown when "valuetype is a Nullable<T>
+    /// and obj is not a boxed T". The control for the two tests above -- without it they would pass
+    /// against an arm that accepted any box at all.
+    #[test]
+    fn unbox_of_a_nullable_from_a_box_of_another_type_is_an_invalid_cast() {
+        let unrelated = Token(0x0200_0009);
+        let mut code = vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+            Instruction::new(Opcode::Box, Operand::Token(unrelated)),
+            Instruction::new(Opcode::Unbox, Operand::Token(Token(0x1B00_0001))),
+            Instruction::new(Opcode::Ldobj, Operand::Token(Token(0x1B00_0001))),
+        ];
+        code.push(ret());
+        let (mut module, main) = nullable_program(code);
+        let other = module.add_type(vec![]);
+        module.set_type_is_value_type(other, true);
+        module.bind_type_token(0, unrelated, other);
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Err(Trap::UnhandledException),
+            "a boxed non-T is InvalidCastException, thrown"
+        );
+    }
+
+    /// III.4.3, verbatim: "When class is the type System.Nullable<T> and the object's class is T,
+    /// castclass succeeds." Reachable only from hand-written IL -- Roslyn spells the same test with
+    /// `isinst`.
+    #[test]
+    fn castclass_to_a_nullable_succeeds_on_a_boxed_underlying_value() {
+        let (module, main) = nullable_program(
+            vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::new(Opcode::Box, Operand::Token(Token(0x0200_0001))),
+                Instruction::new(Opcode::Castclass, Operand::Token(Token(0x1B00_0001))),
+                Instruction::new(Opcode::UnboxAny, Operand::Token(Token(0x0200_0001))),
+                ret(),
+            ],
+        );
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Int32(42))),
+            "the cast succeeds and leaves the boxed T, which unboxes as T"
+        );
+    }
+
+    /// The cross-assembly form of the same rule, and the reason the handles are compared through
+    /// their resolved `TypeId`: the box is tagged with a SECOND token for the underlying type,
+    /// which is what a value boxed in the corlib and tested from a program looks like. A
+    /// handle-equality test alone answers `false` here.
+    #[test]
+    fn a_nullable_cast_matches_a_box_tagged_through_another_token_for_the_same_type() {
+        let (module, main) = nullable_program(
+            vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::new(Opcode::Box, Operand::Token(Token(0x0100_0007))),
+                Instruction::new(Opcode::Isinst, Operand::Token(Token(0x1B00_0001))),
+                Instruction::new(Opcode::UnboxAny, Operand::Token(Token(0x0100_0007))),
+                ret(),
+            ],
+        );
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Int32(42))),
+            "two tokens for one type are one type"
+        );
+    }
+
+    /// The negative control for both cast rules: a box of some OTHER type is not an instance of
+    /// `Nullable<T>`, and `isinst` answers null rather than succeeding.
+    #[test]
+    fn isinst_to_a_nullable_rejects_a_box_of_another_type() {
+        let unrelated = Token(0x0200_0009);
+        let (mut module, main) = nullable_program(
+            vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                Instruction::new(Opcode::Box, Operand::Token(unrelated)),
+                Instruction::new(Opcode::Isinst, Operand::Token(Token(0x1B00_0001))),
+                ret(),
+            ],
+        );
+        let other = module.add_type(vec![]);
+        module.set_type_is_value_type(other, true);
+        module.bind_type_token(0, unrelated, other);
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Null)),
+            "isinst answers null for a box that is not a boxed T"
         );
     }
 

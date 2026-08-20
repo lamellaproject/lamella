@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Host side of the Lamella Link debug + REPL channel: a serial (USB-CDC / UART) Transport over lamella-wire, and the host-stateless REPL -- the host compiles a submission and the target runs the CIL + returns its output. The reference runner runs in-process for host-side testing; the same runner core flashes onto a device behind the wire."
+publish = false
 
 [dependencies]
 # The no_std runner core (run_program / serve_one / RunResult / repl), shared with the on-device firmware;
@@ -73,3 +74,6 @@ debug-backend = ["serial", "dep:lamella-debug-backend", "dep:serde", "dep:serde_
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+lamella-flash-format = { path = "../lamella-flash-format" }

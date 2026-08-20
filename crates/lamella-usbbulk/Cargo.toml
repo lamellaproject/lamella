@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Cross-platform USB bulk transport for CMSIS-DAP v2 probes -- the v2 sibling of lamella-usbhid: WinUSB on Windows, IOKit IOUSBLib on macOS, usbfs on Linux. No 3rd-party USB crates."
+publish = false
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

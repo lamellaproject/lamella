@@ -16,6 +16,7 @@ description = "The socket seam every Lamella language runtime drives: non-blocki
 # (a Wi-Fi module, a Pico W radio, smoltcp over an Ethernet MAC, the host's own sockets) together
 # with settled would-block and handle-lifetime semantics. The alternative is a second socket stack
 # that disagrees with this one about whether a `recv` of 0 is a clean close.
+publish = false
 [dependencies]
 
 [lints]

@@ -90,6 +90,16 @@ impl TypeSymbol {
     }
 }
 
+/// Whether a definition and its arguments are `System.Nullable<T>` -- the type `T?` denotes
+/// (11.4). One argument and the two-part `System.Nullable` name; the last part is unmangled here,
+/// as [`TypeSymbol::Instantiation`] holds it everywhere.
+#[must_use]
+pub(crate) fn is_nullable(definition: &[Box<str>], arguments: &[TypeSymbol]) -> bool {
+    arguments.len() == 1
+        && matches!(definition, [namespace, name]
+            if &**namespace == "System" && &**name == "Nullable")
+}
+
 /// Renders a type as C# SOURCE would spell it, for a diagnostic.
 ///
 /// **THIS IS NOT THE CANONICAL INSTANTIATION SPELLING AND MUST NEVER BECOME IT.** An
@@ -118,21 +128,38 @@ impl fmt::Display for TypeSymbol {
             TypeSymbol::Instantiation {
                 definition,
                 arguments,
+            } if is_nullable(definition, arguments) => {
+                write!(f, "{}?", arguments[0])
+            }
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
             } => {
+                let mut taken = 0usize;
                 for (index, part) in definition.iter().enumerate() {
                     if index > 0 {
                         f.write_str(".")?;
                     }
-                    f.write_str(part)?;
-                }
-                f.write_str("<")?;
-                for (index, argument) in arguments.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
+                    f.write_str(&crate::symbols::unmangled_type_name(part))?;
+                    let own = if index + 1 == definition.len() {
+                        arguments.len().saturating_sub(taken)
+                    } else {
+                        crate::symbols::mangled_arity(part)
+                    };
+                    let end = taken.saturating_add(own).min(arguments.len());
+                    if taken < end {
+                        f.write_str("<")?;
+                        for (position, argument) in arguments[taken..end].iter().enumerate() {
+                            if position > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{argument}")?;
+                        }
+                        f.write_str(">")?;
                     }
-                    write!(f, "{argument}")?;
+                    taken = end;
                 }
-                f.write_str(">")
+                Ok(())
             }
             TypeSymbol::Array { element, rank } => {
                 write!(f, "{element}[")?;

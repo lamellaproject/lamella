@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "CIL emission for C# 1.0: lowering the binder's bound tree to CIL."
+publish = false
 
 [dependencies]
 lamella-syntax = { path = "../lamella-syntax" }

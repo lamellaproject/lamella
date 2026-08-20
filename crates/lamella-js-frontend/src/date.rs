@@ -670,14 +670,18 @@ fn parse_date(text: &str) -> f64 {
     if bytes.get(rest) != Some(&b'-') {
         return parse_rendered(text);
     }
-    let Some(month) = digits(rest + 1, 2) else { return f64::NAN };
+    let Some(month) = digits(rest + 1, 2).filter(|m| (1.0..=12.0).contains(m)) else {
+        return f64::NAN;
+    };
     if bytes.len() == rest + 3 {
         return time_clip(days_from_civil(year, month - 1.0, 1.0) * MS_PER_DAY);
     }
     if bytes.get(rest + 3) != Some(&b'-') {
         return f64::NAN;
     }
-    let Some(day) = digits(rest + 4, 2) else { return f64::NAN };
+    let Some(day) = digits(rest + 4, 2).filter(|d| (1.0..=31.0).contains(d)) else {
+        return f64::NAN;
+    };
     let date_only = days_from_civil(year, month - 1.0, day) * MS_PER_DAY;
     if bytes.len() == rest + 6 {
         return time_clip(date_only);
@@ -685,7 +689,10 @@ fn parse_date(text: &str) -> f64 {
     if bytes.get(rest + 6) != Some(&b'T') {
         return f64::NAN;
     }
-    let (Some(hours), Some(minutes)) = (digits(rest + 7, 2), digits(rest + 10, 2)) else {
+    let (Some(hours), Some(minutes)) = (
+        digits(rest + 7, 2).filter(|h| (0.0..=24.0).contains(h)),
+        digits(rest + 10, 2).filter(|m| (0.0..=59.0).contains(m)),
+    ) else {
         return f64::NAN;
     };
     if bytes.get(rest + 9) != Some(&b':') {
@@ -694,7 +701,9 @@ fn parse_date(text: &str) -> f64 {
     let mut time = date_only + hours * MS_PER_HOUR + minutes * MS_PER_MINUTE;
     let mut at = rest + 12;
     if bytes.get(at) == Some(&b':') {
-        let Some(seconds) = digits(at + 1, 2) else { return f64::NAN };
+        let Some(seconds) = digits(at + 1, 2).filter(|s| (0.0..=59.0).contains(s)) else {
+            return f64::NAN;
+        };
         time += seconds * MS_PER_SECOND;
         at += 3;
         if bytes.get(at) == Some(&b'.') {
@@ -703,9 +712,25 @@ fn parse_date(text: &str) -> f64 {
             at += 4;
         }
     }
+    if hours == 24.0 && time != date_only + 24.0 * MS_PER_HOUR {
+        return f64::NAN;
+    }
     match bytes.get(at) {
         None => time_clip(time),
         Some(&b'Z') if at + 1 == bytes.len() => time_clip(time),
+        Some(&sign) if sign == b'+' || sign == b'-' => {
+            if bytes.len() != at + 6 || bytes.get(at + 3) != Some(&b':') {
+                return f64::NAN;
+            }
+            let (Some(offset_hours), Some(offset_minutes)) = (
+                digits(at + 1, 2).filter(|h| (0.0..=23.0).contains(h)),
+                digits(at + 4, 2).filter(|m| (0.0..=59.0).contains(m)),
+            ) else {
+                return f64::NAN;
+            };
+            let offset = offset_hours * MS_PER_HOUR + offset_minutes * MS_PER_MINUTE;
+            time_clip(if sign == b'+' { time - offset } else { time + offset })
+        }
         _ => f64::NAN,
     }
 }

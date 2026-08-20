@@ -65,6 +65,65 @@ fn radix_digit(unit: u16, radix: u32) -> Option<u32> {
     (value < radix).then_some(value)
 }
 
+/// The value of a run of digits, rounded to `f64` ONCE.
+///
+/// # WHY THIS IS NOT A LOOP OVER `f64`
+///
+/// `parseInt` is specified in two steps: read the digits as a MATHEMATICAL INTEGER, then convert
+/// that integer to a Number. Accumulating `value * radix + digit` in `f64` instead rounds at EVERY
+/// digit, and the error compounds into the answer rather than staying in the last place.
+/// `parseInt("12345678901234567890", 10)` answered `12345678901234569216` where the one correct
+/// rounding of that integer is `12345678901234567168` -- exactly one ulp, and invisible to any test
+/// whose numbers fit in 53 bits.
+///
+/// A `u128` holds every integer up to 38 decimal digits, so the exact path covers what programs
+/// contain and the cast at the end is the single rounding the standard asks for.
+///
+/// Past that width the answer is approximated, and this names the bound rather than claiming
+/// exactness. Radix 10 hands the text to the same correctly-rounded decimal parser `Number()`
+/// reaches, so it stays exact at any length; another radix resumes the accumulating loop. The
+/// standard permits an implementation-approximated integer for a radix outside 2, 4, 8, 10, 16 and
+/// 32, and for one of those an input needing more than 128 bits is this function's stated limit.
+fn digits_to_number(digits: &[u16], radix: u32) -> f64 {
+    let mut exact: u128 = 0;
+    for (index, unit) in digits.iter().enumerate() {
+        let digit = scanned_digit(*unit, radix);
+        match exact
+            .checked_mul(u128::from(radix))
+            .and_then(|shifted| shifted.checked_add(u128::from(digit)))
+        {
+            Some(next) => exact = next,
+            None => return wider_than_a_u128(digits, index, exact, radix),
+        }
+    }
+    exact as f64
+}
+
+/// The digits outran a `u128`. See [`digits_to_number`] for why this is a stated bound.
+fn wider_than_a_u128(digits: &[u16], resume_at: usize, so_far: u128, radix: u32) -> f64 {
+    if radix == 10 {
+        let mut text = String::with_capacity(digits.len());
+        for unit in digits {
+            let digit = scanned_digit(*unit, 10);
+            text.push(char::from_digit(digit, 10).expect("a decimal digit"));
+        }
+        if let Ok(value) = text.parse::<f64>() {
+            return value;
+        }
+    }
+    let mut value = so_far as f64;
+    for unit in &digits[resume_at..] {
+        value = value * f64::from(radix) + f64::from(scanned_digit(*unit, radix));
+    }
+    value
+}
+
+/// A digit the caller has already scanned in this radix. A miss here would mean the scan and this
+/// function disagree about what a digit is, which is an engine defect rather than bad input.
+fn scanned_digit(unit: u16, radix: u32) -> u32 {
+    radix_digit(unit, radix).expect("the caller scanned this run as digits in this radix")
+}
+
 /// `parseInt(string, radix)`.
 ///
 /// IT IS A PREFIX PARSER AND NEVER THROWS. `parseInt("12abc")` is 12, `parseInt("abc")` is `NaN`,
@@ -106,14 +165,13 @@ fn parse_int_radix(text: &JsString, radix: i32) -> f64 {
         }
     }
     let start = at;
-    let mut value = 0.0f64;
-    while let Some(digit) = units.get(at).copied().and_then(|u| radix_digit(u, radix)) {
-        value = value * f64::from(radix) + f64::from(digit);
+    while units.get(at).copied().and_then(|u| radix_digit(u, radix)).is_some() {
         at += 1;
     }
     if at == start {
         return f64::NAN;
     }
+    let value = digits_to_number(&units[start..at], radix);
     if negative {
         -value
     } else {
@@ -211,6 +269,7 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
     function_has_instance(interpreter);
     crate::iterator::install(interpreter);
     crate::generator::install(interpreter);
+    crate::regexp::install(interpreter);
     install_math(interpreter);
     crate::json::install(interpreter);
     crate::collections::install(interpreter);
@@ -223,6 +282,10 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
     install_global_functions(interpreter);
     crate::uri::install(interpreter);
     install_global_this(interpreter);
+
+    #[cfg(feature = "mutation-census")]
+    interpreter.seal_realm();
+
 }
 
 
@@ -582,6 +645,8 @@ fn install_object(interpreter: &mut Interpreter) {
                     "Function"
                 } else if object.date.is_some() {
                     "Date"
+                } else if object.regexp.is_some() {
+                    "RegExp"
                 } else {
                     match &object.primitive {
                         Some(JsValue::Boolean(_)) => "Boolean",
@@ -680,6 +745,38 @@ fn install_object(interpreter: &mut Interpreter) {
     interpreter.define_method(constructor, "values", 1, |interpreter, _this, arguments| {
         object_entries(interpreter, &arg(arguments, 0), false)
     });
+    interpreter.define_method(constructor, "fromEntries", 1, |interpreter, _this, arguments| {
+        let iterable = arg(arguments, 0);
+        if matches!(iterable, JsValue::Undefined | JsValue::Null) {
+            return interpreter.type_error("Object.fromEntries requires an iterable");
+        }
+        let entries = match crate::iterator::iterate_to_list(interpreter, &iterable) {
+            Ok(entries) => entries,
+            Err(abrupt) => return abrupt,
+        };
+        let object_prototype = interpreter.intrinsics.object_prototype;
+        let target = interpreter.allocate(Object::new(Some(object_prototype)));
+        for entry in entries {
+            let JsValue::Object(pair) = entry else {
+                return interpreter.type_error("Object.fromEntries needs each entry to be an object");
+            };
+            let key = match interpreter.get_property(pair, &PropertyKey::from_str("0")) {
+                Completion::Normal(value) => value,
+                abrupt => return abrupt,
+            };
+            let value = match interpreter.get_property(pair, &PropertyKey::from_str("1")) {
+                Completion::Normal(value) => value,
+                abrupt => return abrupt,
+            };
+            let key = match interpreter.to_property_key_value(&key) {
+                Ok(key) => key,
+                Err(abrupt) => return abrupt,
+            };
+            interpreter.object_mut(target).set_own(key, Property::data(value));
+        }
+        Completion::Normal(JsValue::Object(target))
+    });
+
     interpreter.define_method(constructor, "entries", 1, |interpreter, _this, arguments| {
         object_entries(interpreter, &arg(arguments, 0), true)
     });
@@ -3205,6 +3302,9 @@ fn install_string(interpreter: &mut Interpreter) {
     });
 
     interpreter.define_method(prototype, "includes", 1, |interpreter, this, arguments| {
+        if is_regexp(interpreter, &arg(arguments, 0)) {
+            return interpreter.type_error("this String method does not take a regular expression");
+        }
         let text = match coerce_to_string(interpreter, &this) {
             Ok(text) => text,
             Err(abrupt) => return abrupt,
@@ -3370,8 +3470,8 @@ fn install_string(interpreter: &mut Interpreter) {
             Err(abrupt) => return abrupt,
         };
         let pattern = arg(arguments, 0);
-        if pattern.is_object() {
-            return interpreter.refuse(Absence::StringReplaceRegExp);
+        if let Some(completion) = dispatch_replace(interpreter, &this, &pattern, arguments) {
+            return completion;
         }
         let pattern = match interpreter.to_string_value(&pattern) {
             Ok(pattern) => pattern,
@@ -3392,7 +3492,18 @@ fn install_string(interpreter: &mut Interpreter) {
             return Completion::Normal(JsValue::String(text));
         };
         let replacement = match literal {
-            Some(literal) => literal,
+            Some(literal) => match crate::regexp::get_substitution(
+                interpreter,
+                &pattern,
+                &text,
+                at,
+                &[],
+                &JsValue::Undefined,
+                &literal,
+            ) {
+                Ok(text) => text,
+                Err(abrupt) => return abrupt,
+            },
             None => {
                 let matched = JsValue::String(JsString::from_units(pattern.units()));
                 let result = interpreter.call_value(
@@ -3421,8 +3532,27 @@ fn install_string(interpreter: &mut Interpreter) {
             Err(abrupt) => return abrupt,
         };
         let pattern = arg(arguments, 0);
-        if pattern.is_object() {
-            return interpreter.refuse(Absence::StringReplaceRegExp);
+        if is_regexp(interpreter, &pattern) {
+            let JsValue::Object(id) = &pattern else {
+                unreachable!("is_regexp implies an object")
+            };
+            let flags = match interpreter.get_property(*id, &PropertyKey::from_str("flags")) {
+                Completion::Normal(value) => value,
+                abrupt => return abrupt,
+            };
+            if matches!(flags, JsValue::Undefined | JsValue::Null) {
+                return interpreter.type_error("replaceAll needs a pattern with readable flags");
+            }
+            let flags = match interpreter.to_string_value(&flags) {
+                Ok(flags) => flags,
+                Err(abrupt) => return abrupt,
+            };
+            if !flags.to_lossy_string().contains('g') {
+                return interpreter.type_error("replaceAll requires a global regular expression");
+            }
+        }
+        if let Some(completion) = dispatch_replace(interpreter, &this, &pattern, arguments) {
+            return completion;
         }
         let pattern = match interpreter.to_string_value(&pattern) {
             Ok(pattern) => pattern,
@@ -3445,7 +3575,18 @@ fn install_string(interpreter: &mut Interpreter) {
             let Some(found) = find_units(&units, pattern.units(), at) else { break };
             out.extend_from(&JsString::from_units(&units[at..found]));
             let piece = match &literal {
-                Some(literal) => literal.clone(),
+                Some(literal) => match crate::regexp::get_substitution(
+                    interpreter,
+                    &pattern,
+                    &text,
+                    found,
+                    &[],
+                    &JsValue::Undefined,
+                    literal,
+                ) {
+                    Ok(text) => text,
+                    Err(abrupt) => return abrupt,
+                },
                 None => {
                     let matched = JsValue::String(JsString::from_units(pattern.units()));
                     let result = interpreter.call_value(
@@ -3478,27 +3619,39 @@ fn install_string(interpreter: &mut Interpreter) {
         Completion::Normal(JsValue::String(out))
     });
 
-    for (name, absence) in [
-        ("match", Absence::StringMatch),
-        ("matchAll", Absence::StringMatchAll),
-        ("search", Absence::StringSearch),
-    ] {
-        let call: crate::interpreter::NativeFn = match absence {
-            Absence::StringMatch => |interpreter, this, _| {
-                coerce_to_string(interpreter, &this)
-                    .map_or_else(|abrupt| abrupt, |_| interpreter.refuse(Absence::StringMatch))
-            },
-            Absence::StringMatchAll => |interpreter, this, _| {
-                coerce_to_string(interpreter, &this)
-                    .map_or_else(|abrupt| abrupt, |_| interpreter.refuse(Absence::StringMatchAll))
-            },
-            _ => |interpreter, this, _| {
-                coerce_to_string(interpreter, &this)
-                    .map_or_else(|abrupt| abrupt, |_| interpreter.refuse(Absence::StringSearch))
-            },
-        };
-        interpreter.define_method(prototype, name, 1, call);
-    }
+    interpreter.define_method(prototype, "match", 1, |interpreter, this, arguments| {
+        dispatch_through_symbol(interpreter, this, arguments, "match", "")
+    });
+    interpreter.define_method(prototype, "search", 1, |interpreter, this, arguments| {
+        dispatch_through_symbol(interpreter, this, arguments, "search", "")
+    });
+
+    interpreter.define_method(prototype, "matchAll", 1, |interpreter, this, arguments| {
+        if matches!(this, JsValue::Undefined | JsValue::Null) {
+            return interpreter.type_error("a String method requires a coercible receiver");
+        }
+        let pattern = arg(arguments, 0);
+        if is_regexp(interpreter, &pattern) {
+            let JsValue::Object(id) = &pattern else {
+                unreachable!("is_regexp implies an object")
+            };
+            let flags = match interpreter.get_property(*id, &PropertyKey::from_str("flags")) {
+                Completion::Normal(value) => value,
+                abrupt => return abrupt,
+            };
+            if matches!(flags, JsValue::Undefined | JsValue::Null) {
+                return interpreter.type_error("matchAll needs a pattern with readable flags");
+            }
+            let flags = match interpreter.to_string_value(&flags) {
+                Ok(flags) => flags,
+                Err(abrupt) => return abrupt,
+            };
+            if !flags.to_lossy_string().contains('g') {
+                return interpreter.type_error("matchAll requires a global regular expression");
+            }
+        }
+        dispatch_through_symbol(interpreter, this, arguments, "matchAll", "g")
+    });
 
     interpreter.define_method(prototype, "normalize", 0, |interpreter, this, arguments| {
         if let Err(abrupt) = coerce_to_string(interpreter, &this) {
@@ -3551,6 +3704,23 @@ fn install_string(interpreter: &mut Interpreter) {
             Err(abrupt) => return abrupt,
         };
         let separator = arg(arguments, 0);
+        if let JsValue::Object(id) = &separator {
+            let key = PropertyKey::Symbol(interpreter.well_known_symbol("split"));
+            let method = match interpreter.get_property(*id, &key) {
+                Completion::Normal(value) => value,
+                abrupt => return abrupt,
+            };
+            if !matches!(method, JsValue::Undefined | JsValue::Null) {
+                if !interpreter.is_callable(&method) {
+                    return interpreter.type_error("a separator's Symbol.split is not callable");
+                }
+                return interpreter.call_value(
+                    &method,
+                    separator.clone(),
+                    vec![this.clone(), arg(arguments, 1)],
+                );
+            }
+        }
         let limit = match arguments.get(1) {
             Some(JsValue::Undefined) | None => u32::MAX as usize,
             Some(value) => match interpreter.to_number_value(value) {
@@ -3600,18 +3770,10 @@ fn install_string(interpreter: &mut Interpreter) {
 
 /// `startsWith` and `endsWith`, which differ only in where they anchor.
 ///
-/// **THE STANDARD'S `IsRegExp` STEP IS NOT SPELLED HERE, AND IT IS UNREACHABLE RATHER THAN ABSENT.**
-/// Step 3 of each is `? IsRegExp(searchString)` and step 4 throws a TypeError if it answered true,
-/// so `"a".startsWith(/a/)` cannot look like it worked. In THIS profile the operation is vacuous:
-/// its only two ways to answer true are a truthy `@@match` on the argument and a `[[RegExpMatcher]]`
-/// slot, and the realm has neither -- `@@match` is not among the well-known symbols it defines and
-/// no RegExp object can exist. So `IsRegExp` is false for every value a program here can build, and
-/// omitting it is not a wrong answer.
-///
-/// **IT BECOMES OWED THE MOMENT `@@match` IS DEFINED**, and it is owed as a `?` step, because
-/// `Get(argument, @@match)` runs a getter that may throw. `String.prototype.includes` is the third
-/// caller. Written down rather than left implicit, because "the step is absent" and "the step is
-/// unreachable" look identical in the body and only one of them stays true.
+/// **THE STANDARD'S `IsRegExp` STEP IS PERFORMED.** Step 3 of each is `? IsRegExp(searchString)`
+/// and step 4 throws a TypeError if it answered true, so `"a".startsWith(/a/)` cannot look like it
+/// worked. It is a `?` step: `Get(argument, @@match)` runs a getter that may throw, so its position
+/// between the receiver's coercion and the search's is observable.
 const AFFIX_TESTS: [crate::interpreter::NativeFn; 2] = [
     |interpreter, this, arguments| affix(interpreter, this, arguments, true),
     |interpreter, this, arguments| affix(interpreter, this, arguments, false),
@@ -3721,6 +3883,9 @@ fn affix(
         Ok(text) => text,
         Err(abrupt) => return abrupt,
     };
+    if is_regexp(interpreter, &arg(arguments, 0)) {
+        return interpreter.type_error("this String method does not take a regular expression");
+    }
     let search = match interpreter.to_string_value(&arg(arguments, 0)) {
         Ok(search) => search,
         Err(abrupt) => return abrupt,
@@ -3779,6 +3944,12 @@ fn is_trimmable(unit: u16) -> bool {
 /// Warang Citi, Adlam -- was left alone whatever the tables said. And a mapping may CHANGE LENGTH:
 /// `ß` uppercases to two characters and `İ` lowercases to two, which a one-unit-in-one-unit-out
 /// loop cannot express at all.
+///
+/// **PUBLISHED DEVIATION, `final-sigma-is-unconditional`**: the one CONDITIONAL rule in
+/// `SpecialCasing.txt` is not applied, so a word-final `Σ` lowercases to `σ` where the standard
+/// gives `ς`. The condition is defined over the `Cased` and `Case_Ignorable` properties, which live
+/// in the shared Unicode home this crate deliberately does not widen on its own -- the same
+/// decision `non-ascii-identifiers` records. Every UNCONDITIONAL mapping is applied.
 fn change_case(interpreter: &mut Interpreter, this: &JsValue, upper: bool) -> Completion {
     let text = match coerce_to_string(interpreter, this) {
         Ok(text) => text,
@@ -3869,6 +4040,109 @@ fn coerce_to_string(
     interpreter.to_string_value(this)
 }
 
+
+/// `String.prototype.match`, `search` and `matchAll`, which differ in the symbol they look up and
+/// in the flags their fallback pattern is built with.
+///
+/// All three are: coerce the receiver, look for the method on the ARGUMENT, and fall back to building a
+/// regular expression from the argument when it has none. A `null` or `undefined` argument skips
+/// the lookup and goes straight to construction, which is how `"a".match()` matches the empty
+/// pattern rather than throwing.
+fn dispatch_through_symbol(
+    interpreter: &mut Interpreter,
+    this: JsValue,
+    arguments: &[JsValue],
+    symbol: &str,
+    fallback_flags: &str,
+) -> Completion {
+    if matches!(this, JsValue::Undefined | JsValue::Null) {
+        return interpreter.type_error("a String method requires a coercible receiver");
+    }
+
+    let pattern = arg(arguments, 0);
+    if !matches!(pattern, JsValue::Undefined | JsValue::Null) {
+        if let JsValue::Object(id) = &pattern {
+            let key = PropertyKey::Symbol(interpreter.well_known_symbol(symbol));
+            let method = match interpreter.get_property(*id, &key) {
+                Completion::Normal(value) => value,
+                abrupt => return abrupt,
+            };
+            if !matches!(method, JsValue::Undefined | JsValue::Null) {
+                if !interpreter.is_callable(&method) {
+                    return interpreter.type_error("a String method's hook is not callable");
+                }
+                return interpreter.call_value(&method, pattern.clone(), vec![this.clone()]);
+            }
+        }
+    }
+
+    let text = match coerce_to_string(interpreter, &this) {
+        Ok(text) => text,
+        Err(abrupt) => return abrupt,
+    };
+    let source = match &pattern {
+        JsValue::Undefined => crate::JsString::new(),
+        other => match interpreter.to_string_value(other) {
+            Ok(text) => text,
+            Err(abrupt) => return abrupt,
+        },
+    };
+    let built = match crate::regexp::create(
+        interpreter,
+        &source,
+        &crate::JsString::from(fallback_flags),
+    ) {
+        Ok(id) => id,
+        Err(abrupt) => return abrupt,
+    };
+    let key = PropertyKey::Symbol(interpreter.well_known_symbol(symbol));
+    let method = match interpreter.get_property(built, &key) {
+        Completion::Normal(value) => value,
+        abrupt => return abrupt,
+    };
+    interpreter.call_value(&method, JsValue::Object(built), vec![JsValue::String(text)])
+}
+
+/// `IsRegExp`: the property, not the slot.
+///
+/// The standard asks for `@@match` first and only falls back to the internal slot, so an ordinary
+/// object claiming to be a pattern IS one for the purposes of `replaceAll`'s global check. Testing
+/// the slot alone would let such an object past a check the standard applies to it.
+fn is_regexp(interpreter: &mut Interpreter, value: &JsValue) -> bool {
+    let JsValue::Object(id) = value else { return false };
+    let key = PropertyKey::Symbol(interpreter.well_known_symbol("match"));
+    match interpreter.get_property(*id, &key) {
+        Completion::Normal(JsValue::Undefined) => interpreter.object(*id).regexp.is_some(),
+        Completion::Normal(other) => ops::to_boolean(&other),
+        _ => false,
+    }
+}
+
+/// The `Symbol.replace` hand-off shared by `replace` and `replaceAll`.
+///
+/// Answers `None` when the pattern has no hook, which is the caller's signal to run the string
+/// path. The receiver goes through UNCONVERTED: the hook does its own `ToString`, and coercing here
+/// would run a user `toString` before the lookup rather than after it.
+fn dispatch_replace(
+    interpreter: &mut Interpreter,
+    this: &JsValue,
+    pattern: &JsValue,
+    arguments: &[JsValue],
+) -> Option<Completion> {
+    let JsValue::Object(id) = pattern else { return None };
+    let key = PropertyKey::Symbol(interpreter.well_known_symbol("replace"));
+    let method = match interpreter.get_property(*id, &key) {
+        Completion::Normal(value) => value,
+        abrupt => return Some(abrupt),
+    };
+    if matches!(method, JsValue::Undefined | JsValue::Null) {
+        return None;
+    }
+    if !interpreter.is_callable(&method) {
+        return Some(interpreter.type_error("a pattern's Symbol.replace is not callable"));
+    }
+    Some(interpreter.call_value(&method, pattern.clone(), vec![this.clone(), arg(arguments, 1)]))
+}
 
 fn install_number(interpreter: &mut Interpreter) {
     let object_prototype = interpreter.intrinsics.object_prototype;

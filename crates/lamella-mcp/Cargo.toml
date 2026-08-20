@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Native Lamella MCP server: exposes the toolchain to AI assistants over stdio (JSON-RPC 2.0). Default build = compile / run / size / enumerate / identify. Build `--features bake` for the on-device path (bake / deploy / run-on-device / Lamella Link source-level debug), which needs lamella-load's non-additive `code-in-place`. A thin front-end over the SAME lamella-wire-host / lamella-dap seams the CLIs use."
+publish = false
 
 [dependencies]
 # DEFAULT surface (compile / run / enumerate / identify / deploy-status): the Lamella Link REPL engine (host

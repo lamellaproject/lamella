@@ -33,6 +33,11 @@ pub fn collect_model(unit: &CompilationUnit) -> Model {
 /// Adds `unit`'s declared types to an existing model (e.g. one already holding the
 /// reference assemblies). The caller links bases once the model is complete.
 pub fn collect_into(model: &mut Model, unit: &CompilationUnit) {
+    collect_declared(model, unit);
+    model.link_nested_type_parameters();
+}
+
+fn collect_declared(model: &mut Model, unit: &CompilationUnit) {
     for member in &unit.members {
         collect_namespace_member(member, "", model);
     }
@@ -55,12 +60,19 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             }
         }
         NamespaceMember::Type(declaration) => {
-            model.insert(type_info(namespace, declaration));
+            let mut info = type_info(namespace, declaration);
+            if info.is_partial && !writes_accessibility(&declaration.modifiers) {
+                if let Some(existing) = model.get(namespace, &info.name) {
+                    info.accessibility = existing.accessibility;
+                }
+            }
+            model.insert_or_merge(info);
             collect_nested_types(declaration, namespace, model);
         }
         NamespaceMember::Enum(declaration) => {
             let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Enum);
             info.accessibility = accessibility_of(&declaration.modifiers);
+            info.is_sealed = true;
             let enum_base = named_symbol("System", "Enum");
             info.bases.push(enum_base.clone());
             info.base = Some(enum_base);
@@ -91,6 +103,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
         NamespaceMember::Delegate(declaration) => {
             let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Delegate);
             info.accessibility = accessibility_of(&declaration.modifiers);
+            info.is_sealed = true;
             info.methods.push(MethodSymbol {
                 explicit_interface: None,
                 name: "Invoke".into(),
@@ -260,6 +273,10 @@ pub(crate) fn const_expr_references(expr: &Expr, out: &mut Vec<Box<str>>) {
             const_expr_references(condition, out);
             const_expr_references(when_true, out);
             const_expr_references(when_false, out);
+        }
+        ExprKind::NullCoalescing { left, right } => {
+            const_expr_references(left, out);
+            const_expr_references(right, out);
         }
         _ => {}
     }
@@ -807,6 +824,18 @@ pub fn constraints_by_parameter(
 
 /// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
 /// methods.
+/// Whether a declaration's modifiers state an accessibility at all (10.2.3), as opposed to
+/// leaving it to the default. [`accessibility_of`] answers what the accessibility IS and cannot
+/// answer this: an omitted modifier and a written `private` give the same result.
+fn writes_accessibility(modifiers: &[Modifier]) -> bool {
+    modifiers.iter().any(|modifier| {
+        matches!(
+            modifier,
+            Modifier::Public | Modifier::Protected | Modifier::Internal | Modifier::Private
+        )
+    })
+}
+
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     let mut info = TypeInfo::new(
         namespace,
@@ -821,6 +850,10 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     info.type_parameter_constraints =
         constraints_by_parameter(&info.type_parameters, &declaration.constraints);
     info.accessibility = accessibility_of(&declaration.modifiers);
+    info.is_partial = declaration
+        .modifiers
+        .iter()
+        .any(|modifier| matches!(modifier, Modifier::Partial));
     info.is_sealed = declaration.modifiers.iter().any(|m| matches!(m, Modifier::Sealed))
         || matches!(declaration.kind, SyntaxTypeKind::Struct);
     info.is_abstract = declaration
@@ -1035,6 +1068,12 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_sealed: is_sealed_member(modifiers),
                 has_getter: getter.is_some(),
                 has_setter: setter.is_some(),
+                getter_accessibility: getter
+                    .as_ref()
+                    .map(|accessor| accessor_access(accessor, modifiers)),
+                setter_accessibility: setter
+                    .as_ref()
+                    .map(|accessor| accessor_access(accessor, modifiers)),
                 is_required: modifiers.iter().any(|m| matches!(m, Modifier::Required)),
             }),
             Member::Indexer {
@@ -1118,6 +1157,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
         }
     }
     let has_parameterless = info.constructors.iter().any(|c| c.parameters.is_empty());
+    info.synthesized_constructor = true;
     match info.kind {
         TypeKind::Struct if !has_parameterless => {
             info.constructors.push(constructor(&[], Accessibility::Public))
@@ -1128,7 +1168,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
         {
             info.constructors.push(constructor(&[], Accessibility::Public))
         }
-        _ => {}
+        _ => info.synthesized_constructor = false,
     }
     info
 }
@@ -1253,6 +1293,20 @@ fn is_sealed_member(modifiers: &[Modifier]) -> bool {
 /// modifier, or -- implicitly -- any member of an interface (17.2.2 / 20.2).
 fn is_abstract_member(modifiers: &[Modifier], kind: TypeKind) -> bool {
     modifiers.contains(&Modifier::Abstract) || kind == TypeKind::Interface
+}
+
+/// An accessor's EFFECTIVE accessibility: its own access modifier (10.7.2) when it carries one,
+/// else the property's. The binder has already checked that the accessor's is strictly more
+/// restrictive, so this never widens a member.
+fn accessor_access(
+    accessor: &lamella_syntax::ast::Accessor,
+    property: &[Modifier],
+) -> Accessibility {
+    if accessor.modifiers.is_empty() {
+        accessibility_of(property)
+    } else {
+        accessibility_of(&accessor.modifiers)
+    }
 }
 
 /// The accessibility a member's modifiers declare; a class member with none is
@@ -1500,7 +1554,6 @@ mod tests {
         .unit;
         let mut model = Model::new();
         collect_into(&mut model, &unit);
-        model.canonicalize_signatures();
         model.link_bases();
         resolve_constants(&mut model, core::slice::from_ref(&unit));
 
@@ -1533,7 +1586,6 @@ mod tests {
         .unit;
         let mut model = Model::new();
         collect_into(&mut model, &unit);
-        model.canonicalize_signatures();
         model.link_bases();
         resolve_constants(&mut model, core::slice::from_ref(&unit));
 

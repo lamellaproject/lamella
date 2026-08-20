@@ -475,6 +475,18 @@ impl LcscCompiler {
              the executable, or set LAMELLA_REF_DIR to a directory of reference assemblies"
             .to_owned())
     }
+
+    /// The reference-assembly bytes [`discover`](Self::discover) found, corlib first.
+    ///
+    /// **A CALLER THAT NEEDS corlib's BYTES MUST NOT REPEAT THE SEARCH FOR THEM.** Every host that
+    /// compiles also has to hand the same corlib to whatever RUNS the result --
+    /// [`LoopbackLink::new`] takes it directly -- so without this the search ladder gets written a
+    /// second time beside each one, and a ladder with two implementations gains its next rung in
+    /// only one of them. The order is the order `discover` established: corlib is first.
+    #[must_use]
+    pub fn references(&self) -> &[Vec<u8>] {
+        &self.references
+    }
 }
 
 #[cfg(feature = "repl-host")]

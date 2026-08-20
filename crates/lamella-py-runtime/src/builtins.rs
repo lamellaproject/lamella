@@ -5,7 +5,7 @@ use core::cmp::Ordering;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use lamella_py_bytecode::{BinOp, CmpOp, CodeObject};
+use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Functions};
 
 use crate::bigint::BigInt;
 use crate::interp::{
@@ -660,7 +660,7 @@ fn is_self_match_type(cls: Value) -> bool {
 pub fn call_builtin(
     id: u32,
     args: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -859,16 +859,7 @@ pub fn call_builtin(
             [] => Value::fixnum(0).ok_or(Trap::Overflow),
             [x] => {
                 if let Some(f) = model.float_value(*x) {
-                    if f.is_nan() {
-                        return Err(model.with_message(Trap::ValueError, "cannot convert float NaN to integer"));
-                    }
-                    if f.is_infinite() {
-                        return Err(model.with_message(Trap::Overflow, "cannot convert float infinity to integer"));
-                    }
-                    if !(-1.701_411_834_604_692_3e38..1.701_411_834_604_692_3e38).contains(&f) {
-                        return Err(Trap::Overflow);
-                    }
-                    model.new_long(f as i128)
+                    model.int_from_float(f)
                 } else if let Some(n) = x.as_int() {
                     Value::fixnum(i32::try_from(n).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)
                 } else if model.is_long(*x) || model.is_bigint(*x) {
@@ -1787,7 +1778,7 @@ pub fn call_builtin_kw(
     id: u32,
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -1840,7 +1831,7 @@ pub fn call_builtin_kw(
 fn enumerate_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -1869,7 +1860,7 @@ fn enumerate_kw(
 fn zip_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -1892,7 +1883,7 @@ fn zip_kw(
 fn print_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -1930,7 +1921,7 @@ fn print_kw(
 fn sorted_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -1976,7 +1967,7 @@ fn sorted_kw(
 fn dict_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2011,7 +2002,7 @@ fn dict_kw(
 fn format_radix(
     model: &mut ObjectModel,
     args: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     depth: usize,
     prefix: &str,
     radix: u8,
@@ -2038,7 +2029,7 @@ fn format_radix(
 /// String (falling back to the default rendering if it does not return a str).
 fn call_str_dunder(
     method: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<String, Trap> {
@@ -2053,7 +2044,7 @@ fn call_str_dunder(
 /// (Python's `str` falls back to `repr`), else the default rendering (int/str/container/...).
 fn display_arg(
     value: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<String, Trap> {
@@ -2078,7 +2069,7 @@ fn display_arg(
 /// cannot do without the interpreter. A self-referential container is a `RecursionError`.
 fn repr_arg(
     value: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<String, Trap> {
@@ -2225,7 +2216,7 @@ fn ascii_escape(s: &str) -> String {
 fn less_than_dyn(
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
@@ -2239,7 +2230,7 @@ fn less_than_dyn(
 fn compare_dyn(
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Ordering, Trap> {
@@ -2257,7 +2248,7 @@ fn compare_dyn(
 /// fine at teaching scale.
 fn sort_values_dyn(
     elements: &mut [Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<(), Trap> {
@@ -2275,7 +2266,7 @@ fn sort_values_dyn(
 /// built-in ordering.
 fn sorted_list(
     mut elements: Vec<Value>,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2294,7 +2285,7 @@ fn sorted_list(
 fn bytes_from_args(
     args: &[Value],
     model: &mut ObjectModel,
-    functions: &[CodeObject],
+    functions: &Functions,
     depth: usize,
 ) -> Result<Vec<u8>, Trap> {
     match args {
@@ -2340,7 +2331,7 @@ fn bytes_from_args(
 fn source_iters(
     model: &mut ObjectModel,
     iterables: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     depth: usize,
 ) -> Result<Value, Trap> {
     let mut iters = Vec::with_capacity(iterables.len());
@@ -2356,7 +2347,7 @@ fn source_iters(
 pub(crate) fn collect_iterable(
     model: &mut ObjectModel,
     args: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     depth: usize,
 ) -> Result<Vec<Value>, Trap> {
     let iterable = match args {
@@ -2628,7 +2619,7 @@ fn round_to_digits(f: f64, ndigits: i64) -> f64 {
 fn min_max(
     args: &[Value],
     keep: Ordering,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2647,7 +2638,7 @@ fn min_max_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
     keep: Ordering,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2676,7 +2667,7 @@ fn min_max_impl(
     keep: Ordering,
     key: Value,
     default: Option<Value>,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2762,18 +2753,18 @@ mod tests {
         let text = model.new_str("hi").unwrap();
         let (zero, one, two) =
             (Value::fixnum(0).unwrap(), Value::fixnum(1).unwrap(), Value::fixnum(2).unwrap());
-        let bound = call_builtin(mc, &[five, int_ty, one], &[], &mut model, 0).unwrap();
+        let bound = call_builtin(mc, &[five, int_ty, one], &Functions::default(), &mut model, 0).unwrap();
         assert_eq!(model.seq_value(bound).cloned(), Some(alloc::vec![five]));
-        let none_bound = call_builtin(mc, &[five, int_ty, zero], &[], &mut model, 0).unwrap();
+        let none_bound = call_builtin(mc, &[five, int_ty, zero], &Functions::default(), &mut model, 0).unwrap();
         assert_eq!(model.seq_value(none_bound).map(alloc::vec::Vec::len), Some(0));
-        assert_eq!(call_builtin(mc, &[five, int_ty, two], &[], &mut model, 0), Err(Trap::Raised));
+        assert_eq!(call_builtin(mc, &[five, int_ty, two], &Functions::default(), &mut model, 0), Err(Trap::Raised));
         let exc = model.take_pending_exception().unwrap();
         assert!(
             model.repr(exc).contains("int() accepts 1 positional sub-pattern (2 given)"),
             "got: {}",
             model.repr(exc)
         );
-        assert_eq!(call_builtin(mc, &[text, int_ty, one], &[], &mut model, 0), Ok(Value::NONE));
+        assert_eq!(call_builtin(mc, &[text, int_ty, one], &Functions::default(), &mut model, 0), Ok(Value::NONE));
     }
 
     #[test]

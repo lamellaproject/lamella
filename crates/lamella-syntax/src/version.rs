@@ -391,6 +391,28 @@ pub enum Feature {
     /// read a name off. lcsc is deliberately stricter here; the description is therefore OURS,
     /// written in csc's style rather than copied from it.
     NullCoalescing,
+    /// A GETTER-ONLY automatically implemented property, `int P { get; }`. Introduced in C# 6.0.
+    ///
+    /// **A DIFFERENT FEATURE FROM [`Feature::AutoProperties`], AND csc NAMES IT DIFFERENTLY** --
+    /// *readonly automatically implemented properties*, measured. The backing field is `initonly`
+    /// and only a constructor may assign it, which is a rule the C# 3.0 form does not have; a
+    /// compiler that treated the two as one feature would either refuse the common form or emit a
+    /// writable field for the readonly one.
+    ReadonlyAutoProperty,
+    /// A PARTIAL TYPE -- `partial class C` written more than once, the declarations merging into
+    /// one type (ECMA-334 4th ed 17.1.4). Introduced in C# 2.0.
+    ///
+    /// **THE TYPE, NOT THE METHOD.** A partial METHOD (`partial void OnThing();` with its
+    /// implementation in another part) is a C# 3.0 feature and csc gates it separately -- measured,
+    /// *Feature 'partial method' is not available in C# 2. Please use language version 3 or
+    /// greater.* One `partial` token, two features, three years apart.
+    PartialTypes,
+    /// A `#pragma` directive (`#pragma warning disable 649`). Introduced in C# 2.0.
+    ///
+    /// **csc NAMES IT `#pragma`, WITH THE HASH** -- measured, `Feature '#pragma' is not available
+    /// in C# 1` -- which is why this description is punctuation rather than a noun phrase like
+    /// every other entry in the table.
+    PragmaDirective,
     /// The namespace alias qualifier `::` (`global::System`). Introduced in C# 2.0.
     NamespaceAlias,
     /// An access modifier on a property, indexer, or event accessor, for example `private set`.
@@ -438,6 +460,19 @@ pub enum Feature {
     /// An anonymous object creation `new { A = 1, ... }`, producing an instance of a
     /// compiler-synthesized anonymous type. Introduced in C# 3.0.
     AnonymousObjectCreation,
+    /// An implicitly typed local variable -- `var x = 5;`, whose type is inferred from the
+    /// initializer. Introduced in C# 3.0 (C# 3.0 spec, 8.5.1).
+    ///
+    /// **ONE variant covers the `foreach` iteration variable too** (8.8.4), because csc gates both
+    /// under this single name -- measured, `foreach (var v in a)` at ISO-1 reports `Feature
+    /// 'implicitly typed local variable'`, naming a LOCAL VARIABLE for an iteration variable. A
+    /// second variant would have produced a message no csc user ever sees.
+    ///
+    /// **`var` is a CONTEXTUAL keyword and this feature does not own the word.** A type genuinely
+    /// named `var` takes precedence (C# 3.0 spec, 8.5.1: *"and no type named var is in scope"*), so
+    /// nothing here fires for a program that declares one -- which is why the gate is raised from
+    /// the binder, after resolution has been tried, rather than from the lexer.
+    ImplicitlyTypedLocalVariable,
     /// A default (optional) parameter value, for example `void M(int x = 5)`. Introduced in C# 4.0.
     DefaultParameterValues,
     /// A named argument, for example `M(name: value)`. Introduced in C# 4.0.
@@ -498,6 +533,44 @@ pub enum Feature {
     /// the same reason: the declaration is well-formed and the enclosing type's kind is what
     /// makes it late.
     ParameterlessStructConstructor,
+    /// An async function -- the `async` modifier and the `await` operator (ECMA-334 5th ed,
+    /// 12.8.8 and 15.15). Introduced in C# 5.0, and unlike `var` this rung IS ECMA-standardized.
+    ///
+    /// **ONE variant covers the modifier and the operator**, because csc gates both under this
+    /// single name -- measured, one compilation each: the `async` modifier below 5 reports
+    /// `Feature 'async function'`, and an `await` OPERATOR in a non-async method below 5 reports
+    /// the same gate at the `await` token (beside CS4033). Inside an async method the modifier's
+    /// gate is the only one raised -- an `await` in the body adds nothing below 5, also measured.
+    ///
+    /// **Both words are CONTEXTUAL.** `async` is a modifier only by lookahead (a program may
+    /// declare `class async` and a method `async async()` returning it -- both compile in csc);
+    /// `await` is reserved only inside a method whose modifiers include `async`, and the verbatim
+    /// `@await` is an ordinary identifier even there (12.8.8.1).
+    AsyncFunction,
+    /// An async entry point -- `static async Task Main()`. Introduced in **C# 7.1**, two rungs
+    /// after async functions themselves, and gated separately by csc under its own name --
+    /// measured: at `/langversion:5` an async `Task Main` reports `Feature 'async main' is not
+    /// available in C# 5. Please use language version 7.1 or greater.` alongside CS5001, while
+    /// `static async void Main` is CS4009 at every version (an entry point can never be
+    /// async-void). Without this variant the 7.1 rung would have nothing to name.
+    AsyncMain,
+    /// An async method returning `Task<T>` -- one of the three return types 15.15.1 admits, and
+    /// the one that is generic. csc has no separate gate (it is simply part of async functions);
+    /// the variant exists so lcsc's PHASE SPLIT can refuse it by name: `Task<T>` and its builder
+    /// sit behind the generics-costed corlib work, so `void` and `Task` land first
+    /// (the phase-1 design records the split). The description is OURS, in csc's style, because
+    /// there is no csc message to copy.
+    AsyncTaskOfT,
+    /// A GENERIC async method -- `async Task M<T>(...)`. Also csc-gateless and also a phase
+    /// split: the state machine for a generic method is a synthesized generic type, which lands
+    /// beside `Task<T>` (in real code the two populations are nearly the same methods).
+    AsyncGenericMethod,
+    /// An `await` inside a `catch` or `finally` block -- introduced in **C# 6.0**. Below 6 the
+    /// refusal is csc's own CS1985/CS1984 (measured, and the two texts are asymmetric); at 6 and
+    /// above csc compiles it (measured at both rungs), so what remains for lcsc is the
+    /// permitted-but-unbuilt half: the machinery that resumes inside a handler (exception
+    /// spilling, pending-fault rethrow) is not part of phase 1.
+    AwaitInCatchOrFinally,
 }
 
 impl Feature {
@@ -521,13 +594,15 @@ impl Feature {
             Feature::StaticClasses | Feature::BinaryLiterals | Feature::DigitSeparators => true,
             Feature::FileScopedNamespaces => true,
             Feature::ObjectInitializer | Feature::CollectionInitializer => true,
+            Feature::ImplicitlyTypedLocalVariable => true,
             Feature::Generics => true,
             Feature::DefaultOperator => true,
+            Feature::NullCoalescing => true,
+            Feature::PragmaDirective | Feature::AutoProperties => true,
+            Feature::AccessorAccessibility => true,
+            Feature::NullableValueTypes => true,
             Feature::AnonymousMethods
-            | Feature::NullableValueTypes
-            | Feature::NullCoalescing
             | Feature::NamespaceAlias
-            | Feature::AccessorAccessibility
             | Feature::LambdaExpression
             | Feature::ExpressionBodiedMethod
             | Feature::ExpressionBodiedProperty
@@ -536,7 +611,7 @@ impl Feature {
             | Feature::NamedArguments
             | Feature::NullConditional
             | Feature::UsingStatic
-            | Feature::AutoProperties
+            | Feature::ReadonlyAutoProperty
             | Feature::SwitchOnBool
 
             | Feature::TopLevelStatements
@@ -545,6 +620,12 @@ impl Feature {
             | Feature::Records
             | Feature::DefaultInterfaceImplementation
             | Feature::ParameterlessStructConstructor => false,
+            Feature::AsyncFunction => true,
+            Feature::PartialTypes => true,
+            Feature::AsyncMain => false,
+            Feature::AsyncTaskOfT
+            | Feature::AsyncGenericMethod
+            | Feature::AwaitInCatchOrFinally => false,
         }
     }
 
@@ -561,13 +642,15 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 29] = [
+    pub const ALL: [Feature; 38] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
         Feature::NullableValueTypes,
         Feature::DefaultOperator,
         Feature::NullCoalescing,
+        Feature::PragmaDirective,
+        Feature::ReadonlyAutoProperty,
         Feature::NamespaceAlias,
         Feature::AccessorAccessibility,
         Feature::LambdaExpression,
@@ -576,6 +659,7 @@ impl Feature {
         Feature::ObjectInitializer,
         Feature::CollectionInitializer,
         Feature::AnonymousObjectCreation,
+        Feature::ImplicitlyTypedLocalVariable,
         Feature::DefaultParameterValues,
         Feature::NamedArguments,
         Feature::NullConditional,
@@ -591,6 +675,12 @@ impl Feature {
         Feature::Records,
         Feature::DefaultInterfaceImplementation,
         Feature::ParameterlessStructConstructor,
+        Feature::AsyncFunction,
+        Feature::AsyncMain,
+        Feature::AsyncTaskOfT,
+        Feature::AsyncGenericMethod,
+        Feature::AwaitInCatchOrFinally,
+        Feature::PartialTypes,
     ];
 
     /// The first language version in which this feature is available.
@@ -604,18 +694,23 @@ impl Feature {
             | Feature::NullCoalescing
             | Feature::AccessorAccessibility
             | Feature::DefaultOperator
+            | Feature::PragmaDirective
+            | Feature::PartialTypes
             | Feature::NamespaceAlias => LanguageVersion::CSharp2,
             Feature::LambdaExpression
             | Feature::ObjectInitializer
             | Feature::CollectionInitializer
-            | Feature::AnonymousObjectCreation => LanguageVersion::CSharp3,
+            | Feature::AnonymousObjectCreation
+            | Feature::ImplicitlyTypedLocalVariable => LanguageVersion::CSharp3,
             Feature::DefaultParameterValues | Feature::NamedArguments => LanguageVersion::CSharp4,
             Feature::SwitchOnBool => LanguageVersion::CSharp2,
             Feature::AutoProperties => LanguageVersion::CSharp3,
             Feature::ExpressionBodiedMethod | Feature::ExpressionBodiedProperty => {
                 LanguageVersion::CSharp6
             }
-            Feature::NullConditional | Feature::UsingStatic => LanguageVersion::CSharp6,
+            Feature::NullConditional
+            | Feature::UsingStatic
+            | Feature::ReadonlyAutoProperty => LanguageVersion::CSharp6,
             Feature::BinaryLiterals | Feature::DigitSeparators => LanguageVersion::CSharp7,
             Feature::LeadingDigitSeparator => LanguageVersion::CSharp7_2,
             Feature::TopLevelStatements | Feature::Records => LanguageVersion::CSharp9,
@@ -623,6 +718,10 @@ impl Feature {
             Feature::RequiredMembers => LanguageVersion::CSharp11,
             Feature::DefaultInterfaceImplementation => LanguageVersion::CSharp8,
             Feature::ParameterlessStructConstructor => LanguageVersion::CSharp10,
+            Feature::AsyncFunction => LanguageVersion::CSharp5,
+            Feature::AsyncMain => LanguageVersion::CSharp7_1,
+            Feature::AsyncTaskOfT | Feature::AsyncGenericMethod => LanguageVersion::CSharp5,
+            Feature::AwaitInCatchOrFinally => LanguageVersion::CSharp6,
         }
     }
 
@@ -659,6 +758,8 @@ impl Feature {
             Feature::AnonymousMethods => "anonymous methods",
             Feature::NullableValueTypes => "nullable types",
             Feature::NullCoalescing => "null coalescing operator",
+            Feature::ReadonlyAutoProperty => "readonly automatically implemented properties",
+            Feature::PragmaDirective => "#pragma",
             Feature::NamespaceAlias => "namespace alias qualifier",
             Feature::AccessorAccessibility => "access modifiers on properties",
             Feature::LambdaExpression => "lambda expression",
@@ -667,6 +768,7 @@ impl Feature {
             Feature::ObjectInitializer => "object initializer",
             Feature::CollectionInitializer => "collection initializer",
             Feature::AnonymousObjectCreation => "anonymous types",
+            Feature::ImplicitlyTypedLocalVariable => "implicitly typed local variable",
             Feature::DefaultParameterValues => "optional parameter",
             Feature::NamedArguments => "named argument",
             Feature::NullConditional => "null propagating operator",
@@ -683,6 +785,12 @@ impl Feature {
             Feature::Records => "records",
             Feature::DefaultInterfaceImplementation => "default interface implementation",
             Feature::ParameterlessStructConstructor => "parameterless struct constructors",
+            Feature::AsyncFunction => "async function",
+            Feature::PartialTypes => "partial types",
+            Feature::AsyncMain => "async main",
+            Feature::AsyncTaskOfT => "async method returning Task<T>",
+            Feature::AsyncGenericMethod => "generic async method",
+            Feature::AwaitInCatchOrFinally => "await in a catch or finally clause",
         }
     }
 }
@@ -748,25 +856,7 @@ mod tests {
         assert!(LanguageVersion::CSharp2.supports(Feature::AnonymousMethods));
         assert!(!Feature::AnonymousMethods.is_implemented());
 
-        for feature in [
-            Feature::Generics,
-            Feature::StaticClasses,
-            Feature::AnonymousMethods,
-            Feature::NullableValueTypes,
-            Feature::NullCoalescing,
-            Feature::NamespaceAlias,
-            Feature::AccessorAccessibility,
-            Feature::LambdaExpression,
-            Feature::ExpressionBodiedMethod,
-            Feature::ExpressionBodiedProperty,
-            Feature::ObjectInitializer,
-            Feature::CollectionInitializer,
-            Feature::AnonymousObjectCreation,
-            Feature::DefaultParameterValues,
-            Feature::NamedArguments,
-            Feature::NullConditional,
-            Feature::UsingStatic,
-        ] {
+        for feature in Feature::ALL {
             let admitted = LanguageVersion::DEFAULT.supports(feature) && feature.is_implemented();
             assert!(
                 !admitted,
@@ -822,6 +912,8 @@ mod tests {
                 | Feature::NullableValueTypes
                 | Feature::DefaultOperator
                 | Feature::NullCoalescing
+                | Feature::PragmaDirective
+                | Feature::ReadonlyAutoProperty
                 | Feature::NamespaceAlias
                 | Feature::AccessorAccessibility
                 | Feature::LambdaExpression
@@ -830,6 +922,7 @@ mod tests {
                 | Feature::ObjectInitializer
                 | Feature::CollectionInitializer
                 | Feature::AnonymousObjectCreation
+                | Feature::ImplicitlyTypedLocalVariable
                 | Feature::DefaultParameterValues
                 | Feature::NamedArguments
                 | Feature::NullConditional
@@ -844,14 +937,36 @@ mod tests {
                 | Feature::LeadingDigitSeparator
                 | Feature::Records
                 | Feature::DefaultInterfaceImplementation
-                | Feature::ParameterlessStructConstructor => {}
+                | Feature::ParameterlessStructConstructor
+                | Feature::AsyncFunction
+                | Feature::AsyncMain
+                | Feature::AsyncTaskOfT
+                | Feature::AsyncGenericMethod
+                | Feature::AwaitInCatchOrFinally
+                | Feature::PartialTypes => {}
             }
         }
         assert_eq!(
             Feature::ALL.len(),
-            29,
+            38,
             "a Feature variant was added without being added to Feature::ALL"
         );
+    }
+
+    #[test]
+    fn async_gates_are_the_measured_ones() {
+        assert_eq!(Feature::AsyncFunction.description(), "async function");
+        assert_eq!(Feature::AsyncFunction.introduced_in(), LanguageVersion::CSharp5);
+        assert_eq!(Feature::AsyncFunction.introduced_in().required_name(), "5");
+        assert_eq!(Feature::AsyncMain.description(), "async main");
+        assert_eq!(Feature::AsyncMain.introduced_in(), LanguageVersion::CSharp7_1);
+        assert_eq!(Feature::AsyncMain.introduced_in().required_name(), "7.1");
+        assert_eq!(LanguageVersion::CSharp4.feature_gate_code(), 8025);
+        assert_eq!(LanguageVersion::CSharp5.feature_gate_code(), 8026);
+        assert!(!LanguageVersion::CSharp4.supports(Feature::AsyncFunction));
+        assert!(LanguageVersion::CSharp5.supports(Feature::AsyncFunction));
+        assert!(!LanguageVersion::CSharp7.supports(Feature::AsyncMain));
+        assert!(LanguageVersion::CSharp7_1.supports(Feature::AsyncMain));
     }
 
     #[test]
@@ -919,40 +1034,6 @@ mod tests {
         assert_eq!(LanguageVersion::CSharp9.message_name(), "9.0");
     }
 
-    /// Every `Feature`, so a property can be stated over the whole table. A new variant is caught
-    /// by the exhaustive `match` in `description`; adding it here is what makes it caught HERE too.
-    const EVERY_FEATURE: &[Feature] = &[
-        Feature::Generics,
-        Feature::DefaultOperator,
-        Feature::StaticClasses,
-        Feature::AnonymousMethods,
-        Feature::NullableValueTypes,
-        Feature::NullCoalescing,
-        Feature::NamespaceAlias,
-        Feature::AccessorAccessibility,
-        Feature::LambdaExpression,
-        Feature::ExpressionBodiedMethod,
-        Feature::ExpressionBodiedProperty,
-        Feature::ObjectInitializer,
-        Feature::CollectionInitializer,
-        Feature::AnonymousObjectCreation,
-        Feature::DefaultParameterValues,
-        Feature::NamedArguments,
-        Feature::NullConditional,
-        Feature::UsingStatic,
-        Feature::AutoProperties,
-        Feature::SwitchOnBool,
-        Feature::BinaryLiterals,
-        Feature::DigitSeparators,
-        Feature::LeadingDigitSeparator,
-        Feature::TopLevelStatements,
-        Feature::FileScopedNamespaces,
-        Feature::RequiredMembers,
-        Feature::Records,
-        Feature::DefaultInterfaceImplementation,
-        Feature::ParameterlessStructConstructor,
-    ];
-
     #[test]
     fn every_feature_name_is_the_one_csc_quotes() {
         assert_eq!(Feature::NullableValueTypes.description(), "nullable types");
@@ -968,7 +1049,7 @@ mod tests {
         assert_eq!(Feature::NamedArguments.description(), "named argument");
         assert_eq!(Feature::NullConditional.description(), "null propagating operator");
 
-        for feature in EVERY_FEATURE {
+        for feature in Feature::ALL {
             let description = feature.description();
             assert!(
                 !description.contains('\''),

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "DEVICE networking backend for the shared NetBackend seam, targeting the Microchip ATWINC1500 Wi-Fi network CONTROLLER. The WINC hosts its own TCP/IP stack and exposes a socket API over SPI (its HIF protocol), so socket ops map straight onto NetBackend -- no smoltcp. Generic over a board's SPI bus + control pins (e.g. a SAMD21 SERCOM-SPI on the Arduino MKR1000)."
+publish = false
 
 [dependencies]
 # The seam alone. A backend is not a language runtime's dependant: it implements a leaf trait, and

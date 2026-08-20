@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod awaitlower;
 pub mod compile;
 pub mod debug;
 pub mod expr;

@@ -10,6 +10,7 @@ description = "Multicast DNS and DNS-based service discovery, so a board can be 
 # Nothing. The wire format is bytes and the responder is a decision over them, so this depends on
 # no socket seam and no protocol crate: a caller that has a datagram can use it, whatever put the
 # datagram in its hand.
+publish = false
 [dependencies]
 
 [dev-dependencies]

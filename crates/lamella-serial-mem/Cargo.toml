@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "In-memory loopback backend for the interpreter's SerialBackend seam: a no_std port table where every byte written loops back into the same port's receive buffer (hardware UART loopback mode). Pins the seam's semantics in unit tests independent of any host COM port, and is the serial story for embedders with no device (a browser, a simulator, a fixture)."
+publish = false
 
 [dependencies]
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }

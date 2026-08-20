@@ -5,7 +5,7 @@ use crate::interpreter::{Completion, Interpreter};
 use crate::object::{BinaryData, Element, Object, Property, PropertyKey, PropertyKind};
 use crate::string_value::JsString;
 use crate::value::{JsValue, ObjectId};
-use crate::{format, String, Vec};
+use crate::{String, Vec};
 
 /// What a TypedArray is, read out of its slot: everything the exotic methods need.
 #[derive(Debug, Clone, Copy)]
@@ -180,14 +180,14 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
     interpreter.define_builtin(prototype, "constructor", JsValue::Object(constructor));
     interpreter.define_species_getter(constructor);
 
-    accessor(interpreter, prototype, "buffer", |interpreter, this, _| match view_of(
+    accessor(interpreter, prototype, "buffer", "get buffer", |interpreter, this, _| match view_of(
         interpreter,
         &this,
     ) {
         Ok(view) => Completion::Normal(JsValue::Object(view.buffer)),
         Err(abrupt) => abrupt,
     });
-    accessor(interpreter, prototype, "byteLength", |interpreter, this, _| match view_of(
+    accessor(interpreter, prototype, "byteLength", "get byteLength", |interpreter, this, _| match view_of(
         interpreter,
         &this,
     ) {
@@ -199,7 +199,7 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
         }
         Err(abrupt) => abrupt,
     });
-    accessor(interpreter, prototype, "byteOffset", |interpreter, this, _| match view_of(
+    accessor(interpreter, prototype, "byteOffset", "get byteOffset", |interpreter, this, _| match view_of(
         interpreter,
         &this,
     ) {
@@ -209,7 +209,7 @@ pub(crate) fn install(interpreter: &mut Interpreter) {
         Ok(view) => Completion::Normal(JsValue::Number(view.offset as f64)),
         Err(abrupt) => abrupt,
     });
-    accessor(interpreter, prototype, "length", |interpreter, this, _| match view_of(
+    accessor(interpreter, prototype, "length", "get length", |interpreter, this, _| match view_of(
         interpreter,
         &this,
     ) {
@@ -696,13 +696,20 @@ pub(crate) fn validated_view(
     Ok(view)
 }
 
+/// One accessor on a typed-array prototype.
+///
+/// **THE GETTER'S OWN NAME IS PASSED IN RATHER THAN COMPOSED**, because a built-in's `name` is a
+/// `&'static str` and `"get " + name` is not one. `f.name` is observable and the corpus checks it
+/// directly, so the two literals are written out at each call site where a reader can see them
+/// agree -- and the committed realm rendering records every one of them verbatim.
 fn accessor(
     interpreter: &mut Interpreter,
     target: ObjectId,
-    name: &str,
+    name: &'static str,
+    getter_name: &'static str,
     call: crate::interpreter::NativeFn,
 ) {
-    let getter = interpreter.native_function(&format!("get {name}"), 0, call);
+    let getter = interpreter.native_function(getter_name, 0, call);
     interpreter
         .object_mut(target)
         .set_own(PropertyKey::from_str(name), Property::accessor(Some(getter), None));

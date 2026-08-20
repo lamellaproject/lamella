@@ -9,6 +9,10 @@ namespace Lamella.Generated
         public const uint USART1_RCC_EN_OFF = 68;
         public const uint USART1_RCC_EN_BIT = 4;
         public const uint USART1_RCC_EN_MASK = 0x10;
+        public const uint SDMMC2_BASE = 0x40011C00;
+        public const uint SDMMC2_RCC_EN_OFF = 68;
+        public const uint SDMMC2_RCC_EN_BIT = 7;
+        public const uint SDMMC2_RCC_EN_MASK = 0x80;
         public const uint GPIOA_BASE = 0x40020000;
         public const uint GPIOA_RCC_EN_OFF = 48;
         public const uint GPIOA_RCC_EN_BIT = 0;

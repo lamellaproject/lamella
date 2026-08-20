@@ -78,6 +78,11 @@ pub const ARRAY_HANDLE_TABLE_OFFSET: u32 = 0x04;
 /// descriptor at all (a bare TypeSpec, which is what an element the reader cannot name resolves to)
 /// is its own array handle: there is no class descriptor for it to collide with.
 ///
+/// **THAT FALL-THROUGH READS THE TOP BYTE, SO IT ALSO SWALLOWS A HANDLE WHOSE TOP BYTE IS A FLAG
+/// RATHER THAN A TABLE** -- the answer is then the ELEMENT, and the collision this function removes
+/// is back with nothing to report it. A caller that carries such a flag must clear it, lift, and set
+/// it again; a handle reaching here is expected to be spelled as a table byte over a row.
+///
 /// A generic INSTANTIATION is lifted like a class identity rather than passed through, because it
 /// is the one handle in that group that does own a class descriptor -- payload size, GC trace map
 /// and type tag, laid by the same emitter that lays an ordinary type's. Passing it through would

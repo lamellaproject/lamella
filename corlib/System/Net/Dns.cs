@@ -4,8 +4,10 @@ using System.Net.Sockets;
 
 namespace System.Net
 {
-    public class Dns
+    public sealed class Dns
     {
+        private Dns() { }
+
         [Lamella.Runtime.RuntimeProvided] private static int ResolveHost(string host, byte[] buffer, int[] lengths) { return 0; }
 
         private const int MaxAddresses = 8;

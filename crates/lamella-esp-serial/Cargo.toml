@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "The Espressif serial-bootloader protocol, transport-free: framing, checksums and the command set a host speaks to program an ESP32 part's flash. Drives a native serial port, a browser's Web Serial port, or an editor extension from one implementation."
 
+publish = false
 [dependencies]
 
 [lints]

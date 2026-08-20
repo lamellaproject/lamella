@@ -1294,7 +1294,7 @@ impl<'a> Assembly<'a> {
     ///
     /// Matches on the declaring type of the attribute's CONSTRUCTOR, which is how an attribute is
     /// identified in metadata: a `CustomAttribute` row names its ctor, not its type.
-    #[must_use]
+    ///
     /// **THIS IS O(CustomAttribute ROWS) AND MUST NOT BE CALLED PER MEMBER.** `custom_attributes`
     /// scans the whole table to find one parent's rows, so asking it about every method of a
     /// reference assembly is rows x members -- and on a real reference set that dominates the
@@ -1363,6 +1363,14 @@ impl<'a> Assembly<'a> {
         self.has_attribute(method_token, "Lamella.Runtime", "IntendedDefaultAttribute")
     }
 
+    /// Every `CustomAttribute` row (II.22.10) whose parent is `parent`, in table order, each
+    /// carrying its constructor token and its raw value blob (II.23.3).
+    ///
+    /// **THIS SCANS THE WHOLE TABLE FOR ONE PARENT, so a call per member is rows x members.** It is
+    /// the right entry point for a caller holding a SINGLE token; a caller asking about every member
+    /// of an assembly wants [`Assembly::tokens_with_attribute`], which indexes the table in one pass.
+    /// The same warning on [`Assembly::has_attribute`] records what the difference measured.
+    #[must_use]
     pub fn custom_attributes(
         &self,
         parent: Token,

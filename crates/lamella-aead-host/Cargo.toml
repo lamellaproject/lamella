@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "HOST-side AEAD backend for the interpreter's AeadBackend seam: RFC 5297 AES-SIV (AEAD_AES_SIV_CMAC_256, the RFC 8915 NTS cipher) over the RustCrypto aes-siv crate. Byte-identical to the device's mbedTLS-composed SIV; both are pinned by the RFC 5297 appendix vectors."
+publish = false
 
 [dependencies]
 lamella-cil-runtime = { path = "../lamella-cil-runtime" }

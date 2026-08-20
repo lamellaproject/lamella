@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "The AOT image's networking + TLS runtime-support layer: C-ABI entry points over the same NetBackend (smoltcp) and TlsBackend (mbedTLS) seams the interpreter uses, so one native stack serves both tiers. Compiled into the per-target runtime-support archive (tools/runtime/runtime-support, feature `net`); the board firmware installs its phy::Device at boot."
+publish = false
 
 [dependencies]
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }

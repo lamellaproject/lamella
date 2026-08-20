@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "The Lamella virtual execution system: a CIL interpreter implemented from ECMA-335."
+publish = false
 
 [dependencies]
 lamella-cil = { path = "../lamella-cil" }
@@ -25,7 +26,7 @@ lamella-token = { path = "../lamella-token" }
 libm = { version = "0.2.16", optional = true }
 
 [features]
-default = ["bcl", "NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental"]
+default = ["bcl", "NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "generics"]
 # The base BCL intrinsics (System.Console / System.String core / Object..ctor): the
 # ECMA-335 Kernel Profile floor. Off => the minimal interpreter core (arithmetic,
 # control flow, the object model) with no BCL surface -- the smallest build for a
@@ -33,7 +34,30 @@ default = ["bcl", "NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-
 bcl = []
 # The additional NETMFv4_4-profile BCL surface beyond the Kernel Profile
 # (richer String, Math, Char, parsing). Off => the Kernel-only floor. A surface knob.
-NETMFv4_4 = ["bcl"]
+NETMFv4_4 = ["bcl", "reflection", "text", "collections"]
+# The COLLECTION types beyond the array: ArrayList, Hashtable, Stack, Queue and the generic
+# List and Dictionary, together with the Comparer they order through. A capability rather
+# than a profile: a program that only needs arrays should not carry the rest.
+collections = []
+# The richer TEXT surface: System.Char's classification and casing predicates, and the
+# String search, trim, pad, split, join, replace and case members beyond the kernel floor.
+# A capability rather than a profile: text handling composes with any BCL tier.
+#
+# It does not gate String itself, its length, indexer, concatenation or equality -- those are
+# floor surface at every tier. It is also independent of the string-utf8 knobs, which choose
+# how a string is STORED rather than which members exist.
+text = []
+# The metadata INSPECTION surface: System.Type's names, predicates and member lookup,
+# System.Reflection's MethodBase / FieldInfo / PropertyInfo / EventInfo / ParameterInfo /
+# Assembly, and System.Activator. A capability rather than a profile: it composes with any
+# BCL tier, and a build that does not inspect metadata should not carry the machinery.
+#
+# `typeof(T)`, type identity and casts are NOT here -- they are floor surface at every tier.
+# Off means those seams have no reachable implementation rather than a defaulting one, which
+# matters because every gated member is runtime-provided with no managed fallback: a build
+# that cannot synthesize them would otherwise answer null, false, or an empty array into
+# callers that act on the result.
+reflection = []
 # Structured exception handling (throw / try-catch / finally). Off => those opcodes
 # are unsupported and the unwinder is stripped under LTO -- the smallest tier, where a
 # fault terminates rather than unwinds. A capability-profile knob.
@@ -83,6 +107,16 @@ string-utf8 = []
 # a UTF-8-native consumer needs the check `string-utf8` makes unnecessary. Wins when both are set,
 # matching lamella-aot's convention so the interpreter previews the tier an AOT build would use.
 string-utf8-wtf8 = []
+# The instruction-set rules ECMA-335 gives `System.Nullable<T>` and no other type: `box` (III.4.1)
+# yields a null reference or a boxed T, `unbox` / `unbox.any` (III.4.32, III.4.33) recover an
+# instance FROM a boxed T, and `castclass` / `isinst` (III.4.3, III.4.6) succeed on one.
+#
+# Coupled to the monomorphizer rather than chosen per profile: a `Nullable<T>` is an INSTANTIATION,
+# and only `lamella-load`'s generics pass creates one, so without that pass these arms are
+# unreachable by construction rather than merely unused. `lamella-load`'s own `generics` feature
+# turns this on, which is what keeps the two from being set independently. Off is the tiny-target
+# floor, where the rules cost flash a part with no monomorphizer can never spend.
+generics = []
 # Typed references (System.TypedReference): the mkrefany / refanyval / refanytype opcodes
 # (__makeref / __refvalue / __reftype) and the Value::TypedRef they pass. Off (the default,
 # the tiny-target floor) => those three opcodes trap cleanly; they are vanishingly rare in

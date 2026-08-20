@@ -93,6 +93,14 @@ pub enum ExprKind {
         /// The operand it applies to.
         operand: Box<Expr>,
     },
+    /// An `await` expression `await unary-expression` (ECMA-334 5th ed, 12.8.8).
+    ///
+    /// `await` is not a keyword: inside an async method every use of the bare word is this node
+    /// (the word is reserved there, 12.8.8.1), and OUTSIDE one the parser builds it only for the
+    /// measured operator shapes -- `await` followed by an identifier, a literal, or `new` in an
+    /// expression position -- reporting CS4033, so `await(1)` stays a call and `await + 1` stays
+    /// an identifier plus a binary operator, exactly as csc reads them.
+    Await(Box<Expr>),
     /// A `ref`/`out` argument (17.5.1): the address of a variable, passed to a byref
     /// parameter. `out` additionally means the callee assigns the variable.
     RefArgument {
@@ -115,6 +123,21 @@ pub enum ExprKind {
         /// The left operand.
         left: Box<Expr>,
         /// The right operand.
+        right: Box<Expr>,
+    },
+    /// A null-coalescing `left ?? right` (C# 2.0; ECMA-334 4th ed 14.13): `left` when it is not
+    /// null, otherwise `right`.
+    ///
+    /// **ITS OWN VARIANT RATHER THAN A [`BinaryOperator`], BECAUSE IT IS NOT AN OPERATOR ON
+    /// VALUES.** It short-circuits, it is not overloadable (14.13 says so outright), it is the one
+    /// RIGHT-associative binary spelling in the language, and its result type comes from a
+    /// conversion between the two operand types rather than from a promotion. A variant on the
+    /// operator enum would have carried none of that and would have inherited the overload lookup
+    /// every other member of that enum gets.
+    NullCoalescing {
+        /// The left operand -- the value used when it is not null.
+        left: Box<Expr>,
+        /// The right operand -- evaluated only when the left one is null.
         right: Box<Expr>,
     },
     /// A conditional `condition ? when_true : when_false` (14.13).
@@ -266,13 +289,40 @@ pub struct TypeRef {
     pub kind: TypeRefKind,
     /// The byte range the type covers in the source.
     pub span: Span,
+    /// Whether the type's FIRST name part was written as a verbatim identifier -- the `@var` of
+    /// `@var x = 5;` (9.4.2).
+    ///
+    /// **THE NAME ITSELF CANNOT CARRY IT, WHICH IS WHY IT IS A SEPARATE FIELD.** The lexer
+    /// canonicalizes `@var` to the name `var` -- correctly, since that is the identifier it
+    /// denotes and it must bind to a type actually called `var` -- so by the time a `TypeRef`
+    /// exists the two spellings are indistinguishable by text. What the prefix decides is
+    /// whether the name may be read as a CONTEXTUAL KEYWORD at all, and the answer is no: a
+    /// verbatim `@var` is an ordinary type name, so a program that declares no type called `var`
+    /// gets CS0246 where the keyword would have inferred a type.
+    ///
+    /// Only the first part, and only a NAME: `N.@var` and `@var[]` are ordinary type references
+    /// whose name happens to be spelled verbatim somewhere, and neither could have been the
+    /// keyword under any reading.
+    pub verbatim_name: bool,
 }
 
 impl TypeRef {
-    /// Creates a type reference of `kind` covering `span`.
+    /// Creates a type reference of `kind` covering `span`, whose name was not written verbatim.
     #[must_use]
     pub fn new(kind: TypeRefKind, span: Span) -> TypeRef {
-        TypeRef { kind, span }
+        TypeRef {
+            kind,
+            span,
+            verbatim_name: false,
+        }
+    }
+
+    /// This type reference with [`TypeRef::verbatim_name`] set to `verbatim` -- how the parser
+    /// records a `@`-prefixed first name part, which it can see and no later phase can.
+    #[must_use]
+    pub fn with_verbatim_name(mut self, verbatim: bool) -> TypeRef {
+        self.verbatim_name = verbatim;
+        self
     }
 }
 
@@ -283,19 +333,22 @@ pub enum TypeRefKind {
     Predefined(PredefinedType),
     /// A type name, its parts in order: `A.B.C` is `["A", "B", "C"]` (11.1).
     Name(Vec<Box<str>>),
-    /// A constructed generic type `A.B.C<T, U>` (C# 2.0; ECMA-334 4th ed 25.5): the definition's
-    /// name parts in the same order [`TypeRefKind::Name`] carries them, and the type arguments in
-    /// the order written. The arity is `arguments.len()`.
+    /// A constructed generic type -- `A.B.C<T, U>`, and equally `A<T>.B` and `A<T>.B<U>`, where a
+    /// type-argument list sits on an INTERIOR part (C# 2.0; ECMA-334 4th ed 10.8, 25.5).
     ///
-    /// `arguments` is never empty. A name with no argument list is a [`TypeRefKind::Name`], and
-    /// keeping the two apart is what lets `Box` and `Box<T>` be different types rather than one
-    /// type with a sometimes-empty list -- the arity is part of the identity (25.5.1), which is
-    /// also why the metadata spells it with a backtick.
+    /// **EVERY PART CARRIES ITS OWN LIST, BECAUSE THAT IS WHAT THE GRAMMAR SAYS.** A
+    /// `namespace-or-type-name` is `identifier type-argument-list_opt` repeated over the dots, so
+    /// `List<int>.Enumerator` is as ordinary a name as `List<int>`. ONE list for a whole dotted
+    /// name cannot tell `List<int>.Enumerator` from `List.Enumerator<int>`, and those are two
+    /// different types -- so a single list is not a simplification of this, it is a conflation.
+    ///
+    /// **AT LEAST ONE PART HAS ARGUMENTS.** A name carrying no list anywhere is a
+    /// [`TypeRefKind::Name`], and keeping the two apart is what lets `Box` and `Box<T>` be
+    /// different types rather than one type with a sometimes-empty list -- the arity is part of the
+    /// identity (25.5.1), which is also why the metadata spells it with a backtick.
     Generic {
-        /// The generic definition's name parts in order.
-        parts: Vec<Box<str>>,
-        /// The type arguments, in declaration order; at least one.
-        arguments: Vec<TypeRef>,
+        /// The name's parts in order, each with the type-argument list written on it.
+        parts: Vec<TypeNamePart>,
     },
     /// An UNBOUND generic type -- `List<>`, `Dictionary<,>` -- the generic definition named with a
     /// `generic-dimension-specifier` in place of a type-argument list (ECMA-334 4th ed 14.5.11).
@@ -315,6 +368,18 @@ pub enum TypeRefKind {
         /// How many type parameters the definition takes; at least one.
         arity: usize,
     },
+    /// A NULLABLE VALUE TYPE `T?` (C# 2.0; ECMA-334 4th ed 11.4): the underlying type carrying
+    /// the `?` modifier.
+    ///
+    /// **`T?` AND `System.Nullable<T>` DENOTE THE SAME TYPE (11.4), AND `bind_type` MAPS THIS TO
+    /// THAT INSTANTIATION** -- so no later phase needs a nullable case at all. The token table, the
+    /// `TypeSpec`, member lookup for `HasValue`/`Value` and emission are the ones a constructed
+    /// generic struct already has.
+    ///
+    /// **THE SPELLING SURVIVES PARSING BECAUSE A DIAGNOSTIC QUOTES IT.** csc says *Cannot
+    /// implicitly convert type 'string' to 'int?'*, never `System.Nullable<int>`, so the `?` form
+    /// has to reach the binder even though what it denotes is an ordinary constructed type.
+    Nullable(Box<TypeRef>),
     /// An array type (12.1): an element type and the rank (dimension count) of
     /// this array. `int[][]` nests an `Array` whose element is another `Array`.
     Array {
@@ -329,6 +394,22 @@ pub enum TypeRefKind {
     /// A placeholder for a type that could not be parsed, emitted with a
     /// diagnostic for recovery.
     Error,
+}
+
+/// One part of a constructed type name: an identifier and the type-argument list written ON that
+/// identifier (ECMA-334 4th ed 10.8, `namespace-or-type-name`).
+///
+/// **AN EMPTY `arguments` IS A STATEMENT, NOT AN ABSENCE.** It says this part introduces no type
+/// parameters of its own -- which is exactly what ECMA-335 II.10.7.2 mangles into a metadata name,
+/// so `List<int>.Enumerator` reads `` List`1 `` then `Enumerator` and the two representations line
+/// up without a conversion. `System.Collections.Generic.List<int>` is four such parts, three of
+/// them empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeNamePart {
+    /// The identifier this part names.
+    pub name: Box<str>,
+    /// The type arguments written on this part, in order; empty when it carries no list.
+    pub arguments: Vec<TypeRef>,
 }
 
 /// A predefined type (ECMA-334 1st ed, 11.1.4): the type keywords.
@@ -922,13 +1003,32 @@ pub enum Modifier {
     Const,
     /// `unsafe`.
     Unsafe,
+    /// `partial` (C# 2.0, ECMA-334 4th ed 17.1.4) -- this declaration is one PART of a type whose
+    /// other parts are declared elsewhere, possibly in another file.
+    ///
+    /// CONTEXTUAL, like [`Modifier::Required`] and [`Modifier::Async`], and more tightly placed
+    /// than either: 17.1.4 admits it only IMMEDIATELY before `class`, `struct` or `interface`, so
+    /// `class partial { }` and a field of type `partial` both keep compiling (measured against
+    /// csc). See `Parser::partial_is_a_modifier_here`.
+    Partial,
     /// `required` (C# 11) -- an initializer the caller MUST supply.
     ///
-    /// **The only CONTEXTUAL modifier in this list**, so unlike its neighbours it is not produced by
-    /// mapping a [`crate::token::Keyword`]: `required` is an ordinary identifier everywhere else,
-    /// and a field, local, parameter or type may still be named it. See
-    /// `Parser::required_is_a_modifier_here` for the two-token lookahead that tells the two apart.
+    /// One of the two CONTEXTUAL modifiers in this list (see [`Modifier::Async`]), so unlike its
+    /// neighbours it is not produced by mapping a [`crate::token::Keyword`]: `required` is an
+    /// ordinary identifier everywhere else, and a field, local, parameter or type may still be
+    /// named it. See `Parser::required_is_a_modifier_here` for the two-token lookahead that tells
+    /// the two apart.
     Required,
+    /// `async` (C# 5, ECMA-334 5th ed 15.15) -- the method is an async function and `await` is
+    /// reserved in its body.
+    ///
+    /// CONTEXTUAL, like [`Modifier::Required`] and unlike everything else here: `async` stays an
+    /// ordinary identifier elsewhere, so `class async { }`, a field of type `async`, and a method
+    /// `async async()` RETURNING that type all keep compiling (measured against csc). See
+    /// `Parser::async_is_a_modifier_here` for the lookahead -- which, unlike `required`'s
+    /// two-token peek, must scan a full type, because `async Task<int> M()` puts arbitrarily many
+    /// tokens between the modifier and the name that proves it is one.
+    Async,
 }
 
 /// A member of a type (17.2). Fields, methods, and constructors land first;
@@ -1181,25 +1281,35 @@ pub fn explicit_interface_member_name(interface_ref: &TypeRef, member: &str) -> 
                 name.push('.');
             }
         }
-        TypeRefKind::Generic { parts, arguments } => {
+        TypeRefKind::Generic { parts } => {
             for part in parts {
-                name.push_str(part);
+                name.push_str(&part.name);
+                write_type_arguments(&mut name, &part.arguments);
                 name.push('.');
             }
-            name.pop();
-            name.push('<');
-            for (index, argument) in arguments.iter().enumerate() {
-                if index > 0 {
-                    name.push(',');
-                }
-                write_type_ref(&mut name, argument);
-            }
-            name.push_str(">.");
         }
         _ => {}
     }
     name.push_str(member);
     name
+}
+
+/// Appends `<a,b>` to `text` for a part's type arguments, or nothing when it carries none.
+///
+/// Shared by [`explicit_interface_member_name`] and [`write_type_ref`], so a part's arguments are
+/// spelled one way wherever they appear.
+fn write_type_arguments(text: &mut String, arguments: &[TypeRef]) {
+    if arguments.is_empty() {
+        return;
+    }
+    text.push('<');
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        write_type_ref(text, argument);
+    }
+    text.push('>');
 }
 
 /// Appends a type reference's source spelling to `text`, for the mangled names in
@@ -1215,21 +1325,18 @@ fn write_type_ref(text: &mut String, ty: &TypeRef) {
                 text.push_str(part);
             }
         }
-        TypeRefKind::Generic { parts, arguments } => {
+        TypeRefKind::Generic { parts } => {
             for (index, part) in parts.iter().enumerate() {
                 if index > 0 {
                     text.push('.');
                 }
-                text.push_str(part);
+                text.push_str(&part.name);
+                write_type_arguments(text, &part.arguments);
             }
-            text.push('<');
-            for (index, argument) in arguments.iter().enumerate() {
-                if index > 0 {
-                    text.push(',');
-                }
-                write_type_ref(text, argument);
-            }
-            text.push('>');
+        }
+        TypeRefKind::Nullable(underlying) => {
+            write_type_ref(text, underlying);
+            text.push('?');
         }
         TypeRefKind::Array { element, rank } => {
             write_type_ref(text, element);
@@ -1392,6 +1499,13 @@ pub enum ConstructorInitializerKind {
 pub struct Accessor {
     /// The attributes on the accessor itself (17.6.2 accessor-declarations).
     pub attributes: Vec<AttributeSection>,
+    /// The accessor's OWN access modifiers -- `private set`, `protected internal get` (C# 2.0).
+    /// Empty when the accessor takes the property's accessibility, which is the common case and
+    /// the only one C# 1.0 has. Two entries for the compound `protected internal`.
+    ///
+    /// Always empty for an EVENT accessor: `add`/`remove` may not carry modifiers (CS1609), and
+    /// the event accessor block does not parse any.
+    pub modifiers: Vec<Modifier>,
     /// The accessor body, or `None` for a bare `;`.
     pub body: Option<Stmt>,
     /// The byte range the accessor covers.

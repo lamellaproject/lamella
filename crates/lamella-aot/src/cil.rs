@@ -1901,12 +1901,43 @@ fn compare(
 
 /// Pops one operand and pushes its sub-word width conversion (the CLI's `conv.i1`/
 /// `conv.u1`/`conv.i2`/`conv.u2`); the result is `int32`.
+/// Converts the top of stack to `int64` (truncating toward zero) if it is a FLOAT, and leaves any
+/// other type alone.
+///
+/// This is the step III.3.27 puts before every integer conversion whose source is on the stack as an
+/// `F`: the CLI converts the float to an integer and then narrows or widens. Without it the
+/// following narrow reads the operand's IEEE ENCODING -- `(byte)255.9` answering 205, the low byte
+/// of `0x406FFCCCCCCCCCCD`, rather than 255 -- and does so silently, with no build error and no trap.
+///
+/// `int64` rather than `int32` is what makes the AOT agree with the interpreter, which reaches every
+/// integer conversion through one `f as i64`. Going via `int32` would agree for values that fit and
+/// diverge on the saturating edge.
+fn float_to_long_first(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<(), CilError> {
+    let top = *stack.last().ok_or(CilError::StackUnderflow)?;
+    let kind = match value_types.get(top.index()) {
+        Some(MirType::F32) => ConvKind::Float32ToLong,
+        Some(MirType::F64) => ConvKind::Float64ToLong,
+        _ => return Ok(()),
+    };
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let result = new_value(value_types, MirType::I64);
+    insts.push((result, Inst::Convert { value, kind }));
+    stack.push(result);
+    Ok(())
+}
+
 fn convert(
     value_types: &mut Vec<MirType>,
     stack: &mut Vec<ValueId>,
     insts: &mut Vec<(ValueId, Inst)>,
     kind: ConvKind,
 ) -> Result<(), CilError> {
+    float_to_long_first(value_types, stack, insts)?;
+    narrow_to_i32(value_types, stack, insts)?;
     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
     let result = new_value(value_types, MirType::I32);
     insts.push((result, Inst::Convert { value, kind }));
@@ -1922,6 +1953,7 @@ fn widen(
     insts: &mut Vec<(ValueId, Inst)>,
     signed: bool,
 ) -> Result<(), CilError> {
+    float_to_long_first(value_types, stack, insts)?;
     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
     if value_types.get(value.0 as usize) == Some(&MirType::I64) {
         stack.push(value);
@@ -3093,12 +3125,18 @@ fn apply_value_op(
         }
         Opcode::Initobj => match last_local_addr.take() {
             Some((AddrOf::Local(n), _)) => {
-                let (size, refs) = resolver
-                    .value_type_cell(&inst.operand)
-                    .ok_or(CilError::BadOperand)?;
-                let handle = match &inst.operand {
-                    Operand::Token(token) => lamella_ir::TypeHandle(token.0),
-                    _ => lamella_ir::TypeHandle(0),
+                let (handle, size, refs) = match resolver.type_operand_mir(&inst.operand) {
+                    Some(MirType::ValueType { handle, size, refs }) => (handle, size, refs),
+                    _ => {
+                        let (size, refs) = resolver
+                            .value_type_cell(&inst.operand)
+                            .ok_or(CilError::BadOperand)?;
+                        let handle = match &inst.operand {
+                            Operand::Token(token) => lamella_ir::TypeHandle(token.0),
+                            _ => lamella_ir::TypeHandle(0),
+                        };
+                        (handle, size, refs)
+                    }
                 };
                 let zeroed = new_value(value_types, MirType::ValueType { handle, size, refs });
                 insts.push((zeroed, Inst::InitStruct));
@@ -9118,6 +9156,106 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// `conv.i8` from a float is a CONVERSION, not a widen of the operand's low word.
+    ///
+    /// The narrowing and widening kinds are register-width bit operations: they say nothing about
+    /// their operand's type, so handed a float they read its IEEE encoding. `(long)3.0` answered
+    /// the low 32 bits of `0x4008000000000000` -- that is, ZERO -- and `(long)3.0f` answered
+    /// 1077936128, the whole float encoding sign-extended.
+    #[test]
+    fn lowers_a_double_to_long_conversion_rather_than_widening_its_encoding() {
+        for (load, kind) in [
+            (
+                Instruction::new(Opcode::LdcR8, Operand::Float64(3.0)),
+                ConvKind::Float64ToLong,
+            ),
+            (
+                Instruction::new(Opcode::LdcR4, Operand::Float32(3.0)),
+                ConvKind::Float32ToLong,
+            ),
+        ] {
+            let body = MethodBodyImage {
+                max_stack: 1,
+                init_locals: false,
+                local_var_sig: None,
+                code: vec![
+                    load,
+                    Instruction::simple(Opcode::ConvI8),
+                    Instruction::simple(Opcode::Ret),
+                ]
+                .into_boxed_slice(),
+                handlers: Vec::new().into_boxed_slice(),
+            };
+            let func = lower_method(&body).unwrap();
+            assert!(lamella_ir::verify(&func).is_ok());
+            assert_eq!(func.ret, Some(MirType::I64));
+            let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+            assert!(
+                insts
+                    .iter()
+                    .any(|(_, i)| matches!(i, Inst::Convert { kind: k, .. } if *k == kind)),
+                "a float source converts to int64 via {kind:?}"
+            );
+            assert!(
+                !insts.iter().any(|(_, i)| matches!(i, Inst::Widen { .. })),
+                "and is NOT sign-extended as though it were already an integer"
+            );
+        }
+    }
+
+    /// A sub-word narrowing from a float converts FIRST and narrows second (III.3.27), so the bits
+    /// the narrow reads are the value's and not the encoding's: `(byte)255.9` answered 205 -- the low
+    /// byte of `0x406FFCCCCCCCCCCD` -- and `(char)65.9` answered U+999A.
+    ///
+    /// Via `int64`, which is the width the interpreter reaches every integer conversion through, so
+    /// the two tiers agree on the saturating edge as well as on values that fit.
+    #[test]
+    fn a_narrowing_conversion_from_a_double_converts_before_it_narrows() {
+        for (opcode, narrow) in [
+            (Opcode::ConvU1, ConvKind::ZeroExtend8),
+            (Opcode::ConvI1, ConvKind::SignExtend8),
+            (Opcode::ConvU2, ConvKind::ZeroExtend16),
+            (Opcode::ConvI2, ConvKind::SignExtend16),
+        ] {
+            let body = MethodBodyImage {
+                max_stack: 1,
+                init_locals: false,
+                local_var_sig: None,
+                code: vec![
+                    Instruction::new(Opcode::LdcR8, Operand::Float64(255.9)),
+                    Instruction::simple(opcode),
+                    Instruction::simple(Opcode::Ret),
+                ]
+                .into_boxed_slice(),
+                handlers: Vec::new().into_boxed_slice(),
+            };
+            let func = lower_method(&body).unwrap();
+            assert!(lamella_ir::verify(&func).is_ok());
+            assert_eq!(func.ret, Some(MirType::I32));
+            let kinds: Vec<ConvKind> = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|(_, i)| match i {
+                    Inst::Convert { kind, .. } => Some(*kind),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![ConvKind::Float64ToLong, narrow],
+                "{opcode:?} converts to an integer before narrowing it"
+            );
+            assert!(
+                func.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|(_, i)| matches!(i, Inst::Truncate { .. })),
+                "{opcode:?} truncates the int64 to a word before the sub-word narrow"
+            );
+        }
     }
 
     #[test]

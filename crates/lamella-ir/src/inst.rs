@@ -88,6 +88,16 @@ pub enum ConvKind {
     /// Truncate a 64-bit float toward zero to a signed `int32` (`conv.i4` from an `R8`). wasm has a
     /// native truncate; a no-FPU ARM target needs the aeabi soft helper (unsupported).
     Float64ToInt,
+    /// Truncate a 32-bit float toward zero to a signed `int64` (`conv.i8`/`conv.u8` from an `R4`).
+    /// ARM `__aeabi_f2lz`; wasm `i64.trunc_f32_s`.
+    Float32ToLong,
+    /// Truncate a 64-bit float toward zero to a signed `int64` (`conv.i8`/`conv.u8` from an `R8`).
+    /// ARM `__aeabi_d2lz`; wasm `i64.trunc_f64_s`.
+    ///
+    /// This is also the FIRST step of every sub-word narrowing from a float (`conv.i1` and friends):
+    /// the CLI converts the float to an integer and THEN narrows, so without it the narrow reads the
+    /// operand's IEEE encoding rather than its value.
+    Float64ToLong,
     /// Convert a signed `int32` to a 64-bit float (`conv.r8` from an int32 -- e.g. `double d = intVar`).
     /// The no-FPU ARM form is the `__aeabi_i2d` soft helper; wasm has `f64.convert_i32_s`.
     IntToFloat64,
@@ -130,8 +140,8 @@ pub enum ConvKind {
 }
 
 impl ConvKind {
-    /// The [`MirType`] this conversion produces: `F32` for the int-to-float case, `int32` for the
-    /// narrowing/extending and float-to-int cases.
+    /// The [`MirType`] this conversion produces: `F32` for the int-to-float case, `int64` for the
+    /// float-to-long cases, `int32` for the narrowing/extending and float-to-int cases.
     #[must_use]
     pub fn result_type(self) -> MirType {
         match self {
@@ -143,6 +153,7 @@ impl ConvKind {
             | ConvKind::Float32ToFloat64
             | ConvKind::UIntToFloat64
             | ConvKind::ULongToFloat64 => MirType::F64,
+            ConvKind::Float32ToLong | ConvKind::Float64ToLong => MirType::I64,
             ConvKind::IntToRef => MirType::ObjectRef,
             ConvKind::ToNativeInt => MirType::NativeInt,
             ConvKind::SignExtend8

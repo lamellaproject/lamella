@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "An ST-Link debug-probe host: the USB command protocol for ST-Link/V2, V2-1 and V3, presented as Lamella's probe-neutral target-access seam."
+publish = false
 
 [lints]
 workspace = true

@@ -59,7 +59,7 @@ pub fn run_py_str(source: &str) -> RunResult {
         };
     }
     let Some(main_co) = entry_functions
-        .iter()
+        .iter_bodies()
         .find(|function| function.name == "main")
     else {
         return RunResult {

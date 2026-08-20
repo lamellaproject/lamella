@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.TypeInitializationException
 namespace System
 {
-    public class TypeInitializationException : SystemException
+    public sealed class TypeInitializationException : SystemException
     {
         private string _typeName;
 

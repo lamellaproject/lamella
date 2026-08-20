@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Debug-probe discovery, selection, and capability negotiation -- the transport-neutral layer above lamella-cmsis-dap. Enumerates attached probes across transports, picks the DAP interface on a composite probe, negotiates DAP_Info, and hands back a connected Dap. CMSIS-DAP (v1 HID, v2 bulk) is the first probe family."
+publish = false
 
 [lints]
 workspace = true

@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "DEVICE-side TLS backend for the interpreter's TlsBackend seam: a pure byte-transform engine over vendored mbedTLS (TLS 1.2 client), compiled for the target by a C cross-compiler. A board serve installs it via Vm::set_tls_backend and supplies an entropy source; the managed SslStream does all socket I/O and pumps the engine."
 links = "lamella_mbedtls"
+publish = false
 
 [dependencies]
 # Only the seam types (TlsBackend + handles); no default features so a device build pulls

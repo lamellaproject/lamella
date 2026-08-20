@@ -3,6 +3,8 @@ namespace System
 {
     public sealed class Convert
     {
+        private Convert() { }
+
         public static int ToInt32(string value)
         {
             if ((object)value == null) return 0;

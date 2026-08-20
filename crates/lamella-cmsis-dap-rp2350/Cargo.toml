@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Raspberry Pi RP2350 flash programming over the Lamella CMSIS-DAP debug stack -- dormant-state SWD connect, the ADIv6 MEM-AP, and the chip's bootrom flash API driven from the debugger; a device-specific extension of lamella-cmsis-dap."
+publish = false
 
 [lints]
 workspace = true

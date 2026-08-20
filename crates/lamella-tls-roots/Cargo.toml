@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "The bundled system root-certificate store (the official curl/Mozilla CA bundle), indexed by subject DN so a device TLS backend can find a peer chain's signing root without parsing the whole store into its small crypto pool. Firmware that wants system-root trust (over a pinned certificate) links this and registers it with the backend. no_std; the DER is flash-resident."
+publish = false
 
 [dependencies]
 

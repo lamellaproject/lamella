@@ -1,0 +1,22 @@
+[package]
+name = "lamella-sd-sdmmc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A memory-card block device over a native SD controller: the four-wire initialization ladder and transfer state machine, generic over a host-supplied command/data seam."
+publish = false
+
+[dependencies]
+# The bus-independent CARD protocol, shared with the SPI transport.
+lamella-sd-core = { path = "../lamella-sd-core" }
+
+[features]
+default = []
+# A host-only in-memory card simulator answering the `SdmmcHost` seam at the COMMAND level, so the
+# initialization ladder and the four-bit negotiation are testable with no controller and no board.
+sim = []
+
+[lints]
+workspace = true

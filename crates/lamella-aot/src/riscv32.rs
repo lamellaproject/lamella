@@ -338,6 +338,8 @@ fn soft_float_convert(kind: ConvKind) -> Option<(&'static str, u32, u32)> {
         ConvKind::ULongToFloat64 => ("__floatundidf", 2, 2),
         ConvKind::Float32ToInt => ("__fixsfsi", 1, 1),
         ConvKind::Float64ToInt => ("__fixdfsi", 2, 1),
+        ConvKind::Float32ToLong => ("__fixsfdi", 1, 2),
+        ConvKind::Float64ToLong => ("__fixdfdi", 2, 2),
         ConvKind::Float32ToFloat64 => ("__extendsfdf2", 1, 2),
         ConvKind::Float64ToFloat32 => ("__truncdfsf2", 2, 1),
         _ => return None,
@@ -3943,6 +3945,8 @@ fn emit_convert(enc: &mut Encoder, dest: Reg, src: Reg, kind: ConvKind) -> Resul
         ConvKind::Float32ToInt
         | ConvKind::IntToFloat32
         | ConvKind::Float64ToInt
+        | ConvKind::Float32ToLong
+        | ConvKind::Float64ToLong
         | ConvKind::IntToFloat64
         | ConvKind::LongToFloat64
         | ConvKind::Float32ToFloat64

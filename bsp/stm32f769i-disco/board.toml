@@ -67,6 +67,40 @@ hsi_hz = 16000000           # the F7 reset clock: HSI at 16 MHz, no PLL, prescal
 pclk_hz = 16000000          # APB2, where USART1 sits. Equal to HSI under reset prescalers, which
                             # the generator verifies rather than assumes.
 
+# The part's rated operating point, which the reset plan above deliberately does not reach.
+# STATE-AND-VERIFY: this row states the divisors AND the rates they produce, and generation
+# refuses unless the vendor's arithmetic holds and every range the manual sets is satisfied.
+#
+# THE 48 MHz DOMAIN IS THE REASON THIS ROW IS WORTH STATING RATHER THAN LEAVING TO A BRING-UP.
+# It is a second output of the SAME VCO that produces the system clock, and it is what the SD/MMC
+# controllers are clocked from -- so a program that raises the core clock moves the card clock
+# with it. Stated here, the pair is checked together; left to code, they are two places to get
+# right and only one of them fails loudly.
+#
+# THE TWO APB CEILINGS BELOW ARE THE DATASHEET'S, AND THE VENDOR'S TWO DOCUMENTS DISAGREE ABOUT
+# THEM. The reference manual's prescaler-field cautions give 90 MHz for APB2 and 45 MHz for APB1;
+# the datasheet's block diagram for this part gives 108 MHz and 54 MHz. The part-specific document
+# is the one taken, since the manual covers a range of parts and its figures are the range's. A
+# design following the manual's pair would halve both buses and lose nothing but speed.
+[[plans]]
+name = "pll-216mhz"
+source = "pll"
+hsi_hz = 16000000           # the same internal oscillator the reset plan names, so this point is
+                            # reachable without depending on which crystals a unit is populated
+                            # with. Its accuracy suits the card clock; a USB device needs a
+                            # tighter reference than an RC oscillator provides, and would have to
+                            # name a plan running from a crystal instead.
+pll_m = 8                   # 16 MHz / 8 = 2 MHz at the VCO input -- the rate the manual
+                            # recommends outright, to limit PLL jitter.
+pll_n = 216                 # 2 MHz * 216 = 432 MHz VCO, the top of the permitted range.
+pll_p = 2                   # 432 / 2 = 216 MHz system clock, the part's maximum.
+pll_q = 9                   # 432 / 9 = 48 MHz EXACTLY, which is what makes 432 the right VCO:
+                            # the SD/MMC and USB domain divides from it with no remainder.
+sysclk_hz = 216000000
+pll48_hz = 48000000
+pclk_hz = 108000000         # APB2 = sysclk / 2, where USART1 and both SD/MMC controllers sit.
+pclk1_hz = 54000000         # APB1 = sysclk / 4.
+
 # --- control lines ---------------------------------------------------------------------------
 #
 # BOTH USER LEDS ARE ACTIVE LOW and the manual says so outright rather than leaving it to a

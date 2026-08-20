@@ -1,7 +1,7 @@
 //! Positional completion (the IntelliSense engine) for Python, clause-agnostic so the in-browser
 //! IDE and an editor extension drive the same logic rather than each growing its own.
 
-use crate::ast::{Expr, FuncDef, ModuleAst, ParamDef, Stmt, StmtKind};
+use crate::ast::{target_bound_names, Expr, FuncDef, ModuleAst, ParamDef, Stmt, StmtKind};
 use crate::profile::{Capability, Profile};
 use alloc::borrow::ToOwned;
 use alloc::format;
@@ -556,9 +556,13 @@ fn collect_bindings(body: &[Stmt], items: &mut Vec<CompletionItem>) {
             StmtKind::For { target, .. } | StmtKind::ForIter { target, .. } | StmtKind::AsyncFor { target, .. } => {
                 items.push(CompletionItem::new(target, CompletionKind::Local, ""));
             }
-            StmtKind::With { optional_name, .. } | StmtKind::AsyncWith { optional_name, .. } => {
-                if let Some(name) = optional_name {
-                    items.push(CompletionItem::new(name, CompletionKind::Local, ""));
+            StmtKind::With { optional_target, .. } | StmtKind::AsyncWith { optional_target, .. } => {
+                if let Some(target) = optional_target {
+                    let mut bound = Vec::new();
+                    target_bound_names(target, &mut bound);
+                    for name in bound {
+                        items.push(CompletionItem::new(name, CompletionKind::Local, ""));
+                    }
                 }
             }
             _ => {}

@@ -7,8 +7,10 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::OnceCell;
 
 /// The four bytes that open a serialized module: "LPYC" (Lamella PYthon Code).
 pub const MAGIC: [u8; 4] = *b"LPYC";
@@ -63,7 +65,7 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 /// build writes. It costs four bytes a module and buys the ability to add source positions later
 /// without moving this number. It shipped EMPTY and now carries line tables, which is the
 /// reservation paying out rather than a second format change.
-pub const FORMAT_VERSION: u16 = 27;
+pub const FORMAT_VERSION: u16 = 28;
 
 /// The capability bits an artifact's header carries: what its bytecode REQUIRES of the runtime that
 /// loads it. A reader that does not implement a required capability refuses the artifact by name
@@ -148,6 +150,20 @@ impl Capability {
     /// compile error rather than a behavior change.
     pub const ALL: &'static [Capability] =
         &[Capability::Float, Capability::Complex, Capability::Introspection];
+
+    /// Which capabilities cannot be provided without which others, as `(dependent, prerequisite)`.
+    ///
+    /// ONE declaration, read in BOTH directions: [`Profile::with`] closes UPWARD over it (taking a
+    /// capability takes what it rests on) and [`Profile::without`] closes DOWNWARD (dropping one
+    /// drops whatever rested on it). The two directions are not two rules; they are the same edge
+    /// answered from each end, which is why they share a source rather than a convention.
+    ///
+    /// The runtime's cargo manifest states the same implication as a feature edge, and the two have
+    /// to agree: a profile that describes an image nobody can build is a front end that then accepts
+    /// source for it.
+    const REQUIRES: &'static [(Capability, Capability)] = &[
+        (Capability::Complex, Capability::Float),
+    ];
 
     /// The name this capability is spelled with in a diagnostic and in the runtime's cargo manifest --
     /// the SAME string in both, so a developer who reads "float is not available" in an editor can
@@ -259,27 +275,57 @@ impl Profile {
         self.0 & capability.bit() != 0
     }
 
-    /// This profile with `capability` added, plus anything it requires.
+    /// This profile with `capability` added, plus everything that capability rests on.
     #[must_use]
     pub fn with(self, capability: Capability) -> Profile {
-        let mut bits = self.0 | capability.bit();
-        if capability == Capability::Complex {
-            bits |= Capability::Float.bit();
-        }
-        Profile(bits)
+        Profile(Self::close_over_prerequisites(self.0 | capability.bit(), Capability::REQUIRES))
     }
 
-    /// This profile with `capability` removed, plus anything that requires it.
+    /// This profile with `capability` removed, plus everything that rested on it.
     ///
     /// Removing [`Capability::Float`] removes [`Capability::Complex`] too. The alternative is a
     /// value describing an image nobody can build, and a compiler that then accepts `1j` for it.
     #[must_use]
     pub fn without(self, capability: Capability) -> Profile {
-        let mut bits = self.0 & !capability.bit();
-        if capability == Capability::Float {
-            bits &= !Capability::Complex.bit();
+        Profile(Self::close_over_dependents(self.0 & !capability.bit(), Capability::REQUIRES))
+    }
+
+    /// Add the prerequisite of every capability present, until nothing more is owed.
+    ///
+    /// Both closures iterate to a fixed point rather than making a single pass, which is what makes
+    /// a CHAIN (`C` rests on `B` rests on `A`) come out right from either end. The live table holds
+    /// one edge and cannot show that, so `edges` is a parameter and the tests hand these a synthetic
+    /// chain -- **ordered so that a single pass gets the wrong answer**, since a chain listed in the
+    /// convenient order is satisfied by one pass and would prove nothing.
+    fn close_over_prerequisites(mut bits: u16, edges: &[(Capability, Capability)]) -> u16 {
+        loop {
+            let mut next = bits;
+            for (dependent, prerequisite) in edges {
+                if next & dependent.bit() != 0 {
+                    next |= prerequisite.bit();
+                }
+            }
+            if next == bits {
+                return bits;
+            }
+            bits = next;
         }
-        Profile(bits)
+    }
+
+    /// Drop every capability whose prerequisite is absent, until nothing more falls.
+    fn close_over_dependents(mut bits: u16, edges: &[(Capability, Capability)]) -> u16 {
+        loop {
+            let mut next = bits;
+            for (dependent, prerequisite) in edges {
+                if next & prerequisite.bit() == 0 {
+                    next &= !dependent.bit();
+                }
+            }
+            if next == bits {
+                return bits;
+            }
+            bits = next;
+        }
     }
 
 }
@@ -288,6 +334,234 @@ impl Default for Profile {
     fn default() -> Self {
         Profile::FULL
     }
+}
+
+/// One build-time knob of the Python tier: a cargo feature the image was built with.
+///
+/// **A knob is not a [`Capability`], and the difference is the whole reason this type exists.**
+/// `Capability` is the subset the FRONT END can act on, defined by a written test -- the compiler
+/// refuses exactly what it cannot ENCODE, so the refusal set is the constant pool. `BundledStdlib`
+/// and `GcEngine` fail that test: every constant still materializes without them, and what changes
+/// is whether an import resolves at run time and whether memory is reclaimed. Widening `Capability`
+/// to cover them would put values in it the compiler can never have an opinion about.
+///
+/// A published PROFILE has the wider domain, because the person selecting one cannot turn any knob
+/// by hand -- so the profile must state all of them, and this is the set it states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Knob {
+    /// The `float` type and everything producing one.
+    Float,
+    /// The `complex` type and `1j` literals.
+    Complex,
+    /// `dir()` and the per-type name lists it reports from.
+    Introspection,
+    /// The pure-Python module sources carried in the image, so an import resolves with no
+    /// filesystem.
+    BundledStdlib,
+    /// The collector engine, so an arena holds a program's live set rather than its total
+    /// allocation.
+    GcEngine,
+}
+
+impl Knob {
+    /// Every knob, in declaration order.
+    pub const ALL: &'static [Knob] = &[
+        Knob::Float,
+        Knob::Complex,
+        Knob::Introspection,
+        Knob::BundledStdlib,
+        Knob::GcEngine,
+    ];
+
+    /// The cargo feature this knob is spelled with on `lamella-py-runtime` -- the SAME string in
+    /// the manifest, in a diagnostic and here, so a reader who sees a knob named in a profile can
+    /// find the feature that turns it off.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Knob::Float => "float",
+            Knob::Complex => "complex",
+            Knob::Introspection => "introspection",
+            Knob::BundledStdlib => "bundled-stdlib",
+            Knob::GcEngine => "gc-collect",
+        }
+    }
+
+    /// The [`Capability`] this knob provides, when the front end can act on it at all.
+    ///
+    /// `None` is not an omission: it says this knob changes the image without changing what the
+    /// compiler may encode. **This is the ONE place the two sets are related**, so a profile derives
+    /// its `Profile` rather than carrying a second, hand-kept copy of it.
+    #[must_use]
+    pub fn capability(self) -> Option<Capability> {
+        match self {
+            Knob::Float => Some(Capability::Float),
+            Knob::Complex => Some(Capability::Complex),
+            Knob::Introspection => Some(Capability::Introspection),
+            Knob::BundledStdlib | Knob::GcEngine => None,
+        }
+    }
+
+    /// What this knob costs in FLASH, in bytes, on the board named by [`Knob::COST_MEASURED_ON`].
+    ///
+    /// **A size is a claim about a build, and these name theirs.** Each figure is a separate
+    /// linked device build minus the same baseline, `llvm-size` text+rodata, every binary hashed to
+    /// prove it changed. **`BundledStdlib` is ZERO and that is a real result rather than a failed
+    /// measurement:** its module sources are `include_str!` constants reachable only through the
+    /// import resolver, a firmware running a host-compiled bundle never resolves an import, and
+    /// `--gc-sections` drops every one of them. The sources are paid for only where the resolver
+    /// is reachable -- a host, a browser, or an on-device REPL -- and the device tier that reaches
+    /// it needs room the measured board does not have, so on that board the question does not
+    /// arise.
+    #[must_use]
+    pub fn flash_cost_bytes(self) -> u32 {
+        match self {
+            Knob::Float => 0,
+            Knob::Complex => 3_268,
+            Knob::Introspection => 3_616,
+            Knob::BundledStdlib => 0,
+            Knob::GcEngine => 9_724,
+        }
+    }
+
+    /// The build [`Knob::flash_cost_bytes`] describes.
+    pub const COST_MEASURED_ON: &'static str =
+        "microbit-v2-py, nRF52833, --profile flash, thumbv7em-none-eabi, over a python,python-float baseline";
+}
+
+/// Ties [`Knob::ALL`]'s length to the variant list, the same way [`Capability::ALL`]'s is tied.
+///
+/// The match is exhaustive, so a new knob fails to compile HERE, in the one place that also states
+/// the length the assertion checks.
+const fn _every_knob_is_in_all(knob: Knob) -> usize {
+    match knob {
+        Knob::Float => 0,
+        Knob::Complex => 1,
+        Knob::Introspection => 2,
+        Knob::BundledStdlib => 3,
+        Knob::GcEngine => 4,
+    }
+}
+const _: () = assert!(
+    Knob::ALL.len() == 5,
+    "a knob was added without extending ALL"
+);
+
+/// A named, selectable set of knobs -- what a person picks when they cannot turn a knob by hand.
+///
+/// A device receiving a host-compiled bundle runs a PREBUILT interpreter, so the selection was made
+/// before they arrived. The profile is how they find out what they got, which is why
+/// [`NamedProfile::knobs`] is the whole set and not the compiler-visible part of it.
+///
+/// **Each of these corresponds to a firmware build recipe that exists.** A profile whose recipe
+/// nothing builds is a profile nobody can select, which is the failure this type exists to make
+/// visible rather than to commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamedProfile {
+    /// The name a person selects.
+    pub name: &'static str,
+    /// Every knob this profile turns on.
+    pub knobs: &'static [Knob],
+    /// What this profile is for, in one line.
+    pub doc: &'static str,
+}
+
+impl NamedProfile {
+    /// The profiles that correspond to a build recipe in the tree.
+    pub const ALL: &'static [NamedProfile] = &[
+        NamedProfile {
+            name: "no-float",
+            knobs: &[],
+            doc: "The smallest tier: no float, so no complex either. For parts that cannot afford \
+                  soft float at all.",
+        },
+        NamedProfile {
+            name: "base",
+            knobs: &[Knob::Float],
+            doc: "Float, and nothing optional beyond it. The tier a device runs a host-compiled \
+                  bundle on.",
+        },
+        NamedProfile {
+            name: "serve",
+            knobs: &[Knob::Float, Knob::GcEngine],
+            doc: "The tier a host hands arbitrary programs to. The collector is a correctness \
+                  requirement here rather than a default: a bounded live set must run indefinitely.",
+        },
+        NamedProfile {
+            name: "floor",
+            knobs: &[Knob::Float, Knob::GcEngine, Knob::BundledStdlib],
+            doc: "The floor build, which also carries the module sources so an import can resolve \
+                  with no filesystem.",
+        },
+    ];
+
+    /// The compiler-visible [`Profile`] this named profile implies.
+    ///
+    /// DERIVED from [`NamedProfile::knobs`] through [`Knob::capability`], so the capability set and
+    /// the knob set cannot disagree. Writing it out beside the knob list would be a second
+    /// implementation of one fact, which is what a hand-maintained profile table always becomes.
+    #[must_use]
+    pub fn profile(&self) -> Profile {
+        let mut profile = Profile::BARE;
+        let mut index = 0;
+        while index < self.knobs.len() {
+            if let Some(capability) = self.knobs[index].capability() {
+                profile = profile.with(capability);
+            }
+            index += 1;
+        }
+        profile
+    }
+
+    /// What this profile adds to the baseline in FLASH, in bytes, on [`Knob::COST_MEASURED_ON`].
+    ///
+    /// A SUM OF INDEPENDENT DELTAS, and knob costs do not perfectly compose -- shared code
+    /// between two knobs is counted twice here and paid once by the linker. It is an upper bound
+    /// and a comparison between profiles, not a promise about an image.
+    #[must_use]
+    pub fn flash_cost_bytes(&self) -> u32 {
+        let mut total = 0;
+        let mut index = 0;
+        while index < self.knobs.len() {
+            total += self.knobs[index].flash_cost_bytes();
+            index += 1;
+        }
+        total
+    }
+
+    /// Whether this profile turns `knob` on.
+    #[must_use]
+    pub fn has(&self, knob: Knob) -> bool {
+        let mut index = 0;
+        while index < self.knobs.len() {
+            if self.knobs[index] as u8 == knob as u8 {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// The profile of this name, if one exists.
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<&'static NamedProfile> {
+        let mut index = 0;
+        while index < NamedProfile::ALL.len() {
+            let candidate = &NamedProfile::ALL[index];
+            if str_eq(candidate.name, name) {
+                return Some(candidate);
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+/// `str` equality without `PartialEq`'s generic machinery, so the lookup above stays usable from a
+/// `const`-shaped walk and carries no formatting code into a device image.
+fn str_eq(a: &str, b: &str) -> bool {
+    a.as_bytes() == b.as_bytes()
 }
 
 /// A Python string constant's value: a sequence of CODE POINTS, held as WTF-8 bytes.
@@ -1446,7 +1720,6 @@ pub struct CodeObject {
     /// signed -- a line runs backwards as often as a loop does. Roughly four ops share an entry in
     /// real code, which is what makes this about half a byte per op rather than four.
     pub line_table: Vec<u8>,
-    /// How many inline-cache slots a running frame allocates for this code: the count
     /// The two-word operands of the ops too wide to carry them inline, one entry per such site.
     ///
     /// An enum is as wide as its widest variant, so a variant holding two `u32`s sets the size of
@@ -1462,6 +1735,7 @@ pub struct CodeObject {
     /// decoder reproduces that by appending as it reads. Nothing else may reorder the ops without
     /// rebuilding this alongside them.
     pub wide_operands: Vec<[u32; 2]>,
+    /// How many inline-cache slots a running frame allocates for this code: the count
     /// of cacheable sites (each [`Op::LoadAttr`]), numbered in ascending static order.
     pub cache_count: usize,
     /// The exception table: covering `[start, end)` op ranges mapped to a handler op
@@ -1502,35 +1776,139 @@ pub struct ExcEntry {
 /// nothing else. **A container that offered only `iter()` would therefore have forced every body in
 /// a module to materialise on that module's first global lookup**, which is the one access pattern
 /// that would make a lazy body worth nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone)]
 pub struct Functions {
-    /// Every function's code object, materialised.
-    eager: Vec<CodeObject>,
+    arm: Arm,
+}
+
+/// Where a DEFERRED table's encoded bytes live, and the reason this is an enum rather than an
+/// `Rc<[u8]>`: on a device the artifact is ALREADY flash-resident (a serve reaches it through
+/// `include_bytes!`), so copying it into an owned buffer in order to read it lazily would spend in
+/// RAM most of what deferring the bodies just saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Bytes with the program's own lifetime -- the flash-resident case. Nothing is copied.
+    Static(&'static [u8]),
+    /// Bytes this process owns, shared by every module decoded out of one artifact.
+    Shared(Rc<[u8]>),
+}
+
+impl Source {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Source::Static(bytes) => bytes,
+            Source::Shared(bytes) => bytes,
+        }
+    }
+}
+
+/// A table that holds its functions ENCODED, decoding one the first time a body is asked for.
+///
+/// `names` and `lines` are carried decoded because they are what the cheap queries answer from and
+/// what a materialised body has to be handed; `cells` holds `Box<CodeObject>` rather than
+/// `CodeObject` because an EMPTY `OnceCell<CodeObject>` is as large as a full one, and a module
+/// with a hundred functions would pay most of the saving back in empty cells.
+#[derive(Debug, Clone)]
+struct Deferred {
+    source: Source,
+    names: Vec<String>,
+    spans: Vec<(u32, u32)>,
+    lines: Vec<Vec<u8>>,
+    cells: Vec<OnceCell<Box<CodeObject>>>,
+}
+
+#[derive(Debug, Clone)]
+enum Arm {
+    Materialised(Vec<CodeObject>),
+    Deferred(Deferred),
+}
+
+impl Default for Functions {
+    fn default() -> Functions {
+        Functions { arm: Arm::Materialised(Vec::new()) }
+    }
+}
+
+/// Equality is over the FUNCTIONS, never over how much of a table happens to be materialised: two
+/// tables holding the same program compare equal whether or not either has decoded anything. That
+/// is what keeps a deferred decode invisible to the round-trip rows, which is the property worth
+/// having.
+impl PartialEq for Functions {
+    fn eq(&self, other: &Functions) -> bool {
+        self.len() == other.len()
+            && (0..self.len()).all(|index| match (self.get(index), other.get(index)) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => false,
+            })
+    }
+}
+
+impl Eq for Functions {}
+
+/// A table's names, from whichever arm it holds.
+enum Names<'a> {
+    Materialised(core::slice::Iter<'a, CodeObject>),
+    Deferred(core::slice::Iter<'a, String>),
+}
+
+impl<'a> Iterator for Names<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        match self {
+            Names::Materialised(bodies) => bodies.next().map(|code| code.name.as_str()),
+            Names::Deferred(names) => names.next().map(String::as_str),
+        }
+    }
 }
 
 impl Functions {
-    /// How many functions the module defines.
+    /// A table holding its functions encoded, decoding a body only when one is asked for.
+    ///
+    /// `spans` are byte ranges into `source`, already checked to lie inside it by the reader, which
+    /// is the only producer.
+    fn deferred(
+        source: Source,
+        names: Vec<String>,
+        spans: Vec<(u32, u32)>,
+        lines: Vec<Vec<u8>>,
+    ) -> Functions {
+        let mut cells = Vec::with_capacity(spans.len());
+        cells.resize_with(spans.len(), OnceCell::new);
+        Functions { arm: Arm::Deferred(Deferred { source, names, spans, lines, cells }) }
+    }
+
+    /// How many functions the module defines. **Never needs a body.**
     #[must_use]
     pub fn len(&self) -> usize {
-        self.eager.len()
+        match &self.arm {
+            Arm::Materialised(bodies) => bodies.len(),
+            Arm::Deferred(deferred) => deferred.spans.len(),
+        }
     }
 
     /// Whether the module defines none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.eager.is_empty()
+        self.len() == 0
     }
 
     /// Function `index`'s name, or `None` if there is no such function. **Never needs a body.**
     #[must_use]
     pub fn name(&self, index: usize) -> Option<&str> {
-        self.eager.get(index).map(|code| code.name.as_str())
+        match &self.arm {
+            Arm::Materialised(bodies) => bodies.get(index).map(|code| code.name.as_str()),
+            Arm::Deferred(deferred) => deferred.names.get(index).map(String::as_str),
+        }
     }
 
     /// Every function's name, in table order. **Never needs a body**, so an import-time walk that
     /// binds each name to its index costs the names alone.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.eager.iter().map(|code| code.name.as_str())
+        match &self.arm {
+            Arm::Materialised(bodies) => Names::Materialised(bodies.iter()),
+            Arm::Deferred(deferred) => Names::Deferred(deferred.names.iter()),
+        }
     }
 
     /// The index of the FIRST function with this name, or `None`. **Never needs a body.**
@@ -1539,18 +1917,59 @@ impl Functions {
     /// Taking the first matches what a positional scan over the table did before this type existed.
     #[must_use]
     pub fn position(&self, name: &str) -> Option<usize> {
-        self.eager.iter().position(|code| code.name == name)
+        self.names().position(|candidate| candidate == name)
     }
 
-    /// Function `index`'s code object, or `None`. **Materialises the body.**
+    /// Function `index`'s code object, or `None`. **Materialises the body**, and on a deferred table
+    /// that means decoding it here, once -- every later ask is the decoded one.
+    ///
+    /// `None` also answers a body that will not decode, which is reachable on a deferred table where
+    /// the eager path would have refused the whole artifact at load. The span arithmetic is checked
+    /// when the table is built, so this is corruption INSIDE a function rather than a mis-framed
+    /// one, and a caller treats it as the malformed artifact it is.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&CodeObject> {
-        self.eager.get(index)
+        match &self.arm {
+            Arm::Materialised(bodies) => bodies.get(index),
+            Arm::Deferred(deferred) => {
+                let cell = deferred.cells.get(index)?;
+                if cell.get().is_none() {
+                    let (start, end) = *deferred.spans.get(index)?;
+                    let bytes = deferred.source.bytes().get(start as usize..end as usize)?;
+                    let mut reader = Reader { data: bytes, pos: 0 };
+                    let mut code = reader.code_object().ok()?;
+                    code.line_table = deferred.lines.get(index).cloned().unwrap_or_default();
+                    let _ = cell.set(Box::new(code));
+                }
+                cell.get().map(|code| &**code)
+            }
+        }
     }
 
     /// Appends a function -- the front end building a module up as it compiles.
+    ///
+    /// A deferred table materialises first. The producer side never holds one, so this is a
+    /// correctness path rather than a hot one.
     pub fn push(&mut self, code: CodeObject) {
-        self.eager.push(code);
+        self.materialise();
+        match &mut self.arm {
+            Arm::Materialised(bodies) => bodies.push(code),
+            Arm::Deferred(_) => unreachable!("materialise leaves the table materialised"),
+        }
+    }
+
+    /// Decode every body a deferred table still holds encoded, leaving it materialised.
+    ///
+    /// A body that will not decode is dropped, which cannot happen to an artifact whose functions
+    /// would have decoded at load -- `a_deferred_table_materialises_every_function` is the row that
+    /// fails if it ever does, rather than the shortfall being quietly written out as a shorter
+    /// table.
+    fn materialise(&mut self) {
+        if matches!(self.arm, Arm::Deferred(_)) {
+            let bodies: Vec<CodeObject> =
+                (0..self.len()).filter_map(|index| self.get(index).cloned()).collect();
+            self.arm = Arm::Materialised(bodies);
+        }
     }
 
     /// Every code object, materialised, for a consumer that genuinely needs them all: the encoder
@@ -1558,48 +1977,39 @@ impl Functions {
     ///
     /// **Named for what it costs.** A caller that wants names wants [`Functions::names`].
     pub fn iter_bodies(&self) -> impl Iterator<Item = &CodeObject> {
-        self.eager.iter()
+        (0..self.len()).filter_map(|index| self.get(index))
     }
 
     /// The same, mutably: the front end rewriting a table in place (a fold, a late binding).
     /// Producer-side only -- a materialised table is the only kind there is on that side.
     pub fn iter_bodies_mut(&mut self) -> impl Iterator<Item = &mut CodeObject> {
-        self.eager.iter_mut()
+        self.materialise();
+        match &mut self.arm {
+            Arm::Materialised(bodies) => bodies.iter_mut(),
+            Arm::Deferred(_) => unreachable!("materialise leaves the table materialised"),
+        }
     }
 
-    /// Every code object as an owned vector. **Materialises the whole table**, so it is the one call
-    /// here that a deferred table cannot serve cheaply.
-    ///
-    /// It exists because the interpreter's module handle is an `Rc<[CodeObject]>` -- a CONTIGUOUS
-    /// slice, which by construction cannot hold anything unmaterialised. Every caller of this is
-    /// therefore a place that has to become `Rc<Functions>` before a deferred body is worth
-    /// anything, and there are exactly two of them.
+    /// Every code object as an owned vector. **Materialises the whole table.**
     #[must_use]
-    pub fn into_bodies(self) -> Vec<CodeObject> {
-        self.eager
-    }
-
-    /// The table as a contiguous slice. **Materialises the whole table**, and is the borrowed twin of
-    /// [`Functions::into_bodies`] with the same one-way property: a slice is contiguous, so a table
-    /// holding anything unmaterialised cannot produce one.
-    ///
-    /// It exists for the callers that hand a whole function table to something typed
-    /// `&[CodeObject]` -- the interpreter's `run_module`/`run` seam and the harnesses around it.
-    #[must_use]
-    pub fn as_bodies(&self) -> &[CodeObject] {
-        &self.eager
+    pub fn into_bodies(mut self) -> Vec<CodeObject> {
+        self.materialise();
+        match self.arm {
+            Arm::Materialised(bodies) => bodies,
+            Arm::Deferred(_) => unreachable!("materialise leaves the table materialised"),
+        }
     }
 }
 
 impl From<Vec<CodeObject>> for Functions {
-    fn from(eager: Vec<CodeObject>) -> Functions {
-        Functions { eager }
+    fn from(bodies: Vec<CodeObject>) -> Functions {
+        Functions { arm: Arm::Materialised(bodies) }
     }
 }
 
 impl FromIterator<CodeObject> for Functions {
     fn from_iter<I: IntoIterator<Item = CodeObject>>(iter: I) -> Functions {
-        Functions { eager: iter.into_iter().collect() }
+        Functions { arm: Arm::Materialised(iter.into_iter().collect()) }
     }
 }
 
@@ -1608,7 +2018,7 @@ impl core::ops::Index<usize> for Functions {
 
     /// **Materialises the body.** Panics on an out-of-range index, as a slice does.
     fn index(&self, index: usize) -> &CodeObject {
-        &self.eager[index]
+        self.get(index).expect("function index out of range")
     }
 }
 
@@ -1640,6 +2050,15 @@ pub enum DecodeError {
     BadTag(&'static str, u8),
     /// A string field was not valid UTF-8.
     BadUtf8,
+    /// A function's declared byte length disagrees with what decoding it consumed. The length is
+    /// what a deferred read skips by, so a disagreement means a skipped function would have landed
+    /// mid-field -- caught here rather than discovered as corruption later.
+    FunctionSpan {
+        /// The length the artifact declared for the function.
+        declared: u32,
+        /// What decoding it actually consumed.
+        consumed: u32,
+    },
     /// The artifact requires capabilities this reader does not implement. Carries what it asked for
     /// and the subset that is missing, so the refusal names the gap rather than only reporting one.
     UnsupportedFeatures {
@@ -1655,6 +2074,10 @@ impl core::fmt::Display for DecodeError {
         match self {
             DecodeError::UnexpectedEof => f.write_str("unexpected end of bytecode"),
             DecodeError::BadMagic => f.write_str("not a Lamella Python bytecode module (bad magic)"),
+            DecodeError::FunctionSpan { declared, consumed } => write!(
+                f,
+                "function declares {declared} bytes but decoding consumed {consumed}"
+            ),
             DecodeError::UnsupportedVersion(v) => {
                 write!(f, "unsupported bytecode format version {v}")
             }
@@ -1988,7 +2411,12 @@ fn put_module_content(buf: &mut Vec<u8>, module: &Module) {
     put_str(buf, &module.name);
     put_len(buf, module.functions.len());
     for f in module.functions.iter_bodies() {
+        let length_at = buf.len();
+        put_len(buf, 0);
+        let start = buf.len();
         put_code_object(buf, f);
+        let written = (buf.len() - start) as u32;
+        buf[length_at..length_at + 4].copy_from_slice(&written.to_le_bytes());
     }
     put_code_object(buf, &module.body);
     put_debug_section(buf, module);
@@ -2136,6 +2564,28 @@ const BUNDLE_KIND_BIT: u16 = 0x8000;
 /// moves this in the same edit, and the two cannot drift apart again.
 pub const BUNDLE_FORMAT_VERSION: u16 = FORMAT_VERSION | BUNDLE_KIND_BIT;
 
+/// Whether `prefix` opens a [`Bundle`] container this build can decode -- the [`MAGIC`] and the
+/// version word, and deliberately nothing past them.
+///
+/// **This is for the DEPLOY path, where an artifact arrives in chunks and the first chunk is
+/// committed to storage long before any decoder sees the whole of it.** A target that erases its
+/// bundle region and only then discovers the payload was not a bundle has already destroyed the
+/// program it was holding -- so "is this the right KIND of artifact" must be answerable from the
+/// opening bytes, ahead of the erase, rather than by [`Bundle::decode`] once the transfer lands.
+///
+/// **A bare [`Module`] is refused, and that case is the reason the magic alone will not do:** the
+/// two containers share [`MAGIC`] and are told apart only by the kind bit in the version word, so a
+/// check that stopped at the magic would accept the likeliest wrong payload there is.
+///
+/// This is not a validity check and does not stand in for [`Bundle::decode`]: it reads the header
+/// and stops. Feature flags are excluded on purpose -- an artifact declaring features this build
+/// lacks IS a bundle, and refusing it belongs to the decoder, which can name the missing feature.
+pub fn is_bundle_header(prefix: &[u8]) -> bool {
+    prefix.len() >= 6
+        && prefix[0..4] == MAGIC
+        && u16::from_le_bytes([prefix[4], prefix[5]]) == BUNDLE_FORMAT_VERSION
+}
+
 /// A compiled multi-module program: the `entry` module (run at startup) plus the importable managed
 /// modules an `import` resolves to (by `name`). The Python analog of a corlib bundle.
 #[derive(Debug, Clone, PartialEq)]
@@ -2199,6 +2649,44 @@ impl Bundle {
         let mut modules = Vec::with_capacity(n_modules);
         for _ in 0..n_modules {
             modules.push(r.module_content()?);
+        }
+        Ok((Bundle { entry, modules }, features))
+    }
+
+    /// Decode a bundle WITHOUT decoding its functions: each module's table keeps the encoded bytes
+    /// and a byte range per function, and a body is decoded the first time it is asked for.
+    ///
+    /// **This is the same artifact and the same answers.** The header, the module names, every
+    /// function's NAME and every module's `body` are read exactly as [`Bundle::decode`] reads them;
+    /// what is deferred is only the function bodies, which is where 78-91% of a decoded bundle's
+    /// bytes live and which an import mostly never enters.
+    ///
+    /// The trade, stated rather than buried: a function whose bytes are corrupt is refused HERE at
+    /// the call that first needs it, where [`Bundle::decode`] would have refused the whole artifact
+    /// at load. Framing is still checked up front -- every span is verified to lie inside the
+    /// source -- so what is deferred is corruption inside a function, not a mis-framed table.
+    pub fn decode_deferred(source: &Source) -> Result<(Bundle, FeatureFlags), DecodeError> {
+        let mut r = Reader { data: source.bytes(), pos: 0 };
+        if r.bytes(4)? != MAGIC {
+            return Err(DecodeError::BadMagic);
+        }
+        let version = r.u16()?;
+        if version != BUNDLE_FORMAT_VERSION {
+            return Err(DecodeError::UnsupportedVersion(version));
+        }
+        let features = FeatureFlags(r.u16()?);
+        let missing = features.missing_from(SUPPORTED_FEATURES);
+        if !missing.is_empty() {
+            return Err(DecodeError::UnsupportedFeatures {
+                required: features,
+                missing,
+            });
+        }
+        let entry = r.module_content_deferred(source)?;
+        let n_modules = r.u32()? as usize;
+        let mut modules = Vec::with_capacity(n_modules);
+        for _ in 0..n_modules {
+            modules.push(r.module_content_deferred(source)?);
         }
         Ok((Bundle { entry, modules }, features))
     }
@@ -2269,12 +2757,58 @@ impl<'a> Reader<'a> {
 
     /// Read a module's CONTENT (name + functions + body) -- the header-less body of a bare module or
     /// of one module inside a bundle.
+    /// The deferred twin of [`Reader::module_content`]: the same walk, except that a function is
+    /// PASSED OVER by its declared length instead of being decoded, keeping its name and its byte
+    /// range.
+    ///
+    /// The name costs nothing to keep because it is the FIRST field a code object encodes, so it is
+    /// read from the front of the function's own bytes without touching the rest -- which is what
+    /// makes `names`, `name` and `position` free on a table that has decoded nothing.
+    fn module_content_deferred(&mut self, source: &Source) -> Result<Module, DecodeError> {
+        let name = self.string()?;
+        let n_functions = self.u32()? as usize;
+        let mut names = Vec::with_capacity(n_functions);
+        let mut spans = Vec::with_capacity(n_functions);
+        for _ in 0..n_functions {
+            let declared = self.u32()? as usize;
+            let start = self.pos;
+            let end = start.checked_add(declared).ok_or(DecodeError::UnexpectedEof)?;
+            if end > self.data.len() {
+                return Err(DecodeError::UnexpectedEof);
+            }
+            let mut head = Reader { data: &self.data[start..end], pos: 0 };
+            names.push(head.string()?);
+            spans.push((start as u32, end as u32));
+            self.pos = end;
+        }
+        let mut body = self.code_object()?;
+        let debug_len = self.u32()? as usize;
+        let debug = self.bytes(debug_len)?;
+        let mut tables = take_debug_section(debug, n_functions + 1).into_iter();
+        let mut lines = Vec::with_capacity(n_functions);
+        for _ in 0..n_functions {
+            lines.push(tables.next().unwrap_or_default());
+        }
+        body.line_table = tables.next().unwrap_or_default();
+        Ok(Module {
+            name,
+            functions: Functions::deferred(source.clone(), names, spans, lines),
+            body,
+        })
+    }
+
     fn module_content(&mut self) -> Result<Module, DecodeError> {
         let name = self.string()?;
         let n_functions = self.u32()? as usize;
         let mut functions = Vec::with_capacity(n_functions);
         for _ in 0..n_functions {
+            let declared = self.u32()?;
+            let start = self.pos;
             functions.push(self.code_object()?);
+            let consumed = (self.pos - start) as u32;
+            if consumed != declared {
+                return Err(DecodeError::FunctionSpan { declared, consumed });
+            }
         }
         let mut body = self.code_object()?;
         let debug_len = self.u32()? as usize;
@@ -2894,6 +3428,135 @@ mod tests {
         );
     }
 
+    /// The DEPLOY path writes its first chunk to flash before any decoder sees the transfer, so the
+    /// kind question has to be answerable from the opening bytes. The case that decides the shape of
+    /// the check is the bare MODULE: it opens with the SAME magic, so a check that stopped there
+    /// would erase a board's deployed program for an artifact that could never have run.
+    #[test]
+    fn a_deploy_can_tell_a_bundle_from_a_module_before_it_erases_anything() {
+        let bundle = Bundle {
+            entry: sample_module(),
+            modules: Vec::new(),
+        }
+        .encode(FeatureFlags::FIRST_LIGHT);
+        let module = sample_module().encode(FeatureFlags::FIRST_LIGHT);
+
+        assert_eq!(
+            &bundle[0..4],
+            &module[0..4],
+            "the two containers really do share the magic -- which is why the version word is read"
+        );
+        assert!(
+            is_bundle_header(&bundle),
+            "a real bundle's own encoding must be accepted"
+        );
+        assert!(
+            !is_bundle_header(&module),
+            "a bare module must be refused BEFORE a deploy erases anything"
+        );
+
+        assert!(is_bundle_header(&bundle[0..6]));
+
+        assert!(!is_bundle_header(&bundle[0..4]));
+        assert!(!is_bundle_header(&MAGIC));
+        assert!(!is_bundle_header(b""));
+
+        assert!(!is_bundle_header(b"LJSB\x00\x00"));
+    }
+
+    /// A deferred decode must be the SAME PROGRAM, not merely a cheaper one. Equality over
+    /// `Functions` is defined over the functions rather than over how much is materialised, so this
+    /// compares a table that has decoded nothing against one that decoded everything at load.
+    #[test]
+    fn a_deferred_bundle_decodes_to_the_same_program() {
+        let bundle = Bundle {
+            entry: sample_module(),
+            modules: vec![sample_module()],
+        };
+        let bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
+        let source = Source::Shared(Rc::from(bytes.clone().into_boxed_slice()));
+
+        let (eager, eager_features) = Bundle::decode(&bytes).expect("eager decode");
+        let (deferred, deferred_features) = Bundle::decode_deferred(&source).expect("deferred decode");
+
+        assert_eq!(eager_features, deferred_features);
+        assert_eq!(eager, deferred, "a deferred bundle must hold the same program");
+        assert_eq!(eager, bundle, "and so must the eager one -- the control for this row");
+    }
+
+    /// THE PROPERTY THE WHOLE PHASE EXISTS FOR: the queries that do not need a body must not
+    /// materialise one. Asserted against the cells directly rather than inferred from a size, so it
+    /// cannot pass by accident.
+    #[test]
+    fn the_cheap_queries_leave_every_body_encoded() {
+        let bundle = Bundle { entry: sample_module(), modules: Vec::new() };
+        let bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
+        let source = Source::Shared(Rc::from(bytes.into_boxed_slice()));
+        let (deferred, _) = Bundle::decode_deferred(&source).expect("deferred decode");
+        let table = &deferred.entry.functions;
+        assert!(table.len() > 0, "the fixture must define at least one function");
+
+        let names: Vec<&str> = table.names().collect();
+        let first = names[0];
+        assert_eq!(table.name(0), Some(first));
+        assert_eq!(table.position(first), Some(0));
+        assert_eq!(table.position("no such function"), None);
+        assert_eq!(table.len(), names.len());
+
+        let Arm::Deferred(inner) = &table.arm else {
+            panic!("decode_deferred must produce a deferred table");
+        };
+        assert!(
+            inner.cells.iter().all(|cell| cell.get().is_none()),
+            "a name query must not decode a body"
+        );
+
+        assert!(table.get(0).is_some());
+        assert_eq!(
+            inner.cells.iter().filter(|cell| cell.get().is_some()).count(),
+            1,
+            "one body asked for is one body decoded"
+        );
+    }
+
+    /// The row `Functions::materialise` names: a deferred table must yield every function it
+    /// declares, so a body that would not decode cannot be silently written out as a shorter table.
+    #[test]
+    fn a_deferred_table_materialises_every_function() {
+        let bundle = Bundle { entry: sample_module(), modules: Vec::new() };
+        let bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
+        let source = Source::Shared(Rc::from(bytes.clone().into_boxed_slice()));
+        let (deferred, _) = Bundle::decode_deferred(&source).expect("deferred decode");
+
+        let declared = deferred.entry.functions.len();
+        assert_eq!(deferred.entry.functions.iter_bodies().count(), declared);
+
+        assert_eq!(deferred.encode(FeatureFlags::FIRST_LIGHT), bytes);
+    }
+
+    /// The length ahead of each function is what a deferred read skips by, so a wrong one must be
+    /// caught rather than trusted. Red-proved by construction: the artifact is edited to declare a
+    /// length one byte short of what the function occupies.
+    #[test]
+    fn a_function_whose_declared_length_is_wrong_is_refused() {
+        let module = sample_module();
+        let n = module.functions.len();
+        assert!(n > 0, "the fixture must define at least one function");
+        let bundle = Bundle { entry: module, modules: Vec::new() };
+        let mut bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
+
+        let name_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let at = 8 + 4 + name_len + 4;
+        let declared = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        bytes[at..at + 4].copy_from_slice(&(declared - 1).to_le_bytes());
+
+        assert_eq!(
+            Bundle::decode(&bytes),
+            Err(DecodeError::FunctionSpan { declared: declared - 1, consumed: declared }),
+            "the eager path checks the length against what decoding consumed"
+        );
+    }
+
     fn sample_module() -> Module {
         let func = CodeObject {
             name: String::from("inc"),
@@ -3324,6 +3987,105 @@ mod tests {
         let no_complex = Profile::FULL.without(Capability::Complex);
         assert!(no_complex.supports(Capability::Float));
         assert!(!no_complex.supports(Capability::Complex));
+    }
+
+    #[test]
+    fn every_capability_is_reachable_from_exactly_one_knob() {
+        for capability in Capability::ALL {
+            let providers = Knob::ALL
+                .iter()
+                .filter(|k| k.capability() == Some(*capability))
+                .count();
+            assert_eq!(
+                providers, 1,
+                "{} is provided by {providers} knobs, want exactly 1",
+                capability.as_str()
+            );
+        }
+        let wider: Vec<&str> = Knob::ALL
+            .iter()
+            .filter(|k| k.capability().is_none())
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            wider,
+            vec!["bundled-stdlib", "gc-collect"],
+            "the knobs with no capability are the reason a profile is wider than a Profile"
+        );
+    }
+
+    #[test]
+    fn a_named_profile_derives_its_compiler_visible_profile() {
+        let serve = NamedProfile::by_name("serve").expect("serve exists");
+        assert!(serve.has(Knob::GcEngine));
+        assert_eq!(serve.profile(), Profile::BARE.with(Capability::Float));
+        assert!(!serve.profile().supports(Capability::Complex));
+
+        let bare = NamedProfile::by_name("no-float").expect("no-float exists");
+        assert_eq!(bare.profile(), Profile::BARE);
+
+        for profile in NamedProfile::ALL {
+            for capability in Capability::ALL {
+                let from_knobs = profile
+                    .knobs
+                    .iter()
+                    .any(|k| k.capability() == Some(*capability));
+                assert_eq!(
+                    profile.profile().supports(*capability),
+                    from_knobs,
+                    "{} / {}",
+                    profile.name,
+                    capability.as_str()
+                );
+            }
+        }
+        assert!(NamedProfile::by_name("no-such-tier").is_none());
+    }
+
+    #[test]
+    fn a_profiles_price_is_the_sum_of_the_knobs_it_turns_on() {
+        assert_eq!(NamedProfile::by_name("no-float").unwrap().flash_cost_bytes(), 0);
+        assert_eq!(NamedProfile::by_name("base").unwrap().flash_cost_bytes(), 0);
+        assert_eq!(
+            NamedProfile::by_name("serve").unwrap().flash_cost_bytes(),
+            9_724,
+            "serve is the baseline plus the collector"
+        );
+        assert_eq!(
+            NamedProfile::by_name("floor").unwrap().flash_cost_bytes(),
+            9_724,
+            "bundled-stdlib adds nothing on a board whose import resolver is unreachable"
+        );
+        assert_eq!(Knob::BundledStdlib.flash_cost_bytes(), 0);
+        assert!(Knob::COST_MEASURED_ON.contains("microbit-v2-py"));
+    }
+
+    #[test]
+    fn a_chain_of_prerequisites_closes_from_either_end() {
+        let up = &[
+            (Capability::Complex, Capability::Float),
+            (Capability::Introspection, Capability::Complex),
+        ];
+        let closed = Profile::close_over_prerequisites(Capability::Introspection.bit(), up);
+        assert_eq!(
+            closed,
+            Profile::FULL.0,
+            "taking the end of a chain takes the whole chain, not just the next link"
+        );
+
+        let down = &[
+            (Capability::Introspection, Capability::Complex),
+            (Capability::Complex, Capability::Float),
+        ];
+        let fallen = Profile::close_over_dependents(
+            Profile::FULL.0 & !Capability::Float.bit(),
+            down,
+        );
+        assert_eq!(
+            fallen,
+            Profile::BARE.0,
+            "dropping the root of a chain drops everything standing on it, not just the next link"
+        );
     }
 
     #[test]

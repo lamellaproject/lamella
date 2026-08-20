@@ -1147,7 +1147,20 @@ impl Interpreter {
             }
             Tag::ExprRegExp => {
                 coverage.walked += 1;
-                self.refuse(crate::absence::Absence::RegExpLiteral)
+                let (Ok(_span), Ok(body_id), Ok(flags_id)) = (f.span(), f.str_id(), f.str_id())
+                else {
+                    return self.host_error("unreadable regular expression literal");
+                };
+                let (Ok(body), Ok(flags)) =
+                    (artifact.str_utf8(body_id), artifact.str_utf8(flags_id))
+                else {
+                    return self.host_error("unreadable regular expression blob");
+                };
+                let (body, flags) = (crate::JsString::from(body), crate::JsString::from(flags));
+                match crate::regexp::create(self, &body, &flags) {
+                    Ok(id) => Completion::Normal(JsValue::Object(id)),
+                    Err(abrupt) => abrupt,
+                }
             }
             Tag::ExprTemplate => {
                 coverage.walked += 1;

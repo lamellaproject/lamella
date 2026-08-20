@@ -367,7 +367,22 @@ pub mod artifact;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RealmCensus {
     /// Objects on the heap. Every intrinsic, every prototype, every builtin function is one.
+    ///
+    /// **ADDRESSABLE, NOT RESIDENT IN RAM.** Once the realm lives in flash the two differ, and
+    /// they are the whole point of the exercise -- see [`RealmCensus::resident_objects`].
     pub objects: usize,
+    /// Of [`RealmCensus::objects`], how many are being read from FLASH and cost no RAM at all.
+    ///
+    /// Zero until the build-time tables exist. Reported separately rather than folded into the byte
+    /// figures so that the sum is checkable by a reader:
+    /// `objects == resident_objects - promoted_objects + <RAM objects>`.
+    pub resident_objects: usize,
+    /// How many resident objects something has WRITTEN to, so a RAM copy exists.
+    ///
+    /// **A FIGURE FAR ABOVE THE HANDFUL THIS SHOULD BE MEANS THE BARRIER IS PROMOTING THINGS
+    /// NOTHING WROTE** -- or that whatever priced the expectation was counting something else.
+    /// Both are worth knowing, which is why this is reported rather than assumed.
+    pub promoted_objects: usize,
     /// Own properties across every object -- the realm's dominant repeated structure.
     pub properties: usize,
     /// Of those, accessor pairs rather than data properties.
@@ -395,7 +410,68 @@ pub struct RealmCensus {
     /// Bytes of property-key TEXT, before any per-key structure. The floor on what naming the
     /// surface costs, and the number a smaller BCL surface moves directly.
     pub property_key_bytes: usize,
+
+
+    /// `size_of::<Object>()` on the build being measured.
+    ///
+    /// It is REPORTED rather than assumed because it differs between a host and a device -- a
+    /// pointer-width difference across nineteen optional slots -- and a host numerator over a
+    /// device denominator is two populations wearing one number.
+    pub object_size: usize,
+    /// The object table's live bytes: one `Object` per entry **that is in RAM**.
+    ///
+    /// A RESIDENT OBJECT CONTRIBUTES NOTHING HERE, which is the saving the flash tables exist to
+    /// produce. It was `objects * object_size` while every object was in RAM and those were the same
+    /// figure; reading this as "one per addressable id" after the split would credit the design with
+    /// nothing it had done.
+    pub object_struct_bytes: usize,
+    /// What the RAM-side object tables have RESERVED, which is what the allocator was asked for.
+    ///
+    /// Includes the promotion table -- four bytes per resident object -- because that is a real
+    /// allocation a resident realm costs and hiding it here would flatter the design.
+    ///
+    /// THE GAP BETWEEN THIS AND [`RealmCensus::object_struct_bytes`] IS NOT THE WASTE. A Vec that
+    /// doubles abandons every intermediate buffer, so the bytes it has consumed over its life are
+    /// the reserved figure again, near enough -- and under an allocator with no class large enough
+    /// to reclaim them, the abandoned ones are gone for the run.
+    pub object_table_bytes: usize,
+    /// The backing stores of every object's own-property vectors, summed by CAPACITY.
+    ///
+    /// Capacity rather than length for the same reason: the reserve is what was allocated.
+    pub property_store_bytes: usize,
+    /// The native registry's entries. **Its names are NOT in here and that is deliberate**: they
+    /// are `&'static str`, so the text is in constant data and costs no arena at all. See
+    /// [`RealmCensus::native_name_bytes`], which measures it as an inventory.
+    pub native_table_bytes: usize,
+    /// How much text the registry's names amount to. **AN INVENTORY, NOT A COST.**
+    ///
+    /// Kept beside [`RealmCensus::native_table_bytes`] rather than folded into it, because the two
+    /// answer different questions and used to be one number. A figure that simply vanished when the
+    /// names moved to constant data would report the saving and hide what was saved, and the next
+    /// person to ask how big the built-in names are would have nothing to read.
+    pub native_name_bytes: usize,
 }
+
+/// How many objects and native entries the realm is expected to build, so the tables that hold
+/// them are allocated once instead of doubling into place.
+///
+/// # A DOUBLING VECTOR DOES NOT COST THE SLACK, IT COSTS THE SUM
+///
+/// A `Vec` reaching 462 entries has also held buffers of 256, 128, 64 and so on, and it abandoned
+/// each one. Under a general-purpose allocator most of those come back. Under the size-class
+/// allocator the device legs use, a buffer larger than the top class is carved from the frontier
+/// and has no class to return to -- so the two largest abandoned buffers are gone for the run.
+///
+/// So a table's final doubling asks for one contiguous block larger than everything it has already
+/// abandoned, and the abandoned ones may have no class to return to. **A realm whose LIVE set fits
+/// comfortably can still fail on the way it was reached** -- which is what these hints exist to
+/// skip, rather than to bound the realm.
+///
+/// **THESE ARE HINTS AND NOT LIMITS.** A realm that grows past them still works and merely doubles
+/// from here, so the numbers being stale is a performance question rather than a correctness one.
+/// They are deliberately a little above the measured figures for that reason.
+const REALM_OBJECT_HINT: usize = 512;
+const REALM_NATIVE_HINT: usize = 448;
 
 /// A loaded program's bytes: heap-owned, or borrowed from flash and never copied.
 ///
@@ -490,7 +566,7 @@ pub struct Closure {
     /// region-ram` measured 501.4 B retained per FUNCTION call against 0.0 B per ARROW call, and an
     /// arrow is exactly a call that does not build one -- so the whole difference was this array,
     /// allocated on every call whether the body named it or not. ~160 calls exhausted the M33's
-    /// 81,602 B realm again.
+    /// whole fixed realm again.
     ///
     /// Decided by the COMPILER, not by a check here: it is a static property of the body, and
     /// the encoder is the walk that can see it once instead of on every call.
@@ -720,7 +796,14 @@ pub struct GeneratorContext {
 /// `expectedErrorConstructor.name`, so a built-in without a name fails tests that have nothing to do
 /// with naming.
 pub struct NativeFunction {
-    pub name: String,
+    /// **BORROWED, NOT OWNED, AND THAT IS 413 ALLOCATIONS THE REALM NO LONGER MAKES.** Every
+    /// built-in's name is known when the engine is compiled, so the text belongs in constant data
+    /// beside the function it names rather than in a `String` copied into the arena once per realm.
+    ///
+    /// The type is what enforces it. A `&'static str` cannot be handed a value composed at run
+    /// time, so an accessor's `"get length"` is written as a literal at the site that installs it,
+    /// beside the property name it belongs to, where a reader can see the two agree.
+    pub name: &'static str,
     pub length: u32,
     pub call: NativeFn,
     /// `[[Construct]]`, which is a SEPARATE internal method from `[[Call]]` and absent on most
@@ -743,6 +826,33 @@ struct HostClock {
     anchor_epoch_millis: Option<f64>,
     anchor_monotonic_millis: f64,
     monotonic: fn() -> f64,
+}
+
+/// The state the installers run against when the realm came from the build-time tables.
+///
+/// # THE INSTALLERS STILL RUN, AND THEY STILL HAVE A JOB
+///
+/// Three of the four things installation produces cannot be generated, so the installers are not
+/// replaced by the tables -- they are relieved of one duty:
+///
+/// - the **native registry**, whose order is what every `Callable::Native(u32)` in the tables MEANS,
+///   and which cannot be a table at all because a built-in's body is an item no outside path names;
+/// - the **`Intrinsics`** ids, which the engine holds by identity so that assigning `Array =
+///   undefined` cannot break array indexing;
+/// - the **global scope bindings** and the **symbol table**, neither of which is an object.
+///
+/// What they stop doing is creating the objects and writing the properties, because those already
+/// exist. `next_id` hands back the ids the creation would have produced, in the order it would have
+/// produced them, and `discard` absorbs the writes -- see `Interpreter::object_mut`.
+///
+/// **`next_id` is checked rather than trusted.** `Interpreter::finish_replay` refuses a realm whose
+/// installers handed out a different number of ids than the tables hold, because from the first
+/// divergence onward every id names the wrong object and nothing else would say so.
+struct Replay {
+    /// The id the next `allocate` returns. Starts at zero and ends at the table's length.
+    next_id: u32,
+    /// Where a replaying installer's property writes go. Emptied on every hand-out.
+    discard: Object,
 }
 
 /// A function produced by `Function.prototype.bind`.
@@ -782,6 +892,9 @@ pub struct Intrinsics {
     pub boolean_prototype: ObjectId,
     pub error_prototype: ObjectId,
     pub symbol_prototype: ObjectId,
+    pub regexp_prototype: ObjectId,
+    pub regexp_constructor: ObjectId,
+    pub regexp_string_iterator_prototype: ObjectId,
     /// `%IteratorPrototype%`. Not reachable by name from a program -- there is no `Iterator`
     /// global in this profile -- but every iterator in the realm inherits from it, and its
     /// `[Symbol.iterator]` is what makes an iterator itself iterable.
@@ -906,7 +1019,7 @@ pub struct Intrinsics {
 ///   Falling back to `IsArray` and saying so in a note is honest and still a wrong answer for
 ///   `{ length: 2, 0: 'a', 1: 'b', [Symbol.isConcatSpreadable]: true }` -- an array-like the
 ///   standard spreads and a fallback appends whole.
-pub const WELL_KNOWN_SYMBOLS: [&str; 7] = [
+pub const WELL_KNOWN_SYMBOLS: [&str; 12] = [
     "iterator",
     "toStringTag",
     "toPrimitive",
@@ -914,6 +1027,11 @@ pub const WELL_KNOWN_SYMBOLS: [&str; 7] = [
     "unscopables",
     "hasInstance",
     "isConcatSpreadable",
+    "match",
+    "matchAll",
+    "replace",
+    "search",
+    "split",
 ];
 
 /// The error types the standard calls "NativeError", plus `Error` itself at index 0.
@@ -1019,8 +1137,25 @@ pub struct Interpreter {
     host_prints: Vec<String>,
     /// The embedder's clock, if one was installed. `None` means the epoch, not advancing.
     host_clock: Option<HostClock>,
-    /// The object heap. A `JsValue::Object` is an index into it.
-    heap: Vec<Object>,
+    /// The object heap. A `JsValue::Object` is an id it resolves.
+    ///
+    /// **THE REALM IS WHY THIS IS NOT A FLAT `Vec<Object>`.** Every realm object would cost its
+    /// full slot width in RAM before a line of JavaScript runs. [`crate::heap::Heap`] splits the id
+    /// space so a realm object can be read from flash and copied into RAM only when something
+    /// writes to it -- see that module's header for the barrier and for why the promotion table is
+    /// an indirection rather than a pointer.
+    heap: crate::heap::Heap,
+    /// Set only while the installers replay over a realm the build-time tables already built.
+    ///
+    /// `None` in every other instant, including for the whole life of a running program, so what a
+    /// finished interpreter carries for it is one null pointer. See [`Replay`].
+    replay: Option<crate::Box<Replay>>,
+    /// How many of [`Self::heap`] the realm installed. Objects below it are the realm's.
+    #[cfg(feature = "mutation-census")]
+    realm_boundary: usize,
+    /// Which realm objects a program has reached for mutation since the realm was sealed.
+    #[cfg(feature = "mutation-census")]
+    mutated_realm_objects: alloc::collections::BTreeSet<u32>,
     /// Every Symbol this realm has made. A `JsValue::Symbol` is an index into it.
     ///
     /// APPEND-ONLY AND NEVER DEDUPED. Two entries with the same description are two DIFFERENT
@@ -1189,9 +1324,42 @@ impl Default for Interpreter {
     }
 }
 
+/// Where a fresh interpreter's realm objects come from.
+///
+/// **The two arms must produce the same realm, and that they do is checked rather than argued** --
+/// `crate::realm_tables` renders both and compares them against each other and against a committed
+/// copy. Keeping the second arm alive is what keeps that comparison honest: without it the tables
+/// could only ever be compared with themselves.
+#[derive(Clone, Copy)]
+enum RealmSource {
+    /// Assembled from the generated descriptors. What every build does.
+    Tables,
+    /// Built by running the installers, which is how it worked before the tables existed.
+    ///
+    /// It costs the realm's whole property store in RAM, which is the cost the tables remove, so
+    /// nothing ships this. It is the drift gate's other arm.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Installers,
+}
+
 impl Interpreter {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_realm_from(RealmSource::Tables)
+    }
+
+    /// An interpreter whose realm was built by RUNNING the installers rather than read from the
+    /// generated tables.
+    ///
+    /// The oracle for [`crate::realm::REALM`], and the only thing that can be one: a table compared
+    /// against itself agrees no matter what either of them says.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_installed_realm() -> Self {
+        Self::with_realm_from(RealmSource::Installers)
+    }
+
+    fn with_realm_from(source: RealmSource) -> Self {
         let global = new_scope(None);
         let mut interpreter = Self {
             global,
@@ -1201,12 +1369,17 @@ impl Interpreter {
             nested_refused: 0,
             nested_by_tag: [0; 256],
             closures: Vec::new(),
-            natives: Vec::new(),
+            natives: Vec::with_capacity(REALM_NATIVE_HINT),
             bounds: Vec::new(),
             jobs: Vec::new(),
             host_prints: Vec::new(),
             host_clock: None,
-            heap: Vec::new(),
+            heap: crate::heap::Heap::new(REALM_OBJECT_HINT),
+            replay: None,
+            #[cfg(feature = "mutation-census")]
+            realm_boundary: 0,
+            #[cfg(feature = "mutation-census")]
+            mutated_realm_objects: alloc::collections::BTreeSet::new(),
             symbols: Vec::new(),
             symbol_registry: Vec::new(),
             intrinsics: Intrinsics::default(),
@@ -1234,12 +1407,56 @@ impl Interpreter {
             #[cfg(feature = "bench-counters")]
             touched_realm: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
         };
+        if let RealmSource::Tables = source {
+            for descriptor in &crate::realm::REALM {
+                interpreter.heap.allocate(Object::resident(descriptor));
+            }
+            interpreter.replay =
+                Some(crate::Box::new(Replay { next_id: 0, discard: Object::new(None) }));
+        }
         crate::builtins::install(&mut interpreter);
+        interpreter.finish_replay();
         #[cfg(feature = "bench-counters")]
         {
             interpreter.realm_objects = interpreter.heap.len();
         }
         interpreter
+    }
+
+    /// Ends a replay and **refuses a realm whose installers and tables disagree about how many
+    /// objects there are.**
+    ///
+    /// # THIS IS A REAL ASSERT AND THE REASON IS THE ONE THIS CRATE ALREADY WROTE DOWN
+    ///
+    /// A `debug_assert` here would be no check at all: conformance is measured from `--release`,
+    /// this crate's suite is run with `--release`, and a device image is nothing else. The mistake
+    /// it guards is the one that reaches every one of those builds and none of the others.
+    ///
+    /// The failure it catches is total and silent. An installer that creates one object more or
+    /// fewer than the tables hold shifts every id from that point on, so each later descriptor
+    /// describes its neighbour: `Array.prototype`'s methods land on `String.prototype`, every one of
+    /// them a valid object with a plausible shape, and the first thing to notice is a program
+    /// getting a wrong answer. Comparing the counts costs one integer and turns it into a refusal at
+    /// start-up.
+    fn finish_replay(&mut self) {
+        let Some(replay) = self.replay.take() else { return };
+        assert!(
+            replay.next_id as usize == crate::realm::REALM.len(),
+            "the installers built a different realm than the tables describe"
+        );
+    }
+
+    /// Moves this interpreter's realm into leaked memory so it is read the way a flash realm is.
+    ///
+    /// **A TEST INSTRUMENT AND NOT A SAVING** -- see [`crate::heap::Heap::make_resident_by_leaking`]
+    /// for what it does and does not measure. It exists because until the build-time tables land,
+    /// the resident path would otherwise run in no build anyone makes.
+    ///
+    /// Only the heap changes. Everything else holding an `ObjectId` -- the intrinsics table, every
+    /// property value, the global scope -- is untouched, because the ids are preserved.
+    #[cfg(test)]
+    pub(crate) fn make_realm_resident_by_leaking(&mut self) {
+        self.heap.make_resident_by_leaking();
     }
 
     /// The realm properties a program has READ so far, as `(object, key)` pairs.
@@ -1252,17 +1469,80 @@ impl Interpreter {
         self.touched_realm.borrow().iter().cloned().collect()
     }
 
+    /// Adds an object to the heap and returns its id -- **unless the installers are replaying**, in
+    /// which case the object already exists and this hands back the id it was given.
+    ///
+    /// See [`Replay`]. The id sequence is the same either way because it comes from the same code
+    /// running in the same order; that it really is the same is not left to argument, because
+    /// [`Interpreter::finish_replay`] refuses a realm whose object count moved.
     pub(crate) fn allocate(&mut self, object: Object) -> ObjectId {
-        self.heap.push(object);
-        ObjectId((self.heap.len() - 1) as u32)
+        if let Some(replay) = self.replay.as_mut() {
+            drop(object);
+            let id = ObjectId(replay.next_id);
+            replay.next_id += 1;
+            return id;
+        }
+        self.heap.allocate(object)
     }
 
     pub(crate) fn object(&self, id: ObjectId) -> &Object {
-        &self.heap[id.0 as usize]
+        self.heap.get(id)
     }
 
+    /// The native registry in registration order, which is what `Callable::Native(u32)` INDEXES.
+    ///
+    /// **THIS ORDER IS THE MEANING OF EVERY NATIVE INDEX IN THE REALM, AND IT IS THE ONE THING A
+    /// GENERATED DESCRIPTOR TABLE CANNOT CARRY** -- see `crate::realm_tables`. A `builtins.rs` edit
+    /// that registers a native in the middle repoints every later index at the wrong function,
+    /// silently. The snapshot gate exists to read this back and say so.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn native_registry(&self) -> &[NativeFunction] {
+        &self.natives
+    }
+
+    /// Every symbol the realm allocated, in allocation order: `SymbolId(i)` is entry `i`.
+    ///
+    /// A `None` description is a symbol created without one, which is not the same as an empty one.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn symbol_table(&self) -> &[Option<JsString>] {
+        &self.symbols
+    }
+
+    /// **THE WRITE BARRIER FOR A WHOLE OBJECT, AND THE ONLY SOURCE OF A `&mut Object` IN THE
+    /// ENGINE.** A flash-resident realm object is copied into RAM by [`crate::heap::Heap::get_mut`]
+    /// before this returns, which is what covers the nineteen slots `Store` does not -- `prototype`,
+    /// `extensible`, `callable`, `primitive` and every boxed exotic.
     pub(crate) fn object_mut(&mut self, id: ObjectId) -> &mut Object {
-        &mut self.heap[id.0 as usize]
+        #[cfg(feature = "mutation-census")]
+        if (id.0 as usize) < self.realm_boundary {
+            self.mutated_realm_objects.insert(id.0);
+        }
+        if let Some(replay) = self.replay.as_mut() {
+            replay.discard.empty_the_property_stores();
+            return &mut replay.discard;
+        }
+        self.heap.get_mut(id)
+    }
+
+    /// How many objects the realm installed, and which of them a program has since reached for
+    /// mutation.
+    ///
+    /// The boundary is the heap length at the end of installation, so "is this a realm object" is
+    /// an index comparison rather than a flag on every object.
+    #[cfg(feature = "mutation-census")]
+    #[must_use]
+    pub fn mutation_census(&self) -> (usize, &alloc::collections::BTreeSet<u32>) {
+        (self.realm_boundary, &self.mutated_realm_objects)
+    }
+
+    /// Marks the end of realm installation. Everything allocated before this is realm; everything
+    /// after is the program's.
+    #[cfg(feature = "mutation-census")]
+    pub(crate) fn seal_realm(&mut self) {
+        self.realm_boundary = self.heap.len();
+        self.mutated_realm_objects.clear();
     }
 
     /// Makes a NEW symbol. Every call produces a distinct one, description or not.
@@ -1368,7 +1648,17 @@ impl Interpreter {
     /// and the microtask checkpoint are per-AGENT and normative -- so host state reachable from JS
     /// may only ever be touched from that agent's thread. A thread-local in the host says that in
     /// the type system; a captured closure here would let the constraint be broken silently.
-    pub fn define_host_function(&mut self, name: &str, length: u32, call: NativeFn) {
+    ///
+    /// # THE NAME IS `&'static str`, AND THAT IS A CONSTRAINT WORTH STATING
+    ///
+    /// A built-in's name is stored beside its function pointer and is never copied into the heap,
+    /// which is what keeps a realm's 413 registry entries free of 413 string allocations. A host
+    /// function joins the same registry, so its name has to be constant data too -- a literal, or
+    /// anything else with a `'static` lifetime.
+    ///
+    /// In practice a host names its functions in its own source, so this costs nothing. A host that
+    /// genuinely computes a name at run time has to arrange for it to outlive the engine.
+    pub fn define_host_function(&mut self, name: &'static str, length: u32, call: NativeFn) {
         let function = self.native_function(name, length, call);
         self.define_global(name, JsValue::Object(function));
     }
@@ -1438,14 +1728,19 @@ impl Interpreter {
     /// `verifyCallableProperty` checks them on every built-in a test touches. Creating them as
     /// ordinary data properties would fail those checks everywhere at once, which reads as a spread
     /// of unrelated defects rather than as one wrong default.
-    pub(crate) fn native_function(&mut self, name: &str, length: u32, call: NativeFn) -> ObjectId {
+    pub(crate) fn native_function(
+        &mut self,
+        name: &'static str,
+        length: u32,
+        call: NativeFn,
+    ) -> ObjectId {
         self.native_callable(name, length, call, None)
     }
 
     /// Creates a built-in that is also a constructor, with `[[Call]]` and `[[Construct]]` separate.
     pub(crate) fn native_constructor(
         &mut self,
-        name: &str,
+        name: &'static str,
         length: u32,
         call: NativeFn,
         construct: NativeFn,
@@ -1455,12 +1750,12 @@ impl Interpreter {
 
     fn native_callable(
         &mut self,
-        name: &str,
+        name: &'static str,
         length: u32,
         call: NativeFn,
         construct: Option<NativeFn>,
     ) -> ObjectId {
-        self.natives.push(NativeFunction { name: name.to_string(), length, call, construct });
+        self.natives.push(NativeFunction { name, length, call, construct });
         let index = (self.natives.len() - 1) as u32;
         let mut object = Object::new(Some(self.intrinsics.function_prototype));
         object.callable = Some(Callable::Native(index));
@@ -1504,7 +1799,7 @@ impl Interpreter {
     pub(crate) fn define_method(
         &mut self,
         target: ObjectId,
-        name: &str,
+        name: &'static str,
         length: u32,
         call: NativeFn,
     ) {
@@ -2510,6 +2805,18 @@ impl Interpreter {
     }
 
     /// What a write that cannot happen does: nothing, or a TypeError, as `throw` says.
+    ///
+    /// **THIS IS THE LARGEST BEHAVIOURAL DIFFERENCE BETWEEN THE TWO MODES.** An engine carrying
+    /// only the silent half ACCEPTS PROGRAMS THE STANDARD REJECTS, which is not a missing feature
+    /// but a wrong answer: the write appears to succeed and the next read disagrees with it.
+    ///
+    /// AND `throw` IS A PARAMETER RATHER THAN `self.strict` FOR THE SECOND HALF OF THE SAME
+    /// FINDING. It read the CALLER'S mode, which is right for an assignment and wrong for every
+    /// write a built-in makes: the standard's `Set(O, P, V, Throw)` is called with `Throw` = **true**
+    /// from `Array.prototype.push` and its neighbours whatever mode the calling program is in. With
+    /// the flag welded to `self.strict`, `Object.freeze(a); a.push(1)` in sloppy code reported a new
+    /// length and changed nothing. The mode question and the built-in question are two questions;
+    /// answering both from one field made the sloppy half of the language silently lossy.
     fn refuse_write(&mut self, key: &PropertyKey, why: &str, throw: bool) -> Completion {
         if !throw {
             return Completion::Normal(JsValue::Undefined);
@@ -2622,7 +2929,7 @@ impl Interpreter {
     /// # THIS COMPILES AND THEN WALKS THE ARTIFACT. THE TREE IS A TRANSIENT PRODUCT.
     ///
     /// `parse -> encode -> run`: **one representation, not two.** The AST exists
-    /// long enough to be encoded and is then dropped, so the 14.73 bytes of RAM per source byte a
+    /// long enough to be encoded and is then dropped, so the per-source-byte RAM cost a
     /// tree costs are not resident while the program runs -- and that holds for `eval` and the REPL
     /// too, not only for a precompiled device image.
     ///
@@ -2667,10 +2974,24 @@ impl Interpreter {
     }
 
     /// What the realm is MADE OF, counted rather than estimated.
+    ///
+    /// # WHY A CENSUS RATHER THAN AN ESTIMATE
+    ///
+    /// On a part whose RAM the realm dominates, the realm IS the fixed cost -- and a fixed cost
+    /// nothing measures is one nobody can argue with. The program's own representation competes
+    /// with it only while that representation is large per source byte. **Once it is not, the fixed
+    /// term is the whole story** and the first question is where it goes.
+    ///
+    /// Counts, not bytes. The allocator gives the TOTAL honestly; dividing it up by structure
+    /// size would be a model of the allocator rather than a measurement of it. A count paired with
+    /// a measured total is two facts; a computed per-item byte figure would be one fact and one
+    /// assumption wearing the same units.
     #[must_use]
     pub fn realm_census(&self) -> RealmCensus {
         let mut census = RealmCensus {
             objects: self.heap.len(),
+            resident_objects: self.heap.resident_len(),
+            promoted_objects: self.heap.promoted_len(),
             closures: self.closures.len(),
             natives: self.natives.len(),
             symbols: self.symbols.len(),
@@ -2679,7 +3000,15 @@ impl Interpreter {
             programs: self.programs.len(),
             ..RealmCensus::default()
         };
-        for object in &self.heap {
+        census.object_size = core::mem::size_of::<Object>();
+        census.object_struct_bytes = self.heap.ram_objects() * census.object_size;
+        census.object_table_bytes = self.heap.ram_table_bytes();
+        census.native_table_bytes =
+            self.natives.capacity() * core::mem::size_of::<NativeFunction>();
+        census.native_name_bytes = self.natives.iter().map(|native| native.name.len()).sum();
+
+        for object in self.heap.iter() {
+            census.property_store_bytes += object.property_store_bytes();
             let keys = object.own_keys();
             census.properties += keys.len();
             if object.callable.is_some() {
@@ -2710,6 +3039,18 @@ impl Interpreter {
     /// Which is why this is a method rather than advice in a doc comment. "Remember to drop the
     /// parse" is a rule every future caller has to rediscover, and the one who forgets gets a
     /// working program and a silently doubled representation.
+    /// # AN UNCAUGHT THROW COMES BACK AS A VALUE, AND `Debug` WILL NOT RENDER IT
+    ///
+    /// A program that throws answers `Ok(Completion::Throw(value))` -- not `Err` -- because a throw
+    /// is a completion the caller may want to inspect rather than a failure of this call. The value
+    /// is an Error OBJECT, so `Debug` prints its identity (`Object(ObjectId(468))`) and its ordinary
+    /// string conversion is `[object]`: both discard the kind and the message that make one failure
+    /// distinguishable from another.
+    ///
+    /// Render it with [`Interpreter::describe`], which answers `TypeError: ...`, or use
+    /// [`Interpreter::eval_source`], which does that already and reports the throw as an `Err`.
+    /// An embedder that reached for `Debug` and got an object id was looking in the right place and
+    /// finding nothing that pointed here.
     pub fn run_source(&mut self, source: &str) -> Result<Completion, String> {
         let parsed = crate::parse_script(source);
         if parsed.has_errors() {

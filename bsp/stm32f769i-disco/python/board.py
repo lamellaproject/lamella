@@ -59,6 +59,7 @@ FACTS = {
 # Bases only: register offsets and bit encodings belong to the driver that knows the block.
 INSTANCES = {
     "usart1": {"block": "usart", "base": 0x40011000, "rcc_en_off": 0x44, "rcc_en_bit": 0x4},
+    "sdmmc2": {"block": "sdmmc", "base": 0x40011C00, "rcc_en_off": 0x44, "rcc_en_bit": 0x7},
     "gpioa": {"block": "gpio", "base": 0x40020000, "rcc_en_off": 0x30, "rcc_en_bit": 0x0},
     "gpioj": {"block": "gpio", "base": 0x40022400, "rcc_en_off": 0x30, "rcc_en_bit": 0x9},
     "rcc": {"block": "rcc", "base": 0x40023800},
@@ -66,6 +67,7 @@ INSTANCES = {
 
 PLANS = {
     "hsi-16mhz": {"default": True, "source": "hsi", "hsi_hz": 16000000, "pclk_hz": 16000000},
+    "pll-216mhz": {"default": False, "source": "pll", "hsi_hz": 16000000, "pll_m": 8, "pll_n": 216, "pll_p": 2, "pll_q": 9, "sysclk_hz": 216000000, "pll48_hz": 48000000, "pclk_hz": 108000000, "pclk1_hz": 54000000},
 }
 
 # On-board devices + module control lines: PORT group base + pin index + mask + polarity.

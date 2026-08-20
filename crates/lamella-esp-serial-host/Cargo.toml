@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "HOST-side native driver for lamella-esp-serial: an OS serial port, and the loop that performs the protocol's emitted actions against it. The sibling a browser replaces with a Web Serial shim and an editor extension replaces with its own transport."
+publish = false
 
 [dependencies]
 # The protocol itself, transport-free. This crate supplies the transport and NOTHING else -- every

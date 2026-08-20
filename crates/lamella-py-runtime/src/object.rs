@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use lamella_gc::{Heap, Ref, TypeDesc};
-use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Module, UnaryOp};
+use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Functions, Module, UnaryOp};
 
 use crate::bigint::BigInt;
 use crate::builtins::Builtin;
@@ -66,7 +66,7 @@ const STR_ISPRINTABLE: u32 = 45;
 
 /// The id of the `str` method `name`, or `None` if `str` has no such method.
 /// Renders `n` in `radix` (2/8/10/16) with no sign or prefix; `upper` uppercases the hex digits.
-fn format_radix(mut n: u32, radix: u32, upper: bool) -> String {
+fn format_radix(mut n: u128, radix: u128, upper: bool) -> String {
     if n == 0 {
         return String::from("0");
     }
@@ -2224,7 +2224,7 @@ pub struct ObjectModel {
     /// the entry, whose functions are threaded, not stored here). A CROSS-module call clones the `Rc`
     /// (cheap) to run the callee against its OWN function table, disjoint from the `&mut self` borrow.
     /// Built once by [`ObjectModel::set_managed_modules`] alongside the registry.
-    managed_functions: Vec<Rc<[CodeObject]>>,
+    managed_functions: Vec<Rc<Functions>>,
     /// Each managed module's top-level BODY as a shared `Rc`, indexed by `module_id - 1`. A module
     /// body runs on the importer's own frame stack (so the collector's safe point reaches it), which
     /// means its code is resolved once per op and cannot be a borrow into the registry.
@@ -2235,7 +2235,7 @@ pub struct ObjectModel {
     /// the index against the caller's table. `None` for a single-file program (no managed caller exists).
     ///
     /// [`run_bundle`]: crate::interp::run_bundle
-    entry_functions: Option<Rc<[CodeObject]>>,
+    entry_functions: Option<Rc<Functions>>,
     /// Each managed module's live GLOBAL namespace (name -> value), indexed by `module_id - 1`. A
     /// managed module's top-level bindings and its functions' `LoadGlobal`s resolve here (via
     /// [`ObjectModel::current_module_global`]), NOT the entry's `globals`, so a function defined in
@@ -3677,10 +3677,79 @@ impl ObjectModel {
         }
     }
 
-    /// printf-style `%` formatting for `str % args`: `%d`/`%i` an int, `%s` str(), `%r` repr(),
-    /// `%%` a literal `%`; the args are consumed left to right. A conversion with flags/width/
-    /// precision (`%5d`) or an unhandled type (`%f`, `%x`) is `Unsupported` (never wrong output);
-    /// too few or too many args is a `TypeError` (matching CPython's "not enough/all ... converted").
+    /// Checks one `%`-format argument against its conversion character and returns the value the
+    /// spec renderer should be handed: for `%d`/`%i`/`%u` a float is TRUNCATED TOWARD ZERO to an int
+    /// (`"%d" % -3.7` is `"-3"`), and for `%c` a one-character string becomes its code point.
+    ///
+    /// **The rules live here and not in [`ObjectModel::format_value_spec`] because the two surfaces
+    /// disagree in CPython.** `"%d" % 3.7` prints `3`, while `f"{3.7:d}"` is a `ValueError` naming an
+    /// unknown format code -- one shared renderer cannot answer both, so the `%` surface settles its
+    /// own argument first and hands over something the renderer already accepts.
+    ///
+    /// Every refusal is a CATCHABLE Python exception in CPython's wording, and there are four
+    /// families of wording because CPython has four: `%d`/`%i`/`%u` want "a real number",
+    /// `%o`/`%x`/`%X` want "an integer" (a float is refused outright, never truncated), the float
+    /// codes want "must be real number", and `%c` wants "an int or a unicode character". A character
+    /// `%`-format does not define at all (`%b`, `%n`) is a `ValueError` naming its position -- this
+    /// runtime used to render `"%b" % 5` as `"101"`, which is output CPython never produces.
+    fn coerce_percent_arg(&mut self, ty: char, ty_index: usize, arg: Value) -> Result<Value, Trap> {
+        let is_int = self.is_integer_value(arg);
+        match ty {
+            's' | 'r' | 'a' => Ok(arg),
+            'd' | 'i' | 'u' => match self.float_value(arg) {
+                Some(f) => self.int_from_float(f),
+                None if is_int => Ok(arg),
+                None => Err(self.percent_type_error(ty, arg, "a real number is required")),
+            },
+            'o' | 'x' | 'X' if is_int => Ok(arg),
+            'o' | 'x' | 'X' => Err(self.percent_type_error(ty, arg, "an integer is required")),
+            'e' | 'E' | 'f' | 'F' | 'g' | 'G' if is_int || self.float_value(arg).is_some() => Ok(arg),
+            'e' | 'E' | 'f' | 'F' | 'g' | 'G' => {
+                let name = self.type_name_of(arg);
+                Err(self.with_message(Trap::TypeError, &alloc::format!("must be real number, not {name}")))
+            }
+            'c' if is_int && self.as_i128(arg).is_some_and(|n| (0..0x0011_0000).contains(&n)) => Ok(arg),
+            'c' if is_int => Err(self.with_message(Trap::Overflow, "%c arg not in range(0x110000)")),
+            'c' => {
+                let Some(points) = self.str_bytes(arg).map(|s| code_points(s).count()) else {
+                    let name = self.type_name_of(arg);
+                    let message =
+                        alloc::format!("%c requires an int or a unicode character, not {name}");
+                    return Err(self.with_message(Trap::TypeError, &message));
+                };
+                if points != 1 {
+                    let message = alloc::format!(
+                        "%c requires an int or a unicode character, not a string of length {points}"
+                    );
+                    return Err(self.with_message(Trap::TypeError, &message));
+                }
+                let text = String::from(self.str_text(arg)?);
+                let point = text.chars().next().ok_or(Trap::Malformed)? as i32;
+                Value::fixnum(point).ok_or(Trap::Overflow)
+            }
+            _ => {
+                let message = alloc::format!(
+                    "unsupported format character '{ty}' ({:#x}) at index {ty_index}",
+                    ty as u32
+                );
+                Err(self.with_message(Trap::ValueError, &message))
+            }
+        }
+    }
+
+    /// A `%`-format `TypeError` in CPython's shape: `%d format: a real number is required, not str`.
+    /// `requirement` is the family's clause -- see [`ObjectModel::coerce_percent_arg`].
+    fn percent_type_error(&mut self, ty: char, arg: Value, requirement: &str) -> Trap {
+        let name = self.type_name_of(arg);
+        let message = alloc::format!("%{ty} format: {requirement}, not {name}");
+        self.with_message(Trap::TypeError, &message)
+    }
+
+    /// printf-style `%` formatting for `str % args`: `%d`/`%i`/`%u` a real number, `%o`/`%x`/`%X` an
+    /// integer, `%e`/`%f`/`%g` (and their upper-case forms) a real number, `%c` a code point,
+    /// `%s` str(), `%r`/`%a` repr(), `%%` a literal `%`; the args are consumed left to right.
+    /// Too few or too many args is a `TypeError` (CPython's "not enough/all ... converted"), and
+    /// [`ObjectModel::coerce_percent_arg`] carries the per-conversion rules and their refusals.
     fn percent_format(&mut self, template: &str, args: &[Value]) -> Result<String, Trap> {
         let mut out = String::new();
         let chars: Vec<char> = template.chars().collect();
@@ -3750,18 +3819,23 @@ impl ObjectModel {
                 }
             }
             let ty = *chars.get(i).ok_or(Trap::ValueError)?;
+            let ty_index = i;
             i += 1;
             let arg = match mapped_arg {
                 Some(value) => value,
                 None => {
-                    let value = *args.get(next_arg).ok_or(Trap::TypeError)?;
+                    let Some(value) = args.get(next_arg).copied() else {
+                        let message = "not enough arguments for format string";
+                        return Err(self.with_message(Trap::TypeError, message));
+                    };
                     next_arg += 1;
                     value
                 }
             };
             let width_n = width.parse::<usize>().unwrap_or(0);
+            let arg = self.coerce_percent_arg(ty, ty_index, arg)?;
             match ty {
-                's' | 'r' => {
+                's' | 'r' | 'a' => {
                     let mut body = if ty == 's' { self.display(arg)? } else { self.repr(arg) };
                     if has_precision {
                         body = body.chars().take(precision).collect();
@@ -3813,7 +3887,8 @@ impl ObjectModel {
             }
         }
         if !used_mapping && next_arg != args.len() {
-            return Err(Trap::TypeError);
+            let message = "not all arguments converted during string formatting";
+            return Err(self.with_message(Trap::TypeError, message));
         }
         Ok(out)
     }
@@ -4686,7 +4761,7 @@ impl ObjectModel {
         receiver: Value,
         method_id: u32,
         args: &[Value],
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Value, Trap> {
         let slot = self.deque_slot(receiver).ok_or(Trap::TypeError)?;
@@ -4808,6 +4883,27 @@ impl ObjectModel {
             return Ok(v);
         }
         self.new_long(n)
+    }
+
+    /// `int(f)`: the integer a float truncates to, TOWARD ZERO -- `-3.7` gives `-3`, not `-4`. A NaN
+    /// has no integer value (`ValueError`) and neither has an infinity (`OverflowError`); a magnitude
+    /// past i128 is `OverflowError`, because a float is only ever widened as far as the widest
+    /// fixed-width integer the runtime carries.
+    ///
+    /// Shared by the `int` built-in and `%`-format's `%d`/`%i`/`%u`, which is not an economy: in
+    /// CPython those two ARE one conversion, and a second hand-written copy is how they would come to
+    /// disagree about which way -3.7 rounds.
+    pub(crate) fn int_from_float(&mut self, f: f64) -> Result<Value, Trap> {
+        if f.is_nan() {
+            return Err(self.with_message(Trap::ValueError, "cannot convert float NaN to integer"));
+        }
+        if f.is_infinite() {
+            return Err(self.with_message(Trap::Overflow, "cannot convert float infinity to integer"));
+        }
+        if !(-1.701_411_834_604_692_3e38..1.701_411_834_604_692_3e38).contains(&f) {
+            return Err(Trap::Overflow);
+        }
+        self.new_long(f as i128)
     }
 
     /// A defaultdict's `default_factory` (`Value::NONE` for none); `None` if `value` is not a
@@ -4967,7 +5063,7 @@ impl ObjectModel {
     pub(crate) fn new_dict_dyn(
         &mut self,
         pairs: Vec<(Value, Value)>,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Value, Trap> {
         let entries = crate::interp::dedup_pairs(pairs, functions, self, depth)?;
@@ -4988,7 +5084,7 @@ impl ObjectModel {
         &mut self,
         dict: Value,
         key: Value,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Option<usize>, Trap> {
         let i = self.dict_slot(dict).ok_or(Trap::TypeError)?;
@@ -5171,7 +5267,7 @@ impl ObjectModel {
         &mut self,
         a: Value,
         b: Value,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<bool, Trap> {
         let (ea, eb) = match (self.dict_value(a), self.dict_value(b)) {
@@ -5540,7 +5636,7 @@ impl ObjectModel {
         &mut self,
         container: Value,
         index: Value,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Value, Trap> {
         if let Some(i) = self.dict_slot(container) {
@@ -5575,7 +5671,7 @@ impl ObjectModel {
         container: Value,
         index: Value,
         value: Value,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<(), Trap> {
         if let Some(i) = self.dict_slot(container) {
@@ -5595,7 +5691,7 @@ impl ObjectModel {
         &mut self,
         container: Value,
         index: Value,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<(), Trap> {
         if let Some(i) = self.dict_slot(container) {
@@ -5620,7 +5716,7 @@ impl ObjectModel {
         &mut self,
         container: Value,
         element: Value,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<bool, Trap> {
         if self.is_dict(container) {
@@ -6302,7 +6398,7 @@ impl ObjectModel {
     pub fn set_managed_modules(&mut self, modules: Vec<Module>) {
         self.managed_functions = modules
             .iter()
-            .map(|m| Rc::from(m.functions.clone().into_bodies().into_boxed_slice()))
+            .map(|m| Rc::new(m.functions.clone()))
             .collect();
         self.managed_bodies = modules.iter().map(|m| Rc::new(m.body.clone())).collect();
         self.managed_globals = modules.iter().map(|_| Vec::new()).collect();
@@ -6352,7 +6448,7 @@ impl ObjectModel {
     /// `module_id >= 1` is a managed module. A cross-module call clones this `Rc` (cheap) to run the
     /// callee against its own table, disjoint from the `&mut self` borrow.
     #[must_use]
-    pub(crate) fn managed_functions_rc(&self, module_id: u16) -> Option<Rc<[CodeObject]>> {
+    pub(crate) fn managed_functions_rc(&self, module_id: u16) -> Option<Rc<Functions>> {
         match module_id {
             0 => self.entry_functions.clone(),
             k => self.managed_functions.get((k - 1) as usize).cloned(),
@@ -6382,7 +6478,7 @@ impl ObjectModel {
     /// in doubt; counting them is the half that makes "my `__del__` never ran" answerable. **Giving a
     /// function value a table it can be checked against is the real fix, it closes this by
     /// construction, and it belongs to how entry code is registered rather than to the collector.**
-    pub(crate) fn set_entry_functions(&mut self, functions: Rc<[CodeObject]>) {
+    pub(crate) fn set_entry_functions(&mut self, functions: Rc<Functions>) {
         #[cfg(feature = "gc-collect")]
         {
             let retired = self.finalizable.len() + self.finalize_queue.len();
@@ -8616,10 +8712,26 @@ impl ObjectModel {
     /// reports `can't concat R to L`, and `*` of a sequence (incl. bytes) by a non-int reports
     /// `can't multiply sequence by non-int of type 'X'`. Called at the `Op::Binary` chokepoint on a
     /// bare `Trap::TypeError`, so it never overrides a message a user dunder raised (that arrives
-    /// as `Trap::Raised`, carrying its own exception).
+    /// as `Trap::Raised`, carrying its own exception) nor one the operation itself attached.
     pub(crate) fn binop_type_error(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Trap {
+        if self.trap_carries_a_message() {
+            return Trap::TypeError;
+        }
         let message = self.binop_type_error_message(op, lhs, rhs, false);
         self.raise_named_exception("TypeError", &message)
+    }
+
+    /// Whether the trap on its way out already carries a message of its own
+    /// ([`ObjectModel::with_message`]).
+    ///
+    /// **The operator chokepoints synthesize `unsupported operand type(s)` only for a trap that does
+    /// NOT.** `"%d" % None` refuses inside `%`-format, naming the conversion and what it wanted; the
+    /// chokepoint above it can say no more than that `str % NoneType` has no operation, which is both
+    /// less true and less useful. The test is ambient rather than per-site because the rule has three
+    /// implementations and a case added to one of them is a case the other two do not get.
+    #[must_use]
+    fn trap_carries_a_message(&self) -> bool {
+        self.pending_trap_arg.is_some()
     }
 
     /// The `TypeError` for an augmented assignment ([`Op::InplaceBinOp`]) with no applicable
@@ -8628,6 +8740,9 @@ impl ObjectModel {
     /// form says `** or pow()`) -- CPython renders the `=` there, while the concatenate/multiply
     /// sequence messages keep the plain-op text.
     pub(crate) fn inplace_binop_type_error(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Trap {
+        if self.trap_carries_a_message() {
+            return Trap::TypeError;
+        }
         let message = self.binop_type_error_message(op, lhs, rhs, true);
         self.raise_named_exception("TypeError", &message)
     }
@@ -13666,14 +13781,104 @@ impl ObjectModel {
             .is_some_and(|reference| self.heap.type_id_of(reference) == self.bound_method_type_id)
     }
 
-    /// Renders a `str.format(*args)` template: `{}` takes the next positional argument, `{N}` the
-    /// N-th, and `{{` / `}}` are literal braces; each field is rendered with `str()` ([`display`]).
-    /// An out-of-range index is an `IndexError`. A `{:spec}` field is applied through the format-spec
-    /// mini-language below; named fields (`{name}`) are not supported.
+    /// Whether `value` is a Python `int`, in ANY of the three representations the runtime uses for
+    /// one (a tagged fixnum or `bool`, an i128 `long`, or a [`BigInt`]). [`Value::as_int`] alone sees
+    /// only the first, so a reader that asks it is asking about a REPRESENTATION and not about the
+    /// Python type -- which is how `"%d" % (2**40)` came to refuse an ordinary integer.
+    #[must_use]
+    pub(crate) fn is_integer_value(&self, value: Value) -> bool {
+        value.as_int().is_some() || self.is_long(value) || self.is_bigint(value)
+    }
+
+    /// The digits of an `int` in `radix` (2/8/10/16) with its sign split off -- `(digits, negative)`,
+    /// the digits carrying neither sign nor `0x`-style prefix. `None` when `value` is not an `int`.
+    ///
+    /// One reader across all three integer representations, so the format-spec machinery renders
+    /// whatever the runtime can hold rather than only what fits a fixnum.
+    fn int_digits_in_radix(&self, value: Value, radix: u32, upper: bool) -> Option<(String, bool)> {
+        if let Some(n) = self.as_i128(value) {
+            return Some((format_radix(n.unsigned_abs(), u128::from(radix), upper), n < 0));
+        }
+        let big = self.bigint_value(value)?;
+        let magnitude = big.abs();
+        let digits = match radix {
+            10 => magnitude.to_decimal_string(),
+            16 => magnitude.to_power_of_two_radix_string(4),
+            8 => magnitude.to_power_of_two_radix_string(3),
+            _ => magnitude.to_power_of_two_radix_string(1),
+        };
+        let digits = if upper { digits.to_ascii_uppercase() } else { digits };
+        Some((digits, big.is_negative()))
+    }
+
+    /// CPython's `format()` refusal for a presentation type the value's type does not accept:
+    /// `ValueError: Unknown format code 'd' for object of type 'float'`.
+    ///
+    /// A CATCHABLE Python exception rather than [`Trap::Unsupported`], and the difference is the
+    /// whole point: `Unsupported` says LAMELLA does not implement this, is invisible to `try`/
+    /// `except`, and ends the run with a diagnostic naming no line. A wrongly-typed format argument
+    /// is the PROGRAM's error, and CPython lets a program handle it.
+    fn unknown_format_code(&mut self, code: char, value: Value) -> Trap {
+        let name = self.type_name_of(value);
+        let message = alloc::format!("Unknown format code '{code}' for object of type '{name}'");
+        self.with_message(Trap::ValueError, &message)
+    }
+
+    /// Whether the format-spec mini-language applies to `value` at all -- `int`, `str` and `float`
+    /// each parse a spec, and every other type inherits `object.__format__`, which accepts the EMPTY
+    /// spec (`format(None)` is `"None"`) and refuses every other.
+    #[must_use]
+    fn takes_a_format_spec(&self, value: Value) -> bool {
+        self.is_integer_value(value)
+            || self.str_bytes(value).is_some()
+            || self.float_value(value).is_some()
+    }
+
+    /// CPython's `object.__format__` refusal for a non-empty spec on a type that has none:
+    /// `TypeError: unsupported format string passed to NoneType.__format__`. Catchable, for the
+    /// reason spelled out on [`Self::unknown_format_code`].
+    fn unsupported_format_string(&mut self, value: Value) -> Trap {
+        let name = self.type_name_of(value);
+        let message = alloc::format!("unsupported format string passed to {name}.__format__");
+        self.with_message(Trap::TypeError, &message)
+    }
+
+    /// The `f64` the format spec's FLOAT path works from: a float as itself, and an int of any of the
+    /// three representations widened -- an int reaches that path whenever the spec names a float
+    /// presentation type, because `format(42, ".2f")` is `"42.00"` in CPython. `None` for a non-number.
+    #[cfg(feature = "float")]
+    fn spec_float_operand(&self, value: Value) -> Option<f64> {
+        self.float_value(value)
+            .or_else(|| self.as_i128(value).map(|n| n as f64))
+            .or_else(|| self.bigint_value(value).map(BigInt::to_f64))
+    }
+
+    /// The no-float tier's [`ObjectModel::spec_float_operand`]. **The number is never read here**:
+    /// there is no float arithmetic on this tier and the caller refuses with `Trap::FloatUnavailable`
+    /// on the strength of the `Some` alone. It must still answer `Some` for every NUMBER, because
+    /// `f"{5:.2f}"` contains no float and still has to say that FLOAT IS ABSENT FROM THIS BUILD --
+    /// falling through instead would format the int and answer "5" where the program asked for "5.00".
+    #[cfg(not(feature = "float"))]
+    fn spec_float_operand(&self, value: Value) -> Option<f64> {
+        self.is_integer_value(value).then_some(0.0)
+    }
+
+    /// CPython's refusal for a spec that does not PARSE (`format(5, "5x5")`), as opposed to one that
+    /// parses and names a type code the value cannot take. A type with no spec support answers the
+    /// `object.__format__` TypeError instead -- it never gets as far as parsing.
+    fn invalid_format_specifier(&mut self, spec: &str, value: Value) -> Trap {
+        if !self.takes_a_format_spec(value) {
+            return self.unsupported_format_string(value);
+        }
+        let name = self.type_name_of(value);
+        let message = alloc::format!("Invalid format specifier '{spec}' for object of type '{name}'");
+        self.with_message(Trap::ValueError, &message)
+    }
+
     /// Renders `value` under a format spec `[[fill]align][sign][#][0][width][,][.prec][type]`. Supports
     /// the int presentation types (d/x/X/o/b/c), str (s), and the float types (f/F/e/E/g/G/%), plus
     /// alignment/width/fill/sign/zero-pad, str precision (truncation), and digit grouping (`,` / `_`).
-    pub(crate) fn format_value_spec(&self, value: Value, spec: &str) -> Result<String, Trap> {
+    pub(crate) fn format_value_spec(&mut self, value: Value, spec: &str) -> Result<String, Trap> {
         let chars: Vec<char> = spec.chars().collect();
         let mut i = 0;
         let (mut fill, mut align) = (' ', '\0');
@@ -13727,32 +13932,39 @@ impl ObjectModel {
             i += 1;
         }
         if i != chars.len() {
-            return Err(Trap::Unsupported);
+            return Err(self.invalid_format_specifier(spec, value));
         }
 
         let float_type = matches!(type_char, Some('f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%'));
-        if let Some(n) = value.as_int().filter(|_| !float_type) {
-            let magnitude = n.unsigned_abs() as u32;
-            let (digits, prefix) = match type_char.unwrap_or('d') {
-                'd' | 'n' => (format_radix(magnitude, 10, false), ""),
-                'x' => (format_radix(magnitude, 16, false), if alternate { "0x" } else { "" }),
-                'X' => (format_radix(magnitude, 16, true), if alternate { "0X" } else { "" }),
-                'o' => (format_radix(magnitude, 8, false), if alternate { "0o" } else { "" }),
-                'b' => (format_radix(magnitude, 2, false), if alternate { "0b" } else { "" }),
-                'c' => {
-                    let cp = u32::try_from(n).map_err(|_| Trap::ValueError)?;
-                    let ch = char::from_u32(cp).ok_or(Trap::ValueError)?;
-                    let mut buf = [0u8; 4];
-                    let align = if align == '\0' { '<' } else { align };
-                    return Ok(pad_field(ch.encode_utf8(&mut buf), width, fill, align));
-                }
-                _ => return Err(Trap::Unsupported),
+        if self.is_integer_value(value) && !float_type {
+            let int_code = type_char.unwrap_or('d');
+            if int_code == 'c' {
+                let Some(n) = self.as_i128(value).filter(|n| i32::try_from(*n).is_ok()) else {
+                    let message = "Python int too large to convert to C long";
+                    return Err(self.with_message(Trap::Overflow, message));
+                };
+                let Some(ch) = u32::try_from(n).ok().and_then(char::from_u32) else {
+                    return Err(self.with_message(Trap::Overflow, "%c arg not in range(0x110000)"));
+                };
+                let mut buf = [0u8; 4];
+                let align = if align == '\0' { '<' } else { align };
+                return Ok(pad_field(ch.encode_utf8(&mut buf), width, fill, align));
+            }
+            let (radix, upper, prefix) = match int_code {
+                'd' | 'n' => (10, false, ""),
+                'x' => (16, false, if alternate { "0x" } else { "" }),
+                'X' => (16, true, if alternate { "0X" } else { "" }),
+                'o' => (8, false, if alternate { "0o" } else { "" }),
+                'b' => (2, false, if alternate { "0b" } else { "" }),
+                code => return Err(self.unknown_format_code(code, value)),
             };
+            let (digits, negative) =
+                self.int_digits_in_radix(value, radix, upper).ok_or(Trap::Malformed)?;
             let digits = match grouping {
                 Some(separator) => group_integer_digits(&digits, separator),
                 None => digits,
             };
-            let sign_str = if n < 0 {
+            let sign_str = if negative {
                 "-"
             } else {
                 match sign {
@@ -13772,18 +13984,18 @@ impl ObjectModel {
                 return Ok(out);
             }
             Ok(pad_field(&alloc::format!("{sign_str}{prefix}{digits}"), width, fill, align))
-        } else if let Some(s) = self.str_bytes(value) {
-            if !matches!(type_char, None | Some('s')) {
-                return Err(Trap::Unsupported);
+        } else if let Some(s) = self.str_bytes(value).map(<[u8]>::to_vec) {
+            if let Some(code) = type_char.filter(|c| *c != 's') {
+                return Err(self.unknown_format_code(code, value));
             }
             let body = match precision {
-                Some(p) => cp_slice(s, 0, p as i64).to_vec(),
-                None => s.to_vec(),
+                Some(p) => cp_slice(&s, 0, p as i64).to_vec(),
+                None => s,
             };
             let body = String::from_utf8(body).map_err(|_| Trap::Unsupported)?;
             let align = if align == '\0' { '<' } else { align };
             Ok(pad_field(&body, width, fill, align))
-        } else if let Some(f) = self.float_value(value).or_else(|| value.as_int().map(|n| n as f64)) {
+        } else if let Some(f) = self.spec_float_operand(value) {
             #[cfg(not(feature = "float"))]
             {
                 let _ = f;
@@ -13810,7 +14022,7 @@ impl ObjectModel {
                         None => format_float(magnitude),
                         Some(p) => float_format_general(magnitude, p, false, alternate, true),
                     },
-                    _ => return Err(Trap::Unsupported),
+                    Some(code) => return Err(self.unknown_format_code(code, value)),
                 }
             };
             if let Some(separator) = grouping {
@@ -13837,8 +14049,10 @@ impl ObjectModel {
             }
             Ok(pad_field(&alloc::format!("{sign_str}{body}"), width, fill, align))
             }
+        } else if spec.is_empty() {
+            self.display(value)
         } else {
-            Err(Trap::Unsupported)
+            Err(self.unsupported_format_string(value))
         }
     }
 
@@ -13860,12 +14074,17 @@ impl ObjectModel {
         }
     }
 
+    /// Renders a `str.format(*args, **kwargs)` template: `{}` takes the next positional argument,
+    /// `{N}` the N-th, `{name}` a keyword one, and `{{` / `}}` are literal braces; each field is
+    /// rendered with `str()` ([`ObjectModel::display`]) unless it carries a `!r`/`!s`/`!a` conversion
+    /// or a `:spec`, which goes through [`ObjectModel::format_value_spec`]. An out-of-range index is
+    /// an `IndexError`.
     pub(crate) fn format_template(
         &mut self,
         template: &str,
         args: &[Value],
         kwargs: &[(&str, Value)],
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<String, Trap> {
         let mut out = String::new();
@@ -14044,7 +14263,7 @@ impl ObjectModel {
     /// `str.format_map(mapping)`: renders `template`, resolving each `{name}` field by looking the
     /// name up (as a str key) in `mapping` (a dict). A missing key is a `KeyError`; a `:spec` is not
     /// yet supported. `{{`/`}}` escape to a literal brace.
-    fn format_with_map(&self, template: &str, mapping: Value) -> Result<String, Trap> {
+    fn format_with_map(&mut self, template: &str, mapping: Value) -> Result<String, Trap> {
         let entries = self.dict_value(mapping).ok_or(Trap::TypeError)?.clone();
         let mut out = String::new();
         let mut chars = template.chars().peekable();
@@ -14515,7 +14734,7 @@ impl ObjectModel {
             }
             STR_FORMAT => {
                 let template = self.str_text(receiver).map(String::from)?;
-                let rendered = self.format_template(&template, args, &[], &[], 0)?;
+                let rendered = self.format_template(&template, args, &[], &Functions::default(), 0)?;
                 self.new_str(&rendered)
             }
             STR_FORMAT_MAP => {
@@ -14572,7 +14791,22 @@ impl ObjectModel {
                 if !args.is_empty() {
                     return Err(Trap::TypeError);
                 }
-                let folded = self.str_text(receiver)?.to_lowercase();
+                let text = String::from(self.str_text(receiver)?);
+                let mut folded = String::with_capacity(text.len());
+                let mut push = |cp: u32, original: char, out: &mut String| {
+                    out.push(char::from_u32(cp).unwrap_or(original));
+                };
+                for c in text.chars() {
+                    match lamella_unicode::full_case_fold(c as u32) {
+                        None => folded.push(c),
+                        Some(lamella_unicode::FullFold::Single(cp)) => push(cp, c, &mut folded),
+                        Some(lamella_unicode::FullFold::Several(points)) => {
+                            for &cp in points {
+                                push(cp, c, &mut folded);
+                            }
+                        }
+                    }
+                }
                 self.new_str(&folded)
             }
             STR_ENCODE => {
@@ -15075,7 +15309,7 @@ impl ObjectModel {
         list: Value,
         method_id: u32,
         args: &[Value],
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Value, Trap> {
         let slot = match self.container_slot(list, self.list_type_id) {
@@ -15431,7 +15665,7 @@ impl ObjectModel {
         receiver: Value,
         method_id: u32,
         args: &[Value],
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Value, Trap> {
         let index = self.dict_slot(receiver).ok_or(Trap::TypeError)?;
@@ -15562,7 +15796,7 @@ impl ObjectModel {
         &mut self,
         iterable: Value,
         value: Value,
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Value, Trap> {
         let keys = self.collect_elements(iterable)?;
@@ -16482,7 +16716,7 @@ impl ObjectModel {
         receiver: Value,
         method_id: u32,
         args: &[Value],
-        functions: &[CodeObject],
+        functions: &Functions,
         depth: usize,
     ) -> Result<Value, Trap> {
         let frozen = self.is_frozenset(receiver);
@@ -17362,7 +17596,7 @@ mod tests {
             ])
             .unwrap();
         let zero = Value::fixnum(0).unwrap();
-        let d = model.new_dict_fromkeys(keys, zero, &[], 0).unwrap();
+        let d = model.new_dict_fromkeys(keys, zero, &Functions::default(), 0).unwrap();
         assert_eq!(model.py_len(d).unwrap().as_fixnum(), Some(2));
     }
 

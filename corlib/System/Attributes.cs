@@ -21,7 +21,7 @@ namespace System
         GenericParameter = 0x4000,
         All = 32767
     }
-    public class Attribute { public Attribute() { } }
+    public class Attribute { protected Attribute() { } }
     [AttributeUsage(AttributeTargets.Enum, Inherited = false)]
     public sealed class FlagsAttribute : Attribute { public FlagsAttribute() { } }
     public sealed class AttributeUsageAttribute : Attribute

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "The Lamella WASM tier's driver bridge (EXPERIMENTAL, preview): a lamella_i2c import world served by the CIL interpreter running the real layer-1 C# driver."
+publish = false
 
 [lints]
 workspace = true

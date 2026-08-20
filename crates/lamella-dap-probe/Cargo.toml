@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "A DebugBackend over a debug probe: run control, registers, memory and hardware breakpoints over SWD."
+publish = false
 
 [dependencies]
 # The backend seam. A dependency-free leaf crate, so this backend reaches the DAP adapter

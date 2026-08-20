@@ -5,7 +5,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use lamella_gc::Ref;
-use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Op, UnaryOp};
+use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Functions, Op, UnaryOp};
 
 use crate::bigint::BigInt;
 use crate::object::{DescriptorRead, DictViewKind, InlineCache, ObjectModel};
@@ -647,7 +647,7 @@ fn try_binop_dunder(
     op: BinOp,
     lhs: Value,
     rhs: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -676,7 +676,7 @@ pub(crate) fn dispatch_binary(
     binop: BinOp,
     lhs: Value,
     rhs: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -731,7 +731,7 @@ fn dispatch_inplace_binary(
     binop: BinOp,
     lhs: Value,
     rhs: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -832,7 +832,7 @@ fn dispatch_compare(
     cmpop: CmpOp,
     lhs: Value,
     rhs: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -900,7 +900,7 @@ fn compare_dunder_call(
     op: CmpOp,
     receiver: Value,
     other: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -928,7 +928,7 @@ pub(crate) fn try_compare_dunder(
     op: CmpOp,
     lhs: Value,
     rhs: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -942,7 +942,7 @@ pub(crate) fn try_compare_dunder(
 /// truthiness. The interpreter-aware form for `if`/`while`/`bool()` on instances.
 pub(crate) fn py_truthy_dyn(
     value: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
@@ -971,7 +971,7 @@ pub(crate) fn py_truthy_dyn(
 pub(crate) fn elem_eq(
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
@@ -988,7 +988,7 @@ pub(crate) fn elem_eq(
 pub(crate) fn elems_contain(
     needle: Value,
     elements: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
@@ -1004,7 +1004,7 @@ pub(crate) fn elems_contain(
 /// Dedups `elements` interp-aware, first-seen order -- a set literal / comprehension / `set(iter)`.
 pub(crate) fn dedup_elems(
     elements: Vec<Value>,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<Value>, Trap> {
@@ -1021,7 +1021,7 @@ pub(crate) fn dedup_elems(
 pub(crate) fn union_elems_dyn(
     a: &[Value],
     b: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<Value>, Trap> {
@@ -1040,7 +1040,7 @@ pub(crate) fn filter_elems_dyn(
     a: &[Value],
     b: &[Value],
     keep_common: bool,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<Value>, Trap> {
@@ -1057,7 +1057,7 @@ pub(crate) fn filter_elems_dyn(
 pub(crate) fn subset_dyn(
     a: &[Value],
     b: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
@@ -1073,7 +1073,7 @@ pub(crate) fn subset_dyn(
 pub(crate) fn disjoint_dyn(
     a: &[Value],
     b: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
@@ -1091,7 +1091,7 @@ fn try_set_binop_dyn(
     op: BinOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1129,7 +1129,7 @@ fn try_set_compare_dyn(
     op: CmpOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1179,7 +1179,7 @@ fn try_set_compare_dyn(
 /// is to dicts what [`dedup_elems`] is to sets.
 pub(crate) fn dedup_pairs(
     pairs: Vec<(Value, Value)>,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<(Value, Value)>, Trap> {
@@ -1209,7 +1209,7 @@ fn try_dict_compare_dyn(
     op: CmpOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1234,7 +1234,7 @@ fn try_dict_binop_dyn(
     op: BinOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1258,7 +1258,7 @@ fn counter_op_entries(
     op: BinOp,
     lhs: Value,
     rhs: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<(Value, Value)>, Trap> {
@@ -1322,7 +1322,7 @@ fn try_counter_binop_dyn(
     op: BinOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1344,7 +1344,7 @@ fn try_deque_compare_dyn(
     op: CmpOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1396,7 +1396,7 @@ fn try_seq_compare_dyn(
     op: CmpOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1449,7 +1449,7 @@ fn try_odict_compare_dyn(
     op: CmpOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1493,7 +1493,7 @@ fn try_view_binop_dyn(
     op: BinOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1543,7 +1543,7 @@ fn try_view_compare_dyn(
     op: CmpOp,
     a: Value,
     b: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -1730,7 +1730,7 @@ const MAX_CALL_DEPTH: usize = 256;
 /// caller may pass an empty model.
 pub fn run(
     code: &CodeObject,
-    functions: &[CodeObject],
+    functions: &Functions,
     args: &[Value],
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
@@ -1743,7 +1743,7 @@ pub fn run(
 /// managed module's body runs via `run_managed_module` with its own module id.
 pub fn run_module(
     body: &CodeObject,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
     run_frames(body, functions, &[], &[], model, true, 0, 0)
@@ -1763,7 +1763,7 @@ pub fn run_module(
 pub fn run_bundle(bundle: Bundle, model: &mut ObjectModel) -> Result<Value, Trap> {
     let Bundle { entry, modules } = bundle;
     model.set_managed_modules(modules);
-    let entry_functions: Rc<[CodeObject]> = Rc::from(entry.functions.into_bodies());
+    let entry_functions: Rc<Functions> = Rc::new(entry.functions);
     model.set_entry_functions(Rc::clone(&entry_functions));
     run_module(&entry.body, &entry_functions, model)
 }
@@ -1901,9 +1901,9 @@ fn build_module_namespace(
 ) -> Result<(), Trap> {
     let functions = model.managed_functions_rc(module_id).ok_or(Trap::Malformed)?;
     let mut pairs = model.managed_module_globals(module_id);
-    for (index, func) in functions.iter().enumerate() {
-        if !func.name.contains('.') && !pairs.iter().any(|(n, _)| *n == func.name) {
-            pairs.push((func.name.clone(), Value::function_ref_in_module(module_id, index as u32)));
+    for (index, name) in functions.names().enumerate() {
+        if !name.contains('.') && !pairs.iter().any(|(n, _)| n == name) {
+            pairs.push((String::from(name), Value::function_ref_in_module(module_id, index as u32)));
         }
     }
     let namespace = model.namespace_from_globals(pairs)?;
@@ -2060,10 +2060,10 @@ fn find_handler(exc_table: &[ExcEntry], ip: u32) -> Option<ExcEntry> {
 /// else a module-level global (a class or other top-level binding), else a built-in, else a built-in
 /// exception class (so `except IndexError` / `raise ValueError` find the type). `None` if unbound (a
 /// `NameError` at the use site). Shared by `LoadGlobal` and the outer fallback of `LoadName`.
-fn resolve_global(name: &str, functions: &[CodeObject], model: &mut ObjectModel) -> Option<Value> {
+fn resolve_global(name: &str, functions: &Functions, model: &mut ObjectModel) -> Option<Value> {
     if let Some(pyfunc) = model.current_module_global(name).filter(|&g| model.is_py_function(g)) {
         Some(pyfunc)
-    } else if let Some(index) = functions.iter().position(|f| f.name == *name) {
+    } else if let Some(index) = functions.position(name) {
         Some(Value::function_ref_in_module(model.current_module(), index as u32))
     } else if let Some(global) = model.current_module_global(name) {
         Some(global)
@@ -2134,7 +2134,7 @@ fn plan_py_call(
     callee: Value,
     posargs: Vec<Value>,
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
 ) -> Result<PyCallPlan, Trap> {
     let (func, receiver) = if model.is_py_bound(callee) {
@@ -2159,7 +2159,7 @@ fn plan_py_call(
         ),
     };
     let home_funcs = model.managed_functions_rc(module);
-    let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+    let code_funcs: &Functions = home_funcs.as_deref().unwrap_or(functions);
     let code = code_funcs.get(index as usize).ok_or(Trap::Malformed)?;
     let is_generator = code.is_generator;
     let is_coroutine = code.is_coroutine;
@@ -2191,7 +2191,7 @@ fn plan_py_call(
 /// coroutine arm added to three of four is exactly the drift this shape exists to prevent.
 fn new_suspended_call(
     pending: &PendingPyCall,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
     let module = pending.module;
@@ -2208,11 +2208,11 @@ fn new_suspended_call(
 /// suspended frame and a called frame are built identically.
 fn new_planned_frame(
     pending: &PendingPyCall,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
 ) -> Result<Frame, Trap> {
     let home_funcs = model.managed_functions_rc(pending.module);
-    let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+    let code_funcs: &Functions = home_funcs.as_deref().unwrap_or(functions);
     let code = code_funcs.get(pending.index as usize).ok_or(Trap::Malformed)?;
     new_frame(
         code,
@@ -2235,7 +2235,7 @@ fn new_planned_frame(
 /// this path is a candidate for the same treatment [`Flow::Init`] just had.
 fn run_planned_call(
     pending: PendingPyCall,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2243,7 +2243,7 @@ fn run_planned_call(
         return new_suspended_call(&pending, functions, model);
     }
     let home_funcs = model.managed_functions_rc(pending.module);
-    let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+    let code_funcs: &Functions = home_funcs.as_deref().unwrap_or(functions);
     let code = code_funcs.get(pending.index as usize).ok_or(Trap::Malformed)?;
     run_frames(
         code,
@@ -2266,7 +2266,7 @@ pub(crate) fn set_attr(
     object: Value,
     attr: &str,
     value: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<(), Trap> {
@@ -2301,7 +2301,7 @@ pub(crate) fn set_attr(
 pub(crate) fn call_value(
     callee: Value,
     args: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2485,7 +2485,7 @@ fn instantiate(
     class: Value,
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2525,7 +2525,7 @@ fn plan_instantiate(
     class: Value,
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Instantiation, Trap> {
@@ -2571,7 +2571,7 @@ fn call_maybe_kw(
     callee: Value,
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2590,7 +2590,7 @@ fn call_value_kw(
     callee: Value,
     posargs: &[Value],
     kwargs: &[(&str, Value)],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -2750,7 +2750,7 @@ fn list_sort_kw(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
     receiver: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3000,7 +3000,7 @@ pub(crate) fn coroutine_method_id(name: &str) -> Option<u32> {
 fn resume_generator(
     generator: Value,
     resume: Resume,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3036,14 +3036,14 @@ fn drive_taken_generator(
     generator: Value,
     mut frame: Frame,
     resume: Resume,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
     let close_mode = matches!(resume, Resume::Close);
     let module_id = model.generator_module(generator);
     let gen_functions_rc = model.managed_functions_rc(module_id);
-    let gen_functions: &[CodeObject] = gen_functions_rc.as_deref().unwrap_or(functions);
+    let gen_functions: &Functions = gen_functions_rc.as_deref().unwrap_or(functions);
     let entry = match frame.code {
         CodeId::Func(index) => gen_functions.get(index as usize).ok_or(Trap::Malformed)?,
         CodeId::Entry | CodeId::ModuleBody => return Err(Trap::Malformed),
@@ -3126,7 +3126,7 @@ fn call_generator_method(
     generator: Value,
     method_id: u32,
     args: &[Value],
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3203,7 +3203,7 @@ fn advance_delegate(
     sub: Value,
     action: DelegateAction,
     resumable: bool,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<DelegateStep, Trap> {
@@ -3245,7 +3245,7 @@ fn advance_delegate(
 /// event loop at all.
 fn resolve_awaitable(
     awaitable: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3275,7 +3275,7 @@ pub(crate) fn getattr_hooked(
     receiver: Value,
     name: &str,
     slot: &mut InlineCache,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3302,7 +3302,7 @@ pub(crate) fn getattr_hooked(
 fn descriptor_read(
     receiver: Value,
     name: &str,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -3327,7 +3327,7 @@ fn descriptor_read(
 /// object itself, not an int).
 pub(crate) fn coerce_index(
     value: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3351,7 +3351,7 @@ pub(crate) fn coerce_index(
 /// slice with plain int/None bounds) passes through untouched.
 fn coerce_subscript(
     index: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3374,7 +3374,7 @@ fn coerce_subscript(
 /// builtins that collect an iterable.
 pub(crate) fn iterator_for(
     value: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
@@ -3415,7 +3415,7 @@ pub(crate) fn iterator_for(
 /// works everywhere a built-in iterator does, not only in a `for` loop.
 pub(crate) fn py_next_value(
     iterator: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -3487,7 +3487,7 @@ fn zip_strict_message(index: usize, longer: bool) -> String {
 /// and applying its function. `None` when a source is exhausted.
 fn lazy_iter_next(
     iterator: Value,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
@@ -3596,7 +3596,7 @@ fn lazy_iter_next(
 fn resolve_code<'a>(
     id: CodeId,
     entry: &'a CodeObject,
-    functions: &'a [CodeObject],
+    functions: &'a Functions,
     body: Option<&'a CodeObject>,
 ) -> Result<&'a CodeObject, Trap> {
     match id {
@@ -3683,7 +3683,7 @@ fn new_frame(
 #[allow(clippy::too_many_arguments)]
 fn run_frames(
     entry: &CodeObject,
-    functions: &[CodeObject],
+    functions: &Functions,
     args: &[Value],
     cells: &[Value],
     model: &mut ObjectModel,
@@ -3724,7 +3724,7 @@ fn run_frames(
 fn drive(
     frames: &mut Vec<Frame>,
     entry: &CodeObject,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<DriveOutcome, Trap> {
@@ -3745,13 +3745,13 @@ fn drive(
 fn drive_frames(
     frames: &mut Vec<Frame>,
     entry: &CodeObject,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
     outermost: bool,
 ) -> Result<DriveOutcome, Trap> {
     let mut current_module = u16::MAX;
-    let mut home_funcs: Option<Rc<[CodeObject]>> = None;
+    let mut home_funcs: Option<Rc<Functions>> = None;
     let mut home_body: Option<Rc<CodeObject>> = None;
     loop {
         #[cfg(feature = "gc-collect")]
@@ -3774,7 +3774,7 @@ fn drive_frames(
             home_body = model.managed_module_body_rc(current_module);
             model.set_current_module(current_module);
         }
-        let functions: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+        let functions: &Functions = home_funcs.as_deref().unwrap_or(functions);
         let code = resolve_code(frames[top].code, entry, functions, home_body.as_deref())?;
         let faulting_ip = frames[top].ip as u32;
         let op = *code.ops.get(frames[top].ip).ok_or(Trap::Malformed)?;
@@ -4146,10 +4146,7 @@ fn drive_frames(
             }
             Op::MakeFunction { func, flags } => {
                 let name = code.names.get(func as usize).ok_or(Trap::Malformed)?;
-                let index = functions
-                    .iter()
-                    .position(|f| f.name == *name)
-                    .ok_or(Trap::NameError)? as u32;
+                let index = functions.position(name).ok_or(Trap::NameError)? as u32;
                 let home = model.current_module();
                 if flags == 0 {
                     frame.push(Value::function_ref_in_module(home, index));
@@ -4698,7 +4695,7 @@ fn drive_frames(
 #[cfg(feature = "gc-collect")]
 fn push_next_finalizer(
     frames: &mut Vec<Frame>,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
 ) -> bool {
     let Some(object) = model.take_pending_finalizer() else {
@@ -4737,7 +4734,7 @@ fn unwind_exception(
     frames: &mut Vec<Frame>,
     faulting_ip: u32,
     entry: &CodeObject,
-    functions: &[CodeObject],
+    functions: &Functions,
     model: &mut ObjectModel,
 ) -> Result<(), Trap> {
     let exception = match model.take_pending_exception() {
@@ -4755,7 +4752,7 @@ fn unwind_exception(
         let top = frames.len() - 1;
         let home_funcs = model.managed_functions_rc(frames[top].module);
         let home_body = model.managed_module_body_rc(frames[top].module);
-        let functions: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+        let functions: &Functions = home_funcs.as_deref().unwrap_or(functions);
         let code = resolve_code(frames[top].code, entry, functions, home_body.as_deref())?;
         if let Some(handler) = find_handler(&code.exc_table, search_ip) {
             frames[top].enter_handler(exception, handler);
@@ -4932,7 +4929,7 @@ mod tests {
     fn fib_ten_is_fifty_five() {
         let code = fib_code();
         let mut model = no_objects();
-        let result = run(&code, &[], &[Value::fixnum(10).unwrap()], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[Value::fixnum(10).unwrap()], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(55));
     }
 
@@ -4992,7 +4989,7 @@ mod tests {
         let body = code(0, 0, vec![Const::Int(10)], vec![String::from("add")], 0,
             vec![LoadConst(0), BuildTuple(1), MakeFunction { func: 0, flags: 1 }, Return]);
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let pyfunc = run(&body, core::slice::from_ref(&add), &[], &mut model).unwrap();
+        let pyfunc = run(&body, &Functions::from(vec![add.clone()]), &[], &mut model).unwrap();
         assert!(model.is_py_function(pyfunc));
         assert_eq!(model.py_function_index(pyfunc), 0);
         assert_eq!(model.py_function_defaults(pyfunc), vec![Value::fixnum(10).unwrap()]);
@@ -5002,7 +4999,7 @@ mod tests {
     fn bound_method_binds_positional_defaults() {
         use Op::*;
         let m = code(2, 2, Vec::new(), Vec::new(), 0, vec![LoadFast(1), Return]);
-        let functions = [m];
+        let functions = Functions::from(vec![m]);
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         let f = |n: i32| Value::fixnum(n).unwrap();
         let defaults = model.new_tuple(vec![f(10)]).unwrap();
@@ -5036,7 +5033,7 @@ mod tests {
         use Op::*;
         let init = code_w(2, 2, vec![Const::None], vec![String::from("val")], 1,
             vec![LoadFast(1), LoadFast(0), SetAttr { site: 0 }, LoadConst(0), Return], vec![[0, 0]]);
-        let functions = [init];
+        let functions = Functions::from(vec![init]);
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let f = |n: i32| Value::fixnum(n).unwrap();
         let name = model.new_str("C").unwrap();
@@ -5065,7 +5062,7 @@ mod tests {
         outer.cellvars = ["v0"].into_iter().collect();
         let entry = code(0, 0, vec![Const::Int(10)], vec![String::from("outer")], 0,
             vec![MakeFunction { func: 0, flags: 0 }, LoadConst(0), Call(1), Call(0), Return]);
-        let functions = [outer, inner];
+        let functions = Functions::from(vec![outer, inner]);
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let result = run(&entry, &functions, &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(11));
@@ -5086,7 +5083,7 @@ mod tests {
         let entry = code(1, 0, Vec::new(), vec![String::from("make_counter")], 0,
             vec![MakeFunction { func: 0, flags: 0 }, Call(0), StoreFast(0),
                  LoadFast(0), Call(0), LoadFast(0), Call(0), Binary(BinOp::Add), Return]);
-        let functions = [make_counter, inc];
+        let functions = Functions::from(vec![make_counter, inc]);
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let result = run(&entry, &functions, &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(3));
@@ -5099,7 +5096,7 @@ mod tests {
         body.local_names = ["count"].into_iter().collect();
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         model.set_global("count", Value::fixnum(42).unwrap());
-        let result = run_module(&body, &[], &mut model).unwrap();
+        let result = run_module(&body, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(42));
     }
 
@@ -5131,7 +5128,7 @@ mod tests {
             vec![[1, 0]],
         );
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
-        let result = run(&entry, &[], &[], &mut model).unwrap();
+        let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(6));
     }
 
@@ -5159,7 +5156,7 @@ mod tests {
             vec![[1, 0]],
         );
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
-        let result = run(&entry, &[], &[], &mut model).unwrap();
+        let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
         assert!(result.as_builtin_id().is_some(), "C.n resolved to the len built-in");
     }
 
@@ -5185,7 +5182,7 @@ mod tests {
             vec![[1, 0]],
         );
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        let result = run(&entry, &[], &[], &mut model).unwrap();
+        let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.as_f64(result), Some(2.0));
     }
 
@@ -5211,7 +5208,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        let result = run(&entry, &[], &[], &mut model).unwrap();
+        let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.as_f64(result), Some(3.0));
     }
 
@@ -5228,7 +5225,7 @@ mod tests {
             vec![ImportName(0), ImportFrom(1), StoreFast(0), PopTop, LoadFast(0), Return],
         );
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        let result = run(&entry, &[], &[], &mut model).unwrap();
+        let result = run(&entry, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.as_f64(result), Some(core::f64::consts::PI));
     }
 
@@ -5252,7 +5249,7 @@ mod tests {
             vec![ImportName(0), StoreFast(0), Return],
         );
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
-        let err = run(&entry, &[], &[], &mut model).unwrap_err();
+        let err = run(&entry, &Functions::default(), &[], &mut model).unwrap_err();
         assert_eq!(err, Trap::Raised);
         let exc = model.take_pending_exception().unwrap();
         assert_eq!(model.exception_type_name(exc), Some("ModuleNotFoundError"));
@@ -5270,7 +5267,7 @@ mod tests {
             vec![ImportName(0), ImportFrom(1), StoreFast(0), PopTop, Return],
         );
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        let err = run(&entry, &[], &[], &mut model).unwrap_err();
+        let err = run(&entry, &Functions::default(), &[], &mut model).unwrap_err();
         assert_eq!(err, Trap::Raised);
         let exc = model.take_pending_exception().unwrap();
         assert_eq!(model.exception_type_name(exc), Some("ImportError"));
@@ -5282,7 +5279,7 @@ mod tests {
         let mut add = code(2, 2, Vec::new(), Vec::new(), 0,
             vec![LoadFast(0), LoadFast(1), Binary(BinOp::Add), Return]);
         add.name = String::from("add");
-        let functions = [add];
+        let functions = Functions::from(vec![add]);
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         let defaults = model.new_tuple(vec![Value::fixnum(10).unwrap()]).unwrap();
         let pyfunc = model.new_py_function(0, defaults, Value::NONE, 0).unwrap();
@@ -5301,7 +5298,7 @@ mod tests {
             vec![String::from("sub")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), CallKw { site: 0 }, Return], vec![[1, 2]]);
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let result = run(&body, core::slice::from_ref(&sub), &[], &mut model).unwrap();
+        let result = run(&body, &Functions::from(vec![sub.clone()]), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
     }
 
@@ -5311,7 +5308,7 @@ mod tests {
         let code = fib_code();
         let mut model = no_objects();
         for (n, want) in expected.iter().enumerate() {
-            let got = run(&code, &[], &[Value::fixnum(n as i32).unwrap()], &mut model).unwrap();
+            let got = run(&code, &Functions::default(), &[Value::fixnum(n as i32).unwrap()], &mut model).unwrap();
             assert_eq!(got.as_fixnum(), Some(*want), "fib({n})");
         }
     }
@@ -5328,7 +5325,7 @@ mod tests {
             vec![LoadConst(0), LoadConst(1), Binary(BinOp::Mul), Return],
         );
         let mut model = ObjectModel::new(Vec::new(), 4096);
-        let got = run(&code, &[], &[], &mut model).unwrap();
+        let got = run(&code, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.long_value(got), Some(i128::from(FIXNUM_MAX) * 2));
     }
 
@@ -5350,7 +5347,7 @@ mod tests {
             depth: 0,
         }];
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        let result = run(&code, &[], &[], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(99));
     }
 
@@ -5366,7 +5363,7 @@ mod tests {
             vec![LoadGlobal(0), Raise(1)],
         );
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().unwrap();
         assert_eq!(model.exception_type_name(exc), Some("ValueError"));
     }
@@ -5381,7 +5378,7 @@ mod tests {
             vec![LoadGlobal(0), Call(0), PopTop, PopExcept, LoadConst(0), Return]);
         main.exc_table = vec![ExcEntry { start: 0, end: 2, target: 3, depth: 0 }];
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        let result = run(&main, core::slice::from_ref(&boom), &[], &mut model).unwrap();
+        let result = run(&main, &Functions::from(vec![boom.clone()]), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
     }
 
@@ -5395,7 +5392,7 @@ mod tests {
             vec![LoadGlobal(0), Call(0), PopTop, PopExcept, LoadConst(0), Return]);
         main.exc_table = vec![ExcEntry { start: 0, end: 2, target: 3, depth: 0 }];
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        let result = run(&main, core::slice::from_ref(&needs_two), &[], &mut model).unwrap();
+        let result = run(&main, &Functions::from(vec![needs_two.clone()]), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
     }
 
@@ -5408,7 +5405,7 @@ mod tests {
         let main = code(0, 0, Vec::new(), vec![String::from("needs_two")], 0,
             vec![LoadGlobal(0), Call(0), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&main, core::slice::from_ref(&needs_two), &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&main, &Functions::from(vec![needs_two.clone()]), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().unwrap();
         assert_eq!(model.exception_type_name(exc), Some("TypeError"));
     }
@@ -5436,7 +5433,7 @@ mod tests {
             LoadFast(0), Return,
         ]);
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let result = run(&main, core::slice::from_ref(&generator), &[], &mut model).unwrap();
+        let result = run(&main, &Functions::from(vec![generator.clone()]), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(6));
     }
 
@@ -5466,7 +5463,7 @@ mod tests {
             LoadFast(0), Return,
         ]);
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let result = run(&main, core::slice::from_ref(&countup), &[], &mut model).unwrap();
+        let result = run(&main, &Functions::from(vec![countup.clone()]), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(3));
     }
 
@@ -5482,11 +5479,11 @@ mod tests {
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         let sum_prog = code(0, 0, Vec::new(), vec![String::from("sum"), String::from("gen")], 0,
             vec![LoadGlobal(0), LoadGlobal(1), Call(0), Call(1), Return]);
-        let total = run(&sum_prog, core::slice::from_ref(&generator), &[], &mut model).unwrap();
+        let total = run(&sum_prog, &Functions::from(vec![generator.clone()]), &[], &mut model).unwrap();
         assert_eq!(total.as_fixnum(), Some(6));
         let list_prog = code(0, 0, Vec::new(), vec![String::from("list"), String::from("gen")], 0,
             vec![LoadGlobal(0), LoadGlobal(1), Call(0), Call(1), Return]);
-        let list = run(&list_prog, core::slice::from_ref(&generator), &[], &mut model).unwrap();
+        let list = run(&list_prog, &Functions::from(vec![generator.clone()]), &[], &mut model).unwrap();
         assert_eq!(model.repr(list), "[1, 2, 3]");
     }
 
@@ -5500,12 +5497,12 @@ mod tests {
                 vec![LoadGlobal(0), LoadConst(0), LoadConst(1), LoadConst(2), LoadConst(1),
                      LoadConst(3), BuildList(5), Call(1), Return])
         };
-        assert_eq!(run(&list_call("max"), &[], &[], &mut model).unwrap().as_fixnum(), Some(5));
-        assert_eq!(run(&list_call("min"), &[], &[], &mut model).unwrap().as_fixnum(), Some(1));
+        assert_eq!(run(&list_call("max"), &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(5));
+        assert_eq!(run(&list_call("min"), &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(1));
         let varargs = code(0, 0, vec![Const::Int(3), Const::Int(5), Const::Int(1)],
             vec![String::from("max")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), LoadConst(2), Call(3), Return]);
-        assert_eq!(run(&varargs, &[], &[], &mut model).unwrap().as_fixnum(), Some(5));
+        assert_eq!(run(&varargs, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(5));
     }
 
     #[test]
@@ -5518,14 +5515,14 @@ mod tests {
             vec![String::from("sorted")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), LoadConst(2), BuildList(3),
                  LoadConst(4), CallKw { site: 0 }, Return], vec![[1, 3]]);
-        let result = run(&sorted_rev, &[], &[], &mut model).unwrap();
+        let result = run(&sorted_rev, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.repr(result), "[3, 2, 1]");
         let dict_kw = code_w(0, 0,
             vec![Const::Int(1), Const::Int(2),
                  Const::KwNames(vec![String::from("a"), String::from("b")])],
             vec![String::from("dict")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), CallKw { site: 0 }, Return], vec![[0, 2]]);
-        let d = run(&dict_kw, &[], &[], &mut model).unwrap();
+        let d = run(&dict_kw, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.repr(d), "{'a': 1, 'b': 2}");
     }
 
@@ -5552,7 +5549,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model).unwrap().as_fixnum(), Some(-10));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(-10));
     }
 
     #[test]
@@ -5574,7 +5571,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::ValueError));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::ValueError));
     }
 
     #[test]
@@ -5607,7 +5604,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let result = run(&code, &[], &[], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.repr(result), "(True, [1, 2, 3])");
     }
 
@@ -5632,7 +5629,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model).unwrap().as_fixnum(), Some(6));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(6));
     }
 
     #[test]
@@ -5654,7 +5651,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let result = run(&code, &[], &[], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.repr(result), "[2, 4, 6]");
     }
 
@@ -5678,7 +5675,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let result = run(&code, &[], &[], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.repr(result), "{1, 2, 3}");
     }
 
@@ -5701,7 +5698,7 @@ mod tests {
             ],
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
-        let result = run(&code, &[], &[], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.repr(result), "{1: 1, 2: 4, 3: 9}");
     }
 
@@ -5841,7 +5838,7 @@ mod tests {
         use Op::*;
         let code = code_w(1, 0, Vec::new(), Vec::new(), 0, vec![LoadFast(0), Return], vec![[0, 0]]);
         let mut model = no_objects();
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::UnboundLocal));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::UnboundLocal));
     }
 
     #[test]
@@ -5860,7 +5857,7 @@ mod tests {
             vec![LoadFast(0), LoadAttr { site: 0 }, Return],
             vec![[0, 0]],
         );
-        let result = run(&code, &[], &[obj], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[obj], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
     }
 
@@ -5900,7 +5897,7 @@ mod tests {
             ops,
             vec![[0, 0]],
         );
-        let result = run(&code, &[], &[obj], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[obj], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(21));
     }
 
@@ -5943,7 +5940,7 @@ mod tests {
         square.name = String::from("square");
         let main = code(0, 0, vec![Const::Int(7)], vec![String::from("square")], 0,
             vec![LoadGlobal(0), LoadConst(0), Call(1), Return]);
-        let result = run(&main, &[square], &[], &mut model).unwrap();
+        let result = run(&main, &Functions::from(vec![square]), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(49));
 
         let mut fact = code(1, 1, vec![Const::Int(1)], vec![String::from("fact")], 0, vec![
@@ -5963,14 +5960,14 @@ mod tests {
             Return,
         ]);
         fact.name = String::from("fact");
-        let r = run(&fact, core::slice::from_ref(&fact), &[Value::fixnum(5).unwrap()], &mut model).unwrap();
+        let r = run(&fact, &Functions::from(vec![fact.clone()]), &[Value::fixnum(5).unwrap()], &mut model).unwrap();
         assert_eq!(r.as_fixnum(), Some(120));
 
         let mut loop_fn = code(0, 0, Vec::new(), vec![String::from("loop_fn")], 0,
             vec![LoadGlobal(0), Call(0), Return]);
         loop_fn.name = String::from("loop_fn");
         assert_eq!(
-            run(&loop_fn, core::slice::from_ref(&loop_fn), &[], &mut model),
+            run(&loop_fn, &Functions::from(vec![loop_fn.clone()]), &[], &mut model),
             Err(Trap::RecursionError)
         );
     }
@@ -5982,22 +5979,22 @@ mod tests {
 
         let abs_prog = code(0, 0, vec![Const::Int(-5)], vec![String::from("abs")], 0,
             vec![LoadGlobal(0), LoadConst(0), Call(1), Return]);
-        assert_eq!(run(&abs_prog, &[], &[], &mut model).unwrap().as_fixnum(), Some(5));
+        assert_eq!(run(&abs_prog, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(5));
 
         let consts = vec![Const::Int(3), Const::Int(5), Const::Int(1)];
         let min_prog = code(0, 0, consts.clone(), vec![String::from("min")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), LoadConst(2), Call(3), Return]);
-        assert_eq!(run(&min_prog, &[], &[], &mut model).unwrap().as_fixnum(), Some(1));
+        assert_eq!(run(&min_prog, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(1));
         let max_prog = code(0, 0, consts, vec![String::from("max")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), LoadConst(2), Call(3), Return]);
-        assert_eq!(run(&max_prog, &[], &[], &mut model).unwrap().as_fixnum(), Some(5));
+        assert_eq!(run(&max_prog, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(5));
 
         let len_prog = code(0, 0, vec![Const::Str("hello".into())],
             vec![String::from("len")], 0, vec![LoadGlobal(0), LoadConst(0), Call(1), Return]);
-        assert_eq!(run(&len_prog, &[], &[], &mut model).unwrap().as_fixnum(), Some(5));
+        assert_eq!(run(&len_prog, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(5));
 
         let bad = code(0, 0, Vec::new(), vec![String::from("nope")], 0, vec![LoadGlobal(0), Return]);
-        assert_eq!(run(&bad, &[], &[], &mut model), Err(Trap::NameError));
+        assert_eq!(run(&bad, &Functions::default(), &[], &mut model), Err(Trap::NameError));
     }
 
     #[test]
@@ -6008,7 +6005,7 @@ mod tests {
         let cat = code(0, 0, vec![Const::Str("ab".into()), Const::Str("cd".into())],
             vec![String::from("len")], 0,
             vec![LoadGlobal(0), LoadConst(0), LoadConst(1), Binary(BinOp::Add), Call(1), Return]);
-        assert_eq!(run(&cat, &[], &[], &mut model).unwrap().as_fixnum(), Some(4));
+        assert_eq!(run(&cat, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(4));
 
         let cmp = code(0, 0,
             vec![Const::Str("a".into()), Const::Str("b".into()), Const::Int(1), Const::Int(0)],
@@ -6018,7 +6015,7 @@ mod tests {
                 LoadConst(2), Return,
                 LoadConst(3), Return,
             ]);
-        assert_eq!(run(&cmp, &[], &[], &mut model).unwrap().as_fixnum(), Some(1));
+        assert_eq!(run(&cmp, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(1));
 
         let truthy = code(0, 0,
             vec![Const::Str("".into()), Const::Int(1), Const::Int(0)],
@@ -6028,7 +6025,7 @@ mod tests {
                 LoadConst(1), Return,
                 LoadConst(2), Return,
             ]);
-        assert_eq!(run(&truthy, &[], &[], &mut model).unwrap().as_fixnum(), Some(0));
+        assert_eq!(run(&truthy, &Functions::default(), &[], &mut model).unwrap().as_fixnum(), Some(0));
     }
 
     #[test]
@@ -6045,11 +6042,11 @@ mod tests {
                 vec![LoadConst(0), LoadConst(1), Subscript { cache: 0 }, Return],
             )
         };
-        let b = run(&index_prog(1), &[], &[], &mut model).unwrap();
+        let b = run(&index_prog(1), &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.str_bytes(b), Some("b".as_bytes()));
-        let c = run(&index_prog(-1), &[], &[], &mut model).unwrap();
+        let c = run(&index_prog(-1), &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.str_bytes(c), Some("c".as_bytes()));
-        assert_eq!(run(&index_prog(5), &[], &[], &mut model), Err(Trap::IndexError));
+        assert_eq!(run(&index_prog(5), &Functions::default(), &[], &mut model), Err(Trap::IndexError));
     }
 
     #[test]
@@ -6065,7 +6062,7 @@ mod tests {
             vec![LoadConst(0), LoadAttr { site: 0 }, Call(0), Return],
             vec![[0, 0]],
         );
-        let r = run(&prog, &[], &[], &mut model).unwrap();
+        let r = run(&prog, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.str_bytes(r), Some("ABC".as_bytes()));
     }
 
@@ -6095,7 +6092,7 @@ mod tests {
             ],
             vec![[2, 0]],
         );
-        let r = run(&prog, &[], &[], &mut model).unwrap();
+        let r = run(&prog, &Functions::default(), &[], &mut model).unwrap();
         assert_eq!(model.str_bytes(r), Some("ell".as_bytes()));
     }
 
@@ -6187,7 +6184,7 @@ mod tests {
     fn a_no_alloc_driver_runs_with_no_managed_heap() {
         let code = fib_code();
         let mut model = ObjectModel::new(Vec::new(), 0);
-        let result = run(&code, &[], &[Value::fixnum(10).unwrap()], &mut model).unwrap();
+        let result = run(&code, &Functions::default(), &[Value::fixnum(10).unwrap()], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(55));
     }
 
@@ -6197,7 +6194,7 @@ mod tests {
         let code = code_w(0, 0, vec![Const::Str("x".into())], Vec::new(), 0,
             vec![LoadConst(0), Return], vec![[1, 0]]);
         let mut model = ObjectModel::new(Vec::new(), 0);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::OutOfMemory));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::OutOfMemory));
     }
 
 
@@ -6247,7 +6244,7 @@ mod tests {
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         model.set_managed_modules(vec![m]);
-        let result = run_module(&entry, &[], &mut model).unwrap();
+        let result = run_module(&entry, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(10));
         assert!(model.get_global("X").is_none());
         assert!(model.is_module_object(model.get_global("m").unwrap()));
@@ -6272,7 +6269,7 @@ mod tests {
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         model.set_managed_modules(vec![config]);
-        let result = run_module(&entry, &[], &mut model).unwrap();
+        let result = run_module(&entry, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(99));
         assert_eq!(model.get_global("MAX").and_then(Value::as_fixnum), Some(99));
     }
@@ -6303,7 +6300,7 @@ mod tests {
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         model.set_managed_modules(vec![calc]);
-        let result = run_module(&entry, &[], &mut model).unwrap();
+        let result = run_module(&entry, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(5));
     }
 
@@ -6326,7 +6323,7 @@ mod tests {
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         model.set_managed_modules(vec![managed_math]);
-        let pi = run_module(&entry, &[], &mut model).unwrap();
+        let pi = run_module(&entry, &Functions::default(), &mut model).unwrap();
         let pi = model.float_value(pi).expect("native math.pi is a float");
         assert!((pi - core::f64::consts::PI).abs() < 1e-9);
     }
@@ -6355,7 +6352,7 @@ mod tests {
         ]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         model.set_managed_modules(vec![selfmod]);
-        let result = run_module(&entry, &[], &mut model).unwrap();
+        let result = run_module(&entry, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(1));
     }
 
@@ -6366,7 +6363,7 @@ mod tests {
             vec![ImportName(0), StoreFast(0), LoadConst(0), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         model.set_managed_modules(Vec::new());
-        assert_eq!(run_module(&entry, &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run_module(&entry, &Functions::default(), &mut model), Err(Trap::Raised));
     }
 
     #[test]
@@ -6404,7 +6401,7 @@ mod tests {
         );
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         model.set_managed_modules(vec![helpers]);
-        let result = run_module(&entry, &[], &mut model).unwrap();
+        let result = run_module(&entry, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(5));
         assert_eq!(model.get_global("BASE").and_then(Value::as_fixnum), Some(99));
     }
@@ -6451,7 +6448,7 @@ mod tests {
         ]);
         let mut model = ObjectModel::new(Vec::new(), 128 * 1024);
         model.set_managed_modules(vec![a, b]);
-        let result = run_module(&entry, &[], &mut model).unwrap();
+        let result = run_module(&entry, &Functions::default(), &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
     }
 
@@ -6554,7 +6551,7 @@ mod tests {
         let code = code(0, 0, vec![Const::Int(1), Const::Str("a".into())], Vec::new(), 0,
             vec![LoadConst(0), LoadConst(1), Binary(BinOp::Add), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending TypeError");
         let repr = model.repr(exc);
         assert!(
@@ -6569,7 +6566,7 @@ mod tests {
         let code = code(0, 0, vec![Const::Int(1), Const::Str("a".into())], Vec::new(), 0,
             vec![LoadConst(0), LoadConst(1), Compare(CmpOp::Lt), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending TypeError");
         let repr = model.repr(exc);
         assert!(
@@ -6584,7 +6581,7 @@ mod tests {
         let code = code(0, 0, vec![Const::Int(5)], vec![String::from("len")], 0,
             vec![LoadGlobal(0), LoadConst(0), Call(1), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending TypeError");
         let repr = model.repr(exc);
         assert!(repr.contains("object of type 'int' has no len()"), "got: {repr}");
@@ -6596,7 +6593,7 @@ mod tests {
         let code = code(0, 0, vec![Const::Int(5)], Vec::new(), 0,
             vec![LoadConst(0), Call(0), Return]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending TypeError");
         let repr = model.repr(exc);
         assert!(repr.contains("'int' object is not callable"), "got: {repr}");
@@ -6608,7 +6605,7 @@ mod tests {
         let code = code_w(0, 0, vec![Const::Str("a".into())], Vec::new(), 0,
             vec![LoadConst(0), Unary(UnaryOp::Neg), Return], vec![[1, 0]]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending TypeError");
         let repr = model.repr(exc);
         assert!(repr.contains("bad operand type for unary -: 'str'"), "got: {repr}");
@@ -6620,7 +6617,7 @@ mod tests {
         let code = code_w(0, 0, vec![Const::Int(5)], vec![String::from("foo")], 1,
             vec![LoadConst(0), LoadAttr { site: 0 }, Return], vec![[0, 0]]);
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
-        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        assert_eq!(run(&code, &Functions::default(), &[], &mut model), Err(Trap::Raised));
         let exc = model.take_pending_exception().expect("a pending AttributeError");
         let repr = model.repr(exc);
         assert!(repr.contains("'int' object has no attribute 'foo'"), "got: {repr}");

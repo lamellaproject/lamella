@@ -2,7 +2,7 @@
 
 use crate::interp::{Session, Vm};
 use crate::module::{AttrValue, BoxedPrimitive, Module};
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 use crate::module::param_attr_key;
 use crate::net::{Interest, NetResult};
 use crate::tls::{TlsStack, VerifyMode};
@@ -854,7 +854,7 @@ pub fn clock_is_set(
 /// The additional NETMFv4_4-profile BCL surface, beyond the ECMA-335 Kernel
 /// Profile. Gated by `NETMFv4_4` so a Kernel-only build omits it entirely; its public
 /// intrinsics are re-exported below so `crate::intrinsics::*` paths are unchanged.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
 mod extended {
     use super::string_arg_chars;
     use crate::interp::Vm;
@@ -911,6 +911,7 @@ mod extended {
         matches!(unit, 0x20 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.IndexOf(char)`: the index of the first occurrence of a code unit, or
     /// `-1`. The string is `this`.
     ///
@@ -929,6 +930,7 @@ mod extended {
         Ok(Some(match_index(chars.iter().position(|&c| c == target))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.IndexOf(string)`: the index of the first ordinal occurrence of a
     /// substring, or `-1`.
     ///
@@ -944,6 +946,7 @@ mod extended {
         Ok(Some(match_index(find_subsequence(&chars, &needle))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.LastIndexOf(char)`: the index of the last occurrence, or `-1`.
     ///
     /// # Errors
@@ -961,6 +964,7 @@ mod extended {
         Ok(Some(match_index(chars.iter().rposition(|&c| c == target))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.StartsWith(string)` (ordinal): does the string begin with `value`?
     ///
     /// # Errors
@@ -975,6 +979,7 @@ mod extended {
         Ok(Some(Value::Int32(i32::from(chars.starts_with(&value)))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.EndsWith(string)` (ordinal): does the string end with `value`?
     ///
     /// # Errors
@@ -989,6 +994,7 @@ mod extended {
         Ok(Some(Value::Int32(i32::from(chars.ends_with(&value)))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Contains(string)` (ordinal): does the string contain `value`?
     ///
     /// # Errors
@@ -1005,6 +1011,7 @@ mod extended {
         ))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.ToUpper()`: an ASCII upper-cased copy.
     ///
     /// # Errors
@@ -1022,6 +1029,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.ToLower()`: an ASCII lower-cased copy.
     ///
     /// # Errors
@@ -1039,6 +1047,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Trim()`: a copy with leading and trailing ASCII whitespace removed.
     ///
     /// # Errors
@@ -1063,6 +1072,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Replace(char, char)`: every `from` replaced by `to`.
     ///
     /// # Errors
@@ -1088,6 +1098,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Replace(string, string)`: every non-overlapping ordinal occurrence of
     /// `old` replaced by `new`. An empty `old` leaves the string unchanged (.NET throws
     /// `ArgumentException`; the interpreter returns the original rather than trapping).
@@ -1154,6 +1165,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Abs(int)`: the absolute value; throws `OverflowException` for
     /// `int.MinValue`, whose magnitude is unrepresentable (matching .NET).
     ///
@@ -1170,6 +1182,7 @@ mod extended {
             .ok_or(Trap::Overflow)
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Abs(long)`: the absolute value; `OverflowException` for `long.MinValue`.
     ///
     /// # Errors
@@ -1185,6 +1198,7 @@ mod extended {
             .ok_or(Trap::Overflow)
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Max(int, int)`.
     ///
     /// # Errors
@@ -1198,6 +1212,7 @@ mod extended {
         Ok(Some(Value::Int32(left.max(right))))
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Min(int, int)`.
     ///
     /// # Errors
@@ -1211,6 +1226,7 @@ mod extended {
         Ok(Some(Value::Int32(left.min(right))))
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Max(long, long)`.
     ///
     /// # Errors
@@ -1224,6 +1240,7 @@ mod extended {
         Ok(Some(Value::Int64(left.max(right))))
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Min(long, long)`.
     ///
     /// # Errors
@@ -1237,6 +1254,7 @@ mod extended {
         Ok(Some(Value::Int64(left.min(right))))
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Sign(int)`: -1, 0, or 1.
     ///
     /// # Errors
@@ -1249,6 +1267,7 @@ mod extended {
         Ok(Some(Value::Int32(arg_int32(args)?.signum())))
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Math.Sign(long)`: -1, 0, or 1 (returned as an `int`).
     ///
     /// # Errors
@@ -1491,6 +1510,7 @@ mod extended {
         Ok(Some(Value::Int32(rounded as i32)))
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Convert.ToChar(int)`: the character with the given UTF-16 code (0..=65535).
     ///
     /// # Errors
@@ -1509,6 +1529,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Convert.ToByte(int)`: the byte value (0..=255).
     ///
     /// # Errors
@@ -1527,6 +1548,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Convert.ToBoolean(int)`: false for zero, true otherwise.
     ///
     /// # Errors
@@ -1542,6 +1564,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Split(char[, StringSplitOptions])`: splits on the separator character,
     /// keeping empty entries (the `StringSplitOptions` argument is not honored). Returns a
     /// `string[]`.
@@ -1573,6 +1596,7 @@ mod extended {
         Ok(Some(Value::Object(array)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Join(string, string[])`: concatenates the array's strings with the
     /// separator between them (a null element contributes nothing).
     ///
@@ -1865,6 +1889,7 @@ mod extended {
         Ok(arg_int32(args)? as u16)
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.IsDigit(char)` (ASCII classification).
     ///
     /// # Errors
@@ -1879,6 +1904,7 @@ mod extended {
         )))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.IsLetter(char)` (ASCII classification).
     ///
     /// # Errors
@@ -1893,6 +1919,7 @@ mod extended {
         )))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.IsLetterOrDigit(char)` (ASCII classification).
     ///
     /// # Errors
@@ -1908,6 +1935,7 @@ mod extended {
         ))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.IsWhiteSpace(char)` (ASCII whitespace).
     ///
     /// # Errors
@@ -1922,6 +1950,7 @@ mod extended {
         )?)))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.IsUpper(char)` (ASCII).
     ///
     /// # Errors
@@ -1937,6 +1966,7 @@ mod extended {
         ))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.IsLower(char)` (ASCII).
     ///
     /// # Errors
@@ -1952,6 +1982,7 @@ mod extended {
         ))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.ToUpper(char)`: the ASCII upper-case of a code unit (as a `char`).
     ///
     /// # Errors
@@ -1964,6 +1995,7 @@ mod extended {
         Ok(Some(Value::Int32(i32::from(ascii_upper(arg_char(args)?)))))
     }
 
+    #[cfg(feature = "text")]
     /// `System.Char.ToLower(char)`: the ASCII lower-case of a code unit (as a `char`).
     ///
     /// # Errors
@@ -2015,6 +2047,7 @@ mod extended {
         Some(if negative { -value } else { value })
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Int32.Parse(string)`: a base-10 parse.
     ///
     /// # Errors
@@ -2033,6 +2066,7 @@ mod extended {
             .map_err(|_| Trap::Overflow)
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Int64.Parse(string)`: a base-10 parse.
     ///
     /// # Errors
@@ -2050,6 +2084,7 @@ mod extended {
             .map_err(|_| Trap::Overflow)
     }
 
+    #[cfg(feature = "NETMFv4_4")]
     /// `System.Boolean.Parse(string)`: case-insensitive `True` / `False` after trimming.
     ///
     /// # Errors
@@ -2086,6 +2121,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.PadLeft(int [, char])`: right-justify in a field `width` wide, padding
     /// on the left; the original is returned when it is already at least that wide.
     ///
@@ -2113,6 +2149,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.PadRight(int [, char])`: left-justify in a field `width` wide, padding
     /// on the right.
     ///
@@ -2136,6 +2173,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Insert(int startIndex, string value)`: a copy with `value` inserted at
     /// `startIndex`.
     ///
@@ -2164,6 +2202,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.Remove(int startIndex [, int count])`: a copy with `count` units (or
     /// the tail, for the one-argument overload) removed at `startIndex`.
     ///
@@ -2200,6 +2239,7 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
+    #[cfg(feature = "text")]
     /// `System.String.ToCharArray()`: a fresh `char[]` of the string's UTF-16 code units --
     /// packed at the character width, exactly as a `newarr` `char[]` is.
     ///
@@ -2312,6 +2352,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "collections")]
     /// `System.Collections.ArrayList.Add(object)`: appends the value, returning its index.
     ///
     /// # Errors
@@ -2325,6 +2366,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "collections")]
     /// `ArrayList.get_Item(int)`: the element at the index.
     ///
     /// # Errors
@@ -2342,6 +2384,7 @@ mod extended {
             .ok_or(Trap::IndexOutOfRange(index as i32))
     }
 
+    #[cfg(feature = "collections")]
     /// `ArrayList.set_Item(int, object)`: stores the value at the index.
     ///
     /// # Errors
@@ -2361,6 +2404,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "collections")]
     /// `ArrayList.get_Count()`: the element count.
     ///
     /// # Errors
@@ -2378,6 +2422,7 @@ mod extended {
         Ok(Some(Value::Int32(count as i32)))
     }
 
+    #[cfg(feature = "collections")]
     /// `ArrayList.Clear()`: removes every element.
     ///
     /// # Errors
@@ -2395,6 +2440,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "collections")]
     /// `ArrayList.RemoveAt(int)`: removes the element at the index.
     ///
     /// # Errors
@@ -2413,6 +2459,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "collections")]
     /// `ArrayList.Insert(int, object)`: inserts the value before the index.
     ///
     /// # Errors
@@ -2471,6 +2518,7 @@ mod extended {
         None
     }
 
+    #[cfg(feature = "collections")]
     /// `System.Collections.Hashtable.Add(object key, object value)`: appends the pair. A
     /// duplicate key is not rejected (the earlier entry shadows it on lookup).
     ///
@@ -2487,6 +2535,7 @@ mod extended {
         Ok(None)
     }
 
+    #[cfg(feature = "collections")]
     /// `Hashtable.get_Item(object key)`: the value for `key`, or null if absent (no throw).
     ///
     /// # Errors
@@ -2506,6 +2555,7 @@ mod extended {
         }
     }
 
+    #[cfg(feature = "collections")]
     /// `Hashtable.set_Item(object key, object value)`: updates `key`'s value, or adds the pair.
     ///
     /// # Errors
@@ -2530,6 +2580,7 @@ mod extended {
         Ok(None)
     }
 
+    #[cfg(feature = "collections")]
     /// `Hashtable.get_Count()`: the number of key/value pairs.
     ///
     /// # Errors
@@ -2547,6 +2598,7 @@ mod extended {
         Ok(Some(Value::Int32((len / 2) as i32)))
     }
 
+    #[cfg(feature = "collections")]
     /// `Hashtable.Contains(object key)` / `ContainsKey(object key)`: whether `key` is present.
     ///
     /// # Errors
@@ -2562,6 +2614,7 @@ mod extended {
         Ok(Some(Value::Int32(i32::from(present))))
     }
 
+    #[cfg(feature = "collections")]
     /// `Hashtable.Remove(object key)`: removes `key`'s pair if present.
     ///
     /// # Errors
@@ -2580,6 +2633,7 @@ mod extended {
         Ok(None)
     }
 
+    #[cfg(feature = "collections")]
     /// `Stack.Push(object)` / `Queue.Enqueue(object)`: appends the value to the backing list.
     ///
     /// # Errors
@@ -2597,6 +2651,7 @@ mod extended {
         Ok(None)
     }
 
+    #[cfg(feature = "collections")]
     /// `Stack.Pop()`: removes and returns the top (the last element).
     ///
     /// # Errors
@@ -2615,6 +2670,7 @@ mod extended {
         Ok(Some(value))
     }
 
+    #[cfg(feature = "collections")]
     /// `Stack.Peek()`: returns the top (the last element) without removing it.
     ///
     /// # Errors
@@ -2637,6 +2693,7 @@ mod extended {
         ))
     }
 
+    #[cfg(feature = "collections")]
     /// `Queue.Dequeue()`: removes and returns the front (the first element).
     ///
     /// # Errors
@@ -2659,6 +2716,7 @@ mod extended {
         Ok(Some(value))
     }
 
+    #[cfg(feature = "collections")]
     /// `Queue.Peek()`: returns the front (the first element) without removing it.
     ///
     /// # Errors
@@ -2679,6 +2737,7 @@ mod extended {
         Ok(Some(vm.heap().array_get(this, 0).unwrap_or(Value::Null)))
     }
 
+    #[cfg(feature = "collections")]
     /// `Stack.Contains(object)` / `Queue.Contains(object)`: whether an equal element is present
     /// (by `Object.Equals` semantics; see [`value_key_equals`]).
     ///
@@ -2709,7 +2768,7 @@ mod extended {
     }
 }
 
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(any(feature = "NETMFv4_4", feature = "text", feature = "collections"))]
 pub use extended::*;
 
 /// `System.Object.ReferenceEquals(object, object)`: reference identity (two nulls are
@@ -6032,7 +6091,7 @@ pub fn type_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a type handle or names no recorded type.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn reflect_type_of(
     module: &Module,
     args: &[Value],
@@ -6047,7 +6106,7 @@ fn reflect_type_of(
 
 /// Reads a boolean kind bit from the receiver `Type`'s recorded reflection metadata (a C# `bool`
 /// is a 0/1 `int32` on the stack).
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn type_kind_bit(
     module: &Module,
     args: &[Value],
@@ -6061,7 +6120,7 @@ fn type_kind_bit(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_get_full_name(
     vm: &mut Vm,
     module: &Module,
@@ -6076,7 +6135,7 @@ pub fn type_get_full_name(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_get_namespace(
     vm: &mut Vm,
     module: &Module,
@@ -6095,7 +6154,7 @@ pub fn type_get_namespace(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_enum(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     type_kind_bit(module, args, |info| info.is_enum)
 }
@@ -6104,7 +6163,7 @@ pub fn type_is_enum(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_value_type(
     _vm: &mut Vm,
     module: &Module,
@@ -6117,7 +6176,7 @@ pub fn type_is_value_type(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_class(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     type_kind_bit(module, args, |info| !info.is_interface && !info.is_value_type)
 }
@@ -6126,7 +6185,7 @@ pub fn type_is_class(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Op
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_interface(
     _vm: &mut Vm,
     module: &Module,
@@ -6139,7 +6198,7 @@ pub fn type_is_interface(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_abstract(
     _vm: &mut Vm,
     module: &Module,
@@ -6152,7 +6211,7 @@ pub fn type_is_abstract(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_public(
     _vm: &mut Vm,
     module: &Module,
@@ -6166,7 +6225,7 @@ pub fn type_is_public(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_not_public(
     _vm: &mut Vm,
     module: &Module,
@@ -6180,7 +6239,7 @@ pub fn type_is_not_public(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_is_array(
     _vm: &mut Vm,
     _module: &Module,
@@ -6195,7 +6254,7 @@ pub fn type_is_array(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_get_assembly(
     _vm: &mut Vm,
     _module: &Module,
@@ -6216,7 +6275,7 @@ pub fn type_get_assembly(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_get_fields(
     vm: &mut Vm,
     module: &Module,
@@ -6242,7 +6301,7 @@ pub fn type_get_fields(
 /// Whether a member with the given static / visibility bits matches the `BindingFlags` value
 /// (an int-backed enum). Shared by `GetFields` / `GetMethods`. The parameterless overloads default
 /// to `Public | Instance | Static`.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn binding_flags_match(flags: i32, is_static: bool, is_public: bool) -> bool {
     const INSTANCE: i32 = 0x04;
     const STATIC: i32 = 0x08;
@@ -6268,7 +6327,7 @@ fn binding_flags_match(flags: i32, is_static: bool, is_public: bool) -> bool {
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_get_methods(
     vm: &mut Vm,
     module: &Module,
@@ -6300,7 +6359,7 @@ pub fn type_get_methods(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a member handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn member_get_type(
     _vm: &mut Vm,
     module: &Module,
@@ -6320,7 +6379,7 @@ pub fn member_get_type(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_get_base_type(
     _vm: &mut Vm,
     module: &Module,
@@ -6335,7 +6394,7 @@ pub fn type_get_base_type(
 }
 
 /// Reads a `MethodBase.Is*` predicate from the receiver method's recorded `MethodAttributes`.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn method_attr_bit(
     module: &Module,
     args: &[Value],
@@ -6352,7 +6411,7 @@ fn method_attr_bit(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a method handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_is_public(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     method_attr_bit(module, args, |attrs| attrs & 0x0007 == 0x0006)
 }
@@ -6361,7 +6420,7 @@ pub fn method_is_public(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a method handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_is_static(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     method_attr_bit(module, args, |attrs| attrs & 0x0010 != 0)
 }
@@ -6370,7 +6429,7 @@ pub fn method_is_static(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a method handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_is_final(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     method_attr_bit(module, args, |attrs| attrs & 0x0020 != 0)
 }
@@ -6379,7 +6438,7 @@ pub fn method_is_final(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a method handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_is_virtual(
     _vm: &mut Vm,
     module: &Module,
@@ -6392,7 +6451,7 @@ pub fn method_is_virtual(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a method handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_is_abstract(
     _vm: &mut Vm,
     module: &Module,
@@ -6408,7 +6467,7 @@ pub fn method_is_abstract(
 ///
 /// # Errors
 /// Never errors (a missing type or non-string argument yields null).
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn assembly_get_type(
     vm: &mut Vm,
     module: &Module,
@@ -6428,7 +6487,7 @@ pub fn assembly_get_type(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn assembly_full_name(
     vm: &mut Vm,
     module: &Module,
@@ -6444,7 +6503,7 @@ pub fn assembly_full_name(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn assembly_get_types(
     vm: &mut Vm,
     module: &Module,
@@ -6778,7 +6837,7 @@ pub fn intptr_to_raw_value(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_parameter_count(
     _vm: &mut Vm,
     module: &Module,
@@ -6794,7 +6853,7 @@ pub fn method_parameter_count(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_parameter_type(
     _vm: &mut Vm,
     module: &Module,
@@ -6816,7 +6875,7 @@ pub fn method_parameter_type(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_parameter_name(
     vm: &mut Vm,
     module: &Module,
@@ -6834,7 +6893,7 @@ pub fn method_parameter_name(
 
 /// The asm-folded handle a `Type` / `Assembly` reference argument carries (a native int), or 0 for
 /// null. Reflection references are token-only handles, so reference identity is handle equality.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn reflect_handle(arg: Option<&Value>) -> i64 {
     match arg {
         Some(&Value::NativeInt(handle)) => handle,
@@ -6845,14 +6904,14 @@ fn reflect_handle(arg: Option<&Value>) -> i64 {
 /// One operand of a reflection `==`/`!=`, by representation: most reflection references are
 /// token-only HANDLES (a native int), but a composed member (the managed `PropertyInfo` /
 /// `EventInfo`) is a heap INSTANCE -- so `info != null` must see the reference, not a handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 enum ReflectOperand {
     Handle(i64),
     Reference(ObjectRef),
     Null,
 }
 
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn reflect_operand(arg: Option<&Value>) -> ReflectOperand {
     match arg {
         Some(&Value::NativeInt(handle)) => ReflectOperand::Handle(handle),
@@ -6864,7 +6923,7 @@ fn reflect_operand(arg: Option<&Value>) -> ReflectOperand {
 /// Reflection reference equality across both representations: handles compare canonicalized
 /// (a `TypeRef` and its defining `TypeDef` are the same type), instances compare by reference,
 /// and a null equals only null. Mixed shapes are never equal.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&Value>) -> bool {
     match (reflect_operand(left), reflect_operand(right)) {
         (ReflectOperand::Handle(left), ReflectOperand::Handle(right)) => {
@@ -6883,7 +6942,7 @@ fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&
 /// exact type identity, matching .NET's reference equality. A non-type handle (a member's `Field`/
 /// `MethodDef` token, an `Assembly`, an untracked array/pointer `TypeSpec`) has no `TypeId` and is
 /// compared by its own token -- which is exactly the member/assembly identity reflection wants.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn canonical_reflect_handle(module: &Module, handle: i64) -> i64 {
     module
         .type_id_by_handle(handle as u64)
@@ -6897,7 +6956,7 @@ fn canonical_reflect_handle(module: &Module, handle: i64) -> i64 {
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn reflect_handle_equals(
     _vm: &mut Vm,
     module: &Module,
@@ -6911,7 +6970,7 @@ pub fn reflect_handle_equals(
 ///
 /// # Errors
 /// Never errors.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn reflect_handle_not_equals(
     _vm: &mut Vm,
     module: &Module,
@@ -6930,7 +6989,7 @@ pub fn reflect_handle_not_equals(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a field handle; [`Trap::NullReference`] for a
 /// null target on an instance field.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn field_get_value(
     vm: &mut Vm,
     module: &Module,
@@ -6968,7 +7027,7 @@ pub fn field_get_value(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a field handle; [`Trap::NullReference`] for a
 /// null target on an instance field.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn field_set_value(
     vm: &mut Vm,
     module: &Module,
@@ -7005,7 +7064,7 @@ pub fn field_set_value(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a field handle with recorded flags.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn field_is_literal(
     _vm: &mut Vm,
     module: &Module,
@@ -7025,7 +7084,7 @@ pub fn field_is_literal(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a field handle with recorded flags.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn field_is_static(
     _vm: &mut Vm,
     module: &Module,
@@ -7049,7 +7108,7 @@ pub fn field_is_static(
 /// [`Trap::TypeMismatch`] if the receiver is not a field handle, or the field records no
 /// constant (a non-`const` field -- .NET throws InvalidOperationException; the corpus only
 /// asks consts).
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn field_get_raw_constant(
     vm: &mut Vm,
     module: &Module,
@@ -7112,7 +7171,7 @@ pub fn field_get_raw_constant(
 
 /// Unboxes a reflection argument or result: a boxed value type yields its underlying value; a real
 /// reference (or null) passes through unchanged.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 fn unbox_reflect_arg(vm: &Vm, value: Value) -> Value {
     match value {
         Value::Object(reference) => vm
@@ -7132,7 +7191,7 @@ fn unbox_reflect_arg(vm: &Vm, value: Value) -> Value {
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a method handle; propagates any [`Trap`] from
 /// running the invoked method.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_invoke(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let Some(&Value::NativeInt(handle)) = args.first() else {
         return Err(Trap::TypeMismatch(Opcode::Callvirt));
@@ -7176,7 +7235,7 @@ pub fn method_invoke(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
 /// # Errors
 /// [`Trap::TypeMismatch`] if the argument is not a type handle with a recorded layout; propagates a
 /// [`Trap`] from running the constructor.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn activator_create_instance(
     vm: &mut Vm,
     module: &Module,
@@ -7217,7 +7276,7 @@ pub fn activator_create_instance(
 ///
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a type handle.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn type_get_constructor(
     vm: &mut Vm,
     module: &Module,
@@ -7248,7 +7307,7 @@ pub fn type_get_constructor(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a constructor handle with a recorded layout;
 /// propagates a [`Trap`] from running the constructor.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn constructor_invoke(
     vm: &mut Vm,
     module: &Module,
@@ -7397,7 +7456,7 @@ pub fn type_property_custom_attributes(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a method handle or the position is not an
 /// `Int32`; propagates an attribute ctor trap.
-#[cfg(feature = "NETMFv4_4")]
+#[cfg(feature = "reflection")]
 pub fn method_parameter_custom_attributes(
     vm: &mut Vm,
     module: &Module,

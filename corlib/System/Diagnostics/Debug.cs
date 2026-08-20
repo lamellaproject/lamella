@@ -3,6 +3,8 @@ namespace System.Diagnostics
 {
     public sealed class Debug
     {
+        private Debug() { }
+
         public static TraceListenerCollection Listeners
         {
             get { return Trace.Listeners; }

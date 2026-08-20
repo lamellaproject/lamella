@@ -632,6 +632,121 @@ fn build_tuple_display(elems: Vec<DisplayElem>) -> Expr {
     build_spread_display(elems, Expr::Tuple, |e| call1("tuple", e), BinOp::Add)
 }
 
+/// How [`Parser::parse_target`] reads a target that is not a bracketed group.
+///
+/// The target grammar is ONE grammar and this is the only place its three callers -- an assignment's
+/// left side, a `for` header and a `with ... as` clause -- genuinely differ. The difference is a fact
+/// about Python rather than a convenience: in a `for` header `in` is a COMPARISON OPERATOR, so the
+/// expression grammar reads `x in xs` as a single expression and swallows the iterable along with the
+/// target. Everywhere else a target is followed by `=` or `:`, neither of which continues an
+/// expression, so the full grammar is safe and is what allows a parenthesized target to be told from
+/// a parenthesized expression.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetAtom {
+    /// The full expression grammar: an assignment's left side, and a `with ... as` target.
+    Expr,
+    /// A primary and its trailers only, stopping before any operator: a `for` header.
+    Trailer,
+}
+
+/// Whether a `yield` / `yield from` appears anywhere inside `expr`.
+fn expr_contains_yield(expr: &Expr) -> bool {
+    let mut found = false;
+    visit_subexpressions(expr, &mut |e| {
+        if matches!(e, Expr::Yield(_) | Expr::YieldFrom(_)) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether an assignment expression appears anywhere inside `expr`.
+fn expr_contains_walrus(expr: &Expr) -> bool {
+    let mut found = false;
+    visit_subexpressions(expr, &mut |e| {
+        if matches!(e, Expr::Walrus { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The name of the first walrus inside `expr` whose target is one of `targets`, if any.
+fn walrus_target_in<'a>(expr: &'a Expr, targets: &[&str]) -> Option<&'a str> {
+    let mut hit: Option<&'a str> = None;
+    visit_subexpressions(expr, &mut |e| {
+        if hit.is_none() {
+            if let Expr::Walrus { target, .. } = e {
+                if targets.contains(&target.as_str()) {
+                    hit = Some(target);
+                }
+            }
+        }
+    });
+    hit
+}
+
+/// Call `f` on `expr` and on every expression inside it.
+///
+/// ONE walk, and the predicates above are filters over it. Two walks of the same shape would be two
+/// places a new [`Expr`] variant has to be added, and the one that missed it would answer "no" --
+/// the direction that silently keeps an over-accept.
+///
+/// A NESTED COMPREHENSION IS NOT DESCENDED INTO, and that is a rule rather than an economy: the
+/// inner comprehension is checked when the parser builds IT, against its own targets and its own
+/// first-iterable exception. Descending would report its legal `yield` or walrus against the outer
+/// comprehension's list.
+fn visit_subexpressions<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
+    f(expr);
+    match expr {
+        Expr::Walrus { value, .. } => visit_subexpressions(value, f),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::InplaceBinary { lhs, rhs, .. }
+        | Expr::BoolBinary { lhs, rhs, .. } => {
+            visit_subexpressions(lhs, f);
+            visit_subexpressions(rhs, f);
+        }
+        Expr::Unary { operand, .. } | Expr::Not { operand } => visit_subexpressions(operand, f),
+        Expr::Conditional { test, body, orelse } => {
+            visit_subexpressions(test, f);
+            visit_subexpressions(body, f);
+            visit_subexpressions(orelse, f);
+        }
+        Expr::Compare { lhs, rhs, .. } => {
+            visit_subexpressions(lhs, f);
+            visit_subexpressions(rhs, f);
+        }
+        Expr::Call { func, args, keywords } => {
+            visit_subexpressions(func, f);
+            for a in args {
+                visit_subexpressions(a, f);
+            }
+            for kw in keywords {
+                visit_subexpressions(&kw.value, f);
+            }
+        }
+        Expr::Subscript { value, index } => {
+            visit_subexpressions(value, f);
+            visit_subexpressions(index, f);
+        }
+        Expr::Attribute { value, .. } => visit_subexpressions(value, f),
+        Expr::List(items) | Expr::Tuple(items) | Expr::Set(items) => {
+            for e in items {
+                visit_subexpressions(e, f);
+            }
+        }
+        Expr::Dict(pairs) => {
+            for (k, v) in pairs {
+                visit_subexpressions(k, f);
+                visit_subexpressions(v, f);
+            }
+        }
+        Expr::Await(inner) | Expr::YieldFrom(inner) => visit_subexpressions(inner, f),
+        Expr::Yield(Some(inner)) => visit_subexpressions(inner, f),
+        _ => {}
+    }
+}
+
 /// Whether `target` has a `*` anywhere inside it.
 fn contains_star(target: &AssignTarget) -> bool {
     match target {
@@ -897,8 +1012,12 @@ impl Parser {
             self.expect_newline()?;
             return Ok(StmtKind::ImportStar { module });
         }
+        let parenthesized = self.eat(&Tok::LParen);
         let mut names = Vec::new();
         loop {
+            if parenthesized && self.at(&Tok::RParen) {
+                break;
+            }
             let name = self.expect_name()?;
             let bound = if self.eat(&Tok::KwAs) {
                 self.expect_name()?
@@ -909,6 +1028,12 @@ impl Parser {
             if !self.eat(&Tok::Comma) {
                 break;
             }
+        }
+        if parenthesized {
+            if names.is_empty() {
+                return Err(self.error("an import list in parentheses must name at least one name"));
+            }
+            self.expect(&Tok::RParen, "')' closing the import list")?;
         }
         self.expect_newline()?;
         Ok(StmtKind::ImportFrom { module, names })
@@ -1462,7 +1587,7 @@ impl Parser {
     /// stands.
     fn parse_starred_target_assign(&mut self) -> Result<Option<StmtKind>, ParseError> {
         let line = self.current_line();
-        let Ok((first, bracketed)) = self.parse_target() else {
+        let Ok((first, bracketed)) = self.parse_target(TargetAtom::Expr) else {
             return Ok(None);
         };
         let mut targets = vec![first];
@@ -1472,7 +1597,7 @@ impl Parser {
             if matches!(self.peek(), Tok::Assign | Tok::Newline | Tok::Semicolon | Tok::Eof) {
                 break;
             }
-            let Ok((next, _)) = self.parse_target() else {
+            let Ok((next, _)) = self.parse_target(TargetAtom::Expr) else {
                 return Ok(None);
             };
             targets.push(next);
@@ -1506,17 +1631,20 @@ impl Parser {
 
     /// One assignment target, with the flag saying whether it was written as a bracketed group --
     /// which only the statement's outermost level cares about, to decide whether to flatten it.
-    fn parse_target(&mut self) -> Result<(AssignTarget, bool), ParseError> {
+    fn parse_target(&mut self, atom: TargetAtom) -> Result<(AssignTarget, bool), ParseError> {
         let line = self.current_line();
         if self.eat(&Tok::Star) {
-            let (inner, _) = self.parse_target()?;
+            let (inner, _) = self.parse_target(atom)?;
             return Ok((AssignTarget::Starred(Box::new(inner)), false));
         }
         let close = match self.peek() {
             Tok::LParen => Tok::RParen,
             Tok::LBracket => Tok::RBracket,
             _ => {
-                let expr = self.parse_expr()?;
+                let expr = match atom {
+                    TargetAtom::Expr => self.parse_expr()?,
+                    TargetAtom::Trailer => self.parse_trailer()?,
+                };
                 return Ok((self.assign_target(expr, line)?, false));
             }
         };
@@ -1524,7 +1652,7 @@ impl Parser {
         let mut elems = Vec::new();
         let mut saw_comma = false;
         while !self.at(&close) {
-            elems.push(self.parse_target()?.0);
+            elems.push(self.parse_target(atom)?.0);
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -1547,6 +1675,11 @@ impl Parser {
             self.advance();
             let first = self.parse_expr()?;
             return self.finish_tuple_or_expr_stmt(vec![DisplayElem::Star(first)], target_line);
+        }
+        if matches!(self.peek(), Tok::Name(_)) && matches!(self.peek2(), Tok::ColonEqual) {
+            return Err(self.error(
+                "an assignment expression must be parenthesized to stand as a statement: write `(x := 1)`",
+            ));
         }
         let expr = self.parse_expr()?;
         if let Some(op) = aug_assign_op(self.peek()) {
@@ -1852,16 +1985,10 @@ impl Parser {
         self.expect(&Tok::KwFor, "'for'")?;
         let line = self.current_line();
         let mut targets = Vec::new();
-        let mut star_seen = false;
+        let mut saw_comma = false;
         loop {
             let starred = self.eat(&Tok::Star);
-            if starred {
-                if star_seen {
-                    return Err(self.error("a for-loop target may have at most one starred name"));
-                }
-                star_seen = true;
-            }
-            let target = self.for_target(line)?;
+            let target = self.for_target()?;
             targets.push(if starred {
                 AssignTarget::Starred(Box::new(target))
             } else {
@@ -1870,17 +1997,28 @@ impl Parser {
             if !self.eat(&Tok::Comma) {
                 break;
             }
+            saw_comma = true;
             if self.at(&Tok::KwIn) {
                 break;
             }
         }
+        if !saw_comma && matches!(targets.as_slice(), [AssignTarget::Starred(_)]) {
+            return Err(self.error("starred assignment target must be in a list or tuple"));
+        }
+        check_one_star_per_sequence(&targets).map_err(|message| ParseError {
+            line,
+            message: String::from(message),
+        })?;
+        let top_level_star = targets
+            .iter()
+            .any(|t| matches!(t, AssignTarget::Starred(_)));
         self.expect(&Tok::KwIn, "'in'")?;
         let iter = self.parse_rhs_value()?;
         self.expect(&Tok::Colon, "':'")?;
         let mut body = self.parse_suite()?;
         let orelse = self.parse_loop_else()?;
 
-        if !star_seen {
+        if !top_level_star {
             if let [AssignTarget::Name(name)] = targets.as_slice() {
                 let target = name.clone();
                 if !is_async && is_range_call(&iter) {
@@ -1896,19 +2034,23 @@ impl Parser {
             }
         }
 
-        let unpack_targets = match targets.as_slice() {
-            [AssignTarget::Tuple(inner)] if !star_seen => inner.clone(),
-            _ => targets,
-        };
         let tmp = String::from(".unpack");
-        let mut new_body = Vec::with_capacity(body.len() + 1);
-        new_body.push(Stmt::new(
-            line,
-            StmtKind::TupleAssign {
-                targets: unpack_targets,
+        let store = match targets.as_slice() {
+            [AssignTarget::Tuple(inner)] if !top_level_star => StmtKind::TupleAssign {
+                targets: inner.clone(),
                 value: Expr::Name(tmp.clone()),
             },
-        ));
+            [_] => StmtKind::MultiAssign {
+                targets,
+                value: Expr::Name(tmp.clone()),
+            },
+            _ => StmtKind::TupleAssign {
+                targets,
+                value: Expr::Name(tmp.clone()),
+            },
+        };
+        let mut new_body = Vec::with_capacity(body.len() + 1);
+        new_body.push(Stmt::new(line, store));
         new_body.append(&mut body);
         Ok(if is_async {
             StmtKind::AsyncFor { target: tmp, iterable: iter, body: new_body, orelse }
@@ -1920,17 +2062,13 @@ impl Parser {
     /// A single `for`-loop target: a name or a (possibly nested) parenthesized/bracketed tuple of
     /// targets. Parsed as a primary (an atom plus `.`/`[]` trailers) so the loop's `in` keyword --
     /// a comparison operator to `parse_expr` -- is not consumed.
-    fn for_target(&mut self, line: u32) -> Result<AssignTarget, ParseError> {
-        let expr = self.parse_trailer()?;
-        let target = self.assign_target(expr, line)?;
-        match target {
-            AssignTarget::Name(_) | AssignTarget::Tuple(_) => Ok(target),
-            AssignTarget::Starred(_)
-            | AssignTarget::Subscript { .. }
-            | AssignTarget::Attribute { .. } => {
-                Err(self.error("a for-loop target must be a name or a tuple of names"))
-            }
-        }
+    /// One `for`-header target, read by the same grammar an assignment's left side is read by.
+    ///
+    /// A `for` target is any assignment target: a name, a subscript, an attribute, or a nested
+    /// tuple/list target carrying at most one star per sequence. `for d['k'] in xs` and
+    /// `for o.x in xs` store THROUGH a container each iteration rather than binding a name.
+    fn for_target(&mut self) -> Result<AssignTarget, ParseError> {
+        Ok(self.parse_target(TargetAtom::Trailer)?.0)
     }
 
     fn parse_try(&mut self) -> Result<StmtKind, ParseError> {
@@ -2132,11 +2270,11 @@ impl Parser {
         self.expect(&Tok::Colon, "':'")?;
         let body = self.parse_suite()?;
         let mut current = body;
-        for (context, optional_name) in items.into_iter().rev() {
+        for (context, optional_target) in items.into_iter().rev() {
             current = vec![if is_async {
-                Stmt::new(line, StmtKind::AsyncWith { context, optional_name, body: current })
+                Stmt::new(line, StmtKind::AsyncWith { context, optional_target, body: current })
             } else {
-                Stmt::new(line, StmtKind::With { context, optional_name, body: current })
+                Stmt::new(line, StmtKind::With { context, optional_target, body: current })
             }];
         }
         Ok(current
@@ -2146,19 +2284,38 @@ impl Parser {
             .kind)
     }
 
-    /// One `with` item: a context-manager expression and an optional `as name` target.
-    fn parse_with_item(&mut self) -> Result<(Expr, Option<String>), ParseError> {
+    /// One `with` item: a context-manager expression and an optional `as` target.
+    ///
+    /// The target is read by [`Parser::parse_target`], the same grammar an assignment's left side
+    /// uses: `with m() as (a, b)`, `as [a, *rest]`, `as d['k']` and `as o.attr` are all legal.
+    ///
+    /// The bracketed-group flag is dropped rather than used. It tells a STATEMENT whether to
+    /// flatten a lone `[a, b]` into its own target list, and a `with` binds ONE value: `as [a, b]`
+    /// unpacks the entered value into two targets, exactly as `as (a, b)` does, so there is no outer
+    /// list for it to be the flattening of.
+    fn parse_with_item(&mut self) -> Result<(Expr, Option<AssignTarget>), ParseError> {
         let context = self.parse_expr()?;
-        let optional_name = if self.eat(&Tok::KwAs) {
-            Some(self.expect_name()?)
+        let optional_target = if self.eat(&Tok::KwAs) {
+            let line = self.current_line();
+            let (target, _bracketed) = self.parse_target(TargetAtom::Expr)?;
+            if matches!(target, AssignTarget::Starred(_)) {
+                return Err(self.error("starred assignment target must be in a list or tuple"));
+            }
+            check_one_star_per_sequence(core::slice::from_ref(&target)).map_err(|message| {
+                ParseError {
+                    line,
+                    message: String::from(message),
+                }
+            })?;
+            Some(target)
         } else {
             None
         };
-        Ok((context, optional_name))
+        Ok((context, optional_target))
     }
 
     /// A comma-separated list of `with` items (the unparenthesized form).
-    fn parse_with_items(&mut self) -> Result<Vec<(Expr, Option<String>)>, ParseError> {
+    fn parse_with_items(&mut self) -> Result<Vec<(Expr, Option<AssignTarget>)>, ParseError> {
         let mut items = vec![self.parse_with_item()?];
         while self.eat(&Tok::Comma) {
             items.push(self.parse_with_item()?);
@@ -2170,7 +2327,7 @@ impl Parser {
     /// immediately followed by `:`. Returns `None` (leaving the cursor wherever it got to -- the
     /// caller restores it) when the shape does not match, e.g. `with (a or b) as x:` where the `)`
     /// is followed by `as`, so `(a or b)` is a parenthesized expression rather than an item list.
-    fn try_parenthesized_with_items(&mut self) -> Option<Vec<(Expr, Option<String>)>> {
+    fn try_parenthesized_with_items(&mut self) -> Option<Vec<(Expr, Option<AssignTarget>)>> {
         self.eat(&Tok::LParen);
         let mut items = Vec::new();
         loop {
@@ -2958,6 +3115,45 @@ impl Parser {
     /// Desugar an f-string into its literal parts and each replacement field, concatenated left to
     /// right (2.4.3). A bare field is `str(value)`; a `!r`/`!s` conversion is `repr`/`str`; a
     /// `:spec` formats via `"{:spec}".format(value)`. An empty f-string is the empty string.
+    /// A run of adjacent string literals, concatenated at parse time (2.4.1 string literal
+    /// concatenation): `"ab" "cd"` is `"abcd"`.
+    ///
+    /// **An f-string is a string literal**, so a run may mix the two spellings -- `f"a" "b"`,
+    /// `"a" f"b"` and `f"a" f"b"` are each ONE literal -- and the result is an f-string whenever any
+    /// member is one. A run of plain literals stays a plain string and costs nothing at run time.
+    ///
+    /// A BYTES literal never joins this run, which is what keeps `b"a" f"b"` refused: CPython calls
+    /// it *"cannot mix bytes and nonbytes literals"*, and the refusal survives here by the two token
+    /// kinds never meeting. Adjacent bytes literals run their own loop over `Tok::Bytes` alone.
+    fn parse_string_literal_run(&mut self) -> Result<Expr, ParseError> {
+        let mut parts: Vec<FStringPart> = Vec::new();
+        let mut formatted = false;
+        loop {
+            match self.peek().clone() {
+                Tok::Str(value) => {
+                    self.advance();
+                    parts.push(FStringPart::Literal(value));
+                }
+                Tok::FString(mut fparts) => {
+                    self.advance();
+                    formatted = true;
+                    parts.append(&mut fparts);
+                }
+                _ => break,
+            }
+        }
+        if formatted {
+            return self.parse_fstring(parts);
+        }
+        let mut joined = PyStr::default();
+        for part in parts {
+            if let FStringPart::Literal(text) = part {
+                joined.append(&text);
+            }
+        }
+        Ok(Expr::Str(joined))
+    }
+
     fn parse_fstring(&mut self, parts: Vec<FStringPart>) -> Result<Expr, ParseError> {
         let mut acc: Option<Expr> = None;
         for part in parts {
@@ -3177,7 +3373,17 @@ impl Parser {
         self.at(&Tok::KwFor) || self.at(&Tok::KwAsync)
     }
 
-    fn parse_comp_clauses(&mut self) -> Result<Vec<CompClause>, ParseError> {
+    /// The `for target in iterable [if cond]` clauses of a comprehension.
+    ///
+    /// `elements` are the expressions evaluated PER ITEM -- one for a list/set/generator, the key
+    /// and the value for a dict. They are parsed before the clauses (that is the shape of the
+    /// syntax) and are passed back in so the two walrus rules below have everything in one place:
+    /// a comprehension cannot be built without them being checked.
+    fn parse_comp_clauses(
+        &mut self,
+        kind: &str,
+        elements: &[&Expr],
+    ) -> Result<Vec<CompClause>, ParseError> {
         let mut clauses = Vec::new();
         loop {
             if self.at(&Tok::KwAsync) {
@@ -3201,6 +3407,39 @@ impl Parser {
                 iterable,
                 conditions,
             });
+        }
+        for clause in &clauses {
+            if expr_contains_walrus(&clause.iterable) {
+                return Err(self.error(
+                    "an assignment expression cannot be used in a comprehension iterable expression",
+                ));
+            }
+        }
+        let mut targets = Vec::new();
+        for clause in &clauses {
+            for target in &clause.targets {
+                targets.push(target.as_str());
+            }
+        }
+        let conditions = clauses.iter().flat_map(|c| c.conditions.iter());
+        for expr in elements.iter().copied().chain(conditions) {
+            if let Some(name) = walrus_target_in(expr, &targets) {
+                return Err(self.error(alloc::format!(
+                    "an assignment expression cannot rebind comprehension iteration variable '{name}'"
+                )));
+            }
+        }
+        let later_iterables = clauses.iter().skip(1).map(|c| &c.iterable);
+        let conditions = clauses.iter().flat_map(|c| c.conditions.iter());
+        for expr in elements
+            .iter()
+            .copied()
+            .chain(conditions)
+            .chain(later_iterables)
+        {
+            if expr_contains_yield(expr) {
+                return Err(self.error(alloc::format!("'yield' inside {kind}")));
+            }
         }
         Ok(clauses)
     }
@@ -3293,7 +3532,7 @@ impl Parser {
         let key = self.parse_expr()?;
         if !self.eat(&Tok::Colon) {
             if self.at_comp_clause() {
-                let clauses = self.parse_comp_clauses()?;
+                let clauses = self.parse_comp_clauses("set comprehension", &[&key])?;
                 self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
                 return Ok(Expr::SetComp {
                     element: Box::new(key),
@@ -3304,7 +3543,7 @@ impl Parser {
         }
         let value = self.parse_expr()?;
         if self.at_comp_clause() {
-            let clauses = self.parse_comp_clauses()?;
+            let clauses = self.parse_comp_clauses("dict comprehension", &[&key, &value])?;
             self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
             return Ok(Expr::DictComp {
                 key: Box::new(key),
@@ -3391,7 +3630,7 @@ impl Parser {
                             "a generator expression must be parenthesized unless it is the sole argument",
                         ));
                     }
-                    let clauses = self.parse_comp_clauses()?;
+                    let clauses = self.parse_comp_clauses("generator expression", &[&first])?;
                     out.push(CallArg::Positional(Expr::GeneratorExp {
                         element: Box::new(first),
                         clauses,
@@ -3474,19 +3713,7 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Name(String::from("Ellipsis")))
             }
-            Tok::Str(value) => {
-                self.advance();
-                let mut joined = value;
-                while let Tok::Str(next) = self.peek().clone() {
-                    joined.append(&next);
-                    self.advance();
-                }
-                Ok(Expr::Str(joined))
-            }
-            Tok::FString(parts) => {
-                self.advance();
-                self.parse_fstring(parts)
-            }
+            Tok::Str(_) | Tok::FString(_) => self.parse_string_literal_run(),
             Tok::LBracket => {
                 self.advance();
                 if self.at(&Tok::RBracket) {
@@ -3498,7 +3725,7 @@ impl Parser {
                     let DisplayElem::Plain(element) = first else {
                         unreachable!("guarded to a plain element")
                     };
-                    let clauses = self.parse_comp_clauses()?;
+                    let clauses = self.parse_comp_clauses("list comprehension", &[&element])?;
                     self.expect(&Tok::RBracket, "']' closing the comprehension")?;
                     Ok(Expr::ListComp {
                         element: Box::new(element),
@@ -3543,7 +3770,7 @@ impl Parser {
                     let DisplayElem::Plain(element) = first else {
                         unreachable!("guarded to a plain element")
                     };
-                    let clauses = self.parse_comp_clauses()?;
+                    let clauses = self.parse_comp_clauses("generator expression", &[&element])?;
                     self.expect(&Tok::RParen, "')' closing the generator expression")?;
                     Ok(Expr::GeneratorExp {
                         element: Box::new(element),
@@ -5220,23 +5447,328 @@ else:
     }
 
     #[test]
+    fn a_yield_reaches_only_a_comprehensions_first_iterable() {
+        assert!(
+            parse_src("def f():
+    return [i for i in (yield)]
+").is_ok(),
+            "the FIRST iterable is evaluated in the enclosing scope and may yield"
+        );
+
+        for (src, kind) in [
+            ("def f():
+    return [(yield i) for i in range(3)]
+", "list comprehension"),
+            ("def f():
+    return [i for i in range(2) if (yield i)]
+", "list comprehension"),
+            ("def f():
+    return [j for i in [1] for j in (yield)]
+", "list comprehension"),
+            ("def f():
+    return {(yield i) for i in range(3)}
+", "set comprehension"),
+            ("def f():
+    return {(yield i): 1 for i in range(3)}
+", "dict comprehension"),
+            ("def f():
+    return {1: (yield i) for i in range(3)}
+", "dict comprehension"),
+            ("def f():
+    return list((yield i) for i in range(3))
+", "generator expression"),
+        ] {
+            let err = parse_src(src).expect_err("a yield inside a comprehension is refused");
+            assert!(
+                err.message.contains(&alloc::format!("'yield' inside {kind}")),
+                "{src:?} gave {}",
+                err.message
+            );
+        }
+
+        assert!(parse_src("def f():
+    x = yield
+    return x
+").is_ok());
+        assert!(parse_src("def f():
+    return [i for i in range(3)]
+").is_ok());
+    }
+
+    #[test]
+    fn a_walrus_in_a_comprehension_obeys_two_separate_rules() {
+
+        for src in [
+            "x = [i for i in (y := [1, 2])]
+",
+            "x = [j for i in [1] for j in (y := [2])]
+",
+        ] {
+            let err = parse_src(src).expect_err("a walrus in an iterable is refused");
+            assert!(err.message.contains("comprehension iterable"), "{src:?}: {}", err.message);
+        }
+
+        for src in [
+            "x = [i := 1 for i in range(3)]
+",
+            "x = {i := 1 for i in range(3)}
+",
+            "x = {i := 1: 2 for i in range(3)}
+",
+            "x = list(i := 1 for i in range(3))
+",
+            "x = [j for i in range(2) for j in range(2) if (i := 0) == 0]
+",
+            "x = [[j := 1 for j in range(2)] for i in range(3)]
+",
+        ] {
+            let err = parse_src(src).expect_err("rebinding a loop variable is refused");
+            assert!(
+                err.message.contains("rebind comprehension iteration variable"),
+                "{src:?}: {}",
+                err.message
+            );
+        }
+
+        for src in [
+            "x = [(y := i) for i in range(3)]
+",
+            "x = [i for i in [1] if (y := i) > 0]
+",
+            "x = [(a := i) + (b := 2) for i in range(2)]
+",
+            "x = [(i := 1) for _ in range(2)]
+",
+        ] {
+            assert!(parse_src(src).is_ok(), "still legal: {src:?}");
+        }
+    }
+
+    #[test]
+    fn a_bare_walrus_is_not_a_statement() {
+        for src in ["x := 1
+", "def f():
+    x := 1
+", "x := 1, 2
+"] {
+            let err = parse_src(src).expect_err("a bare walrus statement is refused");
+            assert!(err.message.contains("must be parenthesized"), "{src:?}: {}", err.message);
+        }
+
+        for src in [
+            "(x := 1)
+",
+            "y = (x := 1)
+",
+            "print(x := 1)
+",
+            "a = [x := 1]
+",
+            "if (x := 1):
+    pass
+",
+            "a = [y for i in range(2) if (y := i) > 0]
+",
+        ] {
+            assert!(parse_src(src).is_ok(), "still legal: {src:?}");
+        }
+    }
+
+    #[test]
+    fn a_from_import_takes_a_parenthesized_name_list() {
+        for src in [
+            "from m import (a)
+",
+            "from m import (a, b)
+",
+            "from m import (a,)
+",
+            "from m import (
+    a,
+    b,
+)
+",
+            "from m import (a as x, b as y)
+",
+            "from m.n import (a, b)
+",
+        ] {
+            let module = parse_ok(src);
+            let StmtKind::ImportFrom { names, .. } = &module.body[0].kind else {
+                panic!("expected a from-import for {src:?}");
+            };
+            assert!(!names.is_empty(), "{src:?}");
+        }
+
+        let m = parse_ok("from m import (a as x, b)
+");
+        let StmtKind::ImportFrom { names, .. } = &m.body[0].kind else { panic!("a from-import") };
+        assert_eq!(names[0], (String::from("a"), String::from("x")));
+        assert_eq!(names[1], (String::from("b"), String::from("b")));
+
+        let flat = parse_ok("from m import a, b
+");
+        assert!(matches!(&flat.body[0].kind, StmtKind::ImportFrom { names, .. } if names.len() == 2));
+    }
+
+    #[test]
+    fn a_parenthesized_import_list_refuses_what_cpython_refuses() {
+
+        let err = parse_src("from m import ()
+").expect_err("an empty list is refused");
+        assert!(err.message.contains("at least one name"), "{}", err.message);
+
+        assert!(parse_src("from m import (*)
+").is_err());
+
+        assert!(parse_src("import (os)
+").is_err());
+
+        assert!(parse_src("from m import (a
+x = 1
+").is_err());
+
+        assert!(parse_src("from m import (a,,b)
+").is_err());
+    }
+
+    #[test]
+    fn every_target_position_reads_the_same_grammar() {
+
+        let m = parse_ok("d = {}
+for d['k'] in [1, 2, 3]:
+    pass
+");
+        let StmtKind::ForIter { body, .. } = &m.body[1].kind else { panic!("a for-iter") };
+        assert!(
+            matches!(&body[0].kind, StmtKind::MultiAssign { targets, .. }
+                if matches!(targets.as_slice(), [AssignTarget::Subscript { .. }])),
+            "a lone subscript target is STORED, never unpacked"
+        );
+
+        let m = parse_ok("for o.x in ['a']:
+    pass
+");
+        let StmtKind::ForIter { body, .. } = &m.body[0].kind else { panic!("a for-iter") };
+        assert!(matches!(&body[0].kind, StmtKind::MultiAssign { targets, .. }
+            if matches!(targets.as_slice(), [AssignTarget::Attribute { .. }])));
+
+        let m = parse_ok("for [a, *b] in xs:
+    pass
+");
+        let StmtKind::ForIter { body, .. } = &m.body[0].kind else { panic!("a for-iter") };
+        assert!(matches!(&body[0].kind, StmtKind::TupleAssign { targets, .. }
+            if matches!(targets.as_slice(), [AssignTarget::Name(_), AssignTarget::Starred(_)])));
+
+        let m = parse_ok("with ctx() as (a, b):
+    pass
+");
+        let StmtKind::With { optional_target, .. } = &m.body[0].kind else { panic!("a with") };
+        assert!(matches!(optional_target, Some(AssignTarget::Tuple(elems)) if elems.len() == 2));
+
+        let m = parse_ok("with ctx() as d['k']:
+    pass
+");
+        let StmtKind::With { optional_target, .. } = &m.body[0].kind else { panic!("a with") };
+        assert!(matches!(optional_target, Some(AssignTarget::Subscript { .. })));
+
+        let m = parse_ok("with ctx() as o.attr:
+    pass
+");
+        let StmtKind::With { optional_target, .. } = &m.body[0].kind else { panic!("a with") };
+        assert!(matches!(optional_target, Some(AssignTarget::Attribute { .. })));
+
+        assert!(parse_src("async def f(xs):
+    async for d['k'] in xs:
+        pass
+").is_ok());
+        assert!(parse_src("async def f(m):
+    async with m() as (a, b):
+        pass
+").is_ok());
+    }
+
+    #[test]
+    fn widening_a_target_position_does_not_widen_what_it_refuses() {
+
+        for src in [
+            "for *a in xs:
+    pass
+",
+            "with ctx() as *a:
+    pass
+",
+        ] {
+            let err = parse_src(src).expect_err("a lone starred target is refused");
+            assert!(
+                err.message.contains("must be in a list or tuple"),
+                "unexpected diagnostic: {}",
+                err.message
+            );
+        }
+
+        for src in [
+            "for a, *b, *c in xs:
+    pass
+",
+            "for [a, *b, *c] in xs:
+    pass
+",
+            "with ctx() as (a, *b, *c):
+    pass
+",
+        ] {
+            let err = parse_src(src).expect_err("two stars in one sequence are refused");
+            assert!(
+                err.message.contains("only one starred target"),
+                "unexpected diagnostic: {}",
+                err.message
+            );
+        }
+
+        for src in [
+            "for *a, in xs:
+    pass
+",
+            "for [*a] in xs:
+    pass
+",
+            "with ctx() as [*a]:
+    pass
+",
+            "with ctx() as (*a,):
+    pass
+",
+        ] {
+            assert!(parse_src(src).is_ok(), "still legal: {src}");
+        }
+
+        assert!(parse_src("for 1 in xs:
+    pass
+").is_err());
+        assert!(parse_src("with ctx() as 1:
+    pass
+").is_err());
+    }
+
+    #[test]
     fn with_statement_parses() {
         let m = parse_ok("with ctx() as x:\n    print(x)\n");
         let StmtKind::With {
-            optional_name,
+            optional_target,
             body,
             ..
         } = &m.body[0].kind
         else {
             panic!("expected a with statement");
         };
-        assert_eq!(optional_name.as_deref(), Some("x"));
+        assert_eq!(optional_target.as_ref(), Some(&AssignTarget::Name(String::from("x"))));
         assert_eq!(body.len(), 1);
         let m2 = parse_ok("with ctx():\n    pass\n");
-        let StmtKind::With { optional_name, .. } = &m2.body[0].kind else {
+        let StmtKind::With { optional_target, .. } = &m2.body[0].kind else {
             panic!("expected a with statement");
         };
-        assert!(optional_name.is_none());
+        assert!(optional_target.is_none());
     }
 
     #[test]
@@ -5245,8 +5777,8 @@ else:
         assert!(parse_src("with (a(), b()):\n    pass\n").is_ok());
         assert!(parse_src("with (a() as x,):\n    pass\n").is_ok());
         let m = parse_ok("with (a() as x, b() as y):\n    pass\n");
-        let StmtKind::With { optional_name, body, .. } = &m.body[0].kind else { panic!("a with") };
-        assert_eq!(optional_name.as_deref(), Some("x"));
+        let StmtKind::With { optional_target, body, .. } = &m.body[0].kind else { panic!("a with") };
+        assert_eq!(optional_target.as_ref(), Some(&AssignTarget::Name(String::from("x"))));
         assert!(matches!(&body[0].kind, StmtKind::With { .. }), "the second manager nests inside");
         assert!(parse_src("with (a or b) as x:\n    pass\n").is_ok());
         assert!(parse_src("with (a() if c else b()) as x:\n    pass\n").is_ok());
@@ -5255,10 +5787,10 @@ else:
     #[test]
     fn multiple_context_managers_nest() {
         let module = parse_ok("with a() as x, b() as y:\n    pass\n");
-        let StmtKind::With { optional_name, body, .. } = &module.body[0].kind else { panic!("a with") };
-        assert_eq!(optional_name.as_deref(), Some("x"));
+        let StmtKind::With { optional_target, body, .. } = &module.body[0].kind else { panic!("a with") };
+        assert_eq!(optional_target.as_ref(), Some(&AssignTarget::Name(String::from("x"))));
         assert_eq!(body.len(), 1, "the inner with is the outer's whole body");
-        let StmtKind::With { optional_name: inner, .. } = &body[0].kind else { panic!("a nested with") };
-        assert_eq!(inner.as_deref(), Some("y"));
+        let StmtKind::With { optional_target: inner, .. } = &body[0].kind else { panic!("a nested with") };
+        assert_eq!(inner.as_ref(), Some(&AssignTarget::Name(String::from("y"))));
     }
 }

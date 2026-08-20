@@ -3,6 +3,9 @@ namespace System
 {
     public class Type : System.Reflection.MemberInfo
     {
+        protected Type() { }
+
+
 #if LAMELLA_SURFACE_REFLECTION
         public string FullName
         {

@@ -131,14 +131,8 @@ impl<'a> Parser<'a> {
                         error.kind,
                         crate::lexer::LexErrorKind::BigIntNotInProfile
                             | crate::lexer::LexErrorKind::LegacyOctal
-                            | crate::lexer::LexErrorKind::UnsupportedIdentifierCharacter(..)
                     );
-                    let placeholder = match error.kind {
-                        crate::lexer::LexErrorKind::UnsupportedIdentifierCharacter(..) => {
-                            TokenKind::Identifier("\u{0}unsupported".to_string())
-                        }
-                        _ => TokenKind::Number(0.0),
-                    };
+                    let placeholder = TokenKind::Number(0.0);
                     let kind =
                         if excluded { DiagnosticKind::NotInProfile } else { DiagnosticKind::Lexical };
                     self.diagnostics.error(

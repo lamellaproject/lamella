@@ -171,6 +171,7 @@ spelled_enum! {
         "?" => Question,
         "++" => PlusPlus,
         "--" => MinusMinus,
+        "??" => QuestionQuestion,
         "&&" => AmpersandAmpersand,
         "||" => BarBar,
         "<<" => LessThanLessThan,
@@ -342,13 +343,38 @@ pub struct Token {
     pub kind: TokenKind,
     /// The byte range of the token in the source.
     pub span: Span,
+    /// Whether this token was written with the `@` verbatim prefix (9.4.2). Meaningful only for
+    /// [`TokenKind::Identifier`]; always `false` for every other kind.
+    ///
+    /// The identifier's canonical TEXT drops the `@` -- `@name` and `name` denote the SAME name
+    /// for binding and metadata, which 9.4.2 requires -- so the prefix has to survive somewhere
+    /// else for the one decision it affects: a CONTEXTUAL keyword is forced back to an ordinary
+    /// identifier by `@`. `int @await = 4;` inside an async method is legal exactly because the
+    /// parser can see this flag where the text alone reads as the keyword (ECMA-334 5th ed,
+    /// 12.8.8.1).
+    pub verbatim: bool,
 }
 
 impl Token {
     /// Creates a token of `kind` covering `span`.
     #[must_use]
     pub fn new(kind: TokenKind, span: Span) -> Token {
-        Token { kind, span }
+        Token {
+            kind,
+            span,
+            verbatim: false,
+        }
+    }
+
+    /// Creates a token of `kind` covering `span`, recording whether it carried the `@`
+    /// verbatim prefix. Only the lexer's identifier path passes `true`.
+    #[must_use]
+    pub fn with_verbatim(kind: TokenKind, span: Span, verbatim: bool) -> Token {
+        Token {
+            kind,
+            span,
+            verbatim,
+        }
     }
 
     /// Returns `true` when this token is trivia (see [`TokenKind::is_trivia`]).
@@ -399,9 +425,12 @@ mod tests {
         }
     }
 
+    /// The table's size, pinned so a stray addition or a lost row is loud. It is NOT the C# 1.0
+    /// operator set alone: `??` is C# 2.0's and the LEXER is what keeps it out of a C# 1 dialect
+    /// (`try_gate_post_1_0_operator`), not its absence from this table. 45 -> 46 when `??` landed.
     #[test]
-    fn there_are_forty_five_operators_and_punctuators() {
-        assert_eq!(Punctuator::all().len(), 45);
+    fn there_are_forty_six_operators_and_punctuators() {
+        assert_eq!(Punctuator::all().len(), 46);
     }
 
     #[test]

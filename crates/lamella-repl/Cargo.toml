@@ -9,6 +9,7 @@ description = "A host-PC C# REPL that compiles each line and runs it on the lame
 
 # The REPL driver is a host CLI, so std is allowed here: it compiles each submission
 # in-process (lamella-assemble) and runs it on the interpreter.
+publish = false
 [dependencies]
 lamella-assemble = { path = "../lamella-assemble" }
 lamella-load = { path = "../lamella-load" }

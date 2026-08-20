@@ -228,6 +228,15 @@ pub struct ConstructorPrologue {
     /// constructor chains to `this(...)`, since the initializers run in the constructor
     /// ultimately invoked, not here.
     pub leading_body: usize,
+    /// `: this()` ON A STRUCT, which chains to NO constructor: holds the struct's own type token
+    /// and the prologue becomes `ldarg.0; initobj S` instead of a call. `None` for every ordinary
+    /// chain, which is every class and every `: this(args)`.
+    ///
+    /// **A VALUE TYPE HAS NO IL DEFAULT CONSTRUCTOR TO CALL.** The initializer means "every field
+    /// starts at its zero" (17.4.4), and csc lowers it exactly this way -- measured. Calling
+    /// `object::.ctor()` on the `this` byref instead produces IL that RUNS and that `ilverify`
+    /// refuses, which is why this is a field rather than a fallback.
+    pub zero_initialize: Option<Token>,
 }
 
 /// Lowers a method body and reports its local types (for the local signature) and
@@ -381,6 +390,10 @@ fn emit_prologue(
         labels.points.push((out.len() as u32, Some(span)));
     }
     out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+    if let Some(ty) = prologue.zero_initialize {
+        out.push(Instruction::new(Opcode::Initobj, Operand::Token(ty)));
+        return Ok(());
+    }
     for argument in &prologue.arguments {
         crate::expr::emit_argument(argument, frame, tokens, out)?;
     }
@@ -1723,7 +1736,7 @@ mod tests {
             .iter()
             .map(|name| ((*name).into(), int()))
             .collect();
-        let bound = Binder::new().bind_method(None, "M", int(), &params, &[], false, &body);
+        let bound = Binder::new().bind_method(None, "M", int(), &params, &[], false, false, &body);
         let names: Vec<Box<str>> = parameter_names.iter().map(|name| (*name).into()).collect();
         emit_method(&names, &bound).expect("should lower")
     }
@@ -1770,7 +1783,7 @@ mod tests {
     #[test]
     fn emission_records_a_sequence_point_per_statement() {
         let body = parse_statement("{ int x = 1; return x; }").statement;
-        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
         let emitted = emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, None)
             .expect("should lower");
 
@@ -1791,7 +1804,7 @@ mod tests {
         let source = "{ int x = 1; return x; }";
         let body = parse_statement(source).statement;
         let block_span = body.span;
-        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
         let emitted =
             emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
                 .expect("should lower");
@@ -1809,7 +1822,7 @@ mod tests {
     fn an_always_throwing_method_omits_its_closing_brace() {
         let source = "{ throw null; }";
         let body = parse_statement(source).statement;
-        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
         let emitted =
             emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
                 .expect("should lower");
@@ -1830,7 +1843,7 @@ mod tests {
     fn nested_block_closes_its_brace_only_when_reachable() {
         let source = "{ int a = 0; { int reachable = 1; } if (a > 0) { return 2; } return 0; }";
         let body = parse_statement(source).statement;
-        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, false, &body);
         let emitted =
             emit_body(&[], &[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
                 .expect("should lower");

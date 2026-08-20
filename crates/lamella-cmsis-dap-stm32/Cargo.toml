@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "STMicroelectronics STM32 flash programming over a Lamella CMSIS-DAP debug probe: the device-specific flash controller (STM32F4 embedded flash) layered on the chip-agnostic lamella-cmsis-dap, the same way lamella-cmsis-dap-sam adds the SAM controllers."
+publish = false
 
 [lints]
 workspace = true

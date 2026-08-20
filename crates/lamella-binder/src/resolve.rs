@@ -144,8 +144,36 @@ impl TypeTable {
     }
 }
 
+/// What to report for a named type that resolved to nothing: `CS0246` for an ordinary name, and
+/// `CS0825` for a bare `var`.
+///
+/// **`var` REACHING HERE MEANS IT WAS WRITTEN WHERE THE GRAMMAR HAS NO `local-variable-type`** -- a
+/// field, a parameter, a return type, an array element type such as `var[]`. The positions where it
+/// IS admitted (a local declaration, a `for` initializer, a `using` resource, a `foreach` iteration
+/// variable) recognize it BEFORE resolving and never arrive here, so this needs no knowledge of
+/// which position it is in: reaching the resolver is itself the evidence.
+///
+/// **`CS0246` is the actively misleading answer, which is why this is worth a case.** Its text asks
+/// whether a using directive or an assembly reference is missing -- pointing the reader at their
+/// imports for a contextual keyword that could never have been imported from anywhere. A reader who
+/// hits it while using a language feature concludes something is wrong with their references, or
+/// with whatever else the failing declaration mentions.
+///
+/// Only the BARE, single-part name. `N.var` names a type in a namespace and is an ordinary
+/// `CS0246`; a program is entitled to a type called `var`, and one that has been qualified is not
+/// the contextual keyword under any reading.
+fn unresolved_name_diagnostic(parts: &[Box<str>]) -> DiagnosticKind {
+    if matches!(parts, [only] if &**only == "var") {
+        return DiagnosticKind::VarOutsideLocalDeclaration;
+    }
+    DiagnosticKind::TypeNotFound {
+        name: dotted(parts),
+    }
+}
+
 /// Resolves `ty` against `table`, confirming named types exist (11.1). Reports
-/// `CS0246` for an unknown name and returns the error type so binding continues.
+/// `CS0246` for an unknown name -- or `CS0825` for a bare `var`, see
+/// [`unresolved_name_diagnostic`] -- and returns the error type so binding continues.
 #[must_use]
 pub fn resolve_type(
     table: &TypeTable,
@@ -160,12 +188,7 @@ pub fn resolve_type(
             if table.contains(&namespace, name) {
                 ty.clone()
             } else {
-                diagnostics.push(Diagnostic::new(
-                    DiagnosticKind::TypeNotFound {
-                        name: dotted(parts),
-                    },
-                    span,
-                ));
+                diagnostics.push(Diagnostic::new(unresolved_name_diagnostic(parts), span));
                 TypeSymbol::Error
             }
         }

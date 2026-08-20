@@ -4,6 +4,8 @@
 
 use std::fmt;
 
+pub mod selection;
+
 /// The acknowledge a DP/AP transfer returned. `Ok` is success; the others are the ADIv5 wire-level
 /// responses a probe reports back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +27,14 @@ pub enum Ack {
 /// Probe-specific decode detail is flattened to a string so this crate can stay dependency-free;
 /// each probe family converts its own error into [`ProbeError::Protocol`] or
 /// [`ProbeError::Transport`] with a `From` impl on its own side of the boundary.
+///
+/// **`non_exhaustive` because every probe family converts into this enum, so it gains a variant
+/// whenever a family needs to report something the existing ones cannot carry.** Eleven crates
+/// build against it. The attribute is free at the moment it is added only while nothing matches
+/// exhaustively -- after that it breaks every such match -- so it is taken here ahead of the first
+/// variant that would need it, rather than discovered to be needed once it is already too late.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ProbeError {
     /// The packet transport to the probe failed.
     Transport(String),
@@ -42,6 +51,14 @@ pub enum ProbeError {
     /// to a usable driver. Carries the remedy, so callers can print something actionable rather than
     /// a cryptic transport failure.
     Unusable(String),
+    /// More than one PHYSICAL probe matched, so which board was meant is not decidable.
+    ///
+    /// **Refusing is the whole point: the alternative is a successful operation on somebody else's
+    /// target, and that failure is silent.** Carries a name per distinct probe, because the fix is
+    /// to name one and the message should not send the user off to look them up.
+    ///
+    /// Produced by [`selection::choose`]; see that module for the ladder that leads here.
+    Ambiguous(Vec<String>),
 }
 
 impl fmt::Display for ProbeError {
@@ -53,6 +70,13 @@ impl fmt::Display for ProbeError {
             ProbeError::Timeout(what) => write!(f, "timed out waiting for {what}"),
             ProbeError::Device(what) => write!(f, "target device error: {what}"),
             ProbeError::Unusable(remedy) => write!(f, "probe present but not usable: {remedy}"),
+            ProbeError::Ambiguous(names) => write!(
+                f,
+                "{} probes match; name one with a serial argument or by exporting {}={}",
+                names.len(),
+                selection::PROBE_SERIAL_ENV,
+                names.join(" | ")
+            ),
         }
     }
 }

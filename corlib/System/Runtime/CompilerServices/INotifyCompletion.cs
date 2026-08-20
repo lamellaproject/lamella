@@ -1,5 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Runtime.CompilerServices.INotifyCompletion
-#if LAMELLA_SURFACE_NETFX_4_0
+#if LAMELLA_SURFACE_NETFX_4_5
 namespace System.Runtime.CompilerServices
 {
     public interface INotifyCompletion

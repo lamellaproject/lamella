@@ -76,6 +76,10 @@ pub enum BuildError {
     /// first, and the image is built around whichever won with no diagnostic anywhere. Refused
     /// rather than shipped, for the same reason [`Self::SilentSeamCallEdge`] is: the failure mode is
     /// a confident wrong answer, not a crash.
+    ///
+    /// Unreachable from well-formed C# 1.0 metadata today -- one row, one method, one body. A
+    /// monomorphizer meets it immediately, because N instantiations of one generic method all share
+    /// a single MethodDef rid.
     DuplicateMethodBody {
         /// The MethodDef row a second body was written to; the first is the one that was lost.
         rid: u32,
@@ -572,7 +576,7 @@ pub const RP2350_DONE_MAGIC: u32 = 0x4C41_4D44;
 /// `[RP2350_DONE_MAGIC, return value]` in the mailbox, and parks. The entry RETURNS its result
 /// (unlike the microbit flat model, where it loops forever), so a host reads the verdict at
 /// [`RP2350_RESULT_ADDR`]. Single-sourced here so the browser AOT export ([`build`]'s `rp2350` arm)
-/// and the `pico2-aot-image` object-path flasher agree on the boot layout + verdict mailbox.
+/// and the object-path flasher agree on the boot layout + verdict mailbox.
 #[cfg(feature = "arm32")]
 pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
     use lamella_asm_arm32::{Cond, Encoder, Reg};
@@ -2239,11 +2243,22 @@ fn rebase_identities(func: &mut Function, ordinal: u8) -> Result<bool, MonoGap> 
                 Inst::AllocArray {
                     handle, element, ..
                 } => {
-                    *handle = rebase(*handle)?;
-                    if let Some(element) = element {
-                        *element = rebase(*element)?;
+                    match crate::resolver::argument_world_handle(*handle) {
+                        Some(caller) => *handle = caller,
+                        None => {
+                            *handle = rebase(*handle)?;
+                            minted = true;
+                        }
                     }
-                    minted = true;
+                    if let Some(element) = element {
+                        match crate::resolver::argument_world_handle(*element) {
+                            Some(caller) => *element = caller,
+                            None => {
+                                *element = rebase(*element)?;
+                                minted = true;
+                            }
+                        }
+                    }
                 }
                 Inst::TypeDescLiteral { handle, .. } => {
                     return Err(MonoGap::CrossAssemblyIdentity { handle: *handle });
@@ -3522,7 +3537,7 @@ fn reference_startup_cctors(assembly: &Assembly) -> Vec<u32> {
 ///
 /// **THIS IS THE HALF THE IMAGE COMES FROM.** `resolver::slot_types` types what a diagnostic
 /// reads. The two are twins, they already carried comments saying so, and a refusal landed in that
-/// one alone left every image byte-identical while `dump-mir` reported the fix as working. They now
+/// one alone left every image byte-identical while the MIR dump reported it working. They now
 /// key on ONE predicate (`generics::is_value_type_instantiation`) rather than on two arms written
 /// out separately, which is the only version of "stay in step" a compiler can enforce.
 fn mir_type<'x>(
@@ -3877,7 +3892,7 @@ fn type_init_thunk_body(flag_offset: u32, cctor: u32) -> Function {
 /// So the deviation is bounded by the UNMARKED, INITIALIZER-BEARING population and by nothing else.
 /// `lamella-assemble` writes the flag under csc's rule -- every type except one declaring an
 /// explicit `static C()` (`TYPE_BEFORE_FIELD_INIT` in `compile.rs`) -- which keeps that population
-/// small. `examples/dump-cctors` is the census that prices it for a given assembly, and it reports
+/// small. A cctor census prices it for a given assembly, and it reports
 /// the two halves separately because a type carrying the flag WITHOUT an initializer costs nothing.
 ///
 /// Precise, before-first-access initialization is what a trigger-site rewrite replaces this function
@@ -4823,7 +4838,8 @@ type LoweredAssemblyDebug = (
 /// does, through [`refuse_duplicate_bodies`] -- because the lowering has a lenient path and the
 /// decision about what is tolerable belongs at the build entry point, not here.
 ///
-/// Unreachable from well-formed C# 1.0 metadata, where one row means one method means one body.
+/// Unreachable from well-formed C# 1.0 metadata, where one row means one method means one body. A
+/// monomorphizer meets it immediately, because N instantiations of one generic method share a rid.
 struct BodySlots {
     /// The bodies, indexed by MethodDef rid.
     funcs: Vec<Function>,

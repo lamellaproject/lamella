@@ -110,7 +110,7 @@ use crate::serial_matches;
 /// Whether a path's instance-id segment is Windows' SYNTHESIZED id rather than the device's own
 /// serial -- which is what decides whether a mismatch against it means anything.
 ///
-/// Windows names an interface of a COMPOSITE device with an id like `6&1d366a3c&0&0000`; a simple
+/// Windows names an interface of a COMPOSITE device with an id like `6&1a2b3c4d&0&0000`; a simple
 /// device that reports an iSerialNumber gets the serial itself. The ampersands are the tell, and
 /// this file's own path documentation has always said so.
 ///
@@ -643,7 +643,7 @@ mod tests {
     /// A simple device: Windows puts the device's OWN serial in the instance-id segment.
     const SIMPLE: &str = r"\?\usb#vid_39e9&pid_0001#7A5C9E20D14--with-a-serial#{guid}";
     /// A composite device's interface: the id is SYNTHESIZED and carries no serial at all.
-    const COMPOSITE: &str = r"\?\usb#vid_0483&pid_374b#6&1d366a3c&0&0000#{guid}";
+    const COMPOSITE: &str = r"\?\usb#vid_0483&pid_374b#6&1a2b3c4d&0&0000#{guid}";
 
     #[test]
     fn no_requested_serial_takes_any_board() {

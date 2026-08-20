@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "A CMSIS-DAP debug-probe host -- the command protocol and ADIv5/SWD transactions -- implemented from the Arm CMSIS-DAP and ADIv5 specifications."
+publish = false
 
 [lints]
 workspace = true

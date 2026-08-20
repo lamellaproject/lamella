@@ -1,0 +1,19 @@
+[package]
+name = "lamella-sd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The bus-independent half of the SD card protocol: command indices, the initialization constants, the CMD6 function-switch encoding, and the CSD capacity decode -- shared by the SPI-mode and native SDMMC transports."
+publish = false
+
+# DELIBERATELY DEPENDENCY-FREE, and that is a load-bearing property rather than tidiness. A card's
+# protocol is the same protocol whichever wire carries it, so this crate must be reachable from any
+# transport AND from a host that does not share our block-device seam. `lamella-sd-spi` implements
+# `BlockDevice` from `lamella-cil-runtime`; a second project hosting these drivers has its own
+# equivalent and should not be made to take ours to reuse the protocol.
+[dependencies]
+
+[lints]
+workspace = true

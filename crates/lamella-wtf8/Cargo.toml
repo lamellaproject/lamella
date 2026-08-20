@@ -10,6 +10,7 @@ description = "The shared code-point byte codec: one definition of the UTF-8/WTF
 # A leaf, on the `lamella-gc` / `lamella-reactor` pattern: the BYTE form both language runtimes
 # write, depending on nothing so either can depend on it. What differs between them is how code
 # points are grouped into their own notion of a character, and that stays in each caller.
+publish = false
 [dependencies]
 
 [lints]

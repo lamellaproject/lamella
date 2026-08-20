@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The `lamella` command-line tool: the developer-facing surface over the toolchain."
+description = "The `lamella` command-line tool: the developer-facing surface over the toolchain. Default build = devices / run / build / boards / fit / reconcile. Build `--features bake` for the flash image and `deploy`, which needs lamella-load's non-additive `code-in-place` and so cannot be on in a workspace build."
+publish = false
 
 [[bin]]
 name = "lamella"
@@ -16,6 +17,81 @@ path = "src/main.rs"
 # that rule, never a second implementation of it: the same function answers the MCP tool and the
 # editor, so a board's budget cannot mean one thing on one surface and another elsewhere.
 lamella-bsp-gen = { path = "../lamella-bsp-gen" }
+# The host compile-and-run seam (LcscCompiler + the REPL engine's LoopbackLink), the device
+# enumeration behind `devices`, and the target grammar every verb taking `--target` shares. The
+# SAME seams the MCP server and lamella-dap use.
+lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb"] }
+# The wire protocol types: Capabilities / Negotiated / board_model, for what `devices --identify`
+# reports back off a board.
+lamella-wire = { path = "../lamella-wire" }
+# The C# front end, called DIRECTLY by `build` rather than through the REPL compile seam, so the
+# assembly carries the FILE's name and the FILE's source path. The seam names everything `__Repl`
+# against `Repl.cs`, which is right for a submission typed at a prompt and wrong for an artifact
+# written to disk -- the name is what another assembly references and the path is where a debugger
+# looks. `run` still uses the seam, where neither is observable.
+lamella-assemble = { path = "../lamella-assemble" }
+lamella-metadata = { path = "../lamella-metadata" }
+# The compile options `--unsafe` sets. csc gates unsafe code behind `/unsafe` and so does lcsc, so
+# a driver that parses a command line has to carry the switch rather than decide for the user --
+# and a device program that writes registers through raw pointers needs it.
+lamella-syntax = { path = "../lamella-syntax" }
+# The ahead-of-time backend, for `flash`: a CIL assembly to a flashable bare-metal image. This is
+# the FLAT, linker-free path, and it needs nothing on the board -- which is why `flash` works on a
+# board that has never run Lamella.
+lamella-aot = { path = "../lamella-aot", features = ["arm32"] }
+# Writing that image over a board's on-board debug probe. Its `microbit` feature is what pulls the
+# probe-SELECTION ladder: these helpers WRITE FLASH, so they resolve WHICH board rather than taking
+# the first `0d28:0204` the operating system offers -- a write to the wrong board succeeds and
+# reports nothing. The CLI consumes that ladder; it does not select a probe itself.
+lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", features = ["microbit"] }
+# Probe ENUMERATION -- for the interactive picker, so an ambiguous bench can be resolved by asking
+# rather than only by refusing, and for the `devices` listing.
+# `usbbulk` IS NOT OPTIONAL HERE. Without it this crate discovers CMSIS-DAP v1 (HID) probes only,
+# and every RPi Debug Probe is v2 over USB bulk -- so a bench with nine of them attached would list
+# none, and report that absence as though it had looked. A listing that cannot see a whole probe
+# family is worse than no listing: it answers "nothing is attached" with authority.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
+# The Python tier: the front end that bundles a program and the interpreter that runs one, so
+# `run` and `build` take a .py exactly as they take a .cs. The verbs are language-neutral from the
+# first commit because that is not retrofittable -- a verb meaning C# alone, given a Python mode
+# afterwards, would carry the first language's assumptions in its shape forever.
+lamella-py-frontend = { path = "../lamella-py-frontend" }
+lamella-py-runtime = { path = "../lamella-py-runtime" }
+lamella-py-bytecode = { path = "../lamella-py-bytecode" }
+
+# BAKE-only deps (behind the `bake` feature). `code-in-place` is NON-ADDITIVE -- it cfg's out
+# `Module::method_body` and switches loading to the 'static flash model -- so reaching the shared
+# lamella-load in a default or `--workspace` build stops lamella-repl and lamella-runner
+# compiling. MEASURED on this tree (6 errors in lamella-repl, 2 in lamella-runner), not inherited
+# from the sibling comment in lamella-mcp. Gating keeps the workspace green; the full tool is
+# `cargo build -p lamella-cli --features bake`.
+lamella-load = { path = "../lamella-load", optional = true }
+# The debug-channel seam `run --target` drives. It is that channel and not the deploy one because
+# CONSOLE OUTPUT ARRIVES THERE: the wire's terminal frames carry a program's whole output and none
+# of them exists until it has finished, so streaming a running program means draining EVT_OUTPUT,
+# which rides the debug session.
+lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
+
+[features]
+# The flash image and the deploy path: compile -> bake (`Module::write_baked`, which needs
+# `code-in-place`) -> `.lmli`, and the chunked deploy over Lamella Link. Default-OFF for the
+# reason above, which means a workspace build produces a `lamella` that cannot deploy -- stated in
+# the crate documentation as well, because a gate that cannot build the verb it is trusted to
+# cover is worse than a missing gate.
+bake = [
+    "dep:lamella-load", "lamella-load/code-in-place",
+    "lamella-wire-host/baked",
+    "lamella-wire-host/debug-backend", "dep:lamella-debug-backend",
+]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The layer below the memory seam: a dormant-state SWD wake, a Debug Port read that powers nothing
+# up, and an Access Port register addressed through a caller-supplied `SELECT`. None of that is
+# reachable through the memory-level probe seam, and a chip whose memory is unreachable is exactly
+# the case that needs it.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["usbbulk"] }
+lamella-probe-core = { path = "../lamella-probe-core" }
+

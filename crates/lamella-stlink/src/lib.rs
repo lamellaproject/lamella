@@ -1,6 +1,6 @@
 //! An ST-Link debug-probe host.
 
-use lamella_probe_core::{CallFrame, CoreMemory, ProbeError, TargetAccess, cortex_m};
+use lamella_probe_core::{CallFrame, CoreMemory, ProbeError, TargetAccess, cortex_m, selection};
 use lamella_usbbulk::{Binding, Device};
 use std::time::Duration;
 
@@ -283,8 +283,39 @@ impl StLink {
             Ok(Binding::Bound) => {}
             Err(_) => {}
         }
-        let device = Device::open_interface(ST_DEBUG_INTERFACE_GUID, ST_VENDOR_ID, product_id, serial)
-            .map_err(|_| ProbeError::Device("could not open the ST-Link debug interface"))?;
+        let selector = match serial {
+            Some(requested) if !requested.trim().is_empty() => {
+                selection::Selector::by_serial(requested.trim())
+            }
+            _ => selection::Selector::from_environment(),
+        }
+        .with_vid_pid(ST_VENDOR_ID, product_id);
+
+        let candidates: Vec<selection::Candidate> =
+            lamella_usbbulk::enumerate_interface(ST_DEBUG_INTERFACE_GUID)
+                .map_err(|_| ProbeError::Device("could not enumerate the ST-Link debug interfaces"))?
+                .into_iter()
+                .map(|found| selection::Candidate {
+                    vendor_id: found.vendor_id,
+                    product_id: found.product_id,
+                    serial: found.serial_number,
+                })
+                .collect();
+
+        let chosen = match selection::choose(&candidates, &selector) {
+            selection::Selection::Unique(found) => found,
+            selection::Selection::NotFound => {
+                return Err(ProbeError::Device(
+                    "no ST-Link matched -- check the serial, or the product id for this probe \
+                     generation (a V3 is a FAMILY of ids, not one)",
+                ));
+            }
+            selection::Selection::Ambiguous(names) => return Err(ProbeError::Ambiguous(names)),
+        };
+
+        let device =
+            Device::open_interface(ST_DEBUG_INTERFACE_GUID, ST_VENDOR_ID, product_id, chosen.as_deref())
+                .map_err(|_| ProbeError::Device("could not open the ST-Link debug interface"))?;
         Ok(StLink { device, wide_status: None })
     }
 

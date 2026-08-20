@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "The volatile MMIO primitive (write_volatile/read_volatile) the interpreter's Mmio seam installs on device."
+publish = false
 
 [dependencies]
 

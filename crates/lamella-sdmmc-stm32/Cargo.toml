@@ -1,0 +1,21 @@
+[package]
+name = "lamella-sdmmc-stm32"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The STM32 SDMMC controller behind the SdmmcHost seam: the command path state machine, the FIFO data path, and the clock divider, from RM0410 section 39."
+publish = false
+
+[dependencies]
+# The portable half -- the ladder, the four-bit negotiation and the transfer sequencing.
+lamella-sd-sdmmc = { path = "../lamella-sd-sdmmc" }
+# Card-protocol constants shared with the SPI transport.
+lamella-sd-core = { path = "../lamella-sd-core" }
+# The volatile access primitive. Keeping it here rather than writing raw pointer code means this
+# crate needs no `unsafe` of its own.
+lamella-mmio = { path = "../lamella-mmio" }
+
+[lints]
+workspace = true

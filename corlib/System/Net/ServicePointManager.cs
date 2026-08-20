@@ -6,6 +6,8 @@ namespace System.Net
 {
     public sealed class ServicePointManager
     {
+        private ServicePointManager() { }
+
         private static RemoteCertificateValidationCallback _serverCertificateValidationCallback;
 
 #if LAMELLA_NET_2_0

@@ -20,6 +20,7 @@ namespace System.Threading.Tasks
 
         public bool IsCompletedSuccessfully { get { return _completed && _exception == null; } }
 
+#if LAMELLA_SURFACE_NETFX_4_5
         public static Task CompletedTask
         {
             get
@@ -33,11 +34,56 @@ namespace System.Threading.Tasks
                 return _completedTask;
             }
         }
+#endif
 
+#if LAMELLA_SURFACE_NETFX_4_5
         public System.Runtime.CompilerServices.TaskAwaiter GetAwaiter()
         {
             return new System.Runtime.CompilerServices.TaskAwaiter(this);
         }
+
+#if LAMELLA_SURFACE_THREADS
+        public static Task Delay(int millisecondsDelay)
+        {
+            if (millisecondsDelay < -1) throw new ArgumentOutOfRangeException("millisecondsDelay");
+            if (millisecondsDelay == 0) return CompletedTask;
+            Task task = new Task();
+            if (millisecondsDelay == Timeout.Infinite) return task;
+            new DelayCompletion(task, millisecondsDelay);
+            return task;
+        }
+#endif
+#endif
+
+#if LAMELLA_SURFACE_THREADS
+        public void Wait()
+        {
+            Wait(Timeout.Infinite);
+        }
+
+        public bool Wait(int millisecondsTimeout)
+        {
+            if (millisecondsTimeout < -1) throw new ArgumentOutOfRangeException("millisecondsTimeout");
+            if (_completed) { ThrowIfFaulted(); return true; }
+            lock (this)
+            {
+                int start = Environment.TickCount;
+                while (!_completed)
+                {
+                    if (millisecondsTimeout < 0)
+                    {
+                        Monitor.Wait(this);
+                        continue;
+                    }
+                    int elapsed = unchecked(Environment.TickCount - start);
+                    if (elapsed >= millisecondsTimeout) return false;
+                    if (!Monitor.Wait(this, millisecondsTimeout - elapsed)) return false;
+                }
+            }
+            ThrowIfFaulted();
+            return true;
+        }
+#endif
 
         internal void SetResult() { Settle(null); }
 
@@ -48,6 +94,12 @@ namespace System.Threading.Tasks
             if (_completed) throw new InvalidOperationException("The task is already completed.");
             _exception = exception;
             _completed = true;
+#if LAMELLA_SURFACE_THREADS
+            lock (this)
+            {
+                Monitor.PulseAll(this);
+            }
+#endif
             Action first = _continuation;
             Action[] rest = _more;
             int restCount = _moreCount;

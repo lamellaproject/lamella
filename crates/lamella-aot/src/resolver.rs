@@ -1428,6 +1428,13 @@ impl<'a> MetadataResolver<'a> {
     /// EVERY descriptor an image lays: this assembly's own types, then one per INSTANTIATION the
     /// attached [`MonoPlan`](crate::generics::MonoPlan) covers.
     ///
+    /// **THE UNION IS ONE FUNCTION SO THAT A BUILD PATH CANNOT HOLD HALF OF IT.** A path that lays
+    /// this assembly's descriptors and not the plan's gives every instantiation TAG ZERO -- one
+    /// identity shared by all of them, which is exactly what `isinst`/`castclass` compares -- and,
+    /// once instantiations carry dispatch tables, an EMPTY VTABLE. **Neither is visible in an object
+    /// file that links and boots.** Assembled here, a path can only be missing it by not calling
+    /// this at all.
+    ///
     /// A resolver with no plan attached answers exactly [`Self::type_descriptors`], which is what
     /// keeps every non-generic build on the bytes it was already on.
     #[must_use]
@@ -2965,6 +2972,17 @@ impl<'a> MetadataResolver<'a> {
     /// What a TYPE OPERAND denotes once this resolver's instantiation is applied, for the ONE operand
     /// shape whose meaning changes under one: a `TypeSpec`. `None` for every other token and for a
     /// body with no instantiation in force, which leaves each caller on the path it was already on.
+    ///
+    /// **ANSWERED ONCE, HERE, RATHER THAN AT EACH OF THE THREE CALL SITES.**
+    /// [`CallResolver::array_element`], [`CallResolver::type_operand_mir`] and
+    /// [`CallResolver::boxed_value_type`] each ask a different question about the same operand, and
+    /// each starts from [`Assembly::type_token_name`] -- which a `TypeSpec` has none of, so each
+    /// would otherwise fall past every arm to a default: four bytes and OPAQUE, `ObjectRef`, and a
+    /// layout miss respectively. They consult this before their own name-based matches.
+    ///
+    /// **THE LAYOUT LIST, through [`Self::apply_instantiation`], and not the identity one**, because
+    /// every consumer of this sizes a slot or types a value and none of them spells a name -- an ENUM
+    /// argument is its underlying integer here and emphatically not `System.Int32`.
     fn closed_operand_sig(&self, token: Token) -> Option<SigType> {
         if token.table() != table::TYPE_SPEC {
             return None;
@@ -2982,14 +3000,24 @@ impl<'a> MetadataResolver<'a> {
     /// on the path it was already on, which is what keeps every ordinary program on exactly the bytes
     /// it was on.
     ///
-    /// **ONLY A CLOSED FORM THAT NAMES NO ROW IS TAKEN, AND THAT IS THE WHOLE BCL CASE.** A primitive
-    /// or `String` is spelled by a byte in the signature encoding and carries no token from anywhere,
-    /// so naming it is a lookup and not a rebase -- `List<int>` and `List<string>` are exactly this.
-    /// A closed form that DOES name a row (a class or a struct argument) is deliberately not taken:
-    /// its token belongs to the CALLER while this resolver reads the OWNER, which is the
-    /// argument-world problem, and answering it here would be guessing in the one place the refusal
-    /// is currently correct. Those keep refusing, and so does an unsubstituted spec -- `new int[][]`
-    /// and `new Box<int>[n]` close to an array and an instantiation, neither of which this names.
+    /// **A CLOSED FORM THAT NAMES NO ROW IS THE WHOLE BCL CASE.** A primitive or `String` is spelled
+    /// by a byte in the signature encoding and carries no token from anywhere, so naming it is a
+    /// lookup and not a rebase -- `List<int>` and `List<string>` are exactly this.
+    ///
+    /// **A NAMED ARGUMENT -- a class or struct the CALLER declares -- IS ALSO TAKEN, THROUGH THE
+    /// ARGUMENT WORLD.** Its token belongs to the caller while this resolver reads the owner, which
+    /// is the problem [`marked_handle_token`] and [`value_type_layout_across`] solve for the same
+    /// operand in [`mir_type_across`]; sharing that pair is what stops the array's stride and the
+    /// element's MIR type being decided by two different rules. Three of this function's four
+    /// outputs were wrong for such an argument while only the identity refused: a struct strode by
+    /// `unwrap_or(4)` where the signature beside it said eight, and a class element was described
+    /// OPAQUE, which tells a mark-compact collector not to scan an array full of live references.
+    ///
+    /// **ONE SHAPE STILL DECLINES, AND IT IS A PROPERTY OF THE DESCRIPTOR RATHER THAN OF THIS
+    /// FUNCTION:** a struct element holding REFERENCE FIELDS. Word 1 carries a kind and no
+    /// per-element offsets, so such an array cannot be described at all -- see the arm for the
+    /// reasoning. An unsubstituted spec declines too: `new int[][]` and `new Box<int>[n]` close to
+    /// an array and an instantiation, neither of which this names.
     ///
     /// The identity is resolved OWN-ASSEMBLY FIRST, exactly as [`resolve_value_type_def`] resolves a
     /// value type, and for the same reason: a body lowered out of the corlib is read against the
@@ -2999,21 +3027,61 @@ impl<'a> MetadataResolver<'a> {
     /// any other, which is what makes this array's descriptor the SAME one a program-side
     /// `new int[n]` names rather than a second copy of it.
     fn substituted_array_element(&self, spec: Token) -> Option<ArrayElement> {
-        let (namespace, name) = primitive_sig_name(&self.closed_operand_sig(spec)?)?;
-        let element = self
-            .assembly
-            .find_type(namespace, name)
-            .map(|type_def| TypeHandle(type_def.token().0))
-            .or_else(|| {
-                self.find_reference_type(namespace, name)
-                    .map(|(ordinal, _, type_def)| reference_handle(ordinal, type_def.token().0))
-            })?;
-        Some(ArrayElement {
-            handle: lamella_ir::array_handle(element),
-            element: Some(element),
-            element_size: primitive_value_size(namespace, name).unwrap_or(4),
-            element_kind: primitive_element_kind(namespace, name).unwrap_or(ELEMENT_KIND_REFERENCE),
-        })
+        let closed = self.closed_operand_sig(spec)?;
+        if let Some((namespace, name)) = primitive_sig_name(&closed) {
+            let element = self
+                .assembly
+                .find_type(namespace, name)
+                .map(|type_def| TypeHandle(type_def.token().0))
+                .or_else(|| {
+                    self.find_reference_type(namespace, name)
+                        .map(|(ordinal, _, type_def)| reference_handle(ordinal, type_def.token().0))
+                })?;
+            return Some(ArrayElement {
+                handle: lamella_ir::array_handle(element),
+                element: Some(element),
+                element_size: primitive_value_size(namespace, name).unwrap_or(4),
+                element_kind: primitive_element_kind(namespace, name)
+                    .unwrap_or(ELEMENT_KIND_REFERENCE),
+            });
+        }
+        match &closed {
+            SigType::Class(token) => {
+                let element = TypeHandle(
+                    match self.argument_assembly {
+                        Some(_) => in_argument_world(*token),
+                        None => *token,
+                    }
+                    .0,
+                );
+                Some(ArrayElement {
+                    handle: argument_world_array_handle(element),
+                    element: Some(element),
+                    element_size: 4,
+                    element_kind: ELEMENT_KIND_REFERENCE,
+                })
+            }
+            SigType::ValueType(token) => {
+                let layout = value_type_layout_across(
+                    self.assembly,
+                    self.argument_assembly,
+                    *token,
+                    self.references(),
+                    &TargetLayout::ilp32(),
+                )?;
+                if !layout.reference_offsets.is_empty() {
+                    return None;
+                }
+                let element = TypeHandle(marked_handle_token(*token, self.argument_assembly).0);
+                Some(ArrayElement {
+                    handle: argument_world_array_handle(element),
+                    element: Some(element),
+                    element_size: layout.size,
+                    element_kind: ELEMENT_KIND_OPAQUE,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// A `TypeSpec` parent resolved to the generic definition it instantiates and the arguments to
@@ -3152,12 +3220,63 @@ impl<'a> MetadataResolver<'a> {
     /// would land in three callers independently.
     fn link_layout(&self, link: &ChainLink<'a>) -> Option<TypeLayout> {
         if link.arguments.is_empty() {
-            return link
-                .assembly
-                .value_type_layout(link.type_def.token(), &TargetLayout::ilp32())
-                .ok();
+            return self.own_block_layout(link.assembly, link.type_def);
         }
         self.instantiated_layout(link.assembly, link.type_def, &link.arguments)
+    }
+
+    /// One type's OWN field block, laid out with a nested resolver that can LEAVE `owner`.
+    ///
+    /// **`Assembly::value_type_layout` HANDS `layout_value_type` A SINGLE-ASSEMBLY CLOSURE, WHICH IS
+    /// CORRECT FOR THE METADATA CRATE AND WRONG HERE.** That crate holds no reference list, so a
+    /// field whose type is a value type declared in a REFERENCED assembly resolves to nothing there
+    /// and the WHOLE class fails to lay out -- no size, no field offsets and no trace map, and every
+    /// consumer of those refuses. The reference list lives in this resolver, so the closure does too.
+    ///
+    /// It is the ONE reader both the allocation path ([`Self::reference_layout_of`], through
+    /// [`Self::link_layout`]) and the field-access path ([`Self::own_block_field_offset`]) consult,
+    /// so those two cannot number one field differently -- they resolve it through separate code and
+    /// each refuses on its own.
+    fn own_block_layout(
+        &self,
+        owner: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+    ) -> Option<TypeLayout> {
+        let fields: Vec<SigType> = type_def
+            .fields()
+            .filter(|field| !field.is_static())
+            .filter_map(|field| field.signature())
+            .collect();
+        layout_value_type(&fields, &TargetLayout::ilp32(), &|token| {
+            value_type_layout_across(
+                owner,
+                None,
+                token,
+                &self.references,
+                &TargetLayout::ilp32(),
+            )
+        })
+        .ok()
+    }
+
+    /// [`Assembly::field_offset`] over [`Self::own_block_layout`]: the block-relative offset of
+    /// `field` within `type_def` (declared in `owner`), so a field sitting AFTER a cross-assembly
+    /// value-type field is still addressable. Position among the instance fields, exactly the
+    /// numbering the metadata crate's own version uses.
+    fn own_block_field_offset(
+        &self,
+        owner: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+        field: Token,
+    ) -> Option<u32> {
+        let index = type_def
+            .fields()
+            .filter(|candidate| !candidate.is_static())
+            .position(|candidate| candidate.token() == field)?;
+        self.own_block_layout(owner, type_def)?
+            .field_offsets
+            .get(index)
+            .copied()
     }
 }
 
@@ -3530,7 +3649,7 @@ impl CallResolver for MetadataResolver<'_> {
                     .fields()
                     .find(|f| f.name() == Some(field_name))
                     .filter(|f| !f.is_static())?;
-                let block = owner.field_offset(field.token(), &TargetLayout::ilp32())?;
+                let block = self.own_block_field_offset(owner, type_def, field.token())?;
                 Some(self.class_block_start(owner, type_def)? + block)
             }
             _ => {
@@ -3538,7 +3657,7 @@ impl CallResolver for MetadataResolver<'_> {
                     .assembly
                     .type_defs()
                     .find(|type_def| type_def.fields().any(|field| field.token() == *token))?;
-                let block = match self.assembly.field_offset(*token, &TargetLayout::ilp32()) {
+                let block = match self.own_block_field_offset(self.assembly, declaring, *token) {
                     Some(block) => block,
                     None if !self.layout_arguments.is_empty() => {
                         let index = declaring
@@ -5041,6 +5160,27 @@ pub(crate) fn marked_handle_token(token: Token, argument_world: Option<&Assembly
     }
 }
 
+/// [`lamella_ir::array_handle`] over an element handle that may carry [`ARGUMENT_WORLD_BIT`].
+///
+/// **THE LIFT KEYS ON THE TABLE BYTE AND A MARKED HANDLE'S TOP BYTE IS THE MARK**, so handing one
+/// straight to `array_handle` takes its *"already an array identity, or names no class descriptor for
+/// its array to collide with"* fall-through and returns the ELEMENT unchanged. The array and its
+/// element then share one handle -- the exact collision that function exists to remove, arriving
+/// through the repair for a different one. Unmark, lift, re-mark: `build::rebase_identities` drops
+/// the mark afterwards, so the array reaches the image as the same identity the caller's own
+/// `new T[n]` would mint for it.
+///
+/// Both marking arms of [`MetadataResolver::substituted_array_element`] consult this rather than
+/// spelling the unmark-lift-remark at each, because the two arms differ in outcome only by whether a
+/// CLASS descriptor already occupies the colliding handle -- so one of them fails loudly and the
+/// other keeps its descriptor under the element's identity, which is a defect with no symptom.
+fn argument_world_array_handle(element: TypeHandle) -> TypeHandle {
+    match argument_world_handle(element) {
+        Some(unmarked) => TypeHandle(lamella_ir::array_handle(unmarked).0 | ARGUMENT_WORLD_BIT),
+        None => lamella_ir::array_handle(element),
+    }
+}
+
 /// The layout of a value type named by a token, read in the world that token belongs to.
 ///
 /// **ONE FUNCTION, BECAUSE THE MARK IS USELESS AT A READER THAT DOES NOT ASK ABOUT IT.** The three
@@ -5060,7 +5200,8 @@ pub(crate) fn value_type_layout_across<'x>(
     target: &TargetLayout,
 ) -> Option<TypeLayout> {
     let Some(argument) = argument_world_token(token) else {
-        return owner.value_type_layout(token, target).ok();
+        let (declaring, type_def) = resolve_value_type_def(owner, token, references)?;
+        return declaring.value_type_layout(type_def.token(), target).ok();
     };
     let (declaring, type_def) =
         resolve_value_type_def(argument_world.unwrap_or(owner), argument, references)?;
@@ -5283,7 +5424,7 @@ pub fn lower_methods_debug(
 ///
 /// Public so a DIAGNOSTIC types a method exactly as [`lower_methods_with_references`] does. A tool
 /// that computed its own slot types would be reporting a different program from the one the build
-/// lowers, which is the failure `dump-mir` already paid for once by lowering without references.
+/// lowers, which is the failure the MIR dump already paid for once by lowering without references.
 ///
 /// **THE `int32` FALLBACK IS KEPT EVERYWHERE EXCEPT ONE SHAPE, AND THAT NARROWNESS IS DELIBERATE.**
 /// `mir_type` answers `None` for `void`, `!n`, `!!n` and function pointers as well, and which of
@@ -5294,7 +5435,7 @@ pub fn lower_methods_debug(
 /// typing path has to refuse the identical shape and two hand-written arms are how the pair drifted.
 ///
 /// **A REFUSAL HERE IS HALF A FIX.** This function types what a diagnostic reads;
-/// `build::mir_type` types what the image is emitted from. Landed here alone, `dump-mir` becomes
+/// `build::mir_type` types what the image is emitted from. Landed here alone, the MIR dump becomes
 /// honest and every image keeps miscompiling, with a unit test over this function green throughout.
 pub fn slot_types(
     assembly: &Assembly,

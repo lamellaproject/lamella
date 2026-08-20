@@ -33,6 +33,40 @@ pub enum FStringPart {
 /// prefix literal.
 type FStringField = (String, Option<char>, Option<String>, Option<String>);
 
+/// The decimal digits of a base-`radix` digit string, for a literal too large for `i64`.
+///
+/// [`Tok::BigInt`] carries DECIMAL digits, because that is the shape the bytecode constant carries
+/// and the shape the runtime parses. Converting here keeps a base-prefixed bignum entirely inside
+/// the lexer: no new constant, no format version, and nothing to decode on the device.
+///
+/// Schoolbook `acc = acc * radix + digit` over little-endian decimal digits. The values stay small
+/// by construction -- a slot is under 10 and `radix` is at most 16, so `slot * radix + carry` is
+/// under 160 and the carry out is a single digit.
+fn decimal_digits_of(digits: &str, radix: u32) -> String {
+    let mut acc: Vec<u32> = Vec::new();
+    for c in digits.chars() {
+        let mut carry = c
+            .to_digit(radix)
+            .expect("the scan admitted only digits of this radix");
+        for slot in &mut acc {
+            let v = *slot * radix + carry;
+            *slot = v % 10;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            acc.push(carry % 10);
+            carry /= 10;
+        }
+    }
+    if acc.is_empty() {
+        return String::from("0");
+    }
+    acc.iter()
+        .rev()
+        .map(|d| char::from_digit(*d, 10).unwrap_or('0'))
+        .collect()
+}
+
 /// A lexical token kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tok {
@@ -1191,7 +1225,10 @@ impl Lexer {
                 self.push(Tok::Int(value));
                 Ok(())
             }
-            Err(_) => Err(self.err("integer literal too large (exceeds 64 bits)")),
+            Err(_) => {
+                self.push(Tok::BigInt(decimal_digits_of(&digits, radix)));
+                Ok(())
+            }
         }
     }
 
@@ -1543,6 +1580,39 @@ mod tests {
         assert_eq!(
             kinds("100_000_000_000_000_000_000\n")[0],
             Tok::BigInt("100000000000000000000".into())
+        );
+    }
+
+    #[test]
+    fn an_oversized_base_prefixed_literal_is_a_bigint_too() {
+        assert_eq!(
+            kinds("0xFFFFFFFFFFFFFFFF\n")[0],
+            Tok::BigInt("18446744073709551615".into()),
+            "2**64 - 1: under 2**64 and already past i64::MAX, which is where the old cap sat"
+        );
+        assert_eq!(
+            kinds("0x1FFFFFFFFFFFFFFFF\n")[0],
+            Tok::BigInt("36893488147419103231".into())
+        );
+        assert_eq!(
+            kinds("0o2000000000000000000000\n")[0],
+            Tok::BigInt("18446744073709551616".into())
+        );
+        assert_eq!(
+            kinds("0b1000000000000000000000000000000000000000000000000000000000000000\n")[0],
+            Tok::BigInt("9223372036854775808".into())
+        );
+        assert_eq!(
+            kinds("0xDEADBEEFCAFEBABE1234567890ABCDEF\n")[0],
+            Tok::BigInt("295990755076957304699390954000840642031".into())
+        );
+        assert_eq!(kinds("0x7FFFFFFFFFFFFFFF\n")[0], Tok::Int(i64::MAX));
+        assert_eq!(kinds("0xFF\n")[0], Tok::Int(255));
+        assert_eq!(kinds("0o17\n")[0], Tok::Int(15));
+        assert_eq!(kinds("0b1011\n")[0], Tok::Int(11));
+        assert_eq!(
+            kinds("0xFFFF_FFFF_FFFF_FFFF\n")[0],
+            Tok::BigInt("18446744073709551615".into())
         );
     }
 

@@ -64,6 +64,20 @@ enum Locator {
 }
 
 impl ProbeInfo {
+    /// This interface as the three fields the selection ladder decides on.
+    ///
+    /// The rest of this struct -- transport, HID usage, the backend locator -- says how to REACH an
+    /// interface, and none of it bears on WHICH PHYSICAL BOARD was meant. Keeping the two apart is
+    /// what lets one ladder serve probe families whose discovery types have nothing else in common.
+    #[must_use]
+    pub fn as_candidate(&self) -> Candidate {
+        Candidate {
+            vendor_id: self.vendor_id,
+            product_id: self.product_id,
+            serial: self.serial.clone(),
+        }
+    }
+
     fn from_hid(d: lamella_usbhid::DeviceInfo) -> ProbeInfo {
         ProbeInfo {
             vendor_id: d.vendor_id,
@@ -123,97 +137,8 @@ impl Caps {
     }
 }
 
-/// Which probe to open. An unset field matches anything; a probe passes when every set field
-/// matches. [`Selector::any`] takes the first probe found.
-#[derive(Debug, Clone, Default)]
-pub struct Selector {
-    /// Require this USB vendor id.
-    pub vendor_id: Option<u16>,
-    /// Require this USB product id.
-    pub product_id: Option<u16>,
-    /// Require this serial number -- the reliable way to pick one probe out of several alike.
-    pub serial: Option<String>,
-}
-
-/// The environment variable naming the probe this shell's work should reach.
-///
-/// **A bench with one probe per board needs a per-shell default, because the alternative is a
-/// `--serial` on every command and the one time it is forgotten is the one that matters.** A lane
-/// exports its own probe's serial once; every tool that builds its selector with
-/// [`Selector::from_environment`] then reaches that lane's board and no other.
-pub const PROBE_SERIAL_ENV: &str = "LAMELLA_PROBE_SERIAL";
-
-impl Selector {
-    /// Matches the only connected probe, and REFUSES when there is more than one.
-    ///
-    /// **It does NOT mean "the first one discovered", which stops being a usable answer the
-    /// moment a bench holds two probes of the same model.** Every RPi Debug Probe enumerates as
-    /// `2e8a:000c`, so "the first" is decided by USB enumeration order -- which changes with plug
-    /// order and across reboots. Writing to an arbitrary board is not a failure that announces
-    /// itself: the flash SUCCEEDS, on the wrong target, and the board's owner finds it running
-    /// somebody else's program with no error anywhere in the log.
-    ///
-    /// So an unconstrained selector now means *the only one*, and [`open`] answers
-    /// [`ProbeError::Ambiguous`] rather than guessing. A single attached probe is unaffected.
-    pub fn any() -> Self {
-        Self::default()
-    }
-
-    /// The selector a tool should build when the user named no probe: the serial in
-    /// [`PROBE_SERIAL_ENV`] if the environment sets one, otherwise [`Selector::any`].
-    ///
-    /// **The ladder this completes, most specific first:** an explicit `--serial` argument, then
-    /// this shell's configured probe, then the sole connected probe, then a refusal. Every rung is
-    /// a statement about which board is meant; there is no rung that guesses.
-    #[must_use]
-    pub fn from_environment() -> Self {
-        match std::env::var(PROBE_SERIAL_ENV) {
-            Ok(serial) if !serial.trim().is_empty() => Self::by_serial(serial.trim().to_owned()),
-            _ => Self::any(),
-        }
-    }
-
-    /// Matches the probe with this serial number.
-    pub fn by_serial(serial: impl Into<String>) -> Self {
-        Self {
-            serial: Some(serial.into()),
-            ..Self::default()
-        }
-    }
-
-    /// Matches probes with this vendor and product id.
-    pub fn by_vid_pid(vendor_id: u16, product_id: u16) -> Self {
-        Self {
-            vendor_id: Some(vendor_id),
-            product_id: Some(product_id),
-            ..Self::default()
-        }
-    }
-
-    /// Adds a serial-number constraint (builder style).
-    pub fn with_serial(mut self, serial: impl Into<String>) -> Self {
-        self.serial = Some(serial.into());
-        self
-    }
-
-    /// Adds a vendor/product constraint (builder style), narrowing a serial or environment
-    /// selector to one probe FAMILY -- so "the sole attached probe" means the sole micro:bit
-    /// rather than the sole probe of any kind on a bench that holds several models.
-    pub fn with_vid_pid(mut self, vendor_id: u16, product_id: u16) -> Self {
-        self.vendor_id = Some(vendor_id);
-        self.product_id = Some(product_id);
-        self
-    }
-
-    fn matches(&self, p: &ProbeInfo) -> bool {
-        self.vendor_id.is_none_or(|v| v == p.vendor_id)
-            && self.product_id.is_none_or(|pid| pid == p.product_id)
-            && self
-                .serial
-                .as_deref()
-                .is_none_or(|s| p.serial.as_deref() == Some(s))
-    }
-}
+pub use lamella_probe_core::selection::{Candidate, PROBE_SERIAL_ENV, Selector};
+use lamella_probe_core::selection;
 
 /// An error discovering, opening, or negotiating with a probe.
 ///
@@ -372,12 +297,13 @@ pub fn resolve_serial(
 /// test can only reach by supplying the probes, and a selection rule that has never been shown to
 /// REFUSE has not been shown to do its job.
 fn choose_serial(probes: &[ProbeInfo], selector: &Selector) -> Result<String, ProbeError> {
-    let matched: Vec<ProbeInfo> =
-        probes.iter().filter(|p| selector.matches(p)).cloned().collect();
-    match matched.len() {
-        0 => Err(ProbeError::NotFound),
-        1 => matched[0].serial.clone().ok_or(ProbeError::NotFound),
-        _ => Err(ProbeError::Ambiguous(distinct_probes(&matched))),
+    let candidates: Vec<Candidate> = probes.iter().map(ProbeInfo::as_candidate).collect();
+    match selection::choose(&candidates, selector) {
+        selection::Selection::Unique(Some(serial)) => Ok(serial),
+        selection::Selection::Unique(None) | selection::Selection::NotFound => {
+            Err(ProbeError::NotFound)
+        }
+        selection::Selection::Ambiguous(names) => Err(ProbeError::Ambiguous(names)),
     }
 }
 
@@ -485,19 +411,8 @@ pub fn list() -> Vec<ProbeInfo> {
 /// refusal fires -- and no selector could have separated them either. It is a gap in what USB tells
 /// us, not one in this function.
 fn distinct_probes(candidates: &[ProbeInfo]) -> Vec<String> {
-    let mut seen: Vec<(u16, u16, Option<&str>)> = Vec::new();
-    let mut names = Vec::new();
-    for candidate in candidates {
-        let identity = (candidate.vendor_id, candidate.product_id, candidate.serial.as_deref());
-        if seen.contains(&identity) {
-            continue;
-        }
-        seen.push(identity);
-        names.push(candidate.serial.clone().unwrap_or_else(|| {
-            format!("{:04x}:{:04x} (no serial)", candidate.vendor_id, candidate.product_id)
-        }));
-    }
-    names
+    let candidates: Vec<Candidate> = candidates.iter().map(ProbeInfo::as_candidate).collect();
+    selection::distinct_names(&candidates)
 }
 
 /// Every probe-like interface across the native transports -- one entry per interface, so a
@@ -523,7 +438,7 @@ fn all_candidates() -> Vec<ProbeInfo> {
 /// such as [`lamella_cmsis_dap::Dap::read_idcode`].
 pub fn open(selector: &Selector) -> Result<Session, ProbeError> {
     let mut candidates: Vec<ProbeInfo> =
-        all_candidates().into_iter().filter(|p| selector.matches(p)).collect();
+        all_candidates().into_iter().filter(|p| selector.matches(&p.as_candidate())).collect();
     if candidates.is_empty() {
         return Err(ProbeError::NotFound);
     }
@@ -838,7 +753,7 @@ mod tests {
 
     #[test]
     fn selector_matches_on_set_fields_only() {
-        let p = hid_probe(Some(0xff00), Some(0x01), Some(65), None);
+        let p = hid_probe(Some(0xff00), Some(0x01), Some(65), None).as_candidate();
         assert!(Selector::any().matches(&p));
         assert!(Selector::by_serial("PROBE0000001").matches(&p));
         assert!(!Selector::by_serial("OTHER").matches(&p));

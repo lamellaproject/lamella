@@ -9,6 +9,7 @@ description = "The shared garbage-collection contract: root reporting, the trace
 
 # A leaf: the GC contract both the interpreter (lamella-cil-runtime) and the AOT backend
 # (lamella-aot) implement against. No dependencies -- it only defines the shapes.
+publish = false
 [dependencies]
 
 [features]

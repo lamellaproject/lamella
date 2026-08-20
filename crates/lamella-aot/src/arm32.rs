@@ -234,6 +234,8 @@ fn lower_inst(
                 ConvKind::Float32ToInt
                     | ConvKind::IntToFloat32
                     | ConvKind::Float64ToInt
+                    | ConvKind::Float32ToLong
+                    | ConvKind::Float64ToLong
                     | ConvKind::IntToFloat64
                     | ConvKind::LongToFloat64
                     | ConvKind::Float32ToFloat64
@@ -345,6 +347,8 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
         ConvKind::Float32ToInt
         | ConvKind::IntToFloat32
         | ConvKind::Float64ToInt
+        | ConvKind::Float32ToLong
+        | ConvKind::Float64ToLong
         | ConvKind::IntToFloat64
         | ConvKind::LongToFloat64
         | ConvKind::Float32ToFloat64
@@ -4254,6 +4258,8 @@ fn aeabi_convert_helper(kind: ConvKind) -> Option<&'static str> {
     match kind {
         ConvKind::IntToFloat32 => Some("__aeabi_i2f"),
         ConvKind::Float64ToInt => Some("__aeabi_d2iz"),
+        ConvKind::Float32ToLong => Some("__aeabi_f2lz"),
+        ConvKind::Float64ToLong => Some("__aeabi_d2lz"),
         ConvKind::IntToFloat64 => Some("__aeabi_i2d"),
         ConvKind::LongToFloat64 => Some("__aeabi_l2d"),
         ConvKind::Float32ToFloat64 => Some("__aeabi_f2d"),
@@ -9130,6 +9136,50 @@ mod tests {
                 .iter()
                 .any(|r| obj.symbols[r.symbol as usize].name == "__aeabi_d2iz"),
             "a relocation targets __aeabi_d2iz"
+        );
+    }
+
+    #[test]
+    fn lower_object_lowers_double_to_long_via_aeabi_d2lz() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::F64, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 0x4008_0000_0000_0000,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::Float64ToLong,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "__aeabi_d2lz" && !s.defined),
+            "double->long emits an undefined __aeabi_d2lz extern"
+        );
+        assert!(
+            obj.relocations
+                .iter()
+                .any(|r| obj.symbols[r.symbol as usize].name == "__aeabi_d2lz"),
+            "a relocation targets __aeabi_d2lz"
         );
     }
 

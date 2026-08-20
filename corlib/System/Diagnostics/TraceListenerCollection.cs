@@ -6,7 +6,7 @@ namespace System.Diagnostics
         private TraceListener[] _items;
         private int _count;
 
-        public TraceListenerCollection()
+        internal TraceListenerCollection()
         {
             _items = new TraceListener[4];
             _count = 0;

@@ -8,7 +8,7 @@ use crate::ast::{
     NamespaceDecl, NamespaceMember, OverloadableOperator,
     Parameter, ParameterModifier, PostfixOperator, PredefinedType, QualifiedName, Stmt, StmtKind,
     SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeParameter, TypeParameterConstraint,
-    TypeParameterConstraintClause, TypeRef, TypeRefKind,
+    TypeNamePart, TypeParameterConstraintClause, TypeRef, TypeRefKind,
     TypeTestOperation,
     UnaryOperator, UsingDirective, UsingKind, UsingResource, VariableDeclarator,
 };
@@ -113,6 +113,9 @@ pub struct ParsedCompilationUnit {
     pub unit: CompilationUnit,
     /// Lexical and syntactic diagnostics, in source order.
     pub diagnostics: Vec<Diagnostic>,
+    /// This file's `#pragma warning disable|restore` directives (9.5.8), in source order. They
+    /// govern diagnostics the BINDER produces, so they have to reach whoever holds both.
+    pub pragma_warnings: Vec<crate::lexer::PragmaWarning>,
 }
 
 /// Lexes and parses `source` as a whole compilation unit (ECMA-334 1st ed, 16.1) under the
@@ -131,12 +134,15 @@ pub fn parse_compilation_unit_with(
     options: LexOptions,
 ) -> ParsedCompilationUnit {
     let version = options.version;
-    let mut parser = Parser::new(tokenize_with(source, options));
+    let tokenized = tokenize_with(source, options);
+    let pragma_warnings = tokenized.pragma_warnings.clone();
+    let mut parser = Parser::new(tokenized);
     parser.version = version;
     let unit = parser.parse_compilation_unit();
     ParsedCompilationUnit {
         unit,
         diagnostics: without_gated_operator_cascades(parser.diagnostics),
+        pragma_warnings,
     }
 }
 
@@ -208,6 +214,19 @@ struct Parser {
     /// DIAGNOSTIC needs it too -- its code and its "in C# N" both name the version being compiled,
     /// not the one the feature wants.
     version: LanguageVersion,
+    /// Whether the parser is inside the parameter list or body of a method whose modifiers
+    /// include `async`. This is the CONTEXT the contextuality of `await` is scoped to (ECMA-334
+    /// 5th ed, 12.8.8.1): inside, every non-verbatim `await` is the operator and a declared name
+    /// spelled `await` is CS4003; outside, `await` is an ordinary identifier except in the
+    /// measured operator shapes (see [`Parser::await_operator_here`]). Saved and restored around
+    /// each method, never around nested types -- a nested type's members parse through their own
+    /// `parse_member` calls, each of which sets it from its own modifiers.
+    in_async_method: bool,
+    /// Whether the parser is inside an `unsafe { ... }` block, which the parser LOWERS to a
+    /// plain block (pointer use is permitted regardless) -- so the one rule that needs the
+    /// context, `await` refusing there (CS4004, measured), must be raised while the block is
+    /// still visible. Tracked only inside async methods, where the operator exists.
+    in_unsafe_block: bool,
 }
 
 impl Parser {
@@ -225,6 +244,8 @@ impl Parser {
             diagnostics: tokenized.diagnostics,
             defined_symbols: tokenized.defined_symbols,
             version: LanguageVersion::DEFAULT,
+            in_async_method: false,
+            in_unsafe_block: false,
         }
     }
 
@@ -267,13 +288,33 @@ impl Parser {
         }
     }
 
-    /// The current token's identifier text, if it is an identifier. Used for the
-    /// contextual `get`/`set` accessor names, which are not keywords.
+    /// The current token's identifier text, if it is an identifier.
+    ///
+    /// **ASK [`Parser::current_contextual_keyword`] INSTEAD WHENEVER THE TEXT IS COMPARED AGAINST A
+    /// CONTEXTUAL KEYWORD** -- `get`, `set`, `add`, `remove`, `where`, `required`, `async`,
+    /// `await`. This one answers about the NAME, which is the right question for a declared
+    /// identifier and the wrong one for a word that is only sometimes a keyword.
     fn current_identifier_text(&self) -> Option<&str> {
         match &self.current().kind {
             TokenKind::Identifier(text) => Some(text),
             _ => None,
         }
+    }
+
+    /// The current token's identifier text WHEN IT MAY BE READ AS A CONTEXTUAL KEYWORD -- `None`
+    /// for a verbatim identifier, which 9.4.2 forces back to an ordinary name.
+    ///
+    /// **ONE FUNCTION BECAUSE THE RULE HAS ONE STATEMENT AND SEVEN SITES.** `@get` is a method
+    /// named `get`, `@where` is a type named `where`, `@required` is a type named `required`, and
+    /// each is a program csc REJECTS -- so a site that compares the text alone accepts something
+    /// invalid, quietly, and every new contextual keyword adds another such site. Measured before
+    /// the fix: `class Box<T> @where T : class` compiled here and is CS1514 in csc, and
+    /// `@required int n;` was read as the modifier where csc reads a type name (CS1519).
+    fn current_contextual_keyword(&self) -> Option<&str> {
+        if self.current().verbatim {
+            return None;
+        }
+        self.current_identifier_text()
     }
 
     /// Consumes the current token if it is `keyword`, reporting whether it was.
@@ -361,7 +402,11 @@ impl Parser {
                 }
                 Keyword::Unsafe if self.next_is(Punctuator::OpenBrace) => {
                     self.bump();
-                    return self.parse_block();
+                    let was_unsafe = self.in_unsafe_block;
+                    self.in_unsafe_block = true;
+                    let block = self.parse_block();
+                    self.in_unsafe_block = was_unsafe;
+                    return block;
                 }
                 _ => {}
             }
@@ -530,6 +575,9 @@ impl Parser {
             let ty = self.parse_type();
             return self.parse_local_declaration(start, ty, true);
         }
+        if self.await_blocks_declaration_here() {
+            return self.parse_expression_statement(start);
+        }
         let saved_position = self.position;
         let saved_diagnostics = self.diagnostics.len();
         let ty = self.parse_type();
@@ -543,6 +591,68 @@ impl Parser {
         self.parse_expression_statement(start)
     }
 
+    /// Whether a statement beginning at the current non-verbatim `await` must take the
+    /// EXPRESSION reading (see the carve-out in
+    /// [`Parser::parse_declaration_or_expression_statement`]). Inside an async method: always.
+    /// Outside one: only for `await Ident (`, where the declaration reading is impossible and
+    /// csc reads the operator (measured).
+    fn await_blocks_declaration_here(&self) -> bool {
+        if !matches!(self.current_contextual_keyword(), Some("await")) {
+            return false;
+        }
+        if self.in_async_method {
+            return true;
+        }
+        matches!(
+            self.tokens.get(self.position + 1).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_))
+        ) && matches!(
+            self.tokens.get(self.position + 2).map(|token| &token.kind),
+            Some(TokenKind::Punctuator(Punctuator::OpenParen))
+        )
+    }
+
+    /// Whether the current token begins an `await` OPERATOR in expression position.
+    ///
+    /// Inside an async method: every non-verbatim `await` (the word is reserved there,
+    /// 12.8.8.1). Outside one, only the shapes csc reads as the operator, each measured
+    /// one compilation apiece: a following identifier (`x = await T()` is CS4033), a literal, or a
+    /// token that begins a primary expression and cannot continue `await`-as-identifier
+    /// (`new`, `this`, `base`, `typeof`, `true`/`false`/`null`, a predefined type). NOT `(`
+    /// (`await(1)` stays a call of a method named `await` -- compiles in csc), NOT an
+    /// operator (`await + 1` stays identifier-plus-plus -- compiles), NOT `[`, `.`, `;`.
+    fn await_operator_here(&self) -> bool {
+        if !matches!(self.current_contextual_keyword(), Some("await")) {
+            return false;
+        }
+        if self.in_async_method {
+            return true;
+        }
+        match self.tokens.get(self.position + 1).map(|token| &token.kind) {
+            Some(
+                TokenKind::Identifier(_)
+                | TokenKind::IntegerLiteral { .. }
+                | TokenKind::RealLiteral { .. }
+                | TokenKind::DecimalLiteral { .. }
+                | TokenKind::CharacterLiteral(_)
+                | TokenKind::StringLiteral(_),
+            ) => true,
+            Some(TokenKind::Keyword(keyword)) => {
+                matches!(
+                    keyword,
+                    Keyword::New
+                        | Keyword::This
+                        | Keyword::Base
+                        | Keyword::Typeof
+                        | Keyword::True
+                        | Keyword::False
+                        | Keyword::Null
+                ) || predefined_type(&TokenKind::Keyword(*keyword)).is_some()
+            }
+            _ => false,
+        }
+    }
+
     /// Parses one or more comma-separated variable declarators (15.5.1), each an
     /// identifier with an optional `= expression` initializer. Array initializers
     /// are not yet parsed. Does not consume a terminator.
@@ -550,7 +660,7 @@ impl Parser {
         let mut declarators = Vec::new();
         loop {
             let declarator_start = self.current().span.start;
-            let (name, mut end) = self.expect_identifier();
+            let (name, mut end) = self.expect_declared_name();
             let initializer = if self.eat(Punctuator::Equals) {
                 let value = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                     self.parse_array_initializer()
@@ -685,7 +795,7 @@ impl Parser {
             DiagnosticKind::TokenExpected { expected: "(" },
         );
         let ty = self.parse_type();
-        let (name, _) = self.expect_identifier();
+        let (name, _) = self.expect_declared_name();
         if !self.eat_keyword(Keyword::In) {
             let at = self.current().span.start;
             self.report(DiagnosticKind::InExpected, Span::empty_at(at));
@@ -780,7 +890,7 @@ impl Parser {
         let (exception_type, name) = if self.eat(Punctuator::OpenParen) {
             let ty = self.parse_type();
             let name = if matches!(self.current().kind, TokenKind::Identifier(_)) {
-                Some(self.expect_identifier().0)
+                Some(self.expect_declared_name().0)
             } else {
                 None
             };
@@ -1566,8 +1676,6 @@ impl Parser {
         }
     }
 
-    /// Parses a run of leading declaration modifiers (17.2 and elsewhere). The
-    /// parser accepts any; binding checks which are valid where.
     /// Whether the identifier `required` at the current position is the C# 11 MODIFIER rather than
     /// an ordinary identifier naming the member's own type.
     ///
@@ -1589,7 +1697,7 @@ impl Parser {
     /// language version 11.0` diagnostic instead of a parse cascade, which is the whole point of
     /// having the gate.
     fn required_is_a_modifier_here(&self) -> bool {
-        if !matches!(&self.current().kind, TokenKind::Identifier(text) if &**text == "required") {
+        if !matches!(self.current_contextual_keyword(), Some("required")) {
             return false;
         }
         if self.version >= LanguageVersion::CSharp11 {
@@ -1606,6 +1714,113 @@ impl Parser {
         starts_a_type && then_a_name
     }
 
+    /// Whether the current `async` identifier is the C# 5 MODIFIER rather than a type or an
+    /// ordinary name (ECMA-334 5th ed, 15.15). All rows measured against csc, one compilation each:
+    ///
+    /// | source | csc reads it as |
+    /// |---|---|
+    /// | `async Task M() { }` | modifier |
+    /// | `async async async() { }` | modifier, then type `async`, then name |
+    /// | `async async() { ... }` | **a method named `async` returning type `async`** |
+    /// | `async f;` | **a field `f` of type `async`** |
+    /// | `async C() { }` | **type `async`, method `C`** (CS0246 + CS0542, not a ctor) |
+    /// | `async int f;` | modifier, then CS0106 from the binder |
+    ///
+    /// So it is a modifier exactly when what follows can only be read as the REST of a member
+    /// header: another modifier, a predefined type (including `void`), or a scannable type
+    /// followed by an identifier. Unlike [`Parser::required_is_a_modifier_here`]'s two-token
+    /// peek, the last case must SCAN A FULL TYPE speculatively -- `async Task<int> M()` puts
+    /// arbitrarily many tokens between the modifier and the name that proves it is one.
+    ///
+    /// `@async` is never a modifier: the verbatim prefix forces the ordinary identifier (9.4.2).
+    /// Whether the identifier `partial` at the current position is the C# 2.0 MODIFIER rather than
+    /// an ordinary identifier (ECMA-334 4th ed 17.1.4).
+    ///
+    /// **ONE TOKEN OF LOOKAHEAD IS THE WHOLE RULE, AND THAT IS THE STANDARD'S DOING RATHER THAN A
+    /// SHORTCUT.** 17.1.4 admits `partial` only IMMEDIATELY before the declaration's keyword, so
+    /// unlike [`Parser::required_is_a_modifier_here`]'s two-token peek and
+    /// [`Parser::async_is_a_modifier_here`]'s speculative type scan, there is nothing to
+    /// disambiguate: what follows is `class`, `struct` or `interface`, or this is not a modifier.
+    ///
+    /// Measured against csc, and both rows matter: `public class partial { }` declares a TYPE
+    /// named `partial`, and `class C { partial x; }` declares a FIELD of that type. Neither
+    /// compiles if the identifier is claimed unconditionally.
+    ///
+    /// `@partial` is never a modifier: the verbatim prefix forces the ordinary identifier (9.4.2),
+    /// which [`Parser::current_contextual_keyword`] already enforces for every contextual keyword.
+    fn partial_is_a_modifier_here(&self) -> bool {
+        matches!(self.current_contextual_keyword(), Some("partial"))
+            && matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Keyword(
+                    Keyword::Class | Keyword::Struct | Keyword::Interface
+                ))
+            )
+    }
+
+    /// Whether the identifier `partial` at the current position is a MISPLACED modifier -- one
+    /// standing before other modifiers rather than immediately before the declaration's keyword,
+    /// which is csc's CS0267.
+    ///
+    /// **THE LOOKAHEAD HAS TO REACH PAST THE MODIFIERS, AND STOPPING SHORT IS NOT A LOOSER RULE
+    /// BUT A WRONG ONE.** `partial x;` is a FIELD of type `partial` and must stay one, so the
+    /// identifier alone cannot decide; only a `class`/`struct`/`interface` after the run of
+    /// modifier keywords says a type declaration was meant. Without the scan this shape drew a
+    /// parse cascade where csc draws one CS0267.
+    fn partial_is_misplaced_here(&self) -> bool {
+        if !matches!(self.current_contextual_keyword(), Some("partial")) {
+            return false;
+        }
+        let mut ahead = self.position + 1;
+        while let Some(TokenKind::Keyword(keyword)) = self.tokens.get(ahead).map(|token| &token.kind)
+        {
+            match keyword {
+                Keyword::Class | Keyword::Struct | Keyword::Interface => return true,
+                _ if modifier_of(*keyword).is_some() => ahead += 1,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn async_is_a_modifier_here(&mut self) -> bool {
+        if !matches!(self.current_contextual_keyword(), Some("async")) {
+            return false;
+        }
+        match self.tokens.get(self.position + 1).map(|token| &token.kind) {
+            Some(TokenKind::Keyword(keyword)) => {
+                if modifier_of(*keyword).is_some() {
+                    return true;
+                }
+                predefined_type(&TokenKind::Keyword(*keyword)).is_some()
+                    || matches!(
+                        keyword,
+                        Keyword::Void
+                            | Keyword::Class
+                            | Keyword::Struct
+                            | Keyword::Interface
+                            | Keyword::Enum
+                            | Keyword::Delegate
+                            | Keyword::Event
+                    )
+            }
+            Some(TokenKind::Identifier(_)) => {
+                let saved_position = self.position;
+                let saved_diagnostics = self.diagnostics.len();
+                self.bump();
+                let ty = self.parse_type();
+                let is_modifier = !matches!(ty.kind, TypeRefKind::Error)
+                    && matches!(self.current().kind, TokenKind::Identifier(_));
+                self.position = saved_position;
+                self.diagnostics.truncate(saved_diagnostics);
+                is_modifier
+            }
+            _ => false,
+        }
+    }
+
+    /// Parses a run of leading declaration modifiers (17.2 and elsewhere). The parser accepts any;
+    /// binding checks which are valid where.
     fn parse_modifiers(&mut self) -> Vec<Modifier> {
         let mut modifiers = Vec::new();
         loop {
@@ -1625,6 +1840,36 @@ impl Parser {
                         );
                     }
                     Modifier::Required
+                }
+                None if self.partial_is_a_modifier_here() => {
+                    if !self.version.supports(Feature::PartialTypes) {
+                        self.report(
+                            DiagnosticKind::FeatureRequiresLaterVersion {
+                                feature: Feature::PartialTypes.description(),
+                                required: Feature::PartialTypes.introduced_in().required_name(),
+                                current: self.version,
+                            },
+                            self.current().span,
+                        );
+                    }
+                    Modifier::Partial
+                }
+                None if self.partial_is_misplaced_here() => {
+                    self.report(DiagnosticKind::PartialModifierPosition, self.current().span);
+                    Modifier::Partial
+                }
+                None if self.async_is_a_modifier_here() => {
+                    if !self.version.supports(Feature::AsyncFunction) {
+                        self.report(
+                            DiagnosticKind::FeatureRequiresLaterVersion {
+                                feature: Feature::AsyncFunction.description(),
+                                required: Feature::AsyncFunction.introduced_in().required_name(),
+                                current: self.version,
+                            },
+                            self.current().span,
+                        );
+                    }
+                    Modifier::Async
                 }
                 None => break,
             };
@@ -1724,7 +1969,10 @@ impl Parser {
                 || (self.next_is(Punctuator::LessThan)
                     && !self.explicit_interface_qualifier_ahead()))
         {
+            let name_span = self.current().span;
             let (name, _) = self.expect_identifier();
+            let was_async = self.in_async_method;
+            self.in_async_method = modifiers.contains(&Modifier::Async);
             let type_parameters = self.parse_type_parameter_list();
             let (parameters, arglist) = self.parse_parameter_list();
             let constraints = self.parse_type_parameter_constraint_clauses();
@@ -1733,9 +1981,13 @@ impl Parser {
                 let end = block.span.end;
                 (Some(block), end)
             } else {
+                if self.in_async_method {
+                    self.report(DiagnosticKind::AsyncRequiresBody, name_span);
+                }
                 let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
                 (None, end)
             };
+            self.in_async_method = was_async;
             return Member::Method {
                 modifiers,
                 return_type: ty,
@@ -1751,78 +2003,80 @@ impl Parser {
             };
         }
         if self.explicit_interface_qualifier_ahead() {
-            let restore_position = self.position;
-            let restore_diagnostics = self.diagnostics.len();
             let name_start = self.current().span.start;
             let (first, mut prev_end) = self.expect_identifier();
-            let mut parts = Vec::new();
-            parts.push(first);
+            let mut parts: Vec<TypeNamePart> = Vec::new();
+            let mut name = first;
             let mut arguments: Vec<TypeRef> = Vec::new();
-            let mut arguments_on: Option<usize> = None;
+            let mut constructed = false;
             let mut interface_end = prev_end;
             if self.current_punctuator() == Some(Punctuator::LessThan)
                 && self.generic_type_name_ahead()
             {
                 let (list, list_end, _) = self.parse_type_argument_list(false);
                 arguments = list;
-                arguments_on = Some(parts.len() - 1);
+                constructed = true;
                 prev_end = list_end;
             }
             while self.current_punctuator() == Some(Punctuator::Dot) {
                 self.bump();
                 interface_end = prev_end;
+                parts.push(TypeNamePart { name, arguments });
+                arguments = Vec::new();
                 let (part, part_end) = self.expect_identifier();
-                parts.push(part);
+                name = part;
                 prev_end = part_end;
                 if self.current_punctuator() == Some(Punctuator::LessThan)
                     && self.generic_type_name_ahead()
                 {
                     let (list, list_end, _) = self.parse_type_argument_list(false);
                     arguments = list;
-                    arguments_on = Some(parts.len() - 1);
+                    constructed = true;
                     prev_end = list_end;
                 }
             }
-            let member = parts.pop().expect("a qualified member name has >= 2 parts");
-            if arguments.is_empty() || arguments_on == Some(parts.len().saturating_sub(1)) {
-                let interface_kind = if arguments.is_empty() {
-                    TypeRefKind::Name(parts)
-                } else {
-                    TypeRefKind::Generic { parts, arguments }
-                };
-                let explicit_interface =
-                    TypeRef::new(interface_kind, Span::new(name_start, interface_end));
-                if self.current_punctuator() == Some(Punctuator::OpenBrace) {
-                    return self
-                        .parse_property(modifiers, ty, member, Some(explicit_interface), start);
-                }
-                let type_parameters = self.parse_type_parameter_list();
-                let (parameters, arglist) = self.parse_parameter_list();
-                let constraints = self.parse_type_parameter_constraint_clauses();
-                let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
-                    let block = self.parse_block();
-                    let end = block.span.end;
-                    (Some(block), end)
-                } else {
-                    let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
-                    (None, end)
-                };
-                return Member::Method {
-                    modifiers,
-                    return_type: ty,
-                    name: member,
-                    type_parameters,
-                    constraints,
-                    parameters,
-                    is_vararg: arglist.is_some(),
-                    body,
-                    explicit_interface: Some(explicit_interface),
-                    attributes: Vec::new(),
-                    span: Span::new(start, end),
-                };
+            let member = name;
+            let interface_kind = if constructed {
+                TypeRefKind::Generic { parts }
+            } else {
+                TypeRefKind::Name(parts.into_iter().map(|part| part.name).collect())
+            };
+            let explicit_interface =
+                TypeRef::new(interface_kind, Span::new(name_start, interface_end));
+            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                return self
+                    .parse_property(modifiers, ty, member, Some(explicit_interface), start);
             }
-            self.position = restore_position;
-            self.diagnostics.truncate(restore_diagnostics);
+            let was_async = self.in_async_method;
+            self.in_async_method = modifiers.contains(&Modifier::Async);
+            let type_parameters = self.parse_type_parameter_list();
+            let (parameters, arglist) = self.parse_parameter_list();
+            let constraints = self.parse_type_parameter_constraint_clauses();
+            let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                let block = self.parse_block();
+                let end = block.span.end;
+                (Some(block), end)
+            } else {
+                if self.in_async_method {
+                    self.report(DiagnosticKind::AsyncRequiresBody, Span::new(name_start, prev_end));
+                }
+                let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+                (None, end)
+            };
+            self.in_async_method = was_async;
+            return Member::Method {
+                modifiers,
+                return_type: ty,
+                name: member,
+                type_parameters,
+                constraints,
+                parameters,
+                is_vararg: arglist.is_some(),
+                body,
+                explicit_interface: Some(explicit_interface),
+                attributes: Vec::new(),
+                span: Span::new(start, end),
+            };
         }
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::OpenBrace)
@@ -1890,29 +2144,18 @@ impl Parser {
             }
             let accessor_start = self.current().span.start;
             let attributes = self.parse_attribute_sections();
-            if matches!(
-                self.current_keyword(),
-                Some(Keyword::Public | Keyword::Protected | Keyword::Internal | Keyword::Private)
-            ) {
-                let at = self.current().span.start;
-                self.report(
-                    DiagnosticKind::FeatureRequiresLaterVersion {
-                        feature: crate::version::Feature::AccessorAccessibility.description(),
-                        required: crate::version::Feature::AccessorAccessibility
-                            .introduced_in()
-                            .required_name(),
-                                current: self.version,
-                    },
-                    Span::empty_at(at),
-                );
-                while matches!(
-                    self.current_keyword(),
-                    Some(Keyword::Public | Keyword::Protected | Keyword::Internal | Keyword::Private)
-                ) {
-                    self.bump();
-                }
+            let mut modifiers = Vec::new();
+            while let Some(modifier) = match self.current_keyword() {
+                Some(Keyword::Public) => Some(Modifier::Public),
+                Some(Keyword::Protected) => Some(Modifier::Protected),
+                Some(Keyword::Internal) => Some(Modifier::Internal),
+                Some(Keyword::Private) => Some(Modifier::Private),
+                _ => None,
+            } {
+                modifiers.push(modifier);
+                self.bump();
             }
-            let is_getter = match self.current_identifier_text() {
+            let is_getter = match self.current_contextual_keyword() {
                 Some("get") => true,
                 Some("set") => false,
                 _ => break,
@@ -1928,6 +2171,7 @@ impl Parser {
             };
             let accessor = Accessor {
                 attributes,
+                modifiers,
                 body,
                 span: Span::new(accessor_start, accessor_end),
             };
@@ -2039,7 +2283,7 @@ impl Parser {
             }
             let accessor_start = self.current().span.start;
             let attributes = self.parse_attribute_sections();
-            let is_adder = match self.current_identifier_text() {
+            let is_adder = match self.current_contextual_keyword() {
                 Some("add") => true,
                 Some("remove") => false,
                 _ => break,
@@ -2055,6 +2299,7 @@ impl Parser {
             };
             let accessor = Accessor {
                 attributes,
+                modifiers: Vec::new(),
                 body,
                 span: Span::new(accessor_start, accessor_end),
             };
@@ -2307,7 +2552,7 @@ impl Parser {
                 _ => None,
             };
             let ty = self.parse_type();
-            let (name, mut end) = self.expect_identifier();
+            let (name, mut end) = self.expect_declared_name();
             if self.current_punctuator() == Some(Punctuator::Equals) {
                 let at = self.current().span.start;
                 self.report(
@@ -2366,7 +2611,7 @@ impl Parser {
     /// The conditional `a ? b : c` (14.13). Its branches are full expressions, so
     /// they may themselves be assignments or further conditionals.
     fn parse_conditional(&mut self) -> Expr {
-        let condition = self.parse_binary(1);
+        let condition = self.parse_null_coalescing();
         if !self.eat(Punctuator::Question) {
             return condition;
         }
@@ -2382,6 +2627,31 @@ impl Parser {
                 condition: Box::new(condition),
                 when_true: Box::new(when_true),
                 when_false: Box::new(when_false),
+            },
+            span,
+        )
+    }
+
+    /// The null-coalescing operator `a ?? b` (C# 2.0; ECMA-334 4th ed 14.13), which sits between
+    /// conditional-OR and the conditional operator.
+    ///
+    /// **RIGHT-ASSOCIATIVE, AND THAT IS NOT A STYLE CHOICE**: `a ?? b ?? c` groups as
+    /// `a ?? (b ?? c)`, and the other grouping differs whenever `b` is null -- `(a ?? b) ?? c`
+    /// tests the RESULT of the first coalesce, so a null `b` reached with a null `a` would yield
+    /// `c` either way but a null `b` with a non-null `a` would not. Recursing at this level rather
+    /// than looping is what makes it right-associative.
+    fn parse_null_coalescing(&mut self) -> Expr {
+        let left = self.parse_binary(1);
+        if self.current_punctuator() != Some(Punctuator::QuestionQuestion) {
+            return left;
+        }
+        self.bump();
+        let right = self.parse_null_coalescing();
+        let span = Span::new(left.span.start, right.span.end);
+        Expr::new(
+            ExprKind::NullCoalescing {
+                left: Box::new(left),
+                right: Box::new(right),
             },
             span,
         )
@@ -2434,6 +2704,29 @@ impl Parser {
 
     /// Unary expressions (14.6): a prefix operator, a cast, or a postfix chain.
     fn parse_unary(&mut self) -> Expr {
+        if self.await_operator_here() {
+            let await_span = self.current().span;
+            self.bump();
+            if !self.in_async_method {
+                if !self.version.supports(Feature::AsyncFunction) {
+                    self.report(
+                        DiagnosticKind::FeatureRequiresLaterVersion {
+                            feature: Feature::AsyncFunction.description(),
+                            required: Feature::AsyncFunction.introduced_in().required_name(),
+                            current: self.version,
+                        },
+                        await_span,
+                    );
+                }
+                self.report(DiagnosticKind::AwaitOutsideAsync, await_span);
+            }
+            if self.in_async_method && self.in_unsafe_block {
+                self.report(DiagnosticKind::AwaitInUnsafe, await_span);
+            }
+            let operand = self.parse_unary();
+            let span = Span::new(await_span.start, operand.span.end);
+            return Expr::new(ExprKind::Await(Box::new(operand)), span);
+        }
         if self.current_punctuator() == Some(Punctuator::Asterisk) {
             let start = self.current().span.start;
             self.bump();
@@ -2972,6 +3265,22 @@ impl Parser {
         }
     }
 
+    /// [`Parser::expect_identifier`] for a DECLARED name: a local declarator, a parameter, a
+    /// `foreach` iteration variable, a `catch` variable. Inside an async method a declared name
+    /// spelled `await` without the verbatim prefix is CS4003 (12.8.8.1; code and text measured),
+    /// and `@await` passes -- which is why the check needs the token's verbatim flag rather than
+    /// its text. One rule, one function, four callers, so a fifth declaration form grows the
+    /// check by calling this instead of re-spelling it.
+    fn expect_declared_name(&mut self) -> (Box<str>, u32) {
+        let span = self.current().span;
+        let verbatim = self.current().verbatim;
+        let (name, end) = self.expect_identifier();
+        if self.in_async_method && !verbatim && &*name == "await" {
+            self.report(DiagnosticKind::AwaitAsIdentifier, span);
+        }
+        (name, end)
+    }
+
     /// Parses a parenthesized operand `( expression )`, shared by `checked` and
     /// `unchecked`. Returns the inner expression and the offset past the `)`.
     fn parse_parenthesized_operand(&mut self) -> (Expr, u32) {
@@ -3033,22 +3342,29 @@ impl Parser {
             self.bump();
             base = TypeRef::new(TypeRefKind::Pointer(Box::new(base)), Span::new(start, end));
         }
-        if allow_nullable
-            && self.current_punctuator() == Some(Punctuator::Question)
-            && matches!(&base.kind, TypeRefKind::Predefined(p) if is_predefined_value_type(*p))
-        {
-            let at = self.current().span.start;
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: crate::version::Feature::NullableValueTypes.description(),
-                    required: crate::version::Feature::NullableValueTypes
-                        .introduced_in()
-                        .required_name(),
-                            current: self.version,
-                },
-                Span::empty_at(at),
-            );
-            self.bump();
+        if allow_nullable && self.current_punctuator() == Some(Punctuator::Question) {
+            if self.version.supports(Feature::NullableValueTypes) {
+                let end = self.current().span.end;
+                self.bump();
+                base = TypeRef::new(
+                    TypeRefKind::Nullable(Box::new(base)),
+                    Span::new(start, end),
+                );
+            } else if matches!(&base.kind, TypeRefKind::Predefined(p) if is_predefined_value_type(*p))
+            {
+                let at = self.current().span.start;
+                self.report(
+                    DiagnosticKind::FeatureRequiresLaterVersion {
+                        feature: crate::version::Feature::NullableValueTypes.description(),
+                        required: crate::version::Feature::NullableValueTypes
+                            .introduced_in()
+                            .required_name(),
+                        current: self.version,
+                    },
+                    Span::empty_at(at),
+                );
+                self.bump();
+            }
         }
         let mut ranks = Vec::new();
         while let Some(rank) = self.try_rank_specifier() {
@@ -3217,16 +3533,15 @@ impl Parser {
     /// [`MemberInitializerValue`] rather than a synthesized `new`.
     fn parse_member_initializer(&mut self) -> MemberInitializer {
         let start = self.current().span.start;
-        let (name, mut end) = self.expect_identifier();
+        let (name, _) = self.expect_identifier();
         self.expect(Punctuator::Equals, DiagnosticKind::TokenExpected { expected: "=" });
-        let value = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+        let (value, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
             let (nested, nested_end) = self.parse_initializer();
-            end = nested_end;
-            MemberInitializerValue::Nested(nested)
+            (MemberInitializerValue::Nested(nested), nested_end)
         } else {
             let expression = self.parse_expression();
-            end = expression.span.end;
-            MemberInitializerValue::Expression(expression)
+            let end = expression.span.end;
+            (MemberInitializerValue::Expression(expression), end)
         };
         MemberInitializer {
             name,
@@ -3365,12 +3680,10 @@ impl Parser {
     /// type parse -- one feature diagnostic (CS8022) at the `<`, the same one `typeof(List<int>)`
     /// draws, from the same line of code.
     ///
-    /// A specifier on a NON-FINAL part -- `typeof(Outer<>.Inner)` -- is not accepted, though the
-    /// grammar allows one after every part. [`TypeRefKind::Unbound`] carries ONE arity for a whole
-    /// dotted name because [`TypeRefKind::Generic`] carries ONE argument list for one, so the
-    /// constructed form `List<int>.Enumerator` and the unbound form `List<>.Enumerator` are
-    /// unrepresentable for the same reason. This answers `None` for it and the ordinary type parse
-    /// refuses, which is what it already does for the constructed form.
+    /// A specifier on a NON-FINAL part -- `typeof(List<>.Enumerator)` -- is not accepted, though
+    /// the grammar allows one after every part and csc compiles it. [`TypeRefKind::Unbound`]
+    /// carries ONE arity for a whole dotted name, so there is nowhere to record which part the
+    /// specifier sat on. This answers `None` for it and the ordinary type parse refuses.
     fn parse_unbound_type_name(&mut self) -> Option<TypeRef> {
         if !self.version.supports(Feature::Generics) {
             return None;
@@ -3433,47 +3746,61 @@ impl Parser {
     /// [`parse_type_name`](Self::parse_type_name), also returning the right-angle brackets its own
     /// argument list closed on and did not need -- see [`AngleCredit`]. `nested` says whether an
     /// enclosing type-argument list is waiting for a `>`.
+    ///
+    /// **EVERY PART MAY CARRY A TYPE-ARGUMENT LIST, AND THAT IS 10.8's OWN SHAPE**:
+    /// `namespace-or-type-name` is `identifier type-argument-list_opt` repeated over the dots. So
+    /// `List<int>.Enumerator` and `Box<int>.Pair<string>` are read here in full, rather than
+    /// stopping at the first `>` and leaving a `.` that no declarator can follow (CS1002).
     fn parse_type_name_inner(&mut self, nested: bool) -> (TypeRef, AngleCredit) {
         let start = self.current().span.start;
-        let (first, mut end) = self.expect_identifier();
-        let mut parts = Vec::new();
-        parts.push(first);
-        while self.current_punctuator() == Some(Punctuator::Dot) {
+        let verbatim = self.current().verbatim;
+        let (mut name, mut end) = self.expect_identifier();
+        let mut parts: Vec<TypeNamePart> = Vec::new();
+        let mut constructed = false;
+        let mut credit = AngleCredit::default();
+        loop {
+            let mut arguments = Vec::new();
+            if self.current_punctuator() == Some(Punctuator::LessThan) {
+                if self.version.supports(Feature::Generics) {
+                    let (list, list_end, list_credit) = self.parse_type_argument_list(nested);
+                    arguments = list;
+                    end = list_end;
+                    credit = list_credit;
+                    constructed = true;
+                } else {
+                    let at = self.current().span.start;
+                    self.report(
+                        DiagnosticKind::FeatureRequiresLaterVersion {
+                            feature: crate::version::Feature::Generics.description(),
+                            required: crate::version::Feature::Generics
+                                .introduced_in()
+                                .required_name(),
+                            current: self.version,
+                        },
+                        Span::empty_at(at),
+                    );
+                    end = self.skip_type_argument_list();
+                }
+            }
+            parts.push(TypeNamePart { name, arguments });
+            if credit.closes > 0 {
+                break;
+            }
+            if self.current_punctuator() != Some(Punctuator::Dot) {
+                break;
+            }
             self.bump();
-            let (part, part_end) = self.expect_identifier();
-            parts.push(part);
-            end = part_end;
+            let (next, next_end) = self.expect_identifier();
+            name = next;
+            end = next_end;
         }
-        if self.current_punctuator() != Some(Punctuator::LessThan) {
-            return (
-                TypeRef::new(TypeRefKind::Name(parts), Span::new(start, end)),
-                AngleCredit::default(),
-            );
-        }
-        if !self.version.supports(Feature::Generics) {
-            let at = self.current().span.start;
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: crate::version::Feature::Generics.description(),
-                    required: crate::version::Feature::Generics
-                        .introduced_in()
-                        .required_name(),
-                    current: self.version,
-                },
-                Span::empty_at(at),
-            );
-            end = self.skip_type_argument_list();
-            return (
-                TypeRef::new(TypeRefKind::Name(parts), Span::new(start, end)),
-                AngleCredit::default(),
-            );
-        }
-        let (arguments, list_end, credit) = self.parse_type_argument_list(nested);
+        let kind = if constructed {
+            TypeRefKind::Generic { parts }
+        } else {
+            TypeRefKind::Name(parts.into_iter().map(|part| part.name).collect())
+        };
         (
-            TypeRef::new(
-                TypeRefKind::Generic { parts, arguments },
-                Span::new(start, list_end),
-            ),
+            TypeRef::new(kind, Span::new(start, end)).with_verbatim_name(verbatim),
             credit,
         )
     }
@@ -3734,7 +4061,7 @@ impl Parser {
     /// identifier, then `:`. See [`Parser::parse_type_parameter_constraint_clauses`] for why all
     /// three are required.
     fn current_is_constraint_clause_start(&self) -> bool {
-        if !matches!(&self.current().kind, TokenKind::Identifier(name) if &**name == "where") {
+        if !matches!(self.current_contextual_keyword(), Some("where")) {
             return false;
         }
         matches!(
@@ -4078,6 +4405,7 @@ mod tests {
             ExprKind::Unary { operator, operand } => {
                 format!("({} {})", unary_text(*operator), dump(operand))
             }
+            ExprKind::Await(operand) => format!("(await {})", dump(operand)),
             ExprKind::PostfixUnary { operator, operand } => {
                 let text = match operator {
                     PostfixOperator::Increment => "post++",
@@ -4095,6 +4423,9 @@ mod tests {
                 dump(left),
                 dump(right)
             ),
+            ExprKind::NullCoalescing { left, right } => {
+                format!("(?? {} {})", dump(left), dump(right))
+            }
             ExprKind::Conditional {
                 condition,
                 when_true,
@@ -4228,16 +4559,26 @@ mod tests {
                 }
                 text
             }
-            TypeRefKind::Generic { parts, arguments } => {
-                let mut text = parts.join(".");
-                text.push('<');
-                for (index, argument) in arguments.iter().enumerate() {
+            TypeRefKind::Nullable(underlying) => format!("{}?", dump_type(underlying)),
+            TypeRefKind::Generic { parts } => {
+                let mut text = String::new();
+                for (index, part) in parts.iter().enumerate() {
                     if index > 0 {
-                        text.push(',');
+                        text.push('.');
                     }
-                    text.push_str(&dump_type(argument));
+                    text.push_str(&part.name);
+                    if part.arguments.is_empty() {
+                        continue;
+                    }
+                    text.push('<');
+                    for (index, argument) in part.arguments.iter().enumerate() {
+                        if index > 0 {
+                            text.push(',');
+                        }
+                        text.push_str(&dump_type(argument));
+                    }
+                    text.push('>');
                 }
-                text.push('>');
                 text
             }
             TypeRefKind::Unbound { parts, arity } => {
@@ -4599,6 +4940,21 @@ mod tests {
         assert_eq!(tree("null"), "null");
         assert_eq!(tree("foo"), "foo");
         assert_eq!(tree("this"), "this");
+    }
+
+    /// `??` sits between conditional-OR and `?:` and is the one RIGHT-associative binary spelling
+    /// in the language (14.13). Both facts are asserted as TREES rather than as "it compiles",
+    /// because a left-associative `??` accepts every program a right-associative one does and
+    /// answers differently only when the middle operand is null.
+    #[test]
+    fn null_coalescing_is_right_associative_and_binds_below_the_conditional() {
+        let v2 = LanguageVersion::CSharp2;
+        assert_eq!(tree_at("a ?? b", v2), "(?? a b)");
+        assert_eq!(tree_at("a ?? b ?? c", v2), "(?? a (?? b c))");
+        assert_eq!(tree_at("a ?? b ? c : d", v2), "(?: (?? a b) c d)");
+        assert_eq!(tree_at("a || b ?? c", v2), "(?? (|| a b) c)");
+        assert_eq!(tree_at("x = a ?? b", v2), "(= x (?? a b))");
+        assert_eq!(codes("a ?? b"), [8022]);
     }
 
     #[test]
@@ -5079,6 +5435,8 @@ mod tests {
             Modifier::Const => "const",
             Modifier::Unsafe => "unsafe",
             Modifier::Required => "required",
+            Modifier::Async => "async",
+            Modifier::Partial => "partial",
         }
     }
 
@@ -5667,6 +6025,140 @@ mod tests {
     }
 
     #[test]
+    fn async_is_a_modifier_exactly_where_csc_reads_one() {
+        let v4 = LanguageVersion::CSharp4;
+        let v5 = LanguageVersion::CSharp5;
+
+        assert_eq!(unit_codes_at("class C { static async void M() { } }", v5), []);
+        assert_eq!(unit_codes_at("class C { static async void M() { } }", v4), [8025]);
+        assert_eq!(unit_codes("class C { static async void M() { } }"), [8022]);
+        assert_eq!(
+            unit_codes_at("class C { static async void M() { await this.T(); } }", v4),
+            [8025]
+        );
+
+        assert_eq!(unit_codes_at("class async { } class C { async f; }", v5), []);
+        assert_eq!(
+            unit_codes_at("class async { } class C { async async() { return new async(); } }", v5),
+            []
+        );
+        assert_eq!(unit_codes_at("class C { async C() { } }", v5), []);
+        assert_eq!(
+            unit_codes_at("class async { } class C { async async async() { return null; } }", v5),
+            []
+        );
+        assert_eq!(
+            unit_tree_at("class async { } class C { async async async() { return null; } }", v5),
+            "(class async) (class C (method async async async () (block (return null))))"
+        );
+        assert_eq!(
+            unit_codes_at(
+                "using System.Threading.Tasks; class C { static async Task<int> M() { return 1; } }",
+                v5
+            ),
+            []
+        );
+
+        assert_eq!(
+            unit_codes_at("abstract class C { public abstract async void M(); }", v5),
+            [1994]
+        );
+
+        assert_eq!(
+            unit_codes_at(
+                "class C { static void N() { int async = 3; int await = 4; async = await; } }",
+                v5
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn await_is_reserved_inside_an_async_method_and_ordinary_outside() {
+        let v4 = LanguageVersion::CSharp4;
+        let v5 = LanguageVersion::CSharp5;
+
+        assert_eq!(
+            unit_tree_at(
+                "class C { object x; async void M() { await this.x; } }",
+                v5
+            ),
+            "(class C (field object x) (method async void M () (block (expr (await (. this x))))))"
+        );
+        assert_eq!(
+            unit_codes_at("class C { async void M() { int await = 4; } }", v5),
+            [4003]
+        );
+        assert_eq!(
+            unit_codes_at("class C { async void M(int await) { } }", v5),
+            [4003]
+        );
+        assert_eq!(
+            unit_codes_at("class C { async void M() { int @await = 4; @await = 5; } }", v5),
+            []
+        );
+
+        assert_eq!(
+            unit_codes_at("class C { static object T() { return null; } static void N() { await T(); } }", v5),
+            [4033]
+        );
+        assert_eq!(
+            unit_codes_at(
+                "class C { static object T() { return null; } static void N() { object x = await T(); } }",
+                v5
+            ),
+            [4033]
+        );
+        assert_eq!(
+            unit_codes_at("class C { static object T() { return null; } static void N() { await T(); } }", v4),
+            [8025, 4033]
+        );
+        assert_eq!(
+            unit_codes_at("class C { static void N() { object x = await new object(); } }", v5),
+            [4033]
+        );
+
+        assert_eq!(
+            unit_codes_at(
+                "class C { object d; async void M() { unsafe { await this.d; } } }",
+                v5
+            ),
+            [4004]
+        );
+        assert_eq!(
+            unit_codes_at(
+                "class C { object d; async void M() { unsafe { } await this.d; } }",
+                v5
+            ),
+            []
+        );
+
+        assert_eq!(
+            unit_codes_at(
+                "class C { static int await(int x) { return x; } static void N() { int y = await(1); } }",
+                v5
+            ),
+            []
+        );
+        assert_eq!(
+            unit_codes_at("class C { static void N() { int await = 3; int y = await + 1; } }", v5),
+            []
+        );
+        assert_eq!(
+            unit_codes_at(
+                "class C { static void N() { int[] await = new int[1]; int y = await[0]; } }",
+                v5
+            ),
+            []
+        );
+        assert_eq!(
+            unit_codes_at("class C { static void N() { int await = 3; int y = await; } }", v5),
+            []
+        );
+        assert_eq!(unit_codes_at("class await { } class C { await f; }", v5), []);
+    }
+
+    #[test]
     fn a_file_scoped_namespace_holds_everything_after_it() {
         assert_eq!(
             unit_tree_at("namespace N; class C { }", LanguageVersion::CSharp10),
@@ -6046,6 +6538,51 @@ mod tests {
     }
 
     #[test]
+    fn a_type_argument_list_sits_on_the_part_it_was_written_on() {
+        let v2 = LanguageVersion::CSharp2;
+
+        assert_eq!(unit_codes_at("class C { List<int>.Enumerator f; }", v2), []);
+        assert_eq!(
+            field_type_at("class C { List<int>.Enumerator f; }", v2),
+            "List<int>.Enumerator"
+        );
+        assert_eq!(
+            field_type_at("class C { Box<int>.Pair<string> f; }", v2),
+            "Box<int>.Pair<string>"
+        );
+        assert_eq!(
+            field_type_at(
+                "class C { System.Collections.Generic.List<int>.Enumerator f; }",
+                v2
+            ),
+            "System.Collections.Generic.List<int>.Enumerator"
+        );
+        assert_eq!(
+            field_type_at("class C { Box<int>.Ring.Hub f; }", v2),
+            "Box<int>.Ring.Hub"
+        );
+        assert_eq!(
+            field_type_at("class C { Box<int>.Cursor[] f; }", v2),
+            "Box<int>.Cursor[]"
+        );
+        assert_eq!(field_type_at("class C { A.B.C f; }", v2), "A.B.C");
+
+        assert_eq!(
+            field_type_at("class C { Box<Box<int>>.Cursor f; }", v2),
+            "Box<Box<int>>.Cursor"
+        );
+        assert_eq!(unit_codes_at("class C { Box<Box<int>>.Cursor f; }", v2), []);
+
+        assert_eq!(unit_codes("class C { List<int>.Enumerator f; }"), [8022]);
+        assert_eq!(
+            field_type_at("class C { List<int>.Enumerator f; }", LanguageVersion::CSharp1),
+            "List.Enumerator"
+        );
+        assert_eq!(unit_codes("class C { Box<int>.Pair<string> f; }"), [8022, 8022]);
+        assert_eq!(unit_codes("class C { A.B<int> f; }"), [8022]);
+    }
+
+    #[test]
     fn a_nested_type_argument_list_closes_on_the_right_shift_token() {
         let v2 = LanguageVersion::CSharp2;
 
@@ -6118,7 +6655,7 @@ mod tests {
             unit_codes(
                 "class C { int f; public int P { get { return f; } private set { f = value; } } }"
             ),
-            [8022]
+            []
         );
         assert_eq!(unit_codes("class C { int? f; }"), [8022]);
         assert_eq!(unit_codes("class C { int? M() { return 0; } }"), [8022]);
@@ -6255,6 +6792,27 @@ mod tests {
     fn declaration_diagnostics_match_the_reference_compiler() {
         assert_eq!(unit_codes("class C { int x }"), vec![1002]);
         assert_eq!(unit_codes("class C {"), vec![1513]);
+    }
+
+    /// A `@`-prefixed contextual keyword is an ordinary identifier (9.4.2), and every site that
+    /// reads one has to ask the same question -- which is why they all ask
+    /// [`Parser::current_contextual_keyword`] rather than comparing the text.
+    ///
+    /// **THE PAIRS ARE THE POINT.** Each plain spelling must keep working, or a guard that refuses
+    /// everything would pass the verbatim half on its own. Both halves were scored against csc
+    /// before this was written: `class Box<T> @where T : class` is CS1514 there and USED TO COMPILE
+    /// here, and `@required int n;` is CS1519 there while this compiler read the modifier.
+    #[test]
+    fn a_verbatim_contextual_keyword_is_never_read_as_one() {
+        assert_eq!(unit_codes_at("class Box<T> where T : class { }", LanguageVersion::CSharp2), vec![]);
+        assert!(!unit_codes_at("class Box<T> @where T : class { }", LanguageVersion::CSharp2).is_empty());
+        assert_eq!(unit_codes("class C { int P { get { return 1; } } }"), vec![]);
+        assert!(!unit_codes("class C { int P { @get { return 1; } } }").is_empty());
+        assert_eq!(
+            unit_codes("class C { event System.EventHandler E { add { } remove { } } }"),
+            vec![]
+        );
+        assert!(!unit_codes("class C { event System.EventHandler E { @add { } remove { } } }").is_empty());
     }
 
     #[test]

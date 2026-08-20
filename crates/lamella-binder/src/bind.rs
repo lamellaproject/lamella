@@ -14,15 +14,32 @@ pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
         TypeRefKind::Name(parts) => {
             TypeSymbol::Named(parts.iter().cloned().collect()).fold_builtin()
         }
-        TypeRefKind::Generic { parts, arguments } => TypeSymbol::Instantiation {
-            definition: parts.iter().cloned().collect(),
-            arguments: arguments.iter().map(bind_type).collect(),
+        TypeRefKind::Generic { parts } => TypeSymbol::Instantiation {
+            definition: parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    if index + 1 == parts.len() {
+                        part.name.clone()
+                    } else {
+                        crate::symbols::metadata_type_name(&part.name, part.arguments.len()).into()
+                    }
+                })
+                .collect(),
+            arguments: parts
+                .iter()
+                .flat_map(|part| part.arguments.iter().map(bind_type))
+                .collect(),
         },
         TypeRefKind::Unbound { parts, arity } => TypeSymbol::Instantiation {
             definition: parts.iter().cloned().collect(),
             arguments: (0..*arity)
                 .map(|_| TypeSymbol::Special(SpecialType::Object))
                 .collect(),
+        },
+        TypeRefKind::Nullable(underlying) => TypeSymbol::Instantiation {
+            definition: ["System".into(), "Nullable".into()].into(),
+            arguments: [bind_type(underlying)].into(),
         },
         TypeRefKind::Array { element, rank } => bind_type(element).into_array(*rank),
         TypeRefKind::Pointer(element) => {
@@ -87,6 +104,76 @@ mod tests {
             StmtKind::LocalDeclaration { ty, .. } => bind_type(&ty),
             other => panic!("expected a local declaration, got {other:?}"),
         }
+    }
+
+    /// [`bound_type`] at a dialect that admits generics -- the default one is ISO-1, where a
+    /// type-argument list is refused and the tree carries the bare name instead.
+    fn bound_type_at_csharp2(source: &str) -> TypeSymbol {
+        use lamella_syntax::lexer::LexOptions;
+        use lamella_syntax::parser::parse_compilation_unit_with;
+        use lamella_syntax::version::LanguageVersion;
+        let parsed = parse_compilation_unit_with(
+            &alloc::format!("class Holder {{ void M() {{ {source} }} }}"),
+            LexOptions {
+                version: LanguageVersion::CSharp2,
+                ..LexOptions::default()
+            },
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let lamella_syntax::ast::NamespaceMember::Type(declaration) = &parsed.unit.members[0]
+        else {
+            panic!("expected a type declaration");
+        };
+        let lamella_syntax::ast::Member::Method { body, .. } = &declaration.members[0] else {
+            panic!("expected a method");
+        };
+        let StmtKind::Block(statements) = &body.as_ref().expect("a body").kind else {
+            panic!("a method body is a block");
+        };
+        match &statements[0].kind {
+            StmtKind::LocalDeclaration { ty, .. } => bind_type(ty),
+            other => panic!("expected a local declaration, got {other:?}"),
+        }
+    }
+
+    /// A NESTED type reached through a constructed enclosing one binds to ONE instantiation whose
+    /// arguments are flattened enclosing-first, and whose definition keeps the ENCLOSING part's
+    /// arity mangled in while leaving the last part bare (ECMA-335 II.9.2, II.10.7.2).
+    ///
+    /// **THE MANGLING IS THE WHOLE DISTINCTION.** Without it `List<int>.Enumerator` and
+    /// `List.Enumerator<int>` -- two different types -- reach the resolver as one symbol, a
+    /// definition of `["List", "Enumerator"]` with one argument. Asserted on the parts rather than
+    /// on the rendering, because the rendering is derived from them.
+    #[test]
+    fn a_constructed_nested_name_flattens_its_arguments_and_mangles_its_enclosing_parts() {
+        use alloc::vec::Vec;
+        let parts = |ty: &TypeSymbol| -> (Vec<alloc::string::String>, usize) {
+            match ty {
+                TypeSymbol::Instantiation {
+                    definition,
+                    arguments,
+                } => (
+                    definition.iter().map(|part| part.to_string()).collect(),
+                    arguments.len(),
+                ),
+                other => panic!("expected an instantiation, got {other:?}"),
+            }
+        };
+
+        let enumerator = bound_type_at_csharp2("List<int>.Enumerator e;");
+        assert_eq!(parts(&enumerator), (alloc::vec!["List`1".to_string(), "Enumerator".to_string()], 1));
+        assert_eq!(enumerator.to_string(), "List<int>.Enumerator");
+
+        let pair = bound_type_at_csharp2("Box<int>.Pair<string> p;");
+        assert_eq!(parts(&pair), (alloc::vec!["Box`1".to_string(), "Pair".to_string()], 2));
+        assert_eq!(pair.to_string(), "Box<int>.Pair<string>");
+
+        let other = bound_type_at_csharp2("List.Enumerator<int> e;");
+        assert_eq!(parts(&other), (alloc::vec!["List".to_string(), "Enumerator".to_string()], 1));
+        assert_eq!(other.to_string(), "List.Enumerator<int>");
+        assert_ne!(enumerator, other);
+
+        assert_eq!(bound_type_at_csharp2("A.B.C c;").to_string(), "A.B.C");
     }
 
     #[test]

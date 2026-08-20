@@ -1,8 +1,8 @@
 //! The HOST side of the Lamella Link debug + REPL channel:
 
 pub use lamella_runner::{
-    RunResult, baked_image_checksum, debug, deploy, repl, run_program, send_image, send_program,
-    serve_one, try_recv_result,
+    RunResult, baked_image_checksum, bundle, debug, deploy, repl, run_program, send_image,
+    send_program, serve_one, try_recv_result,
 };
 
 pub mod engine;
@@ -930,6 +930,127 @@ pub fn deploy_chunked_blocking(
     Ok(true)
 }
 
+/// The largest bundle slice one `DEPLOY_BUNDLE` frame can carry: the frame's `u16` LEN cap, less the
+/// 8-byte `(offset, total)` header every bundle chunk carries, rounded DOWN to a 4-byte word.
+///
+/// **The alignment is the target's, not a preference.** A bundle is written to flash with word
+/// stores, so `deploy_bundle_chunk` REFUSES an `offset % 4 != 0` outright. That makes an unaligned
+/// `chunk_len` fail on the SECOND frame rather than the first -- chunk zero is always aligned -- which
+/// is the reading that sends someone to look at the bundle instead of at the caller's chunk size.
+///
+/// NOTE: this is a smaller word than [`CHUNK_DATA_CAP`]'s 512, and deliberately a separate
+/// constant. A baked image must start each chunk on a 512-byte flash PAGE because the image path
+/// erases per page; the bundle path erases once up front, so word alignment is all its stores
+/// require. Reusing the image cap here would work, and would quietly demand 128x more alignment
+/// than the target asks for.
+pub const BUNDLE_CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 4) * 4;
+
+/// Host driver, blocking: run a BUNDLE from the target's RAM now, without persisting it -- the
+/// bundle counterpart of [`eval_image_blocking`].
+///
+/// A bundle is an artifact the target loads through a front end rather than a baked CIL image (a
+/// `.lpyc` Python bundle today), so this is the path a `.lpyc` takes and a baked image never does.
+///
+/// **GATE ON [`lamella_wire::Capabilities::BUNDLE`], from the `HELLO_ACK`**, which
+/// [`hello_blocking`] already returns -- the bit exists precisely so a host can decide without a
+/// round trip. This follows the house contract that the CALLER picks the path from the negotiated
+/// caps, the same way it picks `send_program` vs `send_image`. Calling it against a target without
+/// the bit is not unsafe -- the target refuses by name and this reports
+/// [`TransportError::Refused`] promptly rather than timing out -- but it spends a round trip to
+/// learn what the session already knew.
+///
+/// **Payload is the bundle's BARE bytes, with no `(offset, total)` header.** That asymmetry with
+/// [`deploy_bundle_blocking`] is the protocol's and is deliberate: running from RAM does not chunk,
+/// so it does not carry a header it would never vary.
+///
+/// # Errors
+/// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
+/// on timeout; otherwise a carrier [`TransportError`].
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn run_bundle_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    bundle: &[u8],
+    timeout: Duration,
+) -> Result<RunResult, TransportError> {
+    transport.send(lamella_runner::bundle::RUN_BUNDLE, seq, bundle)?;
+    await_result(transport, seq, timeout)
+}
+
+/// Host driver, blocking: persist a BUNDLE to the target's deploy region so it boots on reset --
+/// the bundle counterpart of [`deploy_chunked_blocking`]. Returns whether every chunk was accepted.
+///
+/// **GATE ON [`lamella_wire::Capabilities::BUNDLE`]**, as for [`run_bundle_blocking`].
+///
+/// **Payload is ALWAYS `[offset u32][total u32][bytes]`**, so a bundle that fits one frame is the
+/// degenerate one-chunk case rather than a second code path -- the protocol pays eight bytes on a
+/// small bundle to keep the artifact kind on EVERY frame, so an interrupted transfer cannot be
+/// misread as a partial baked image. **A bundle NEVER travels under `DEPLOY_CHUNK`.**
+///
+/// `chunk_len` is clamped to [`BUNDLE_CHUNK_DATA_CAP`] and rounded DOWN to a 4-byte word, because
+/// the target refuses an unaligned offset; a caller may pass the bundle's whole length to send it in
+/// one frame.
+///
+/// **An EMPTY bundle CLEARS the deploy region**, mirroring `deploy_blocking`'s empty-image clear.
+/// One frame still goes out (`offset = 0, total = 0`): the target erases the header and commits a
+/// zero length, which is how it records "nothing deployed". Returning `Ok(true)` without sending
+/// would report a clear that never happened.
+///
+/// # Errors
+/// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
+/// if a chunk goes unacked past `timeout`; otherwise a carrier [`TransportError`].
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn deploy_bundle_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    bundle: &[u8],
+    chunk_len: usize,
+    timeout: Duration,
+) -> Result<bool, TransportError> {
+    use lamella_wire::{Frame, msg};
+    let chunk_len = (chunk_len.min(BUNDLE_CHUNK_DATA_CAP) / 4 * 4).max(4);
+    let total = bundle.len() as u32;
+    let mut offset = 0usize;
+    loop {
+        let end = (offset + chunk_len).min(bundle.len());
+        let mut payload = Vec::with_capacity(8 + (end - offset));
+        payload.extend_from_slice(&(offset as u32).to_le_bytes());
+        payload.extend_from_slice(&total.to_le_bytes());
+        payload.extend_from_slice(&bundle[offset..end]);
+        transport.send(lamella_runner::bundle::DEPLOY_BUNDLE, seq, &payload)?;
+
+        let deadline = Instant::now() + timeout;
+        let mut acked = None;
+        'wait: while Instant::now() < deadline {
+            while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
+                if reply_seq != seq {
+                    continue;
+                }
+                if msg_type == deploy::DEPLOY_RESULT {
+                    acked = Some(payload.first().copied().unwrap_or(0) == 1);
+                    break 'wait;
+                }
+                if msg_type == msg::ERROR {
+                    return Err(TransportError::Refused {
+                        reason: payload.first().copied().unwrap_or(0),
+                        msg_type: payload.get(1).copied().unwrap_or(0),
+                    });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        match acked {
+            Some(true) => {}
+            Some(false) => return Ok(false),
+            None => return Err(TransportError::Closed),
+        }
+        offset = end;
+        if offset >= bundle.len() {
+            return Ok(true);
+        }
+    }
+}
+
 /// Host driver, blocking: query the deployed image's content checksum -- `Some(checksum)` if the
 /// target holds a valid image, `None` if none. Compare it to a freshly-baked image's
 /// [`lamella_runner::baked_image_checksum`] to SKIP re-deploying an image the target already holds
@@ -1150,5 +1271,111 @@ mod tests {
         }
         assert!(covered.iter().all(|c| *c), "a byte of the image never crossed, and the deploy said OK");
         assert_eq!(got, image, "the image reassembled wrong");
+    }
+
+    /// The bundle deploy's own version of the coverage test, plus the constraint that is NOT the
+    /// image path's: **every offset must be 4-byte aligned**, because `deploy_bundle_chunk` refuses
+    /// `offset % 4 != 0` outright. The caller here asks for 1,023 -- not a multiple of 4 -- which is
+    /// exactly the value a person types. Un-rounded, chunk zero lands at offset 0 and is ACCEPTED,
+    /// and every chunk after it is refused; the deploy then returns `Ok(false)` naming a bundle that
+    /// is fine, so the assertion that matters is alignment and coverage together.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn every_bundle_chunk_starts_on_a_word_and_the_whole_bundle_crosses() {
+        let bundle: Vec<u8> = (0..10_003).map(|i| (i % 251) as u8).collect();
+        let mut transport = MemTransport::new();
+        for _ in 0..32 {
+            transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 7, &[1]).expect("a 1-byte ack frames"));
+        }
+
+        let ok = deploy_bundle_blocking(&mut transport, 7, &bundle, 1023, Duration::from_secs(5))
+            .expect("the in-memory carrier never errors");
+        assert!(ok, "every chunk acked");
+
+        let mut got = vec![0u8; bundle.len()];
+        let mut covered = vec![false; bundle.len()];
+        let mut frames = 0usize;
+        let mut reader = FrameReader::new();
+        reader.push(&transport.take_sent());
+        while let Some(frame) = reader.next_frame() {
+            assert_eq!(
+                frame.msg_type,
+                lamella_runner::bundle::DEPLOY_BUNDLE,
+                "a bundle must never travel under another op"
+            );
+            let offset = u32::from_le_bytes(frame.payload[0..4].try_into().unwrap()) as usize;
+            let total = u32::from_le_bytes(frame.payload[4..8].try_into().unwrap()) as usize;
+            assert_eq!(offset % 4, 0, "offset {offset} is not word aligned; the target refuses it");
+            assert_eq!(total, bundle.len(), "the total must be the whole bundle on EVERY frame");
+            for (i, byte) in frame.payload[8..].iter().enumerate() {
+                got[offset + i] = *byte;
+                covered[offset + i] = true;
+            }
+            frames += 1;
+        }
+        assert!(frames > 1, "a 10 KB bundle at 1,020 bytes a chunk must actually chunk");
+        assert!(covered.iter().all(|c| *c), "a byte never crossed and the deploy said OK");
+        assert_eq!(got, bundle, "the bundle reassembled wrong");
+    }
+
+    /// An empty bundle is the CLEAR, and a clear that sends nothing is a clear that did not happen.
+    /// `while offset < len` -- the image path's loop shape -- sends zero frames here and returns
+    /// `Ok(true)`, reporting a region wiped that still holds the old program.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn an_empty_bundle_still_sends_one_frame_because_that_is_the_clear() {
+        let mut transport = MemTransport::new();
+        transport.feed(&encode_frame(deploy::DEPLOY_RESULT, 9, &[1]).expect("a 1-byte ack frames"));
+
+        let ok = deploy_bundle_blocking(&mut transport, 9, &[], 4096, Duration::from_secs(5))
+            .expect("the in-memory carrier never errors");
+        assert!(ok, "the clear was acked");
+
+        let mut reader = FrameReader::new();
+        reader.push(&transport.take_sent());
+        let frame = reader.next_frame().expect("a clear must put ONE frame on the wire");
+        assert_eq!(frame.msg_type, lamella_runner::bundle::DEPLOY_BUNDLE);
+        assert_eq!(frame.payload, vec![0u8; 8], "offset 0, total 0, and no bytes");
+        assert!(reader.next_frame().is_none(), "a clear is exactly one frame");
+    }
+
+    /// A target that does not implement the op answers `ERROR`. Without an arm for it the loop polls
+    /// to its deadline and reports `Closed` -- "the link is closed" for a board that answered
+    /// immediately, which is the one reading that sends someone to check the cable.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn a_target_that_refuses_the_bundle_op_is_reported_as_refused_not_as_a_closed_link() {
+        let mut transport = MemTransport::new();
+        transport.feed(&encode_frame(lamella_wire::msg::ERROR, 5, &[]).expect("an ERROR frames"));
+
+        let error = deploy_bundle_blocking(&mut transport, 5, &[1, 2, 3, 4], 4096, Duration::from_secs(5))
+            .expect_err("a refusal is an error, not an Ok(false)");
+        assert!(
+            matches!(error, TransportError::Refused { .. }),
+            "expected Refused, got {error:?} -- a refusal reported as a timeout is the defect"
+        );
+    }
+
+    /// `RUN_BUNDLE` takes the BARE bytes. The asymmetry with `DEPLOY_BUNDLE` is the protocol's and is
+    /// deliberate, so a header helpfully added here would be decoded as the first eight bytes of the
+    /// program.
+    #[test]
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    fn run_bundle_sends_the_bare_bytes_with_no_chunk_header() {
+        let bundle: Vec<u8> = (0..64).map(|i| (i % 251) as u8).collect();
+        let mut transport = MemTransport::new();
+        transport.feed(
+            &encode_frame(repl::RUN_RESULT, 6, &RunResult { exit: 0, stdout: String::new() }.encode())
+                .expect("a result frames"),
+        );
+
+        run_bundle_blocking(&mut transport, 6, &bundle, Duration::from_secs(5))
+            .expect("the in-memory carrier never errors");
+
+        let mut reader = FrameReader::new();
+        reader.push(&transport.take_sent());
+        let frame = reader.next_frame().expect("one frame");
+        assert_eq!(frame.msg_type, lamella_runner::bundle::RUN_BUNDLE);
+        assert_eq!(frame.payload, bundle, "RUN_BUNDLE must carry the bundle and nothing else");
     }
 }

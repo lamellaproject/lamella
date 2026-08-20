@@ -454,7 +454,8 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
         }
         BoundExprKind::Cast { operand, .. }
         | BoundExprKind::TypeTest { operand, .. }
-        | BoundExprKind::Conversion { operand, .. } => visit_local_uses(operand, f),
+        | BoundExprKind::Conversion { operand, .. }
+        | BoundExprKind::Await { operand, .. } => visit_local_uses(operand, f),
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
             visit_local_uses(inner, f);
         }
@@ -466,6 +467,10 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
             visit_local_uses(condition, f);
             visit_local_uses(when_true, f);
             visit_local_uses(when_false, f);
+        }
+        BoundExprKind::NullCoalescing { left, right } => {
+            visit_local_uses(left, f);
+            visit_local_uses(right, f);
         }
         BoundExprKind::Assignment { target, value, .. } => {
             visit_local_uses(target, f);
@@ -863,6 +868,7 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
             }
             collect_field_uses(operand, reads, writes);
         }
+        BoundExprKind::Await { operand, .. } => collect_field_uses(operand, reads, writes),
         BoundExprKind::Cast { operand, .. }
         | BoundExprKind::TypeTest { operand, .. }
         | BoundExprKind::Conversion { operand, .. } => collect_field_uses(operand, reads, writes),
@@ -877,6 +883,10 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
             collect_field_uses(condition, reads, writes);
             collect_field_uses(when_true, reads, writes);
             collect_field_uses(when_false, reads, writes);
+        }
+        BoundExprKind::NullCoalescing { left, right } => {
+            collect_field_uses(left, reads, writes);
+            collect_field_uses(right, reads, writes);
         }
     }
 }
@@ -1722,6 +1732,7 @@ impl Analyzer<'_> {
                     }
                 }
             }
+            BoundExprKind::Await { operand, .. } => self.expression(operand, assigned, span),
             BoundExprKind::Ref { out, operand } => {
                 if *out {
                     if let BoundExprKind::Local(name) = &operand.kind {
@@ -1777,6 +1788,11 @@ impl Analyzer<'_> {
                 self.expression(when_true, &mut if_true, span);
                 self.expression(when_false, &mut if_false, span);
                 *assigned = if_true.intersection(&if_false).cloned().collect();
+            }
+            BoundExprKind::NullCoalescing { left, right } => {
+                self.expression(left, assigned, span);
+                let mut if_null = assigned.clone();
+                self.expression(right, &mut if_null, span);
             }
             BoundExprKind::Assignment {
                 operator,

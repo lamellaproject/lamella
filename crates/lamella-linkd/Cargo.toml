@@ -1,0 +1,26 @@
+[package]
+name = "lamella-linkd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Lamella Link relay daemon: carries the protocol between two carriers for a board a host cannot reach directly. It runs on a companion processor beside the microcontroller -- listening on a socket and speaking to the board over a serial line -- and it is a service endpoint rather than a USB device. It is not a debugger, not a runtime and not a flasher: it forwards frames without reframing them and without interpreting them, which is the whole of its correctness argument."
+publish = false
+
+[dependencies]
+# The protocol, and the relay itself. `relay::pump` is the forwarding core -- red-proved to keep a
+# frame's type, sequence and payload byte for byte, and to carry a message type it does not know.
+# This crate supplies the carriers and the session policy around it and adds nothing to the wire.
+lamella-wire = { path = "../lamella-wire" }
+# The two carriers this daemon joins. `tcp` for the socket a host dials in on (TcpTransport has a
+# from-stream constructor, which is what a LISTENER needs), `serial` for the line the companion
+# processor shares with the microcontroller. No `repl-host`: a relay compiles no C# and holds no
+# session state, and pulling the compiler in would say otherwise.
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = [
+    "serial",
+    "tcp",
+] }
+
+[lints]
+workspace = true

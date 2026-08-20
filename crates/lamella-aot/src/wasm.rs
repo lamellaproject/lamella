@@ -2148,6 +2148,8 @@ fn emit_convert(body: &mut Func, kind: ConvKind) -> Result<(), LowerError> {
         ConvKind::Float32ToInt => body.i32_trunc_f32_s(),
         ConvKind::IntToFloat32 => body.f32_convert_i32_s(),
         ConvKind::Float64ToInt => body.i32_trunc_f64_s(),
+        ConvKind::Float32ToLong => body.i64_trunc_f32_s(),
+        ConvKind::Float64ToLong => body.i64_trunc_f64_s(),
         ConvKind::IntToFloat64 => body.f64_convert_i32_s(),
         ConvKind::LongToFloat64 => body.f64_convert_i64_s(),
         ConvKind::Float32ToFloat64 => body.f64_promote_f32(),

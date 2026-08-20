@@ -7,13 +7,16 @@ fn main() {
     let repo = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"))
         .join("..")
         .join("..");
-    let boards = collect(&repo.join("bsp"), "board.toml");
-    let parts = collect(&repo.join("csp"), "parts.toml");
-    let modules = collect(&repo.join("csp"), "module.toml");
+    let boards = collect(&repo.join("bsp"), Path::new("board.toml"));
+    let parts = collect(&repo.join("csp"), Path::new("parts.toml"));
+    let modules = collect(&repo.join("csp"), Path::new("module.toml"));
+    let board_python = collect(&repo.join("bsp"), &Path::new("python").join("board.py"));
 
     println!("cargo:rerun-if-changed={}", repo.join("bsp").display());
     println!("cargo:rerun-if-changed={}", repo.join("csp").display());
-    for path in boards.values().chain(parts.values()).chain(modules.values()) {
+    for path in
+        boards.values().chain(parts.values()).chain(modules.values()).chain(board_python.values())
+    {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
@@ -36,6 +39,14 @@ fn main() {
     for (id, path) in &modules {
         out.push_str(&format!("    ({id:?}, include_str!({:?})),\n", path.display().to_string()));
     }
+    out.push_str(
+        "];\n\n/// Every board's GENERATED Python `board` module, by board id -- what `import \
+         board` serves\n/// when a program is run against a named board.\npub const BOARD_PYTHON: \
+         &[(&str, &str)] = &[\n",
+    );
+    for (id, path) in &board_python {
+        out.push_str(&format!("    ({id:?}, include_str!({:?})),\n", path.display().to_string()));
+    }
     out.push_str("];\n");
 
     let dest = PathBuf::from(std::env::var_os("OUT_DIR").expect("out dir")).join("catalogue.rs");
@@ -44,7 +55,10 @@ fn main() {
 
 /// Every immediate subdirectory of `root` containing `file`, as `id -> path`, sorted by id so the
 /// generated table is stable across builds (an unstable order is a diff on every rebuild).
-fn collect(root: &Path, file: &str) -> BTreeMap<String, PathBuf> {
+///
+/// `file` is a path RELATIVE to each subdirectory, so a fact stated one level down
+/// (`<board>/python/board.py`) is collected by the same walk as one stated at the top.
+fn collect(root: &Path, file: &Path) -> BTreeMap<String, PathBuf> {
     let mut found = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return found;

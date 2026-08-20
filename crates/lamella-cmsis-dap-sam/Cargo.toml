@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Microchip SAM (ATSAMD21, ...) flash programming over the Lamella CMSIS-DAP debug stack -- a device-specific extension of lamella-cmsis-dap."
+publish = false
 
 [lints]
 workspace = true

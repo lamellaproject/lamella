@@ -5,7 +5,6 @@ namespace System
     {
         private string _objectName;
 
-        public ObjectDisposedException() : base() { }
         public ObjectDisposedException(string message) : base(message) { }
         public ObjectDisposedException(string message, Exception innerException) : base(message, innerException) { }
 

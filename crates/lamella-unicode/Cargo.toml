@@ -14,6 +14,7 @@ description = "Language-neutral Unicode Character Database properties (from UCD 
 
 # Layered tiers, feature-gated so each consumer links only its slice. The base `categories` tier
 # (general category + the derived predicates) is always compiled; the heavier tiers are opt-in.
+publish = false
 [features]
 default = ["normalization"]
 # Unicode normalization (NFC/NFD/NFKC/NFKD) -- the C# BCL String.Normalize + Python PEP 3131.
