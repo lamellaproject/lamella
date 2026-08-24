@@ -26,6 +26,26 @@ namespace System
             }
         }
 
-        public Exception InnerException { get { return _innerException; } }
+        [Lamella.Runtime.RuntimeProvided] private Exception RuntimeInnerException() { return null; }
+
+        public Exception InnerException
+        {
+            get
+            {
+                Exception raised = RuntimeInnerException();
+                if (raised != null) { return raised; }
+                return _innerException;
+            }
+        }
+
+        public virtual Exception GetBaseException()
+        {
+            Exception current = this;
+            while (current.InnerException != null)
+            {
+                current = current.InnerException;
+            }
+            return current;
+        }
     }
 }

@@ -798,6 +798,14 @@ impl Func {
     pub fn i32_trunc_f64_s(&mut self) {
         self.op(0xAA);
     }
+    /// `i64.trunc_f32_s` -- truncate an f32 to a signed i64.
+    pub fn i64_trunc_f32_s(&mut self) {
+        self.op(0xAE);
+    }
+    /// `i64.trunc_f64_s` -- truncate an f64 to a signed i64.
+    pub fn i64_trunc_f64_s(&mut self) {
+        self.op(0xB0);
+    }
     /// `f32.convert_i32_s` -- convert a signed i32 to an f32.
     pub fn f32_convert_i32_s(&mut self) {
         self.op(0xB2);
@@ -1190,6 +1198,24 @@ mod tests {
             write_var_i64(&mut out, *value);
             assert_eq!(&out, expected, "i64 LEB128 of {value}");
         }
+    }
+
+    /// The two float-to-i64 truncations, pinned by byte. Their values are not transcribed from
+    /// anywhere -- the numeric section of the opcode table is DENSE, and both neighbours are
+    /// already in this file: `i64.extend_i32_u` is 0xAD and `f32.convert_i32_s` is 0xB2, and the
+    /// four opcodes between them are `i64.trunc_f32_s`, `_u`, `i64.trunc_f64_s`, `_u` in that
+    /// order. So 0xAE and 0xB0 are forced by entries the assembler already emits.
+    #[test]
+    fn the_signed_float_to_i64_truncations_encode_as_their_neighbours_require() {
+        let mut body = Func::new(0);
+        body.i64_trunc_f32_s();
+        body.i64_trunc_f64_s();
+        assert_eq!(body.code, [0xAE, 0xB0]);
+
+        let mut neighbours = Func::new(0);
+        neighbours.i64_extend_i32_u();
+        neighbours.f32_convert_i32_s();
+        assert_eq!(neighbours.code, [0xAD, 0xB2]);
     }
 
     /// The canonical first milestone: `fn main() -> i32 { 40 + 2 }`, exported as `main`. The

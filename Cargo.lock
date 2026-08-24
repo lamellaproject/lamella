@@ -378,6 +378,7 @@ dependencies = [
  "lamella-py-frontend",
  "lamella-py-runtime",
  "lamella-syntax",
+ "lamella-usbbulk",
  "lamella-wire",
  "lamella-wire-host",
 ]

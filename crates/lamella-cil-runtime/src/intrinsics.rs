@@ -2841,6 +2841,62 @@ pub fn exception_runtime_message(
     }))
 }
 
+/// `System.Exception.RuntimeInnerException`: the exception a RUNTIME-raised exception wraps, or
+/// NULL for one managed code constructed. `this` is the exception.
+///
+/// The exact shape of [`exception_runtime_message`], for the exact reason: a runtime-raised
+/// exception has no field storage, so `InnerException` reading `_innerException` on one TRAPS
+/// (`FieldSlotMissing`, measured) rather than answering null. The only wrapper the VES mints today
+/// is the `TypeInitializationException` a failed `.cctor` leaves behind, and .NET's carries the
+/// constructor's own exception -- so without this seam the wrapper is either a trap or a lie.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not an object reference.
+pub fn exception_runtime_inner_exception(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(this)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    Ok(Some(match vm.exception_inner(this) {
+        Some(inner) => Value::Object(inner),
+        None => Value::Null,
+    }))
+}
+
+/// `System.TypeInitializationException.RuntimeTypeName`: the full name of the type whose
+/// initializer failed, for a wrapper the RUNTIME raised, or NULL for one managed code constructed.
+/// `this` is the exception.
+///
+/// Read back from the poisoned-type table rather than stored per-exception: the table already maps
+/// the failing type to its wrapper, and the type's name is in the module. That keeps the runtime
+/// state to ONE fact (which type failed, and with what) instead of three parallel side tables.
+///
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not an object reference.
+#[cfg(feature = "exceptions")]
+pub fn type_initialization_exception_runtime_type_name(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(this)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(type_id) = vm.failed_type_of(this) else {
+        return Ok(Some(Value::Null));
+    };
+    let Some(name) = module.type_full_name(type_id) else {
+        return Ok(Some(Value::Null));
+    };
+    let name = alloc::string::String::from(name);
+    let text = vm.heap_mut().alloc_text(&name);
+    Ok(Some(Value::Object(text)))
+}
+
 /// `System.Exception.get_Message`: the stored message string, or an empty string if
 /// none was given (`Message` is conventionally non-null). `this` is the exception.
 ///

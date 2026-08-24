@@ -1165,6 +1165,15 @@ fn section_transfers(stmt: &BoundStmt) -> bool {
         Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
             section_transfers(body)
         }
+        Kind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            finally.as_ref().is_some_and(|block| always_exits(block))
+                || (section_transfers(body)
+                    && catches.iter().all(|catch| section_transfers(&catch.body)))
+        }
         _ => always_exits(stmt),
     }
 }

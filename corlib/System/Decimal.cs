@@ -221,6 +221,78 @@ namespace System
             remainder = (uint)(cur % 10);
         }
 
+
+        private static void Shift(ref uint clo, ref uint cmid, ref uint chi, int places,
+                                  out uint lastDropped, out bool restNonZero)
+        {
+            lastDropped = 0;
+            restNonZero = false;
+            for (int i = 0; i < places; i++)
+            {
+                if (lastDropped != 0) restNonZero = true;
+                uint remainder;
+                uint tlo, tmid, thi;
+                DivBy10(clo, cmid, chi, out tlo, out tmid, out thi, out remainder);
+                clo = tlo; cmid = tmid; chi = thi;
+                lastDropped = remainder;
+            }
+        }
+
+        private static void Increment(ref uint clo, ref uint cmid, ref uint chi)
+        {
+            clo = clo + 1;
+            if (clo != 0) return;
+            cmid = cmid + 1;
+            if (cmid != 0) return;
+            chi = chi + 1;
+        }
+
+        private static Decimal Compose(uint clo, uint cmid, uint chi, bool negative, int scale)
+        {
+            return new Decimal(unchecked((int)clo), unchecked((int)cmid), unchecked((int)chi), negative, (byte)scale);
+        }
+
+        public static Decimal Round(Decimal d, int decimals)
+        {
+            if (decimals < 0 || decimals > 28) throw new ArgumentOutOfRangeException("Decimal can only round to between 0 and 28 digits of precision.");
+            int scale = d.Scale;
+            if (scale <= decimals) return d;
+            uint clo = (uint)d.lo, cmid = (uint)d.mid, chi = (uint)d.hi;
+            uint lastDropped;
+            bool restNonZero;
+            Shift(ref clo, ref cmid, ref chi, scale - decimals, out lastDropped, out restNonZero);
+            bool roundUp = lastDropped > 5
+                || (lastDropped == 5 && (restNonZero || (clo & 1) == 1));
+            if (roundUp) Increment(ref clo, ref cmid, ref chi);
+            bool negative = d.IsNegative && !(clo == 0 && cmid == 0 && chi == 0);
+            return Compose(clo, cmid, chi, negative, decimals);
+        }
+
+        public static Decimal Truncate(Decimal d)
+        {
+            int scale = d.Scale;
+            if (scale == 0) return d;
+            uint clo = (uint)d.lo, cmid = (uint)d.mid, chi = (uint)d.hi;
+            uint lastDropped;
+            bool restNonZero;
+            Shift(ref clo, ref cmid, ref chi, scale, out lastDropped, out restNonZero);
+            bool negative = d.IsNegative && !(clo == 0 && cmid == 0 && chi == 0);
+            return Compose(clo, cmid, chi, negative, 0);
+        }
+
+        public static Decimal Floor(Decimal d)
+        {
+            int scale = d.Scale;
+            if (scale == 0) return d;
+            uint clo = (uint)d.lo, cmid = (uint)d.mid, chi = (uint)d.hi;
+            uint lastDropped;
+            bool restNonZero;
+            Shift(ref clo, ref cmid, ref chi, scale, out lastDropped, out restNonZero);
+            if (d.IsNegative && (lastDropped != 0 || restNonZero)) Increment(ref clo, ref cmid, ref chi);
+            bool negative = d.IsNegative && !(clo == 0 && cmid == 0 && chi == 0);
+            return Compose(clo, cmid, chi, negative, 0);
+        }
+
         public override string ToString()
         {
             char[] digits = new char[32];

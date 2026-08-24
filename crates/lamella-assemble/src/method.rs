@@ -47,6 +47,9 @@ struct LoopContext {
     continue_label: usize,
     break_label: usize,
     is_switch: bool,
+    /// The protected-region depth where this loop was entered, so a `break` or `continue` from
+    /// deeper inside knows it is LEAVING one. See [`Labels::statement_branch`].
+    region_depth: usize,
 }
 
 /// A method's return epilogue, used when the body has a `try`: a `return` cannot
@@ -74,6 +77,9 @@ struct Labels<'a> {
     /// The enclosing `switch` statements (innermost last), so `goto case`/`goto default`
     /// can branch to a sibling section's label.
     switches: Vec<SwitchContext>,
+    /// How many protected regions -- `try` bodies and their `catch`/`finally` handlers -- enclose
+    /// the instruction being emitted. [`emit_try`] is the only thing that opens one.
+    region_depth: usize,
     /// True while emitting a synthesized `finally` (a using/lock disposal): its
     /// statements become hidden sequence points a debugger steps over.
     hidden_region: bool,
@@ -91,6 +97,9 @@ struct SwitchContext {
     cases: Vec<(i64, usize)>,
     string_cases: Vec<(Box<[u16]>, usize)>,
     default: Option<usize>,
+    /// The protected-region depth where the switch was entered, for the same reason
+    /// [`LoopContext`] carries one: a `goto case` from inside a `try` leaves it.
+    region_depth: usize,
 }
 
 impl Labels<'_> {
@@ -116,6 +125,27 @@ impl Labels<'_> {
     fn branch(&mut self, opcode: Opcode, label: usize, out: &mut Vec<Instruction>) {
         out.push(Instruction::new(opcode, Operand::Target(0)));
         self.pending.push((out.len() - 1, label));
+    }
+
+    /// An unconditional branch at a STATEMENT boundary to `label`, whose target sits
+    /// `target_depth` protected regions deep -- picking the opcode the CLI requires.
+    ///
+    /// `br` may not cross the boundary of a `try` block or of a handler; `leave` may, and it runs
+    /// any intervening `finally` on the way out (ECMA-335 III.1.7.5). A `leave` where a `br` would
+    /// also do is harmless -- it empties an evaluation stack that a statement boundary has already
+    /// left empty -- so the test only has to be conservative in one direction.
+    ///
+    /// **THE DEPTHS ARE COMPARED RATHER THAN TESTED AGAINST ZERO**, and the difference is two
+    /// programs: a `break` whose loop is ITSELF inside a `try` leaves nothing and wants `br`, and
+    /// so does one inside a `finally` whose loop is also inside it. Asking only *"does this method
+    /// contain a try"* answers both of those the same way as the case that must be `leave`.
+    fn statement_branch(&mut self, label: usize, target_depth: usize, out: &mut Vec<Instruction>) {
+        let opcode = if self.region_depth > target_depth {
+            Opcode::Leave
+        } else {
+            Opcode::Br
+        };
+        self.branch(opcode, label, out);
     }
 
     fn backpatch(&self, out: &mut [Instruction]) {
@@ -629,6 +659,7 @@ fn emit_statement(
                 continue_label: start,
                 break_label: end,
                 is_switch: false,
+                region_depth: labels.region_depth,
             });
             emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
@@ -644,6 +675,7 @@ fn emit_statement(
                 continue_label: test,
                 break_label: end,
                 is_switch: false,
+                region_depth: labels.region_depth,
             });
             emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
@@ -668,12 +700,12 @@ fn emit_statement(
             out,
         )?,
         BoundStmtKind::Break => {
-            let target = loop_target(labels, false, |context| context.break_label)?;
-            labels.branch(Opcode::Br, target, out);
+            let (target, depth) = loop_target(labels, false, |context| context.break_label)?;
+            labels.statement_branch(target, depth, out);
         }
         BoundStmtKind::Continue => {
-            let target = loop_target(labels, true, |context| context.continue_label)?;
-            labels.branch(Opcode::Br, target, out);
+            let (target, depth) = loop_target(labels, true, |context| context.continue_label)?;
+            labels.statement_branch(target, depth, out);
         }
         BoundStmtKind::Checked(inner) | BoundStmtKind::Unchecked(inner) => {
             emit_statement(inner, frame, tokens, labels, out)?;
@@ -832,11 +864,13 @@ fn emit_statement(
                 cases: switch_cases,
                 string_cases: switch_string_cases,
                 default: default_label,
+                region_depth: labels.region_depth,
             });
             labels.loops.push(LoopContext {
                 continue_label: end,
                 break_label: end,
                 is_switch: true,
+                region_depth: labels.region_depth,
             });
             let reachability = lamella_binder::switch_section_reachability(expression, sections);
             for (index, section) in sections.iter().enumerate() {
@@ -912,6 +946,7 @@ fn emit_statement(
                 continue_label: step,
                 break_label: end,
                 is_switch: false,
+                region_depth: labels.region_depth,
             });
             emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
@@ -932,12 +967,7 @@ fn emit_statement(
         }
         BoundStmtKind::Goto(label) => {
             let id = labels.named_label(label);
-            let opcode = if labels.epilogue.is_some() {
-                Opcode::Leave
-            } else {
-                Opcode::Br
-            };
-            labels.branch(opcode, id, out);
+            labels.statement_branch(id, 0, out);
         }
         BoundStmtKind::GotoCase(value) => {
             let target = labels.switches.last().and_then(|switch| {
@@ -945,10 +975,10 @@ fn emit_statement(
                     .cases
                     .iter()
                     .find(|(case, _)| case == value)
-                    .map(|(_, label)| *label)
+                    .map(|(_, label)| (*label, switch.region_depth))
             });
             match target {
-                Some(label) => labels.branch(Opcode::Br, label, out),
+                Some((label, depth)) => labels.statement_branch(label, depth, out),
                 None => {
                     return Err(EmitError::Unsupported(
                         "goto case with no matching case in the enclosing switch",
@@ -962,10 +992,10 @@ fn emit_statement(
                     .string_cases
                     .iter()
                     .find(|(case, _)| case == text)
-                    .map(|(_, label)| *label)
+                    .map(|(_, label)| (*label, switch.region_depth))
             });
             match target {
-                Some(label) => labels.branch(Opcode::Br, label, out),
+                Some((label, depth)) => labels.statement_branch(label, depth, out),
                 None => {
                     return Err(EmitError::Unsupported(
                         "goto case with no matching string case in the enclosing switch",
@@ -973,8 +1003,12 @@ fn emit_statement(
                 }
             }
         }
-        BoundStmtKind::GotoDefault => match labels.switches.last().and_then(|s| s.default) {
-            Some(label) => labels.branch(Opcode::Br, label, out),
+        BoundStmtKind::GotoDefault => match labels
+            .switches
+            .last()
+            .and_then(|switch| switch.default.map(|label| (label, switch.region_depth)))
+        {
+            Some((label, depth)) => labels.statement_branch(label, depth, out),
             None => {
                 return Err(EmitError::Unsupported(
                     "goto default with no default section in the enclosing switch",
@@ -1006,7 +1040,10 @@ fn emit_try(
     let end = labels.label();
 
     let try_start = out.len() as u32;
-    emit_statement(body, frame, tokens, labels, out)?;
+    labels.region_depth += 1;
+    let emitted = emit_statement(body, frame, tokens, labels, out);
+    labels.region_depth -= 1;
+    emitted?;
     if !always_exits(body) {
         labels.branch(Opcode::Leave, end, out);
     }
@@ -1027,7 +1064,10 @@ fn emit_try(
             }
             _ => out.push(Instruction::simple(Opcode::Pop)),
         }
-        emit_statement(&catch.body, frame, tokens, labels, out)?;
+        labels.region_depth += 1;
+        let emitted = emit_statement(&catch.body, frame, tokens, labels, out);
+        labels.region_depth -= 1;
+        emitted?;
         if !always_exits(&catch.body) {
             labels.branch(Opcode::Leave, end, out);
         }
@@ -1052,8 +1092,11 @@ fn emit_try(
         let handler_start = out.len() as u32;
         let saved_hidden = labels.hidden_region;
         labels.hidden_region |= finally.span.is_hidden();
-        emit_statement(finally, frame, tokens, labels, out)?;
+        labels.region_depth += 1;
+        let emitted = emit_statement(finally, frame, tokens, labels, out);
+        labels.region_depth -= 1;
         labels.hidden_region = saved_hidden;
+        emitted?;
         out.push(Instruction::simple(Opcode::Endfinally));
         labels.handlers.push(EhClause {
             try_range: InstructionRange {
@@ -1132,6 +1175,7 @@ fn emit_for(
         continue_label: step,
         break_label: end,
         is_switch: false,
+        region_depth: labels.region_depth,
     });
     emit_statement(body, frame, tokens, labels, out)?;
     labels.loops.pop();
@@ -1148,13 +1192,13 @@ fn loop_target(
     labels: &Labels,
     skip_switch: bool,
     select: impl Fn(&LoopContext) -> usize,
-) -> Result<usize, EmitError> {
+) -> Result<(usize, usize), EmitError> {
     labels
         .loops
         .iter()
         .rev()
         .find(|context| !(skip_switch && context.is_switch))
-        .map(select)
+        .map(|context| (select(context), context.region_depth))
         .ok_or(EmitError::Unsupported("break/continue outside a loop"))
 }
 

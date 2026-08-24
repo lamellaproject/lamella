@@ -36,7 +36,7 @@ namespace System.Device.Gpio
         public PinNumberingScheme NumberingScheme { get { return _numbering; } }
 
         /// <summary>The number of pins provided by the controller.</summary>
-        public int PinCount { get { return _driver.PinCount; } }
+        public virtual int PinCount { get { return _driver.PinCount; } }
 
         private int Logical(int pinNumber)
         {
@@ -73,7 +73,7 @@ namespace System.Device.Gpio
         }
 
         /// <summary>Whether a specific pin is open.</summary>
-        public bool IsPinOpen(int pinNumber) { return _open[Logical(pinNumber)]; }
+        public virtual bool IsPinOpen(int pinNumber) { return _open[Logical(pinNumber)]; }
 
         /// <summary>Closes an open pin.</summary>
         public void ClosePin(int pinNumber)
@@ -84,26 +84,26 @@ namespace System.Device.Gpio
         }
 
         /// <summary>Sets the mode of a pin.</summary>
-        public void SetPinMode(int pinNumber, PinMode mode) { _driver.SetPinMode(Logical(pinNumber), mode); }
+        public virtual void SetPinMode(int pinNumber, PinMode mode) { _driver.SetPinMode(Logical(pinNumber), mode); }
 
         /// <summary>Gets the mode of a pin.</summary>
-        public PinMode GetPinMode(int pinNumber) { return _driver.GetPinMode(Logical(pinNumber)); }
+        public virtual PinMode GetPinMode(int pinNumber) { return _driver.GetPinMode(Logical(pinNumber)); }
 
         /// <summary>Whether a pin supports a specific mode.</summary>
-        public bool IsPinModeSupported(int pinNumber, PinMode mode) { return _driver.IsPinModeSupported(Logical(pinNumber), mode); }
+        public virtual bool IsPinModeSupported(int pinNumber, PinMode mode) { return _driver.IsPinModeSupported(Logical(pinNumber), mode); }
 
         /// <summary>Reads the current value of a pin.</summary>
-        public PinValue Read(int pinNumber) { return _driver.Read(Logical(pinNumber)); }
+        public virtual PinValue Read(int pinNumber) { return _driver.Read(Logical(pinNumber)); }
 
         /// <summary>Writes a value to a pin.</summary>
-        public void Write(int pinNumber, PinValue value) { _driver.Write(Logical(pinNumber), value); }
+        public virtual void Write(int pinNumber, PinValue value) { _driver.Write(Logical(pinNumber), value); }
 
         /// <summary>Toggles the current value of a pin.</summary>
-        public void Toggle(int pinNumber) { _driver.Toggle(Logical(pinNumber)); }
+        public virtual void Toggle(int pinNumber) { _driver.Toggle(Logical(pinNumber)); }
 
         /// <summary>Adds a callback that is invoked when <paramref name="pinNumber"/> has an event
         /// of type <paramref name="eventTypes"/>.</summary>
-        public void RegisterCallbackForPinValueChangedEvent(
+        public virtual void RegisterCallbackForPinValueChangedEvent(
             int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
         {
             _driver.AddCallbackForPinValueChangedEvent(Logical(pinNumber), eventTypes, callback);
@@ -111,7 +111,7 @@ namespace System.Device.Gpio
 
         /// <summary>Removes a callback that was being invoked for the pin at
         /// <paramref name="pinNumber"/>.</summary>
-        public void UnregisterCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
+        public virtual void UnregisterCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
         {
             _driver.RemoveCallbackForPinValueChangedEvent(Logical(pinNumber), callback);
         }

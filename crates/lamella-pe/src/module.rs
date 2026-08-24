@@ -19,6 +19,42 @@ use lamella_token::Token;
 /// The runtime version string written into the metadata root.
 const RUNTIME_VERSION: &str = "v4.0.30319";
 
+/// `MethodAttributes.HideBySig` (II.23.1.10): the method hides by name AND signature, which is what
+/// C# means by hiding and what csc marks every method it emits with. Applied in
+/// [`Module::push_method_row`] rather than by each caller -- see that function for why.
+const METHOD_HIDE_BY_SIG: u16 = 0x0080;
+
+/// `ParameterAttributes.Out` (II.23.1.13): the argument is written by the callee. It is what
+/// separates `out` from `ref` in metadata -- both travel as a byref in the SIGNATURE, so without
+/// this bit a consumer, a debugger and reflection all see an `out` parameter as a `ref` one.
+pub const PARAM_OUT: u16 = 0x0002;
+
+/// One `Param` row (II.22.33): the declared name, and the flags that say how the argument travels.
+#[derive(Debug, Clone)]
+pub struct ParamRow {
+    /// The declared name, so a debugger shows `count` rather than `arg1`.
+    pub name: Box<str>,
+    /// `ParameterAttributes` (II.23.1.13); 0 for an ordinary by-value parameter.
+    pub flags: u16,
+}
+
+impl ParamRow {
+    /// A by-value parameter: a name and no flags.
+    #[must_use]
+    pub fn named(name: Box<str>) -> ParamRow {
+        ParamRow { name, flags: 0 }
+    }
+}
+
+/// A bare name is a by-value parameter, which is what every SYNTHESIZED parameter list wants --
+/// a delegate's `object`/`IntPtr`, an accessor's `value`. A declared list builds its rows from the
+/// modifiers instead.
+impl From<&str> for ParamRow {
+    fn from(name: &str) -> ParamRow {
+        ParamRow::named(name.into())
+    }
+}
+
 fn align4(buffer: &mut Vec<u8>) {
     while buffer.len() % 4 != 0 {
         buffer.push(0);
@@ -724,12 +760,29 @@ impl ImageBuilder {
         body: &[u8],
         flags: u16,
         impl_flags: u16,
-        parameters: &[Box<str>],
+        parameters: &[ParamRow],
     ) -> Token {
         align4(&mut self.bodies);
         let rva = TEXT_RVA + CLI_HEADER_SIZE + self.bodies.len() as u32;
         self.bodies.extend_from_slice(body);
+        self.push_method_row(rva, name, signature, flags, impl_flags, parameters)
+    }
 
+    /// THE ONE PLACE A `MethodDef` ROW IS WRITTEN, AND THE ONE PLACE ITS FLAGS ARE FINALIZED.
+    ///
+    /// **`HideBySig` IS UNCONDITIONAL HERE BECAUSE IT IS THE C# CONTRACT, NOT A DEFAULT.** Every
+    /// `MethodDef` this builder writes comes from C# source, and C# hides by name AND signature.
+    /// Without the flag the runtime hides by NAME alone (II.23.1.10), so a derived method hides
+    /// every base overload of that name whatever its signature -- `Shadows` semantics, not C#'s.
+    fn push_method_row(
+        &mut self,
+        rva: u32,
+        name: &str,
+        signature: &[u8],
+        flags: u16,
+        impl_flags: u16,
+        parameters: &[ParamRow],
+    ) -> Token {
         let name = self.strings.intern(name);
         let signature = self.blobs.intern(signature);
         let first_param = self.tables.row_count(table::PARAM) + 1;
@@ -738,7 +791,7 @@ impl ImageBuilder {
             alloc::vec![
                 Column::U32(rva),
                 Column::U16(impl_flags),
-                Column::U16(flags),
+                Column::U16(flags | METHOD_HIDE_BY_SIG),
                 Column::StringRef(name),
                 Column::BlobRef(signature),
                 Column::Index(table::PARAM, first_param),
@@ -769,31 +822,9 @@ impl ImageBuilder {
         signature: &[u8],
         flags: u16,
         impl_flags: u16,
-        parameters: &[Box<str>],
+        parameters: &[ParamRow],
     ) -> Token {
-        let name = self.strings.intern(name);
-        let signature = self.blobs.intern(signature);
-        let first_param = self.tables.row_count(table::PARAM) + 1;
-        let row = self.tables.add_row(
-            table::METHOD_DEF,
-            alloc::vec![
-                Column::U32(0),
-                Column::U16(impl_flags),
-                Column::U16(flags),
-                Column::StringRef(name),
-                Column::BlobRef(signature),
-                Column::Index(table::PARAM, first_param),
-            ],
-        );
-        self.add_param_rows(parameters);
-        self.method_debug.push(MethodDebug {
-            sequence_points: Vec::new(),
-            local_signature: 0,
-            locals: Vec::new(),
-            scope_length: 0,
-            document: 0,
-        });
-        let token = Token::new(table::METHOD_DEF, row);
+        let token = self.push_method_row(0, name, signature, flags, impl_flags, parameters);
         self.deferred_bodies.push(token);
         token
     }
@@ -818,13 +849,13 @@ impl ImageBuilder {
     /// Adds a `Param` row (II.22.33) per parameter -- `Flags=0`, `Sequence` 1..N, `Name`
     /// -- so a debugger/PDB consumer can show argument names instead of `argN`. The rows
     /// follow the just-added `MethodDef` whose `ParamList` points at the first of them.
-    fn add_param_rows(&mut self, parameters: &[Box<str>]) {
+    fn add_param_rows(&mut self, parameters: &[ParamRow]) {
         for (index, parameter) in parameters.iter().enumerate() {
-            let name = self.strings.intern(parameter);
+            let name = self.strings.intern(&parameter.name);
             self.tables.add_row(
                 table::PARAM,
                 alloc::vec![
-                    Column::U16(0),
+                    Column::U16(parameter.flags),
                     Column::U16((index + 1) as u16),
                     Column::StringRef(name),
                 ],
@@ -886,7 +917,7 @@ impl ImageBuilder {
         name: &str,
         signature: &[u8],
         flags: u16,
-        parameters: &[Box<str>],
+        parameters: &[ParamRow],
     ) -> Token {
         self.add_bodyless_method(name, signature, flags, 0, parameters)
     }
@@ -898,7 +929,7 @@ impl ImageBuilder {
         name: &str,
         signature: &[u8],
         flags: u16,
-        parameters: &[Box<str>],
+        parameters: &[ParamRow],
     ) -> Token {
         self.add_bodyless_method(name, signature, flags, 0x0003, parameters)
     }
@@ -917,31 +948,9 @@ impl ImageBuilder {
         signature: &[u8],
         flags: u16,
         impl_flags: u16,
-        parameters: &[Box<str>],
+        parameters: &[ParamRow],
     ) -> Token {
-        let name = self.strings.intern(name);
-        let signature = self.blobs.intern(signature);
-        let first_param = self.tables.row_count(table::PARAM) + 1;
-        let row = self.tables.add_row(
-            table::METHOD_DEF,
-            alloc::vec![
-                Column::U32(0),
-                Column::U16(impl_flags),
-                Column::U16(flags),
-                Column::StringRef(name),
-                Column::BlobRef(signature),
-                Column::Index(table::PARAM, first_param),
-            ],
-        );
-        self.add_param_rows(parameters);
-        self.method_debug.push(MethodDebug {
-            sequence_points: Vec::new(),
-            local_signature: 0,
-            locals: Vec::new(),
-            scope_length: 0,
-            document: 0,
-        });
-        Token::new(table::METHOD_DEF, row)
+        self.push_method_row(0, name, signature, flags, impl_flags, parameters)
     }
 
     /// Adds a P/Invoke `MethodDef` (RVA 0, no body) -- `flags` carry `PinvokeImpl` (II.23.1.10), and
@@ -954,7 +963,7 @@ impl ImageBuilder {
         name: &str,
         signature: &[u8],
         flags: u16,
-        parameters: &[Box<str>],
+        parameters: &[ParamRow],
     ) -> Token {
         self.add_bodyless_method(name, signature, flags, 0x0080, parameters)
     }

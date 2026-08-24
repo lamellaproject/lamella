@@ -20,13 +20,23 @@ namespace System.Device.I2c
         public abstract void Read(byte[] buffer);
 
         /// <summary>Reads a byte from the device.</summary>
-        public abstract byte ReadByte();
+        public virtual byte ReadByte()
+        {
+            byte[] buffer = new byte[1];
+            Read(buffer);
+            return buffer[0];
+        }
 
         /// <summary>Writes <paramref name="buffer"/> to the device in one transaction.</summary>
         public abstract void Write(byte[] buffer);
 
         /// <summary>Writes a byte to the device.</summary>
-        public abstract void WriteByte(byte value);
+        public virtual void WriteByte(byte value)
+        {
+            byte[] buffer = new byte[1];
+            buffer[0] = value;
+            Write(buffer);
+        }
 
         /// <summary>Performs an atomic write-then-read: the write bytes go out, a RESTART
         /// condition (not a STOP) follows, and the read fills <paramref name="readBuffer"/>

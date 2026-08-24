@@ -94,4 +94,7 @@ workspace = true
 # the case that needs it.
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["usbbulk"] }
 lamella-probe-core = { path = "../lamella-probe-core" }
+# The concrete USB-bulk transport a CMSIS-DAP v2 probe is reached over, named because a tool that
+# builds its own `Dap` holds the transport type rather than a boxed seam.
+lamella-usbbulk = { path = "../lamella-usbbulk" }
 

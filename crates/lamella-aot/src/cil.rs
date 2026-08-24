@@ -951,8 +951,12 @@ fn lower_with_source(
                 .map(|(index, _)| index)
         })
         .collect();
+    let back_edge_target = |b: usize| {
+        b != 0 && preds.get(b).is_some_and(|p| p.iter().any(|&pred| pred >= b))
+    };
+    let takes_edge_params = |b: usize| is_merge(b) || back_edge_target(b);
     let takes_local_params =
-        |b: usize| is_merge(b) || finally_handler[b].is_some() || finally_continuation[b];
+        |b: usize| takes_edge_params(b) || finally_handler[b].is_some() || finally_continuation[b];
     let trap_access: Vec<Option<TrapKind>> = blocks
         .iter()
         .enumerate()
@@ -1297,7 +1301,7 @@ fn lower_with_source(
                     &handler_block_of_clause,
                     unwind_finally(b),
                     resolver,
-                    &is_merge,
+                    &takes_edge_params,
                     &args,
                     &locals,
                     local_count,
@@ -1313,7 +1317,7 @@ fn lower_with_source(
                     inst,
                     end,
                     &block_of,
-                    &is_merge,
+                    &takes_edge_params,
                     &args,
                     local_count,
                     &mut stack,
@@ -1329,7 +1333,7 @@ fn lower_with_source(
                     inst,
                     end,
                     &block_of,
-                    &is_merge,
+                    &takes_edge_params,
                     &args,
                     local_count,
                     &mut stack,
@@ -1487,14 +1491,14 @@ fn lower_with_source(
                     )?
                 } else {
                     let mut args = merge_args(
-                        is_merge(next),
+                        takes_edge_params(next),
                         local_count,
                         &locals,
                         local_types,
                         &mut value_types,
                         &mut insts,
                     );
-                    if is_merge(next) {
+                    if takes_edge_params(next) {
                         args.extend(stack.iter().copied());
                     }
                     Terminator::Jump {
@@ -1562,6 +1566,31 @@ fn lower_with_source(
                 block.insts.push((value, zero_inst(ret_ty)));
                 block.terminator = Some(Terminator::Return(Some(value)));
             }
+        }
+    }
+
+    for block in &mir_blocks {
+        let edge = |target: BlockId, args: &[ValueId]| -> Result<(), CilError> {
+            match mir_blocks.get(target.index()) {
+                Some(t) if t.params.len() == args.len() => Ok(()),
+                _ => Err(CilError::UnsupportedControlFlow(
+                    ControlFlowGap::BackEdgeNotHeader,
+                )),
+            }
+        };
+        match &block.terminator {
+            Some(Terminator::Jump { target, args }) => edge(*target, args)?,
+            Some(Terminator::Branch {
+                if_true,
+                true_args,
+                if_false,
+                false_args,
+                ..
+            }) => {
+                edge(*if_true, true_args)?;
+                edge(*if_false, false_args)?;
+            }
+            _ => {}
         }
     }
 
@@ -4488,7 +4517,7 @@ fn build_eh_leave(
     handler_block_of_clause: &[usize],
     unwind: Option<usize>,
     resolver: &dyn CallResolver,
-    is_merge: &impl Fn(usize) -> bool,
+    takes_edge_params: &impl Fn(usize) -> bool,
     entry_args: &[ValueId],
     locals: &[Option<ValueId>],
     local_count: usize,
@@ -4526,7 +4555,7 @@ fn build_eh_leave(
     );
     let landing = split_edge_to_merge(
         leave_target,
-        is_merge,
+        takes_edge_params,
         entry_args,
         local_count,
         locals,
@@ -5993,7 +6022,7 @@ fn build_branch(
     inst: &Instruction,
     fallthrough: usize,
     block_of: &impl Fn(usize) -> Option<usize>,
-    is_merge: &impl Fn(usize) -> bool,
+    takes_edge_params: &impl Fn(usize) -> bool,
     entry_args: &[ValueId],
     local_count: usize,
     stack: &mut Vec<ValueId>,
@@ -6017,14 +6046,14 @@ fn build_branch(
                 entry_args.to_vec()
             } else {
                 let mut args = merge_args(
-                    is_merge(target),
+                    takes_edge_params(target),
                     local_count,
                     locals,
                     local_types,
                     value_types,
                     insts,
                 );
-                if is_merge(target) {
+                if takes_edge_params(target) {
                     args.extend(stack.iter().copied());
                 }
                 args
@@ -6044,7 +6073,7 @@ fn build_branch(
             let mut split = |block: usize| {
                 split_edge_to_merge(
                     block,
-                    is_merge,
+                    takes_edge_params,
                     entry_args,
                     local_count,
                     locals,
@@ -6086,7 +6115,7 @@ fn build_switch(
     inst: &Instruction,
     fallthrough: usize,
     block_of: &impl Fn(usize) -> Option<usize>,
-    is_merge: &impl Fn(usize) -> bool,
+    takes_edge_params: &impl Fn(usize) -> bool,
     entry_args: &[ValueId],
     local_count: usize,
     stack: &mut Vec<ValueId>,
@@ -6108,7 +6137,7 @@ fn build_switch(
     ))?;
     let mut not_matched = split_edge_to_merge(
         default,
-        is_merge,
+        takes_edge_params,
         entry_args,
         local_count,
         locals,
@@ -6125,7 +6154,7 @@ fn build_switch(
         ))?;
         let matched = split_edge_to_merge(
             target,
-            is_merge,
+            takes_edge_params,
             entry_args,
             local_count,
             locals,
@@ -6163,7 +6192,7 @@ fn build_switch(
     ))?;
     let matched = split_edge_to_merge(
         target0,
-        is_merge,
+        takes_edge_params,
         entry_args,
         local_count,
         locals,
@@ -6226,7 +6255,7 @@ fn emit_case_test(
 #[allow(clippy::too_many_arguments)]
 fn split_edge_to_merge(
     block: usize,
-    is_merge: &impl Fn(usize) -> bool,
+    takes_edge_params: &impl Fn(usize) -> bool,
     entry_args: &[ValueId],
     local_count: usize,
     locals: &[Option<ValueId>],
@@ -6237,7 +6266,7 @@ fn split_edge_to_merge(
     block_count: usize,
 ) -> usize {
     let entry_loop_header = block == 0 && !entry_args.is_empty();
-    if !is_merge(block) && !entry_loop_header {
+    if !takes_edge_params(block) && !entry_loop_header {
         return block;
     }
     let mut insts: Vec<(ValueId, Inst)> = Vec::new();
@@ -8599,11 +8628,88 @@ mod tests {
             handlers: Vec::new().into_boxed_slice(),
         };
         let func = lower_method(&body).unwrap();
-        assert_eq!(func.blocks.len(), 4);
+        assert_eq!(func.blocks.len(), 5);
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(func.value_types.len() > 8);
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn threads_a_loop_local_written_in_the_condition_of_an_empty_bodied_loop() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::new(Opcode::BrS, Operand::Target(4)),
+                Instruction::simple(Opcode::Nop),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Dup),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Clt),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(3)),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+
+        let (condition, increment) = func
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(index, block)| {
+                block
+                    .insts
+                    .iter()
+                    .find_map(|(value, inst)| match inst {
+                        Inst::Binary { op: BinOp::Add, .. } => Some(*value),
+                        _ => None,
+                    })
+                    .map(|value| (index, value))
+            })
+            .expect("the condition block increments the local");
+
+        let carried = func.blocks.iter().any(|block| {
+            matches!(
+                &block.terminator,
+                Some(Terminator::Jump { args, .. }) if args.first() == Some(&increment)
+            )
+        });
+        assert!(
+            carried,
+            "no edge carries the incremented local around the loop -- the loop reads its entry value \
+             forever"
+        );
+
+        let body = func
+            .blocks
+            .iter()
+            .find(|block| {
+                !block.params.is_empty()
+                    && matches!(
+                        &block.terminator,
+                        Some(Terminator::Jump { target, .. }) if target.index() == condition
+                    )
+            })
+            .expect("the body is a parameter-taking block that jumps to the condition");
+        let Some(Terminator::Jump { args, .. }) = &body.terminator else {
+            unreachable!("matched above")
+        };
+        assert_eq!(
+            args.first(),
+            body.params.first(),
+            "the body passes its own parameter on, which is what the split block filled"
+        );
     }
 
     #[test]

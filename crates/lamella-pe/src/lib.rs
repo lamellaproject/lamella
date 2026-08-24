@@ -19,7 +19,7 @@ pub use heap::{
     BlobHeapBuilder, GuidHeapBuilder, StringHeapBuilder, UserStringHeapBuilder, compress_i32,
     compress_u32,
 };
-pub use module::ImageBuilder;
+pub use module::{ImageBuilder, PARAM_OUT, ParamRow};
 pub use pdb::{
     DebugDocument, LocalVariable, MethodDebug, SequencePoint, build_portable_pdb,
     sequence_points_blob,

@@ -4,6 +4,9 @@ namespace System
 {
     public struct Char : IComparable
     {
+        public const char MaxValue = '\uFFFF';
+        public const char MinValue = '\u0000';
+
 
         public static UnicodeCategory GetUnicodeCategory(char c) { return (UnicodeCategory)CharCategoryData.Category(c); }
 
@@ -76,8 +79,37 @@ namespace System
 
         public static bool IsSurrogate(char c) { return c >= '\uD800' && c <= '\uDFFF'; }
 
+        private static char Index(string s, int index)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            if (index < 0 || index >= s.Length) throw new ArgumentOutOfRangeException("index");
+            return s[index];
+        }
+
+        public static UnicodeCategory GetUnicodeCategory(string s, int index) { return GetUnicodeCategory(Index(s, index)); }
+        public static bool IsLetter(string s, int index) { return IsLetter(Index(s, index)); }
+        public static bool IsDigit(string s, int index) { return IsDigit(Index(s, index)); }
+        public static bool IsLetterOrDigit(string s, int index) { return IsLetterOrDigit(Index(s, index)); }
+        public static bool IsUpper(string s, int index) { return IsUpper(Index(s, index)); }
+        public static bool IsLower(string s, int index) { return IsLower(Index(s, index)); }
+        public static bool IsNumber(string s, int index) { return IsNumber(Index(s, index)); }
+        public static bool IsWhiteSpace(string s, int index) { return IsWhiteSpace(Index(s, index)); }
+        public static bool IsPunctuation(string s, int index) { return IsPunctuation(Index(s, index)); }
+        public static bool IsSymbol(string s, int index) { return IsSymbol(Index(s, index)); }
+        public static bool IsSeparator(string s, int index) { return IsSeparator(Index(s, index)); }
+        public static bool IsControl(string s, int index) { return IsControl(Index(s, index)); }
+        public static bool IsSurrogate(string s, int index) { return IsSurrogate(Index(s, index)); }
+
+        public static char Parse(string s)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            if (s.Length != 1) throw new FormatException("String must be exactly one character long.");
+            return s[0];
+        }
+
 #if LAMELLA_SURFACE_FLOAT
         public static double GetNumericValue(char c) { return CharNumericData.Value(c); }
+        public static double GetNumericValue(string s, int index) { return GetNumericValue(Index(s, index)); }
 #endif
 
         public static char ToUpper(char c) { return CaseMapping.ToUpper(c); }

@@ -19,7 +19,8 @@ use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, encode_with_off
 use lamella_metadata::signature::element;
 use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_name};
 use lamella_pe::{
-    DebugDocument, ImageBuilder, LocalVariable, MethodDebug, SequencePoint, TypeSig,
+    DebugDocument, ImageBuilder, LocalVariable, MethodDebug, PARAM_OUT, ParamRow, SequencePoint,
+    TypeSig,
     field_signature, generic_method_signature, local_signature, method_signature,
     method_spec_signature, property_signature, type_signature, vararg_call_site_signature,
     vararg_method_signature,
@@ -1474,9 +1475,9 @@ pub(crate) fn build_submission_delta(
     let holder_name = format!("Submission${index}");
     image.add_type("<repl>", &holder_name, object, PUBLIC_CLASS);
 
-    let parameter_names = [Box::<str>::from("s")];
+    let parameter_names = [ParamRow::from("s")];
     let emitted = emit_body(
-        &parameter_names,
+        &param_row_names(&parameter_names),
         &[],
         &[],
         bound,
@@ -2627,6 +2628,7 @@ fn emit_type_inner(
                     *is_vararg,
                     body,
                     explicit_interface.as_ref(),
+                    0,
                     debug,
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
@@ -2691,6 +2693,7 @@ fn emit_type_inner(
                     false,
                     body,
                     None,
+                    SPECIAL_NAME,
                     debug,
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
@@ -2718,6 +2721,7 @@ fn emit_type_inner(
                     false,
                     body,
                     None,
+                    SPECIAL_NAME,
                     debug,
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
@@ -3170,6 +3174,16 @@ fn emit_abstract_method(
 /// A WRAPPER, so the scope is closed on every exit rather than the last: the body below returns
 /// through several `?`s, and a leaked scope would resolve the NEXT method's `T` against this one's.
 #[allow(clippy::too_many_arguments)]
+/// `extra_flags` carries what the DECLARATION KIND means and the modifiers cannot express:
+/// `SPECIAL_NAME` for an operator, nothing for an ordinary method.
+///
+/// **IT IS A REQUIRED PARAMETER RATHER THAN A DEFAULT, SO A NEW MEMBER KIND HAS TO DECIDE.**
+/// `SpecialName` is what MAKES a method an operator (II.10.3), and an emitter that omits the flag
+/// while also not requiring it agrees with itself -- the two halves cancel, and only a consumer
+/// outside the compilation sees that `==` is an ordinary method rather than an operator.
+///
+/// Keying on the `op_` name prefix instead would mark a plain method spelled `op_Foo`, which csc
+/// leaves unmarked; the declaration kind is the thing that knows, so the declaration kind says so.
 fn emit_one_method(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -3184,6 +3198,7 @@ fn emit_one_method(
     is_vararg: bool,
     body: &Stmt,
     explicit_interface: Option<&TypeRef>,
+    extra_flags: u16,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let entered = binder.enter_type_parameters(type_parameters, constraints);
@@ -3201,6 +3216,7 @@ fn emit_one_method(
         is_vararg,
         body,
         explicit_interface,
+        extra_flags,
         debug,
     );
     binder.exit_type_parameters(entered);
@@ -3224,6 +3240,7 @@ fn emit_one_method_in_scope(
     is_vararg: bool,
     body: &Stmt,
     explicit_interface: Option<&TypeRef>,
+    extra_flags: u16,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let method_type_parameters: Vec<Box<str>> =
@@ -3280,7 +3297,7 @@ fn emit_one_method_in_scope(
     let is_static = modifiers.contains(&Modifier::Static);
     let is_virtual = modifiers.contains(&Modifier::Virtual);
     let is_override = modifiers.contains(&Modifier::Override);
-    let mut flags = member_visibility(modifiers);
+    let mut flags = member_visibility(modifiers) | extra_flags;
     if is_static {
         flags |= METHOD_STATIC;
     }
@@ -3485,14 +3502,59 @@ fn constructed_interface_member_ref(
 /// The declared name of each parameter, in order -- the `Param` rows (II.22.33) that make up a
 /// method's `ParamList` run, so a debugger shows `count` rather than `arg1` and a parameter-targeted
 /// attribute has a row to hang off.
-fn parameter_names(parameters: &[Parameter]) -> Vec<Box<str>> {
-    parameters.iter().map(|parameter| parameter.name.clone()).collect()
+fn parameter_names(parameters: &[Parameter]) -> Vec<ParamRow> {
+    parameters
+        .iter()
+        .map(|parameter| ParamRow {
+            name: parameter.name.clone(),
+            flags: param_flags(parameter.modifier),
+        })
+        .collect()
+}
+
+/// The `ParameterAttributes` a declared modifier means (II.23.1.13).
+///
+/// **`out` AND `ref` ARE THE SAME SIGNATURE AND DIFFERENT METADATA.** Both encode a byref in the
+/// method signature, so the only thing that tells a consumer, a debugger or reflection which one
+/// the author wrote is this bit -- and it was never emitted, so every `out` parameter in every
+/// assembly this compiler has built has been published as a `ref`.
+fn param_flags(modifier: Option<ParameterModifier>) -> u16 {
+    match modifier {
+        Some(ParameterModifier::Out) => PARAM_OUT,
+        _ => 0,
+    }
+}
+
+/// Just the names out of a `Param` row list, for [`emit_body`] -- which builds the frame and has
+/// no use for the metadata flags the rows also carry.
+fn param_row_names(rows: &[ParamRow]) -> Vec<Box<str>> {
+    rows.iter().map(|row| row.name.clone()).collect()
+}
+
+/// [`bound_parameter_names`] for a list that CANNOT contain a `ref` or `out` parameter: a property
+/// or event accessor's `value`, and an indexer's indices, which C# forbids from being byref at all
+/// (CS0631). Naming the reason once beats an unexplained empty slice at four call sites.
+fn by_value_parameter_names(parameters: &[(Box<str>, TypeSymbol)]) -> Vec<ParamRow> {
+    bound_parameter_names(parameters, &[])
 }
 
 /// The names out of a BOUND parameter list -- the `(name, type)` pairs the accessor and body
 /// paths build, as against [`parameter_names`]'s syntactic ones.
-fn bound_parameter_names(parameters: &[(Box<str>, TypeSymbol)]) -> Vec<Box<str>> {
-    parameters.iter().map(|(name, _)| name.clone()).collect()
+fn bound_parameter_names(
+    parameters: &[(Box<str>, TypeSymbol)],
+    passing: &[ParamPassing],
+) -> Vec<ParamRow> {
+    parameters
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| ParamRow {
+            name: name.clone(),
+            flags: match passing.get(index) {
+                Some(ParamPassing::Out) => PARAM_OUT,
+                _ => 0,
+            },
+        })
+        .collect()
 }
 
 /// Whether `parameters` ends in a `params` array (17.5.1.4). Only the LAST parameter can be one,
@@ -3540,14 +3602,34 @@ fn emit_param_array_marker(
 
 /// The `ref`/`out` (byref) flag of each parameter, in order -- parallel to the bound
 /// parameter list, driving the byref signature and the deref of body reads/writes.
-fn byref_flags(parameters: &[Parameter]) -> Vec<bool> {
+/// How one argument travels: by value, or as a byref the callee reads (`ref`) or writes (`out`).
+///
+/// **BODY LOWERING ASKS ONE QUESTION AND METADATA ASKS ANOTHER, WHICH IS WHY THIS IS NOT A BOOL.**
+/// A `ref` and an `out` parameter are the same thing to the emitter -- an address to deref through
+/// -- and different things to a consumer, and collapsing them to "is it byref" is what left the
+/// `Out` flag with nowhere to come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamPassing {
+    ByValue,
+    Ref,
+    Out,
+}
+
+impl ParamPassing {
+    /// Whether the argument slot holds an ADDRESS -- true for both `ref` and `out`, which is the
+    /// only thing the body lowering needs to know.
+    fn is_byref(self) -> bool {
+        !matches!(self, ParamPassing::ByValue)
+    }
+}
+
+fn byref_flags(parameters: &[Parameter]) -> Vec<ParamPassing> {
     parameters
         .iter()
-        .map(|parameter| {
-            matches!(
-                parameter.modifier,
-                Some(ParameterModifier::Ref | ParameterModifier::Out)
-            )
+        .map(|parameter| match parameter.modifier {
+            Some(ParameterModifier::Ref) => ParamPassing::Ref,
+            Some(ParameterModifier::Out) => ParamPassing::Out,
+            _ => ParamPassing::ByValue,
         })
         .collect()
 }
@@ -3923,7 +4005,7 @@ fn emit_method_body(
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol)],
-    byref_flags: &[bool],
+    byref_flags: &[ParamPassing],
     body: &lamella_syntax::ast::Stmt,
     is_static: bool,
     is_async: bool,
@@ -3966,7 +4048,7 @@ fn emit_method_body(
             .enumerate()
             .map(|(index, (_, ty))| {
                 let sig = open_type_sig(tokens, ty, scope)?;
-                Ok(if byref_flags.get(index).copied().unwrap_or(false) {
+                Ok(if byref_flags.get(index).copied().unwrap_or(ParamPassing::ByValue).is_byref() {
                     TypeSig::ByRef(Box::new(sig))
                 } else {
                     sig
@@ -3980,7 +4062,7 @@ fn emit_method_body(
             &signature,
             flags,
             IL_MANAGED,
-            &bound_parameter_names(params),
+            &by_value_parameter_names(params),
         );
         tokens.pending_async.push(PendingAsync {
             stub_token,
@@ -4033,7 +4115,7 @@ fn emit_bound_body(
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol)],
-    byref_flags: &[bool],
+    byref_flags: &[ParamPassing],
     bound: &BoundStmt,
     is_static: bool,
     is_vararg: bool,
@@ -4085,7 +4167,7 @@ fn emit_bound_body_into(
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol)],
-    byref_flags: &[bool],
+    byref_flags: &[ParamPassing],
     bound: &BoundStmt,
     is_static: bool,
     flags: u16,
@@ -4127,7 +4209,7 @@ fn emit_bound_body_in_scope(
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol)],
-    byref_flags: &[bool],
+    byref_flags: &[ParamPassing],
     bound: &BoundStmt,
     is_static: bool,
     is_vararg: bool,
@@ -4148,11 +4230,11 @@ fn emit_bound_body_in_scope(
         declaring: declaring_parameters,
     };
     let arg_base = u16::from(!is_static);
-    let parameter_names = bound_parameter_names(params);
+    let parameter_names = bound_parameter_names(params, byref_flags);
     let byref_params: Vec<(Box<str>, TypeSymbol)> = params
         .iter()
         .enumerate()
-        .filter(|(index, _)| byref_flags.get(*index).copied().unwrap_or(false))
+        .filter(|(index, _)| byref_flags.get(*index).copied().unwrap_or(ParamPassing::ByValue).is_byref())
         .map(|(_, (name, ty))| (name.clone(), ty.clone()))
         .collect();
     let debug_source = debug.map(|context| context.source.as_bytes());
@@ -4164,7 +4246,7 @@ fn emit_bound_body_in_scope(
         handlers,
         pinned_slots,
     } = emit_body(
-        &parameter_names,
+        &param_row_names(&parameter_names),
         &byref_params,
         scope.declaring,
         bound,
@@ -4230,7 +4312,7 @@ fn emit_bound_body_in_scope(
         .enumerate()
         .map(|(index, (_, ty))| {
             let sig = open_type_sig(tokens, ty, scope)?;
-            Ok(if byref_flags.get(index).copied().unwrap_or(false) {
+            Ok(if byref_flags.get(index).copied().unwrap_or(ParamPassing::ByValue).is_byref() {
                 TypeSig::ByRef(Box::new(sig))
             } else {
                 sig
@@ -4277,7 +4359,7 @@ pub(crate) struct PendingAsync {
     pub(crate) enclosing: TypeSymbol,
     /// The stub's frame facts, fixed when its row was added.
     pub(crate) params: Vec<(Box<str>, TypeSymbol)>,
-    pub(crate) byref_flags: Vec<bool>,
+    pub(crate) byref_flags: Vec<ParamPassing>,
     pub(crate) return_symbol: TypeSymbol,
     pub(crate) is_static: bool,
     pub(crate) flags: u16,
@@ -4596,7 +4678,7 @@ fn emit_property(
         } else if is_abstract {
             let signature =
                 method_signature(true, &[member_type_sig(tokens, enclosing, &property_ty)?], &TypeSig::Void);
-            Some(image.add_abstract_method(&method_name, &signature, flags, &bound_parameter_names(&params)))
+            Some(image.add_abstract_method(&method_name, &signature, flags, &by_value_parameter_names(&params)))
         } else if let Some(field) = backing {
             let signature = method_signature(
                 !is_static,
@@ -4608,7 +4690,7 @@ fn emit_property(
                 &method_name,
                 &signature,
                 flags,
-                &bound_parameter_names(&params),
+                &by_value_parameter_names(&params),
                 field,
                 is_static,
                 true,
@@ -4741,7 +4823,7 @@ fn emit_auto_accessor(
     method_name: &str,
     signature: &[u8],
     flags: u16,
-    parameter_names: &[Box<str>],
+    parameter_names: &[ParamRow],
     field: Token,
     is_static: bool,
     is_setter: bool,
@@ -4921,7 +5003,7 @@ fn emit_indexer(
                 &getter_name,
                 &signature,
                 flags,
-                &bound_parameter_names(&index_params),
+                &by_value_parameter_names(&index_params),
             ))
         } else {
             None
@@ -4955,7 +5037,7 @@ fn emit_indexer(
                 &setter_name,
                 &signature,
                 flags,
-                &bound_parameter_names(&params),
+                &by_value_parameter_names(&params),
             ))
         } else {
             None
@@ -5332,6 +5414,9 @@ fn emit_field(
         let mut flags = visibility;
         if is_static {
             flags |= FIELD_STATIC;
+        }
+        if modifiers.contains(&Modifier::Readonly) {
+            flags |= FIELD_INITONLY;
         }
         let is_const_decimal =
             is_const && matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal));
@@ -13388,6 +13473,96 @@ mod tests {
         assert!(
             calls("ToOther"),
             "the control row: (Other)t IS the operator's own conversion and must still call it"
+        );
+    }
+
+    #[test]
+    fn every_declaration_position_carries_the_metadata_flags_csc_emits() {
+        const HIDE_BY_SIG: u32 = 0x0080;
+        const SPECIAL_NAME: u32 = 0x0800;
+        const INIT_ONLY: u32 = 0x0020;
+        const PARAM_OUT: u32 = 0x0002;
+
+        let image = image_of_gated_source(
+            "public class P {
+                 public readonly int Fixed;
+                 public int Mutable;
+                 public int Instance() { return 1; }
+                 public static int Static() { return 2; }
+                 public int Prop { get { return 3; } }
+                 public virtual int Virt() { return 4; }
+                 public static P operator +(P a, P b) { return a; }
+                 public static void Split(int v, out int lo, ref int hi) { lo = v; hi = v; }
+                 public P() { }
+             }",
+        );
+        let assembly = lamella_metadata::Assembly::read(&image).expect("the image parses");
+        let ty = assembly
+            .type_defs()
+            .find(|def| def.name().is_some_and(|n| n.name == "P"))
+            .expect("P is a TypeDef");
+
+        let method = |name: &str| {
+            ty.methods()
+                .find(|m| m.name() == Some(name))
+                .unwrap_or_else(|| panic!("P has no method {name}"))
+        };
+        for name in [
+            "Instance", "Static", "get_Prop", "op_Addition", "Split", "Virt", ".ctor",
+        ] {
+            assert!(
+                method(name).flags() & HIDE_BY_SIG != 0,
+                "{name} must carry HideBySig"
+            );
+        }
+        assert!(
+            method("op_Addition").flags() & SPECIAL_NAME != 0,
+            "an operator must carry SpecialName"
+        );
+        assert!(
+            method("Instance").flags() & SPECIAL_NAME == 0,
+            "an ordinary method must NOT carry SpecialName"
+        );
+
+        let field = |name: &str| {
+            ty.fields()
+                .find(|f| f.name() == Some(name))
+                .unwrap_or_else(|| panic!("P has no field {name}"))
+        };
+        assert!(
+            field("Fixed").flags() & INIT_ONLY != 0,
+            "a readonly field must carry InitOnly"
+        );
+        assert!(
+            field("Mutable").flags() & INIT_ONLY == 0,
+            "a writable field must NOT carry InitOnly"
+        );
+
+        let split: alloc::vec::Vec<(Option<&str>, u32)> =
+            method("Split").params().map(|p| (p.name(), p.flags())).collect();
+        assert_eq!(
+            split
+                .iter()
+                .find(|(name, _)| *name == Some("lo"))
+                .map(|(_, flags)| flags & PARAM_OUT),
+            Some(PARAM_OUT),
+            "an `out` parameter must carry Out: {split:?}"
+        );
+        assert_eq!(
+            split
+                .iter()
+                .find(|(name, _)| *name == Some("hi"))
+                .map(|(_, flags)| flags & PARAM_OUT),
+            Some(0),
+            "a `ref` parameter must NOT carry Out: {split:?}"
+        );
+        assert_eq!(
+            split
+                .iter()
+                .find(|(name, _)| *name == Some("v"))
+                .map(|(_, flags)| flags & PARAM_OUT),
+            Some(0),
+            "a by-value parameter must NOT carry Out: {split:?}"
         );
     }
 

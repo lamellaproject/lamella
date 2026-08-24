@@ -6984,8 +6984,16 @@ pub fn emit_board_rust(
 
 /// The families whose strata additionally emit the Swift projection. The emitters are
 /// family-generic; each family joins this list deliberately as its Swift consumers arrive.
-const SWIFT_FAMILIES: &[&str] =
-    &["nrf51", "nrf52833", "rp2040", "rp2350", "samd21", "stm32f7", "stm32l476"];
+const SWIFT_FAMILIES: &[&str] = &[
+    "ch32v003",
+    "nrf51",
+    "nrf52833",
+    "rp2040",
+    "rp2350",
+    "samd21",
+    "stm32f7",
+    "stm32l476",
+];
 
 fn emit_swift_header(out: &mut String, what: &str, sources: &[String], regen: &str) {
     out.push_str(&format!(

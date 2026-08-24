@@ -158,6 +158,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(environment_tick_count),
     entry!(exception_ctor),
     entry!(exception_get_message),
+    entry!(exception_runtime_inner_exception),
     entry!(exception_runtime_message),
     #[cfg(feature = "reflection")]
     entry!(field_get_raw_constant),
@@ -526,6 +527,8 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     #[cfg(feature = "reflection")]
     entry!(type_get_methods),
     entry!(type_get_name),
+    #[cfg(feature = "exceptions")]
+    entry!(type_initialization_exception_runtime_type_name),
     #[cfg(feature = "reflection")]
     entry!(type_get_namespace),
     entry!(type_get_property),

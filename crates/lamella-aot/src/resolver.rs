@@ -1817,6 +1817,26 @@ impl<'a> MetadataResolver<'a> {
                 }
             }
         }
+        let links: Vec<(&'a Assembly<'a>, TypeDef<'a>)> = self
+            .cross_class_chain(reference, type_def, &[])
+            .into_iter()
+            .map(|link| (link.assembly, link.type_def))
+            .collect();
+        self.fold_explicit_itable_entries(
+            &links,
+            &|link, link_type, body| {
+                let MethodKind::Definition(rid) = link.resolve_method(body)?.kind else {
+                    return None;
+                };
+                let method = link_type.methods().find(|method| method.rid() == rid)?;
+                let key = slot_key(link, &method, rid);
+                let slot = impls
+                    .iter()
+                    .find(|slot| slot.name == method.name() && slot.key == key)?;
+                slot_entry(slot, &|rid| Some(rid))
+            },
+            &mut entries,
+        );
         entries
     }
 
@@ -1892,26 +1912,26 @@ impl<'a> MetadataResolver<'a> {
         closed
     }
 
-    /// One `MethodImpl` row as an itable entry: `(interface_method_tag, implementation)`, or `None` if
-    /// the row is not interface dispatch or the implementation is not a function of this module.
+    /// The INTERFACE a `MethodImpl` row's declaration column names and the dispatch TAG it carries,
+    /// or `None` if the row is not interface dispatch at all.
+    ///
+    /// The two travel together because a caller walking a base chain needs both and they come from one
+    /// resolution: the tag keys the itable entry, and the interface name is what decides whether a more
+    /// derived type has RE-IMPLEMENTED the mapping this row establishes.
     ///
     /// `MethodImpl` covers BOTH explicit interface implementations and explicit overrides of a base
-    /// CLASS's virtual, and only the first belongs here -- a class virtual is a vtable SLOT, and putting
-    /// it in the itable would key a slot by a tag no `callvirt` derives. So the declaring type must
-    /// actually be an interface, checked in this assembly first and then across the references, and
+    /// CLASS's virtual, and only the first belongs in an itable -- a class virtual is a vtable SLOT, and
+    /// putting it in the itable would key a slot by a tag no `callvirt` derives. So the declaring type
+    /// must actually be an interface, checked in this assembly first and then across the references, and
     /// anything undecidable is DECLINED rather than guessed.
     ///
-    /// `assembly` is the one the `MethodImpl` row and both its tokens are written in -- this module's
-    /// for an ordinary type, the OWNER's for an instantiation of a definition declared next door.
-    /// The `body` token in particular is resolved to a `MethodDef` RID, and a rid is meaningless
-    /// outside the table it indexes.
-    fn explicit_itable_entry(
+    /// `assembly` is the one the `MethodImpl` row and its declaration token are written in -- this
+    /// module's for an ordinary type, the OWNER's for a type declared next door.
+    fn explicit_interface_dispatch(
         &self,
         assembly: &'a Assembly<'a>,
-        body: Token,
         declaration: Token,
-        resolve: &dyn Fn(u32) -> Option<u32>,
-    ) -> Option<(u32, VtableEntry)> {
+    ) -> Option<(String, u32)> {
         let declared = assembly.resolve_method(declaration)?;
         let interface = declared.declaring_type?;
         let is_interface = match assembly.find_type(interface.namespace, interface.name) {
@@ -1927,10 +1947,71 @@ impl<'a> MetadataResolver<'a> {
         }
         let signature = declared.signature.as_ref()?;
         let tag = interface_method_tag(assembly, &interface, declared.name?, &signature.parameters)?;
-        let MethodKind::Definition(rid) = assembly.resolve_method(body)?.kind else {
-            return None;
-        };
-        Some((tag, VtableEntry::Func(resolve(rid)?)))
+        Some((joined_full_name(&interface), tag))
+    }
+
+    /// Folds every EXPLICIT (`MethodImpl`) interface implementation reachable from a type into
+    /// `entries`, overriding any entry already keyed by the same tag.
+    ///
+    /// **`links` IS THE BASE CHAIN, DERIVED-FIRST, AND THAT IS THE WHOLE POINT OF THIS FUNCTION.** An
+    /// interface map is established at the type whose `InterfaceImpl` row declares it and is INHERITED
+    /// by everything below, so `class D : B` answers for `IFoo` exactly as `B : IFoo` does -- and the
+    /// `MethodImpl` rows that say HOW are written on `B`, never copied down. Reading only `D`'s own rows
+    /// therefore leaves `D`'s itable missing every explicitly implemented interface its base declares,
+    /// and an itable that is missing an entry is not a dispatch that fails to link: the emitted scan
+    /// runs off the end of the table and traps (`unreachable` on wasm, `udf` on Cortex-M), and
+    /// `Inst::InterfaceHasTag` answers a confident FALSE for a cast .NET performs.
+    ///
+    /// **NEITHER "ALWAYS OVERRIDE" NOR "FILL ONLY WHEN ABSENT" IS THE RULE, AND EACH IS WRONG ON A
+    /// PROGRAM C# CAN WRITE.** An inherited row must beat the implicit entry for
+    /// `class B : IFoo { int IFoo.Bar() {...} public virtual int Bar() {...} }` seen through
+    /// `class D : B`, because the implicit pass matches `D`'s override by name and II.12.2 says `B`'s
+    /// explicit mapping still governs. It must NOT beat it for `class D : B, IFoo` with a public
+    /// `Bar()`, where `D` RE-IMPLEMENTS `IFoo` and .NET calls `D`'s. The two differ only in whether a
+    /// more derived type DECLARES the interface, which is what `reimplemented` tracks.
+    ///
+    /// Two limits, both narrower than they look. Re-implementation is compared by the interface's
+    /// FULL NAME, so a type re-implementing `IFoo<int>` also masks a base's `IFoo<string>` rows --
+    /// the tag still distinguishes the two instantiations, so their entries cannot collide; only the
+    /// mask is coarse. And an inherited row resolves to the BASE's body, which is what every shape C#
+    /// can emit needs: csc marks an explicit implementation `private final virtual`, so no derived
+    /// type can override it.
+    ///
+    ///
+    /// `body_impl` is the half that genuinely differs between callers and is the only reason this takes
+    /// a closure: a body in THIS module is a function index, and a body in a REFERENCED assembly is an
+    /// extern symbol the linker resolves. The chain walk, the tag derivation and the override order are
+    /// the parts that must not differ, so they live here rather than at each call site.
+    fn fold_explicit_itable_entries(
+        &self,
+        links: &[(&'a Assembly<'a>, TypeDef<'a>)],
+        body_impl: &dyn Fn(&'a Assembly<'a>, TypeDef<'a>, Token) -> Option<VtableEntry>,
+        entries: &mut Vec<(u32, VtableEntry)>,
+    ) {
+        let mut reimplemented: Vec<String> = Vec::new();
+        for &(assembly, type_def) in links {
+            for (body, declaration) in type_def.method_impls() {
+                let Some((interface, tag)) = self.explicit_interface_dispatch(assembly, declaration)
+                else {
+                    continue;
+                };
+                if reimplemented.iter().any(|name| *name == interface) {
+                    continue;
+                }
+                let Some(implementation) = body_impl(assembly, type_def, body) else {
+                    continue;
+                };
+                match entries.iter_mut().find(|(other, _)| *other == tag) {
+                    Some(slot) => slot.1 = implementation,
+                    None => entries.push((tag, implementation)),
+                }
+            }
+            for token in type_def.interfaces() {
+                if let Some(name) = assembly.type_token_name(token) {
+                    reimplemented.push(joined_full_name(&name));
+                }
+            }
+        }
     }
 
     /// One `InterfaceImpl` row's interface token resolved to the assembly that declares the
@@ -2125,16 +2206,20 @@ impl<'a> MetadataResolver<'a> {
                     }
                 }
             }
-            for (body, declaration) in type_def.method_impls() {
-                let Some(entry) = self.explicit_itable_entry(assembly, body, declaration, resolve)
-                else {
-                    continue;
-                };
-                match entries.iter_mut().find(|(tag, _)| *tag == entry.0) {
-                    Some(slot) => slot.1 = entry.1,
-                    None => entries.push(entry),
-                }
-            }
+            let chain: Vec<(&'a Assembly<'a>, TypeDef<'a>)> = assembly_base_chain(assembly, type_def)
+                .into_iter()
+                .map(|td| (assembly, td))
+                .collect();
+            self.fold_explicit_itable_entries(
+                &chain,
+                &|link, _, body| {
+                    let MethodKind::Definition(rid) = link.resolve_method(body)?.kind else {
+                        return None;
+                    };
+                    Some(VtableEntry::Func(resolve(rid)?))
+                },
+                &mut entries,
+            );
             entries
         }
     }

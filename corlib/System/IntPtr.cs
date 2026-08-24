@@ -10,6 +10,24 @@ namespace System
         public int ToInt32() { return (int)ToRawValue(this); }
         public long ToInt64() { return ToRawValue(this); }
 
+        public IntPtr(int value) { this = FromRawValue(value); }
+        public IntPtr(long value) { this = FromRawValue(value); }
+
+        public override bool Equals(object obj)
+        {
+            if (obj is IntPtr) return ToRawValue(this) == ToRawValue((IntPtr)obj);
+            return false;
+        }
+
+        public override int GetHashCode()
+        {
+            long raw = ToRawValue(this);
+            return unchecked((int)raw) ^ (int)(raw >> 32);
+        }
+
+        public static bool operator ==(IntPtr value1, IntPtr value2) { return ToRawValue(value1) == ToRawValue(value2); }
+        public static bool operator !=(IntPtr value1, IntPtr value2) { return ToRawValue(value1) != ToRawValue(value2); }
+
         public static explicit operator IntPtr(int value) { return FromRawValue(value); }
         public static explicit operator IntPtr(long value) { return FromRawValue(value); }
         public static explicit operator int(IntPtr value) { return value.ToInt32(); }
@@ -29,6 +47,24 @@ namespace System
 
         public uint ToUInt32() { return (uint)ToRawValue(this); }
         public ulong ToUInt64() { return ToRawValue(this); }
+
+        public UIntPtr(uint value) { this = FromRawValue(value); }
+        public UIntPtr(ulong value) { this = FromRawValue(value); }
+
+        public override bool Equals(object obj)
+        {
+            if (obj is UIntPtr) return ToRawValue(this) == ToRawValue((UIntPtr)obj);
+            return false;
+        }
+
+        public override int GetHashCode()
+        {
+            ulong raw = ToRawValue(this);
+            return unchecked((int)raw) ^ (int)(raw >> 32);
+        }
+
+        public static bool operator ==(UIntPtr value1, UIntPtr value2) { return ToRawValue(value1) == ToRawValue(value2); }
+        public static bool operator !=(UIntPtr value1, UIntPtr value2) { return ToRawValue(value1) != ToRawValue(value2); }
 
         public static explicit operator UIntPtr(uint value) { return FromRawValue(value); }
         public static explicit operator UIntPtr(ulong value) { return FromRawValue(value); }

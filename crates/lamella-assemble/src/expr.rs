@@ -1555,10 +1555,6 @@ fn emit_cast(
         out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
         return Ok(());
     }
-    if tokens.is_enum(to) {
-        out.push(Instruction::simple(Opcode::ConvI4));
-        return Ok(());
-    }
     if matches!(to, TypeSymbol::Special(SpecialType::String)) {
         let token = tokens.instruction_type_token(to).ok_or(EmitError::Unsupported(
             "a cast to string with no metadata token",
@@ -1575,16 +1571,23 @@ fn emit_cast(
         }
         return Ok(());
     }
-    if let TypeSymbol::Special(target) = to {
+    let target_special = match to {
+        TypeSymbol::Special(special) => Some(*special),
+        _ if tokens.is_enum(to) => Some(tokens.enum_underlying(to).unwrap_or(SpecialType::Int32)),
+        _ => None,
+    };
+    if let Some(target_special) = target_special {
+        let source = conversion_operand_type(from, tokens);
+        let target = TypeSymbol::Special(target_special);
         if checked {
             let unsigned_source =
-                matches!(from, TypeSymbol::Special(source) if source.is_unsigned());
-            if let Some(ovf) = checked_overflow_conversion(*target, unsigned_source) {
+                matches!(&source, TypeSymbol::Special(special) if special.is_unsigned());
+            if let Some(ovf) = checked_overflow_conversion(target_special, unsigned_source) {
                 out.push(Instruction::simple(ovf));
                 return Ok(());
             }
         }
-        return emit_numeric_conversion(from, to, out);
+        return emit_numeric_conversion(&source, &target, out);
     }
     if boxes_to_a_reference(from, tokens) {
         let token = tokens.instruction_type_token(from).ok_or(EmitError::Unsupported(
@@ -1717,6 +1720,21 @@ fn emit_conversion(
 /// is `conv.u8`, III.3.19) and reaches a floating-point type through `conv.r.un` -- which reads
 /// the source integer as unsigned (III.3.31) -- before narrowing; a signed source, and any
 /// same-or-narrowing integral target, use the plain width-keyed `conv.*` (III.3.17).
+/// The type a numeric conversion actually operates on: an enum's UNDERLYING integral type, and
+/// `ty` unchanged otherwise.
+///
+/// **ONE IMPLEMENTATION, CALLED FOR BOTH ENDS OF A CONVERSION.** An enum is its underlying type on
+/// the source side exactly as it is on the target side (ECMA-335 II.14.3), and the two ends used to
+/// be decided separately -- the target by an arm that hardcoded `conv.i4`, the source by a
+/// signedness test that only recognized a primitive. A `uint`-backed enum widening to `long`
+/// therefore sign-extended.
+fn conversion_operand_type(ty: &TypeSymbol, tokens: &Tokens) -> TypeSymbol {
+    match tokens.enum_underlying(ty) {
+        Some(underlying) => TypeSymbol::Special(underlying),
+        None => ty.clone(),
+    }
+}
+
 fn emit_numeric_conversion(
     source: &TypeSymbol,
     target: &TypeSymbol,

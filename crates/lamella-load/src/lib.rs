@@ -58,7 +58,8 @@ use lamella_cil_runtime::intrinsics::{
     enum_format, enum_get_name,
     enum_get_names, enum_get_values, enum_has_flag, enum_is_defined, enum_parse,
     enum_to_string_format, exception_ctor,
-    exception_get_message, exception_runtime_message, int32_to_string, int64_to_string,
+    exception_get_message, exception_runtime_inner_exception, exception_runtime_message,
+    int32_to_string, int64_to_string,
     interlocked_compare_exchange,
     md_array_address, md_array_get,
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
@@ -97,6 +98,8 @@ use lamella_cil_runtime::intrinsics::{
     intptr_from_raw_value, intptr_to_raw_value,
     mmio_read32, mmio_write32, mmio_read8, mmio_write8, mmio_read16, mmio_write16,
 };
+#[cfg(feature = "exceptions")]
+use lamella_cil_runtime::intrinsics::type_initialization_exception_runtime_type_name;
 #[cfg(feature = "gc")]
 use lamella_cil_runtime::intrinsics::{gc_collect, weak_make_cell, weak_read_cell, weak_write_cell};
 #[cfg(feature = "varargs")]
@@ -3630,6 +3633,16 @@ fn bind_bcl_calls(
                     module.bind_token(asm, *token, target);
                     continue;
                 }
+                if let Some(target) = bind_through_base_chain(
+                    module,
+                    index,
+                    type_index,
+                    parent_type,
+                    &key,
+                ) {
+                    module.bind_token(asm, *token, target);
+                    continue;
+                }
             }
             if let Some(params) = list_ctor(
                 parent_type.namespace,
@@ -3662,6 +3675,57 @@ fn bind_bcl_calls(
         };
         module.bind_token(asm, *token, id);
     }
+}
+
+/// Looks for the member `key` names on each type in the BASE CHAIN of `parent`, and returns the
+/// first match -- the search ECMA-335 III.4.2 requires of `callvirt` when the class named by the
+/// reference does not itself declare the member.
+///
+/// # How the key is re-aimed
+///
+/// [`name_key`] is `"{namespace}.{type}.{method}|{params}"`, so a key for one type becomes the key
+/// for another by swapping the [`type_key`] prefix. That is done rather than re-encoding the
+/// signature because re-encoding needs the referencing assembly and would be a SECOND spelling of a
+/// rule the caller has already applied -- two spellings of one encoding is where they drift.
+///
+/// # Why the walk stops where it does
+///
+/// It follows `Module::type_base` until a type has no base, which is `System.Object`. A cycle would
+/// hang, so the walk is bounded by the number of types the index holds: a base chain cannot be
+/// longer than that without repeating, and repeating is the only way to exceed it.
+///
+/// Returns `None` -- leaving the token unbound, i.e. a loud `UnresolvedCall` at the call site -- when
+/// the parent type is unknown, when the key does not carry the expected prefix, or when no type in
+/// the chain declares a member of that name and signature. All three are the safe direction.
+fn bind_through_base_chain(
+    module: &Module,
+    index: &NameIndex,
+    type_index: &TypeNameIndex,
+    parent: TypeName<'_>,
+    key: &str,
+) -> Option<MethodId> {
+    let parent_key = type_key(parent.namespace, parent.name);
+    let suffix = key.strip_prefix(parent_key.as_str())?;
+    let mut current = *type_index.get(&parent_key)?;
+    let mut names: BTreeMap<TypeId, &String> = BTreeMap::new();
+    for (name, id) in type_index {
+        names.insert(*id, name);
+    }
+    for _ in 0..type_index.len() {
+        let Some(base) = module.type_base(current) else {
+            return None;
+        };
+        if let Some(base_name) = names.get(&base) {
+            let mut candidate = String::with_capacity(base_name.len() + suffix.len());
+            candidate.push_str(base_name);
+            candidate.push_str(suffix);
+            if let Some(&target) = index.get(&candidate) {
+                return Some(target);
+            }
+        }
+        current = base;
+    }
+    None
 }
 
 /// Binds a `MemberRef` reached through the declaring type's OWN OPEN instantiation -- `List<!0>`
@@ -4240,6 +4304,11 @@ fn bcl_intrinsic(
         ("Exception", ".ctor") => Some(intrinsic!(exception_ctor)),
         ("Exception", "get_Message") => Some(intrinsic!(exception_get_message)),
         ("Exception", "RuntimeMessage") => Some(intrinsic!(exception_runtime_message)),
+        ("Exception", "RuntimeInnerException") => Some(intrinsic!(exception_runtime_inner_exception)),
+        #[cfg(feature = "exceptions")]
+        ("TypeInitializationException", "RuntimeTypeName") => {
+            Some(intrinsic!(type_initialization_exception_runtime_type_name))
+        }
         #[cfg(feature = "finalizers")]
         ("GC", "SuppressFinalize") => Some(intrinsic!(suppress_finalize)),
         #[cfg(feature = "finalizers")]

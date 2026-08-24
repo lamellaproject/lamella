@@ -1189,21 +1189,62 @@ impl Binder {
     /// is a known gap rather than a silent wrong answer.
     #[must_use]
     pub(crate) fn lookup_type_of(&self, ty: &TypeSymbol) -> TypeSymbol {
-        let TypeSymbol::Named(parts) = ty else {
+        if self.constraints_of_type_parameter(ty).is_none() {
             return member_lookup_type(ty);
+        }
+        self.effective_base_class(ty, self.type_parameters_in_scope.len())
+    }
+
+    /// A type parameter's effective base class (25.7): its written class-type constraint, and --
+    /// **THROUGH A TYPE-PARAMETER CONSTRAINT, THE EFFECTIVE BASE CLASS OF THAT PARAMETER**. An
+    /// interface constraint is not one, and neither is `where T : class`, which says only that the
+    /// argument is a reference type.
+    ///
+    /// **`where U : T` GIVES U EVERYTHING T PROMISES, AND NOT FOLLOWING IT WAS THREE REFUSALS OF
+    /// VALID CODE FROM ONE OMISSION** -- under `where U : T where T : Animal`, U's base came out
+    /// `object`, so `u.Legs()` was CS0117, `Animal a = u;` was CS0029, and U did not satisfy a
+    /// `where V : class` parameter. csc compiles all three. The recursion is what 25.7 asks for
+    /// rather than an extra: the clause defines the type-parameter-constraint case in terms of the
+    /// effective base classes OF those constraints.
+    ///
+    /// **`System.Object` IS DROPPED FROM THE CANDIDATE SET BEFORE THE MOST-ENCOMPASSED CHOICE
+    /// (13.4.2), WHICH IS BOTH CORRECT AND THE ROBUST SPELLING.** `object` encompasses every
+    /// candidate, so it can never be the most encompassed one unless it is alone -- and asking
+    /// `converts` to establish that needs a model holding `System.Object`, which a corlib-less
+    /// compilation does not have. Filtering first makes the answer independent of how much of the
+    /// world this compilation can see.
+    ///
+    /// `fuel` bounds the walk at the number of parameters in scope: a chain that visits one twice
+    /// is circular, which is CS0454 rather than a program this has to answer about.
+    fn effective_base_class(&self, parameter: &TypeSymbol, fuel: usize) -> TypeSymbol {
+        let Some(constraints) = self.constraints_of_type_parameter(parameter) else {
+            return type_symbol_in("System", "Object");
         };
-        let [only] = &parts[..] else {
-            return member_lookup_type(ty);
+        let Some(fuel) = fuel.checked_sub(1) else {
+            return type_symbol_in("System", "Object");
         };
-        let Some(constraints) = self.type_parameter_in_scope(only) else {
-            return member_lookup_type(ty);
-        };
-        let named_class = constraints.types.iter().find(|constraint| {
-            self.type_info_of(constraint)
+        let mut candidates: Vec<TypeSymbol> = Vec::new();
+        for constraint in &constraints.types {
+            if self.constraints_of_type_parameter(constraint).is_some() {
+                candidates.push(self.effective_base_class(constraint, fuel));
+            } else if self
+                .type_info_of(constraint)
                 .is_some_and(|info| info.kind != TypeKind::Interface)
-        });
-        match named_class {
-            Some(class) => class.clone(),
+            {
+                candidates.push(constraint.clone());
+            }
+        }
+        candidates.retain(|candidate| !is_system_object(candidate));
+        let chosen = candidates
+            .iter()
+            .position(|candidate| {
+                candidates
+                    .iter()
+                    .all(|other| crate::conversion::converts(&self.model, candidate, other))
+            })
+            .or_else(|| (!candidates.is_empty()).then_some(0));
+        match chosen {
+            Some(index) => candidates.swap_remove(index),
             None if constraints.value_type => type_symbol_in("System", "ValueType"),
             None => type_symbol_in("System", "Object"),
         }
@@ -1957,6 +1998,15 @@ impl Binder {
     /// the message differs -- csc says *"in the generic type 'Box<T>'"* and *"in the generic method
     /// 'C.M<T>()'"* under the SAME four codes. `member` is that noun. Writing the tests twice is
     /// how the next constraint kind would land on one of them.
+    ///
+    /// **EVERY ONE OF 25.7.1's FOUR BULLETS ENDS IN AN ALTERNATIVE THAT NAMES A TYPE PARAMETER**,
+    /// and each test delegates to the predicate that carries it -- *"A is a type parameter having
+    /// the value type constraint"*, *"A is a type parameter that is known to be a reference type"*,
+    /// *"A is a type parameter having the constructor constraint"*, and the implicit type parameter
+    /// conversion of 25.7.4. Asking the world what KIND of type `A` is answers all four wrongly
+    /// for a type parameter, which has no kind until it is instantiated: a `where T : struct` type
+    /// could not name itself anywhere, a `where T : IThing` one could not either, and the two
+    /// constructor rows went the other way and accepted what csc refuses.
     fn check_one_type_argument_as(
         &mut self,
         argument: &TypeSymbol,
@@ -1966,8 +2016,7 @@ impl Binder {
         member: GenericMember,
         span: Span,
     ) {
-        if constraints.reference_type && !crate::conversion::is_reference_type(&self.model, argument)
-        {
+        if constraints.reference_type && !self.satisfies_reference_type_constraint(argument) {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::TypeArgumentMustBeReferenceType {
                     argument: alloc::format!("{argument}").into(),
@@ -1978,7 +2027,7 @@ impl Binder {
                 span,
             ));
         }
-        if constraints.value_type && !self.is_value_type(argument) {
+        if constraints.value_type && !self.satisfies_value_type_constraint(argument) {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::TypeArgumentMustBeValueType {
                     argument: alloc::format!("{argument}").into(),
@@ -1989,9 +2038,7 @@ impl Binder {
                 span,
             ));
         }
-        if constraints.default_constructor
-            && !self.has_accessible_parameterless_constructor(argument)
-        {
+        if constraints.default_constructor && !self.satisfies_constructor_constraint(argument) {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::TypeArgumentNeedsDefaultConstructor {
                     argument: alloc::format!("{argument}").into(),
@@ -2007,7 +2054,7 @@ impl Binder {
             if constraint.is_error() {
                 continue;
             }
-            if !crate::conversion::converts(&self.model, argument, &constraint) {
+            if !self.satisfies_named_constraint(argument, &constraint) {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::TypeArgumentNoConversionToConstraint {
                         argument: alloc::format!("{argument}").into(),
@@ -2020,6 +2067,120 @@ impl Binder {
                 ));
             }
         }
+    }
+
+    /// The constraints written on `ty` when it is a BARE TYPE PARAMETER in scope, else `None`.
+    ///
+    /// The `None` arm is the discriminator every 25.7.1 test switches on: a type argument that is
+    /// not a type parameter is decided by what it IS, and one that is, by what it PROMISES.
+    fn constraints_of_type_parameter(
+        &self,
+        ty: &TypeSymbol,
+    ) -> Option<&crate::symbols::TypeParameterConstraints> {
+        let TypeSymbol::Named(parts) = ty else {
+            return None;
+        };
+        let [only] = &parts[..] else {
+            return None;
+        };
+        self.type_parameter_in_scope(only)
+    }
+
+    /// 25.7.1's value-type bullet: a NON-NULLABLE struct or enum type, or a type parameter that
+    /// itself carries the `struct` constraint.
+    ///
+    /// **`is_value_type` IS THE WRONG QUESTION IN BOTH DIRECTIONS HERE, WHICH IS WHY THIS IS NOT
+    /// A CALL TO IT.** It answers `false` for a type parameter, so `struct Box<T> where T : struct`
+    /// could not name `Box<T>` in its own signature or body; and it answers `true` for
+    /// `System.Nullable<int>`, which is a struct and is exactly the one struct the constraint
+    /// exists to exclude -- `Nullable<Nullable<int>>` compiled here and is CS0453 in csc.
+    fn satisfies_value_type_constraint(&self, argument: &TypeSymbol) -> bool {
+        match self.constraints_of_type_parameter(argument) {
+            Some(own) => own.value_type,
+            None => {
+                self.is_value_type(argument)
+                    && crate::conversion::nullable_underlying(argument).is_none()
+            }
+        }
+    }
+
+    /// 25.7.1's reference-type bullet: an interface, class, delegate or array type, or a type
+    /// parameter KNOWN TO BE ONE (25.7).
+    fn satisfies_reference_type_constraint(&self, argument: &TypeSymbol) -> bool {
+        match self.constraints_of_type_parameter(argument) {
+            Some(_) => self.known_to_be_reference_type(argument),
+            None => crate::conversion::is_reference_type(&self.model, argument),
+        }
+    }
+
+    /// 25.7's *known to be a reference type*: the parameter has the `class` constraint, or its
+    /// effective base class is neither `object` nor `System.ValueType` -- which is to say it
+    /// names a real class, so every instantiation is a reference type whatever else is written.
+    ///
+    /// [`Binder::lookup_type_of`] already derives the effective base class, and asking it rather
+    /// than re-deriving one keeps the two answers from drifting: a parameter whose members are
+    /// looked up on `Animal` is the same parameter that satisfies `where U : class`.
+    fn known_to_be_reference_type(&self, parameter: &TypeSymbol) -> bool {
+        if self
+            .constraints_of_type_parameter(parameter)
+            .is_some_and(|own| own.reference_type)
+        {
+            return true;
+        }
+        let base = self.lookup_type_of(parameter);
+        !is_reference_base_class(&base) && !is_system_object(&base)
+    }
+
+    /// 25.7.1's constructor bullet: a type with an accessible parameterless constructor, or a type
+    /// parameter carrying `new()` -- or `struct`, since every value type has one (11.1.2).
+    ///
+    /// **THE TYPE-PARAMETER ARM IS THE STRICT ONE, AND IT CLOSES A HOLE RATHER THAN OPENING ONE.**
+    /// [`Binder::has_accessible_parameterless_constructor`] answers `true` for a type the model
+    /// cannot see, deliberately; a type parameter is never in the model, so an unconstrained `T`
+    /// used to satisfy `where U : new()` and lcsc ACCEPTED two programs csc reports CS0310 on.
+    /// A parameter's constraints are not "a type we failed to decode" -- they are the whole of
+    /// what is known about it, so the answer is exact.
+    fn satisfies_constructor_constraint(&self, argument: &TypeSymbol) -> bool {
+        match self.constraints_of_type_parameter(argument) {
+            Some(own) => own.requires_default_constructor(),
+            None => self.has_accessible_parameterless_constructor(argument),
+        }
+    }
+
+    /// 25.7.1's first bullet: the argument converts to the named constraint by identity, an
+    /// implicit reference conversion, a boxing conversion, or -- from a type parameter -- an
+    /// implicit reference, boxing or type parameter conversion (25.7.4).
+    fn satisfies_named_constraint(&self, argument: &TypeSymbol, constraint: &TypeSymbol) -> bool {
+        crate::conversion::converts(&self.model, argument, constraint)
+            || self.type_parameter_converts_to(argument, constraint, self.type_parameters_in_scope.len())
+    }
+
+    /// 25.7.4's conversions out of a type parameter: to any type in its effective base class chain
+    /// or effective interface set, and -- transitively -- to anything a type-parameter constraint
+    /// of its own converts to.
+    ///
+    /// **THE TRANSITIVE STEP IS NOT AN EXTRA: `where U : T` MAKES U's CONSTRAINT SET T's**, so
+    /// `class Holder<T, U> where U : T where T : IThing` supplies `U` to a `where V : IThing`
+    /// parameter and the only evidence for it is one hop away. `fuel` bounds the walk at the
+    /// number of parameters in scope -- a chain that visits one twice is circular, which is
+    /// CS0454 rather than a program this has to answer about.
+    fn type_parameter_converts_to(
+        &self,
+        argument: &TypeSymbol,
+        constraint: &TypeSymbol,
+        fuel: usize,
+    ) -> bool {
+        let Some(own) = self.constraints_of_type_parameter(argument) else {
+            return false;
+        };
+        let Some(fuel) = fuel.checked_sub(1) else {
+            return false;
+        };
+        own.types.iter().any(|written| {
+            written == constraint
+                || crate::conversion::converts(&self.model, written, constraint)
+                || self.type_parameter_converts_to(written, constraint, fuel)
+        })
     }
 
     /// Whether `ty` satisfies a `new()` constraint: a value type (which always has one), or a
@@ -2602,10 +2763,13 @@ impl Binder {
 
     /// Whether `ty` is a BARE type parameter of the declaration being bound -- `T`, not `Box<T>`
     /// and not `T[]`, both of which are ordinary types that merely mention one.
+    ///
+    /// The same recognition [`Binder::constraints_of_type_parameter`] makes, discarding the
+    /// constraints; one implementation, so a caller asking WHETHER and one asking WHICH can never
+    /// disagree about what a bare parameter is.
     #[must_use]
     pub(crate) fn is_bare_type_parameter(&self, ty: &TypeSymbol) -> bool {
-        matches!(ty, TypeSymbol::Named(parts)
-            if matches!(&parts[..], [only] if self.type_parameter_in_scope(only).is_some()))
+        self.constraints_of_type_parameter(ty).is_some()
     }
 
     /// The DECLARED kind of a named or constructed type, taken from the DEFINITION's row.
@@ -11335,6 +11499,17 @@ fn binary_numeric_promotion(left: SpecialType, right: SpecialType) -> Option<Spe
 fn is_reference_base_class(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Named(parts)
         if matches!(&**parts, [ns, name] if &**ns == "System" && (&**name == "Enum" || &**name == "ValueType")))
+}
+
+/// Whether `ty` is `System.Object`, in EITHER spelling: the `object` keyword's special form, and
+/// the dotted name [`Binder::lookup_type_of`] hands back for an unconstrained type parameter.
+///
+/// Two spellings because the two producers differ and neither folds to the other here -- a
+/// parameter's effective base class is built as a name, and a written `object` arrives special.
+fn is_system_object(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Special(SpecialType::Object))
+        || matches!(ty, TypeSymbol::Named(parts)
+            if matches!(&**parts, [ns, name] if &**ns == "System" && &**name == "Object"))
 }
 
 fn fold_primitive_name(ty: &TypeSymbol) -> TypeSymbol {

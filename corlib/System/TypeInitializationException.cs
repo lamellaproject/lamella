@@ -11,6 +11,16 @@ namespace System
             _typeName = fullTypeName;
         }
 
-        public string TypeName { get { return _typeName == null ? "" : _typeName; } }
+        [Lamella.Runtime.RuntimeProvided] private string RuntimeTypeName() { return null; }
+
+        public string TypeName
+        {
+            get
+            {
+                string raised = RuntimeTypeName();
+                if (raised != null) { return raised; }
+                return _typeName == null ? "" : _typeName;
+            }
+        }
     }
 }

@@ -19,13 +19,23 @@ namespace System.Device.Spi
         public abstract void Read(byte[] buffer);
 
         /// <summary>Reads a byte from the SPI device.</summary>
-        public abstract byte ReadByte();
+        public virtual byte ReadByte()
+        {
+            byte[] buffer = new byte[1];
+            Read(buffer);
+            return buffer[0];
+        }
 
         /// <summary>Writes <paramref name="buffer"/> to the SPI device.</summary>
         public abstract void Write(byte[] buffer);
 
         /// <summary>Writes a byte to the SPI device.</summary>
-        public abstract void WriteByte(byte value);
+        public virtual void WriteByte(byte value)
+        {
+            byte[] buffer = new byte[1];
+            buffer[0] = value;
+            Write(buffer);
+        }
 
         /// <summary>Writes and reads data as one full-duplex operation: every written word
         /// clocks a word in. The buffers must be the same length.</summary>

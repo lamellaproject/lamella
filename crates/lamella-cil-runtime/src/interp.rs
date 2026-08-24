@@ -68,10 +68,26 @@ pub struct Vm {
     /// inside the cctor sees the type as initialized (partial state, as the spec allows)
     /// instead of re-running it.
     cctors_run: BTreeSet<TypeId>,
+    /// The types whose `.cctor` THREW, and the `TypeInitializationException` raised for each.
+    ///
+    /// [`cctors_run`](Self::cctors_run) alone cannot answer II.10.5.3.1 guarantee 3: it records
+    /// that an initializer RAN and not how it ENDED, so a failed type would read as initialized
+    /// and the next access would reach statics nobody assigned. This map is what closes that.
+    ///
+    /// The exception object is stored, not rebuilt: .NET caches the wrapper it raised and rethrows
+    /// that same instance at every later access, so a program comparing two catches by reference
+    /// sees one object.
+    #[cfg(feature = "exceptions")]
+    cctors_failed: Vec<(TypeId, ObjectRef)>,
     /// The message string of each exception object, kept as runtime side-state so
     /// `Exception.Message` works without modeling mscorlib's field layout (and so the
     /// message-stripping knob has one place to act). Keyed by the exception object.
     exception_messages: BTreeMap<ObjectRef, ObjectRef>,
+    /// The exception each exception WRAPS, for `Exception.InnerException` -- the same side-state
+    /// as `exception_messages` and for the same reason: a runtime-raised exception has no field
+    /// storage, so the VES cannot assign the field a managed constructor would have. Populated
+    /// today only by a failed type initializer, which is the one wrapper the VES mints itself.
+    exception_inners: BTreeMap<ObjectRef, ObjectRef>,
     /// The base-chain TAG vector of a runtime-fault exception object -- one whose managed
     /// type is external to the loaded module (`EXTERNAL_TYPE_ID`), so it has no live base
     /// chain to walk. A catchable fault (`catchable_fault`) records the vector of its .NET
@@ -1123,17 +1139,67 @@ impl Vm {
     }
 
     /// The not-yet-run `.cctor` of `type_id`, marking it run (II.10.5.3 lazy
-    /// initialization). `None` if the type has no cctor or it already ran in this VM.
+    /// initialization). `Ok(None)` if the type has no cctor or it already ran in this VM.
     /// Marking happens HERE -- before the caller pushes the cctor's frame -- so a
     /// recursive trigger inside the cctor sees the type as initialized (the partial
     /// state the spec allows) and the replayed trigger instruction does not re-fire.
-    pub fn take_pending_cctor(&mut self, module: &Module, type_id: TypeId) -> Option<MethodId> {
-        let cctor = module.cctor_of_type(type_id)?;
-        if self.cctors_run.insert(type_id) {
-            Some(cctor)
-        } else {
-            None
+    ///
+    /// # Errors
+    /// [`Trap::TypeInitializationFailed`] when the type's initializer already THREW: the type
+    /// stays inaccessible (II.10.5.3.1 guarantee 3) and this access must fail the way the first
+    /// one did.
+    ///
+    pub fn take_pending_cctor(
+        &mut self,
+        module: &Module,
+        type_id: TypeId,
+    ) -> Result<Option<MethodId>, TypeId> {
+        #[cfg(feature = "exceptions")]
+        if self.cctors_failed.iter().any(|&(failed, _)| failed == type_id) {
+            return Err(type_id);
         }
+        let Some(cctor) = module.cctor_of_type(type_id) else {
+            return Ok(None);
+        };
+        if self.cctors_run.insert(type_id) {
+            Ok(Some(cctor))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The `TypeInitializationException` a failed `.cctor` left behind for `type_id`, if its
+    /// initializer threw. Every trigger site asks this BEFORE
+    /// [`take_pending_cctor`](Self::take_pending_cctor), because a failed type is also a RUN type
+    /// and that call answers `None` for both -- which is exactly how the second access used to
+    /// sail past into unassigned statics.
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub fn cctor_failure(&self, type_id: TypeId) -> Option<ObjectRef> {
+        self.cctors_failed
+            .iter()
+            .find(|&&(failed, _)| failed == type_id)
+            .map(|&(_, exception)| exception)
+    }
+
+    /// Records that `type_id`'s initializer threw, and the exception to raise at every later
+    /// access. Called as the cctor's frame unwinds, so the wrapper is minted once.
+    #[cfg(feature = "exceptions")]
+    fn note_cctor_failed(&mut self, type_id: TypeId, exception: ObjectRef) {
+        self.cctors_failed.push((type_id, exception));
+    }
+
+    /// The type whose failed initializer produced `exception`, if it is such a wrapper -- the
+    /// reverse of [`cctor_failure`](Self::cctor_failure), backing
+    /// `TypeInitializationException.TypeName`.
+    ///
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub fn failed_type_of(&self, exception: ObjectRef) -> Option<TypeId> {
+        self.cctors_failed
+            .iter()
+            .find(|&&(_, wrapper)| wrapper == exception)
+            .map(|&(type_id, _)| type_id)
     }
 
     /// Marks every type's `.cctor` as already run -- the EAGER embedder's escape hatch
@@ -1294,6 +1360,22 @@ impl Vm {
     #[must_use]
     pub fn exception_message(&self, exception: ObjectRef) -> Option<ObjectRef> {
         self.exception_messages.get(&exception).copied()
+    }
+
+    /// Records `inner` as the exception `exception` wraps, for `Exception.InnerException`.
+    ///
+    /// Side-state for the same reason the message is: a runtime-raised exception has no field
+    /// storage at all, so a `TypeInitializationException` the VES mints cannot assign the
+    /// `_innerException` field a managed constructor would have. Without this the wrapper's
+    /// `InnerException` reads null, which is a divergence from .NET in a BCL class.
+    pub fn set_exception_inner(&mut self, exception: ObjectRef, inner: ObjectRef) {
+        self.exception_inners.insert(exception, inner);
+    }
+
+    /// The exception `exception` wraps, if the runtime recorded one.
+    #[must_use]
+    pub fn exception_inner(&self, exception: ObjectRef) -> Option<ObjectRef> {
+        self.exception_inners.get(&exception).copied()
     }
 
     /// Records the base-chain TAG vector of a runtime-fault `exception` (a type external to the
@@ -3897,7 +3979,8 @@ fn push_pending_cctor(
     let Some(type_id) = module.method_type(method) else {
         return Ok(());
     };
-    let Some(cctor) = vm.take_pending_cctor(module, type_id) else {
+    let Some(cctor) = vm.take_pending_cctor(module, type_id)
+                    .map_err(Trap::TypeInitializationFailed)? else {
         return Ok(());
     };
     if frames.len() >= MAX_CALL_DEPTH {
@@ -3915,7 +3998,8 @@ fn run_pending_cctor_nested(module: &Module, vm: &mut Vm, method: MethodId) -> R
     let Some(type_id) = module.method_type(method) else {
         return Ok(());
     };
-    let Some(cctor) = vm.take_pending_cctor(module, type_id) else {
+    let Some(cctor) = vm.take_pending_cctor(module, type_id)
+                    .map_err(Trap::TypeInitializationFailed)? else {
         return Ok(());
     };
     Session::new(module, cctor, Vec::new())?.run(module, vm)?;
@@ -4111,12 +4195,66 @@ fn fault_exception(trap: &Trap) -> Option<(Cow<'static, str>, &'static [&'static
     Some((Cow::Borrowed(text), chain))
 }
 
+/// The base chain of the wrapper a failed type initializer raises, leaf-first to `System.Object`.
+#[cfg(feature = "exceptions")]
+const TYPE_INIT: &[&str] = &[
+    "System.TypeInitializationException",
+    "System.SystemException",
+    "System.Exception",
+    "System.Object",
+];
+
+/// If `method` is a type initializer that is unwinding, poisons its type and returns the
+/// `TypeInitializationException` to propagate in place of `exception`; otherwise returns
+/// `exception` unchanged.
+///
+/// ECMA-335 II.10.5.3.1 guarantee 3 in two halves, and each half is separately observable:
+/// **wrapping** (the constructor's own exception must not escape -- a caller catching
+/// `TypeInitializationException`, as the standard tells them to, would miss it) and **poisoning**
+/// (the type stays inaccessible, so a later access fails the same way rather than reading statics
+/// nobody assigned). `tools/corpus/static-init-throws.cs` scores both, separately, by design.
+///
+#[cfg(feature = "exceptions")]
+fn poison_failed_type(
+    module: &Module,
+    vm: &mut Vm,
+    method: MethodId,
+    exception: ObjectRef,
+) -> ObjectRef {
+    let Some(type_id) = module.method_type(method) else {
+        return exception;
+    };
+    if module.cctor_of_type(type_id) != Some(method) {
+        return exception;
+    }
+    if let Some(existing) = vm.cctor_failure(type_id) {
+        return existing;
+    }
+    let name = module.type_full_name(type_id).unwrap_or("<unknown>");
+    let message = alloc::format!("The type initializer for '{name}' threw an exception.");
+    let wrapper = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
+    let text = vm.heap_mut().alloc_text(&message);
+    vm.set_exception_message(wrapper, text);
+    let chain: Vec<u32> = TYPE_INIT
+        .iter()
+        .copied()
+        .map(crate::exception::exception_tag)
+        .collect();
+    vm.set_exception_chain(wrapper, chain);
+    vm.set_exception_inner(wrapper, exception);
+    vm.note_cctor_failed(type_id, wrapper);
+    wrapper
+}
+
 /// Converts a catchable runtime fault into a thrown exception object (carrying a default
 /// message and its base-chain tag vector so `catch` matches it by type), or returns `None`
 /// for traps that should still abort execution (a stack overflow, an unresolved token,
 /// malformed CIL, ...).
 #[cfg(feature = "exceptions")]
 fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
+    if let Trap::TypeInitializationFailed(type_id) = *trap {
+        return vm.cctor_failure(type_id);
+    }
     let (text, chain_names) = fault_exception(trap)?;
     let chain: Vec<u32> = chain_names
         .iter()
@@ -4260,6 +4398,11 @@ fn complete_finally(
             Ok(Status::Running)
         }
         AfterFinally::Unwind(exception) => {
+            #[cfg(feature = "exceptions")]
+            let exception = match frames.last() {
+                Some(frame) => poison_failed_type(module, vm, frame.method, exception),
+                None => exception,
+            };
             if let Some(unwound) = frames.pop() {
                 vm.frame_pool.retire(unwound);
             }
@@ -5024,7 +5167,8 @@ fn step(
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             if let Some(type_id) = module.type_of_static_slot(slot) {
-                if let Some(cctor) = vm.take_pending_cctor(module, type_id) {
+                if let Some(cctor) = vm.take_pending_cctor(module, type_id)
+                    .map_err(Trap::TypeInitializationFailed)? {
                     return Ok(Flow::EnsureCctor(cctor));
                 }
             }
@@ -5205,7 +5349,8 @@ fn step(
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             if let Some(type_id) = module.type_of_static_slot(slot) {
-                if let Some(cctor) = vm.take_pending_cctor(module, type_id) {
+                if let Some(cctor) = vm.take_pending_cctor(module, type_id)
+                    .map_err(Trap::TypeInitializationFailed)? {
                     return Ok(Flow::EnsureCctor(cctor));
                 }
             }
@@ -5222,7 +5367,8 @@ fn step(
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             if let Some(type_id) = module.type_of_static_slot(slot) {
-                if let Some(cctor) = vm.take_pending_cctor(module, type_id) {
+                if let Some(cctor) = vm.take_pending_cctor(module, type_id)
+                    .map_err(Trap::TypeInitializationFailed)? {
                     return Ok(Flow::EnsureCctor(cctor));
                 }
             }
@@ -7267,6 +7413,20 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
         messages.push(Value::Object(exception));
         messages.push(Value::Object(message));
     }
+    let mut inners: Vec<Value> = Vec::with_capacity(vm.exception_inners.len() * 2);
+    for (&exception, &inner) in &vm.exception_inners {
+        inners.push(Value::Object(exception));
+        inners.push(Value::Object(inner));
+    }
+    #[cfg(feature = "exceptions")]
+    let mut failed_keys: Vec<TypeId> = Vec::with_capacity(vm.cctors_failed.len());
+    #[cfg(feature = "exceptions")]
+    let mut failed_values: Vec<Value> = Vec::with_capacity(vm.cctors_failed.len());
+    #[cfg(feature = "exceptions")]
+    for &(type_id, exception) in &vm.cctors_failed {
+        failed_keys.push(type_id);
+        failed_values.push(Value::Object(exception));
+    }
     let mut lock_states: Vec<LockState> = Vec::with_capacity(vm.locks.len());
     let mut lock_keys: Vec<Value> = Vec::with_capacity(vm.locks.len());
     for (key, state) in core::mem::take(&mut vm.locks) {
@@ -7283,6 +7443,13 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
         for value in messages.iter_mut() {
             visit(value);
         }
+        for value in inners.iter_mut() {
+            visit(value);
+        }
+        #[cfg(feature = "exceptions")]
+        for value in failed_values.iter_mut() {
+            visit(value);
+        }
         for value in lock_keys.iter_mut() {
             visit(value);
         }
@@ -7295,6 +7462,24 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
             _ => None,
         })
         .collect();
+    vm.exception_inners = inners
+        .chunks_exact(2)
+        .filter_map(|pair| match (&pair[0], &pair[1]) {
+            (Value::Object(key), Value::Object(value)) => Some((*key, *value)),
+            _ => None,
+        })
+        .collect();
+    #[cfg(feature = "exceptions")]
+    {
+        vm.cctors_failed = failed_keys
+            .into_iter()
+            .zip(failed_values)
+            .filter_map(|(type_id, value)| match value {
+                Value::Object(reference) => Some((type_id, reference)),
+                _ => None,
+            })
+            .collect();
+    }
     vm.locks = lock_keys
         .into_iter()
         .zip(lock_states)

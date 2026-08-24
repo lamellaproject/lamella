@@ -44,6 +44,16 @@ pub enum Trap {
     /// `Monitor.Wait`/`Pulse`/`PulseAll` by a thread that does not own the object's lock (the
     /// `SynchronizationLockException` site).
     SynchronizationLock,
+    /// A type whose `.cctor` already THREW was accessed again (ECMA-335 II.10.5.3.1 guarantee 3:
+    /// an initializer that threw has been executed and did not complete, so the type stays
+    /// inaccessible and every later access fails the way the first one did).
+    ///
+    /// It carries the [`TypeId`](crate::module::TypeId) rather than the exception because the
+    /// exception is VM state: .NET caches the `TypeInitializationException` it raised and rethrows
+    /// that same instance, so the fault-to-exception conversion looks the recorded one up instead
+    /// of minting a second.
+    ///
+    TypeInitializationFailed(crate::module::TypeId),
     /// A checked arithmetic operation or conversion overflowed (the `OverflowException`
     /// site) -- `add.ovf` / `sub.ovf` / `mul.ovf` and `conv.ovf.*`.
     Overflow,
@@ -137,6 +147,10 @@ impl fmt::Display for Trap {
                 f.write_str("monitor wait/pulse by a thread that does not own the lock")
             }
             Trap::Overflow => f.write_str("arithmetic overflow"),
+            Trap::TypeInitializationFailed(type_id) => write!(
+                f,
+                "type {type_id}'s initializer already threw, so the type stays uninitialized"
+            ),
             Trap::UnresolvedField(token) => {
                 write!(f, "field token 0x{:08X} resolved to no field", token.0)
             }

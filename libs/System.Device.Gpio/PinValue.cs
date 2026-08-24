@@ -36,7 +36,7 @@ namespace System.Device.Gpio
         public static bool operator !=(PinValue a, PinValue b) { return a._value != b._value; }
 
         /// <summary>Returns the inverse of the value.</summary>
-        public static PinValue operator !(PinValue value) { return value._value == 0 ? High : Low; }
+        public static PinValue operator !(PinValue v) { return v._value == 0 ? High : Low; }
 
         /// <summary>Indicates whether this instance and a specified object are equal.</summary>
         public override bool Equals(object obj) { return (obj is PinValue) && (this == (PinValue)obj); }

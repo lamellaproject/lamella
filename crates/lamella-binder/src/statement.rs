@@ -1636,6 +1636,33 @@ mod tests {
         assert_eq!(codes("switch (1) { case 0: goto case 1; case 1: break; }"), []);
     }
 
+    /// A `try` transfers out of its section when its body and every handler do (8.10) -- and the
+    /// predicate had no arm for one, so every shape below was CS8070 on a program csc compiles.
+    ///
+    /// **THE `lock` AND `using` ROWS ARE THE POINT, NOT AN EXTRA.** The arm list already NAMED
+    /// both constructs, so a reader had every reason to believe they were covered; binding
+    /// desugars each of them into a block ending in a `try`, so the node that arrives is a `Try`
+    /// and the arm bearing their names is reached by nothing. Naming a construct is not covering
+    /// it, and only a row can tell the two apart.
+    #[test]
+    fn a_try_transfers_out_of_its_section_when_its_body_does() {
+        assert_eq!(codes("switch (1) { case 0: try { break; } finally { } }"), []);
+        assert_eq!(
+            codes("switch (1) { case 0: try { break; } catch { break; } }"),
+            []
+        );
+        assert_eq!(codes("switch (1) { case 0: lock (this) { break; } }"), []);
+        assert_eq!(
+            codes("switch (1) { case 0: try { break; } catch { } }"),
+            [8070]
+        );
+        assert_eq!(codes("switch (1) { case 0: try { } finally { } }"), [8070]);
+        assert_eq!(
+            codes("switch (1) { case 0: try { } finally { while (true) { break; } } }"),
+            [8070]
+        );
+    }
+
     /// `@var` is the identifier `var` (9.4.2), so it is an ordinary type name in every position --
     /// including the one where the keyword would otherwise take over. With no type of that name
     /// declared it is CS0246, csc's answer, and NOT the CS0825 the resolver reserves for the
