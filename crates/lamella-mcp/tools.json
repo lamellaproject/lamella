@@ -5,120 +5,518 @@
       "name": "lamella_check",
       "title": "Check (compile only)",
       "description": "Compile-CHECK a Lamella program WITHOUT running it -- returns diagnostics only. Fast iteration on errors before you run or deploy. C# or Python.",
-      "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The program source." }, "language": { "type": "string", "enum": ["csharp", "python"], "default": "csharp" } }, "required": ["code"] },
-      "annotations": { "readOnlyHint": true, "openWorldHint": false }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The program source."
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "csharp",
+              "python"
+            ],
+            "default": "csharp"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "lamella_run",
       "title": "Run (host interpreter)",
       "description": "Compile and RUN a Lamella program on the HOST interpreter (no device needed) and return stdout, exit code, and diagnostics. Use this to test logic quickly. C#: a full program with a Main; Python: define main() and its return value is printed.",
-      "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The program source." }, "language": { "type": "string", "enum": ["csharp", "python"], "default": "csharp" } }, "required": ["code"] },
-      "annotations": { "readOnlyHint": true, "openWorldHint": false }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The program source."
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "csharp",
+              "python"
+            ],
+            "default": "csharp"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "lamella_size",
       "title": "Size report",
       "description": "Report the flash / RAM / .wasm footprint of a compiled program against the target's budget -- the size meter. Use it to see whether a program fits a board before deploying, and where the bytes go.",
-      "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The C# program source." }, "target": { "type": "string", "description": "Optional board/profile name (e.g. 'pico2'); default is the generic profile." } }, "required": ["code"] },
-      "annotations": { "readOnlyHint": true, "openWorldHint": false }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The C# program source."
+          },
+          "target": {
+            "type": "string",
+            "description": "Optional board/profile name (e.g. 'pico2'); default is the generic profile."
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "lamella_boards",
+      "description": "Every board this build knows, with the part it is built around and its flash and RAM budgets. Needs no hardware. The same catalog `lamella boards` lists.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "lamella_fit",
+      "description": "Does an image of image_bytes fit on board? Answers from the board file and the part row -- an attached board contributes nothing to the arithmetic, so this needs no hardware. The answer carries what it ASSUMED and what it cannot answer; read both. Use lamella_size to obtain image_bytes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "A board id, as lamella_boards lists it."
+          },
+          "image_bytes": {
+            "type": "integer",
+            "description": "The image's size in bytes."
+          }
+        },
+        "required": [
+          "board",
+          "image_bytes"
+        ]
+      }
+    },
+    {
+      "name": "lamella_reconcile",
+      "description": "Compare readings taken from an attached board against what that board declares it can be asked. With no readings it reports what attaching the board WOULD settle, and what nothing declared can reach.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "A board id, as lamella_boards lists it."
+          },
+          "readings": {
+            "type": "object",
+            "description": "Discriminator name to integer value, e.g. {\"chip_idcode\": 195463191}.",
+            "additionalProperties": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "board"
+        ]
+      }
     },
     {
       "name": "lamella_bake",
       "title": "Bake to flash image",
       "description": "Compile + BAKE a C# program into a deployable '.lmli' flash image (corlib-baked, the on-device deploy format) and report its size + the baked profile. Optionally write the image to out_path for inspection. This is the artifact lamella_deploy sends to a board.",
-      "inputSchema": { "type": "object", "properties": { "code": { "type": "string", "description": "The C# program source." }, "out_path": { "type": "string", "description": "Optional path to write the .lmli image to." } }, "required": ["code"] },
-      "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The C# program source."
+          },
+          "out_path": {
+            "type": "string",
+            "description": "Optional path to write the .lmli image to."
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "lamella_list_devices",
       "title": "List attached boards",
       "description": "Enumerate the boards attached to this machine (cross-platform) -- each entry gives its carrier (usb | serial), the target string to pass to deploy/debug tools, and its USB vid/pid/serial/product. Read-only; the first thing to call before any device action.",
-      "inputSchema": { "type": "object", "properties": {} },
-      "annotations": { "readOnlyHint": true, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_identify_device",
       "title": "Identify a board",
       "description": "HELLO a Lamella Link target and return what it is: board name (from its board_model), chip IDCODE + device id when the firmware reports them, negotiated capabilities, and the resolved chip SKU. Read-only -- does not deploy or run anything.",
-      "inputSchema": { "type": "object", "properties": { "target": { "type": "string", "description": "COM port (e.g. 'COM9') or 'usb'[':'<serial>]." } }, "required": ["target"] },
-      "annotations": { "readOnlyHint": true, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "COM port (e.g. 'COM9') or 'usb'[':'<serial>]."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_run_on_device",
       "title": "Run on device (Lamella Link interpreter)",
       "description": "Compile a submission and run it ON THE DEVICE over Lamella Link -- the target runs the CIL on its interpreter and returns the output. Transient (nothing is flashed). Use this to exercise real hardware (GPIO, peripherals) without a persistent deploy.",
-      "inputSchema": { "type": "object", "properties": { "target": { "type": "string", "description": "COM port or usb target." }, "code": { "type": "string", "description": "The C# program source." } }, "required": ["target", "code"] },
-      "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "COM port or usb target."
+          },
+          "code": {
+            "type": "string",
+            "description": "The C# program source."
+          }
+        },
+        "required": [
+          "target",
+          "code"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_deploy",
       "title": "Deploy to board (persistent)",
       "description": "Compile -> bake -> chunk-deploy a program to a board's FLASH over Lamella Link, so it boots on reset. Optionally boot it immediately (run=true). This OVERWRITES the resident image on the board.",
-      "inputSchema": { "type": "object", "properties": { "target": { "type": "string", "description": "COM port or usb target." }, "code": { "type": "string", "description": "The C# program source." }, "run": { "type": "boolean", "default": true, "description": "Boot the image immediately after deploy." } }, "required": ["target", "code"] },
-      "annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "COM port or usb target."
+          },
+          "code": {
+            "type": "string",
+            "description": "The C# program source."
+          },
+          "run": {
+            "type": "boolean",
+            "default": true,
+            "description": "Boot the image immediately after deploy."
+          }
+        },
+        "required": [
+          "target",
+          "code"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_deploy_status",
       "title": "Resident image status",
       "description": "Query the board's resident deployed image -- returns the content checksum if it holds a valid image, or that none is present. Read-only. Compare to a freshly-baked image to skip a redundant re-deploy.",
-      "inputSchema": { "type": "object", "properties": { "target": { "type": "string", "description": "COM port or usb target." } }, "required": ["target"] },
-      "annotations": { "readOnlyHint": true, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "COM port or usb target."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "lamella_flash",
+      "title": "Flash a board's chip",
+      "description": "Write an image that ALREADY EXISTS to a board's chip, over a probe or its bootloader volume. ERASES the board's flash: whatever was on it is gone, including another program you did not put there. Takes a path to a built image (.bin/.hex/.elf/.s19, or .uf2 for a volume route), never source -- build one with lamella_bake or the `lamella build` verb. The board is NEVER inferred and an ambiguous bench is REFUSED rather than guessed at: if more than one candidate matches, this returns the candidates and writes nothing, and you must call again naming one. A write to the wrong board succeeds and reports success, which is why. If a sidecar sits beside the image (<image>.manifest.json), it is CHECKED: a board that disagrees with `board`, or bytes that do not hash to what it records, refuse the call before any probe is opened. It is never used to infer `board`. A sidecar that is present and will not parse also refuses -- a claim nobody can check is worse than no claim.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "type": "string",
+            "description": "Path to a built image. Never source."
+          },
+          "board": {
+            "type": "string",
+            "description": "Board id, as lamella_boards lists it. Required; never inferred."
+          },
+          "via": {
+            "type": "string",
+            "enum": [
+              "volume",
+              "probe"
+            ],
+            "description": "Which mechanism. Omit for the board's own: a debugger soldered to it, or its bootloader drive. `probe` means an EXTERNAL SWD probe and reads every byte back; `volume` cannot read the flash back at all."
+          },
+          "probe": {
+            "type": "string",
+            "description": "Probe serial, on a probe route. REQUIRED when more than one probe is attached -- the call is refused until one is named."
+          },
+          "volume": {
+            "type": "string",
+            "description": "Bootloader drive, on a volume route. Required when more than one board is in its bootloader."
+          }
+        },
+        "required": [
+          "image",
+          "board"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_launch",
       "title": "Debug: launch session",
       "description": "Start a SOURCE-LEVEL debug session on a board: deploy the program, attach, and stop at entry. Returns a session id (pass it to the other debug tools) and the initial stop (reason + source location). Overwrites the resident image.",
-      "inputSchema": { "type": "object", "properties": { "target": { "type": "string", "description": "COM port or usb target." }, "code": { "type": "string", "description": "The C# program source." } }, "required": ["target", "code"] },
-      "annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "COM port or usb target."
+          },
+          "code": {
+            "type": "string",
+            "description": "The C# program source."
+          }
+        },
+        "required": [
+          "target",
+          "code"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_set_breakpoints",
       "title": "Debug: set breakpoints",
       "description": "Set source-line breakpoints for the session (replaces the prior set). Returns which requested lines actually bound to code. Can be called mid-session to rebind.",
-      "inputSchema": { "type": "object", "properties": { "session": { "type": "string" }, "lines": { "type": "array", "items": { "type": "integer" }, "description": "1-based source line numbers." }, "source": { "type": "string", "description": "Optional source file basename; defaults to the launched program." } }, "required": ["session", "lines"] },
-      "annotations": { "readOnlyHint": false, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "1-based source line numbers."
+          },
+          "source": {
+            "type": "string",
+            "description": "Optional source file basename; defaults to the launched program."
+          }
+        },
+        "required": [
+          "session",
+          "lines"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_continue",
       "title": "Debug: continue",
       "description": "Resume the session until the next breakpoint, an exit, or a fault. Returns the stop (reason, source location, exit code / fault message).",
-      "inputSchema": { "type": "object", "properties": { "session": { "type": "string" } }, "required": ["session"] },
-      "annotations": { "readOnlyHint": false, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_step",
       "title": "Debug: step",
       "description": "Single-step the session at source granularity: 'in' (step into calls), 'over' (step over), or 'out' (run to return). Returns the new stop location.",
-      "inputSchema": { "type": "object", "properties": { "session": { "type": "string" }, "kind": { "type": "string", "enum": ["in", "over", "out"], "default": "over" } }, "required": ["session"] },
-      "annotations": { "readOnlyHint": false, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "in",
+              "over",
+              "out"
+            ],
+            "default": "over"
+          }
+        },
+        "required": [
+          "session"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_stack",
       "title": "Debug: stack trace",
       "description": "Return the current call stack of the session -- each frame's qualified method name and source location. Read-only.",
-      "inputSchema": { "type": "object", "properties": { "session": { "type": "string" } }, "required": ["session"] },
-      "annotations": { "readOnlyHint": true, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_locals",
       "title": "Debug: locals",
       "description": "Return the local variables (and arguments) in scope at a stack frame, by name and value. Read-only. Reports that no locals are available on a target that does not supply them.",
-      "inputSchema": { "type": "object", "properties": { "session": { "type": "string" }, "frame": { "type": "integer", "default": 0, "description": "Frame index (0 = innermost)." } }, "required": ["session"] },
-      "annotations": { "readOnlyHint": true, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "frame": {
+            "type": "integer",
+            "default": 0,
+            "description": "Frame index (0 = innermost)."
+          }
+        },
+        "required": [
+          "session"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_eval",
       "title": "Debug: evaluate",
       "description": "Evaluate an expression / submission in the session's Debug Console (compiled + run through the Lamella Link engine) and return its output. Runs code on the device.",
-      "inputSchema": { "type": "object", "properties": { "session": { "type": "string" }, "expression": { "type": "string" } }, "required": ["session", "expression"] },
-      "annotations": { "readOnlyHint": false, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "expression": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session",
+          "expression"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "lamella_debug_disconnect",
       "title": "Debug: disconnect",
       "description": "End the debug session and release the board.",
-      "inputSchema": { "type": "object", "properties": { "session": { "type": "string" } }, "required": ["session"] },
-      "annotations": { "readOnlyHint": false, "openWorldHint": true }
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": true
+      }
     }
   ]
 }

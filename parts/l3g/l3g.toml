@@ -3,7 +3,7 @@
 # share their whole register address map: every name, address, access type and reset default from
 # 0x00 to 0x38 is the same on both.
 #
-# A PART IS NOT A CHIP A PROGRAM RUNS ON, which is why this catalogue is a sibling of the chip
+# A PART IS NOT A CHIP A PROGRAM RUNS ON, which is why this catalog is a sibling of the chip
 # packages rather than part of one: a board states which BUSES exist, a part states its own
 # IDENTITY, and a probe joins the two at run time. A carrier can be populated with either of these
 # two parts on the same pads, so which one is fitted is discovered rather than declared.
@@ -40,7 +40,7 @@ notes = [
     "Reserved registers must not be written. The documents are explicit that writing them may change factory calibration data loaded at boot and lead to device malfunction, and the reserved ranges are large: 0x00-0x0E and 0x10-0x1F.",
     "TWO BITS OF CTRL_REG2 ARE RESERVED WITH A VALUE, WHICH IS NOT THE SAME AS RESERVED. Its top two bits are loaded at boot and both documents say the loaded value must not be changed, so a read-modify-write is required there rather than a bare write of a composed field.",
     "THE FIELD LAYOUTS BELOW ARE A SUBSET AND THE OMISSIONS ARE DELIBERATE. FIFO_CTRL_REG, FIFO_SRC_REG, INT1_CFG, INT1_SRC, the six INT1 threshold registers and INT1_DURATION carry their address, width and access and NO fields: the FIFO and the interrupt generator have not been transcribed. Their addresses are stated because the map is complete; treat the absent fields as untranscribed rather than as registers without structure.",
-    "THE HIGH-PASS CUTOFF TABLE IS NOT CARRIED. Both documents give the cutoff for each of ten HPCF codes at each of four output data rates, in fractions of a hertz down to 0.009 Hz. Those are the figures a fixed-point catalogue cannot state without either a float or a unit this schema has no other use for, and no reading of the rate output needs them.",
+    "THE HIGH-PASS CUTOFF TABLE IS NOT CARRIED. Both documents give the cutoff for each of ten HPCF codes at each of four output data rates, in fractions of a hertz down to 0.009 Hz. Those are the figures a fixed-point catalog cannot state without either a float or a unit this schema has no other use for, and no reading of the rate output needs them.",
 ]
 
 # --- buses ---------------------------------------------------------------------------------------
@@ -258,7 +258,7 @@ notes = "Interrupt duration counter. Fields not transcribed. This is the last re
 #
 # MICRODEGREES PER SECOND, AS INTEGERS. The documents give 8.75, 17.50 and 70 millidegrees per
 # second per digit; a facts table that carried 17.50 as a float would force floating point into
-# every emitted language for the sake of three rows, on a catalogue that has to work on a tier with
+# every emitted language for the sake of three rows, on a catalog that has to work on a tier with
 # no floating point at all.
 [enums.sensitivity_udps_per_digit]
 "0" = 8750

@@ -42,7 +42,7 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
 /// question about the definition's NAME -- the binder holds no separate nullable representation and
 /// this is the one place that recognizes the shape.
 #[must_use]
-pub(crate) fn nullable_underlying(ty: &TypeSymbol) -> Option<&TypeSymbol> {
+pub fn nullable_underlying(ty: &TypeSymbol) -> Option<&TypeSymbol> {
     let TypeSymbol::Instantiation {
         definition,
         arguments,

@@ -57,9 +57,11 @@ if (-not $Define) { $Define = $DefaultSurface }
 # names other entries in this list; all of them reference the corlib implicitly.
 $Assemblies = @(
     @{ name = 'Lamella.Hardware';                      references = @() },
-    @{ name = 'System.Device.Gpio';                    references = @() },
+    # `System.Device.Pwm`'s sources build INTO this assembly and it gets no assembly of its own:
+    # upstream ships `PwmChannel` inside `System.Device.Gpio.dll`, and converging on upstream is the
+    # standing rule. The namespace is unchanged; only the assembly is.
+    @{ name = 'System.Device.Gpio';                    references = @(); extraSources = @('System.Device.Pwm') },
     @{ name = 'System.Device.Model';                   references = @() },
-    @{ name = 'System.Device.Pwm';                     references = @() },
     @{ name = 'System.Net.NetworkInformation';         references = @() },
     # Real .NET's own assembly name, bare and unprefixed, because these are real .NET's types in real
     # .NET's namespace: it ships System.IO.Ports out-of-band (dotnet/dotnet) rather than in its
@@ -77,7 +79,12 @@ $Assemblies = @(
     # AdcControllers binding ship from there, so a program reaching an ADC needs no compatibility
     # assembly. This assembly holds the nanoFramework-shaped surface over that seam.
     @{ name = 'nanoFramework.System.Device.Adc';       references = @('Lamella.Hardware') },
-    @{ name = 'nanoFramework.System.IO.FileSystem';    references = @() }
+    @{ name = 'nanoFramework.System.IO.FileSystem';    references = @() },
+    # The NETMF compatibility tier, so an existing Microsoft.SPOT.Hardware program compiles unchanged.
+    # `Microsoft.SPOT.*` is already unambiguous about whose design it is, so the assembly takes NETMF's
+    # own name with no prefix -- unlike the nanoFramework rows above, whose namespaces are `System.*`.
+    # It shims onto System.Device.Gpio and so is built after it.
+    @{ name = 'Microsoft.SPOT.Hardware';                references = @('System.Device.Gpio') }
 )
 
 # An assembly present on disk but missing from the list above would be silently skipped, and a
@@ -160,6 +167,12 @@ foreach ($assembly in $Assemblies) {
     $name = $assembly.name
     $src = @(Get-Sources (Join-Path $root "libs/$name"))
     if (-not $src.Count) { throw "libs/$name contains no .cs sources" }
+    # Source directories that build INTO this assembly rather than getting one of their own.
+    foreach ($extra in $assembly.extraSources) {
+        $extraSrc = @(Get-Sources (Join-Path $root "libs/$extra"))
+        if (-not $extraSrc.Count) { throw "libs/$extra contains no .cs sources" }
+        $src += $extraSrc
+    }
     $dll = Join-Path $out "$name.dll"
     $refs = @("/reference:$corlibDll")
     foreach ($r in $assembly.references) { $refs += "/reference:$(Join-Path $out "$r.dll")" }

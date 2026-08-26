@@ -49,8 +49,8 @@ fn main() {
     }
     out.push_str("];\n");
 
-    let dest = PathBuf::from(std::env::var_os("OUT_DIR").expect("out dir")).join("catalogue.rs");
-    std::fs::write(&dest, out).expect("write catalogue");
+    let dest = PathBuf::from(std::env::var_os("OUT_DIR").expect("out dir")).join("catalog.rs");
+    std::fs::write(&dest, out).expect("write catalog");
 }
 
 /// Every immediate subdirectory of `root` containing `file`, as `id -> path`, sorted by id so the

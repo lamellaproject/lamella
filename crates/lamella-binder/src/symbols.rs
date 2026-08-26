@@ -95,6 +95,17 @@ pub struct PropertySymbol {
     pub is_static: bool,
     /// The property's accessibility.
     pub accessibility: Accessibility,
+    /// The interface an EXPLICIT implementation names (`int I.P { get; }`), as written; `None`
+    /// for an ordinary property.
+    ///
+    /// **A RULE THAT NEEDS THE INTERFACE CANNOT RECOVER IT FROM THE NAME**: an explicit property is
+    /// stored under its PLAIN name, unlike a method's mangled `I.M`. Without this field, "is this
+    /// property explicitly implemented" can only be answered as "is there a non-public one of this
+    /// name", which cannot say WHICH interface -- and `ListEnumerator<T>` declares `public T
+    /// Current` for `IEnumerator<T>` beside `object IEnumerator.Current` for the non-generic
+    /// interface it also implements, so crediting the second against the first strips a slot csc
+    /// emits.
+    pub explicit_interface: Option<TypeSymbol>,
     /// Whether the property is declared `virtual` -- its accessors are overridable slots.
     pub is_virtual: bool,
     /// Whether the property is `abstract` (its accessors have no body and a concrete derived
@@ -112,6 +123,16 @@ pub struct PropertySymbol {
     pub has_getter: bool,
     /// Whether this declaration provides a `set` accessor.
     pub has_setter: bool,
+    /// Whether that setter was spelled `init` rather than `set` (C# 9).
+    ///
+    /// **IT IS A SETTER EITHER WAY**, which is why this is a flag beside `has_setter` and not a
+    /// third accessor: csc answers `int P { init { } set { } }` with CS1007, so the two spellings
+    /// name one slot. What changes is WHERE it may be called -- an object initializer, an instance
+    /// constructor on `this`/`base`, or another `init` accessor, and nowhere else (CS8852).
+    ///
+    /// For an IMPORTED property this is read from the `modreq(IsExternalInit)` on the `set_`
+    /// accessor's return type, which is the only thing in metadata that distinguishes the two.
+    pub is_init: bool,
     /// The `get` accessor's EFFECTIVE accessibility -- its own access modifier (C# 2.0's 10.7.2)
     /// when it carries one, else the property's. `None` when there is no `get` accessor.
     ///
@@ -149,6 +170,20 @@ pub struct EventSymbol {
     /// Whether the event is `abstract`: its `add`/`remove` accessors are unimplemented slots a
     /// concrete derived class must supply.
     pub is_abstract: bool,
+    /// Whether the event is declared `virtual` -- its accessors are overridable slots.
+    ///
+    /// **THE THREE BELOW ARE WHAT AN OVERRIDE RULE NEEDS, AND A MEMBER MISSING THEM CANNOT BE ASKED.**
+    /// [`PropertySymbol`] records all three, which is why `override` properties get
+    /// CS0506/CS0239/CS0115. A model that cannot say whether a member is overridable gives the
+    /// rule nothing to test: `is_abstract` alone answers CS0534 (does a concrete class still owe
+    /// this member) and nothing else.
+    pub is_virtual: bool,
+    /// Whether the event is declared `override` -- it replaces a base slot rather than
+    /// introducing a new one.
+    pub is_override: bool,
+    /// Whether the event is declared `sealed` -- an `override` that CLOSES its slot, so no
+    /// further derived class may override it.
+    pub is_sealed: bool,
 }
 
 /// How a parameter is passed (17.5.1). The signature TYPE records by-reference-ness
@@ -166,14 +201,41 @@ pub enum ParameterMode {
     Out,
 }
 
-/// What a parameter DECLARES beyond its type: the name a diagnostic quotes, and whether it is
-/// `ref` or `out`.
+/// What a parameter DECLARES beyond its type: the name a diagnostic quotes, whether it is
+/// `ref` or `out`, and the default argument that makes it optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParameterInfo {
     /// The declared name. Empty when the source of this method could not supply one.
     pub name: Box<str>,
     /// `ref` / `out` / by value.
     pub mode: ParameterMode,
+    /// The DEFAULT ARGUMENT (15.6.2.13) that makes this parameter optional, already folded to its
+    /// constant value; `None` for a required parameter.
+    ///
+    /// **A VALUE, NOT AN EXPRESSION, because the call site is where it is consumed and the call
+    /// site may be in another assembly.** An imported method's default arrives decoded from its
+    /// `Constant` row, and a source method's is folded by [`crate::declaration::resolve_constants`]
+    /// -- so both reach a caller the same way and neither carries a syntax tree it could not have.
+    ///
+    /// `Literal::Null` covers more shapes than its name suggests, and that is csc's doing rather
+    /// than a shortcut: measured, csc emits a `NullReference` constant for `= null` on a reference
+    /// type, for `default(string)`, for `int? x = null` AND for `default(S)` on a struct.
+    pub default: Option<Literal>,
+}
+
+impl ParameterInfo {
+    /// A required parameter: a name and a passing mode, with no default.
+    ///
+    /// The shape every synthesized parameter wants -- an accessor's `value`, a delegate's
+    /// `object`/`IntPtr` -- and the one the vast majority of declared parameters want too.
+    #[must_use]
+    pub fn required(name: Box<str>, mode: ParameterMode) -> ParameterInfo {
+        ParameterInfo {
+            name,
+            mode,
+            default: None,
+        }
+    }
 }
 
 /// A method of a type (17.5), reduced to what overload resolution needs.
@@ -309,6 +371,52 @@ impl MethodSymbol {
         self.parameter_info.get(index).map(|info| info.mode)
     }
 
+    /// The default argument of parameter `index`, when it has one.
+    #[must_use]
+    pub fn parameter_default(&self, index: usize) -> Option<&Literal> {
+        self.parameter_info.get(index)?.default.as_ref()
+    }
+
+    /// How many arguments a call MUST supply: the parameters up to the first optional one.
+    ///
+    /// Optional parameters are a TRAILING run by construction -- csc's CS1737 refuses a required
+    /// parameter after an optional one -- so the first parameter carrying a default fixes the
+    /// minimum, and `position` below relies on that.
+    #[must_use]
+    pub fn required_parameter_count(&self) -> usize {
+        self.parameter_info
+            .iter()
+            .position(|info| info.default.is_some())
+            .unwrap_or(self.parameters.len())
+    }
+
+    /// Whether a call supplying `argc` POSITIONAL arguments has the right count for this method.
+    ///
+    /// **THE ARITY RULE, STATED ONCE** -- every site that asks whether a call has the right number
+    /// of arguments asks it here, so a new admissible shape is added in one place.
+    ///
+    /// Three admissible shapes, in the order 12.6.4.2 considers them:
+    ///
+    /// * exactly as many arguments as parameters;
+    /// * fewer, with every parameter left over carrying a default;
+    /// * a `params` tail absorbing any count from the fixed arity up (and it absorbs zero, which
+    ///   is why the comparison is against `len() - 1`).
+    ///
+    /// This answers COUNT alone. Whether the argument types convert is a separate question with a
+    /// separate diagnostic (`CS1503`), and answering it here would put a wrong code on a real
+    /// error.
+    #[must_use]
+    pub fn accepts_argument_count(&self, argc: usize) -> bool {
+        let declared = self.parameters.len();
+        if argc == declared {
+            return true;
+        }
+        if argc < declared && argc >= self.required_parameter_count() {
+            return true;
+        }
+        self.is_params && declared > 0 && argc + 1 >= declared
+    }
+
     /// This generic method DEFINITION closed over `arguments`: the same method with every mention
     /// of one of its own type parameters replaced, so `Id<int>` returns `int` and takes `int` where
     /// `Id<T>` returns `T` and takes `T`.
@@ -392,9 +500,26 @@ pub struct TypeInfo {
     /// `None` for a top-level type. Drives the `NestedClass` row and the empty namespace
     /// on emission.
     pub enclosing: Option<Box<str>>,
-    /// Whether this type comes from a referenced assembly (not the unit being compiled), so
-    /// an `internal` member of it is `CS0122` from here (cross-assembly internal).
+    /// Whether this type comes from a referenced assembly (not the unit being compiled).
     pub is_external: bool,
+    /// For an external type, whether the import filter DROPPED a constructor it declares -- so an
+    /// empty [`Self::constructors`] means "declares constructors, none of them visible here"
+    /// rather than "nothing recorded".
+    ///
+    /// **THE TWO ARE DIFFERENT ANSWERS AND ONLY ONE OF THEM IS A DIAGNOSTIC.** A base class with no
+    /// visible constructor cannot be derived from, and csc says so; a `TypeInfo` that simply has no
+    /// constructors recorded (a hand-built model, a type whose `.ctor` signature did not decode) is
+    /// a gap, and refusing on it would refuse correct code. Nothing downstream can tell them apart
+    /// after the fact, so the filter records which one it produced.
+    pub hidden_constructors: bool,
+    /// For an external type, whether its assembly named THIS compilation a friend with
+    /// `[assembly: InternalsVisibleTo]`, so its `internal` members are reachable from here.
+    ///
+    /// **AN EXTERNAL TYPE'S `internal` MEMBERS ARE ONLY IN THE MODEL AT ALL WHEN THIS IS SET** --
+    /// `reference.rs` does not import them otherwise, matching csc. The flag is carried anyway
+    /// rather than inferred from their presence, so the accessibility rule states the fact it
+    /// depends on instead of relying on an invariant established in another file.
+    pub internals_visible: bool,
     /// For an external type, the simple name of the assembly that defines it (so its `TypeRef`
     /// is scoped to the right `AssemblyRef`, not just mscorlib). `None` for a this-module type.
     pub assembly: Option<Box<str>>,
@@ -502,7 +627,7 @@ impl TypeParameterConstraints {
 /// **THIS IS AN IDENTITY RULE, NOT A DISPLAY ONE.** Arity is PART of a generic type's name --
 /// `Box`, `Box<T>` and `Box<T,U>` are three unrelated types that may all be declared in one
 /// namespace, and only the mangled spelling tells them apart. A model keyed by the bare name
-/// collapses them, which is why a wrong arity used to resolve to whichever one was collected.
+/// collapses them, so a wrong arity resolves to whichever one was collected last.
 ///
 /// It is the ONE spelling: a definition read from a reference assembly already arrives mangled, and
 /// this function is what makes a definition read from SOURCE arrive the same way, so the two sources
@@ -661,6 +786,8 @@ impl TypeInfo {
             constructors: Vec::new(),
             enclosing: None,
             is_external: false,
+            hidden_constructors: false,
+            internals_visible: false,
             assembly: None,
             accessibility: Accessibility::Public,
             is_sealed: false,
@@ -1476,10 +1603,10 @@ impl SignatureCanon {
 /// ARITY-MANGLED name (II.10.7.2), with the source spelling put back in the last part --
 /// `["Box"]` at arity 1 becomes `["App", "Box"]` when the model holds `App.Box`1`.
 ///
-/// **THIS RULE HAS THREE CALLERS AND HAD BEEN WRITTEN IN NONE OF THEM.** A simple name is
-/// qualified in three places -- the use-site resolver, [`SignatureCanon::canonicalize`], and
-/// `Binder::canonicalize` -- each with its own lookup, and every one handled `Named`, arrays and
-/// pointers while falling through on an instantiation. The result was one spelling with three
+/// **THIS RULE HAS THREE CALLERS AND BELONGS IN NONE OF THEM.** A simple name is qualified in
+/// three places -- the use-site resolver, [`SignatureCanon::canonicalize`], and
+/// `Binder::canonicalize` -- each with its own lookup. A copy per site handles `Named`, arrays and
+/// pointers and falls through on an instantiation, giving one spelling three
 /// answers: `Box<int>` resolved in a local declaration, was silently left unqualified in a
 /// parameter, and had no members either way. The lookups genuinely differ (a prebuilt map, a model
 /// query); the RULE does not, so it lives here once.

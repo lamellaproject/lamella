@@ -1,0 +1,53 @@
+# The ATSAMD10 Xplained Mini: board truth only -- what is wired to what. Chip truth lives in
+# csp/samd10/. Kit ATSAMD10-XMINI, part ATSAMD10D14AM (24-pin QFN, 16 KB): its mEDBG virtual COM
+# port is SERCOM0 on PA10/PA11 at peripheral function C.
+#
+# THE PART IS STATED HERE BECAUSE NO DOCUMENT THIS BOARD SHIPS WITH STATES IT. The user guide says
+# "ATSAMD10" fifteen times and never a part number, a package or a flash size. The package follows
+# from its headers naming PA10, PA11, PA17 and PA27, which only the 24-pin QFN carries -- but the
+# DENSITY does not follow from anything on the board: the 16 KB and 8 KB QFN variants are
+# pad-identical. A DSU read returning DID 0x10020100 (DEVSEL 0x00) is what settles it at 16 KB, and
+# NVMCTRL reporting 256 pages of 64 B says the same thing through a second register.
+
+
+[table]
+kind = "board"
+board = "atsamd10-xmini"
+vendor = "microchip"
+family = "samd10"
+part = "atsamd10d14am"
+board_model = 38
+sources = [
+    "ATSAMD10 Xplained Mini user guide Atmel-42387, mEDBG wiring table: the bridge's USART TxD pairs with PA11/RxD and its RxD with PA10/TxD, both SERCOM0",
+    "SAM D10 datasheet Atmel-42242H table 6-1: PA10 and PA11 reach SERCOM0/PAD[2] and SERCOM0/PAD[3] at peripheral function C",
+    "USB vendor and product ids read off the board's own mEDBG enumeration, 03eb:2145",
+]
+notes = [
+    "The Arduino headers carry a SERCOM1 SPI whose pads land in a non-obvious order -- PAD[0] MOSI on PA22, PAD[1] slave select on PA23, PAD[2] MISO on PA24, PAD[3] SCK on PA09. Those pads carry pin-map rows in csp/samd10/pins.toml; none has a binding below.",
+    "PA09 carries that SPI clock AND the board's user LED. Driving the LED as a GPIO and running SERCOM1 SPI are mutually exclusive on this board, and nothing in the chip reports the conflict -- so a future LED device row and a future SPI binding must not both be added without a decision about which owns the pad.",
+    "An mEDBG (ATmega32U4) rather than the EDBG its SAM D11 sibling carries, which is why the USB product id differs even though the vendor does not.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"
+usb_vid = 0x03EB
+usb_pid = 0x2145
+role = "vcp"
+baud = 115200
+plan = "osc8m-8mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom0"
+function = "C"
+gclk_gen = 0
+tx = { pin = "PA10", pad = 2 }
+rx = { pin = "PA11", pad = 3 }
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000

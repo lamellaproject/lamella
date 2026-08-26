@@ -1,0 +1,119 @@
+# INSTANCE map for the STM32U5A5: where each block copy sits, plus its RCC clock-enable routing.
+# `-1` = the row gates nothing (the RCC itself).
+#
+# EVERY BASE HERE IS THE NONSECURE ALIAS, which is a decision rather than a default. This is an
+# Armv8-M TrustZone part, so RM0456 Table 6 prints TWO address columns for every peripheral --
+# "Secure boundary address" and "Nonsecure boundary address" -- and an instance row has one `base`.
+# The rows below state the NONSECURE one, the same choice csp/stm32u585 made and for the same
+# reason: with TZEN = 0 only the nonsecure alias is meaningful, and with TZEN = 1 the secure alias
+# exists IN ADDITION at the same offset, so the table is correct either way.
+#
+# THE PORT SET IS COMPLETE FOR THIS SUB-GROUP AND IS READ FROM THE PRESENCE COLUMN, NOT FROM THE
+# ADDRESS COLUMN. Table 6 carries the memory map and a per-line presence matrix in ONE table --
+# four columns of X and '-' headed STM32U535/545, STM32U575/585, STM32U59x/5Ax and STM32U5Fx/5Gx.
+# An address in that table is a statement about the SERIES; the X in this part's column is the
+# statement about this die. GPIOJ is the row where they part company: it is marked present on
+# STM32U59x/5Ax and ABSENT on STM32U575/585, so this part carries ten ports where the U585 carries
+# nine.
+#
+#
+
+[table]
+kind = "instances"
+family = "stm32u5a5"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32U5 series reference manual RM0456 Rev 7: Table 6 (memory map and peripheral register boundary addresses), STM32U59x/5Ax column -- GPIOA through GPIOJ on AHB2 from nonsecure 0x42020000 in 0x400 steps, and RCC at nonsecure 0x46020C00-0x46020FFF",
+    "RM0456 Rev 7 section 11.8.30, RCC AHB2 peripheral clock enable register 1 (RCC_AHB2ENR1), address offset 0x08C, per-bit descriptions: GPIOAEN bit 0 through GPIOJEN bit 9, one bit per port in order",
+    "RM0456 Rev 7 Table 6 for USART1 at nonsecure 0x40013800 on APB2, present in the STM32U59x/5Ax column, and the RCC APB2 peripheral clock enable register (RCC_APB2ENR) at address offset 0x0A4 whose per-bit description gives USART1EN as bit 14",
+]
+notes = [
+    "Bit positions are taken from the manual's per-bit prose rather than from its register bit-map diagram: that diagram is a wide grid whose columns do not survive a text conversion, and this manual's does not.",
+    "RCC_AHB2ENR1's RESET VALUE differs by sub-group on this series, so a table spanning sub-groups would have to state one and be wrong for the others. The OFFSET and the ten bit positions used here are what this file depends on, and both were read against the STM32U59x/5Ax content.",
+    "NO BLOCK LAYOUT FILE ACCOMPANIES THESE ROWS YET. An instance is useful the moment its base and its gate are known; a register map is a separate reading. A consumer needing GPIO register offsets must read them from RM0456 for this sub-group and must not infer them from csp/stm32u585, which is a different column of the same tables.",
+]
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x42020000
+rcc_en_off = 0x8C
+rcc_en_bit = 0
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x42020400
+rcc_en_off = 0x8C
+rcc_en_bit = 1
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x42020800
+rcc_en_off = 0x8C
+rcc_en_bit = 2
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x42020C00
+rcc_en_off = 0x8C
+rcc_en_bit = 3
+
+[[instances]]
+name = "gpioe"
+block = "gpio"
+base = 0x42021000
+rcc_en_off = 0x8C
+rcc_en_bit = 4
+
+[[instances]]
+name = "gpiof"
+block = "gpio"
+base = 0x42021400
+rcc_en_off = 0x8C
+rcc_en_bit = 5
+
+[[instances]]
+name = "gpiog"
+block = "gpio"
+base = 0x42021800
+rcc_en_off = 0x8C
+rcc_en_bit = 6
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x42021C00
+rcc_en_off = 0x8C
+rcc_en_bit = 7
+
+[[instances]]
+name = "gpioi"
+block = "gpio"
+base = 0x42022000
+rcc_en_off = 0x8C
+rcc_en_bit = 8
+
+# GPIOJ IS THE ROW THAT DOES NOT EXIST ON A U575/585. See the header.
+[[instances]]
+name = "gpioj"
+block = "gpio"
+base = 0x42022400
+rcc_en_off = 0x8C
+rcc_en_bit = 9
+
+[[instances]]
+name = "usart1"
+block = "usart"
+base = 0x40013800
+rcc_en_off = 0xA4   # RCC_APB2ENR
+rcc_en_bit = 14     # USART1EN
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x46020C00
+rcc_en_off = -1
+rcc_en_bit = -1

@@ -127,9 +127,8 @@ pub mod element {
 /// # Why it lives here and not in a consumer
 ///
 /// It maps a `lamella-metadata` type onto `lamella-metadata` constants, so a copy anywhere else is a
-/// SECOND table over one byte space -- the drift shape this tree has already paid for once, when the
-/// AOT's interface tag kept its own version and `Pointer`/`ByRef` had no arm in it: `IFoo.Bar(int*)`,
-/// `IFoo.Bar(byte*)` and `IFoo.Bar(ref int)` all tagged alike. One table, beside the decoder it must
+/// SECOND table over one byte space. A separate copy missing an arm for `Pointer`/`ByRef` tags
+/// `IFoo.Bar(int*)`, `IFoo.Bar(byte*)` and `IFoo.Bar(ref int)` alike. One table, beside the decoder it must
 /// agree with.
 ///
 /// **EVERY BYTE IS FROZEN.** The AOT folds these into interface-method tags, which are baked
@@ -252,6 +251,19 @@ pub struct MethodSig {
     /// vararg call-site `MemberRef` carries the fixed parameters, then a sentinel, then the
     /// variable-argument types.
     pub is_vararg: bool,
+    /// The REQUIRED custom modifiers on the RETURN type, as `TypeDefOrRef` tokens, in the order
+    /// the blob wrote them. Empty for almost every method.
+    ///
+    /// **THE ONE THING THAT DISTINGUISHES AN INIT-ONLY SETTER FROM AN ORDINARY ONE.** csc emits
+    /// `void modreq(System.Runtime.CompilerServices.IsExternalInit)` as an `init` accessor's
+    /// return type, and the signature is an ordinary `void set_P(int)` in every other respect --
+    /// so a decoder that drops the modifier reports the two as the same method, and a consumer
+    /// assigns an init-only property wherever it likes: `b.P = 1` on an imported init-only property
+    /// compiles clean without the modifier and is CS8852 under csc.
+    ///
+    /// Only the return position is captured, because that is where the one modifier this compiler
+    /// acts on appears; see [`read_type_collecting_required`].
+    pub return_type_required_modifiers: Vec<Token>,
     /// How many type parameters the method itself declares (the `1` of `T Identity<T>(T)`), or 0.
     ///
     /// **BINDING-SIGNIFICANT, NOT BOOKKEEPING** (II.23.2.1): the runtime overloads generic methods
@@ -357,8 +369,34 @@ fn read_type_def_or_ref(reader: &mut Reader) -> Result<Token, SigError> {
     Ok(Token::new(table, coded >> 2))
 }
 
+/// Reads one type signature from `reader`, collecting any REQUIRED custom modifiers into
+/// `required` rather than dropping them.
+///
+/// **THE MODIFIERS ARE COLLECTED, NOT MODELLED, AND THAT IS DELIBERATE.** A `SigType::Modified`
+/// variant would be the faithful shape and would break 923 match sites across the compiler, the
+/// loader and the AOT lane -- nearly all of which want the type UNDER the modifier and would
+/// unwrap it again. A caller that cares about a modifier asks for it here; every other caller uses
+/// [`read_type`] and is unaffected.
+///
+/// The list is FLAT and unpositioned: a modifier nested inside an array element or a generic
+/// argument is appended to the same list with nothing to say where it came from, so this answers
+/// "which required modifiers appear anywhere in this type" and not "where".
+fn read_type_collecting_required(
+    reader: &mut Reader,
+    required: &mut Vec<Token>,
+) -> Result<SigType, SigError> {
+    read_type_inner(reader, Some(required))
+}
+
 /// Reads one type signature from `reader`.
 pub fn read_type(reader: &mut Reader) -> Result<SigType, SigError> {
+    read_type_inner(reader, None)
+}
+
+fn read_type_inner(
+    reader: &mut Reader,
+    mut required: Option<&mut Vec<Token>>,
+) -> Result<SigType, SigError> {
     loop {
         let element = reader.read_u8()?;
         return Ok(match element {
@@ -401,7 +439,14 @@ pub fn read_type(reader: &mut Reader) -> Result<SigType, SigError> {
                     rank,
                 }
             }
-            element::CMOD_REQD | element::CMOD_OPT => {
+            element::CMOD_REQD => {
+                let modifier = read_type_def_or_ref(reader)?;
+                if let Some(collected) = required.as_deref_mut() {
+                    collected.push(modifier);
+                }
+                continue;
+            }
+            element::CMOD_OPT => {
                 read_type_def_or_ref(reader)?;
                 continue;
             }
@@ -454,7 +499,9 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
         0
     };
     let param_count = reader.read_compressed_u32()?;
-    let return_type = read_type(&mut reader)?;
+    let mut return_type_required_modifiers = Vec::new();
+    let return_type =
+        read_type_collecting_required(&mut reader, &mut return_type_required_modifiers)?;
     let mut parameters = Vec::new();
     let mut sentinel_index = None;
     while (parameters.len() as u32) < param_count {
@@ -472,6 +519,7 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
         is_vararg,
         sentinel_index,
         generic_param_count,
+        return_type_required_modifiers,
     })
 }
 

@@ -1,0 +1,31 @@
+# PIN map for the STM32U5A5: pin x function -> (instance, signal).
+# Function ids are the ST alternate-function numbers AF0..AF15 that the AFRL and AFRH nibbles
+# select. The rows are EVIDENCE-ONLY: a pad gains a row when something reaches it.
+#
+#
+
+[table]
+kind = "pins"
+family = "stm32u5a5"
+sources = [
+    "STM32U5Axxx datasheet DS13543 Rev 3 section 4.3 table 28 (alternate function AF0 to AF7): port A row PA9 gives USART1_TX in the AF7 column and row PA10 gives USART1_RX in the same column",
+    "STM32U5 series reference manual RM0456 Rev 7 for the AF selection mechanism, which is series-wide",
+]
+notes = [
+    "PA13 and PA14 are JTMS/SWDIO and JTCK/SWCLK at AF0 and are held by the debug port. They carry no row here because nothing binds them, but a design taking either away loses debugging.",
+    "This family populates AF0 to AF15; DS13543 splits them across two tables, 28 for AF0..AF7 and 29 for AF8..AF15. Only the first is read here, because both rows below are in it.",
+]
+
+[[pins]]
+pin = "PA9"
+function = "AF7"
+instance = "usart1"
+signal = "tx"
+source = "DS13543 Rev 3 table 28, port A row PA9, AF7 column = USART1_TX. Its other populated functions are TIM1_CH2 at AF1, SPI2_SCK at AF3 and DCMI_D0/PSSI_D0 at AF5."
+
+[[pins]]
+pin = "PA10"
+function = "AF7"
+instance = "usart1"
+signal = "rx"
+source = "DS13543 Rev 3 table 28, port A row PA10, AF7 column = USART1_RX. Its other populated functions are CRS_SYNC at AF0, TIM1_CH3 at AF1, LPTIM2_IN2 at AF2, SAI1_D1 at AF3 and DCMI_D1/PSSI_D1 at AF5."

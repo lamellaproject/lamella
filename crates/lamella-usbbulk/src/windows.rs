@@ -116,8 +116,8 @@ use crate::serial_matches;
 ///
 /// NOTE the one way this can be wrong, and which way it falls. A device whose real serial contained
 /// an ampersand would be misread as synthesized -- and that is the SAFE direction: it falls back to
-/// reading the descriptor, which is exactly what the code did for every device before this
-/// distinction existed. The costly mistake would be the other way round, and this cannot make it.
+/// reading the descriptor, which is what a path making no such distinction does for every device.
+/// The costly mistake would be the other way round, and this cannot make it.
 fn is_synthesized_instance_id(id: &str) -> bool {
     id.contains('&')
 }

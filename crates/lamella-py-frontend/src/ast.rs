@@ -331,8 +331,8 @@ pub struct CompClause {
 /// already exists, so the names inside them are USES rather than bindings.
 ///
 /// Three separate walks need this answer -- the local collector, the type-inference pass that pins
-/// a dynamic slot, and the editor completion list -- and each of them used to read the single name
-/// a `with` target was allowed to be. Once a target can be a sequence, a walk that reads one name
+/// a dynamic slot, and the editor completion list -- and none of them may read only the single name
+/// a `with` target was once allowed to be. A target can be a sequence, so a walk that reads one name
 /// binds too FEW, which is the direction that produces a wrong answer rather than a missing
 /// feature: a slot nothing pinned is a slot inference will give a static type.
 pub(crate) fn target_bound_names<'a>(target: &'a AssignTarget, out: &mut Vec<&'a str>) {

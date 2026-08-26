@@ -1,0 +1,67 @@
+# The SAM D10 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for the bindings a board package uses, each with its source; grow the table with the
+# boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+#
+# THE FUNCTION LETTER IS THE WHOLE ROW, and it is not derivable from the SERCOM number. Column C is
+# SERCOM and column D is SERCOM-ALT, so the same instance appears under different letters on
+# different pins. A row carrying the right instance under the wrong letter muxes a different
+# peripheral onto the pad and reports success.
+#
+# The rows below are the ATSAMD10-XMINI's Arduino-header wiring. Every one is sourced to
+# Atmel-42242H table 6-1 for the letter and corroborated by the kit user guide Atmel-42387, which
+# names the SERCOM for each header pin independently.
+
+[table]
+kind = "pins"
+family = "samd10"
+sources = [
+    "SAM D10 datasheet Atmel-42242H-SAM-D10-Datasheet_09/2016 table 6-1 (PORT function multiplexing), column C = SERCOM and column D = SERCOM-ALT",
+    "ATSAMD10 Xplained Mini user guide Atmel-42387, whose header tables name the SERCOM for each Arduino-header pin -- used as corroboration for the rows below, never as their source",
+]
+notes = [
+    "The board's SPI is SERCOM1 taken entirely from column C, and the four pads land in a non-obvious order: PAD[0] is MOSI, PAD[1] is the slave select, PAD[2] is MISO and PAD[3] is SCK. A driver assigning pads by their usual SPI order would swap MISO and SCK.",
+    "PA09 carries both the SPI clock and the board's user LED, per Atmel-42387. Driving the LED as a GPIO and running SERCOM1 SPI are mutually exclusive on this board, and nothing in the chip will say so -- this is the pin-reservation case, on a board we hold.",
+    "PA30 and PA31 carry SWCLK and SWDIO under function G. They are not listed below because nothing muxes them, but a board that reassigns either loses its debug connection.",
+]
+
+[[pins]]
+pin = "PA22"
+function = "C"
+instance = "sercom1"
+signal = "pad0"
+source = "Atmel-42242H table 6-1: PA22 column C = SERCOM1/PAD[0], and the Type column marks the pad I2C-capable. Atmel-42387 wires it to header D11 as SPI MOSI."
+
+[[pins]]
+pin = "PA23"
+function = "C"
+instance = "sercom1"
+signal = "pad1"
+source = "Atmel-42242H table 6-1: PA23 column C = SERCOM1/PAD[1], and the Type column marks the pad I2C-capable. Atmel-42387 wires it to header D10 as the SPI slave select."
+
+[[pins]]
+pin = "PA24"
+function = "C"
+instance = "sercom1"
+signal = "pad2"
+source = "Atmel-42242H table 6-1: PA24 column C = SERCOM1/PAD[2]. Atmel-42387 wires it to header D12 as SPI MISO."
+
+[[pins]]
+pin = "PA09"                # PAD[3] is the CLOCK on this board, not the fourth data pad -- see
+function = "C"             # the block note above about the pad order
+instance = "sercom1"
+signal = "pad3"
+source = "Atmel-42242H table 6-1: PA09 column C = SERCOM1/PAD[3]. Atmel-42387 wires it to header D13 as SPI SCK, and the same pad drives the board's user LED."
+
+[[pins]]
+pin = "PA10"
+function = "C"
+instance = "sercom0"
+signal = "pad2"
+source = "Atmel-42242H table 6-1: PA10 column C = SERCOM0/PAD[2]. Atmel-42387's mEDBG wiring table pairs the bridge's USART RxD with PA10/TxD, so this is the D10's transmit line."
+
+[[pins]]
+pin = "PA11"
+function = "C"
+instance = "sercom0"
+signal = "pad3"
+source = "Atmel-42242H table 6-1: PA11 column C = SERCOM0/PAD[3]. Atmel-42387 wires it to header D0 as the USART receive line."

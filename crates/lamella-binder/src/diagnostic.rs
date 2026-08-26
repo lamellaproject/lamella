@@ -137,47 +137,11 @@ impl DiagnosticKind {
 
 /// The namespace a diagnostic code belongs to.
 ///
-/// **`CS` MEANS WHAT csc MEANS BY IT, ALWAYS.** A code is a search key: a developer who hits
-/// `CS0649` will look it up and land on
-/// csc's documentation, so lcsc may only spell a condition `CS` when csc has that same concept. It
-/// follows that a condition csc has NO concept of cannot borrow a `CS` number -- an unused one
-/// today is one a future Roslyn release may claim, and then the same key means two things
-/// depending on which compiler emitted it.
-///
-/// **`LAM` IS FOR EXACTLY THOSE CONDITIONS, AND IT IS A SMALL FAMILY.** Almost everything routes to
-/// csc's own codes: a BCL surface we do not ship reports as `CS0246`/`CS0234` (which is also how
-/// nanoFramework expresses a restricted platform, measured), a construct above the selected dialect
-/// reports as the `CS8022` family, and a language feature missing a compiler-required member reports
-/// as `CS0518`/`CS0656`. What is left is the condition none of those describe: the dialect permits
-/// the construct and THIS BUILD cannot produce it.
-///
-/// **The user-visible payoff is that the prefix says which kind of problem it is.** A `CS` code is a
-/// statement about the language; a `LAM` code is a statement about this build's coverage, and the
-/// second kind changes as the compiler grows where the first does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodeNamespace {
-    /// csc's namespace, for conditions csc also has.
-    Cs,
-    /// Lamella's, for conditions csc has no concept of.
-    Lam,
-}
-
-impl CodeNamespace {
-    /// The literal prefix that precedes the digits: `CS` or `LAM`.
-    ///
-    /// Chosen against the widths a Problems pane already carries -- `CS0649` and `CA1822` at six
-    /// characters, `IDE0051` and `MSB3021` at seven -- so `LAM0001` costs nothing in a pane already
-    /// sized for the built-in analyzers, and one character in raw terminal output where the path
-    /// dominates the line anyway. Four digits rather than three because the extra character buys
-    /// ranges (compiler coverage, backend, linker, runtime) and three would not.
-    #[must_use]
-    pub fn prefix(self) -> &'static str {
-        match self {
-            CodeNamespace::Cs => "CS",
-            CodeNamespace::Lam => "LAM",
-        }
-    }
-}
+/// **Re-exported from `lamella-syntax`, where it now lives.** It moved because the PARSER needs it
+/// too: a parse diagnostic was assumed to always be csc's, and `LAM0001` was therefore unreachable
+/// from the half of the compiler that raises most of the feature gates. Two copies of this enum
+/// would have been two answers to "which prefix does this condition get".
+pub use lamella_syntax::diagnostic::CodeNamespace;
 
 /// A semantic-diagnostic kind, with any detail its message needs.
 /// Which position in a member's signature a type occupies, for the accessibility-consistency
@@ -833,6 +797,26 @@ pub enum DiagnosticKind {
     },
     /// `CS0150`: a constant value was expected (e.g. a non-constant `case` label).
     ConstantExpected,
+    /// `CS1525`: a term that cannot begin an expression at all, with the term quoted as csc
+    /// quotes it -- `Invalid expression term 'int'`.
+    ///
+    /// Distinct from [`Self::ExpressionHasNoName`], and the pair is measured: `nameof(int)` is
+    /// this and `nameof(Int32)` is `"Int32"`. A predefined-type KEYWORD never reaches the question
+    /// `CS8081` answers, because it is not an expression to begin with.
+    ///
+    /// The parser has a `CS1525` of its own that renders without the term; this one exists because
+    /// the binder is where the offending term is still in hand.
+    InvalidExpressionTerm {
+        /// The term, as written -- `int`, `void`.
+        term: Box<str>,
+    },
+    /// `CS8081`: a `nameof` operand that has no name -- a literal, a call, an element access, an
+    /// operator expression, `typeof(T)`, a bare `this`, or a PARENTHESIZED name.
+    ///
+    /// The parenthesized form belongs in that list: `nameof(a)` is `"a"` and `nameof((a))` is
+    /// this diagnostic. Parentheses make an expression, and an expression is what does not have a
+    /// name.
+    ExpressionHasNoName,
     /// `CS0152`: a `switch` has two labels with the same value (or two `default`s).
     DuplicateCaseLabel {
         /// The duplicated label, rendered as `case 5` or `default`.
@@ -1195,6 +1179,13 @@ pub enum DiagnosticKind {
         /// The member's qualified signature (`C.M()` / `C.P`).
         member: Box<str>,
     },
+    /// `CS8712`: an `abstract` event declared with `add`/`remove` accessor syntax. An abstract
+    /// event declares a contract and has no bodies to write, so csc refuses the syntax outright
+    /// rather than reporting `CS0500` twice, once per accessor.
+    AbstractEventWithAccessors {
+        /// The event's qualified name (`C.E`).
+        member: Box<str>,
+    },
     /// `CS0666`: a struct declares a `protected` (or `protected internal`) member.
     ProtectedMemberInStruct {
         /// The member's qualified name (`S.x` / `S.M()` / `S.P`).
@@ -1226,6 +1217,31 @@ pub enum DiagnosticKind {
         /// The referenced member, qualified by its declaring type (`C.first`, `C.M()`).
         member: Box<str>,
     },
+    /// `CS1737`: a REQUIRED parameter follows an optional one (15.6.2.13).
+    ///
+    /// A `params` array is exempt: `M(int a = 1, params int[] rest)` is legal, because the
+    /// trailing array is not a parameter a call has to supply.
+    RequiredAfterOptionalParameter,
+    /// `CS1741`: a `ref` or `out` parameter carries a default value. One message for both, which is
+    /// csc's own wording -- measured on each separately.
+    ByRefParameterWithDefault,
+    /// `CS1751`: a `params` array carries a default value.
+    ///
+    /// The message says *"parameter collection"*, not *"parameter array"*.
+    ParamsParameterWithDefault,
+    /// `CS1736`: a default argument is not a compile-time constant.
+    DefaultValueNotConstant {
+        /// The parameter's declared name, which csc's message quotes.
+        parameter: Box<str>,
+    },
+    /// `CS1750`: a default argument IS a constant but does not standard-convert to the parameter's
+    /// type -- a different code from `CS1736`, and the distinction is the whole message.
+    DefaultValueWrongType {
+        /// The default's own type, as csc renders it -- `<null>` for the null literal.
+        from: Box<str>,
+        /// The parameter's declared type.
+        to: Box<str>,
+    },
     /// `CS0231`: a `params` parameter is not the last parameter in the list.
     ParamsNotLast,
     /// `CS0225`: a `params` parameter is not a single-dimensional array.
@@ -1249,6 +1265,11 @@ pub enum DiagnosticKind {
         field: Box<str>,
     },
     /// `CS0200`: a property with no `set` accessor is assigned.
+    /// CS8852: an init-only property or indexer assigned outside the places C# 9 permits.
+    InitOnlyAssignment {
+        /// The property, rendered qualified by its declaring type (`Box.P`), as csc renders it.
+        property: Box<str>,
+    },
     PropertyCannotBeAssigned {
         /// The property, qualified as csc renders it (`C.P`).
         property: Box<str>,
@@ -1261,9 +1282,9 @@ pub enum DiagnosticKind {
     /// csc user lands. Softening it to describe only what we implement would break exactly the
     /// property the wording exists for.
     ///
-    /// Used today only for a collection initializer's missing `Add`, which is where it was
-    /// measured. **Other sites still report `CS0117` where csc may say `CS1061`; that split is
-    /// unmeasured and is NOT claimed to be right.**
+    /// **THE SPLIT IS MEASURED: THE RECEIVER DECIDES IT.** One program naming a missing member
+    /// both ways reports one of each -- `T.Nope()` through the type is `CS0117`, and `t.Nope()` on
+    /// an expression is this.
     MemberNotFoundOnExpression {
         /// The type the member was looked for on.
         type_name: Box<str>,
@@ -1714,6 +1735,8 @@ impl DiagnosticKind {
             DiagnosticKind::MultipleEntryPoints => 17,
             DiagnosticKind::MethodGroupToNonDelegate { .. } => 428,
             DiagnosticKind::ConstantExpected => 150,
+            DiagnosticKind::InvalidExpressionTerm { .. } => 1525,
+            DiagnosticKind::ExpressionHasNoName => 8081,
             DiagnosticKind::DuplicateCaseLabel { .. } => 152,
             DiagnosticKind::SwitchFallThrough { .. } => 163,
             DiagnosticKind::SwitchFallOutFinal { .. } => 8070,
@@ -1773,6 +1796,7 @@ impl DiagnosticKind {
             DiagnosticKind::VirtualOrAbstractMemberIsPrivate { .. } => 621,
             DiagnosticKind::ModifierNotValidForItem { .. } => 106,
             DiagnosticKind::SealedMemberIsNotOverride { .. } => 238,
+            DiagnosticKind::AbstractEventWithAccessors { .. } => 8712,
             DiagnosticKind::ProtectedMemberInStruct { .. } => 666,
             DiagnosticKind::MemberNamedLikeType { .. } => 542,
             DiagnosticKind::StaticConstructorHasParameters { .. } => 132,
@@ -1780,12 +1804,18 @@ impl DiagnosticKind {
             DiagnosticKind::VoidLocal => 1547,
             DiagnosticKind::SwitchGoverningType => 151,
             DiagnosticKind::FieldInitializerReference { .. } => 236,
+            DiagnosticKind::RequiredAfterOptionalParameter => 1737,
+            DiagnosticKind::ByRefParameterWithDefault => 1741,
+            DiagnosticKind::ParamsParameterWithDefault => 1751,
+            DiagnosticKind::DefaultValueNotConstant { .. } => 1736,
+            DiagnosticKind::DefaultValueWrongType { .. } => 1750,
             DiagnosticKind::ParamsNotLast => 231,
             DiagnosticKind::ParamsNotArray => 225,
             DiagnosticKind::InconsistentAccessibility { position, .. } => position.code(),
             DiagnosticKind::ConstFieldRequiresValue => 145,
             DiagnosticKind::InterfaceCannotContainInstanceField => 525,
             DiagnosticKind::ReadonlyAssignment { .. } => 191,
+            DiagnosticKind::InitOnlyAssignment { .. } => 8852,
             DiagnosticKind::PropertyCannotBeAssigned { .. } => 200,
             DiagnosticKind::MemberNotFoundOnExpression { .. } => 1061,
             DiagnosticKind::NotACollectionInitializerTarget { .. } => 1922,
@@ -2207,6 +2237,10 @@ impl fmt::Display for DiagnosticKind {
                 "Cannot convert method group '{method}' to non-delegate type '{target}'"
             ),
             DiagnosticKind::ConstantExpected => write!(f, "A constant value is expected"),
+            DiagnosticKind::InvalidExpressionTerm { term } => {
+                write!(f, "Invalid expression term '{term}'")
+            }
+            DiagnosticKind::ExpressionHasNoName => write!(f, "Expression does not have a name."),
             DiagnosticKind::DuplicateCaseLabel { label } => write!(
                 f,
                 "The label '{label}:' already occurs in this switch statement"
@@ -2395,6 +2429,10 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "'{member}' cannot declare a body because it is marked abstract"
             ),
+            DiagnosticKind::AbstractEventWithAccessors { member } => write!(
+                f,
+                "'{member}': abstract event cannot use event accessor syntax"
+            ),
             DiagnosticKind::AutoPropertyMustHaveGetAccessor => {
                 write!(f, "Auto-implemented properties must have get accessors.")
             }
@@ -2481,6 +2519,23 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "A field initializer cannot reference the non-static field, method, or property '{member}'"
             ),
+            DiagnosticKind::RequiredAfterOptionalParameter => {
+                f.write_str("Optional parameters must appear after all required parameters")
+            }
+            DiagnosticKind::ByRefParameterWithDefault => {
+                f.write_str("A ref or out parameter cannot have a default value")
+            }
+            DiagnosticKind::ParamsParameterWithDefault => {
+                f.write_str("Cannot specify a default value for a parameter collection")
+            }
+            DiagnosticKind::DefaultValueNotConstant { parameter } => write!(
+                f,
+                "Default parameter value for '{parameter}' must be a compile-time constant"
+            ),
+            DiagnosticKind::DefaultValueWrongType { from, to } => write!(
+                f,
+                "A value of type '{from}' cannot be used as a default parameter because there are no standard conversions to type '{to}'"
+            ),
             DiagnosticKind::ParamsNotLast => write!(
                 f,
                 "A params parameter must be the last parameter in a parameter list"
@@ -2507,6 +2562,10 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::ReadonlyAssignment { field } => write!(
                 f,
                 "A readonly field '{field}' cannot be assigned to (except in a constructor)"
+            ),
+            DiagnosticKind::InitOnlyAssignment { property } => write!(
+                f,
+                "Init-only property or indexer '{property}' can only be assigned in an object                  initializer, or on 'this' or 'base' in an instance constructor or an 'init'                  accessor."
             ),
             DiagnosticKind::PropertyCannotBeAssigned { property } => write!(
                 f,

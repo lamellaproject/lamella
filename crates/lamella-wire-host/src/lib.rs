@@ -359,6 +359,39 @@ pub fn parse_usb_target(target: &str) -> (u16, u16, Option<String>) {
     (vid, pid, serial)
 }
 
+/// The target string that names `board` -- **what to hand [`open_target`] to reach this exact
+/// device**, and the answer a listing should print.
+///
+/// **THE GRAMMAR IS NOT PART OF THIS PROMISE.** The contract is only that what comes out of here
+/// goes back into [`open_target`] and reaches the same board; the spelling stays private to this
+/// crate, so it can gain a field (a hub, a port) without moving every caller. A public
+/// `format(vid, pid, serial)` would have promised the shape instead of the property.
+///
+/// It exists so the string has ONE writer. Spelled at each call site instead, a format with
+/// several writers and one private reader cannot be round-trip tested by any of them -- and the
+/// drift that ends with a listing showing a target nothing can open is silent until somebody
+/// pastes one in.
+#[cfg(feature = "usb")]
+#[must_use]
+pub fn usb_target_of(board: &lamella_usbbulk::DeviceInfo) -> String {
+    format_usb_target(board.vendor_id, board.product_id, board.serial_number.as_deref())
+}
+
+/// The private spelling of a usb target, and the inverse of [`parse_usb_target`]: the full id-pair
+/// form, so it round-trips whatever the ids are.
+///
+/// Not public: see [`usb_target_of`]. The four-digit padding is load-bearing -- a `{:x}` printer
+/// turns `(0x39e9, 0x0001)` into `usb:39e9:1`, which parses back as the DEFAULT pid with the SERIAL
+/// `39e9`, because a single token is always read as a serial. That is not an error anywhere; it is
+/// a target that opens a different board.
+#[cfg(feature = "usb")]
+fn format_usb_target(vid: u16, pid: u16, serial: Option<&str>) -> String {
+    match serial {
+        Some(serial) => format!("usb:{vid:04x}:{pid:04x}:{serial}"),
+        None => format!("usb:{vid:04x}:{pid:04x}"),
+    }
+}
+
 #[cfg(feature = "usb")]
 impl Transport for UsbTransport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
@@ -945,8 +978,13 @@ pub fn deploy_chunked_blocking(
 /// than the target asks for.
 pub const BUNDLE_CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 4) * 4;
 
-/// Host driver, blocking: run a BUNDLE from the target's RAM now, without persisting it -- the
-/// bundle counterpart of [`eval_image_blocking`].
+/// Host driver: send a BUNDLE for the target to run from RAM now, without persisting it -- the
+/// bundle counterpart of [`lamella_runner::send_program`], and the SEND HALF on its own.
+///
+/// **THE REPLY IS A [`lamella_runner::repl::RUN_RESULT`], COLLECTED WITH
+/// [`lamella_runner::try_recv_result`]** -- the same poll a program run uses, because the target
+/// answers both the same way. So a caller that cannot block has every piece it needs and no
+/// waiting policy is imposed here.
 ///
 /// A bundle is an artifact the target loads through a front end rather than a baked CIL image (a
 /// `.lpyc` Python bundle today), so this is the path a `.lpyc` takes and a baked image never does.
@@ -967,18 +1005,36 @@ pub const BUNDLE_CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 4) * 4;
 /// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
 /// on timeout; otherwise a carrier [`TransportError`].
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn send_run_bundle(
+    transport: &mut impl Transport,
+    seq: u16,
+    bundle: &[u8],
+) -> Result<(), TransportError> {
+    transport.send(lamella_runner::bundle::RUN_BUNDLE, seq, bundle)
+}
+
+/// Host driver, blocking: [`send_run_bundle`] and wait for the result.
+///
+/// **A CONVENIENCE OVER THE TWO HALVES ABOVE, NOT THE CONTRACT.** A host with an event loop, a
+/// cancel button or an agent behind it drives `send_run_bundle` + [`lamella_runner::try_recv_result`]
+/// itself and owns its own waiting; nothing here needs a thread.
+///
+/// # Errors
+/// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
+/// on timeout; otherwise a carrier [`TransportError`].
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn run_bundle_blocking(
     transport: &mut impl Transport,
     seq: u16,
     bundle: &[u8],
     timeout: Duration,
 ) -> Result<RunResult, TransportError> {
-    transport.send(lamella_runner::bundle::RUN_BUNDLE, seq, bundle)?;
+    send_run_bundle(transport, seq, bundle)?;
     await_result(transport, seq, timeout)
 }
 
-/// Host driver, blocking: persist a BUNDLE to the target's deploy region so it boots on reset --
-/// the bundle counterpart of [`deploy_chunked_blocking`]. Returns whether every chunk was accepted.
+/// **DEPLOYING a BUNDLE: the protocol, stated once.** A bundle persists to the target's deploy
+/// region so it boots on reset -- the bundle counterpart of `deploy_chunked_blocking`.
 ///
 /// **GATE ON [`lamella_wire::Capabilities::BUNDLE`]**, as for [`run_bundle_blocking`].
 ///
@@ -987,14 +1043,115 @@ pub fn run_bundle_blocking(
 /// small bundle to keep the artifact kind on EVERY frame, so an interrupted transfer cannot be
 /// misread as a partial baked image. **A bundle NEVER travels under `DEPLOY_CHUNK`.**
 ///
-/// `chunk_len` is clamped to [`BUNDLE_CHUNK_DATA_CAP`] and rounded DOWN to a 4-byte word, because
-/// the target refuses an unaligned offset; a caller may pass the bundle's whole length to send it in
-/// one frame.
+/// The chunk plan for a bundle deploy: **pure arithmetic, no I/O, no waiting.**
 ///
-/// **An EMPTY bundle CLEARS the deploy region**, mirroring `deploy_blocking`'s empty-image clear.
-/// One frame still goes out (`offset = 0, total = 0`): the target erases the header and commits a
-/// zero length, which is how it records "nothing deployed". Returning `Ok(true)` without sending
-/// would report a clear that never happened.
+/// Every rule that decides what goes on the wire lives here and nowhere else: the clamp, the word
+/// rounding, and the single frame an EMPTY bundle is still due. A host that drives its own event loop
+/// iterates this and sends each chunk when it likes; [`deploy_bundle_blocking`] is one caller of it,
+/// not the definition of the protocol.
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub struct BundleChunks<'a> {
+    bundle: &'a [u8],
+    chunk_len: usize,
+    offset: usize,
+    done: bool,
+}
+
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+impl<'a> BundleChunks<'a> {
+    /// Plan `bundle` into frames of at most `chunk_len` payload bytes.
+    ///
+    /// `chunk_len` is clamped to [`BUNDLE_CHUNK_DATA_CAP`] and rounded DOWN to a 4-byte word, and
+    /// floored at one word: the target refuses an unaligned offset, an over-long payload aborts the
+    /// deploy rather than short-writing it, and a zero would never advance. Rounding down rather
+    /// than refusing keeps the obvious "send it in one frame" call -- passing the bundle's own
+    /// length -- working on an odd-sized bundle.
+    #[must_use]
+    pub fn new(bundle: &'a [u8], chunk_len: usize) -> Self {
+        Self {
+            bundle,
+            chunk_len: (chunk_len.min(BUNDLE_CHUNK_DATA_CAP) / 4 * 4).max(4),
+            offset: 0,
+            done: false,
+        }
+    }
+
+    /// The next frame payload -- `[offset u32][total u32][bytes]` -- or `None` when the bundle is
+    /// fully planned.
+    ///
+    /// **An EMPTY bundle yields exactly ONE frame** (`offset = 0, total = 0`), mirroring
+    /// `deploy_blocking`'s empty-image clear: the target erases the header and commits a zero
+    /// length, which is how it records "nothing deployed". Yielding nothing would report a clear
+    /// that never happened.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Vec<u8>> {
+        if self.done {
+            return None;
+        }
+        let end = (self.offset + self.chunk_len).min(self.bundle.len());
+        let total = self.bundle.len() as u32;
+        let mut payload = Vec::with_capacity(8 + (end - self.offset));
+        payload.extend_from_slice(&(self.offset as u32).to_le_bytes());
+        payload.extend_from_slice(&total.to_le_bytes());
+        payload.extend_from_slice(&self.bundle[self.offset..end]);
+        self.offset = end;
+        self.done = self.offset >= self.bundle.len();
+        Some(payload)
+    }
+}
+
+/// Host driver: put one planned chunk on the wire. The ack is the caller's to collect.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn send_bundle_chunk(
+    transport: &mut impl Transport,
+    seq: u16,
+    chunk: &[u8],
+) -> Result<(), TransportError> {
+    transport.send(lamella_runner::bundle::DEPLOY_BUNDLE, seq, chunk)
+}
+
+/// Host driver: poll for one chunk's `DEPLOY_RESULT` (non-blocking; `Ok(None)` if it is not in yet).
+///
+/// `Ok(Some(true))` accepted, `Ok(Some(false))` the target REJECTED that chunk. Following
+/// [`lamella_runner::try_recv_result`]'s rule, `Ok(None)` means one thing only -- nothing has
+/// arrived -- so a refusal comes back as [`TransportError::Refused`] rather than as a caller
+/// polling a healthy link to its deadline and blaming the cable.
+///
+/// # Errors
+/// [`TransportError::Refused`] when the target answered `ERROR` for this sequence; otherwise a
+/// carrier [`TransportError`].
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub fn try_recv_bundle_ack(
+    transport: &mut impl Transport,
+    seq: u16,
+) -> Result<Option<bool>, TransportError> {
+    use lamella_wire::{Frame, msg};
+    while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
+        if reply_seq != seq {
+            continue;
+        }
+        if msg_type == deploy::DEPLOY_RESULT {
+            return Ok(Some(payload.first().copied().unwrap_or(0) == 1));
+        }
+        if msg_type == msg::ERROR {
+            return Err(TransportError::Refused {
+                reason: payload.first().copied().unwrap_or(0),
+                msg_type: payload.get(1).copied().unwrap_or(0),
+            });
+        }
+    }
+    Ok(None)
+}
+
+/// Host driver, blocking: send every chunk and wait for each ack. Returns whether every chunk was
+/// accepted.
+///
+/// **A CONVENIENCE OVER [`BundleChunks`], [`send_bundle_chunk`] AND [`try_recv_bundle_ack`], NOT THE
+/// CONTRACT.** The protocol is those three; this is the one waiting policy that suits a CLI. A host
+/// with an event loop drives the same three and never blocks.
 ///
 /// # Errors
 /// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
@@ -1007,35 +1164,15 @@ pub fn deploy_bundle_blocking(
     chunk_len: usize,
     timeout: Duration,
 ) -> Result<bool, TransportError> {
-    use lamella_wire::{Frame, msg};
-    let chunk_len = (chunk_len.min(BUNDLE_CHUNK_DATA_CAP) / 4 * 4).max(4);
-    let total = bundle.len() as u32;
-    let mut offset = 0usize;
-    loop {
-        let end = (offset + chunk_len).min(bundle.len());
-        let mut payload = Vec::with_capacity(8 + (end - offset));
-        payload.extend_from_slice(&(offset as u32).to_le_bytes());
-        payload.extend_from_slice(&total.to_le_bytes());
-        payload.extend_from_slice(&bundle[offset..end]);
-        transport.send(lamella_runner::bundle::DEPLOY_BUNDLE, seq, &payload)?;
-
+    let mut chunks = BundleChunks::new(bundle, chunk_len);
+    while let Some(chunk) = chunks.next() {
+        send_bundle_chunk(transport, seq, &chunk)?;
         let deadline = Instant::now() + timeout;
         let mut acked = None;
-        'wait: while Instant::now() < deadline {
-            while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-                if reply_seq != seq {
-                    continue;
-                }
-                if msg_type == deploy::DEPLOY_RESULT {
-                    acked = Some(payload.first().copied().unwrap_or(0) == 1);
-                    break 'wait;
-                }
-                if msg_type == msg::ERROR {
-                    return Err(TransportError::Refused {
-                        reason: payload.first().copied().unwrap_or(0),
-                        msg_type: payload.get(1).copied().unwrap_or(0),
-                    });
-                }
+        while Instant::now() < deadline {
+            if let Some(ack) = try_recv_bundle_ack(transport, seq)? {
+                acked = Some(ack);
+                break;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -1044,11 +1181,8 @@ pub fn deploy_bundle_blocking(
             Some(false) => return Ok(false),
             None => return Err(TransportError::Closed),
         }
-        offset = end;
-        if offset >= bundle.len() {
-            return Ok(true);
-        }
     }
+    Ok(true)
 }
 
 /// Host driver, blocking: query the deployed image's content checksum -- `Some(checksum)` if the

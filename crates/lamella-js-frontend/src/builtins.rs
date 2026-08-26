@@ -3950,6 +3950,19 @@ fn is_trimmable(unit: u16) -> bool {
 /// gives `ς`. The condition is defined over the `Cased` and `Case_Ignorable` properties, which live
 /// in the shared Unicode home this crate deliberately does not widen on its own -- the same
 /// decision `non-ascii-identifiers` records. Every UNCONDITIONAL mapping is applied.
+///
+/// # WARNING: THE MAPPINGS COME FROM THE COMPILER AND NOT FROM A PINNED TABLE
+///
+/// The paragraph above discusses which Unicode data this crate may widen, and the mapping applied
+/// below is not that data at all: `char::to_uppercase` and `char::to_lowercase` are Rust standard
+/// library methods, so the version answering `"ß".toUpperCase()` is **the one the compiling
+/// toolchain happens to ship**. Nobody selected it, and it is a different pin from the one this
+/// crate's identifier alphabet reads.
+///
+/// It is a SOURCING gap and not a wiring mistake: the shared home publishes the case PROPERTIES
+/// (`is_uppercase`, `is_lowercase`, `is_cased`) and the fold tables, and **no case MAPPING data at
+/// all**, so there is no pinned table to read instead. Until there is one, the correct statement
+/// about this function is that its mappings track the toolchain.
 fn change_case(interpreter: &mut Interpreter, this: &JsValue, upper: bool) -> Completion {
     let text = match coerce_to_string(interpreter, this) {
         Ok(text) => text,
@@ -5066,7 +5079,8 @@ pub(crate) fn merge_descriptor(
     Property { kind, enumerable, configurable }
 }
 
-/// `ToPropertyDescriptor` (ECMA-262 6.2.6.5): reads a descriptor OBJECT into the fields it supplies.
+/// `ToPropertyDescriptor` (ECMA-262 17th ed, 6.2.6.5): reads a descriptor OBJECT into the fields it
+/// supplies.
 ///
 /// # THREE THINGS THIS FIXED, EACH INVISIBLE UNTIL A PROGRAM DEPENDED ON IT
 ///

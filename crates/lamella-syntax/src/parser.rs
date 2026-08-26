@@ -4,9 +4,11 @@ use crate::ast::{
     Accessor, AssignmentOperator, Attribute, AttributeArgument, AttributeSection, BinaryOperator,
     CatchClause, CompilationUnit, ConstructorInitializer, ConstructorInitializerKind,
     ConversionDirection, DelegateDecl, EnumDecl, EnumMember, Expr, ExprKind, ForInitializer,
-    GotoTarget, Initializer, Literal, Member, MemberInitializer, MemberInitializerValue, Modifier,
+    GotoTarget, Initializer, InterpolationPart, Literal, Member, MemberInitializer,
+    MemberInitializerValue, Modifier,
     NamespaceDecl, NamespaceMember, OverloadableOperator,
-    Parameter, ParameterModifier, PostfixOperator, PredefinedType, QualifiedName, Stmt, StmtKind,
+    Parameter, ParameterModifier, PostfixOperator, PredefinedType, QualifiedName, RecordParts,
+    Stmt, StmtKind,
     SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeParameter, TypeParameterConstraint,
     TypeNamePart, TypeParameterConstraintClause, TypeRef, TypeRefKind,
     TypeTestOperation,
@@ -15,7 +17,7 @@ use crate::ast::{
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::lexer::{LexOptions, Tokenized, tokenize, tokenize_with};
 use crate::span::Span;
-use crate::version::{Feature, LanguageVersion};
+use crate::version::{Feature, FeatureGate, LanguageVersion};
 use crate::token::{Keyword, Punctuator, Token, TokenKind, TypedRefKeyword};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
@@ -1203,16 +1205,7 @@ impl Parser {
         let start = self.current().span.start;
         self.bump();
         if self.current_keyword() == Some(Keyword::Static) {
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: crate::version::Feature::UsingStatic.description(),
-                    required: crate::version::Feature::UsingStatic
-                        .introduced_in()
-                        .required_name(),
-                            current: self.version,
-                },
-                Span::empty_at(self.current().span.start),
-            );
+            self.gate_feature_here(Feature::UsingStatic);
             self.bump();
         }
         let kind = if matches!(self.current().kind, TokenKind::Identifier(_))
@@ -1389,6 +1382,9 @@ impl Parser {
         modifiers: Vec<Modifier>,
         start: u32,
     ) -> NamespaceMember {
+        if self.record_declaration_here() {
+            return NamespaceMember::Type(self.parse_record(attributes, modifiers, start));
+        }
         match self.current_keyword() {
             Some(Keyword::Enum) => {
                 NamespaceMember::Enum(self.parse_enum(attributes, modifiers, start))
@@ -1400,6 +1396,38 @@ impl Parser {
                 self.parse_class_struct_interface(attributes, modifiers, start),
             ),
         }
+    }
+
+    /// Parses a `record` declaration (C# 9) -- the same shape as a class, plus an optional
+    /// positional parameter list, an optional argument list on its base, and a `;` body.
+    ///
+    /// It shares [`Parser::parse_class_struct_interface`] rather than copying it, because a record
+    /// IS a class declaration in every respect the two have in common: modifiers, type parameters,
+    /// a base list, constraint clauses and members. A separate parser would be a second
+    /// implementation of all of that, and the next member kind would be added to one of them.
+    fn parse_record(
+        &mut self,
+        attributes: Vec<AttributeSection>,
+        modifiers: Vec<Modifier>,
+        start: u32,
+    ) -> TypeDecl {
+        let keyword_span = self.current().span;
+        self.bump();
+        self.gate_feature(Feature::Records, keyword_span);
+        if matches!(
+            self.current_keyword(),
+            Some(Keyword::Class) | Some(Keyword::Struct)
+        ) {
+            let end = self.current().span.end;
+            self.gate_feature(
+                Feature::RecordStructs,
+                Span::new(keyword_span.start, end),
+            );
+        }
+        let mut declaration =
+            self.parse_class_struct_interface_inner(attributes, modifiers, start, Some(keyword_span));
+        synthesize_record_members(&mut declaration);
+        declaration
     }
 
     /// Parses an `enum` declaration (21): the kind keyword, a name, an optional
@@ -1565,15 +1593,8 @@ impl Parser {
         start: u32,
         named: bool,
     ) -> NamespaceDecl {
-        if named && !self.version.supports(Feature::FileScopedNamespaces) {
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: Feature::FileScopedNamespaces.description(),
-                    required: Feature::FileScopedNamespaces.introduced_in().required_name(),
-                    current: self.version,
-                },
-                keyword,
-            );
+        if named {
+            self.gate_feature(Feature::FileScopedNamespaces, keyword);
         }
         match container {
             _ if !named => {}
@@ -1619,19 +1640,40 @@ impl Parser {
         modifiers: Vec<Modifier>,
         start: u32,
     ) -> TypeDecl {
+        self.parse_class_struct_interface_inner(attributes, modifiers, start, None)
+    }
+
+    /// The body of [`Parser::parse_class_struct_interface`], shared with [`Parser::parse_record`].
+    ///
+    /// `record_keyword` is `Some(span)` when the contextual `record` has already been consumed,
+    /// and it changes exactly four things -- the kind keyword becomes OPTIONAL (`record R` is a
+    /// class), a positional parameter list may follow the name, the FIRST base may carry an
+    /// argument list, and `;` is a legal body. Everything else is the same grammar, which is why
+    /// this is one function: a copy would be a second place to add the next member kind to.
+    fn parse_class_struct_interface_inner(
+        &mut self,
+        attributes: Vec<AttributeSection>,
+        modifiers: Vec<Modifier>,
+        start: u32,
+        record_keyword: Option<Span>,
+    ) -> TypeDecl {
+        let mut keyword_form = false;
         let kind = match self.current_keyword() {
             Some(Keyword::Class) => {
                 self.bump();
+                keyword_form = true;
                 TypeKind::Class
             }
             Some(Keyword::Struct) => {
                 self.bump();
+                keyword_form = true;
                 TypeKind::Struct
             }
             Some(Keyword::Interface) => {
                 self.bump();
                 TypeKind::Interface
             }
+            _ if record_keyword.is_some() => TypeKind::Class,
             _ => {
                 let at = self.current().span.start;
                 self.report(DiagnosticKind::TypeDeclarationExpected, Span::empty_at(at));
@@ -1640,9 +1682,24 @@ impl Parser {
         };
         let (name, _) = self.expect_identifier();
         let type_parameters = self.parse_type_parameter_list();
+        let parameters = if record_keyword.is_some()
+            && self.current_punctuator() == Some(Punctuator::OpenParen)
+        {
+            Some(self.parse_parameter_list().0)
+        } else {
+            None
+        };
+        let mut base_arguments = None;
         let bases = if self.eat(Punctuator::Colon) {
             let mut bases = Vec::new();
             bases.push(self.parse_type());
+            if record_keyword.is_some() && self.current_punctuator() == Some(Punctuator::OpenParen)
+            {
+                self.bump();
+                let (arguments, _) = self
+                    .parse_arguments(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                base_arguments = Some(arguments);
+            }
             while self.eat(Punctuator::Comma) {
                 bases.push(self.parse_type());
             }
@@ -1651,18 +1708,31 @@ impl Parser {
             Vec::new()
         };
         let constraints = self.parse_type_parameter_constraint_clauses();
-        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
         let mut members = Vec::new();
-        while self.current_punctuator() != Some(Punctuator::CloseBrace)
-            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        let end = if record_keyword.is_some()
+            && self.current_punctuator() == Some(Punctuator::Semicolon)
         {
-            let before = self.position;
-            members.push(self.parse_member());
-            if self.position == before {
+            let end = self.current().span.end;
+            self.bump();
+            end
+        } else {
+            self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+            while self.current_punctuator() != Some(Punctuator::CloseBrace)
+                && !matches!(self.current().kind, TokenKind::EndOfFile)
+            {
+                let before = self.position;
+                members.push(self.parse_member());
+                if self.position == before {
+                    self.bump();
+                }
+            }
+            let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+            if record_keyword.is_some() && self.current_punctuator() == Some(Punctuator::Semicolon)
+            {
                 self.bump();
             }
-        }
-        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+            end
+        };
         TypeDecl {
             attributes,
             modifiers,
@@ -1672,6 +1742,12 @@ impl Parser {
             bases,
             constraints,
             members,
+            record: record_keyword.map(|keyword_span| RecordParts {
+                parameters,
+                base_arguments,
+                keyword_form,
+                keyword_span,
+            }),
             span: Span::new(start, end),
         }
     }
@@ -1748,6 +1824,37 @@ impl Parser {
     ///
     /// `@partial` is never a modifier: the verbatim prefix forces the ordinary identifier (9.4.2),
     /// which [`Parser::current_contextual_keyword`] already enforces for every contextual keyword.
+    /// Whether a RECORD declaration begins at the current position (C# 9): the contextual keyword
+    /// `record`, then an identifier or the `class`/`struct` keyword.
+    ///
+    /// **THE TEST IS UNCONDITIONAL, AND THAT IS MEASURED RATHER THAN ASSUMED -- IT IS NOT HOW THE
+    /// OTHER CONTEXTUAL KEYWORDS IN THIS FILE BEHAVE.** `partial`, `async` and `required` each
+    /// need a lookahead because the identifier may be naming a type; `record` does not, because
+    /// csc takes the declaration whatever else is in scope. Three rows measured, one compilation
+    /// each, with a `class record { }` declared beside them:
+    ///
+    /// | source | csc |
+    /// |---|---|
+    /// | `class C { record x; }` | a nested private RECORD named `x`, plus `CS8860` on the class |
+    /// | `class C { record x = null; }` | `CS1514 { expected` -- a record, then a stray `=` |
+    /// | `class C { record M() { return null; } }` | `CS1519` -- a POSITIONAL record `M`, then `return` |
+    ///
+    /// The second and third rows are the ones that settle it: both are unambiguous field and
+    /// method shapes, both are stolen by the record grammar anyway. A parser that disambiguated
+    /// against a field would accept two programs csc rejects.
+    ///
+    /// `@record` is never this: [`Parser::current_contextual_keyword`] answers `None` for a
+    /// verbatim identifier, and csc agrees -- `public @record R(int X);` is `CS0106`, a METHOD `R`
+    /// returning a type called `record`.
+    fn record_declaration_here(&self) -> bool {
+        matches!(self.current_contextual_keyword(), Some("record"))
+            && matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Identifier(_))
+                    | Some(TokenKind::Keyword(Keyword::Class | Keyword::Struct))
+            )
+    }
+
     fn partial_is_a_modifier_here(&self) -> bool {
         matches!(self.current_contextual_keyword(), Some("partial"))
             && matches!(
@@ -1827,31 +1934,13 @@ impl Parser {
             let modifier = match self.current_keyword().and_then(modifier_of) {
                 Some(modifier) => modifier,
                 None if self.required_is_a_modifier_here() => {
-                    if !self.version.supports(Feature::RequiredMembers) {
-                        self.report(
-                            DiagnosticKind::FeatureRequiresLaterVersion {
-                                feature: Feature::RequiredMembers.description(),
-                                required: Feature::RequiredMembers
-                                    .introduced_in()
-                                    .required_name(),
-                                current: self.version,
-                            },
-                            self.current().span,
-                        );
-                    }
+                    let at = self.current().span;
+                    self.gate_feature(Feature::RequiredMembers, at);
                     Modifier::Required
                 }
                 None if self.partial_is_a_modifier_here() => {
-                    if !self.version.supports(Feature::PartialTypes) {
-                        self.report(
-                            DiagnosticKind::FeatureRequiresLaterVersion {
-                                feature: Feature::PartialTypes.description(),
-                                required: Feature::PartialTypes.introduced_in().required_name(),
-                                current: self.version,
-                            },
-                            self.current().span,
-                        );
-                    }
+                    let at = self.current().span;
+                    self.gate_feature(Feature::PartialTypes, at);
                     Modifier::Partial
                 }
                 None if self.partial_is_misplaced_here() => {
@@ -1859,16 +1948,8 @@ impl Parser {
                     Modifier::Partial
                 }
                 None if self.async_is_a_modifier_here() => {
-                    if !self.version.supports(Feature::AsyncFunction) {
-                        self.report(
-                            DiagnosticKind::FeatureRequiresLaterVersion {
-                                feature: Feature::AsyncFunction.description(),
-                                required: Feature::AsyncFunction.introduced_in().required_name(),
-                                current: self.version,
-                            },
-                            self.current().span,
-                        );
-                    }
+                    let at = self.current().span;
+                    self.gate_feature(Feature::AsyncFunction, at);
                     Modifier::Async
                 }
                 None => break,
@@ -1896,14 +1977,16 @@ impl Parser {
         let start = self.current().span.start;
         let attributes = self.parse_attribute_sections();
         let modifiers = self.parse_modifiers();
-        if matches!(
-            self.current_keyword(),
-            Some(Keyword::Class)
-                | Some(Keyword::Struct)
-                | Some(Keyword::Interface)
-                | Some(Keyword::Enum)
-                | Some(Keyword::Delegate)
-        ) {
+        if self.record_declaration_here()
+            || matches!(
+                self.current_keyword(),
+                Some(Keyword::Class)
+                    | Some(Keyword::Struct)
+                    | Some(Keyword::Interface)
+                    | Some(Keyword::Enum)
+                    | Some(Keyword::Delegate)
+            )
+        {
             return Member::NestedType(Box::new(
                 self.parse_type_kind_declaration(attributes, modifiers, start),
             ));
@@ -1980,6 +2063,10 @@ impl Parser {
                 let block = self.parse_block();
                 let end = block.span.end;
                 (Some(block), end)
+            } else if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+                let (block, end) =
+                    self.parse_expression_body(Feature::ExpressionBodiedMethod, !Self::type_is_void(&ty));
+                (Some(block), end)
             } else {
                 if self.in_async_method {
                     self.report(DiagnosticKind::AsyncRequiresBody, name_span);
@@ -2043,7 +2130,9 @@ impl Parser {
             };
             let explicit_interface =
                 TypeRef::new(interface_kind, Span::new(name_start, interface_end));
-            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+            if self.current_punctuator() == Some(Punctuator::OpenBrace)
+                || self.current_punctuator() == Some(Punctuator::EqualsGreaterThan)
+            {
                 return self
                     .parse_property(modifiers, ty, member, Some(explicit_interface), start);
             }
@@ -2079,7 +2168,8 @@ impl Parser {
             };
         }
         if matches!(self.current().kind, TokenKind::Identifier(_))
-            && self.next_is(Punctuator::OpenBrace)
+            && (self.next_is(Punctuator::OpenBrace)
+                || self.next_is(Punctuator::EqualsGreaterThan))
         {
             let (name, _) = self.expect_identifier();
             return self.parse_property(modifiers, ty, name, None, start);
@@ -2132,6 +2222,82 @@ impl Parser {
     /// the `get` and `set` accessors and the byte offset past the closing `}`.
     /// `get` and `set` are contextual identifiers, not keywords, matched by
     /// spelling. Each accessor has a block body or a bare `;`.
+    /// Parses an expression body -- `=> expression ;` -- where a member's `{ ... }` block or `;`
+    /// would go, and returns it DESUGARED into the block it means (17.6.2, C# 6.0).
+    ///
+    /// **A DESUGAR RATHER THAN AN AST NODE, AND THAT IS THE WHOLE REASON THIS FEATURE IS CHEAP.**
+    /// `int M() => e;` is `int M() { return e; }` and nothing downstream needs to know the
+    /// difference: the binder, the flow analysis and the emitter see the block they already
+    /// handle. A node would have meant a new case in every one of them.
+    ///
+    /// `returns_value` decides which statement the block holds: a member with a value returns it,
+    /// and a `void` method or a `set`/`add`/`remove` accessor evaluates the expression as a
+    /// statement. Getting that backwards is not cosmetic -- `return e;` in a void method is
+    /// `CS0127`, and a bare `e;` in a value-returning one is `CS0161`.
+    ///
+    /// `feature` names the member kind, because csc's message does: *'expression-bodied method'*
+    /// and *'expression-bodied property'* are different search keys at the same version.
+    fn parse_expression_body(&mut self, feature: Feature, returns_value: bool) -> (Stmt, u32) {
+        let arrow = self.current().span;
+        self.gate_feature(feature, arrow);
+        self.bump();
+        let expression = self.parse_expression();
+        let expression_span = expression.span;
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        let inner = if returns_value {
+            Stmt::new(StmtKind::Return(Some(expression)), expression_span)
+        } else {
+            Stmt::new(StmtKind::Expression(expression), expression_span)
+        };
+        let span = Span::new(arrow.start, end);
+        (Stmt::new(StmtKind::Block(alloc::vec![inner]), span), end)
+    }
+
+    /// Reports that `feature` needs a later dialect than the one being compiled, and says nothing
+    /// when the dialect already has it. One place, because the message carries the feature's csc
+    /// NAME and its introducing version together and a caller that assembled them itself could
+    /// pair the right name with the wrong version.
+    /// Refuses `feature` at `at` unless this compilation can admit it, and says WHICH of the two
+    /// bits refused it.
+    ///
+    /// **THE ONLY PLACE IN THE PARSER THAT RAISES A FEATURE GATE.** The decision itself is
+    /// [`Feature::gate_against`]'s, shared with the binder's `gate_feature`, so the two halves of
+    /// the compiler cannot drift into two answers.
+    ///
+    fn gate_feature(&mut self, feature: Feature, at: Span) {
+        let kind = match feature.gate_against(self.version) {
+            None => return,
+            Some(FeatureGate::RequiresLaterVersion { required }) => {
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: feature.description(),
+                    required,
+                    current: self.version,
+                }
+            }
+            Some(FeatureGate::NotInThisBuild) => DiagnosticKind::FeatureNotInThisBuild {
+                feature: feature.description(),
+                permitted_by: self.version,
+            },
+        };
+        self.report(kind, at);
+    }
+
+    /// [`Self::gate_feature`] at the current token's start, as an empty span.
+    ///
+    /// The position most gate sites want: csc reports a feature gate at the construct's first
+    /// character rather than over its extent.
+    fn gate_feature_here(&mut self, feature: Feature) {
+        let at = Span::empty_at(self.current().span.start);
+        self.gate_feature(feature, at);
+    }
+
+    /// Whether a syntactic return type is `void`, which decides whether an expression body
+    /// returns its expression or evaluates it. Syntactic on purpose: the parser has no model, and
+    /// `void` is a keyword rather than a name, so there is nothing to resolve.
+    fn type_is_void(ty: &TypeRef) -> bool {
+        matches!(&ty.kind, TypeRefKind::Predefined(PredefinedType::Void))
+    }
+
     fn parse_accessor_block(&mut self) -> (Option<Accessor>, Option<Accessor>, u32) {
         self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
         let mut getter = None;
@@ -2155,15 +2321,24 @@ impl Parser {
                 modifiers.push(modifier);
                 self.bump();
             }
-            let is_getter = match self.current_contextual_keyword() {
-                Some("get") => true,
-                Some("set") => false,
+            let accessor_keyword_span = self.current().span;
+            let (is_getter, is_init) = match self.current_contextual_keyword() {
+                Some("get") => (true, false),
+                Some("set") => (false, false),
+                Some("init") => (false, true),
                 _ => break,
             };
+            if is_init {
+                self.gate_feature(Feature::InitOnlySetters, accessor_keyword_span);
+            }
             self.bump();
             let (body, accessor_end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
                 let end = block.span.end;
+                (Some(block), end)
+            } else if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+                let (block, end) =
+                    self.parse_expression_body(Feature::ExpressionBodiedAccessor, is_getter);
                 (Some(block), end)
             } else {
                 let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
@@ -2173,9 +2348,13 @@ impl Parser {
                 attributes,
                 modifiers,
                 body,
+                is_init,
                 span: Span::new(accessor_start, accessor_end),
             };
-            if is_getter {
+            let already = if is_getter { getter.is_some() } else { setter.is_some() };
+            if already {
+                self.report(DiagnosticKind::DuplicateAccessor, accessor_keyword_span);
+            } else if is_getter {
                 getter = Some(accessor);
             } else {
                 setter = Some(accessor);
@@ -2195,7 +2374,27 @@ impl Parser {
         explicit_interface: Option<TypeRef>,
         start: u32,
     ) -> Member {
-        let (getter, setter, end) = self.parse_accessor_block();
+        let (getter, setter, end) =
+            if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+                let accessor_start = self.current().span.start;
+                let (block, end) =
+                    self.parse_expression_body(Feature::ExpressionBodiedProperty, true);
+                let getter = Accessor {
+                    attributes: Vec::new(),
+                    modifiers: Vec::new(),
+                    body: Some(block),
+                    is_init: false,
+                    span: Span::new(accessor_start, end),
+                };
+                (Some(getter), None, end)
+            } else {
+                self.parse_accessor_block()
+            };
+        if let Some(accessor) = &setter {
+            if accessor.is_init && modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
+                self.report(DiagnosticKind::InitAccessorOnStaticMember, accessor.span);
+            }
+        }
         Member::Property {
             modifiers,
             ty,
@@ -2301,6 +2500,7 @@ impl Parser {
                 attributes,
                 modifiers: Vec::new(),
                 body,
+                is_init: false,
                 span: Span::new(accessor_start, accessor_end),
             };
             if is_adder {
@@ -2484,7 +2684,22 @@ impl Parser {
             Punctuator::CloseBracket,
             DiagnosticKind::TokenExpected { expected: "]" },
         );
-        let (getter, setter, end) = self.parse_accessor_block();
+        let (getter, setter, end) =
+            if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+                let accessor_start = self.current().span.start;
+                let (block, end) =
+                    self.parse_expression_body(Feature::ExpressionBodiedIndexer, true);
+                let getter = Accessor {
+                    attributes: Vec::new(),
+                    modifiers: Vec::new(),
+                    body: Some(block),
+                    is_init: false,
+                    span: Span::new(accessor_start, end),
+                };
+                (Some(getter), None, end)
+            } else {
+                self.parse_accessor_block()
+            };
         Member::Indexer {
             modifiers,
             ty,
@@ -2523,7 +2738,10 @@ impl Parser {
         }
         loop {
             let start = self.current().span.start;
-            let _ = self.parse_attribute_sections();
+            let attributes = self.parse_attribute_sections();
+            if let Some(span) = Self::caller_info_attribute_span(&attributes) {
+                self.gate_feature(Feature::CallerInfoAttribute, span);
+            }
             if self.current().kind == TokenKind::TypedRefKeyword(TypedRefKeyword::ArgList) {
                 let span = self.current().span;
                 self.bump();
@@ -2553,25 +2771,20 @@ impl Parser {
             };
             let ty = self.parse_type();
             let (name, mut end) = self.expect_declared_name();
+            let mut default_value = None;
             if self.current_punctuator() == Some(Punctuator::Equals) {
                 let at = self.current().span.start;
-                self.report(
-                    DiagnosticKind::FeatureRequiresLaterVersion {
-                        feature: crate::version::Feature::DefaultParameterValues.description(),
-                        required: crate::version::Feature::DefaultParameterValues
-                            .introduced_in()
-                            .required_name(),
-                                current: self.version,
-                    },
-                    Span::empty_at(at),
-                );
+                self.gate_feature(Feature::DefaultParameterValues, Span::empty_at(at));
                 self.bump();
-                end = self.parse_expression().span.end;
+                let value = self.parse_expression();
+                end = value.span.end;
+                default_value = Some(value);
             }
             parameters.push(Parameter {
                 modifier,
                 ty,
                 name,
+                default_value,
                 span: Span::new(start, end),
             });
             if !self.eat(Punctuator::Comma) {
@@ -2579,6 +2792,39 @@ impl Parser {
             }
         }
         (parameters, arglist)
+    }
+
+    /// The span of a CALLER-INFO ATTRIBUTE among `sections`, if one is present.
+    ///
+    /// `[CallerMemberName]` and its two siblings substitute a constant for an OMITTED argument at
+    /// the call site, and that substitution is the whole feature. Accepting the attribute and
+    /// ignoring it compiles, and then passes the DECLARED default everywhere -- so a logging
+    /// helper built on it records `null` instead of its caller. A wrong answer, not a missing one.
+    ///
+    ///
+    /// Matched on the WRITTEN name, with and without the `Attribute` suffix and ignoring any
+    /// qualification, because the parser has no types -- and every spelling of these three reduces
+    /// to one of six final identifiers.
+    fn caller_info_attribute_span(sections: &[AttributeSection]) -> Option<Span> {
+        const NAMES: [&str; 6] = [
+            "CallerMemberName",
+            "CallerMemberNameAttribute",
+            "CallerFilePath",
+            "CallerFilePathAttribute",
+            "CallerLineNumber",
+            "CallerLineNumberAttribute",
+        ];
+        sections
+            .iter()
+            .flat_map(|section| section.attributes.iter())
+            .find(|attribute| {
+                attribute
+                    .name
+                    .parts
+                    .last()
+                    .is_some_and(|part| NAMES.contains(&&**part))
+            })
+            .map(|attribute| attribute.span)
     }
 
     /// Parses a full expression (14): an assignment, which sits at the bottom of
@@ -2592,6 +2838,17 @@ impl Parser {
     /// matching how csc parses then checks.
     fn parse_assignment(&mut self) -> Expr {
         let target = self.parse_conditional();
+        if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+            let arrow = self.current().span;
+            self.gate_feature(Feature::LambdaExpression, arrow);
+            self.bump();
+            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                self.parse_block();
+            } else {
+                self.parse_expression();
+            }
+            return Expr::new(ExprKind::Error, Span::new(target.span.start, arrow.end));
+        }
         let Some(operator) = self.current_punctuator().and_then(assignment_operator) else {
             return target;
         };
@@ -2708,16 +2965,7 @@ impl Parser {
             let await_span = self.current().span;
             self.bump();
             if !self.in_async_method {
-                if !self.version.supports(Feature::AsyncFunction) {
-                    self.report(
-                        DiagnosticKind::FeatureRequiresLaterVersion {
-                            feature: Feature::AsyncFunction.description(),
-                            required: Feature::AsyncFunction.introduced_in().required_name(),
-                            current: self.version,
-                        },
-                        await_span,
-                    );
-                }
+                self.gate_feature(Feature::AsyncFunction, await_span);
                 self.report(DiagnosticKind::AwaitOutsideAsync, await_span);
             }
             if self.in_async_method && self.in_unsafe_block {
@@ -2941,6 +3189,79 @@ impl Parser {
     /// A primary expression (14.5): a literal, a simple name, `this`, or a
     /// parenthesized expression. A token that can begin none of these is
     /// `CS1525`, recovered with an [`ExprKind::Error`] placeholder.
+
+    /// Turns a scanned interpolated string into its AST parts, parsing each hole's tokens as an
+    /// expression IN THIS PARSER'S CONTEXT -- the dialect, and whether we are inside an `async`
+    /// method, both of which change how a hole's own tokens read (`await x` is an operator in one
+    /// and an identifier in the other).
+    fn parse_interpolation_parts(
+        &mut self,
+        string: &crate::token::InterpolatedString,
+    ) -> Vec<InterpolationPart> {
+        string
+            .parts
+            .iter()
+            .map(|part| match part {
+                crate::token::InterpolatedPart::Literal(units) => {
+                    InterpolationPart::Literal(units.clone())
+                }
+                crate::token::InterpolatedPart::Hole(hole) => InterpolationPart::Hole {
+                    expression: Box::new(self.parse_interpolation_operand(&hole.tokens, hole.span)),
+                    alignment: if hole.alignment.is_empty() {
+                        None
+                    } else {
+                        Some(Box::new(
+                            self.parse_interpolation_operand(&hole.alignment, hole.span),
+                        ))
+                    },
+                    format: hole.format.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// Parses one hole's (or alignment's) tokens as a single expression.
+    ///
+    /// **THE TOKENS ARRIVE ALREADY SCANNED, WITH THEIR ORIGINAL FILE SPANS**, so a diagnostic
+    /// raised in here points at the source the reader wrote. An `EndOfFile` is appended because
+    /// every path in this parser expects one and none of them may run off the end.
+    ///
+    /// An empty hole parses to nothing rather than to `CS1525`: the scanner already reported
+    /// `CS1733` for it, and a second complaint about the same absence is a cascade csc does not
+    /// emit.
+    fn parse_interpolation_operand(&mut self, tokens: &[Token], hole: Span) -> Expr {
+        if !tokens.iter().any(|token| !token.is_trivia()) {
+            return Expr::new(ExprKind::Error, hole);
+        }
+        let mut inner = Parser {
+            tokens: tokens
+                .iter()
+                .filter(|token| !token.is_trivia())
+                .cloned()
+                .chain(core::iter::once(Token::new(
+                    TokenKind::EndOfFile,
+                    Span::empty_at(hole.end),
+                )))
+                .collect(),
+            position: 0,
+            diagnostics: Vec::new(),
+            defined_symbols: BTreeSet::new(),
+            version: self.version,
+            in_async_method: self.in_async_method,
+            in_unsafe_block: self.in_unsafe_block,
+        };
+        let expression = inner.parse_expression();
+        if !matches!(inner.current().kind, TokenKind::EndOfFile) {
+            let at = inner.current().span;
+            inner.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::InterpolationCloseDelimiterExpected,
+                at,
+            ));
+        }
+        self.diagnostics.append(&mut inner.diagnostics);
+        expression
+    }
+
     fn parse_primary(&mut self) -> Expr {
         let span = self.current().span;
         let kind = self.current().kind.clone();
@@ -2978,6 +3299,11 @@ impl Parser {
             TokenKind::StringLiteral(units) => {
                 self.bump();
                 Expr::new(ExprKind::Literal(Literal::String(units)), span)
+            }
+            TokenKind::InterpolatedString(string) => {
+                self.bump();
+                let parts = self.parse_interpolation_parts(&string);
+                Expr::new(ExprKind::InterpolatedString(parts), span)
             }
             TokenKind::Keyword(Keyword::True) => {
                 self.bump();
@@ -3117,8 +3443,9 @@ impl Parser {
                 }
             }
             TokenKind::Identifier(name) => {
+                let verbatim = self.current().verbatim;
                 self.bump();
-                Expr::new(ExprKind::Name(name), span)
+                Expr::new(ExprKind::Name { name, verbatim }, span)
             }
             TokenKind::Punctuator(Punctuator::OpenParen) => {
                 self.bump();
@@ -3138,16 +3465,7 @@ impl Parser {
                 Expr::new(ExprKind::PredefinedType(predefined), span)
             }
             TokenKind::Keyword(Keyword::Delegate) => {
-                self.report(
-                    DiagnosticKind::FeatureRequiresLaterVersion {
-                        feature: crate::version::Feature::AnonymousMethods.description(),
-                        required: crate::version::Feature::AnonymousMethods
-                            .introduced_in()
-                            .required_name(),
-                                current: self.version,
-                    },
-                    Span::empty_at(span.start),
-                );
+                self.gate_feature(Feature::AnonymousMethods, Span::empty_at(span.start));
                 self.bump();
                 if self.current_punctuator() == Some(Punctuator::OpenParen) {
                     self.skip_balanced(Punctuator::OpenParen, Punctuator::CloseParen);
@@ -3181,16 +3499,7 @@ impl Parser {
                 && self.next_is(Punctuator::Colon)
             {
                 let at = self.current().span.start;
-                self.report(
-                    DiagnosticKind::FeatureRequiresLaterVersion {
-                        feature: crate::version::Feature::NamedArguments.description(),
-                        required: crate::version::Feature::NamedArguments
-                            .introduced_in()
-                            .required_name(),
-                                current: self.version,
-                    },
-                    Span::empty_at(at),
-                );
+                self.gate_feature(Feature::NamedArguments, Span::empty_at(at));
                 self.bump();
                 self.bump();
             }
@@ -3353,16 +3662,7 @@ impl Parser {
             } else if matches!(&base.kind, TypeRefKind::Predefined(p) if is_predefined_value_type(*p))
             {
                 let at = self.current().span.start;
-                self.report(
-                    DiagnosticKind::FeatureRequiresLaterVersion {
-                        feature: crate::version::Feature::NullableValueTypes.description(),
-                        required: crate::version::Feature::NullableValueTypes
-                            .introduced_in()
-                            .required_name(),
-                        current: self.version,
-                    },
-                    Span::empty_at(at),
-                );
+                self.gate_feature(Feature::NullableValueTypes, Span::empty_at(at));
                 self.bump();
             }
         }
@@ -3392,16 +3692,7 @@ impl Parser {
     fn parse_new(&mut self, start: u32) -> Expr {
         self.bump();
         if self.current_punctuator() == Some(Punctuator::OpenBrace) {
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: crate::version::Feature::AnonymousObjectCreation.description(),
-                    required: crate::version::Feature::AnonymousObjectCreation
-                        .introduced_in()
-                        .required_name(),
-                            current: self.version,
-                },
-                Span::empty_at(start),
-            );
+            self.gate_feature(Feature::AnonymousObjectCreation, Span::empty_at(start));
             let end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
             return Expr::new(ExprKind::Error, Span::new(start, end));
         }
@@ -3459,9 +3750,6 @@ impl Parser {
 
     /// Reports the C# 3.0 initializer gate at the current `{` when the dialect does not permit one.
     ///
-    /// **Only that half of the two-bit rule lives here.** The other half -- a dialect that PERMITS
-    /// an initializer while this build cannot produce one -- is the binder's, because only it has
-    /// `LAM0001`. The two conditions are disjoint, so a program never draws both.
     ///
     /// **The two forms are the SAME version and DIFFERENT nouns**, so which one the message names
     /// is decided here rather than by the feature table: csc reports `'object initializer'` for
@@ -3473,17 +3761,7 @@ impl Parser {
         } else {
             Feature::CollectionInitializer
         };
-        if self.version.supports(feature) {
-            return;
-        }
-        self.report(
-            DiagnosticKind::FeatureRequiresLaterVersion {
-                feature: feature.description(),
-                required: feature.introduced_in().required_name(),
-                current: self.version,
-            },
-            Span::empty_at(self.current().span.start),
-        );
+        self.gate_feature_here(feature);
     }
 
     /// Parses an object or collection initializer `{ ... }`, positioned on the `{` (C# 3.0).
@@ -3769,16 +4047,7 @@ impl Parser {
                     constructed = true;
                 } else {
                     let at = self.current().span.start;
-                    self.report(
-                        DiagnosticKind::FeatureRequiresLaterVersion {
-                            feature: crate::version::Feature::Generics.description(),
-                            required: crate::version::Feature::Generics
-                                .introduced_in()
-                                .required_name(),
-                            current: self.version,
-                        },
-                        Span::empty_at(at),
-                    );
+                    self.gate_feature(Feature::Generics, Span::empty_at(at));
                     end = self.skip_type_argument_list();
                 }
             }
@@ -3983,16 +4252,7 @@ impl Parser {
         }
         if !self.version.supports(Feature::Generics) {
             let at = self.current().span.start;
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: crate::version::Feature::Generics.description(),
-                    required: crate::version::Feature::Generics
-                        .introduced_in()
-                        .required_name(),
-                    current: self.version,
-                },
-                Span::empty_at(at),
-            );
+            self.gate_feature(Feature::Generics, Span::empty_at(at));
             self.skip_type_argument_list();
             return Vec::new();
         }
@@ -4343,6 +4603,104 @@ fn modifier_of(keyword: Keyword) -> Option<Modifier> {
     })
 }
 
+/// Adds the members a `record` declaration generates, as ORDINARY SYNTAX.
+///
+/// **A DESUGAR, FOR THE REASON `=>` IS ONE.** Every member csc synthesizes for a record is
+/// expressible in the language it is a record of -- a property, a constructor, a method -- so
+/// producing them here means the binder, the flow analysis and the emitter see shapes they already
+/// handle, and none of them learns what a record is. The one name that cannot be TYPED,
+/// `<Clone>$`, is still an ordinary identifier in the tree.
+///
+/// **THIS IS THE POSITIONAL HALF ONLY, AND THE FEATURE STAYS GATED UNTIL THE REST LANDS.** csc
+/// emits eleven further members for EVERY record form -- value equality, `ToString`/`PrintMembers`,
+/// `<Clone>$` and the copy constructor -- and they are not optional: a record missing `Equals(R)`
+/// or `op_Equality` is an assembly whose members a csc-built consumer calls and does not find.
+/// Measured over three record forms; there is no "records without value equality" subset to ship.
+///
+/// A member the SOURCE already declares is left alone: C# lets a record write its own `X` beside
+/// `record R(int X)`, and the generated one then does not exist.
+fn synthesize_record_members(declaration: &mut TypeDecl) {
+    let Some(parts) = declaration.record.clone() else {
+        return;
+    };
+    let Some(parameters) = parts.parameters else {
+        return;
+    };
+    let span = parts.keyword_span;
+    let declares = |name: &str, members: &[Member]| {
+        members.iter().any(|member| match member {
+            Member::Property { name: existing, .. } => &**existing == name,
+            Member::Field { declarators, .. } => {
+                declarators.iter().any(|declarator| &*declarator.name == name)
+            }
+            _ => false,
+        })
+    };
+    let mut generated = Vec::new();
+    for parameter in &parameters {
+        if declares(&parameter.name, &declaration.members) {
+            continue;
+        }
+        let accessor = |is_init: bool| Accessor {
+            attributes: Vec::new(),
+            modifiers: Vec::new(),
+            body: None,
+            is_init,
+            span,
+        };
+        generated.push(Member::Property {
+            modifiers: alloc::vec![Modifier::Public],
+            ty: parameter.ty.clone(),
+            name: parameter.name.clone(),
+            getter: Some(accessor(false)),
+            setter: Some(accessor(true)),
+            explicit_interface: None,
+            attributes: Vec::new(),
+            span,
+        });
+    }
+    let body = Stmt::new(
+        StmtKind::Block(
+            parameters
+                .iter()
+                .map(|parameter| {
+                    let target = Expr::new(
+                        ExprKind::MemberAccess {
+                            receiver: Box::new(Expr::new(ExprKind::This, span)),
+                            name: parameter.name.clone(),
+                        },
+                        span,
+                    );
+                    Stmt::new(
+                        StmtKind::Expression(Expr::new(
+                            ExprKind::Assignment {
+                                operator: AssignmentOperator::Assign,
+                                target: Box::new(target),
+                                value: Box::new(Expr::name(parameter.name.clone(), span)),
+                            },
+                            span,
+                        )),
+                        span,
+                    )
+                })
+                .collect(),
+        ),
+        span,
+    );
+    generated.push(Member::Constructor {
+        modifiers: alloc::vec![Modifier::Public],
+        name: declaration.name.clone(),
+        parameters,
+        is_vararg: false,
+        initializer: None,
+        body,
+        header_span: span,
+        attributes: Vec::new(),
+        span,
+    });
+    declaration.members.extend(generated);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4360,11 +4718,43 @@ mod tests {
             ExprKind::Literal(Literal::String(_)) => String::from("str"),
             ExprKind::Literal(Literal::Boolean(value)) => format!("{value}"),
             ExprKind::Literal(Literal::Null) => String::from("null"),
-            ExprKind::Name(name) => String::from(&**name),
+            ExprKind::Name { name, verbatim } => {
+                if *verbatim {
+                    format!("@{name}")
+                } else {
+                    String::from(&**name)
+                }
+            }
             ExprKind::PredefinedType(predefined) => String::from(predefined_text(*predefined)),
             ExprKind::This => String::from("this"),
             ExprKind::Base => String::from("base"),
             ExprKind::Parenthesized(inner) => format!("(paren {})", dump(inner)),
+            ExprKind::InterpolatedString(parts) => {
+                let mut out = String::from("(interp");
+                for part in parts {
+                    match part {
+                        InterpolationPart::Literal(units) => {
+                            out.push_str(&format!(" [{}]", units.len()));
+                        }
+                        InterpolationPart::Hole {
+                            expression,
+                            alignment,
+                            format,
+                        } => {
+                            out.push_str(&format!(" {{{}", dump(expression)));
+                            if let Some(alignment) = alignment {
+                                out.push_str(&format!(",{}", dump(alignment)));
+                            }
+                            if let Some(format) = format {
+                                out.push_str(&format!(":{format}"));
+                            }
+                            out.push('}');
+                        }
+                    }
+                }
+                out.push(')');
+                out
+            }
             ExprKind::MemberAccess { receiver, name } => {
                 format!("(. {} {name})", dump(receiver))
             }
@@ -4942,6 +5332,23 @@ mod tests {
         assert_eq!(tree("this"), "this");
     }
 
+    /// **THE EXPRESSION HALF OF 9.4.2, WHICH NO TOKEN-LEVEL GUARD CAN COVER.**
+    /// [`Parser::current_contextual_keyword`] serves the sites that still hold a token; a BINDER
+    /// site asking whether a simple name is a contextual keyword -- `nameof` today, `with`
+    /// tomorrow -- sees an [`Expr`] whose text has already had the `@` dropped, so the flag has to
+    /// reach the tree. Until it did, `@nameof(x)` compiled here and is `CS0103` under csc,
+    /// measured.
+    ///
+    /// The name itself stays `nameof`, because that is the identifier `@nameof` denotes and what
+    /// it must bind to; only the dump renders the `@`, so the flag is visible to a test at all.
+    #[test]
+    fn a_verbatim_simple_name_records_its_at_sign() {
+        assert_eq!(tree("nameof(x)"), "(call nameof x)");
+        assert_eq!(tree("@nameof(x)"), "(call @nameof x)");
+        assert_eq!(tree("@x + y"), "(+ @x y)");
+        assert_eq!(tree("x + @y"), "(+ x @y)");
+    }
+
     /// `??` sits between conditional-OR and `?:` and is the one RIGHT-associative binary spelling
     /// in the language (14.13). Both facts are asserted as TREES rather than as "it compiles",
     /// because a left-associative `??` accepts every program a right-associative one does and
@@ -5395,8 +5802,7 @@ mod tests {
         assert_eq!(stmt_tree("switch (x) {}"), "(switch x)");
         assert_eq!(
             stmt_tree("switch (x) { case 1: f(); break; default: g(); break; }"),
-            "(switch x (section (case 1) (expr (call f)) (break)) \
-             (section (default) (expr (call g)) (break)))"
+            "(switch x (section (case 1) (expr (call f)) (break)) (section (default) (expr (call g)) (break)))"
         );
         assert_eq!(
             stmt_tree("switch (x) { case 1: case 2: f(); break; }"),
@@ -5593,7 +5999,8 @@ mod tests {
                     text.push_str(&format!(" {}", dump_accessor("get", getter)));
                 }
                 if let Some(setter) = setter {
-                    text.push_str(&format!(" {}", dump_accessor("set", setter)));
+                    let keyword = if setter.is_init { "init" } else { "set" };
+                    text.push_str(&format!(" {}", dump_accessor(keyword, setter)));
                 }
                 text.push(')');
                 text
@@ -5659,7 +6066,8 @@ mod tests {
                     text.push_str(&format!(" {}", dump_accessor("get", getter)));
                 }
                 if let Some(setter) = setter {
-                    text.push_str(&format!(" {}", dump_accessor("set", setter)));
+                    let keyword = if setter.is_init { "init" } else { "set" };
+                    text.push_str(&format!(" {}", dump_accessor(keyword, setter)));
                 }
                 text.push(')');
                 text
@@ -5763,15 +6171,43 @@ mod tests {
             TypeKind::Struct => "struct",
             TypeKind::Interface => "interface",
         };
-        let mut text = format!("({keyword}");
+        let mut text = match &declaration.record {
+            None => format!("({keyword}"),
+            Some(parts) if parts.keyword_form => format!("(record {keyword}"),
+            Some(_) => String::from("(record"),
+        };
         for modifier in &declaration.modifiers {
             text.push_str(&format!(" {}", modifier_name(*modifier)));
         }
         text.push_str(&format!(" {}", declaration.name));
+        if let Some(parts) = &declaration.record {
+            if let Some(parameters) = &parts.parameters {
+                text.push('(');
+                for (index, parameter) in parameters.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str(", ");
+                    }
+                    text.push_str(&format!("{} {}", dump_type(&parameter.ty), parameter.name));
+                }
+                text.push(')');
+            }
+        }
         if !declaration.bases.is_empty() {
             text.push_str(" :");
             for base in &declaration.bases {
                 text.push_str(&format!(" {}", dump_type(base)));
+            }
+            if let Some(parts) = &declaration.record {
+                if let Some(arguments) = &parts.base_arguments {
+                    text.push('(');
+                    for (index, argument) in arguments.iter().enumerate() {
+                        if index > 0 {
+                            text.push_str(", ");
+                        }
+                        text.push_str(&dump(argument));
+                    }
+                    text.push(')');
+                }
             }
         }
         for member in &declaration.members {
@@ -5971,6 +6407,130 @@ mod tests {
     }
 
     /// The diagnostic codes `source` draws under `version`.
+    /// **AN EXPRESSION BODY IS GATED AT ITS OWN MEMBER KIND, AND `=>` IS FOUR FEATURES.** csc
+    /// names the declaration rather than the token -- measured at ISO-1, one declaration each:
+    ///
+    /// ```text
+    /// int M() => 1;              'expression-bodied method'             C# 6.0
+    /// int P => 1;                'expression-bodied property'           C# 6.0
+    /// int this[int i] => 1;      'expression-bodied indexer'            C# 6.0
+    /// int P { get => _v; }       'expression body property accessor'    C# 7.0
+    /// x => x                     'lambda expression'                    C# 3.0
+    /// ```
+    ///
+    /// The accessor's name is not spelled like the other three, and the indexer does not call
+    /// itself a property. Both are csc's, copied rather than derived, because the text is a search
+    /// key.
+    ///
+    /// The gate lives at these five parser sites rather than in the lexer, which cannot tell them
+    /// apart: it named the lambda for all of them, and returned `Unknown`, so three of the five
+    /// forms drew cascade diagnostics csc does not emit.
+    #[test]
+    fn an_expression_body_is_gated_at_its_own_member_kind() {
+        let at = |version: LanguageVersion, source: &str| {
+            let options = LexOptions { version, ..LexOptions::default() };
+            let parsed = parse_compilation_unit_with(source, options);
+            let mut names: Vec<String> = parsed
+                .diagnostics
+                .iter()
+                .filter_map(|d| match &d.kind {
+                    DiagnosticKind::FeatureRequiresLaterVersion { feature, .. } => {
+                        Some(String::from(*feature))
+                    }
+                    _ => None,
+                })
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        const METHOD: &str = "class C { public int M() => 1; }";
+        const VOID: &str = "class C { void V() { } public void W() => V(); }";
+        const PROPERTY: &str = "class C { public int P => 1; }";
+        const INDEXER: &str = "class C { public int this[int i] => i; }";
+        const ACCESSOR: &str = "class C { int _v; public int P { get => _v; } }";
+        const LAMBDA: &str = "delegate int D(int x); class C { void M() { D d = x => x; } }";
+
+        assert_eq!(at(LanguageVersion::CSharp1, METHOD), ["expression-bodied method"]);
+        assert_eq!(at(LanguageVersion::CSharp1, VOID), ["expression-bodied method"]);
+        assert_eq!(at(LanguageVersion::CSharp1, PROPERTY), ["expression-bodied property"]);
+        assert_eq!(at(LanguageVersion::CSharp1, INDEXER), ["expression-bodied indexer"]);
+        assert_eq!(at(LanguageVersion::CSharp1, ACCESSOR), ["expression body property accessor"]);
+        assert_eq!(at(LanguageVersion::CSharp1, LAMBDA), ["lambda expression"]);
+
+        for source in [METHOD, VOID, PROPERTY, INDEXER] {
+            assert!(at(LanguageVersion::CSharp6, source).is_empty(), "{source} is C# 6");
+        }
+        assert_eq!(
+            at(LanguageVersion::CSharp6, ACCESSOR),
+            ["expression body property accessor"],
+            "an accessor body is C# 7, one rung after the member forms"
+        );
+        assert!(at(LanguageVersion::CSharp7, ACCESSOR).is_empty());
+
+        let body_of = |source: &str, member_name: &str| -> &'static str {
+            let options = LexOptions {
+                version: LanguageVersion::CSharp7,
+                ..LexOptions::default()
+            };
+            let unit = parse_compilation_unit_with(source, options).unit;
+            for member in unit.members.iter() {
+                let NamespaceMember::Type(declaration) = member else { continue };
+                for candidate in &declaration.members {
+                    let body = match candidate {
+                        Member::Method { name, body, .. } if &**name == member_name => body,
+                        Member::Property { name, getter, .. } if &**name == member_name => {
+                            &getter.as_ref().expect("a getter").body
+                        }
+                        _ => continue,
+                    };
+                    let Some(block) = body else { panic!("{member_name} has no body") };
+                    let StmtKind::Block(statements) = &block.kind else {
+                        panic!("an expression body desugars to a BLOCK")
+                    };
+                    return match statements.first().map(|s| &s.kind) {
+                        Some(StmtKind::Return(Some(_))) => "return",
+                        Some(StmtKind::Expression(_)) => "evaluate",
+                        other => panic!("unexpected desugar: {other:?}"),
+                    };
+                }
+            }
+            panic!("no member named {member_name}")
+        };
+        assert_eq!(body_of(METHOD, "M"), "return", "an int method returns its expression");
+        assert_eq!(body_of(VOID, "W"), "evaluate", "a VOID method evaluates it -- `return e;` is CS0127");
+        assert_eq!(body_of(PROPERTY, "P"), "return", "a property getter returns its expression");
+        assert_eq!(
+            body_of("class C { int _v; public int P { get => _v; set => _v = value; } }", "P"),
+            "return",
+            "and so does a get accessor"
+        );
+
+        assert!(
+            at(LanguageVersion::CSharp7, LAMBDA).is_empty(),
+            "C# 7 HAS lambdas; what this dialect permits and does not lower is the binder's to report"
+        );
+    }
+
+    /// The tree dump at `version`, IGNORING diagnostics.
+    ///
+    /// **FOR A CONSTRUCT WHOSE GATE IS THE POINT.** `unit_tree_at` requires a clean parse, which a
+    /// feature that is parsed-but-not-implemented can never give -- the gate fires at every
+    /// version by design, so that the binder can name the construct rather than cascade. This
+    /// asserts the SHAPE, which the parser produces at every version; the gate itself is asserted
+    /// separately by `unit_codes_at`, and asserting both through one helper would mean asserting
+    /// neither.
+    fn unit_tree_ignoring_gates(source: &str, version: LanguageVersion) -> String {
+        let parsed = parse_compilation_unit_with(
+            source,
+            LexOptions {
+                version,
+                ..LexOptions::default()
+            },
+        );
+        dump_unit(&parsed.unit)
+    }
+
     fn unit_codes_at(source: &str, version: LanguageVersion) -> Vec<u16> {
         parse_compilation_unit_with(
             source,
@@ -6779,12 +7339,10 @@ mod tests {
 
     #[test]
     fn a_whole_hello_world_program_parses() {
-        let source = "using System; namespace Hello { class Program { \
-                      static void Main() { System.Console.WriteLine(\"Hi\"); } } }";
+        let source = "using System; namespace Hello { class Program {   static void Main() { System.Console.WriteLine(\"Hi\"); } } }";
         assert_eq!(
             unit_tree(source),
-            "(using System) (namespace Hello (class Program (method static void Main () \
-             (block (expr (call (. (. System Console) WriteLine) str))))))"
+            "(using System) (namespace Hello (class Program (method static void Main () (block (expr (call (. (. System Console) WriteLine) str))))))"
         );
     }
 
@@ -6825,6 +7383,89 @@ mod tests {
         assert!(unit_codes("class C { void M() { if x) ; } }").contains(&1003));
         assert!(unit_codes("class C { void M() { f(1; } }").contains(&1026));
         assert!(unit_codes("class C { void M() { object o = typeof(); } }").contains(&1031));
+    }
+
+    /// `record` is a CONTEXTUAL keyword, and the disambiguation rule is measured rather than read
+    /// off the grammar -- see [`Parser::record_declaration_here`] for the three csc rows.
+    ///
+    /// **THE FORMS ARE DISTINGUISHED IN THE DUMP BECAUSE THEY ARE DIFFERENT DECLARATIONS.**
+    /// `record R` has no parameter list and `record R()` has an empty one; only the second gets a
+    /// `Deconstruct`, so a tree that rendered them alike would make the difference untestable.
+    #[test]
+    fn record_declarations() {
+        let at9 = |source| unit_tree_ignoring_gates(source, LanguageVersion::CSharp9);
+        assert_eq!(at9("record R;"), "(record R)");
+        assert_eq!(at9("record R { }"), "(record R)");
+        assert_eq!(at9("record R();"), "(record R() (ctor public R () (block)))");
+        assert_eq!(
+            at9("record R(int X);"),
+            "(record R(int X) (property public int X (get ;) (init ;)) (ctor public R (int X) (block (expr (= (. this X) X)))))"
+        );
+        assert_eq!(
+            at9("public sealed record R(int X, string S);"),
+            "(record public sealed R(int X, string S) (property public int X (get ;) (init ;)) (property public string S (get ;) (init ;)) (ctor public R (int X, string S) (block (expr (= (. this X) X)) (expr (= (. this S) S)))))"
+        );
+        assert_eq!(
+            at9("record R(int X) { }"),
+            "(record R(int X) (property public int X (get ;) (init ;)) (ctor public R (int X) (block (expr (= (. this X) X)))))"
+        );
+        assert_eq!(
+            at9("record R(int X) { public int X; }"),
+            "(record R(int X) (field public int X) (ctor public R (int X) (block (expr (= (. this X) X)))))"
+        );
+        assert_eq!(
+            at9("record D(int X, int Y) : B(X);"),
+            "(record D(int X, int Y) : B(X) (property public int X (get ;) (init ;)) (property public int Y (get ;) (init ;)) (ctor public D (int X, int Y) (block (expr (= (. this X) X)) (expr (= (. this Y) Y)))))"
+        );
+        assert_eq!(
+            at9("record D(int X) : B, I;"),
+            "(record D(int X) : B I (property public int X (get ;) (init ;)) (ctor public D (int X) (block (expr (= (. this X) X)))))"
+        );
+        assert_eq!(
+            at9("record record(int X);"),
+            "(record record(int X) (property public int X (get ;) (init ;)) (ctor public record (int X) (block (expr (= (. this X) X)))))"
+        );
+    }
+
+    /// The four rows that say `record` is not read like `partial`, `async` or `required`: it takes
+    /// the declaration whatever else is in scope, and only `@` gives the word back.
+    #[test]
+    fn record_is_contextual_but_not_speculative() {
+        let at9 = |source| unit_tree_ignoring_gates(source, LanguageVersion::CSharp9);
+        assert_eq!(at9("class C { record x; }"), "(class C (record x))");
+        assert_eq!(
+            at9("class C { record R(int X); }"),
+            "(class C (record R(int X) (property public int X (get ;) (init ;)) (ctor public R (int X) (block (expr (= (. this X) X))))))"
+        );
+        assert_eq!(at9("class C { @record x; }"), "(class C (field record x))");
+        assert_eq!(at9("class record { }"), "(class record)");
+    }
+
+    /// `record class` and `record struct` are a SEPARATE csc feature one rung higher, and csc
+    /// calls both `'record structs'` -- plural, for the class form too.
+    #[test]
+    fn the_record_keyword_forms_are_a_second_gate() {
+        assert_eq!(
+            unit_tree_ignoring_gates("record class R(int X);", LanguageVersion::CSharp10),
+            "(record class R(int X) (property public int X (get ;) (init ;)) (ctor public R (int X) (block (expr (= (. this X) X)))))"
+        );
+        assert_eq!(
+            unit_tree_ignoring_gates("record struct R(int X);", LanguageVersion::CSharp10),
+            "(record struct R(int X) (property public int X (get ;) (init ;)) (ctor public R (int X) (block (expr (= (. this X) X)))))"
+        );
+        assert!(!unit_codes_at("record class R(int X);", LanguageVersion::CSharp9).is_empty());
+        assert!(!unit_codes_at("record R(int X);", LanguageVersion::CSharp8).is_empty());
+    }
+
+    /// `init` occupies the SET slot and is spelled where `set` would be, so the tree keeps it as a
+    /// flag on the setter rather than a third accessor -- csc answers `int P { init { } set { } }`
+    /// with CS1007, which is what says the two are one slot.
+    #[test]
+    fn an_init_accessor_is_a_setter_and_is_invalid_on_a_static_member() {
+        let at9 = |source| unit_codes_at(source, LanguageVersion::CSharp9);
+        assert!(at9("class C { public static int P { get; init; } }").contains(&8856));
+        assert!(!at9("class C { public int P { get; init; } }").contains(&8856));
+        assert!(!at9("class C { public static int P { get; set; } }").contains(&8856));
     }
 
     #[test]
@@ -7075,12 +7716,9 @@ mod tests {
     #[test]
     fn parsing_every_prefix_of_a_program_never_panics() {
         let corpus = [
-            "using System; namespace N { class C : B { public int F = 0; void M(ref int a) \
-             { for (int i = 0; i < 10; i++) { f(i); } } C() : base() {} int P { get; set; } \
-             int this[int i] { get { return 0; } } } }",
+            "using System; namespace N { class C : B { public int F = 0; void M(ref int a) { for (int i = 0; i < 10; i++) { f(i); } } C() : base() {} int P { get; set; } int this[int i] { get { return 0; } } } }",
             "[Serializable] enum E : byte { A, B = 2, } delegate int D(string s);",
-            "class C { public static C operator +(C a, C b) { return a; } ~C() {} \
-             event H E { add {} remove {} } int[] xs = { 1, 2, 3 }; }",
+            "class C { public static C operator +(C a, C b) { return a; } ~C() {} event H E { add {} remove {} } int[] xs = { 1, 2, 3 }; }",
         ];
         for source in corpus {
             for end in 0..=source.len() {

@@ -1,0 +1,101 @@
+# BLOCK layout: the STM32L0x1 GPIO port block, stated COMPLETE from RM0377 rather than grown a
+# field at a time. Offsets are instance-base-relative; the port instance bases live in
+# ../instances.toml.
+#
+# EVERY VALUE HERE WAS READ FROM THIS FAMILY'S OWN BOOK. Nothing was carried over from
+# csp/stm32l476, and the reason is that a carry-over would have LOOKED right: that family's USART2
+# sits at the same address as this one's and its RCC block does too, while its GPIOA sits at
+# 0x48000000 where this family puts GPIOA at 0x50000000. Two of three values survive a copy and
+# the third is silently wrong. The field NAMES differ as well -- RM0377 spells the mode fields
+# MODE0..MODE15 where RM0351 spells them MODER0..MODER15 -- so even a correct offset can carry a
+# name this book does not use.
+#
+
+[table]
+kind = "block"
+family = "stm32l0"
+block = "gpio"
+sources = [
+    "STM32L0x1 reference manual RM0377 Rev 10 section 8.4.12 table 46 (GPIO register map and reset values) for the offsets and the bit positions",
+    "RM0377 Rev 10 sections 8.4.1 to 8.4.11 (per-register descriptions) for the field names and the encodings, used as an independent cross-check on table 46 -- the two agree register for register",
+    "RM0377 Rev 10 section 8.3.2 (I/O pin alternate function multiplexer and mapping) for the AF0..AF15 selection, and 27.3 for the reset state of the debug pins",
+]
+notes = [
+    "MODE encoding, from 8.4.1: 00 = input, 01 = general purpose output, 10 = alternate function, 11 = analog. ANALOG IS THE RESET STATE on most pins, so an alternate-function setup must CLEAR a pin's 2-bit field before OR-ing its value in; a read-modify-write that only ORs leaves 11 and the pin stays analog.",
+    "PUPD encoding, from 8.4.4: 00 = no pull, 01 = pull-up, 10 = pull-down, 11 = reserved. OT, from 8.4.2: 0 = push-pull (reset), 1 = open-drain.",
+    "GPIOA's MODER reset value DIFFERS from every other port's, and table 46 gives it its own row for that reason: PA14 and PA13 reset to 10 (alternate function) because they are SWCLK and SWDIO. RM0377 27.3 states it from the other side -- 'PA14: SWCLK in pull-down, PA13: SWDIO in pull-up'. A driver that assumes a uniform analog reset across ports is wrong about exactly the two pins a debugger is holding.",
+    "BSRR is write-only and atomic: BS0..BS15 in bits 15:0 SET a pin, BR0..BR15 in bits 31:16 RESET it. Writing it needs no read and cannot lose a concurrent write to another pin, which ODR cannot promise.",
+    "AFRL covers pins 0..7 and AFRH pins 8..15, 4 bits each. WHICH peripheral each AF number selects is NOT in this book: RM0377 8.3.2 says 'Refer to the Alternate function mapping table in the device datasheet for the detailed mapping of the alternate function I/O pins.' The mapping therefore comes from the device datasheet rather than from this block.",
+]
+
+[registers.MODER]
+offset = 0x00
+width = 32
+fields = { MODE0 = [0, 2], MODE1 = [2, 2], MODE2 = [4, 2], MODE3 = [6, 2], MODE4 = [8, 2], MODE5 = [10, 2], MODE6 = [12, 2], MODE7 = [14, 2], MODE8 = [16, 2], MODE9 = [18, 2], MODE10 = [20, 2], MODE11 = [22, 2], MODE12 = [24, 2], MODE13 = [26, 2], MODE14 = [28, 2], MODE15 = [30, 2] }
+notes = "Port mode, 2 bits per pin. See the block notes for the encoding and for GPIOA's distinct reset value."
+
+[registers.OTYPER]
+offset = 0x04
+width = 32
+fields = { OT0 = [0, 1], OT1 = [1, 1], OT2 = [2, 1], OT3 = [3, 1], OT4 = [4, 1], OT5 = [5, 1], OT6 = [6, 1], OT7 = [7, 1], OT8 = [8, 1], OT9 = [9, 1], OT10 = [10, 1], OT11 = [11, 1], OT12 = [12, 1], OT13 = [13, 1], OT14 = [14, 1], OT15 = [15, 1] }
+notes = "Output type, 1 bit per pin. Bits 31:16 are reserved."
+
+[registers.OSPEEDR]
+offset = 0x08
+width = 32
+fields = { OSPEED0 = [0, 2], OSPEED1 = [2, 2], OSPEED2 = [4, 2], OSPEED3 = [6, 2], OSPEED4 = [8, 2], OSPEED5 = [10, 2], OSPEED6 = [12, 2], OSPEED7 = [14, 2], OSPEED8 = [16, 2], OSPEED9 = [18, 2], OSPEED10 = [20, 2], OSPEED11 = [22, 2], OSPEED12 = [24, 2], OSPEED13 = [26, 2], OSPEED14 = [28, 2], OSPEED15 = [30, 2] }
+notes = "Output speed, 2 bits per pin."
+
+[registers.PUPDR]
+offset = 0x0C
+width = 32
+fields = { PUPD0 = [0, 2], PUPD1 = [2, 2], PUPD2 = [4, 2], PUPD3 = [6, 2], PUPD4 = [8, 2], PUPD5 = [10, 2], PUPD6 = [12, 2], PUPD7 = [14, 2], PUPD8 = [16, 2], PUPD9 = [18, 2], PUPD10 = [20, 2], PUPD11 = [22, 2], PUPD12 = [24, 2], PUPD13 = [26, 2], PUPD14 = [28, 2], PUPD15 = [30, 2] }
+notes = "Pull-up/pull-down selection, 2 bits per pin."
+
+[registers.IDR]
+offset = 0x10
+width = 32
+fields = { ID0 = [0, 1], ID1 = [1, 1], ID2 = [2, 1], ID3 = [3, 1], ID4 = [4, 1], ID5 = [5, 1], ID6 = [6, 1], ID7 = [7, 1], ID8 = [8, 1], ID9 = [9, 1], ID10 = [10, 1], ID11 = [11, 1], ID12 = [12, 1], ID13 = [13, 1], ID14 = [14, 1], ID15 = [15, 1] }
+notes = "Input data, read-only, 1 bit per pin. Bits 31:16 are reserved."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { OD0 = [0, 1], OD1 = [1, 1], OD2 = [2, 1], OD3 = [3, 1], OD4 = [4, 1], OD5 = [5, 1], OD6 = [6, 1], OD7 = [7, 1], OD8 = [8, 1], OD9 = [9, 1], OD10 = [10, 1], OD11 = [11, 1], OD12 = [12, 1], OD13 = [13, 1], OD14 = [14, 1], OD15 = [15, 1] }
+notes = "Output data, 1 bit per pin. Prefer BSRR for a single-pin change: this register is read-modify-write and a concurrent write to another pin can be lost. Bits 31:16 are reserved."
+
+[registers.BSRR]
+offset = 0x18
+width = 32
+fields = { BS0 = [0, 1], BS1 = [1, 1], BS2 = [2, 1], BS3 = [3, 1], BS4 = [4, 1], BS5 = [5, 1], BS6 = [6, 1], BS7 = [7, 1], BS8 = [8, 1], BS9 = [9, 1], BS10 = [10, 1], BS11 = [11, 1], BS12 = [12, 1], BS13 = [13, 1], BS14 = [14, 1], BS15 = [15, 1], BR0 = [16, 1], BR1 = [17, 1], BR2 = [18, 1], BR3 = [19, 1], BR4 = [20, 1], BR5 = [21, 1], BR6 = [22, 1], BR7 = [23, 1], BR8 = [24, 1], BR9 = [25, 1], BR10 = [26, 1], BR11 = [27, 1], BR12 = [28, 1], BR13 = [29, 1], BR14 = [30, 1], BR15 = [31, 1] }
+notes = "Bit set/reset, write-only. Set wins over reset when a pin's BS and BR bits are both written 1."
+
+[registers.LCKR]
+offset = 0x1C
+width = 32
+fields = { LCK0 = [0, 1], LCK1 = [1, 1], LCK2 = [2, 1], LCK3 = [3, 1], LCK4 = [4, 1], LCK5 = [5, 1], LCK6 = [6, 1], LCK7 = [7, 1], LCK8 = [8, 1], LCK9 = [9, 1], LCK10 = [10, 1], LCK11 = [11, 1], LCK12 = [12, 1], LCK13 = [13, 1], LCK14 = [14, 1], LCK15 = [15, 1], LCKK = [16, 1] }
+notes = "Configuration lock. Committing it takes the write/read sequence in 8.4.8, and a locked pin stays locked until the next MCU reset -- so nothing here is a step a driver takes casually."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { AFSEL0 = [0, 4], AFSEL1 = [4, 4], AFSEL2 = [8, 4], AFSEL3 = [12, 4], AFSEL4 = [16, 4], AFSEL5 = [20, 4], AFSEL6 = [24, 4], AFSEL7 = [28, 4] }
+notes = "Alternate function selection for pins 0..7, 4 bits per pin."
+
+[registers.AFRH]
+offset = 0x24
+width = 32
+fields = { AFSEL8 = [0, 4], AFSEL9 = [4, 4], AFSEL10 = [8, 4], AFSEL11 = [12, 4], AFSEL12 = [16, 4], AFSEL13 = [20, 4], AFSEL14 = [24, 4], AFSEL15 = [28, 4] }
+notes = "Alternate function selection for pins 8..15, 4 bits per pin. Nibble n of this register is pin 8+n, not pin n."
+
+# MODER field values (8.4.1) and PUPDR field values (8.4.4).
+[constants]
+MODER_MODE_INPUT = 0
+MODER_MODE_OUTPUT = 1
+MODER_MODE_AF = 2
+MODER_MODE_ANALOG = 3
+PUPD_NONE = 0
+PUPD_UP = 1
+PUPD_DOWN = 2
+OTYPE_PUSH_PULL = 0
+OTYPE_OPEN_DRAIN = 1

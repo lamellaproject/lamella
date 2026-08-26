@@ -3,7 +3,7 @@
 # rcc_en_bit] makes ST's banked enable registers DATA, so ONE stm32 emitter arm serves both:
 # the F0 gates GPIOA at the single-bank AHBENR (offset 0x14) bit 17 (IOPAEN) where the L4
 # uses AHB2ENR (0x4C) bit 0, and USART2 at APB1ENR (0x1C) bit 17. `-1` = the row gates
-# nothing (the RCC itself). RM-EXACT (no F091 serve yet).
+# nothing (the RCC itself). RM-EXACT.
 
 [table]
 kind = "instances"

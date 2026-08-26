@@ -1,6 +1,6 @@
 # The SAM3X Parallel I/O Controller block: one PIO group per port letter (the pioa instance
 # row carries the group base). Only the mux registers the peripheral bring-up paths touch are
-# transcribed so far (partial, append-only). Each register is one bit per I/O line (0-31).
+# transcribed here (partial, append-only). Each register is one bit per I/O line (0-31).
 
 [table]
 kind = "block"

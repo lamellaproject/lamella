@@ -4,12 +4,29 @@ use crate::ast::{ClassEntry, Greed, Node};
 use crate::program::{Direction, Fold, Instruction, Program};
 use crate::Vec;
 
-/// Pattern-wide settings the tree does not carry per node.
+/// The settings in force where compilation STARTS, which the tree does not carry per node.
+///
+/// # NOT "PATTERN-WIDE", AND THE PROGRAM ALREADY KNEW THAT FOR TWO OF THE THREE
+///
+/// These arrive from the front end as one value each because a front end reads one flag string.
+/// **The compiled program stores them per instruction**, and it did so before `fold` joined them:
+/// [`Instruction::Assert`] carries its own `multiline` and [`Instruction::Any`] its own `dot_all`.
+///
+/// That is not incidental. `i`, `m` and `s` are exactly the three flags a scoped inline modifier
+/// can change -- ECMA-262 17th ed, 22.2.2.7.4 (`UpdateModifiers`) sets `[[IgnoreCase]]`,
+/// `[[Multiline]]` and `[[DotAll]]` and nothing else -- so all three belong on the instruction for
+/// the same reason. `fold` was the one that had been hoisted, and it is back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Options {
     /// `^` and `$` also match at line terminators.
     pub multiline: bool,
-    /// How a backreference canonicalizes case, already resolved from the front end's flags.
+    /// How the pattern canonicalizes case AT ITS TOP LEVEL, already resolved from the front end's
+    /// flags.
+    ///
+    /// **This is the fold in force where compilation starts, not a property of the program.** The
+    /// instructions carry their own, because a scoped inline modifier -- `(?i:...)`, which Python's
+    /// `re` ships today -- changes the answer part-way down a pattern. [`Fold`] states that scope
+    /// in full. A front end with no such construct passes one value and every instruction gets it.
     ///
     /// **A LITERAL AND A BACKREFERENCE NEED THE SAME CASE DATA, AND ONLY THE LITERAL CAN BE
     /// REFUSED.** A front end folds the literals and class members it emits, where it has its
@@ -18,6 +35,33 @@ pub struct Options {
     /// character at all, and the text being compared arrives from the SUBJECT at match time. So
     /// this is the one place the matcher itself must canonicalize, and it carries a resolved
     /// [`Fold`] rather than a flag so that the rule is decided where the flags are understood.
+    ///
+    /// # THE LITERAL HALF DOES NOT NEED THE DATA ITS REFUSAL CLAIMS IT DOES
+    ///
+    /// A front end that folds a literal at COMPILE time has to enumerate the fold EQUIVALENCE
+    /// CLASS -- every code point folding to one target -- which the shared Unicode home does not
+    /// expose. That is the stated blocker for a cased non-ASCII literal under `i`, and **it is a
+    /// property of compile-time widening rather than of the problem.**
+    ///
+    /// **Canonicalizing at MATCH time needs only the FORWARD function**, which is already public
+    /// and already used here: `Canonicalize(pattern) == Canonicalize(subject)` decides a literal
+    /// without ever naming the other members of its class. [`Fold::same`] IS that comparison. So
+    /// the literal half asks nothing of a crate two other languages depend on, and keeps one
+    /// character as one instruction rather than a class of N -- which is the direction a part with
+    /// 256 KB wants anyway.
+    ///
+    /// **The scope, stated exactly, because most of the surface does NOT follow:**
+    ///
+    /// ```text
+    /// literal char, `u` mode           a match-time fold decides it
+    /// class SINGLE member, `u` mode    the same comparison, the same answer
+    /// class RANGE                      STILL REFUSED -- "does any member of `[a-b]`
+    ///                                      canonicalize to this?" is a range-intersection
+    ///                                      predicate, and no fold answers it
+    /// any of them WITHOUT `u`          STILL REFUSED -- Canonicalize MAPS rather than folds
+    ///                                      in that mode, and there is no mapping table to read.
+    ///                                      The same gap [`Fold::Ascii`] is published for.
+    /// ```
     pub fold: Fold,
 }
 
@@ -29,6 +73,7 @@ pub fn compile(node: &Node, groups: u32, options: Options) -> Program {
         classes: Vec::new(),
         counters: 0,
         registers: 0,
+        fold: options.fold,
         options,
     };
 
@@ -51,6 +96,14 @@ struct Builder {
     classes: Vec<ClassEntry>,
     counters: usize,
     registers: usize,
+    /// The canonicalization in force at the node being lowered.
+    ///
+    /// **THE SINGLE SITE THAT DECIDES `fold` FOR EVERY INSTRUCTION THAT COMPARES A CHARACTER.**
+    /// Three emit sites read it and none of them decides it, which is what keeps one rule from
+    /// gaining a case in only one of its implementations -- without making the rule pattern-wide,
+    /// which is a different thing and would foreclose a scoped inline modifier. A construct that
+    /// scopes folding sets this over its subexpression and restores it after.
+    fold: Fold,
     options: Options,
 }
 
@@ -77,12 +130,13 @@ impl Builder {
             Node::Empty => {}
 
             Node::Char(ch) => {
-                self.emit(Instruction::Char { ch: *ch, direction });
+                self.emit(Instruction::Char { ch: *ch, direction, fold: self.fold });
             }
 
             Node::Class { entries, negated } => {
                 let (start, len) = self.intern(entries);
-                self.emit(Instruction::Class { start, len, negated: *negated, direction });
+                let fold = self.fold;
+                self.emit(Instruction::Class { start, len, negated: *negated, direction, fold });
             }
 
             Node::Any { dot_all } => {
@@ -129,11 +183,7 @@ impl Builder {
             }
 
             Node::Backreference(group) => {
-                self.emit(Instruction::Backreference {
-                    group: *group,
-                    direction,
-                    fold: self.options.fold,
-                });
+                self.emit(Instruction::Backreference { group: *group, direction, fold: self.fold });
             }
 
             Node::Look { behind, negate, node } => {
@@ -291,6 +341,52 @@ mod tests {
         compile(node, groups, Options::default())
     }
 
+    /// TWO FOLDS IN ONE PROGRAM, DISAGREEING -- the capability a pattern-wide field cannot express.
+    ///
+    /// ECMA-262 17th ed REQUIRES it: `(?i:...)` is the production
+    /// `Atom :: (? RegularExpressionModifiers : Disjunction )` (22.2.1), whose runtime semantics
+    /// `UpdateModifiers` (22.2.2.7.4) turn `i` on for a SUBEXPRESSION. Python's `re` ships the same
+    /// construct. **A `Fold` held once per program cannot represent either**, and that is why this
+    /// crate carries it per instruction even though no front end here emits two yet.
+    #[test]
+    fn two_instructions_in_one_program_can_fold_differently() {
+        let program = Program {
+            instructions: crate::vec![
+                Instruction::Save { slot: 0 },
+                Instruction::Char {
+                    ch: b'a' as u32,
+                    direction: Direction::Forward,
+                    fold: Fold::Simple,
+                },
+                Instruction::Char {
+                    ch: b'a' as u32,
+                    direction: Direction::Forward,
+                    fold: Fold::None,
+                },
+                Instruction::Save { slot: 1 },
+                Instruction::Match,
+            ],
+            classes: Vec::new(),
+            slots: 2,
+            counters: 0,
+            registers: 0,
+        };
+
+        let matched = |subject: &str| {
+            let units: Vec<u16> = subject.encode_utf16().collect();
+            let input = crate::haystack::CodeUnitInput::new(&units);
+            matches!(
+                crate::matcher::run(&program, &input, 0, crate::Fuel::UNLIMITED),
+                crate::Outcome::Match(_)
+            )
+        };
+
+        assert!(matched("Aa"), "the first instruction folds, so `A` is `a` THERE");
+        assert!(matched("aa"), "and folding does not stop it matching its own spelling");
+        assert!(!matched("aA"), "the second does NOT fold, so `A` is not `a` there");
+        assert!(!matched("AA"), "which one field for the whole program could not have said");
+    }
+
     /// The whole match is a capture like any other, so a bare pattern still writes slots 0 and 1.
     #[test]
     fn the_whole_match_is_saved_around_the_body() {
@@ -314,7 +410,7 @@ mod tests {
             .instructions
             .iter()
             .filter_map(|i| match i {
-                Instruction::Char { ch, direction } => {
+                Instruction::Char { ch, direction, .. } => {
                     assert_eq!(*direction, Direction::Backward, "inside a lookbehind");
                     Some(*ch)
                 }

@@ -446,9 +446,9 @@ pub struct RealmCensus {
     /// How much text the registry's names amount to. **AN INVENTORY, NOT A COST.**
     ///
     /// Kept beside [`RealmCensus::native_table_bytes`] rather than folded into it, because the two
-    /// answer different questions and used to be one number. A figure that simply vanished when the
-    /// names moved to constant data would report the saving and hide what was saved, and the next
-    /// person to ask how big the built-in names are would have nothing to read.
+    /// answer different questions. Folded into one number, the figure simply vanishes when the names
+    /// move to constant data -- reporting the saving and hiding what was saved, so the next person
+    /// asking how big the built-in names are has nothing to read.
     pub native_name_bytes: usize,
 }
 
@@ -3434,9 +3434,8 @@ impl Interpreter {
     /// to this record, so a name that has since vanished reads as `undefined` in sloppy code rather
     /// than resolving somewhere else.
     ///
-    /// **AND THE STRICT ARM OF STEP 3 IS REACHABLE, WHICH A COMMENT HERE USED TO DENY.** The
-    /// reasoning was that `with` is sloppy-only -- true of the STATEMENT, and not of the code that
-    /// runs inside the record it creates. A strict function declared in a `with` body closes over
+    /// **AND THE STRICT ARM OF STEP 3 IS REACHABLE, WHICH "`with` IS SLOPPY-ONLY" WOULD DENY.** That
+    /// is true of the STATEMENT and not of the code that runs inside the record it creates. A strict function declared in a `with` body closes over
     /// the object environment record and reads through it with `S` true. See [`Reference`].
     fn object_binding_value(
         &mut self,

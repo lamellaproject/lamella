@@ -801,6 +801,19 @@ pub enum Inst {
         /// offset 0 -- a ref-offset TABLE cannot describe an array, since it would have to be
         /// length-dependent. The front end supplies it; the backend has no metadata access.
         element_kind: u32,
+        /// Which elements this array's may be cast BETWEEN, for the array descriptor's cast-class
+        /// word -- ECMA-335 III.4.3's array-element rule, decided from the element's metadata by the
+        /// front end and carried here because the backend has none.
+        ///
+        /// It is a THIRD fact beside `element_size` (a stride) and `element_kind` (what to trace),
+        /// and none of the three derives from another. The kind cannot serve: it answers a WIDTH
+        /// question, so it names `Byte`/`Boolean` and `UInt16`/`Char` with one code each while
+        /// giving `SByte`/`Byte` and `Int16`/`UInt16` different ones -- and an array cast must
+        /// separate the first two pairs and join the second two.
+        ///
+        /// `0` where the element's only compatible partner is its own exact identity: every
+        /// reference element, and every real struct.
+        element_cast_class: u32,
     },
     /// Loads element `index` of `array` -- the CLI's `ldelem`. The result is the element at
     /// `array + 4 + index*element_size` (the 4-byte length prefix is skipped). A sub-word element
@@ -885,6 +898,23 @@ pub enum Inst {
         /// The size in bytes of one element.
         element_size: u32,
     },
+    /// The ADDRESS of element `(index0, index1)` of a 2-D `array` -- the CLI's `int[,]::Address`, the
+    /// rectangular-array twin of `ldelema`. The result is a `ManagedPtr` to the same element
+    /// [`Inst::Array2DLoad`] reads, bounds-checked the same way.
+    ///
+    /// It is the third of the four pseudo-methods a multidimensional array type declares (`.ctor`,
+    /// `Get`, `Set`, `Address`), and the one `fixed (int* p = m)` needs: pinning a rectangular array
+    /// points at element `[0, ..]` through `Address`, never through the 1-D `ldelema`.
+    Array2DElemAddr {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The first (row) index.
+        index0: ValueId,
+        /// The second (column) index.
+        index1: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
     /// Allocates a rank-N (N >= 3) rectangular array -- the CLI's `int[,,...]::.ctor`. The layout is
     /// `[dim0][dim1]...[dim(N-1)][elements]`: N u32 dimension words, then the elements row-major, so the
     /// size is `4*N + (dim0*dim1*...*dim(N-1))*element_size`. `dims` holds the N dimension lengths in
@@ -925,6 +955,17 @@ pub enum Inst {
         /// The size in bytes of one element.
         element_size: u32,
     },
+    /// The ADDRESS of element `(indices[0], ..., indices[N-1])` of a rank-N `array` -- the CLI's
+    /// `int[,,...]::Address`. The rank-N twin of [`Inst::Array2DElemAddr`], addressing the same
+    /// element [`Inst::ArrayMDLoad`] reads.
+    ArrayMDElemAddr {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The N indices, in order.
+        indices: alloc::boxed::Box<[ValueId]>,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
     /// Loads a static field -- the CLI's `ldsfld`. `offset` is the field's byte offset within
     /// `owner`'s static storage region (the target adds that region's base). Static fields holding
     /// an `ObjectRef` are GC roots the collector must scan; only scalar statics are lowered so far.
@@ -943,6 +984,25 @@ pub enum Inst {
         offset: u32,
         /// The value to store.
         value: ValueId,
+    },
+    /// The ADDRESS of a static field -- the CLI's `ldsflda`. The twin of [`Inst::StaticLoad`],
+    /// addressing the same slot rather than reading it; the result is a `ManagedPtr`.
+    ///
+    /// It is not a convenience over `StaticLoad`. Calling an instance method on a static VALUE-TYPE
+    /// field is spelled `ldsflda; call` in CIL and cannot be spelled any other way: an instance
+    /// method on a struct receives a managed pointer, so loading the value into a temporary and
+    /// taking the temporary's address would give the callee a COPY -- correct for a reader like
+    /// `double.MaxValue.CompareTo(x)` and silently wrong for anything that mutates. The address has
+    /// to be the field's own.
+    ///
+    /// A static holding an `ObjectRef` is a GC root, and handing out its ADDRESS lets a caller write
+    /// through it -- so the same rule the collector needs from `StaticStore` applies here, reached a
+    /// different way.
+    StaticAddr {
+        /// Whose static region the field lives in.
+        owner: StaticOwner,
+        /// The field's byte offset within the owner's static region.
+        offset: u32,
     },
 }
 

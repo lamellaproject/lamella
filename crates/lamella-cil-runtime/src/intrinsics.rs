@@ -2790,6 +2790,118 @@ pub fn object_reference_equals(
     Ok(Some(Value::Int32(i32::from(same))))
 }
 
+/// `System.ValueType.Equals(object)`: the VALUE equality every struct and enum inherits
+/// (ECMA-335 Partition IV; .NET's `ValueType.Equals`). True when `obj` is a boxed instance of
+/// the SAME value type carrying an equal value.
+///
+/// Without this, a boxed struct or enum inherits `Object.Equals` -- reference identity -- and two
+/// separately boxed copies of one enum constant are two allocations, so `Hashtable[Level.High]`
+/// cannot read back what it just wrote. Every PRIMITIVE was already right only because `Int32`,
+/// `Char`, `Double` and the rest each override `Equals` individually, which is what made the gap
+/// read as a fact about enums rather than a missing base method.
+///
+/// # The type test is by resolved `TypeId`, not by the box's raw tag
+///
+/// A box carries the asm-folded token of its `box` SITE, so one value type boxed in two assemblies
+/// (a program's enum boxed by the program, then handed to the corlib's `Hashtable`, which reboxes
+/// nothing but may compare against a corlib-side box) carries two handles for one type. Both are
+/// mapped through [`Module::type_id_by_handle`] first, exactly as a cross-assembly cast does; the
+/// raw handles are compared only when neither resolves, so an unloaded type still tests by identity
+/// rather than answering true for everything.
+///
+/// # What a field holding a REFERENCE compares as
+///
+/// .NET walks a value type's fields and calls each field's OWN virtual `Equals`. An intrinsic
+/// cannot re-enter managed dispatch, so [`struct_fields_equal`] answers that walk directly: nested
+/// value types recurse, a field holding a STRING compares by its characters, and any other object
+/// reference compares by reference.
+///
+/// # Errors
+/// Never; the signature matches the intrinsic ABI.
+pub fn value_type_equals(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let equal = match (args.first(), args.get(1)) {
+        (Some(Value::Object(left)), Some(Value::Object(right))) => {
+            boxed_values_equal(vm, module, *left, *right)
+        }
+        _ => false,
+    };
+    Ok(Some(Value::Int32(i32::from(equal))))
+}
+
+/// Whether two heap references are boxes of the same value type carrying equal values -- the
+/// core of [`value_type_equals`], separated so the type-identity rule has one home.
+fn boxed_values_equal(vm: &Vm, module: &Module, left: ObjectRef, right: ObjectRef) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Some(left_token), Some(right_token)) = (
+        vm.heap().boxed_type_token(left),
+        vm.heap().boxed_type_token(right),
+    ) else {
+        return false;
+    };
+    if !same_boxed_type(module, left_token, right_token) {
+        return false;
+    }
+    match (vm.heap().boxed_value(left), vm.heap().boxed_value(right)) {
+        (Some(left_value), Some(right_value)) => {
+            struct_fields_equal(vm, &left_value, &right_value)
+        }
+        _ => false,
+    }
+}
+
+/// .NET's field-wise value-type comparison, expressed against [`Value`]: a nested value type
+/// recurses field by field, a field holding a string compares by its CHARACTERS (what that field's
+/// own `String.Equals` would answer), and everything else falls to `Value`'s `PartialEq` -- exact
+/// for the numeric, `char` and `bool` fields a value type is normally made of.
+///
+/// The reference case tries identity first, so two fields that ARE one object never pay for a
+/// character walk and a non-string reference still answers by identity.
+fn struct_fields_equal(vm: &Vm, left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Struct(left_fields), Value::Struct(right_fields)) => {
+            left_fields.len() == right_fields.len()
+                && left_fields
+                    .iter()
+                    .zip(right_fields.iter())
+                    .all(|(left_field, right_field)| {
+                        struct_fields_equal(vm, left_field, right_field)
+                    })
+        }
+        (Value::Object(left_ref), Value::Object(right_ref)) => {
+            left_ref == right_ref || heap_strings_equal(vm, *left_ref, *right_ref)
+        }
+        _ => left == right,
+    }
+}
+
+/// Whether two references are both heap strings holding the same characters -- the field-wise
+/// comparison [`struct_fields_equal`] gives a reference field, answering what that field's own
+/// `String.Equals` would. `false` when either reference is not a string.
+fn heap_strings_equal(vm: &Vm, left: ObjectRef, right: ObjectRef) -> bool {
+    match (vm.heap().as_string(left), vm.heap().as_string(right)) {
+        (Some(left_text), Some(right_text)) => left_text == right_text,
+        _ => false,
+    }
+}
+
+/// Whether two asm-folded box tags name one value type: by resolved [`Module::type_id_by_handle`]
+/// when both resolve (the cross-assembly case), else by raw handle identity.
+fn same_boxed_type(module: &Module, left: u64, right: u64) -> bool {
+    match (
+        module.type_id_by_handle(left),
+        module.type_id_by_handle(right),
+    ) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => left == right,
+    }
+}
+
 /// `System.Object..ctor()`: the base constructor every constructor chains to. With
 /// no object header to initialize here, it is a no-op (it still receives `this`).
 ///
@@ -5692,6 +5804,10 @@ pub fn type_from_handle(
 /// boxed value whose tag already carries the value type's token (Int32, Boolean, ...); a
 /// heap string yields `System.String`'s handle, and a reference instance its own type's.
 ///
+/// A RUNTIME-RAISED exception is the one receiver whose type is not on the heap at all: the VES
+/// mints it with a type external to the loaded module, so its handle comes from the record made
+/// when it was raised rather than from its instance.
+///
 /// # Errors
 /// [`Trap::NullReference`] on a null receiver; [`Trap::TypeMismatch`] if the receiver is not
 /// an object or its type has no recorded handle.
@@ -5714,6 +5830,16 @@ pub fn object_get_type(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<O
                 .is_string(reference)
                 .then(|| module.string_type_id().and_then(|id| module.type_handle_of(id)))
                 .flatten()
+        })
+        .or_else(|| {
+            #[cfg(feature = "exceptions")]
+            {
+                vm.exception_type_handle(reference)
+            }
+            #[cfg(not(feature = "exceptions"))]
+            {
+                None
+            }
         })
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     Ok(Some(Value::NativeInt(handle as i64)))
@@ -7001,8 +7127,7 @@ fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&
 #[cfg(feature = "reflection")]
 fn canonical_reflect_handle(module: &Module, handle: i64) -> i64 {
     module
-        .type_id_by_handle(handle as u64)
-        .and_then(|type_id| module.type_handle_of(type_id))
+        .canonical_type_handle(handle as u64)
         .map_or(handle, |canonical| canonical as i64)
 }
 

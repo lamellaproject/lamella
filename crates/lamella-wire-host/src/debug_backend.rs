@@ -65,6 +65,11 @@ pub enum WireTransport {
     /// A board's native driverless-USB carrier (WinUSB / libusb), behind the `usb` feature.
     #[cfg(feature = "usb")]
     Usb(UsbTransport),
+    /// An in-memory stand-in for a board, so the backend's own behaviour is testable with no
+    /// hardware. `#[cfg(test)]`, so it exists in no build anyone ships and widens no public enum.
+    /// Shared, because a test has to read what the backend sent AFTER the backend is gone.
+    #[cfg(test)]
+    Mem(std::sync::Arc<std::sync::Mutex<lamella_wire::MemTransport>>),
 }
 
 impl Transport for WireTransport {
@@ -73,6 +78,8 @@ impl Transport for WireTransport {
             WireTransport::Serial(t) => t.send(msg_type, seq, payload),
             #[cfg(feature = "usb")]
             WireTransport::Usb(t) => t.send(msg_type, seq, payload),
+            #[cfg(test)]
+            WireTransport::Mem(t) => t.lock().expect("the test transport").send(msg_type, seq, payload),
         }
     }
     fn poll(&mut self) -> Result<Option<WireFrame>, TransportError> {
@@ -80,6 +87,8 @@ impl Transport for WireTransport {
             WireTransport::Serial(t) => t.poll(),
             #[cfg(feature = "usb")]
             WireTransport::Usb(t) => t.poll(),
+            #[cfg(test)]
+            WireTransport::Mem(t) => t.lock().expect("the test transport").poll(),
         }
     }
 }
@@ -295,6 +304,24 @@ impl WireHostBackend {
     fn next_seq(&mut self) -> u16 {
         self.seq = self.seq.wrapping_add(1);
         self.seq
+    }
+
+    /// End the session on the target if one is live: `DBG_DETACH`, wait for the ack, forget it.
+    ///
+    /// **ONE IMPLEMENTATION, CALLED FROM BOTH ENDS.** `launch` clears a session before starting
+    /// another, and [`Drop`] closes the one this host opened.
+    ///
+    /// Best effort by construction: a target that has already gone away cannot be told anything,
+    /// and a failed send is not worth reporting to a caller that is on its way out.
+    fn detach_if_live(&mut self) {
+        if !self.session_live {
+            return;
+        }
+        let seq = self.next_seq();
+        if self.transport.send(debug::DBG_DETACH, seq, &[]).is_ok() {
+            self.await_type(debug::DBG_ACK);
+        }
+        self.session_live = false;
     }
 
     /// Blocks until a frame of `msg_type` arrives (dropping others -- the protocol runs
@@ -575,15 +602,25 @@ pub fn decode_children(payload: &[u8]) -> Option<Vec<(String, WireValue)>> {
     Some(out)
 }
 
+/// Closing the host closes the session it opened.
+///
+/// **A DAP `disconnect` reaches no backend: it answers success and sends nothing.** The serve loop
+/// breaks, the `Debugger` owning this backend is dropped, and this is where the target hears about
+/// it -- so an editor that disconnects does not leave a session live on the device until some later
+/// host launches into it.
+///
+/// This covers a host whose session ends with the host, which is every host that runs one session
+/// per process. A host holding one backend across several sessions wants an explicit detach on the
+/// [`DebugBackend`] seam itself, which this crate does not own.
+impl Drop for WireHostBackend {
+    fn drop(&mut self) {
+        self.detach_if_live();
+    }
+}
+
 impl DebugBackend for WireHostBackend {
     fn launch(&mut self) -> bool {
-        if self.session_live {
-            let seq = self.next_seq();
-            if self.transport.send(debug::DBG_DETACH, seq, &[]).is_ok() {
-                self.await_type(debug::DBG_ACK);
-            }
-            self.session_live = false;
-        }
+        self.detach_if_live();
         self.running = false;
         self.exit_code = 0;
         let seq = self.next_seq();
@@ -802,7 +839,68 @@ impl DebugBackend for WireHostBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::SrcMap;
+    use super::{SrcMap, WireHostBackend, WireTransport, debug};
+    use lamella_wire::{MemTransport, Transport};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A backend wired to an in-memory board, with a live session and one `DBG_ACK` already
+    /// waiting -- so a detach completes instead of sitting out its timeout.
+    fn backend_with_a_live_session() -> (WireHostBackend, Arc<Mutex<MemTransport>>) {
+        let mut board = MemTransport::new();
+        board.send(debug::DBG_ACK, 1, &[]).expect("queue the board's ack");
+        let acked = board.take_sent();
+        let mut host = MemTransport::new();
+        host.feed(&acked);
+
+        let shared = Arc::new(Mutex::new(host));
+        let backend = WireHostBackend {
+            transport: WireTransport::Mem(Arc::clone(&shared)),
+            srcmap: None,
+            user_bps: Vec::new(),
+            image: Vec::new(),
+            timeout: Duration::from_millis(50),
+            seq: 0,
+            session_live: true,
+            running: false,
+            frames: Vec::new(),
+            exit_code: 0,
+            pending_output: None,
+        };
+        (backend, shared)
+    }
+
+    /// The message types the host sent, decoded through the wire's own framing rather than by
+    /// looking for a byte -- a raw scan would pass on a payload that happens to contain one.
+    fn sent_types(shared: &Arc<Mutex<MemTransport>>) -> Vec<u8> {
+        let bytes = shared.lock().expect("the test transport").take_sent();
+        let mut reader = MemTransport::new();
+        reader.feed(&bytes);
+        let mut types = Vec::new();
+        while let Ok(Some(frame)) = reader.poll() {
+            types.push(frame.msg_type);
+        }
+        types
+    }
+
+    #[test]
+    fn dropping_the_host_detaches_the_session_it_opened() {
+        let (backend, shared) = backend_with_a_live_session();
+
+        drop(backend);
+
+        assert_eq!(sent_types(&shared), vec![debug::DBG_DETACH], "the target is told, once");
+    }
+
+    #[test]
+    fn dropping_a_host_with_no_live_session_sends_nothing() {
+        let (mut backend, shared) = backend_with_a_live_session();
+        backend.session_live = false;
+
+        drop(backend);
+
+        assert!(sent_types(&shared).is_empty(), "silence, because there is nothing to close");
+    }
 
     #[test]
     fn srcmap_carries_qualified_method_names() {

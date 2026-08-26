@@ -848,6 +848,40 @@ pub mod board_model {
     /// file states no carrier for exactly that reason.
     pub const ARDUINO_UNO_Q: u16 = 36;
 
+    /// Microchip SAM D11 Xplained Pro (ATSAMD11D14AM, Cortex-M0+, 16 KB flash / 4 KB SRAM). Its kit
+    /// prints
+    /// only "ATSAMD11D14A", which names four ordering codes across three packages; the board is
+    /// the 24-pin QFN, identified by the four pads its headers name that no other package carries
+    /// and confirmed by a DSU read returning DID `0x10030100`.
+    pub const ATSAMD11_XPLAINED_PRO: u16 = 37;
+
+    /// Microchip ATSAMD10 Xplained Mini (ATSAMD10D14AM, Cortex-M0+, 16 KB flash / 4 KB SRAM) --
+    /// the same core and memory as the SAM D11 Xplained Pro on a part with no USB at all, and the
+    /// first board here whose flash size could not be read off any document it ships with: its
+    /// package comes in 16 KB and 8 KB variants with identical pads, and only DID `0x10020100`
+    /// separates them. An mEDBG rather than an EDBG, so a different USB product id.
+    pub const ATSAMD10_XPLAINED_MINI: u16 = 38;
+
+    /// ST NUCLEO-L011K4 (STM32L011K4T6, Cortex-M0+, 16 KB flash / 2 KB SRAM) -- the smallest RAM
+    /// of any board here. Its virtual COM port does NOT ride the PA2/PA3 pair every other Nucleo
+    /// uses: the receive line is PA15, and on this part USART2 is selected at AF4 where the L476
+    /// selects it at AF7, so neither the pin nor the function number carries across from a sibling.
+    pub const NUCLEO_L011K4: u16 = 39;
+
+    /// ST NUCLEO-U5A5ZJ-Q (STM32U5A5ZJT6Q, Cortex-M33, 4 MB flash / 2496 KB contiguous SRAM) --
+    /// the largest RAM of any board here, and the MB1549 reference board it shares with the
+    /// NUCLEO-U575ZI-Q carries two different parts, so the board id and not the board shape is
+    /// what selects the chip row. Its strata are `csp/stm32u5a5`, NOT `csp/stm32u585`: the U5's
+    /// reference manual puts the two in different product columns and gives this one a GPIOJ the
+    /// U585 does not have.
+    pub const NUCLEO_U5A5ZJ_Q: u16 = 40;
+
+    /// ST NUCLEO-L053R8 (STM32L053R8T6, Cortex-M0+, 64 KB flash / 8 KB SRAM). Its strata are
+    /// `csp/stm32l053`, NOT `csp/stm32l0`: that family is the L0x1 line at category 1, and this
+    /// part is L0x3 at category 3 -- a different reference manual, a different datasheet, three
+    /// more GPIO ports and a USART1 the other line does not have.
+    pub const NUCLEO_L053R8: u16 = 41;
+
     /// The display name for a `board_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
@@ -892,6 +926,11 @@ pub mod board_model {
             ARDUINO_UNO_R4_MINIMA => "Arduino UNO R4 Minima",
             ARDUINO_PORTENTA_H7 => "Arduino Portenta H7",
             ARDUINO_UNO_Q => "Arduino UNO Q",
+            ATSAMD11_XPLAINED_PRO => "SAM D11 Xplained Pro",
+            ATSAMD10_XPLAINED_MINI => "ATSAMD10 Xplained Mini",
+            NUCLEO_L011K4 => "NUCLEO-L011K4",
+            NUCLEO_U5A5ZJ_Q => "NUCLEO-U5A5ZJ-Q",
+            NUCLEO_L053R8 => "NUCLEO-L053R8",
             _ => return None,
         })
     }

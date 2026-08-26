@@ -12,14 +12,15 @@ use lamella_syntax::version::LanguageVersion;
 use lamella_binder::{
     Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, CodeNamespace, ConversionKind,
     Diagnostic as BinderDiagnostic, FieldReference, Model, SpecialType, TypeSymbol,
-    bind_compilation_unit_with_dialect, bind_type, collect_into, load_assembly,
+    bind_type, collect_into, load_assembly,
     parameter_symbol, resolve_constants,
 };
 use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, encode_with_offsets, write_method_body};
 use lamella_metadata::signature::element;
 use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_name};
 use lamella_pe::{
-    DebugDocument, ImageBuilder, LocalVariable, MethodDebug, PARAM_OUT, ParamRow, SequencePoint,
+    DebugDocument, ImageBuilder, LocalVariable, MethodDebug, PARAM_HAS_DEFAULT, PARAM_OPTIONAL,
+    PARAM_OUT, ParamRow, SequencePoint,
     TypeSig,
     field_signature, generic_method_signature, local_signature, method_signature,
     method_spec_signature, property_signature, type_signature, vararg_call_site_signature,
@@ -58,6 +59,24 @@ const TYPE_BEFORE_FIELD_INIT: u32 = 0x0010_0000;
 
 /// The Nested* visibility bits (II.23.1.15) for a nested type, from its declared accessibility.
 /// A nested type is PRIVATE by default (10.5.1); the explicit `private` lands here too.
+/// The `TypeAttributes` visibility bits (II.23.1.15) a type declaration asks for, in the top-level
+/// range or the `Nested*` range as the type's POSITION requires -- the two ranges are disjoint and
+/// a `TypeDef` with an enclosing type must use the nested one or the image is refused.
+///
+/// **EVERY TYPE KIND ASKS HERE, AND THAT IS WHY THERE IS ONE STATEMENT RATHER THAN FOUR.** A kind
+/// whose emitter writes a literal `Public` bit instead -- an interface, a delegate, an enum -- makes
+/// `internal interface`, `internal delegate` and `internal enum` ship PUBLIC: the declared boundary
+/// of the assembly, visible to every consumer, with nothing anywhere saying so.
+fn type_visibility(modifiers: &[Modifier], is_nested: bool) -> u32 {
+    if is_nested {
+        nested_visibility(modifiers)
+    } else if modifiers.contains(&Modifier::Public) {
+        0x0000_0001
+    } else {
+        0x0000_0000
+    }
+}
+
 fn nested_visibility(modifiers: &[Modifier]) -> u32 {
     if modifiers.contains(&Modifier::Public) {
         0x0000_0002
@@ -80,6 +99,7 @@ const METHOD_NEWSLOT: u16 = 0x0100;
 const METHOD_PINVOKE_IMPL: u16 = 0x2000;
 const METHOD_FINAL: u16 = 0x0020;
 const METHOD_ABSTRACT: u16 = 0x0400;
+const METHOD_CHECK_ACCESS_ON_OVERRIDE: u16 = 0x0200;
 const INTERFACE_FLAGS: u32 =
     0x0000_0001 | 0x0000_0020 | 0x0000_0080 | TYPE_BEFORE_FIELD_INIT;
 const IFACE_METHOD_FLAGS: u16 =
@@ -139,7 +159,7 @@ impl Diagnostic {
     pub(crate) fn from_syntax(diagnostic: &SyntaxDiagnostic) -> Diagnostic {
         Diagnostic {
             code: diagnostic.code(),
-            namespace: CodeNamespace::Cs,
+            namespace: diagnostic.kind.namespace(),
             severity: diagnostic.severity(),
             message: format!("{}", diagnostic.kind),
             span: diagnostic.span,
@@ -348,11 +368,18 @@ fn compile(
     embed_pdb: bool,
     language_version: LanguageVersion,
 ) -> Compilation {
-    let diagnostics: Vec<Diagnostic> =
-        bind_compilation_unit_with_dialect(unit, references, unsafe_option_missing, language_version)
-        .iter()
-        .map(Diagnostic::from_binder)
-        .collect();
+    let diagnostics: Vec<Diagnostic> = lamella_binder::bind_compilation_unit_with_options(
+        unit,
+        references,
+        lamella_binder::BindOptions {
+            unsafe_option_missing,
+            language_version,
+            compiling_assembly: assembly_name,
+        },
+    )
+    .iter()
+    .map(Diagnostic::from_binder)
+    .collect();
     let had_error = diagnostics.iter().any(Diagnostic::is_error);
     let units = core::slice::from_ref(unit);
     let Some(program) = ValidatedProgram::from_clean_bind(units, references, had_error) else {
@@ -450,6 +477,7 @@ pub fn compile_sources_with(
             lamella_binder::BindOptions {
                 unsafe_option_missing,
                 language_version,
+                compiling_assembly: assembly_name,
             },
         ))
     {
@@ -503,10 +531,14 @@ pub fn compile_sources_with(
 /// matches a qualified argument, so the emit-time call resolution silently fails ("a call that
 /// did not resolve") -- and a simple name shared by two namespaces resolves to the WRONG one or
 /// to none.
-fn reference_model(units: &[CompilationUnit], references: &[Assembly]) -> Model {
+fn reference_model(
+    units: &[CompilationUnit],
+    references: &[Assembly],
+    assembly_name: &str,
+) -> Model {
     let mut model = Model::new();
     for reference in references {
-        load_assembly(&mut model, reference);
+        load_assembly(&mut model, reference, assembly_name);
     }
     for unit in units {
         collect_into(&mut model, unit);
@@ -562,7 +594,7 @@ fn build_image(
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let units = program.units;
     let references = program.references;
-    let model = reference_model(units, references);
+    let model = reference_model(units, references, assembly_name);
     let mut binder = Binder::with_model(model);
     let contexts: Vec<DebugContext> = debug
         .into_iter()
@@ -1000,7 +1032,7 @@ fn encode_value(
     if let TypeSymbol::Array { element, rank: 1 } = &resolved {
         return encode_array(binder, tokens, enclosing, expr, element, blob);
     }
-    if let ExprKind::Name(name) = &expr.kind {
+    if let ExprKind::Name { name, .. } = &expr.kind {
         if let Some(constant) = binder
             .model()
             .get_by_symbol(enclosing)
@@ -1231,7 +1263,7 @@ fn enum_member_constant(model: &Model, expr: &Expr) -> Option<(TypeSymbol, i64)>
     let ExprKind::MemberAccess { receiver, name } = &expr.kind else {
         return None;
     };
-    let ExprKind::Name(enum_name) = &receiver.kind else {
+    let ExprKind::Name { name: enum_name, .. } = &receiver.kind else {
         return None;
     };
     let enum_ty = TypeSymbol::Named([enum_name.clone()].into());
@@ -1805,12 +1837,26 @@ fn emit_interface(
     continuation: Option<Token>,
 ) -> Result<Token, crate::EmitError> {
     let enclosing = declared_type_symbol(namespace, declaration);
+    let enclosing_type = binder
+        .model()
+        .get_by_symbol(&enclosing)
+        .and_then(|info| info.enclosing.clone());
     let type_token = match continuation {
         Some(token) => token,
         None => {
             let nil = Token::new(TYPE_DEF, 0);
+            let metadata_namespace = if enclosing_type.is_some() { "" } else { namespace };
+            let flags = (INTERFACE_FLAGS & !0x0000_0007)
+                | type_visibility(&declaration.modifiers, enclosing_type.is_some());
             let token =
-                image.add_type(namespace, &declared_type_name(declaration), nil, INTERFACE_FLAGS);
+                image.add_type(metadata_namespace, &declared_type_name(declaration), nil, flags);
+            if let Some(enclosing_full) = &enclosing_type {
+                if let Some(enclosing_token) =
+                    tokens.type_token(&type_symbol_from_dotted(enclosing_full))
+                {
+                    image.add_nested_class(token, enclosing_token);
+                }
+            }
             emit_generic_parameters(
                 image,
                 tokens,
@@ -1876,7 +1922,7 @@ fn emit_interface(
             );
             let method =
                 image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS, &parameter_names(parameters));
-            emit_param_array_marker(image, tokens, method, parameters);
+            emit_declared_parameter_metadata(image, binder, tokens, &enclosing, method, parameters);
         }
     }
     let mut first_property = None;
@@ -2025,7 +2071,20 @@ fn emit_delegate(
         mint_signature_type(binder, &binder.canonicalize(&bind_type(&parameter.ty)), &[], &inherited, image, tokens)?;
     }
     let base = system_base(image, tokens, "MulticastDelegate");
-    image.add_type(namespace, &declaration.name, base, DELEGATE_TYPE_FLAGS);
+    let delegate_ty = named_symbol(namespace, &declaration.name);
+    let enclosing_type = binder
+        .model()
+        .get_by_symbol(&delegate_ty)
+        .and_then(|info| info.enclosing.clone());
+    let metadata_namespace = if enclosing_type.is_some() { "" } else { namespace };
+    let flags = (DELEGATE_TYPE_FLAGS & !0x0000_0007)
+        | type_visibility(&declaration.modifiers, enclosing_type.is_some());
+    let delegate_token = image.add_type(metadata_namespace, &declaration.name, base, flags);
+    if let Some(enclosing_full) = &enclosing_type {
+        if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
+            image.add_nested_class(delegate_token, enclosing_token);
+        }
+    }
     let ctor_signature =
         method_signature(true, &[TypeSig::Object, TypeSig::NativeInt], &TypeSig::Void);
     image.add_runtime_method(
@@ -2059,7 +2118,7 @@ fn emit_delegate(
         DELEGATE_INVOKE_FLAGS,
         &parameter_names(&declaration.parameters),
     );
-    emit_param_array_marker(image, tokens, invoke, &declaration.parameters);
+    emit_declared_parameter_metadata(image, binder, tokens, &named_symbol(namespace, &declaration.name), invoke, &declaration.parameters);
     Ok(())
 }
 
@@ -2092,10 +2151,9 @@ fn emit_enum(
         .model()
         .get_by_symbol(&enum_ty)
         .and_then(|info| info.enclosing.clone());
-    let (metadata_namespace, flags) = match &enclosing {
-        Some(_) => ("", (ENUM_TYPE_FLAGS & !0x0000_0007) | 0x0000_0002),
-        None => (namespace, ENUM_TYPE_FLAGS),
-    };
+    let metadata_namespace = if enclosing.is_some() { "" } else { namespace };
+    let flags = (ENUM_TYPE_FLAGS & !0x0000_0007)
+        | type_visibility(&declaration.modifiers, enclosing.is_some());
     let enum_type_token = image.add_type(metadata_namespace, &declaration.name, base, flags);
     if let Some(enclosing_full) = &enclosing {
         if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
@@ -2226,6 +2284,70 @@ fn base_class_ctor(image: &mut ImageBuilder, tokens: &Tokens, base_class: &TypeS
         return image.member_ref(parent, ".ctor", &method_signature(true, &[], &TypeSig::Void));
     }
     object_base_ctor(image, tokens)
+}
+
+/// The base constructor an IMPLICIT `: base()` calls when it is not the parameterless one, with
+/// the default arguments it needs -- `None` when the ordinary parameterless lookup is right.
+///
+/// **"TAKES NO PARAMETERS" AND "IS CALLABLE WITH NO ARGUMENTS" ARE DIFFERENT QUESTIONS**, and
+/// `base_class_ctor` asks the first. Against `class B { public B(int v = 9) { } }` it finds
+/// nothing, and its fallback mints a parameterless `.ctor` `MemberRef` on a fabricated `TypeRef` --
+/// which, having no resolution scope, resolves against `mscorlib`. The CLR then answers
+/// `TypeLoadException: Could not load type 'B' from assembly 'mscorlib'` for a type this module
+/// DEFINES. Measured by running the image; every compile-time gate called it clean.
+fn implicit_base_chain(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+) -> Option<(Token, Vec<BoundExpr>)> {
+    let base = binder.model().get_by_symbol(enclosing)?.base.clone()?;
+    let constructors = binder.model().get_by_symbol(&base)?.constructors.clone();
+    if constructors.iter().any(|c| c.parameters.is_empty()) {
+        return None;
+    }
+    let chosen = constructors
+        .iter()
+        .find(|c| c.accepts_argument_count(0) && !c.parameters.is_empty())?;
+    let arguments: Vec<BoundExpr> = (0..chosen.parameters.len())
+        .map(|index| {
+            let literal = chosen.parameter_default(index)?.clone();
+            Some(default_argument_expr(&chosen.parameters[index], &literal))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let reference = lamella_binder::MethodReference {
+        declaring_type: base.clone(),
+        name: ".ctor".into(),
+        parameters: chosen.parameters.clone(),
+        return_type: TypeSymbol::Special(SpecialType::Void),
+        is_static: false,
+        is_vararg: chosen.is_vararg,
+        instantiation: None,
+        declaring_instantiation: None,
+    };
+    let ctor = tokens
+        .method(&base, ".ctor", &chosen.parameters)
+        .or_else(|| {
+            mint_member_ref(&reference, image, tokens);
+            tokens.method(&base, ".ctor", &chosen.parameters)
+        })?;
+    Some((ctor, arguments))
+}
+
+/// A default argument as a bound expression of the parameter's own type -- the emitter's copy of
+/// the rule `Binder::default_argument` applies at a call site, and it must stay the same rule:
+/// `Literal::Null` is csc's ENCODING for four different defaults, one of which is a struct's.
+fn default_argument_expr(parameter_ty: &TypeSymbol, literal: &Literal) -> BoundExpr {
+    if matches!(literal, Literal::Null) && !matches!(parameter_ty, TypeSymbol::Special(SpecialType::String | SpecialType::Object | SpecialType::Null)) {
+        return BoundExpr {
+            kind: BoundExprKind::DefaultValue(parameter_ty.clone()),
+            ty: parameter_ty.clone(),
+        };
+    }
+    BoundExpr {
+        kind: BoundExprKind::Literal(literal.clone()),
+        ty: parameter_ty.clone(),
+    }
 }
 
 /// Emits one type, with its own type parameters IN SCOPE for the whole emission.
@@ -2377,16 +2499,8 @@ fn emit_type_inner(
         };
         let merged = merged_modifiers(declaration, later);
         let modifiers = merged.as_slice();
-        let (metadata_namespace, mut flags) = if nested_in.is_some() {
-            ("", (flags & !0x0000_0007) | nested_visibility(modifiers))
-        } else {
-            let visibility = if modifiers.contains(&Modifier::Public) {
-                0x0000_0001
-            } else {
-                0x0000_0000
-            };
-            (namespace, (flags & !0x0000_0007) | visibility)
-        };
+        let metadata_namespace = if nested_in.is_some() { "" } else { namespace };
+        let mut flags = (flags & !0x0000_0007) | type_visibility(modifiers, nested_in.is_some());
         if modifiers.contains(&Modifier::Abstract) {
             flags |= TYPE_ABSTRACT;
         }
@@ -2522,15 +2636,18 @@ fn emit_type_inner(
             ..
         } = member
         {
-            let signature = field_signature(&type_sig(tokens, &binder.canonicalize(&bind_type(ty)))?);
-            let flags = FIELD_PRIVATE
-                | if modifiers.contains(&Modifier::Static) {
-                    FIELD_STATIC
-                } else {
-                    0
-                };
-            for declarator in declarators {
-                image.add_field(&declarator.name, &signature, flags);
+            if event_has_backing_field(modifiers, declaration.kind == TypeKind::Interface) {
+                let signature =
+                    field_signature(&type_sig(tokens, &binder.canonicalize(&bind_type(ty)))?);
+                let flags = FIELD_PRIVATE
+                    | if modifiers.contains(&Modifier::Static) {
+                        FIELD_STATIC
+                    } else {
+                        0
+                    };
+                for declarator in declarators {
+                    image.add_field(&declarator.name, &signature, flags);
+                }
             }
         }
     }
@@ -2651,7 +2768,8 @@ fn emit_type_inner(
                 ..
             } if find_dll_import(name, attributes).is_some() => {
                 emit_pinvoke_method(
-                    image, binder, tokens, modifiers, name, return_type, parameters, attributes,
+                    image, binder, tokens, &enclosing, modifiers, name, return_type, parameters,
+                    attributes,
                 )?;
             }
             Member::Method {
@@ -2962,47 +3080,65 @@ fn emit_event(
         member_visibility(modifiers)
             | SPECIAL_NAME
             | METHOD_HIDEBYSIG
-            | if is_static { METHOD_STATIC } else { 0 }
+            | if is_static {
+                METHOD_STATIC
+            } else {
+                slot_flags(modifiers, member_visibility(modifiers))
+            }
     };
     let params = [(Box::<str>::from("value"), event_ty.clone())];
-    let add = emit_method_body(
-        image,
-        binder,
-        tokens,
-        enclosing,
-        &[],
-        &[],
-        &accessor_name("add_", name),
-        &void,
-        &params,
-        &[],
-        &event_accessor_body(name, AssignmentOperator::Add),
-        is_static,
-        false,
-        false,
-        flags,
-        None,
-        debug,
-    )?;
-    let remove = emit_method_body(
-        image,
-        binder,
-        tokens,
-        enclosing,
-        &[],
-        &[],
-        &accessor_name("remove_", name),
-        &void,
-        &params,
-        &[],
-        &event_accessor_body(name, AssignmentOperator::Subtract),
-        is_static,
-        false,
-        false,
-        flags,
-        None,
-        debug,
-    )?;
+    let (add, remove) = if modifiers.contains(&Modifier::Abstract) {
+        let signature = method_signature(
+            true,
+            &[member_type_sig(tokens, enclosing, event_ty)?],
+            &TypeSig::Void,
+        );
+        let value = [ParamRow::from(SETTER_VALUE_PARAMETER)];
+        let add = image.add_abstract_method(&accessor_name("add_", name), &signature, flags, &value);
+        let remove =
+            image.add_abstract_method(&accessor_name("remove_", name), &signature, flags, &value);
+        (add, remove)
+    } else {
+        let add = emit_method_body(
+            image,
+            binder,
+            tokens,
+            enclosing,
+            &[],
+            &[],
+            &accessor_name("add_", name),
+            &void,
+            &params,
+            &[],
+            &event_accessor_body(name, AssignmentOperator::Add),
+            is_static,
+            false,
+            false,
+            flags,
+            None,
+            debug,
+        )?;
+        let remove = emit_method_body(
+            image,
+            binder,
+            tokens,
+            enclosing,
+            &[],
+            &[],
+            &accessor_name("remove_", name),
+            &void,
+            &params,
+            &[],
+            &event_accessor_body(name, AssignmentOperator::Subtract),
+            is_static,
+            false,
+            false,
+            flags,
+            None,
+            debug,
+        )?;
+        (add, remove)
+    };
     let event_type_token = tokens
         .type_token(event_ty)
         .ok_or(crate::EmitError::Unsupported(
@@ -3051,7 +3187,11 @@ fn emit_custom_event(
         member_visibility(modifiers)
             | SPECIAL_NAME
             | METHOD_HIDEBYSIG
-            | if is_static { METHOD_STATIC } else { 0 }
+            | if is_static {
+                METHOD_STATIC
+            } else {
+                slot_flags(modifiers, member_visibility(modifiers))
+            }
     };
     let params = [(Box::<str>::from("value"), event_ty.clone())];
     let accessor_token = |prefix: &str,
@@ -3108,7 +3248,7 @@ fn emit_custom_event(
 /// `Delegate.Combine`/`Remove` exactly as a source `E += h` inside the type would.
 fn event_accessor_body(field: &str, operator: AssignmentOperator) -> Stmt {
     let span = Span::new(0, 0);
-    let reference = |text: &str| Expr::new(ExprKind::Name(text.into()), span);
+    let reference = |text: &str| Expr::name(text, span);
     let assignment = Expr::new(
         ExprKind::Assignment {
             operator,
@@ -3150,9 +3290,10 @@ fn emit_abstract_method(
         &parameter_sigs,
         &member_type_sig(tokens, &enclosing, &binder.canonicalize(&bind_type(return_type)))?,
     );
-    let flags = member_visibility(modifiers) | slot_flags(modifiers);
+    let visibility = member_visibility(modifiers);
+    let flags = visibility | slot_flags(modifiers, visibility);
     let method = image.add_abstract_method(name, &signature, flags, &parameter_names(parameters));
-    emit_param_array_marker(image, tokens, method, parameters);
+    emit_declared_parameter_metadata(image, binder, tokens, enclosing, method, parameters);
     Ok(method)
 }
 
@@ -3291,21 +3432,17 @@ fn emit_one_method_in_scope(
             &return_symbol,
             body_token,
         )?;
-        emit_param_array_marker(image, tokens, body_token, parameters);
+        emit_declared_parameter_metadata(image, binder, tokens, enclosing, body_token, parameters);
         return Ok(body_token);
     }
     let is_static = modifiers.contains(&Modifier::Static);
-    let is_virtual = modifiers.contains(&Modifier::Virtual);
-    let is_override = modifiers.contains(&Modifier::Override);
     let mut flags = member_visibility(modifiers) | extra_flags;
     if is_static {
         flags |= METHOD_STATIC;
     }
-    if is_virtual || is_override {
-        flags |= METHOD_VIRTUAL | METHOD_HIDEBYSIG;
-        if is_virtual {
-            flags |= METHOD_NEWSLOT;
-        }
+    let slots = slot_flags(modifiers, member_visibility(modifiers));
+    if slots != 0 {
+        flags |= slots;
     } else if !is_static
         && binder.member_implements_interface(
             enclosing,
@@ -3334,7 +3471,7 @@ fn emit_one_method_in_scope(
         None,
         debug,
     )?;
-    emit_param_array_marker(image, tokens, method, parameters);
+    emit_declared_parameter_metadata(image, binder, tokens, enclosing, method, parameters);
     Ok(method)
 }
 
@@ -3512,6 +3649,15 @@ fn parameter_names(parameters: &[Parameter]) -> Vec<ParamRow> {
         .collect()
 }
 
+/// An `i64` as an unsuffixed integer [`Literal`], the shape every integral constant path here
+/// wants.
+fn integer_constant(value: i64) -> Literal {
+    Literal::Integer {
+        value: value as u64,
+        suffix: lamella_syntax::token::IntegerSuffix::None,
+    }
+}
+
 /// The `ParameterAttributes` a declared modifier means (II.23.1.13).
 ///
 /// **`out` AND `ref` ARE THE SAME SIGNATURE AND DIFFERENT METADATA.** Both encode a byref in the
@@ -3566,7 +3712,24 @@ fn ends_in_params_array(parameters: &[Parameter]) -> bool {
         .is_some_and(|parameter| parameter.modifier == Some(ParameterModifier::Params))
 }
 
-/// Emits `[System.ParamArrayAttribute]` on the last declared parameter of `method` when
+/// Emits the metadata a method's DECLARED parameters carry beyond their types: the
+/// `[ParamArrayAttribute]` marker on a `params` array, and the `Optional`/`HasDefault` bits plus
+/// `Constant` row of every optional parameter.
+///
+/// **ONE FUNCTION AT ONE SET OF SITES, because these are the same question asked twice.** The
+/// obvious home for the default looked like `parameter_names`, which builds the `Param` rows -- but
+/// it builds them for the ABSTRACT, interface, delegate and P/Invoke paths only; an ordinary
+/// method's rows come from `bound_parameter_names` off the BOUND parameter list, which has no
+/// syntax to read a default from. Putting the case in one of two builders is how a rule with
+/// several implementations gains it in none of them, and the tell here was a 34-row control table
+/// in which every form compiled and every flag read `0x0000`.
+///
+/// This function already ran at every site that emits a method from declared parameters, already
+/// had the method token, and already reached back into the finished `Param` run. It is the seam.
+///
+/// ---
+///
+/// The `params` half: `[System.ParamArrayAttribute]` on the last declared parameter when
 /// `parameters` ends in a `params` array (17.5.1.4) -- the empty-argument marker blob, matching
 /// what csc writes byte for byte.
 ///
@@ -3580,16 +3743,38 @@ fn ends_in_params_array(parameters: &[Parameter]) -> bool {
 ///
 /// Silently skipped if `System.ParamArrayAttribute` does not resolve -- a corlib being compiled
 /// before that type exists, which is the same lenient posture the other synthesized markers take.
-fn emit_param_array_marker(
+fn emit_declared_parameter_metadata(
     image: &mut ImageBuilder,
+    binder: &Binder,
     tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
     method: Token,
     parameters: &[Parameter],
 ) {
+    let rows = image.method_parameters(method);
+    for (index, parameter) in parameters.iter().enumerate() {
+        let Some(expr) = &parameter.default_value else {
+            continue;
+        };
+        let Some(&param) = rows.get(index) else {
+            continue;
+        };
+        let mut flags = image.param_flags(param) | PARAM_OPTIONAL;
+        let ty = binder.canonicalize(&parameter_symbol(parameter));
+        if let Some(literal) = lamella_binder::parameter_default_in_model(binder.model(), enclosing, expr) {
+            if let Some((element, value)) = constant_row(binder.model(), &ty, &literal) {
+                flags |= PARAM_HAS_DEFAULT;
+                image.add_constant(param, element, &value);
+            } else if matches!(ty, TypeSymbol::Special(SpecialType::Decimal)) {
+                emit_decimal_parameter_attribute(image, tokens, &literal, param);
+            }
+        }
+        image.set_param_flags(param, flags);
+    }
     if !ends_in_params_array(parameters) {
         return;
     }
-    let Some(&param) = image.method_parameters(method).get(parameters.len() - 1) else {
+    let Some(&param) = rows.get(parameters.len() - 1) else {
         return;
     };
     let Some(constructor) =
@@ -3692,6 +3877,7 @@ fn emit_pinvoke_method(
     image: &mut ImageBuilder,
     binder: &Binder,
     tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
     modifiers: &[Modifier],
     name: &str,
     return_type: &TypeRef,
@@ -3729,7 +3915,7 @@ fn emit_pinvoke_method(
     let flags =
         member_visibility(modifiers) | METHOD_STATIC | METHOD_HIDEBYSIG | METHOD_PINVOKE_IMPL;
     let method = image.add_pinvoke_method(name, &signature, flags, &parameter_names(parameters));
-    emit_param_array_marker(image, tokens, method, parameters);
+    emit_declared_parameter_metadata(image, binder, tokens, enclosing, method, parameters);
     let module_ref = image.add_module_ref(&dll_import.library);
     image.add_impl_map(method, dll_import.mapping_flags, &dll_import.entry_point, module_ref);
     Ok(())
@@ -3759,13 +3945,23 @@ fn emit_constructor(
         .iter()
         .map(|parameter| (parameter.name.clone(), binder.canonicalize(&bind_type(&parameter.ty))))
         .collect();
-    let base_prologue = || base_ctor.map(|ctor| ConstructorPrologue {
-        ctor,
-        span: header_span,
-        arguments: Vec::new(),
-        leading_body: 0,
-        zero_initialize: None,
-    });
+    let implicit_base = implicit_base_chain(image, binder, tokens, enclosing);
+    let base_prologue = || match &implicit_base {
+        Some((ctor, arguments)) => Some(ConstructorPrologue {
+            ctor: *ctor,
+            span: header_span,
+            arguments: arguments.clone(),
+            leading_body: 0,
+            zero_initialize: None,
+        }),
+        None => base_ctor.map(|ctor| ConstructorPrologue {
+            ctor,
+            span: header_span,
+            arguments: Vec::new(),
+            leading_body: 0,
+            zero_initialize: None,
+        }),
+    };
     let zero_initialize = match initializer {
         Some(init)
             if init.kind == ConstructorInitializerKind::This
@@ -3803,7 +3999,7 @@ fn emit_constructor(
             Some(&prologue),
             debug,
         )?;
-        emit_param_array_marker(image, tokens, ctor, parameters);
+        emit_declared_parameter_metadata(image, binder, tokens, enclosing, ctor, parameters);
         return Ok(ctor);
     }
     let mut prologue = match initializer {
@@ -3871,7 +4067,7 @@ fn emit_constructor(
         prologue.as_ref(),
         debug,
     )?;
-    emit_param_array_marker(image, tokens, ctor, parameters);
+    emit_declared_parameter_metadata(image, binder, tokens, enclosing, ctor, parameters);
     Ok(ctor)
 }
 
@@ -3995,6 +4191,35 @@ fn wrap_finalizer(body: BoundStmt, base: &lamella_binder::MethodReference) -> Bo
 /// token. Shared by ordinary methods, constructors' callers, and property
 /// accessors -- the parameters and return are already bound symbols.
 #[allow(clippy::too_many_arguments)]
+/// Wraps `return_sig` in `modreq(System.Runtime.CompilerServices.IsExternalInit)` when the caller
+/// marked the member being emitted as an `init` accessor, and CONSUMES the mark.
+///
+/// **THE ONE PLACE THE MARK IS READ**, so an `init` accessor cannot be emitted down one path with
+/// the modifier and down another without it -- both signature paths in `emit_method_body` (the
+/// async stub and the ordinary one) call this, and each takes the mark or leaves it clear.
+///
+/// A modifier this build cannot MINT is dropped rather than faked: the type comes from the corlib
+/// in scope, and a compilation with no such type has nothing to name. That is the only silent
+/// path, and it is the same one every synthesized attribute takes.
+fn apply_init_only_modifier(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    return_sig: TypeSig,
+) -> Result<TypeSig, crate::EmitError> {
+    if !core::mem::take(&mut tokens.next_return_is_external_init) {
+        return Ok(return_sig);
+    }
+    let marker = named_symbol("System.Runtime.CompilerServices", "IsExternalInit");
+    mint_named_type_token(&marker, image, tokens);
+    let Some(modifier) = tokens.type_token(&marker) else {
+        return Ok(return_sig);
+    };
+    Ok(TypeSig::Modified {
+        modifier,
+        inner: Box::new(return_sig),
+    })
+}
+
 fn emit_method_body(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -4056,6 +4281,7 @@ fn emit_method_body(
             })
             .collect::<Result<_, _>>()?;
         let return_sig = open_type_sig(tokens, return_symbol, scope)?;
+        let return_sig = apply_init_only_modifier(image, tokens, return_sig)?;
         let signature = method_signature(!is_static, &parameter_sigs, &return_sig);
         let stub_token = image.add_method_deferred_body(
             name,
@@ -4320,6 +4546,7 @@ fn emit_bound_body_in_scope(
         })
         .collect::<Result<_, _>>()?;
     let return_sig = open_type_sig(tokens, return_symbol, scope)?;
+    let return_sig = apply_init_only_modifier(image, tokens, return_sig)?;
     let signature = if is_vararg {
         vararg_method_signature(!is_static, &parameter_sigs, &return_sig)
     } else if method_type_parameters.is_empty() {
@@ -4656,7 +4883,21 @@ fn emit_property(
         );
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let params = [(Box::from("value"), property_ty.clone())];
+        let setter_void = if setter.is_init {
+            let marker = named_symbol("System.Runtime.CompilerServices", "IsExternalInit");
+            mint_named_type_token(&marker, image, tokens);
+            match tokens.type_token(&marker) {
+                Some(modifier) => TypeSig::Modified {
+                    modifier,
+                    inner: Box::new(TypeSig::Void),
+                },
+                None => TypeSig::Void,
+            }
+        } else {
+            TypeSig::Void
+        };
         let token = if let Some(body) = &setter.body {
+            tokens.next_return_is_external_init = setter.is_init;
             let token = emit_method_body(
                 image, binder, tokens, enclosing, &[], &[], &method_name, &void, &params, &[], body,
                 is_static, false, false, flags, None, debug,
@@ -4677,13 +4918,13 @@ fn emit_property(
             Some(token)
         } else if is_abstract {
             let signature =
-                method_signature(true, &[member_type_sig(tokens, enclosing, &property_ty)?], &TypeSig::Void);
+                method_signature(true, &[member_type_sig(tokens, enclosing, &property_ty)?], &setter_void);
             Some(image.add_abstract_method(&method_name, &signature, flags, &by_value_parameter_names(&params)))
         } else if let Some(field) = backing {
             let signature = method_signature(
                 !is_static,
                 &[member_type_sig(tokens, enclosing, &property_ty)?],
-                &TypeSig::Void,
+                &setter_void,
             );
             let token = emit_auto_accessor(
                 image,
@@ -4728,6 +4969,19 @@ fn emit_property(
 /// field is `initonly`, and a half-written `{ get; set { ... } }` is not an auto-property at all --
 /// the binder refuses each with its own diagnostic, and this predicate is what keeps the emitter
 /// from synthesizing a field for either.
+/// Whether a field-like event declaration (`event H E;`) carries a synthesized backing delegate
+/// field. An ordinary one does; an `abstract` one does not, because it declares only the contract
+/// -- its `add_E`/`remove_E` are bodyless and there is nothing to combine a handler onto. An
+/// interface event is abstract for the same reason.
+///
+/// **BOTH POSITIONS OF THIS RULE CALL IT.** The token pre-pass reserves the field row and the
+/// emitter writes it, and a `TypeDef`'s field range runs to where the next type's begins
+/// (II.22.37) -- so the two answering differently does not lose a field, it shifts every field
+/// token after it. This is [`is_auto_property`]'s shape for the member kind beside it.
+fn event_has_backing_field(modifiers: &[Modifier], is_interface: bool) -> bool {
+    !is_interface && !modifiers.contains(&Modifier::Abstract)
+}
+
 fn is_auto_property(
     modifiers: &[Modifier],
     getter: Option<&lamella_syntax::ast::Accessor>,
@@ -4940,11 +5194,12 @@ fn property_accessor_flags(
         } else {
             accessor_modifiers
         };
-        let mut flags = member_visibility(visibility) | SPECIAL_NAME;
+        let level = member_visibility(visibility);
+        let mut flags = level | SPECIAL_NAME;
         if is_static {
             flags |= METHOD_STATIC;
         } else {
-            flags |= slot_flags(modifiers);
+            flags |= slot_flags(modifiers, level);
         }
         flags
     }
@@ -5010,7 +5265,7 @@ fn emit_indexer(
         };
         if let Some(token) = token {
             emit_attributes(image, binder, tokens, enclosing, token, &getter.attributes);
-            emit_param_array_marker(image, tokens, token, parameters);
+            emit_declared_parameter_metadata(image, binder, tokens, enclosing, token, parameters);
             image.add_method_semantics(SEMANTICS_GETTER, token, property);
         }
     }
@@ -5044,7 +5299,7 @@ fn emit_indexer(
         };
         if let Some(token) = token {
             emit_attributes(image, binder, tokens, enclosing, token, &setter.attributes);
-            emit_param_array_marker(image, tokens, token, parameters);
+            emit_declared_parameter_metadata(image, binder, tokens, enclosing, token, parameters);
             image.add_method_semantics(SEMANTICS_SETTER, token, property);
         }
     }
@@ -5348,11 +5603,16 @@ fn accessor_name(prefix: &str, property: &str) -> String {
 }
 
 /// The vtable-slot attributes (II.23.1.10) implied by a member's `virtual`/`override`/
-/// `abstract` modifiers, on top of its accessibility: `virtual` and plain `abstract` open a
-/// fresh slot (Virtual | NewSlot); `override` reuses the inherited slot (Virtual, no
-/// NewSlot); `abstract` additionally marks the method bodyless (Abstract). A member with
-/// none of these keeps the default non-virtual binding (0).
-fn slot_flags(modifiers: &[Modifier]) -> u16 {
+/// `abstract`/`sealed` modifiers, on top of its accessibility: `virtual` and plain `abstract` open
+/// a fresh slot (Virtual | NewSlot); `override` reuses the inherited slot (Virtual, no
+/// NewSlot); `abstract` additionally marks the method bodyless (Abstract); `sealed override`
+/// closes the slot to further overriding (Final, 17.5.6). A member with none of these keeps the
+/// default non-virtual binding (0).
+///
+/// **THE ONE STATEMENT OF THIS RULE.** Every member kind that can carry these modifiers --
+/// method, property, indexer and both forms of event -- calls this function rather than
+/// restating it, so a slot attribute is decided in one place for all of them.
+fn slot_flags(modifiers: &[Modifier], visibility: u16) -> u16 {
     let is_abstract = modifiers.contains(&Modifier::Abstract);
     let is_virtual = modifiers.contains(&Modifier::Virtual);
     let is_override = modifiers.contains(&Modifier::Override);
@@ -5365,6 +5625,12 @@ fn slot_flags(modifiers: &[Modifier]) -> u16 {
     }
     if is_abstract {
         flags |= METHOD_ABSTRACT;
+    }
+    if modifiers.contains(&Modifier::Sealed) {
+        flags |= METHOD_FINAL;
+    }
+    if visibility & 0x0007 == 0x0003 {
+        flags |= METHOD_CHECK_ACCESS_ON_OVERRIDE;
     }
     flags
 }
@@ -5446,6 +5712,26 @@ fn const_field_row(
     field_ty: &TypeSymbol,
 ) -> Option<(u8, alloc::vec::Vec<u8>)> {
     let literal = model.get_by_symbol(enclosing)?.find_field(name)?.constant.clone()?;
+    constant_row(model, field_ty, &literal)
+}
+
+/// A `Constant` row's (element type, little-endian blob) for `literal` held at type `ty`
+/// (II.22.9), or `None` when the type has no constant encoding.
+///
+/// **SHARED BY `const` FIELDS AND OPTIONAL PARAMETERS, because II.22.9 is one table and they write
+/// the same row.** Three of its rules are ones a second copy would get wrong, and all three were
+/// measured against csc rather than read off the standard:
+///
+/// * a NULL reference is `CLASS` (0x12) with four zero bytes -- and csc writes it for `= null`,
+///   for `default(string)`, for `int? x = null` AND for `default(S)` on a struct;
+/// * an ENUM constant takes its UNDERLYING integer's element type and width, not the enum's;
+/// * a `decimal` has no encoding here at all and travels in a `[DecimalConstant]` attribute.
+fn constant_row(
+    model: &Model,
+    field_ty: &TypeSymbol,
+    literal: &Literal,
+) -> Option<(u8, alloc::vec::Vec<u8>)> {
+    let literal = literal.clone();
     if matches!(literal, Literal::Null) {
         return Some((0x12, alloc::vec![0u8; 4]));
     }
@@ -5458,6 +5744,7 @@ fn const_field_row(
         let value = lamella_binder::literal_int_value(&literal)?;
         return Some((element, value.to_le_bytes()[..width].to_vec()));
     }
+    let field_ty = lamella_binder::nullable_underlying(field_ty).unwrap_or(field_ty);
     let TypeSymbol::Special(special) = field_ty else {
         return None;
     };
@@ -5735,10 +6022,11 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 };
                 let initobj_creation =
                     constructor.parameters.is_empty() && is_value_type(&constructor.declaring_type, tokens);
-                if !initobj_creation
-                    && tokens
-                        .method(&constructor.declaring_type, &constructor.name, &def_key)
-                        .is_none()
+                if initobj_creation {
+                    mint_value_type_token(&constructor.declaring_type, image, tokens);
+                } else if tokens
+                    .method(&constructor.declaring_type, &constructor.name, &def_key)
+                    .is_none()
                 {
                     mint_member_ref(constructor, image, tokens);
                 }
@@ -7205,10 +7493,27 @@ fn mint_member_signature_types(
     Ok(())
 }
 
-/// Mints the metadata token a `box`/`unbox.any` names for the value type `ty`. A
+/// Mints the metadata token a `box`/`unbox.any`/`initobj` names for the value type `ty`. A
 /// module struct already has its `TypeDef` token (nothing to do); a primitive needs a
-/// `System.*` `TypeRef`.
+/// `System.*` `TypeRef`; a CONSTRUCTED GENERIC struct needs its blob-keyed `TypeSpec`.
+///
+/// **AN INSTANTIATION IS DELEGATED, AND THIS IS THE FOURTH MINTING ENTRY TO NEED THE CASE.**
+/// [`mint_named_type_token`] says the same thing about its own arm, and the shape repeated exactly:
+/// `Own<int>` boxed out of a LOCAL worked, because the local's declared type comes through that
+/// function -- while the identical box out of a PARAMETER or a FIELD refused, because those have no
+/// declaration in the body and the box's own minting reached only [`TypeSymbol::Special`]. One
+/// construct, four minting entries, and the case landed in a subset of them again
+/// (`a-rule-with-several-implementations-gains-a-new-case-in-none-of-them`).
+///
+/// Delegated rather than re-handled. Building the `GENERICINST` blob here would be a second
+/// implementation of "the `TypeSpec` naming a constructed type", and the two would drift -- the
+/// mistake [`mint_type_token`]'s own note records having made under a `Display` key, where
+/// `Box<!!0>` and `Box<!0>` are one string and two rows.
 fn mint_value_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    if matches!(ty, TypeSymbol::Instantiation { .. }) {
+        mint_type_token(image, tokens, ty);
+        return;
+    }
     if tokens.type_token(ty).is_some() {
         return;
     }
@@ -7273,6 +7578,46 @@ fn emit_decimal_constant_attribute(
     else {
         return;
     };
+    emit_decimal_constant_blob(image, tokens, lo, mid, hi, scale, negative, field);
+}
+
+/// `[DecimalConstant]` on a `Param`, for an optional parameter whose default is a `decimal`.
+///
+/// A decimal has no `Constant`-table encoding at all (II.22.9 has no element type for it), so csc
+/// writes `Optional` WITHOUT `HasDefault` and puts the value in this attribute -- the same trick a
+/// `const decimal` FIELD uses, and measured on both.
+fn emit_decimal_parameter_attribute(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    literal: &Literal,
+    param: Token,
+) {
+    let Literal::Decimal {
+        lo,
+        mid,
+        hi,
+        scale,
+        negative,
+    } = literal
+    else {
+        return;
+    };
+    emit_decimal_constant_blob(image, tokens, *lo, *mid, *hi, *scale, *negative, param);
+}
+
+/// The shared half: mint `DecimalConstantAttribute`'s five-argument `.ctor` and attach its value
+/// blob to `parent` -- a `Field` for a `const decimal`, a `Param` for an optional one.
+#[allow(clippy::too_many_arguments)]
+fn emit_decimal_constant_blob(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    lo: u32,
+    mid: u32,
+    hi: u32,
+    scale: u8,
+    negative: bool,
+    parent: Token,
+) {
     let attr_ty = named_symbol("System.Runtime.CompilerServices", "DecimalConstantAttribute");
     let params = [
         TypeSymbol::Special(SpecialType::Byte),
@@ -7300,7 +7645,7 @@ fn emit_decimal_constant_attribute(
     blob.extend_from_slice(&mid.to_le_bytes());
     blob.extend_from_slice(&lo.to_le_bytes());
     blob.extend_from_slice(&[0x00, 0x00]);
-    image.add_custom_attribute(field, ctor, &blob);
+    image.add_custom_attribute(parent, ctor, &blob);
 }
 
 /// Mints `System.Decimal.op_Increment`/`op_Decrement` (`decimal -> decimal`): a `decimal++`/`--`
@@ -7460,7 +7805,7 @@ fn static_field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
                 continue;
             };
             let span = declarator.span;
-            let target = Expr::new(ExprKind::Name(declarator.name.clone()), span);
+            let target = Expr::name(declarator.name.clone(), span);
             let assignment = Expr::new(
                 ExprKind::Assignment {
                     operator: AssignmentOperator::Assign,
@@ -7563,11 +7908,11 @@ fn any_part_declares_instance_constructor(
 ///
 /// **A PARTIAL TYPE'S MODIFIERS ARE THE UNION OF ITS PARTS' (17.1.4), SO A QUESTION ABOUT ONE HAS
 /// TO BE ASKED OF EVERY PART.** Asking the declaration in hand answers about one part and reads
-/// exactly like an answer about the type, which is why this went unnoticed in FOUR bits at once:
-/// `partial class Q { }` + `abstract partial class Q { }` emitted a type that was not abstract, and
-/// `partial class V { }` + `public partial class V { }` emitted one that was not public -- so a
-/// type the source declares public shipped as `NotPublic` and every consumer outside the assembly
-/// saw CS0122 or CS0246 for a type that is right there.
+/// exactly like an answer about the type, which is what makes it invisible at every bit at once:
+/// `partial class Q { }` + `abstract partial class Q { }` yields a type that is not abstract, and
+/// `partial class V { }` + `public partial class V { }` yields one that is not public -- so a type
+/// the source declares public ships as `NotPublic` and every consumer outside the assembly sees
+/// CS0122 or CS0246 for a type that is right there.
 ///
 /// **THE RETURN IS A LIST, NOT A PREDICATE, BECAUSE THE CALLER ASKS SEVERAL QUESTIONS.** Visibility
 /// alone is four modifiers wide (`nested_visibility` reads `public`/`protected`/`internal`/
@@ -8077,8 +8422,13 @@ fn collect_type_tokens(
                 );
             }
         }
-        if let Member::EventField { declarators, .. } = member {
-            if !is_interface {
+        if let Member::EventField {
+            modifiers,
+            declarators,
+            ..
+        } = member
+        {
+            if event_has_backing_field(modifiers, is_interface) {
                 for declarator in declarators {
                     *next_field += 1;
                     tokens.insert_field(
@@ -8671,7 +9021,7 @@ mod tests {
 
         let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
         let mut model = Model::new();
-        lamella_binder::load_assembly(&mut model, &assembly);
+        lamella_binder::load_assembly(&mut model, &assembly, "");
         let holder = model.get("App", "Holder").expect("the emitted type");
         let method = holder
             .methods
@@ -8946,7 +9296,7 @@ mod tests {
         };
         let assembly = Assembly::read(reference).expect("the fixture parses");
         let mut model = Model::new();
-        load_assembly(&mut model, &assembly);
+        load_assembly(&mut model, &assembly, "");
         Binder::with_model(model).bind_expression(expr)
     }
 
@@ -9151,11 +9501,11 @@ mod tests {
     /// **AN *IMPORTED* GENERIC METHOD ON A GENERIC TYPE IS STILL REFUSED, AND THE REASON MOVED.**
     /// The emitter could already write this shape for a THIS-MODULE declaration
     /// (`a_generic_method_on_a_generic_type_declared_here`); what blocked the IMPORTED spelling was
-    /// one layer earlier and was not a generics-emission gap at all. `reference::sigtype_to_symbol`
-    /// decoded `ELEMENT_TYPE_MVAR` to its declared NAME and had no arm for `ELEMENT_TYPE_VAR`, so
-    /// `Fixture.Holder<TOuter>.Echo<TMethod>(TMethod) -> TOuter` arrived with
-    /// `parameters: [Named(["TMethod"])]` and `return_type: Error` -- one rule, two numbering
-    /// spaces, the case in one of them.
+    /// one layer earlier and is not a generics-emission question at all. `reference::sigtype_to_symbol`
+    /// must decode `ELEMENT_TYPE_VAR` as well as `ELEMENT_TYPE_MVAR`: with an arm for only one,
+    /// `Fixture.Holder<TOuter>.Echo<TMethod>(TMethod) -> TOuter` arrives as
+    /// `parameters: [Named(["TMethod"])]` with `return_type: Error` -- **one rule, two numbering
+    /// spaces, the case written in one of them.**
     ///
     /// **BOTH HALVES ARE ASSERTED HERE BECAUSE ONLY THE PAIR SEPARATES THE TWO SPACES.** A decode
     /// that answered every numbered parameter from the METHOD's list would give this signature
@@ -9371,6 +9721,146 @@ mod tests {
     /// disappears the day the gate lifts: this helper should then become an ordinary
     /// `compile_source` call, and the test that still passes is the one that was measuring the
     /// right thing.
+    /// The `Param` rows of the single method named `name`, as `(sequence, flags, constant)` --
+    /// the shape the optional-parameter parity harness compares against csc, asserted here so a
+    /// regression is caught by `cargo test` and not only by a tool that needs an SDK beside it.
+    fn param_rows_of(image: &[u8], name: &str) -> Vec<(u32, u32, Option<(u8, Vec<u8>)>)> {
+        let assembly = lamella_metadata::Assembly::read(image).expect("the image parses");
+        let method = assembly
+            .type_defs()
+            .flat_map(|t| t.methods().collect::<Vec<_>>())
+            .find(|m| m.name() == Some(name))
+            .expect("the method is in the image");
+        method
+            .params()
+            .filter(|p| p.sequence() != 0)
+            .map(|p| {
+                let constant = p.constant().map(|c| (constant_tag(&c), constant_blob(&c)));
+                (p.sequence(), p.flags(), constant)
+            })
+            .collect()
+    }
+
+    /// A `ConstantValue`'s element-type byte and little-endian blob, for the assertions below.
+    /// Only the shapes those tests use; anything else is a test bug rather than a compiler one.
+    fn constant_tag(value: &lamella_metadata::ConstantValue) -> u8 {
+        match value {
+            lamella_metadata::ConstantValue::I4(_) => 0x08,
+            lamella_metadata::ConstantValue::String(_) => 0x0e,
+            lamella_metadata::ConstantValue::Null => 0x12,
+            other => panic!("unexpected constant shape in this test: {other:?}"),
+        }
+    }
+
+    fn constant_blob(value: &lamella_metadata::ConstantValue) -> Vec<u8> {
+        match value {
+            lamella_metadata::ConstantValue::I4(n) => n.to_le_bytes().to_vec(),
+            lamella_metadata::ConstantValue::String(units) => {
+                units.iter().flat_map(|u| u.to_le_bytes()).collect()
+            }
+            lamella_metadata::ConstantValue::Null => alloc::vec![0u8; 4],
+            other => panic!("unexpected constant shape in this test: {other:?}"),
+        }
+    }
+
+    /// Compiles `source` at C# 4 -- the rung an optional parameter needs -- and returns the image.
+    /// The C# 2 helper beside this one cannot serve: the parser gates `= expr` below 4.
+    fn image_of_csharp4_source(source: &str) -> Vec<u8> {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp4,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(source, options);
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "the source must PARSE cleanly under C# 4: {:?}",
+            parsed.diagnostics
+        );
+        let units = alloc::vec![parsed.unit];
+        let references: Vec<Assembly> = Vec::new();
+        let diagnostics = lamella_binder::bind_compilation_unit_with_dialect(
+            &units[0],
+            &references,
+            false,
+            LanguageVersion::CSharp4,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "the source must BIND cleanly at C# 4: {:?}",
+            diagnostics.iter().map(|d| alloc::format!("{}", d.kind)).collect::<Vec<_>>()
+        );
+        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+            .expect("the barrier is minted from the assertion above");
+        let (image, _) = build_image(&program, "test.dll", "test", None, false, false)
+            .expect("an optional parameter emits");
+        image
+    }
+
+    /// AN OPTIONAL PARAMETER IS `Optional|HasDefault` PLUS A `Constant` ROW -- `0x1010`, which is
+    /// what csc writes for every default that IS a constant (measured over 34 forms in
+    /// the optional-parameter parity harness).
+    ///
+    /// **RED-PROOF: drop `PARAM_HAS_DEFAULT` from `emit_declared_parameter_metadata` and the flag
+    /// assertion fails; drop the `add_constant` call and the row assertion fails.** Before this
+    /// landed the whole declaration was refused by the feature gate, so both read nothing at all.
+    #[test]
+    fn an_optional_parameter_carries_its_flags_and_its_constant_row() {
+        let image = image_of_csharp4_source(
+            "public class P { public void M(int a, int b = 7, string s = \"hi\") { } }",
+        );
+        let rows = param_rows_of(&image, "M");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1, 0x0000, "a required parameter carries no bits");
+        assert_eq!(rows[0].2, None);
+        assert_eq!(rows[1].1, 0x1010, "Optional | HasDefault");
+        assert_eq!(rows[1].2, Some((0x08, alloc::vec![7, 0, 0, 0])));
+        assert_eq!(rows[2].1, 0x1010);
+        assert_eq!(
+            rows[2].2,
+            Some((0x0e, alloc::vec![b'h', 0, b'i', 0])),
+            "a Constant-table string is raw UTF-16, not a length-prefixed SerString"
+        );
+    }
+
+    /// csc SPELLS FOUR DIFFERENT DEFAULTS AS A NULL REFERENCE, and the fourth is the one no
+    /// reading of the standard predicts: `default(S)` on a STRUCT.
+    ///
+    #[test]
+    fn every_shape_csc_spells_as_a_null_reference_is_spelled_that_way_here() {
+        let image = image_of_csharp4_source(
+            "public struct S { public int N; } \
+             public class P { public void M(string a = null, string b = default(string), \
+             S d = default(S)) { } }",
+        );
+        let rows = param_rows_of(&image, "M");
+        assert_eq!(rows.len(), 3);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.1, 0x1010, "parameter {index}");
+            assert_eq!(
+                row.2,
+                Some((0x12, alloc::vec![0u8; 4])),
+                "parameter {index} must be a NullReference constant -- including the struct"
+            );
+        }
+    }
+
+    /// AN ENUM DEFAULT IS ITS UNDERLYING INTEGER'S CONSTANT, not the enum's -- and the value has
+    /// to survive the model-aware fold that resolves `E.B` against another type.
+    ///
+    /// **RED-PROOF: remove the `MemberAccess` arm from `parameter_default_in_model` and the
+    /// constant goes to `None` while the flags keep `Optional` -- exactly the half-emitted shape
+    /// that would let a caller omit an argument this compiler cannot supply.**
+    #[test]
+    fn an_enum_member_default_folds_to_its_underlying_integer() {
+        let image = image_of_csharp4_source(
+            "public enum E { A, B, C } public class P { public void M(E e = E.C) { } }",
+        );
+        let rows = param_rows_of(&image, "M");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, 0x1010);
+        assert_eq!(rows[0].2, Some((0x08, alloc::vec![2, 0, 0, 0])));
+    }
+
     fn image_of_gated_source(source: &str) -> Vec<u8> {
         let options = LexOptions {
             version: LanguageVersion::CSharp2,
@@ -9465,6 +9955,445 @@ mod tests {
     fn image_of_source_against_generic_fixture(source: &str) -> Option<Vec<u8>> {
         let fixture = reference_fixture(NESTED_FIXTURE)?;
         Some(image_of_source_against(&fixture, source))
+    }
+
+    /// Compiles `source` under C# 2 with no references and returns the image, like
+    /// [`image_of_gated_source`] -- but named, so a reference's `[assembly: InternalsVisibleTo]`
+    /// has something to match and a consumer can be compiled twice under two different names.
+    fn named_image_of(assembly_name: &str, source: &str) -> Vec<u8> {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(source, options);
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "the source must PARSE cleanly under C# 2: {:?}",
+            parsed.diagnostics
+        );
+        let compiled = crate::compile_unit_with_references(
+            &parsed.unit,
+            &alloc::format!("{assembly_name}.dll"),
+            assembly_name,
+            &[],
+        );
+        assert!(
+            !compiled.diagnostics.iter().any(Diagnostic::is_error),
+            "the library must COMPILE: {:?}",
+            compiled.diagnostics
+        );
+        compiled.image.expect("a clean bind emits an image")
+    }
+
+    /// The diagnostic codes a consumer named `assembly_name` gets for `source` against `library`.
+    fn consumer_codes(assembly_name: &str, library: &[u8], source: &str) -> Vec<u16> {
+        let options = LexOptions {
+            version: LanguageVersion::CSharp2,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(source, options);
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
+            "the consumer must PARSE cleanly: {:?}",
+            parsed.diagnostics
+        );
+        let references = alloc::vec![Assembly::read(library).expect("the library parses")];
+        let compiled = crate::compile_unit_with_references(
+            &parsed.unit,
+            &alloc::format!("{assembly_name}.dll"),
+            assembly_name,
+            &references,
+        );
+        compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// **A REFERENCED ASSEMBLY'S `internal` MEMBERS ARE NOT IMPORTED, SO NAMING ONE IS AN ABSENCE
+    /// RATHER THAN A PROTECTION LEVEL.** csc reads a reference at `MetadataImportOptions.Public`
+    /// -- public, `protected` and `protected internal` only -- so a cross-assembly `internal`
+    /// constructor is `CS1729` (*no constructor takes 1 arguments*) and a cross-assembly `internal`
+    /// method is `CS1061`, both measured. lcsc imported them and reported `CS0122` instead, which
+    /// is the right family and the wrong sentence; and because nothing then STOPPED the call, an
+    /// `internal` constructor reached across an assembly boundary compiled clean.
+    ///
+    /// **THIS REACHES REAL LIBRARIES, NOT ONLY CONTRIVED ONES.** A library in this tree compiles
+    /// against such a constructor and csc refuses the same source, so the two disagree on whether
+    /// the assembly builds at all -- which is what an A/B oracle against csc exists to catch.
+    #[test]
+    fn a_reference_s_internal_members_are_not_imported() {
+        let library = named_image_of(
+            "Lib",
+            "namespace Lib {
+                 public class Result {
+                     internal Result(int n) { }
+                     internal int Peek() { return 0; }
+                     public int Open() { return 1; }
+                 }
+             }\n",
+        );
+        assert_eq!(
+            consumer_codes(
+                "Consumer",
+                &library,
+                "namespace App { class P { static void M() { object o = new Lib.Result(1); } } }\n",
+            ),
+            alloc::vec![1729],
+            "an internal constructor of another assembly does not exist here"
+        );
+        assert_eq!(
+            consumer_codes(
+                "Consumer",
+                &library,
+                "namespace App { class P { static void M() { Lib.Result r = null; r.Peek(); } } }\n",
+            ),
+            alloc::vec![1061],
+            "and neither does an internal method"
+        );
+        assert!(
+            consumer_codes(
+                "Consumer",
+                &library,
+                "namespace App { class P { static void M() { Lib.Result r = null; r.Open(); } } }\n",
+            )
+            .is_empty(),
+            "THE CONTROL: the public member on the SAME type still binds, so this is a filter and \
+             not a blanket refusal"
+        );
+    }
+
+    /// **A VIRTUAL METHOD IS IMPORTED WHATEVER ITS ACCESS, AND THIS ROW IS ABOUT THE CONTRACT A
+    /// DERIVED TYPE INHERITS RATHER THAN ABOUT WHAT THIS ONE MAY CALL.** An `internal abstract`
+    /// member is exactly what a derived class in ANOTHER assembly cannot supply, so a filter that
+    /// drops it makes `class D : ImportedBase { }` compile where csc reports `CS0534` -- a contract
+    /// that does not fail but silently vanishes. Not reachable from the `internal`-member test
+    /// above, which asks what a CALL sees; found by a hand-written control after it was green.
+    #[test]
+    fn an_internal_abstract_member_of_a_reference_is_still_owed_by_a_derived_class() {
+        let library = named_image_of(
+            "Lib",
+            "namespace Lib {
+                 public abstract class Owed { public abstract int Pub(); internal abstract int Hidden(); }
+             }\n",
+        );
+        assert_eq!(
+            consumer_codes(
+                "Consumer",
+                &library,
+                "namespace App { class D : Lib.Owed { public override int Pub() { return 1; } } }\n",
+            ),
+            alloc::vec![534],
+            "an internal abstract member is owed -- and cannot be supplied from another assembly"
+        );
+        assert!(
+            consumer_codes(
+                "Consumer",
+                &library,
+                "namespace App { abstract class D : Lib.Owed { public override int Pub() { return 1; } } }\n",
+            )
+            .is_empty(),
+            "THE CONTROL: an ABSTRACT derived class owes nothing, so this is the inherited-contract \
+             rule and not a blanket refusal to derive"
+        );
+    }
+
+    /// **AND AN `[assembly: InternalsVisibleTo]` NAMING THE COMPILATION PUTS THEM BACK.** The grant
+    /// is keyed on the ASSEMBLY NAME, not on the file: the identical consumer source compiled under
+    /// a different `/out` name is refused again, which is the control that separates "the friend
+    /// declaration was read" from "the filter stopped running".
+    ///
+    /// The attribute is declared in the library's own source rather than taken from a corlib
+    /// fixture, so the test states its whole world and cannot be moved by a corlib rebuild.
+    #[test]
+    fn a_friend_declaration_restores_a_reference_s_internal_members_by_name() {
+        let library = named_image_of(
+            "Lib",
+            "[assembly: System.Runtime.CompilerServices.InternalsVisibleTo(\"Friend\")]
+             namespace System { public class Attribute { } }
+             namespace System.Runtime.CompilerServices {
+                 public sealed class InternalsVisibleToAttribute : System.Attribute {
+                     public InternalsVisibleToAttribute(string assemblyName) { }
+                 }
+             }
+             namespace Lib { public class Result { internal Result(int n) { } } }\n",
+        );
+        let use_it =
+            "namespace App { class P { static void M() { object o = new Lib.Result(1); } } }\n";
+        assert!(
+            consumer_codes("Friend", &library, use_it).is_empty(),
+            "the assembly the declaration NAMES reaches the internal constructor"
+        );
+        assert_eq!(
+            consumer_codes("Stranger", &library, use_it),
+            alloc::vec![1729],
+            "and any other assembly does not -- the grant is a name, not a switch"
+        );
+    }
+
+    /// **A MEMBER BESIDE AN EXPLICIT IMPLEMENTATION IMPLEMENTS NOTHING, AND WAS GIVEN THE
+    /// INTERFACE'S SLOT ANYWAY.** 13.4.4 looks for an explicit implementation FIRST and only then
+    /// for a public member, so when `int ILeft.Value()` is present the plain `public int Value()`
+    /// beside it implements no interface member at all -- csc gives it no `virtual`, `newslot` or
+    /// `final`, and this compiler gave it all three.
+    ///
+    /// The two controls are most of the value. `Plain` implements the same interface IMPLICITLY and
+    /// its members MUST keep the sealed-virtual slot; `Lonely` implements nothing and must have
+    /// none.
+    #[test]
+    fn a_member_beside_an_explicit_implementation_takes_no_interface_slot() {
+        let image = named_image_of(
+            "Ax",
+            "namespace Ax {
+                 public delegate void Handler();
+                 public interface ILeft { int Value(); int Prop { get; } event Handler E; }
+                 public interface IRight { int Value(); }
+                 public class Both : ILeft, IRight {
+                     int ILeft.Value() { return 0; }
+                     int IRight.Value() { return 0; }
+                     int ILeft.Prop { get { return 0; } }
+                     event Handler ILeft.E { add { } remove { } }
+                     public int Value() { return 0; }
+                     public int Prop { get { return 0; } }
+                     public event Handler E;
+                     public void Poke() { if (E != null) { E(); } }
+                 }
+                 public class Plain : ILeft {
+                     public int Value() { return 0; }
+                     public int Prop { get { return 0; } }
+                     public event Handler E;
+                     public void Poke() { if (E != null) { E(); } }
+                 }
+                 public class Lonely {
+                     public int Value() { return 0; }
+                     public int Prop { get { return 0; } }
+                     public event Handler E;
+                     public void Poke() { if (E != null) { E(); } }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the library parses");
+        let mut slots = alloc::collections::BTreeMap::new();
+        for ty in assembly.type_defs() {
+            let Some(name) = ty.name().map(|n| n.name) else { continue };
+            for method in ty.methods() {
+                let Some(member) = method.name() else { continue };
+                let slot = method.flags() as u16
+                    & (METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_ABSTRACT);
+                slots.insert(alloc::format!("{name}::{member}"), slot);
+            }
+        }
+        let sealed_virtual = METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL;
+
+        for member in ["ILeft.Value", "IRight.Value", "ILeft.get_Prop", "ILeft.add_E", "ILeft.remove_E"] {
+            assert_eq!(
+                slots[&alloc::format!("Both::{member}")],
+                sealed_virtual,
+                "{member} is the explicit implementation and holds the slot"
+            );
+        }
+        for member in ["Value", "get_Prop", "add_E", "remove_E"] {
+            assert_eq!(
+                slots[&alloc::format!("Both::{member}")],
+                0,
+                "Both::{member} sits beside an explicit implementation and implements nothing"
+            );
+        }
+
+        for member in ["Value", "get_Prop", "add_E", "remove_E"] {
+            assert_eq!(
+                slots[&alloc::format!("Plain::{member}")],
+                sealed_virtual,
+                "Plain::{member} implements ILeft implicitly and MUST keep the slot"
+            );
+        }
+        for member in ["Value", "get_Prop", "add_E", "remove_E", "Poke"] {
+            assert_eq!(
+                slots[&alloc::format!("Lonely::{member}")],
+                0,
+                "Lonely implements nothing"
+            );
+        }
+        assert_eq!(slots["Both::Poke"], 0, "an ordinary method is never virtual");
+    }
+
+    /// **A TYPE'S VISIBILITY AND ITS NESTING FOLLOW ITS DECLARATION, AT EVERY TYPE KIND.** The rule
+    /// is one statement, because a per-kind copy that writes a literal `Public` bit ships an
+    /// `internal` interface, delegate or enum as PUBLIC surface -- the declared boundary of the
+    /// assembly, visible to every consumer, with nothing anywhere saying so.
+    ///
+    /// **THE NESTING HALF IS WORSE THAN A WRONG BIT.** `emit_nested_types` hands the enclosing
+    /// type's full name where a namespace goes, so a path that does not translate it into real
+    /// nesting emits a nested interface or delegate as a TOP-LEVEL type whose metadata namespace is
+    /// the literal string `Lib.Outer`, with no `NestedClass` row at all.
+    /// **A consumer in another assembly then cannot name it at all**: `Outer.INested`, the spelling
+    /// the source declares, is CS0426 when csc reads the emitted assembly, because that type has no
+    /// such member. Not a shape difference -- an unreachable type.
+    ///
+    /// Every expected value here was measured against csc on the same source.
+    #[test]
+    fn a_type_s_visibility_and_nesting_follow_its_declaration_at_every_type_kind() {
+        let image = named_image_of(
+            "Lib",
+            "namespace Lib {
+                 public class Open { }
+                 internal class Hidden { }
+                 public interface IShown { void M(); }
+                 internal interface IHidden { void M(); }
+                 public delegate void ShownHandler();
+                 internal delegate void HiddenHandler();
+                 public enum ShownChoice { First }
+                 internal enum HiddenChoice { First }
+                 public class Outer {
+                     public class Shown { }
+                     private class Buried { }
+                     internal interface INested { void M(); }
+                     private delegate void NestedHandler();
+                     protected internal enum NestedChoice { First }
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the library parses");
+        let mut seen = alloc::collections::BTreeMap::new();
+        for ty in assembly.type_defs() {
+            let Some(name) = ty.name() else { continue };
+            if name.name == "<Module>" {
+                continue;
+            }
+            let nested = ty.enclosing_type().is_some();
+            seen.insert(
+                alloc::string::String::from(name.name),
+                (
+                    alloc::string::String::from(name.namespace),
+                    ty.flags() & 0x0000_0007,
+                    nested,
+                ),
+            );
+        }
+        let top = |ns: &str, visibility: u32| {
+            (alloc::string::String::from(ns), visibility, false)
+        };
+        let nested = |visibility: u32| (alloc::string::String::new(), visibility, true);
+
+        assert_eq!(seen["Open"], top("Lib", 0x01), "a public class");
+        assert_eq!(seen["Hidden"], top("Lib", 0x00), "an internal class");
+        assert_eq!(seen["IShown"], top("Lib", 0x01), "a public interface");
+        assert_eq!(seen["IHidden"], top("Lib", 0x00), "an INTERNAL INTERFACE, which shipped public");
+        assert_eq!(seen["ShownHandler"], top("Lib", 0x01), "a public delegate");
+        assert_eq!(seen["HiddenHandler"], top("Lib", 0x00), "an INTERNAL DELEGATE, which shipped public");
+        assert_eq!(seen["ShownChoice"], top("Lib", 0x01), "a public enum");
+        assert_eq!(seen["HiddenChoice"], top("Lib", 0x00), "an INTERNAL ENUM, which shipped public");
+
+        assert_eq!(seen["Shown"], nested(0x02), "NestedPublic");
+        assert_eq!(seen["Buried"], nested(0x03), "NestedPrivate");
+        assert_eq!(
+            seen["INested"],
+            nested(0x05),
+            "a nested internal interface is NestedAssembly -- it was a top-level type named `Lib.Outer`"
+        );
+        assert_eq!(
+            seen["NestedHandler"],
+            nested(0x03),
+            "a nested private delegate is NestedPrivate -- it was a top-level type too"
+        );
+        assert_eq!(
+            seen["NestedChoice"],
+            nested(0x07),
+            "a nested protected-internal enum is NestedFamORAssem, not NestedPublic"
+        );
+    }
+
+    /// **AN EVENT'S ACCESSORS CARRY THE VTABLE SLOT ITS MODIFIERS ASK FOR, AND AN `abstract` ONE
+    /// IS BODYLESS.** The slot rule (II.23.1.10) has one statement per member kind in this
+    /// compiler, and an event form naming none of them ships a `virtual` or `abstract` event as a
+    /// plain non-virtual one -- so the contract DISAPPEARS from the metadata instead of failing: `class C : Abs { }` against such a library compiles here, compiles under csc,
+    /// links under NativeAOT and runs, with nothing anywhere saying the event can never be raised.
+    ///
+    /// The three assertions are three different failure modes, and only the first is visible to a
+    /// diagnostic: the flags are what a consumer binds against, the missing backing field is what
+    /// `event_has_backing_field` decides in two places at once, and RVA 0 is a CLI validity rule
+    /// the runtime enforces at type load (`TypeLoadException: Abstract method with non-zero RVA`)
+    /// from an image ilverify passes and a bit-for-bit flag comparison calls clean.
+    #[test]
+    fn an_event_s_accessors_carry_the_vtable_slot_its_modifiers_ask_for() {
+        let image = named_image_of(
+            "Lib",
+            "namespace Lib {
+                 public delegate void H();
+                 public abstract class Abs {
+                     public abstract event H AbsE;
+                     public virtual event H VirtE;
+                     public event H PlainE;
+                     public virtual event H CustomE { add { } remove { } }
+                 }
+                 public class Mid : Abs {
+                     public override event H AbsE;
+                     public sealed override event H VirtE;
+                 }
+             }\n",
+        );
+        let assembly = Assembly::read(&image).expect("the library parses");
+        let mut flags = alloc::collections::BTreeMap::new();
+        let mut rvas = alloc::collections::BTreeMap::new();
+        let mut fields = alloc::vec::Vec::new();
+        for ty in assembly.type_defs() {
+            let Some(type_name) = ty.name().map(|n| n.name) else { continue };
+            for method in ty.methods() {
+                let Some(name) = method.name() else { continue };
+                flags.insert(alloc::format!("{type_name}::{name}"), method.flags() as u16);
+                rvas.insert(alloc::format!("{type_name}::{name}"), method.rva());
+            }
+            for field in ty.fields() {
+                if let Some(name) = field.name() {
+                    fields.push(alloc::format!("{type_name}::{name}"));
+                }
+            }
+        }
+        let slot = |key: &str| flags[key] & (METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_ABSTRACT | METHOD_FINAL);
+
+        assert_eq!(
+            slot("Abs::add_AbsE"),
+            METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_ABSTRACT,
+            "an abstract event's accessors are abstract virtual newslot"
+        );
+        assert_eq!(
+            slot("Abs::add_VirtE"),
+            METHOD_VIRTUAL | METHOD_NEWSLOT,
+            "a virtual field-like event's accessors open a slot"
+        );
+        assert_eq!(
+            slot("Abs::add_CustomE"),
+            METHOD_VIRTUAL | METHOD_NEWSLOT,
+            "and so do a virtual custom-accessor event's"
+        );
+        assert_eq!(slot("Abs::add_PlainE"), 0, "a plain event has no slot");
+        assert_eq!(
+            slot("Mid::add_AbsE"),
+            METHOD_VIRTUAL,
+            "an override reuses the inherited slot rather than opening one"
+        );
+        assert_eq!(
+            slot("Mid::add_VirtE"),
+            METHOD_VIRTUAL | METHOD_FINAL,
+            "and `sealed override` closes it -- the case NO member kind handled"
+        );
+
+        assert_eq!(rvas["Abs::add_AbsE"], 0, "an abstract accessor has no body");
+        assert_eq!(rvas["Abs::remove_AbsE"], 0, "both of them");
+        assert!(
+            rvas["Abs::add_VirtE"] != 0,
+            "a virtual one still has the synthesized combine body"
+        );
+        assert!(
+            !fields.contains(&alloc::string::String::from("Abs::AbsE")),
+            "an abstract event declares a contract, not a backing field"
+        );
+        assert!(
+            fields.contains(&alloc::string::String::from("Abs::VirtE")),
+            "a virtual one still has its backing field"
+        );
     }
 
     /// [`image_of_source_against_generic_fixture`] for any reference assembly.
@@ -9954,11 +10883,11 @@ mod tests {
 
     /// **A MEMBER OF AN INSTANTIATED GENERIC TYPE IS NAMED BY A `MemberRef` WHOSE PARENT IS A
     /// `TypeSpec` CARRYING THE ARGUMENTS (II.23.2.1), AND EVERY WRONG ANSWER HERE DECODES
-    /// CLEANLY.** Measured before this landed, on exactly this source: `Box<int>.Echo(41)` emitted
-    /// a `MemberRef` parented on a `TypeRef` to this module's OWN `` Box`1 `` -- the `<int>` gone,
-    /// the signature substituted -- and `b.Get()` emitted `callvirt` straight at the open
-    /// `MethodDef`. Both compiled, exited 0, and produced IL instruction-for-instruction identical
-    /// to the non-generic control's.
+    /// CLEANLY.** On exactly this source, the wrong answers are: `Box<int>.Echo(41)` as a `MemberRef`
+    /// parented on a `TypeRef` to this module's OWN `` Box`1 `` -- the `<int>` gone, the signature
+    /// substituted -- and `b.Get()` as a `callvirt` straight at the open `MethodDef`. **Both
+    /// compile, exit 0, and produce IL instruction-for-instruction identical to the non-generic
+    /// control's.**
     ///
     /// **THE SIGNATURE IS ASSERTED AGAINST THE DEFINITION'S OWN `MethodDef` BLOB RATHER THAN
     /// AGAINST A LITERAL, AND THAT IS THE POINT OF THE ROW.** II.23.2.1 requires the `MemberRef` to
@@ -10120,10 +11049,10 @@ mod tests {
     /// that answered one row for both would make the probe's `open == closed` TRUE, which is the
     /// program's own refusal condition.
     ///
-    /// **MEASURED AGAINST csc BEFORE THIS WAS WRITTEN, with `System.Reflection.Metadata` over csc's
-    /// own output**: `typeof(List<>)` is `ldtoken` of the **TypeRef** `` List`1 ``,
-    /// `typeof(Dictionary<,>)` of `` Dictionary`2 ``, and `typeof(List<int>)` beside them of a
-    /// `TypeSpec`. lcsc now emits the same three shapes. The unbound form names no `TypeSpec` at
+    /// **MEASURED AGAINST csc with `System.Reflection.Metadata` over csc's own output**:
+    /// `typeof(List<>)` is `ldtoken` of the **TypeRef** `` List`1 ``, `typeof(Dictionary<,>)` of
+    /// `` Dictionary`2 ``, and `typeof(List<int>)` beside them of a `TypeSpec`. lcsc emits the same
+    /// three shapes. The unbound form names no `TypeSpec` at
     /// all, which is the half a `TypeSpec`-vs-`TypeSpec` comparison could not have caught.
     ///
     /// Declared in this module rather than imported, so the definition's row is a `TypeDef` and the
@@ -10240,7 +11169,7 @@ mod tests {
         assert!(emitted_sealed("Shut"), "a `sealed class` emits II.23.1.15's sealed bit");
         assert!(!emitted_sealed("Open"), "and an unsealed one does not -- the control");
         let mut model = Model::new();
-        lamella_binder::load_assembly(&mut model, &assembly);
+        lamella_binder::load_assembly(&mut model, &assembly, "");
         let modelled_sealed = |name: &str| -> bool {
             model
                 .get("Lib", name)
@@ -10256,7 +11185,7 @@ mod tests {
 
     /// **A PARTIAL TYPE'S FLAGS ARE THE UNION OF ITS PARTS' MODIFIERS (17.1.4), AND READING THE
     /// FIRST PART'S LIST ALONE IS AN ANSWER ABOUT ONE PART THAT LOOKS LIKE AN ANSWER ABOUT THE
-    /// TYPE.** Four bits were decided that way and all four were wrong for the same reason.
+    /// TYPE.** Every bit decided that way is wrong for the same reason.
     ///
     /// **VISIBILITY IS THE ONE THAT MATTERS MOST, AND IT IS NOT A FLAG NOBODY READS.**
     /// `partial class V { }` + `public partial class V { }` emitted `NotPublic`, so a type the
@@ -11767,9 +12696,9 @@ mod tests {
     /// **THE INTERFACE MUST BE IMPORTED, WHICH IS THE WHOLE REASON THIS TEST COMPILES A REFERENCE
     /// FIRST.** Written against a this-module interface the same program is green either way: an
     /// in-module qualifier finds a tokenized `MethodDef` and never reaches the `MemberRef` arm
-    /// where the defect lives. The first version of this test did exactly that, passed, and
-    /// stayed passing when the fix was reverted -- proving nothing, the same way the resolver test
-    /// that used a GLOBAL-namespace definition never exercised the scope search.
+    /// where the defect lives. A test written that way passes with the fix reverted --
+    /// proving nothing, the same way a resolver test using a GLOBAL-namespace definition never
+    /// exercises the scope search.
     ///
     /// **AND THE ASSERTION IS THE `TypeRef`'s NAMESPACE, BECAUSE "IT EMITTED" CANNOT SEE THE
     /// FAILURE THAT MATTERS.** Taking the spelling as written mints a `TypeRef` with an EMPTY
@@ -13476,6 +14405,15 @@ mod tests {
         );
     }
 
+    /// EVERY DECLARATION POSITION CARRIES THE METADATA FLAGS csc EMITS, ONE ROW EACH.
+    ///
+    /// **A MISSING FLAG IS INVISIBLE TO EVERY OTHER CHECK IN THIS TREE.** An emitter that does
+    /// not write one and a binder that does not require it agree with each other, and only a
+    /// consumer OUTSIDE the compilation disagrees -- so nothing inside can report it.
+    ///
+    /// **THE POSITIONS ARE THE TEST, NOT THE TOTAL.** A flag is rarely absent everywhere:
+    /// `HideBySig` reaches constructors, virtuals, abstracts and event accessors while missing the
+    /// rest, so a single method passes while three positions stay broken.
     #[test]
     fn every_declaration_position_carries_the_metadata_flags_csc_emits() {
         const HIDE_BY_SIG: u32 = 0x0080;
@@ -13797,7 +14735,7 @@ mod tests {
     /// DIFFERENT door, which is why the corlib ratchet counted three rows after the struct-`.ctor`
     /// fix closed the first two.
     ///
-    /// **An operator lowering names its BCL member outright and used to mint unconditionally.**
+    /// **An operator lowering names its BCL member outright, so it must not mint unconditionally.**
     /// `a + b` is `String.Concat`, `typeof(T)` is `Type.GetTypeFromHandle`; in a module that
     /// DEFINES `System.String` and `System.Type` those are this module's own `MethodDef`s, and the
     /// reference gave each type a second identity scoped to an `mscorlib` `AssemblyRef` the image
@@ -13811,10 +14749,10 @@ mod tests {
     /// model's synthetic `get_Item` -- so the guard that WAS there asked a question the table could
     /// not answer, and minted.
     ///
-    /// **A constructor with an explicit chain used to pay for the implicit one anyway.** The base
-    /// call was computed before the initializer was consulted, and computing it MINTS a reference
-    /// to the base's PARAMETERLESS constructor -- which a base like `Handle(bool, bool)` does not
-    /// have, so the rows named a member nothing declares and nothing called.
+    /// **A constructor with an explicit chain must not pay for the implicit one.** Computing the
+    /// base call before consulting the initializer MINTS a reference to the base's PARAMETERLESS
+    /// constructor -- which a base like `Handle(bool, bool)` does not have, so the rows would name
+    /// a member nothing declares and nothing calls.
     ///
     /// Both halves are asserted, because they fail independently: no `TypeRef` may name a type
     /// this module defines, AND no `MemberRef` may name one of these members however its parent is

@@ -85,9 +85,8 @@ pub const SEND_IF_COND_CHECK_PATTERN: u8 = 0xAA;
 /// with its own OCR and does NOT begin initializing, so a host that omits this polls a perfectly
 /// healthy card forever and concludes it never became ready.
 ///
-/// It is NOT needed on the SPI transport, which is why this constant did not exist until a
-/// native host needed it: in SPI mode the argument carries only [`ACMD41_HCS`] and the voltage
-/// negotiation does not happen. The same command, on two wires, wants two different arguments.
+/// It is NOT needed on the SPI transport: there the argument carries only [`ACMD41_HCS`] and the
+/// voltage negotiation does not happen. The same command, on two wires, wants two different arguments.
 pub const ACMD41_VOLTAGE_WINDOW: u32 = 0x00FF_8000;
 
 /// The high-capacity-support bit in the [`cmd::APP_SEND_OP_COND`] argument.

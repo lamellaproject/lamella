@@ -1,0 +1,20 @@
+# BLOCK: the STM32L0x3 flash controller, stated only as far as the one fact consumers outside the
+# controller need. The controller itself is not described here.
+#
+# THIS FAMILY ERASES TO ZERO, WHICH INVERTS THE USUAL BLANK CHECK. A correctly erased part reads as
+# full and a full part reads as erased.
+#
+
+[table]
+kind = "block"
+family = "stm32l053"
+block = "flash"
+erased_value = 0x00000000
+sources = [
+    "STM32L0x3 reference manual RM0367 Rev 8, the NVM chapter: NOTZEROERR is raised when a program targets a word whose content is not zero, which only coheres if an erased word IS zero",
+    "The STM32L053R8 array, which reads zero rather than ones after an erase -- the same controller behaviour established on an STM32L011",
+]
+notes = [
+    "The 2 Kbytes of data EEPROM this family carries are a separate array from the program flash, and nothing here states a value for them.",
+    "This block declares no registers. The register map of this controller is read and owned elsewhere, and a partial transcription here would be a second spelling of somebody else's source.",
+]

@@ -9,7 +9,15 @@ pub struct Artifact {
     pub bytes: Vec<u8>,
     /// The address the first byte belongs at, as the file stated it. A raw `.bin` states nothing,
     /// so it reads as 0 and the caller's own base applies.
-    pub base: u32,
+    /// The address the artifact SAYS it belongs at, where its format can say.
+    ///
+    /// **`None` IS NOT ZERO AND THE DIFFERENCE DECIDES A REFUSAL.** A flat `.bin` carries no
+    /// address at all -- it is bytes, and where they go is the caller's to know. `.hex`, `.s19` and
+    /// `.elf` each state one, and a stated address that disagrees with the board is worth stopping
+    /// for. Recording the absence as `0` made a flat binary look like a claim of address zero,
+    /// which is correct for a part that boots from 0 and refuses every image on a part that does
+    /// not.
+    pub base: Option<u32>,
     /// The format, for the line that reports what was written.
     pub format: &'static str,
 }
@@ -31,10 +39,22 @@ pub enum Kind {
     WirePayload,
 }
 
-/// The extension `path` carries, for a caller checking it against a format it requires.
+/// The extension `path` carries, lowercased, for a caller checking it against a format it requires.
 #[must_use]
-pub fn classify_format(path: &Path) -> Option<&str> {
-    path.extension().and_then(|extension| extension.to_str())
+pub fn classify_format(path: &Path) -> Option<String> {
+    extension_of(path)
+}
+
+/// `path`'s extension, lowercased, which is the only form anything here compares.
+///
+/// **AN EXTENSION IS NOT CASE-SENSITIVE WHERE THESE FILES COME FROM.** A vendor ships `FIRMWARE.BIN`
+/// and a release archive ships `IMAGE.HEX`; a Windows filesystem does not distinguish them from the
+/// lowercase spellings, so a reader who typed the name they can see gets a file that exists. Matched
+/// literally, `VENDOR.BIN` fell through every image arm and read as SOURCE -- and the refusal then
+/// offered `lamella deploy VENDOR.BIN`, which hands a binary to a C# compiler.
+///
+fn extension_of(path: &Path) -> Option<String> {
+    path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase)
 }
 
 /// The kind of thing `path` is.
@@ -44,7 +64,7 @@ pub fn classify_format(path: &Path) -> Option<&str> {
 /// the person who named the file chose deliberately.
 #[must_use]
 pub fn classify(path: &Path) -> Kind {
-    match path.extension().and_then(|extension| extension.to_str()) {
+    match extension_of(path).as_deref() {
         Some("bin" | "hex" | "s19" | "srec" | "uf2" | "elf") => Kind::ChipImage,
         Some("lmli" | "lpyc") => Kind::WirePayload,
         _ => Kind::Source,
@@ -56,23 +76,40 @@ pub fn classify(path: &Path) -> Kind {
 /// # Errors
 /// A file that cannot be read, a format this cannot resolve to a flat span, or a malformed one.
 pub fn read(path: &Path) -> Result<Artifact, String> {
-    match path.extension().and_then(|extension| extension.to_str()) {
+    match extension_of(path).as_deref() {
         Some("bin") => {
             let bytes = read_bytes(path)?;
-            Ok(Artifact { bytes, base: 0, format: "raw binary" })
+            Ok(Artifact { bytes, base: None, format: "raw binary" })
         }
         Some("hex") => {
             let bytes = read_bytes(path)?;
             parse_intel_hex(&bytes).map_err(|why| format!("{}: {why}", path.display()))
         }
+        Some("s19" | "srec") => {
+            let bytes = read_bytes(path)?;
+            parse_srecord(&bytes).map_err(|why| format!("{}: {why}", path.display()))
+        }
+        Some("elf") => {
+            let bytes = read_bytes(path)?;
+            let image = lamella_elf::flat_image(&bytes).map_err(|why| {
+                let because = match why {
+                    lamella_elf::ElfError::NotExecutableElf32 => {
+                        "it is not a linked ELF32 executable -- most often a relocatable object \
+                         that has not been linked yet"
+                    }
+                    lamella_elf::ElfError::NoLoadableContent => {
+                        "it declares no loadable bytes, so writing it would flash nothing"
+                    }
+                    lamella_elf::ElfError::Truncated => "it is truncated",
+                    _ => "it is not an ELF this can read",
+                };
+                format!("{}: {because}.", path.display())
+            })?;
+            Ok(Artifact { bytes: image.bytes, base: Some(image.base), format: "ELF" })
+        }
         Some("uf2") => Err(format!(
             "{}: a UF2 is written by copying it to a bootloader volume, and this board is written \
              over a probe.\nBuild the image in a format a probe takes: `--format hex` or `bin`.",
-            path.display()
-        )),
-        Some("elf") => Err(format!(
-            "{}: an ELF carries sections and a program header rather than a flat image. Extracting \
-             the loadable span is not built yet; objcopy it to a .bin or .hex first.",
             path.display()
         )),
         _ => Err(format!("{}: not a format this can write", path.display())),
@@ -358,7 +395,123 @@ fn parse_intel_hex(bytes: &[u8]) -> Result<Artifact, String> {
     let Some(base) = base else {
         return Err("no data records, so there is nothing to write".to_owned());
     };
-    Ok(Artifact { bytes: image, base, format: "Intel HEX" })
+    Ok(Artifact { bytes: image, base: Some(base), format: "Intel HEX" })
+}
+
+/// Read Motorola S-records into one flat image, the inverse of [`write_srecord`].
+///
+/// **THE ADDRESS WIDTH IS CARRIED BY THE RECORD TYPE**, which is the whole reason there are three
+/// data types: `S1` states a 16-bit address, `S2` a 24-bit one and `S3` a 32-bit one, and the
+/// writer picks the narrowest that reaches the highest byte. A reader that assumed one width would
+/// work on small images and place a large one at a wrong address, which a board reports as nothing
+/// at all.
+fn parse_srecord(bytes: &[u8]) -> Result<Artifact, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "not text, so not S-records".to_owned())?;
+    let mut base: Option<u32> = None;
+    let mut image: Vec<u8> = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record = SRecord::parse(line).map_err(|why| format!("line {}: {why}", number + 1))?;
+        match record.kind {
+            '0' | '5' | '6' => {}
+            '1' | '2' | '3' => match base {
+                None => {
+                    base = Some(record.address);
+                    image.extend_from_slice(&record.data);
+                }
+                Some(start) => {
+                    let expected = start + u32::try_from(image.len()).unwrap_or(u32::MAX);
+                    if record.address != expected {
+                        return Err(format!(
+                            "line {}: the data jumps from {expected:#010x} to {:#010x}. This file \
+                             describes more than one region, which cannot be written as one flat \
+                             image.",
+                            number + 1,
+                            record.address
+                        ));
+                    }
+                    image.extend_from_slice(&record.data);
+                }
+            },
+            '7' | '8' | '9' => break,
+            other => {
+                return Err(format!(
+                    "line {}: record type S{other} is not one this reads",
+                    number + 1
+                ));
+            }
+        }
+    }
+    let Some(base) = base else {
+        return Err("no data records, so there is nothing to write".to_owned());
+    };
+    Ok(Artifact { bytes: image, base: Some(base), format: "Motorola S-records" })
+}
+
+/// One S-record: `S`, the type, a byte count, the address, the data, and the checksum.
+struct SRecord {
+    kind: char,
+    address: u32,
+    data: Vec<u8>,
+}
+
+impl SRecord {
+    /// Parse `S<t><CC><address><data><checksum>`, checking the count and the checksum.
+    ///
+    /// **THE CHECKSUM IS VERIFIED RATHER THAN SKIPPED**, for the same reason the Intel HEX reader
+    /// verifies its own: these bytes are going into flash on real hardware, and a truncated
+    /// download stays well-formed right up to where it stops.
+    fn parse(line: &str) -> Result<Self, String> {
+        let rest = line.strip_prefix('S').ok_or("an S-record begins with 'S'")?;
+        let mut chars = rest.chars();
+        let kind = chars.next().ok_or("a record needs a type digit")?;
+        let body = chars.as_str();
+        if body.len() % 2 != 0 {
+            return Err("a record is an even number of hex digits after the type".to_owned());
+        }
+        let mut raw = Vec::with_capacity(body.len() / 2);
+        for pair in body.as_bytes().chunks(2) {
+            let text = std::str::from_utf8(pair).map_err(|_| "not hex".to_owned())?;
+            raw.push(u8::from_str_radix(text, 16).map_err(|_| format!("{text:?} is not hex"))?);
+        }
+        let (&count, after) = raw.split_first().ok_or("a record needs a count byte")?;
+        if usize::from(count) != after.len() {
+            return Err(format!(
+                "the count says {count} bytes follow it and {} do",
+                after.len()
+            ));
+        }
+        let width = match kind {
+            '0' | '1' | '9' => 2,
+            '2' | '8' => 3,
+            '3' | '7' => 4,
+            '5' => 2,
+            '6' => 3,
+            other => return Err(format!("record type S{other} is not one this reads")),
+        };
+        let (&checksum, payload) = after.split_last().ok_or("a record needs a checksum")?;
+        let sum = std::iter::once(count)
+            .chain(payload.iter().copied())
+            .fold(0u8, |total, byte| total.wrapping_add(byte));
+        if !sum != checksum {
+            return Err(format!(
+                "checksum {checksum:#04x} does not match the data, which sums to {:#04x}",
+                !sum
+            ));
+        }
+        if payload.len() < width {
+            return Err("the record is too short for its address".to_owned());
+        }
+        let (address_bytes, data) = payload.split_at(width);
+        let address = address_bytes
+            .iter()
+            .fold(0u32, |total, byte| (total << 8) | u32::from(*byte));
+        Ok(SRecord { kind, address, data: data.to_vec() })
+    }
 }
 
 /// One Intel HEX record.
@@ -410,12 +563,113 @@ mod tests {
     /// checks, so a wrong one here would fail rather than pass silently.
     const SIMPLE: &str = ":04000000DEADBEEFC4\n:00000001FF\n";
 
+    /// **A STATED ZERO AND NO STATEMENT AT ALL ARE DIFFERENT FACTS**, and the flash verb refuses on
+    /// one and not the other.
+    ///
+    /// A flat `.bin` is bytes: where they belong is the board's to say. Intel HEX, S-records and
+    /// ELF each carry an address, and one that disagrees with the board is worth stopping for.
+    /// Recording the absence as `0` made every flat image look like a claim of address zero --
+    /// invisible on a part that boots from zero, and a refusal of every flat image on one that
+    /// does not.
+    #[test]
+    fn a_flat_binary_states_no_address_and_a_hex_at_zero_states_one() {
+        let flat = Artifact { bytes: vec![1, 2, 3, 4], base: None, format: "raw binary" };
+        let hex = parse_intel_hex(SIMPLE.as_bytes()).expect("valid Intel HEX");
+        assert_eq!(flat.base, None, "a flat binary carries no address");
+        assert_eq!(hex.base, Some(0), "and a HEX record at zero carries one that happens to be 0");
+        assert_ne!(flat.base, hex.base, "so the two must not compare equal");
+    }
+
     #[test]
     fn a_simple_hex_reads_back_as_its_bytes() {
         let artifact = parse_intel_hex(SIMPLE.as_bytes()).expect("valid Intel HEX");
         assert_eq!(artifact.bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(artifact.base, 0);
+        assert_eq!(artifact.base, Some(0), "these records state address zero");
         assert_eq!(artifact.format, "Intel HEX");
+    }
+
+    /// **THE WRITER AND THE READER MUST BE INVERSES, AT EVERY ADDRESS WIDTH.** `build --format
+    /// s19` produced S-records that `flash` then refused as "not a format this can write" -- the
+    /// CLI emitting an artifact its own verb could not take, while the usage claimed *"`build`
+    /// produces what `flash` consumes"*.
+    ///
+    /// The three bases are the point rather than padding: the record TYPE carries the address
+    /// width, so the writer picks `S1`/`S2`/`S3` by how high the image reaches. A reader that
+    /// assumed one width round-trips a small image perfectly and puts a large one at a wrong
+    /// address, which a board reports as nothing at all.
+    #[test]
+    fn s_records_round_trip_at_every_address_width() {
+        let image = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        for base in [0x0000_0000u32, 0x0000_1000, 0x0080_0000, 0x0800_0000, 0x1000_0000] {
+            let text = write_srecord(&image, base);
+            let read = parse_srecord(text.as_bytes())
+                .unwrap_or_else(|why| panic!("base {base:#010x} did not read back: {why}"));
+            assert_eq!(read.base, Some(base), "base {base:#010x} moved");
+            assert_eq!(read.bytes, image, "base {base:#010x} changed the bytes");
+            assert_eq!(read.format, "Motorola S-records");
+        }
+    }
+
+    /// The same image written as Intel HEX and as S-records must read back identically. Two
+    /// readers agreeing is a stronger claim than either one round-tripping against its own writer,
+    /// which can share a mistake with it.
+    #[test]
+    fn the_two_text_formats_read_back_the_same_image() {
+        let image = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let base = 0x0800_0000;
+        let hex = parse_intel_hex(write_intel_hex(&image, base).as_bytes()).expect("hex");
+        let srec = parse_srecord(write_srecord(&image, base).as_bytes()).expect("s19");
+        assert_eq!(hex.bytes, srec.bytes);
+        assert_eq!(hex.base, srec.base);
+    }
+
+    /// A truncated S-record download stays well-formed right up to where it stops, exactly as a
+    /// hex one does, so the checksum is what catches it before the bytes reach flash.
+    #[test]
+    fn a_bad_s_record_checksum_is_refused() {
+        let good = write_srecord(&[0xDE, 0xAD, 0xBE, 0xEF], 0);
+        let first = good.lines().next().expect("a data record").to_owned();
+        let mut corrupt = first[..first.len() - 1].to_owned();
+        corrupt.push(if first.ends_with('0') { '1' } else { '0' });
+        let error = parse_srecord(corrupt.as_bytes()).expect_err("the checksum disagrees");
+        assert!(error.contains("checksum"), "got {error}");
+    }
+
+    /// A gap is refused rather than filled, for the same reason the hex reader refuses one.
+    #[test]
+    fn two_disjoint_s_record_regions_are_refused_by_name() {
+        let mut text = write_srecord(&[0xDE, 0xAD], 0x0000).replace("S9030000FC\n", "");
+        text.push_str(&write_srecord(&[0x12, 0x34], 0x1000));
+        let error = parse_srecord(text.as_bytes()).expect_err("not one flat image");
+        assert!(error.contains("more than one region"), "got {error}");
+    }
+
+    /// **A LINKED ELF IS WHAT SOMEBODY ELSE'S TOOLCHAIN HANDS YOU**, and `flash` exists to write
+    /// bytes whoever built them. The flattening takes segments by PHYSICAL address, which is the
+    /// address a programmer needs on a part whose initialized data is copied from flash to RAM.
+    #[test]
+    fn a_linked_elf_flattens_to_its_physical_base() {
+        let elf = lamella_elf::write_executable_arm_thumb(&[0x00, 0xBF, 0x00, 0xBF], 0, 0x0800_0000);
+        let image = lamella_elf::flat_image(&elf).expect("a linked executable");
+        assert_eq!(image.base, 0x0800_0000);
+        assert!(image.bytes.ends_with(&[0x00, 0xBF, 0x00, 0xBF]));
+    }
+
+    /// **AN UNLINKED OBJECT IS THE MISTAKE THIS WILL ACTUALLY MEET**, because it is what a
+    /// compiler emits and what somebody reaches for first. It must be refused by name rather than
+    /// flattened into whatever its sections happen to say.
+    #[test]
+    fn an_unlinked_object_is_not_mistaken_for_an_image() {
+        let object = lamella_elf::write_relocatable_object(
+            lamella_elf::Machine::Arm,
+            &[0x00, 0xBF],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            lamella_elf::flat_image(&object),
+            Err(lamella_elf::ElfError::NotExecutableElf32)
+        );
     }
 
     /// **A TRUNCATED DOWNLOAD IS THE ORDINARY WAY A HEX FILE GOES WRONG**, and it stays
@@ -445,7 +699,7 @@ mod tests {
     fn an_extended_linear_address_sets_the_high_half_of_the_base() {
         let high = ":020000040800F2\n:04000000DEADBEEFC4\n:00000001FF\n";
         let artifact = parse_intel_hex(high.as_bytes()).expect("valid Intel HEX");
-        assert_eq!(artifact.base, 0x0800_0000);
+        assert_eq!(artifact.base, Some(0x0800_0000));
         assert_eq!(artifact.bytes.len(), 4);
     }
 
@@ -504,7 +758,7 @@ mod tests {
             let read_back = parse_intel_hex(text.as_bytes())
                 .unwrap_or_else(|error| panic!("base {base:#x}: {error}"));
             assert_eq!(read_back.bytes, image, "base {base:#x}");
-            assert_eq!(read_back.base, base);
+            assert_eq!(read_back.base, Some(base));
         }
     }
 
@@ -571,13 +825,22 @@ mod tests {
 
     /// A format recognized as a chip image but not yet written must say why, because a reader
     /// cannot otherwise tell a gap from a mistake.
+    ///
+    /// **UF2 IS NOW THE ONLY ONE**, and the second half of this test is what says so: `.s19` and
+    /// `.elf` were both in this set, and both are read now. The way to prove a format is READ
+    /// without having a file to hand is that it fails on the FILE rather than on the format --
+    /// which is also a real behavior change, because a format refused by extension never opened
+    /// the file at all.
     #[test]
-    fn a_recognized_but_unwritable_format_says_which_it_is() {
-        for (name, expect) in [("serve.uf2", "bootloader volume"), ("serve.elf", "objcopy")] {
-            let error = read(Path::new(name)).expect_err("not written");
+    fn the_one_recognized_but_unwritable_format_says_why() {
+        let error = read(Path::new("serve.uf2")).expect_err("not written");
+        assert!(error.contains("bootloader volume"), "got {error}");
+
+        for name in ["serve.s19", "serve.elf"] {
+            let error = read(Path::new(name)).expect_err("no such file");
             assert!(
-                error.contains(expect),
-                "{name} should explain itself with {expect:?}, got {error}"
+                !error.contains("not a format this can write"),
+                "{name} is a format this reads now, so it must fail on the file: {error}"
             );
         }
     }

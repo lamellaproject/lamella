@@ -235,6 +235,40 @@ impl<'a> Parser<'a> {
         self.diagnostics.error(Phase::Early, DiagnosticKind::EarlyError, span, message);
     }
 
+    /// The early errors on a `RegularExpressionLiteral`: the body must parse and the flags must be
+    /// legal and distinct.
+    ///
+    /// # THE PHASE IS THE WHOLE POINT, AND DEFERRING IT IS OBSERVABLE
+    ///
+    /// The lexer scans a literal's body and flags as TEXT and validates neither, so a bad flag
+    /// parses cleanly and throws when the pattern is compiled -- at RUN time, with the program
+    /// already running. 22.2.1 makes both checks EARLY ERRORS on the literal, so a conforming
+    /// program never runs at all, and a negative test asserts the phase rather than the message.
+    ///
+    /// # A PUBLISHED ABSENCE IS NOT A SYNTAX ERROR, AND THE CRATE ALREADY KNOWS THE DIFFERENCE
+    ///
+    /// `\p{...}` is legal ECMAScript this engine does not implement, and the published list records
+    /// it as refusing at RUN time. Raising it here would move it to parse time and make that list
+    /// wrong about its own phase. So only an error that is NOT a published absence is reported:
+    /// `ErrorKind::absence` draws that line, and it exists so a consumer's list can be built from
+    /// it.
+    fn check_regexp_literal(&mut self, body: &str, flags: &str, span: Span) {
+        let parsed = match lamella_regexp::js::Flags::parse(flags) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                if error.kind.absence().is_none() {
+                    self.early_error(span, error.kind.message());
+                }
+                return;
+            }
+        };
+        if let Err(error) = lamella_regexp::js::parse(body, parsed) {
+            if error.kind.absence().is_none() {
+                self.early_error(span, error.kind.message());
+            }
+        }
+    }
+
     fn span_from(&self, start: usize) -> Span {
         Span::new(start, self.token_start.max(start))
     }
@@ -1860,7 +1894,9 @@ impl<'a> Parser<'a> {
             TokenKind::Template(_) => self.parse_template(context.tagged(false)),
             TokenKind::RegExp { body, flags } => {
                 self.advance(Goal::Div);
-                Expression::RegExp { body, flags, span: self.span_from(start) }
+                let span = self.span_from(start);
+                self.check_regexp_literal(&body, &flags, span);
+                Expression::RegExp { body, flags, span }
             }
             TokenKind::PrivateName(name) => {
                 self.advance(Goal::Div);

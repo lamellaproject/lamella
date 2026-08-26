@@ -27,7 +27,7 @@ notes = [
 # of this type would answer with is precisely the one byte that differs between them.
 #
 # THE PAIR IS WHY THE TWO AXES ARE TWO. Both members of this family are primary and only one is
-# validated, where the other family in this catalogue has both members unvalidated and one of them
+# validated, where the other family in this catalog has both members unvalidated and one of them
 # secondary. Each family varies on one axis and holds the other fixed, so neither could be ordered
 # on a single rank without calling one kind of shortfall the smaller.
 

@@ -35,7 +35,7 @@ const PROGRAM_SOURCE: usize = 0;
 /// The name a DEFINITION is keyed by in this pass -- asked of the shared crate's speller rather
 /// than spelled a second time here.
 ///
-/// # Why this is not [`super::full_type_name`], which every one of these sites used to call
+/// # Why this is not [`super::full_type_name`]
 ///
 /// Every name this pass matches a definition against was written by
 /// `lamella_generics::type_def_full_name`: an [`Instantiation`]'s `definition`, a
@@ -96,6 +96,20 @@ pub fn collect_instantiations<'pe>(
         return Vec::new();
     };
 
+    let mut program_tokens: BTreeMap<String, Token> = BTreeMap::new();
+    for type_ref in program.type_refs() {
+        let token = type_ref.token();
+        if let Some(name) = lamella_generics::type_def_full_name(program, token) {
+            program_tokens.entry(name).or_insert(token);
+        }
+    }
+    for type_def in program.type_defs() {
+        let token = type_def.token();
+        if let Some(name) = lamella_generics::type_def_full_name(program, token) {
+            program_tokens.insert(name, token);
+        }
+    }
+
     let mut rows: Vec<(String, (String, Vec<SigType>))> = Vec::new();
     for row in 1..u32::from(u16::MAX) {
         let token = Token::new(TYPE_SPEC, row);
@@ -122,7 +136,7 @@ pub fn collect_instantiations<'pe>(
                 Some(parts) => parts,
                 None => (
                     found.definition.clone().into_string(),
-                    payload_free_arguments(&found.arguments)?,
+                    expressible_arguments(&found.arguments, &program_tokens)?,
                 ),
             };
             Some(Instantiation {
@@ -134,11 +148,80 @@ pub fn collect_instantiations<'pe>(
         .collect()
 }
 
+/// The walk's decoded arguments as THIS assembly's signatures: a payload-free element byte carries
+/// itself, and a NAMED or CONSTRUCTED argument is resolved through `program_tokens` to the token the
+/// assembly being lowered already holds for that name.
+///
+/// `None` the moment one cannot be expressed -- a type parameter, or a name this assembly has no row
+/// for -- because the alternative is a signature naming something the program cannot mean.
+///
+/// # Why resolving a name here is not inventing a token
+///
+/// Inventing a token is taking a number from one assembly and reading it against another's tables.
+/// This does the opposite: it starts from a NAME, which has no world, and asks the assembly being
+/// lowered for its OWN row. A name it has no row for is refused, not guessed.
+///
+/// The DERIVED set is what this reaches. `List<Alpha>` closes over `ListEnumerator<Alpha>`,
+/// `IEnumerable<Alpha>` and `IEnumerator<Alpha>`, and a program spells none of them -- so under a
+/// payload-free-only rule each was dropped and the instantiation emitted with a hole exactly where
+/// `GetEnumerator` pointed.
+#[cfg(feature = "generics")]
+fn expressible_arguments(
+    arguments: &[lamella_generics::TypeArg],
+    program_tokens: &BTreeMap<String, Token>,
+) -> Option<Vec<SigType>> {
+    arguments
+        .iter()
+        .map(|argument| expressible_argument(argument, program_tokens))
+        .collect()
+}
+
+/// One argument, per [`expressible_arguments`].
+#[cfg(feature = "generics")]
+fn expressible_argument(
+    argument: &lamella_generics::TypeArg,
+    program_tokens: &BTreeMap<String, Token>,
+) -> Option<SigType> {
+    match argument {
+        lamella_generics::TypeArg::Named { name, value_type } => {
+            let token = *program_tokens.get(name.as_ref())?;
+            Some(if *value_type {
+                SigType::ValueType(token)
+            } else {
+                SigType::Class(token)
+            })
+        }
+        lamella_generics::TypeArg::Instance {
+            definition,
+            value_type,
+            arguments,
+        } => {
+            let token = *program_tokens.get(definition.as_ref())?;
+            let inner = arguments
+                .iter()
+                .map(|argument| expressible_argument(argument, program_tokens))
+                .collect::<Option<Vec<_>>>()?;
+            Some(SigType::GenericInst {
+                definition: Box::new(if *value_type {
+                    SigType::ValueType(token)
+                } else {
+                    SigType::Class(token)
+                }),
+                arguments: inner,
+            })
+        }
+        lamella_generics::TypeArg::SzArray(element) => Some(SigType::SzArray(Box::new(
+            expressible_argument(element, program_tokens)?,
+        ))),
+        other => payload_free_argument(other),
+    }
+}
+
 /// The walk's decoded arguments as this assembly's signatures, when every one of them is a type the
 /// element byte fully describes -- `int`, `string`, `object`, and arrays of those.
 ///
-/// `None` the moment one is not, because the rest of what a `Named` or constructed argument means
-/// lives in a token, and a token means nothing outside the assembly that wrote it.
+/// `None` the moment one is not. Kept as the leaf [`expressible_argument`] falls through to, so the
+/// element-byte rule has one home rather than two.
 #[cfg(feature = "generics")]
 fn payload_free_arguments(arguments: &[lamella_generics::TypeArg]) -> Option<Vec<SigType>> {
     arguments.iter().map(payload_free_argument).collect()
@@ -198,8 +281,8 @@ pub struct Instantiation {
 /// emitted under the corlib's id is well formed: phase 5 binds the program's tokens to ids, and an
 /// id carries its own token space with it.
 ///
-/// **WHAT THIS DOES NOT BUY IS A TOKEN INSIDE A TYPE ARGUMENT.** See
-/// [`Refusal::ArgumentNamesForeignToken`].
+/// **A TOKEN INSIDE A TYPE ARGUMENT IS CARRIED TOO.** An instantiation's identity is a canonical
+/// NAME, and a name has no world, so the two sides never have to be comparable in one.
 #[derive(Clone)]
 pub(crate) struct DefinitionSource<'pe> {
     /// The assembly itself: read for the definition's `TypeDef`, its fields, its interfaces and its
@@ -228,36 +311,6 @@ pub enum Refusal {
     /// Which assemblies "here" means is [`DefinitionSource`]'s job: the program and every reference
     /// it was loaded against, so a definition in the corlib is found rather than refused.
     DefinitionNotHere {
-        /// The definition's full name.
-        definition: String,
-    },
-    /// A type ARGUMENT names a type by token, and the definition being instantiated is declared in
-    /// a different assembly from the one that wrote the argument.
-    ///
-    /// # Why this is refused rather than lowered
-    ///
-    /// Substitution puts the argument's signature INTO the definition's -- `T[] items` becomes
-    /// `MyType[] items` -- and everything downstream then reads that signature against the
-    /// DEFINITION's tables: the enum-zero lookup, the cast-shape key, and the `Class`/`ValueType`
-    /// arm of the type-operand binder all call `type_token_name` on it. A program token read
-    /// against the corlib's tables does not miss; it names whatever the corlib's row of that number
-    /// happens to be, and the type index then finds a real type by that wrong name. **This is the
-    /// one shape here that would answer plausibly and wrongly rather than trapping**, which is why
-    /// it is a refusal and not a best effort.
-    ///
-    /// Rebasing the argument into the definition's token space is what would lift this, and that is
-    /// the same work the AOT tier does for a named type argument crossing a boundary.
-    ///
-    /// # What it does NOT cover, deliberately
-    ///
-    /// `List<int>` and `List<string>` do not reach here at all: `I4` and `String` are primitives in
-    /// the signature encoding and carry no token. Neither does any instantiation whose definition
-    /// is the program's own, whatever its arguments -- there is one assembly there and nothing to
-    /// rebase.
-    ///
-    ArgumentNamesForeignToken {
-        /// The instantiation that wanted it.
-        instantiation: String,
         /// The definition's full name.
         definition: String,
     },
@@ -464,9 +517,6 @@ pub enum Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Refusal::ArgumentNamesForeignToken { instantiation, definition } => {
-                write!(formatter, "`{instantiation}` names a type argument by token, and `{definition}` is declared in a different assembly from the one that wrote it -- the argument would be read against the wrong tables")
-            }
             Refusal::DefinitionNotHere { definition } => {
                 write!(formatter, "generic definition `{definition}` is not defined in this assembly, so no body can be duplicated from it")
             }
@@ -617,13 +667,6 @@ pub(crate) fn monomorphize<'pe>(
             });
             continue;
         };
-        if source != PROGRAM_SOURCE && want.arguments.iter().any(names_a_token) {
-            lowering.refusals.push(Refusal::ArgumentNamesForeignToken {
-                instantiation: want.name.clone(),
-                definition: want.definition.clone(),
-            });
-            continue;
-        }
         let type_id = module.add_type(Vec::new());
         module.bind_type_full_name(type_id, want.name.clone());
         lowering.types.push((want.name.clone(), type_id));
@@ -685,7 +728,11 @@ pub(crate) fn monomorphize<'pe>(
                         continue;
                     };
                     let zero = default_field_value_substituted(
+                        module,
                         assembly,
+                        source.asm,
+                        source.type_offset,
+                        type_index,
                         &substituted,
                         &field_index.enum_zeros,
                     );
@@ -706,7 +753,11 @@ pub(crate) fn monomorphize<'pe>(
             };
             entry.own_field_slots.push(defaults.len() as u32);
             defaults.push(default_field_value_substituted(
+                module,
                 assembly,
+                source.asm,
+                source.type_offset,
+                type_index,
                 &substituted,
                 &field_index.enum_zeros,
             ));
@@ -1848,18 +1899,6 @@ fn token_is_open<'pe>(assembly: &Assembly<'pe>, token: Token, owner: Option<u32>
 /// `15 12 0d 01 08` and `15 12 0d 01 0e` -- `List<int>` and `List<string>`, whose single arguments
 /// are the primitive bytes `08` and `0e`. Neither reaches this function's `true` arm, which is why
 /// the corlib case needs no rebase.
-fn names_a_token(sig: &SigType) -> bool {
-    match sig {
-        SigType::Class(_) | SigType::ValueType(_) => true,
-        SigType::GenericInst { .. } => true,
-        SigType::SzArray(inner) | SigType::Pointer(inner) | SigType::ByRef(inner) => {
-            names_a_token(inner)
-        }
-        SigType::Array { element, .. } => names_a_token(element),
-        _ => false,
-    }
-}
-
 /// Whether a signature mentions a type parameter of either kind, anywhere inside it.
 ///
 /// `pub(crate)` for the LOADER's benefit as well as this pass's, and sharing it is the point rather
@@ -1996,7 +2035,11 @@ fn substituted_sig_key<'pe>(
 
 /// The zero value one substituted field signature takes.
 fn default_field_value_substituted<'pe>(
+    module: &Module,
     assembly: &Assembly<'pe>,
+    asm: u8,
+    type_offset: Option<usize>,
+    type_index: &TypeNameIndex,
     sig: &SigType,
     enum_zeros: &BTreeMap<String, Value>,
 ) -> Value {
@@ -2007,7 +2050,39 @@ fn default_field_value_substituted<'pe>(
             }
         }
     }
-    default_field_value(Some(sig.clone()))
+    struct_zero_of_sig(module, assembly, asm, type_offset, type_index, sig)
+        .unwrap_or_else(|| default_field_value(Some(sig.clone())))
+}
+
+/// A zero INSTANCE of a substituted signature naming a STRUCT, or `None` when the signature names
+/// something else or the struct cannot be resolved here.
+///
+/// [`default_field_value`] answers null for every value type that is not a primitive, which is
+/// correct for a reference and wrong for a struct: ECMA-335 III.4.21 zero-initializes an instance,
+/// so a `decimal` or `DateTime` field of an instantiation starts as a zeroed struct. Left null it
+/// traps the moment an intrinsic reads it -- `Holder<int>.Fee == 0m` on a fresh instance.
+///
+/// Resolvable here because monomorphization runs after the ordinary walk, so an ordinary struct's
+/// layout is already final. An instantiation whose field is ANOTHER instantiation still being
+/// built in this same pass is not, and keeps the null it had.
+fn struct_zero_of_sig<'pe>(
+    module: &Module,
+    assembly: &Assembly<'pe>,
+    asm: u8,
+    type_offset: Option<usize>,
+    type_index: &TypeNameIndex,
+    sig: &SigType,
+) -> Option<Value> {
+    let SigType::ValueType(token) = sig else {
+        return None;
+    };
+    let type_id = base_type_of(module, assembly, asm, type_offset, type_index, *token)?;
+    if !module.type_is_value_type(type_id) {
+        return None;
+    }
+    Some(Value::Struct(
+        module.type_field_defaults(type_id)?.into_boxed_slice(),
+    ))
 }
 
 /// The `TypeId` a definition's `extends` token names, if this load can see it.
@@ -2059,8 +2134,7 @@ const NULLABLE_DEFINITION: &str = "System.Nullable`1";
 /// more than one place while the identity is minted exactly once.
 ///
 /// A definition whose name is not `Nullable<T>`, or a type argument no loaded assembly declares,
-/// records nothing: the arms then treat the type as the ordinary value type it looks like, which is
-/// the behavior every instantiation had before this.
+/// records nothing: the arms then treat the type as the ordinary value type it looks like.
 ///
 /// # Why the PROGRAM's own `System.Nullable<T>` is excluded
 ///
@@ -2161,6 +2235,56 @@ fn find_instantiation(
         let want = &instantiations[*index];
         want.definition == definition && want.arguments == arguments
     })
+}
+
+/// [`find_instantiation`] by CANONICAL NAME first, falling back to the token-equality match.
+///
+/// # Why a name, and why the token match still stands behind it
+///
+/// The token match compares `SigType`s, and **a token means nothing outside the assembly that wrote
+/// it** -- so it can only ever find an instantiation whose arguments were spelled in the SAME world
+/// as the call site's -- the arguments are the program's and the definition is somebody else's, and
+/// there is no one world to compare in.
+///
+/// A canonical NAME has no world. `lamella_generics::spell_sig_across` decodes each side against
+/// its own assembly and composes after, which is the same thing the AOT tier's resolver does at its
+/// own two-world site -- so the two tiers agree on a spelling by construction rather than by
+/// coincidence.
+///
+/// **The token path is kept as the fallback rather than replaced**, because a name cannot always be
+/// spelled: a site carrying a METHOD type parameter substitutes from an argument list the speller
+/// does not take, and answers `None`. Those sites match exactly as they did before.
+#[cfg(feature = "generics")]
+fn find_instantiation_named(
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+    definition: &str,
+    arguments: &[SigType],
+    spelled: Option<&str>,
+) -> Option<usize> {
+    if let Some(name) = spelled {
+        if let Some(found) = emitted
+            .iter()
+            .position(|(index, _)| instantiations[*index].name == name)
+        {
+            return Some(found);
+        }
+    }
+    find_instantiation(instantiations, emitted, definition, arguments)
+}
+
+/// The canonical name of `open` instantiated with `arguments`, with the two sides read against the
+/// assemblies they were actually written in -- the definition against `definition_assembly`, every
+/// argument against `argument_assembly`. `None` without the `generics` capability, or when either
+/// side does not decode (a method type parameter, most often).
+#[cfg(feature = "generics")]
+fn spell_instantiation<'pe>(
+    definition_assembly: &Assembly<'pe>,
+    argument_assembly: &Assembly<'pe>,
+    open: &SigType,
+    arguments: &[SigType],
+) -> Option<String> {
+    lamella_generics::spell_sig_across(definition_assembly, argument_assembly, open, arguments)
 }
 
 /// Binds one rewritten token to what it means for THIS instantiation or pair.
@@ -2274,6 +2398,13 @@ fn bind_open_token<'pe>(
             let parent_sig = assembly
                 .type_spec_signature(member.parent())
                 .ok_or_else(unbound)?;
+            #[cfg(feature = "generics")]
+            let spelled = spell_instantiation(
+                assembly,
+                &sources[PROGRAM_SOURCE].assembly,
+                &parent_sig,
+                type_arguments,
+            );
             let SigType::GenericInst {
                 definition,
                 arguments,
@@ -2294,6 +2425,14 @@ fn bind_open_token<'pe>(
                     instantiation: owner.into(),
                     token: site.token.0,
                 })?;
+            #[cfg(feature = "generics")]
+            let target =
+                find_instantiation_named(instantiations, emitted, &definition_name, &substituted, spelled.as_deref())
+                    .ok_or_else(|| Refusal::InstantiationNotInSet {
+                        instantiation: owner.into(),
+                        wanted: definition_name.clone(),
+                    })?;
+            #[cfg(not(feature = "generics"))]
             let target = find_instantiation(instantiations, emitted, &definition_name, &substituted)
                 .ok_or_else(|| Refusal::InstantiationNotInSet {
                     instantiation: owner.into(),
@@ -2379,10 +2518,12 @@ fn bind_type_operand<'pe>(
         instantiation: owner.into(),
         token: site.token.0,
     };
-    let _ = type_offset;
+
     module.bind_cast_elem(asm, synthetic, cast_elem_of_sig(asm, substituted));
     if matches!(site.opcode, Opcode::Newarr) {
-        module.bind_array_default(asm, synthetic, default_field_value(Some(substituted.clone())));
+        let zero = struct_zero_of_sig(module, assembly, asm, type_offset, type_index, substituted)
+            .unwrap_or_else(|| default_field_value(Some(substituted.clone())));
+        module.bind_array_default(asm, synthetic, zero);
     }
     match substituted {
         SigType::GenericInst {

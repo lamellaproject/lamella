@@ -321,6 +321,185 @@ namespace System
             return -1;
         }
 
+        public int IndexOf(string value, int startIndex, int count)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            int n = this.Length;
+            if (startIndex < 0 || startIndex > n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > n - count) throw new ArgumentOutOfRangeException("count");
+            int m = value.Length;
+            if (m == 0) return startIndex;
+            int last = startIndex + count - m;
+            for (int i = startIndex; i <= last; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < m; j++)
+                {
+                    if (this[i + j] != value[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
+        }
+
+        public int IndexOfAny(char[] anyOf, int startIndex)
+        {
+            if ((object)anyOf == null) throw new ArgumentNullException("anyOf");
+            int n = this.Length;
+            if (startIndex < 0 || startIndex > n) throw new ArgumentOutOfRangeException("startIndex");
+            for (int i = startIndex; i < n; i++)
+            {
+                char c = this[i];
+                for (int j = 0; j < anyOf.Length; j++)
+                {
+                    if (anyOf[j] == c) return i;
+                }
+            }
+            return -1;
+        }
+
+        public int IndexOfAny(char[] anyOf, int startIndex, int count)
+        {
+            if ((object)anyOf == null) throw new ArgumentNullException("anyOf");
+            int n = this.Length;
+            if (startIndex < 0 || startIndex > n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > n - count) throw new ArgumentOutOfRangeException("count");
+            int end = startIndex + count;
+            for (int i = startIndex; i < end; i++)
+            {
+                char c = this[i];
+                for (int j = 0; j < anyOf.Length; j++)
+                {
+                    if (anyOf[j] == c) return i;
+                }
+            }
+            return -1;
+        }
+
+        public int LastIndexOf(char value, int startIndex)
+        {
+            int n = this.Length;
+            if (n == 0) return -1;
+            if (startIndex < 0 || startIndex >= n) throw new ArgumentOutOfRangeException("startIndex");
+            for (int i = startIndex; i >= 0; i--)
+            {
+                if (this[i] == value) return i;
+            }
+            return -1;
+        }
+
+        public int LastIndexOf(char value, int startIndex, int count)
+        {
+            int n = this.Length;
+            if (n == 0) return -1;
+            if (startIndex < 0 || startIndex >= n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex - count + 1 < 0) throw new ArgumentOutOfRangeException("count");
+            int floor = startIndex - count + 1;
+            for (int i = startIndex; i >= floor; i--)
+            {
+                if (this[i] == value) return i;
+            }
+            return -1;
+        }
+
+        public int LastIndexOf(string value)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            int n = this.Length;
+            if (n == 0) return value.Length == 0 ? 0 : -1;
+            return LastIndexOf(value, n - 1, n);
+        }
+
+        public int LastIndexOf(string value, int startIndex)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if (this.Length == 0 && (startIndex == -1 || startIndex == 0))
+            {
+                return value.Length == 0 ? 0 : -1;
+            }
+            return LastIndexOf(value, startIndex, startIndex + 1);
+        }
+
+        public int LastIndexOf(string value, int startIndex, int count)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            int n = this.Length;
+            if (n == 0 && (startIndex == -1 || startIndex == 0)) return value.Length == 0 ? 0 : -1;
+            if (startIndex < 0 || startIndex > n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex - count + 1 < 0) throw new ArgumentOutOfRangeException("count");
+            int m = value.Length;
+            if (m == 0) return startIndex + 1 > n ? n : startIndex + 1;
+            int floor = startIndex - count + 1;
+            int start = startIndex - m + 1;
+            if (start > n - m) start = n - m;
+            for (int i = start; i >= floor; i--)
+            {
+                bool match = true;
+                for (int j = 0; j < m; j++)
+                {
+                    if (this[i + j] != value[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
+        }
+
+        public int LastIndexOfAny(char[] anyOf)
+        {
+            if ((object)anyOf == null) throw new ArgumentNullException("anyOf");
+            for (int i = this.Length - 1; i >= 0; i--)
+            {
+                char c = this[i];
+                for (int j = 0; j < anyOf.Length; j++)
+                {
+                    if (anyOf[j] == c) return i;
+                }
+            }
+            return -1;
+        }
+
+        public int LastIndexOfAny(char[] anyOf, int startIndex)
+        {
+            if ((object)anyOf == null) throw new ArgumentNullException("anyOf");
+            int n = this.Length;
+            if (n == 0) return -1;
+            if (startIndex < 0 || startIndex >= n) throw new ArgumentOutOfRangeException("startIndex");
+            for (int i = startIndex; i >= 0; i--)
+            {
+                char c = this[i];
+                for (int j = 0; j < anyOf.Length; j++)
+                {
+                    if (anyOf[j] == c) return i;
+                }
+            }
+            return -1;
+        }
+
+        public int LastIndexOfAny(char[] anyOf, int startIndex, int count)
+        {
+            if ((object)anyOf == null) throw new ArgumentNullException("anyOf");
+            int n = this.Length;
+            if (n == 0) return -1;
+            if (startIndex < 0 || startIndex >= n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex - count + 1 < 0) throw new ArgumentOutOfRangeException("count");
+            int floor = startIndex - count + 1;
+            for (int i = startIndex; i >= floor; i--)
+            {
+                char c = this[i];
+                for (int j = 0; j < anyOf.Length; j++)
+                {
+                    if (anyOf[j] == c) return i;
+                }
+            }
+            return -1;
+        }
+
+        public static string Copy(string str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return new String(str.ToCharArray(), 0, str.Length);
+        }
+
         public bool Contains(string value)
         {
             return IndexOf(value) >= 0;

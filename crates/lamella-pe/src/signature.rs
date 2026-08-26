@@ -87,6 +87,24 @@ pub enum TypeSig {
     /// types there. Encoding one as the other produces a signature that decodes without error and
     /// means something else.
     MVar(u32),
+    /// A type carrying a REQUIRED custom modifier -- `modreq(M) T` (II.23.2.7).
+    ///
+    /// **THE MODIFIER PRECEDES THE TYPE IT MODIFIES IN THE BLOB**, which is why this wraps rather
+    /// than decorates: `void modreq(IsExternalInit)` encodes as `CMOD_REQD <M> VOID`, and a reader
+    /// takes the modifier first and then reads a type.
+    ///
+    /// **REQUIRED, NOT OPTIONAL, AND THE DIFFERENCE IS THE WHOLE POINT OF THE ONE USE THIS HAS.** A
+    /// `modopt` may be ignored by a consumer; a `modreq` may not, so a compiler that does not
+    /// understand `IsExternalInit` must refuse to bind the accessor rather than treat it as an
+    /// ordinary setter. That is what makes an init-only setter safe to expose to a compiler
+    /// predating C# 9 -- and what makes DROPPING one on import an accepts-invalid rather than a
+    /// cosmetic loss.
+    Modified {
+        /// The `TypeDef`/`TypeRef` token of the modifier type.
+        modifier: Token,
+        /// The type being modified.
+        inner: Box<TypeSig>,
+    },
     /// An instantiation of a generic type: `Box<int>`, or `Box<!0>` inside another generic
     /// (`ELEMENT_TYPE_GENERICINST`).
     GenericInst {
@@ -157,6 +175,11 @@ fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
         TypeSig::MVar(number) => {
             out.push(element::MVAR);
             compress_u32(*number, out);
+        }
+        TypeSig::Modified { modifier, inner } => {
+            out.push(element::CMOD_REQD);
+            compress_u32(CodedIndex::TypeDefOrRef.encode(*modifier), out);
+            encode_type(inner, out);
         }
         TypeSig::GenericInst {
             definition,
@@ -362,6 +385,35 @@ mod tests {
             type_signature(&TypeSig::Class(Token::new(0x02, 18))),
             [0x12, 0x48]
         );
+    }
+
+    /// An init-only setter is `void modreq(IsExternalInit) set_P(int)`, and its whole distinction
+    /// from an ordinary setter is that modifier -- the rest of the signature is identical.
+    ///
+    /// **ENCODED AND DECODED IN ONE TEST, BECAUSE EITHER HALF ALONE PROVES NOTHING USEFUL.** A
+    /// writer that emits the bytes and a reader that drops them agree that nothing is wrong, and
+    /// the two compilers only disagree later, over an assignment nobody in this crate can see. The
+    /// round trip is what ties them together.
+    #[test]
+    fn a_required_modifier_survives_the_round_trip() {
+        let is_external_init = Token::new(0x01, 7);
+        let sig = method_signature(
+            true,
+            &[TypeSig::Int32],
+            &TypeSig::Modified {
+                modifier: is_external_init,
+                inner: Box::new(TypeSig::Void),
+            },
+        );
+        assert_eq!(sig, [0x20, 0x01, 0x1F, 0x1D, 0x01, 0x08]);
+        let decoded = lamella_metadata::parse_method(&sig).expect("a well-formed signature");
+        assert_eq!(decoded.return_type, lamella_metadata::SigType::Void);
+        assert_eq!(decoded.parameters, [lamella_metadata::SigType::I4]);
+        assert_eq!(decoded.return_type_required_modifiers, [is_external_init]);
+        let plain = method_signature(true, &[TypeSig::Int32], &TypeSig::Void);
+        let decoded_plain = lamella_metadata::parse_method(&plain).expect("a well-formed signature");
+        assert_eq!(decoded_plain.return_type, lamella_metadata::SigType::Void);
+        assert!(decoded_plain.return_type_required_modifiers.is_empty());
     }
 
     #[test]

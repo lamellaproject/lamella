@@ -85,6 +85,10 @@ pub fn parameter_infos(parameters: &[Parameter]) -> alloc::vec::Vec<crate::symbo
                 Some(ParameterModifier::Out) => ParameterMode::Out,
                 _ => ParameterMode::Value,
             },
+            default: parameter
+                .default_value
+                .as_ref()
+                .and_then(crate::declaration::fold_parameter_default),
         })
         .collect()
 }

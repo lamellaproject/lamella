@@ -23,7 +23,7 @@ sources = [
     "SAMD21 datasheet DS40001882D 25.6.2.3 + Table 25-2 (baud-rate generator): the synchronous equations and the 8-bit synchronous BAUD range",
 ]
 notes = [
-    "These SPI-mode values are transcribed from the datasheet only; no binding exercises this SERCOM in SPI mode yet.",
+    "These SPI-mode values are transcribed from the datasheet only; no binding exercises this SERCOM in SPI mode.",
     "CTRLA.MODE must be 0x3 for master or 0x2 for slave (27.8.1); the usart's 0x1 is a different mode of the same field.",
     "Synchronous baud: f_baud = f_ref / (2 * (BAUD + 1)), so BAUD = f_ref / (2 * f_baud) - 1 (Table 25-2). f_ref is the routed GCLK generator's rate, a PLAN fact. The register is 8 bits, so the slowest reachable clock is f_ref / 512.",
     "Every write to an enable-protected register (CTRLB, ENABLE, SWRST) must wait its SYNCBUSY bit before the config is live -- the same rule the usart block states, for the same registers.",

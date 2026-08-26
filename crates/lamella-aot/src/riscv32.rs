@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use lamella_asm_riscv32::{BranchCond, Encoder, Label, Reg};
 use lamella_ir::{
     BinOp, CmpOp, ConvKind, Function, Inst, MirType, StaticOwner, Terminator, TypeHandle, ValueId,
+    VerifyError,
 };
 
 use crate::resolver::{ARRAY_DESC_MARK, TypeMeta, VtableEntry, descriptor_symbol};
@@ -17,10 +18,18 @@ use crate::stackmaps::{
 };
 
 /// Why a function could not be lowered to RV32IM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     /// The function did not pass IR verification.
-    NotWellFormed,
+    ///
+    /// CARRIES THE VERIFIER'S OWN ERRORS rather than collapsing them: a bare "not well formed" names
+    /// neither the malformed instruction nor the types that disagreed, so a refusing row reported no
+    /// reason at all. The verifier has always returned a `Vec<VerifyError>`; only this boundary threw
+    /// it away.
+    NotWellFormed {
+        /// What [`lamella_ir::verify`] rejected. Never empty -- it is constructed only from an `Err`.
+        errors: Vec<VerifyError>,
+    },
     /// An instruction or shape this backend does not lower yet.
     Unsupported,
     /// The all-spilled frame's slot offsets exceed the 12-bit lw/sw immediate (a function past
@@ -714,8 +723,8 @@ fn lower_module_to_image(
     let funcs: &[Function] = &program;
     if !tolerant {
         for func in funcs {
-            if lamella_ir::verify(func).is_err() {
-                return Err(LowerError::NotWellFormed);
+            if let Err(errors) = lamella_ir::verify(func) {
+                return Err(LowerError::NotWellFormed { errors });
             }
         }
     }
@@ -750,8 +759,8 @@ fn lower_module_to_image(
             let mut s_desc_relocs: Vec<DescReloc> = Vec::new();
             let mut s_abs_desc_relocs: Vec<DescReloc> = Vec::new();
             let mut s_externs = externs.clone();
-            let lowered = if lamella_ir::verify(func).is_err() {
-                Err(LowerError::NotWellFormed)
+            let lowered = if let Err(errors) = lamella_ir::verify(func) {
+                Err(LowerError::NotWellFormed { errors })
             } else {
                 lower_function(
                     &mut scratch,
@@ -2117,6 +2126,12 @@ fn lower_inst(
             enc.li(reg(result), (STATIC_FIELD_BASE + *offset) as i32);
             enc.lw(reg(result), reg(result), 0);
         }
+        Inst::StaticAddr { owner, offset } => {
+            if !matches!(owner, StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
+            enc.li(reg(result), (STATIC_FIELD_BASE + *offset) as i32);
+        }
         Inst::StaticStore {
             owner,
             offset,
@@ -2776,6 +2791,10 @@ fn lower_inst_spilled(
             enc.lw(t0, t0, 0);
             slot_store(enc, t0, slot(result));
         }
+        Inst::StaticAddr { owner, offset } => {
+            emit_static_addr(enc, t0, t1, owner, *offset, statics_ptr_pool, relocate)?;
+            slot_store(enc, t0, slot(result));
+        }
         Inst::StaticStore {
             owner,
             offset,
@@ -2941,6 +2960,33 @@ fn lower_inst_spilled(
                 enc.sw(t0, Reg::A0, 4 * k as i32);
             }
             slot_store(enc, Reg::A0, slot(result));
+        }
+        Inst::Array2DElemAddr {
+            array,
+            index0,
+            index1,
+            element_size,
+        } => {
+            if !matches!(*element_size, 1 | 2 | 4 | 8) {
+                return Err(LowerError::Unsupported);
+            }
+            slot_load(enc, t0, slot(*array));
+            slot_load(enc, t1, slot(*index0));
+            slot_load(enc, t2, slot(*index1));
+            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
+            slot_store(enc, scratch, slot(result));
+        }
+        Inst::ArrayMDElemAddr {
+            array,
+            indices,
+            element_size,
+        } => {
+            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4 | 8) {
+                return Err(LowerError::Unsupported);
+            }
+            slot_load(enc, t0, slot(*array));
+            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
+            slot_store(enc, t1, slot(result));
         }
         Inst::ArrayMDLoad {
             array,
@@ -3304,6 +3350,7 @@ fn lower_inst_spilled(
             length,
             element_size,
             element_kind,
+            element_cast_class,
         } => {
             let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                 Some((_, l)) => *l,
@@ -3318,9 +3365,13 @@ fn lower_inst_spilled(
                             element.map_or(0, |e| descriptor_tag(descriptors, e)),
                             0,
                             0,
+                            *element_cast_class,
                         ],
-                        itable: Vec::new(),
-                        base: None,
+                        itable: descriptor_itable(descriptors, *handle, externs),
+                        base: descriptors
+                            .iter()
+                            .find(|m| m.handle == *handle)
+                            .and_then(|m| m.base),
                         element: *element,
                     });
                     type_desc_labels.push((*handle, l));
@@ -3470,9 +3521,19 @@ fn lower_inst_spilled(
             enc.li(Reg::A0, *tag as i32);
             slot_load(enc, t0, slot(receiver));
             enc.lw(t0, t0, -4);
+            let array_form = enc.new_label();
+            let have_itable = enc.new_label();
+            enc.lw(t1, t0, 0);
+            enc.srli(t1, t1, 24);
+            enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
+            enc.branch(BranchCond::Eq, t1, t2, array_form);
             enc.lw(t1, t0, 4);
             enc.slli(t1, t1, 2);
             enc.addi(t1, t1, (DESC_HEADER_WORDS * 4) as i32);
+            enc.j(have_itable);
+            enc.bind_label(array_form);
+            enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
+            enc.bind_label(have_itable);
             enc.add(t1, t0, t1);
             enc.lw(t2, t1, 0);
             enc.addi(t1, t1, 4);
@@ -3588,13 +3649,19 @@ fn lower_inst_spilled(
             let done = enc.new_label();
             slot_load(enc, t0, slot(*descriptor));
             enc.branch(BranchCond::Eq, t0, Reg::ZERO, miss);
+            let array_form = enc.new_label();
+            let have_itable = enc.new_label();
             enc.lw(t1, t0, 0);
             enc.srli(t1, t1, 24);
             enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
-            enc.branch(BranchCond::Eq, t1, t2, miss);
+            enc.branch(BranchCond::Eq, t1, t2, array_form);
             enc.lw(t1, t0, 4);
             enc.slli(t1, t1, 2);
             enc.addi(t1, t1, 16);
+            enc.j(have_itable);
+            enc.bind_label(array_form);
+            enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
+            enc.bind_label(have_itable);
             enc.add(t1, t0, t1);
             enc.lw(t2, t1, 0);
             enc.branch(BranchCond::Eq, t2, Reg::ZERO, miss);
@@ -3958,13 +4025,22 @@ fn emit_convert(enc: &mut Encoder, dest: Reg, src: Reg, kind: ConvKind) -> Resul
     Ok(())
 }
 
-/// Whether `value` is a pointer -- a heap ObjectRef or a managed pointer (`this` / `&field`). The
-/// register-only path can dereference only a pointer base; the all-spilled path additionally handles
-/// a value-type base living in its own multi-word stack slot.
+/// Whether `value` is a pointer -- a heap ObjectRef, a managed pointer (`this` / `&field`) or an
+/// unmanaged one. The register-only path can dereference only a pointer base; the all-spilled path
+/// additionally handles a value-type base living in its own multi-word stack slot.
+///
+/// A `NativeInt` base IS a pointer, and the distinction is not a performance one. An UNMANAGED
+/// pointer (`T*`) is CIL's `native int`: `conv.u`/`conv.i` is where a managed pointer stops being
+/// tracked, and a pointer local is declared `NativeInt` outright, so `p->f` through an `S* p`
+/// arrives here with a `NativeInt` base. The two answers read DIFFERENT MEMORY -- a pointer base is
+/// dereferenced, anything else is taken as an instance living in the value's own slot -- so
+/// classifying one as inline answers the pointer itself where the field was asked for, and stores to
+/// the pointer instead of through it. Nothing else can be a field base: a base is an address or an
+/// inline struct, and an inline struct is a `ValueType`.
 fn is_pointer(value_types: &[MirType], value: ValueId) -> bool {
     matches!(
         value_types.get(value.index()),
-        Some(MirType::ObjectRef | MirType::ManagedPtr)
+        Some(MirType::ObjectRef | MirType::ManagedPtr | MirType::NativeInt)
     )
 }
 
@@ -4663,6 +4739,7 @@ mod tests {
                             length: ValueId(0),
                             element_size: 8,
                             element_kind: 8,
+                            element_cast_class: 0,
                         },
                     ),
                 ],
@@ -4725,6 +4802,7 @@ mod tests {
                             length: ValueId(0),
                             element_size: 4,
                             element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
+                            element_cast_class: 0,
                         },
                     ),
                 ],
@@ -5862,11 +5940,13 @@ mod tests {
                 size: 8,
                 refs: lamella_ir::RefWords::NONE,
             },
+            MirType::NativeInt,
         ];
         assert!(is_pointer(&types, ValueId(0)));
         assert!(is_pointer(&types, ValueId(1)));
         assert!(!is_pointer(&types, ValueId(2)));
         assert!(!is_pointer(&types, ValueId(3)));
+        assert!(is_pointer(&types, ValueId(4)));
     }
 
     /// A two-element `int[]` hand-laid in RAM: set the length, store a[0]=20 and a[1]=22, load
@@ -7247,7 +7327,7 @@ mod tests {
             "exactly one method demoted -- the good one is not reported"
         );
         assert_eq!(report[0].0, 1, "the report names the stubbed method's index");
-        assert!(matches!(report[0].1, LowerError::NotWellFormed));
+        assert!(matches!(report[0].1, LowerError::NotWellFormed { .. }));
     }
 
     #[test]

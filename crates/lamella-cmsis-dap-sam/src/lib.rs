@@ -117,6 +117,219 @@ fn samd21_command<A: TargetAccess>(target: &mut A, cmd: u32) -> Result<(), Probe
     Err(ProbeError::Timeout("SAMD21 flash controller"))
 }
 
+/// SAM DSU `DID` -- the part's own identification word, at DSU base + 0x18.
+pub const SAM_DSU_DID: u32 = 0x4100_2018;
+/// The same `DID` through the DSU's EXTERNAL view.
+///
+/// The DSU's first 0x100 bytes are the internal address range and the next 0x100 mirror them as
+/// the external range (SAM D11 12.9, 12.11.2.2). A part locked by the NVMCTRL security bit
+/// discards debug-adapter accesses below 0x100 with an error response, so the external view is the
+/// one that still answers on a protected part -- and the same word on an unprotected one.
+pub const SAM_DSU_DID_EXTERNAL: u32 = 0x4100_2118;
+/// SAM NVMCTRL `PARAM` (+0x08): `NVMP` pages in [15:0], `PSZ` page-size code in [18:16].
+pub const SAM_NVMCTRL_PARAM: u32 = 0x4100_4008;
+/// The SAM D10/D11/D21 erase unit is a row of FOUR pages (SAM D10 and D11 21.6.3, SAM D21 22.6.3),
+/// so a row is four times whatever page size [`SamFlashGeometry`] reports -- 256 bytes on all three
+/// parts today, since each has 64-byte pages.
+pub const SAMD21_PAGES_PER_ROW: u32 = 4;
+/// `DIE` and `REVISION` masked out of a `DID`: what is left names the part, not the die spin.
+const DID_PART_KEY: u32 = 0xffff_00ff;
+
+/// A SAM part as its own silicon reports it: the fields of the DSU `DID` register.
+///
+/// This is the only identification that comes from the die. A kit label, a USB product id and an
+/// operator's expectation can each name a different board than the one the probe is wired to: two
+/// SAM D21 kits share EDBG product id 0x2169, three Xplained Pro kits share 0x2111, an EDBG serial
+/// names the DEBUGGER, and a Cortex-M0-class DP IDCODE is answered by parts from two vendors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamDeviceId {
+    /// The register as read.
+    pub raw: u32,
+    /// `PROCESSOR[31:28]`: 0x0 Cortex-M0, 0x1 Cortex-M0+, 0x2 Cortex-M3, 0x3 Cortex-M4.
+    pub processor: u8,
+    /// `FAMILY[27:23]`: 0x0 general purpose, 0x1 PicoPower.
+    pub family: u8,
+    /// `SERIES[21:16]`: the product series within the family.
+    pub series: u8,
+    /// `DIE[15:12]`: the die within the family.
+    pub die: u8,
+    /// `REVISION[11:8]`: 0x0 = rev A, 0x1 = rev B, and so on.
+    pub revision: u8,
+    /// `DEVSEL[7:0]`: flash density, pin count and variant -- the part within the series.
+    pub devsel: u8,
+}
+
+impl SamDeviceId {
+    /// Splits a `DID` word into its fields.
+    pub fn decode(raw: u32) -> Self {
+        Self {
+            raw,
+            processor: ((raw >> 28) & 0xf) as u8,
+            family: ((raw >> 23) & 0x1f) as u8,
+            series: ((raw >> 16) & 0x3f) as u8,
+            die: ((raw >> 12) & 0xf) as u8,
+            revision: ((raw >> 8) & 0xf) as u8,
+            devsel: (raw & 0xff) as u8,
+        }
+    }
+
+    /// The Cortex-M core `PROCESSOR` names, or `None` for a code no datasheet read for this table
+    /// tabulates.
+    pub fn core(&self) -> Option<&'static str> {
+        match self.processor {
+            0x0 => Some("Cortex-M0"),
+            0x1 => Some("Cortex-M0+"),
+            0x2 => Some("Cortex-M3"),
+            0x3 => Some("Cortex-M4"),
+            0x6 => Some("Cortex-M4F"),
+            _ => None,
+        }
+    }
+
+    /// The die revision as its letter: `REVISION` 0 is rev A.
+    pub fn revision_letter(&self) -> char {
+        (b'A' + self.revision.min(25)) as char
+    }
+
+    /// The exact part, for the rows a document or a measurement sources.
+    ///
+    /// `None` is not a failure and not an unknown part: it means this table has no sourced row for
+    /// that `DEVSEL`, while the fields above still give the family, series, die and revision.
+    pub fn part(&self) -> Option<&'static str> {
+        match self.raw & DID_PART_KEY {
+            0x1003_0000 => Some("ATSAMD11D14AM (24-pin QFN)"),
+            0x1003_0003 => Some("ATSAMD11D14ASS (20-pin SOIC)"),
+            0x1003_0006 => Some("ATSAMD11C14A (14-pin SOIC)"),
+            0x1003_0009 => Some("ATSAMD11D14AU (20-ball WLCSP)"),
+            0x1002_0000 => Some("ATSAMD10D14AM (24-pin QFN)"),
+            0x1002_0001 => Some("ATSAMD10D13AM (24-pin QFN)"),
+            0x1002_0003 => Some("ATSAMD10D14ASS (20-pin SOIC)"),
+            0x1002_0004 => Some("ATSAMD10D13ASS (20-pin SOIC)"),
+            0x1002_0006 => Some("ATSAMD10C14A (14-pin SOIC)"),
+            0x1002_0007 => Some("ATSAMD10C13A (14-pin SOIC)"),
+            0x1002_0009 => Some("ATSAMD10D14AU (20-ball WLCSP)"),
+            0x1001_0000 => Some("ATSAMD21J18A"),
+            _ => None,
+        }
+    }
+
+    /// Whether this part's flash controller is the one the [`Samd21Flash`] routines drive: the
+    /// SAM D10 (series 0x2), SAM D11 (0x3) and SAM D21 (0x1) NVMCTRL agree register for register --
+    /// base, offsets, the 0xA5 `CMDEX` key, the command codes, the half-word `ADDR` and the
+    /// four-page row (Atmel-42242H and Atmel-42363H ch.21 against DS40001882 ch.22).
+    ///
+    /// Read the series rather than trusting the family to be uniform: the SAM D5x/E5x NVMCTRL puts
+    /// its command register where the D21 puts its configuration register. A series absent from
+    /// this list is not a claim that its controller differs -- it is one nobody has read a
+    /// datasheet for, which is the same refusal for a different reason.
+    pub fn drives_samd21_nvmctrl(&self) -> bool {
+        self.processor == 0x1 && self.family == 0x0 && matches!(self.series, 0x1 | 0x2 | 0x3)
+    }
+
+    /// Whether this part's flash controller is the one the [`Same54Flash`] routines drive: the
+    /// SAM D5x/E5x NVMCTRL, which erases by 8 KiB block and puts its command register where the
+    /// D21 puts its configuration register.
+    ///
+    /// **Measured, not tabulated.** DS60001507 documents what the `DID` FIELDS mean but publishes
+    /// no table of their values, so this is the identity read off the SAM E54 Xplained Pro:
+    /// `DID 0x61840300`, processor `0x6`, family `0x3`, series `0x4`. The other members of
+    /// the family (D51, E51, E53) are not claimed here -- not because their controller is thought
+    /// to differ, but because nobody has read one off a part, which is the same discipline the
+    /// D21 `DEVSEL` rows follow.
+    pub fn drives_same54_nvmctrl(&self) -> bool {
+        self.processor == 0x6 && self.family == 0x3 && self.series == 0x4
+    }
+
+    /// Which flash routine in this crate drives this part, if either does.
+    ///
+    /// **A part absent from both is not a part this crate cannot flash** -- it is one whose
+    /// controller nobody has read a datasheet for. The distinction matters because the two answers
+    /// call for opposite next steps, and a tool that prints the first when it means the second
+    /// sends a reader looking for a document that is already on the shelf.
+    pub fn flash_routine(&self) -> Option<&'static str> {
+        if self.drives_samd21_nvmctrl() {
+            return Some("Samd21Flash");
+        }
+        if self.drives_same54_nvmctrl() {
+            return Some("Same54Flash");
+        }
+        None
+    }
+}
+
+/// The flash geometry a SAM part reports about itself through NVMCTRL `PARAM`.
+///
+/// A probe-side tool has no linker script and no running firmware to ask how big the part in front
+/// of it is, and a table of part sizes inside a host tool is a second spelling that nothing checks.
+/// `PARAM` is the part's own answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamFlashGeometry {
+    /// `NVMP[15:0]`: pages in the NVM main address space.
+    pub pages: u32,
+    /// `8 << PSZ`: the page size in bytes, which is the write granularity.
+    pub page_bytes: u32,
+}
+
+impl SamFlashGeometry {
+    /// Decodes a `PARAM` read.
+    pub fn decode(param: u32) -> Self {
+        Self { pages: param & 0xffff, page_bytes: 8 << ((param >> 16) & 0x7) }
+    }
+
+    /// The size of the main array, which is what an image has to fit inside.
+    pub fn flash_bytes(&self) -> u32 {
+        self.pages * self.page_bytes
+    }
+
+    /// The SAM D11/D21 erase granularity: four pages.
+    pub fn samd21_row_bytes(&self) -> u32 {
+        self.page_bytes * SAMD21_PAGES_PER_ROW
+    }
+}
+
+/// Reading a SAM part's identity and flash geometry off the part itself, over whatever probe
+/// reached it. Both reads are non-destructive and neither needs a halt.
+pub trait SamIdentify {
+    /// Reads and decodes the DSU `DID`.
+    ///
+    /// An all-zero or all-ones word is refused rather than decoded. Those are what a MEM-AP that
+    /// is not reaching the part returns, and every decoded field would then be a confident zero --
+    /// a tool whose answer is an identity has to show it can see one. Such a read is retried
+    /// against [`SAM_DSU_DID_EXTERNAL`] before it is refused.
+    ///
+    /// A part locked by the NVMCTRL security bit does not answer zero on the internal view: it
+    /// takes the access down with an error response, which arrives here as a transport error
+    /// rather than a refusal, and is cleared by the caller before retrying at the external view.
+    fn sam_device_id(&mut self) -> Result<SamDeviceId, ProbeError>;
+
+    /// Reads NVMCTRL `PARAM` and decodes the flash geometry. A zero page count is refused for the
+    /// same reason: a part with no flash is not what a working read looks like.
+    fn sam_flash_geometry(&mut self) -> Result<SamFlashGeometry, ProbeError>;
+}
+
+impl<A: TargetAccess> SamIdentify for A {
+    fn sam_device_id(&mut self) -> Result<SamDeviceId, ProbeError> {
+        let mut raw = self.read_word(SAM_DSU_DID)?;
+        if raw == 0 || raw == u32::MAX {
+            raw = self.read_word(SAM_DSU_DID_EXTERNAL)?;
+        }
+        if raw == 0 || raw == u32::MAX {
+            return Err(ProbeError::Device(
+                "DSU DID reads all zeros or all ones in both DSU views -- no part answering",
+            ));
+        }
+        Ok(SamDeviceId::decode(raw))
+    }
+
+    fn sam_flash_geometry(&mut self) -> Result<SamFlashGeometry, ProbeError> {
+        let geometry = SamFlashGeometry::decode(self.read_word(SAM_NVMCTRL_PARAM)?);
+        if geometry.pages == 0 {
+            return Err(ProbeError::Device("NVMCTRL PARAM reports zero pages -- no NVMCTRL answering"));
+        }
+        Ok(geometry)
+    }
+}
+
 const SAME54_CTRLA: u32 = 0x4100_4000;
 const SAME54_CTRLB: u32 = 0x4100_4004;
 const SAME54_INTFLAG: u32 = 0x4100_4010;
@@ -126,7 +339,8 @@ const SAME54_CMD_EB: u32 = 0x01;
 const SAME54_CMD_WP: u32 = 0x03;
 const SAME54_CMD_PBC: u32 = 0x15;
 const SAME54_PAGE: usize = 512;
-const SAME54_BLOCK: u32 = 8192;
+/// The SAM D5x/E5x erase granularity: one 8 KiB block (DS60001507, NVMCTRL).
+pub const SAME54_BLOCK: u32 = 8192;
 const SAME54_STATUS_READY: u32 = 1 << 16;
 const SAME54_WMODE_MASK: u32 = 0b11 << 4;
 
@@ -875,5 +1089,166 @@ mod tests {
             Sam3xFlashDescriptor { interface: 0x000f_0640, size: 262_144, page_size: 256, planes: 1 }
         );
         assert_eq!(&target.inner().transport().sent[1][4..8], &0x5a00_0000u32.to_le_bytes());
+    }
+
+    /// A MEM-AP read reply carrying `value`.
+    fn word_reply(value: u32) -> Vec<u8> {
+        let b = value.to_le_bytes();
+        vec![proto::cmd::TRANSFER, 0x01, 0x01, b[0], b[1], b[2], b[3]]
+    }
+
+    #[test]
+    fn device_id_decodes_the_samd11_datasheet_rows() {
+        for (did, part) in [
+            (0x1003_0200u32, "ATSAMD11D14AM (24-pin QFN)"),
+            (0x1003_0203, "ATSAMD11D14ASS (20-pin SOIC)"),
+            (0x1003_0206, "ATSAMD11C14A (14-pin SOIC)"),
+            (0x1003_0209, "ATSAMD11D14AU (20-ball WLCSP)"),
+        ] {
+            let id = SamDeviceId::decode(did);
+            assert_eq!(id.part(), Some(part), "DID {did:#010x}");
+            assert_eq!((id.processor, id.family, id.series), (0x1, 0x0, 0x3));
+            assert_eq!((id.core(), id.revision_letter()), (Some("Cortex-M0+"), 'C'));
+            assert!(id.drives_samd21_nvmctrl(), "the D11 NVMCTRL is the D21 routine's");
+        }
+    }
+
+    #[test]
+    fn device_id_decodes_the_samd10_datasheet_rows() {
+        for (did, part) in [
+            (0x1002_0000u32, "ATSAMD10D14AM (24-pin QFN)"),
+            (0x1002_0001, "ATSAMD10D13AM (24-pin QFN)"),
+            (0x1002_0007, "ATSAMD10C13A (14-pin SOIC)"),
+            (0x1002_0009, "ATSAMD10D14AU (20-ball WLCSP)"),
+        ] {
+            let id = SamDeviceId::decode(did);
+            assert_eq!(id.part(), Some(part), "DID {did:#010x}");
+            assert_eq!((id.processor, id.family, id.series), (0x1, 0x0, 0x2));
+            assert!(id.drives_samd21_nvmctrl(), "the D10 NVMCTRL is the D21 routine's");
+        }
+    }
+
+    #[test]
+    fn geometry_from_param_reports_the_samd10_eight_kilobyte_part() {
+        let geometry = SamFlashGeometry::decode(0x0003_0080);
+        assert_eq!((geometry.pages, geometry.page_bytes), (128, 64));
+        assert_eq!(geometry.flash_bytes(), 8 * 1024);
+    }
+
+    #[test]
+    fn device_id_names_the_three_parts_read_off_this_bench() {
+        for (did, part, series, rev) in [
+            (0x1001_0300u32, "ATSAMD21J18A", 0x1u8, 'D'),
+            (0x1003_0100, "ATSAMD11D14AM (24-pin QFN)", 0x3, 'B'),
+            (0x1002_0100, "ATSAMD10D14AM (24-pin QFN)", 0x2, 'B'),
+        ] {
+            let id = SamDeviceId::decode(did);
+            assert_eq!(id.part(), Some(part), "DID {did:#010x}");
+            assert_eq!((id.series, id.die, id.devsel), (series, 0x0, 0x00));
+            assert_eq!(id.revision_letter(), rev);
+            assert!(id.drives_samd21_nvmctrl());
+        }
+    }
+
+    #[test]
+    fn device_id_leaves_an_unsourced_row_unnamed_but_still_decoded() {
+        let id = SamDeviceId::decode(0x1001_0305);
+        assert_eq!(id.part(), None);
+        assert_eq!((id.series, id.devsel, id.core()), (0x1, 0x05, Some("Cortex-M0+")));
+        assert!(id.drives_samd21_nvmctrl());
+    }
+
+    #[test]
+    fn device_id_refuses_the_families_this_flash_routine_does_not_drive() {
+        let e54 = SamDeviceId::decode(0x6184_0300);
+        assert_eq!((e54.processor, e54.family, e54.series), (0x6, 0x3, 0x4));
+        assert!(!e54.drives_samd21_nvmctrl());
+        assert!(e54.drives_same54_nvmctrl());
+        assert_eq!(e54.flash_routine(), Some("Same54Flash"));
+    }
+
+    /// The two routines must claim DISJOINT parts, and a part neither claims must report neither.
+    ///
+    /// The defect this pins is not a wrong predicate -- both were right -- but a tool that read one
+    /// predicate's `false` as "this crate cannot flash this part", when the other routine drives it.
+    #[test]
+    fn each_part_is_claimed_by_at_most_one_flash_routine() {
+        for raw in [0x1001_0000u32, 0x1003_0100, 0x1002_0000] {
+            let id = SamDeviceId::decode(raw);
+            assert!(id.drives_samd21_nvmctrl(), "{raw:#010x} is a D21-class NVMCTRL");
+            assert!(!id.drives_same54_nvmctrl());
+            assert_eq!(id.flash_routine(), Some("Samd21Flash"));
+        }
+        let e54 = SamDeviceId::decode(0x6184_0300);
+        assert!(e54.drives_same54_nvmctrl() && !e54.drives_samd21_nvmctrl());
+
+        let unread = SamDeviceId::decode(0x6018_0400);
+        assert!(!unread.drives_samd21_nvmctrl() && !unread.drives_same54_nvmctrl());
+        assert_eq!(unread.flash_routine(), None);
+    }
+
+    #[test]
+    fn geometry_from_param_agrees_with_the_samd21_flash_constants() {
+        let geometry = SamFlashGeometry::decode(0x0003_1000);
+        assert_eq!(geometry.page_bytes, SAMD21_PAGE as u32);
+        assert_eq!(geometry.samd21_row_bytes(), SAMD21_ROW);
+        assert_eq!(geometry.flash_bytes(), 256 * 1024);
+    }
+
+    #[test]
+    fn geometry_from_param_reports_the_samd11_sixteen_kilobytes() {
+        let geometry = SamFlashGeometry::decode(0x0003_0100);
+        assert_eq!((geometry.pages, geometry.page_bytes), (256, 64));
+        assert_eq!(geometry.flash_bytes(), 16 * 1024);
+        assert_eq!(geometry.samd21_row_bytes(), 256);
+    }
+
+    #[test]
+    fn sam_device_id_reads_the_dsu_register() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies = vec![ack, word_reply(0x1003_0000)];
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        let id = target.sam_device_id().unwrap();
+        assert_eq!(&target.inner().transport().sent[0][4..8], &SAM_DSU_DID.to_le_bytes());
+        assert_eq!(id.part(), Some("ATSAMD11D14AM (24-pin QFN)"));
+    }
+
+    #[test]
+    fn sam_flash_geometry_reads_nvmctrl_param() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies = vec![ack, word_reply(0x0003_0100)];
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        let geometry = target.sam_flash_geometry().unwrap();
+        assert_eq!(&target.inner().transport().sent[0][4..8], &SAM_NVMCTRL_PARAM.to_le_bytes());
+        assert_eq!(geometry.flash_bytes(), 16 * 1024);
+    }
+
+    #[test]
+    fn a_zero_internal_dsu_view_is_retried_at_the_external_one() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies =
+            vec![ack.clone(), word_reply(0), ack, word_reply(0x1001_0300)];
+        let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+        let id = target.sam_device_id().unwrap();
+        assert_eq!(id.part(), Some("ATSAMD21J18A"));
+        assert_eq!(&target.inner().transport().sent[0][4..8], &SAM_DSU_DID.to_le_bytes());
+        assert_eq!(
+            &target.inner().transport().sent[2][4..8],
+            &SAM_DSU_DID_EXTERNAL.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn a_dead_read_path_is_refused_rather_than_decoded() {
+        for dead in [0x0000_0000u32, 0xffff_ffff] {
+            let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+            let replies =
+                vec![ack.clone(), word_reply(dead), ack, word_reply(dead)];
+            let mut target = ArmDap::new(Dap::new(Mock::new(replies)));
+            assert!(target.sam_device_id().is_err(), "DID {dead:#010x} decoded instead of refusing");
+        }
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut target = ArmDap::new(Dap::new(Mock::new(vec![ack, word_reply(0)])));
+        assert!(target.sam_flash_geometry().is_err(), "a zero-page PARAM decoded instead of refusing");
     }
 }

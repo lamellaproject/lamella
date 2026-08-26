@@ -1,0 +1,15 @@
+[package]
+name = "lamella-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The board and part fact files, compiled in from `bsp/` and `csp/`, and how a board resolves to its part row. Consumed by every developer-facing surface -- the `lamella` CLI, the MCP server, the editor -- so a board cannot resolve one way for one of them and another way for another."
+publish = false
+
+[dependencies]
+# The fact strata this parses into: `BoardTable`, `PartRow`, `Strata`. The catalog supplies the
+# TEXT and this crate supplies the resolution; the RULE computed over them (a fit verdict, a
+# reconciliation) stays in `lamella-bsp-gen` and is not restated here.
+lamella-bsp-gen = { path = "../lamella-bsp-gen" }

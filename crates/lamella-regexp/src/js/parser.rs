@@ -93,9 +93,9 @@ const V_FLAG: Absent = Absent {
 };
 const CASE_FOLDING: Absent = Absent {
     id: "regexp-case-folding",
-    reason: "a case-insensitive pattern containing a CASED character beyond ASCII, or a class \
-             RANGE that crosses out of ASCII -- a caseless character matches, and a backreference \
-             folds correctly under `u`",
+    reason: "a class RANGE that crosses out of ASCII under `i`, in any mode; and WITHOUT `u`, any \
+             cased character beyond ASCII -- under `u` a literal, a class member and a \
+             backreference all fold correctly, and a caseless character always matched",
 };
 
 impl ErrorKind {
@@ -188,8 +188,9 @@ impl ErrorKind {
                 String::from("the `v` flag's set notation is not implemented")
             }
             ErrorKind::CaseFoldingUnavailable => String::from(
-                "a case-insensitive pattern beyond ASCII needs a case-folding table that is not \
-                 present in this build",
+                "a case-insensitive class RANGE beyond ASCII needs a range-intersection predicate, \
+                 and without `u` a cased character beyond ASCII needs a case MAPPING table; \
+                 neither is present in this build",
             ),
         }
     }
@@ -220,6 +221,9 @@ pub fn parse(source: &str, flags: Flags) -> Result<Pattern, Error> {
 /// It has to know just three things -- whether a backslash escaped the character, whether it is
 /// inside a class, and whether a `(` is followed by `?` -- and nothing else about the grammar. A
 /// prescan that tried to understand more would be a second parser, and the two would disagree.
+///
+/// It takes the mode for one reason: a group NAME may contain a `\u` escape, and resolving it is
+/// what makes `(?<A>)` and its escaped spelling the same name to the duplicate check here.
 fn prescan(units: &[u16]) -> Result<(u32, Vec<(String, u32)>), Error> {
     let mut groups = 0u32;
     let mut names: Vec<(String, u32)> = Vec::new();
@@ -262,6 +266,9 @@ fn prescan(units: &[u16]) -> Result<(u32, Vec<(String, u32)>), Error> {
 }
 
 /// Reads a group name starting after `(?<`, answering it and the index past the closing `>`.
+///
+/// It takes no mode. A name's alphabet is the language's identifier alphabet and its escapes are
+/// always unicode-mode ([`name_escape`] says why), so nothing here depends on the pattern's flags.
 fn read_group_name(units: &[u16], start: usize) -> Result<(String, usize), Error> {
     let mut name = String::new();
     let mut index = start;
@@ -278,14 +285,15 @@ fn read_group_name(units: &[u16], start: usize) -> Result<(String, usize), Error
             return Ok((name, index + 1));
         }
 
-        let (ch, width) = read_code_point(units, index);
+        let (ch, width) = if unit == 0x5C {
+            name_escape(units, index)?
+        } else {
+            read_code_point(units, index)
+        };
         let value = char::from_u32(ch)
             .ok_or(Error { kind: ErrorKind::InvalidGroupName, at: index })?;
-        let allowed = if first {
-            value == '$' || value == '_' || lamella_identifier_start(ch)
-        } else {
-            value == '$' || lamella_identifier_continue(ch)
-        };
+        let allowed =
+            if first { lamella_identifier_start(ch) } else { lamella_identifier_continue(ch) };
         if !allowed {
             return Err(Error { kind: ErrorKind::InvalidGroupName, at: index });
         }
@@ -295,17 +303,91 @@ fn read_group_name(units: &[u16], start: usize) -> Result<(String, usize), Error
     }
 }
 
-/// Identifier start, as the standard's `IdentifierStartChar` uses it for group names.
+/// `\ RegExpUnicodeEscapeSequence` inside a group name: the code point, and its width in units.
 ///
-/// It is ASCII plus the underscore and dollar here. The full Unicode ID_Start set lives with the
-/// language's own identifiers, and a group name reaching outside ASCII is refused with a position
-/// rather than accepted under a narrower rule than the one that names it.
-fn lamella_identifier_start(ch: u32) -> bool {
-    matches!(ch, 0x41..=0x5A | 0x61..=0x7A | 0x5F | 0x24)
+/// # THE ESCAPE IS ALWAYS READ IN UNICODE MODE, EVEN WHEN THE PATTERN IS NOT
+///
+/// ECMA-262 17th ed, 22.2.1 writes the production as
+/// `RegExpIdentifierStart[UnicodeMode] :: \ RegExpUnicodeEscapeSequence[+UnicodeMode]`.
+/// **The `[+UnicodeMode]` FOLLOWS the nonterminal, so it SETS the parameter rather than guarding
+/// the alternative** -- unlike the `[~UnicodeMode]` that PRECEDES the surrogate-pair alternative
+/// below it, which is a condition. So `u{ CodePoint }` and a lead-plus-trail pair of escapes are
+/// available in a group name whatever flags the pattern carries, and `/(?<\u{1d4d1}>a)/` with no
+/// `u` is legal.
+///
+/// Reading that as a condition costs exactly one test and looks right in every other position,
+/// which is why the distinction is written down here rather than left to the grammar.
+fn name_escape(units: &[u16], at: usize) -> Result<(u32, usize), Error> {
+    let malformed = || Error { kind: ErrorKind::InvalidGroupName, at };
+    if units.get(at + 1).copied() != Some(0x75) {
+        return Err(malformed());
+    }
+
+    if units.get(at + 2).copied() == Some(0x7B) {
+        let mut value: u32 = 0;
+        let mut index = at + 3;
+        let digits_from = index;
+        while let Some(digit) = units.get(index).copied().and_then(hex_value) {
+            value = value.saturating_mul(16).saturating_add(digit);
+            if value > 0x10FFFF {
+                return Err(malformed());
+            }
+            index += 1;
+        }
+        if index == digits_from || units.get(index).copied() != Some(0x7D) {
+            return Err(malformed());
+        }
+        return Ok((value, index + 1 - at));
+    }
+
+    let lead = hex4(units, at + 2).ok_or_else(malformed)?;
+    if (0xD800..0xDC00).contains(&lead) {
+        let trail_at = at + 6;
+        if units.get(trail_at).copied() == Some(0x5C)
+            && units.get(trail_at + 1).copied() == Some(0x75)
+        {
+            if let Some(trail) = hex4(units, trail_at + 2) {
+                if (0xDC00..0xE000).contains(&trail) {
+                    let combined = 0x10000 + ((lead - 0xD800) << 10) + (trail - 0xDC00);
+                    return Ok((combined, 12));
+                }
+            }
+        }
+    }
+    Ok((lead, 6))
 }
 
+/// Exactly four hex digits at `at`, or `None` if any of them is missing or not a digit.
+fn hex4(units: &[u16], at: usize) -> Option<u32> {
+    let mut value = 0u32;
+    for offset in 0..4 {
+        value = value * 16 + hex_value(*units.get(at + offset)?)?;
+    }
+    Some(value)
+}
+
+/// `IdentifierStartChar`: `UnicodeIDStart`, plus `$` and `_` which the grammar names itself.
+///
+/// ECMA-262 17th ed, 22.2.1 -- `RegExpIdentifierStart :: IdentifierStartChar`, and 12.7 gives
+/// `IdentifierStartChar :: UnicodeIDStart | $ | _`. A group name is an identifier, so the alphabet
+/// is the LANGUAGE's, not a narrower one chosen here.
+fn lamella_identifier_start(ch: u32) -> bool {
+    if ch < 0x80 {
+        return matches!(ch, 0x41..=0x5A | 0x61..=0x7A | 0x5F | 0x24);
+    }
+    lamella_unicode::is_id_start(ch)
+}
+
+/// `IdentifierPartChar`: `UnicodeIDContinue`, plus `$`, ZWNJ and ZWJ.
+///
+/// The last two are named by the grammar rather than read from a table. They are also in
+/// ID_Continue as of UCD 16.0.0, so the branch is redundant today -- it stays because the standard
+/// requires them whatever a later UCD revision does with the property.
 fn lamella_identifier_continue(ch: u32) -> bool {
-    lamella_identifier_start(ch) || matches!(ch, 0x30..=0x39)
+    if ch < 0x80 {
+        return matches!(ch, 0x41..=0x5A | 0x61..=0x7A | 0x30..=0x39 | 0x5F | 0x24);
+    }
+    ch == 0x200C || ch == 0x200D || lamella_unicode::is_id_continue(ch)
 }
 
 /// Reads a code point at `index`, pairing surrogates. Used where the standard reads a code point
@@ -487,7 +569,10 @@ impl<'a> Parser<'a> {
             return Ok(Node::Char(ch));
         }
         if ch >= ASCII_LIMIT {
-            return self.error(ErrorKind::CaseFoldingUnavailable);
+            if !self.flags.code_point_mode() {
+                return self.error(ErrorKind::CaseFoldingUnavailable);
+            }
+            return Ok(Node::Char(ch));
         }
         let entries = self.fold_entries(ch);
         if entries.len() == 1 {
@@ -928,10 +1013,14 @@ impl Parser<'_> {
                         return Ok(());
                     }
                     if ch >= ASCII_LIMIT {
-                        return Err(Error {
-                            kind: ErrorKind::CaseFoldingUnavailable,
-                            at: self.pos,
-                        });
+                        if !self.flags.code_point_mode() {
+                            return Err(Error {
+                                kind: ErrorKind::CaseFoldingUnavailable,
+                                at: self.pos,
+                            });
+                        }
+                        entries.push(ClassEntry::Single(ch));
+                        return Ok(());
                     }
                     entries.extend(self.fold_entries(ch));
                 } else {

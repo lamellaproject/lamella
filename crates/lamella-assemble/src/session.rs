@@ -70,7 +70,7 @@ impl Session {
     pub fn new(references: &[Assembly]) -> Session {
         let mut base_model = Model::new();
         for reference in references {
-            load_assembly(&mut base_model, reference);
+            load_assembly(&mut base_model, reference, "");
         }
         base_model.link_bases();
         Session {

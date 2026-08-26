@@ -1,0 +1,80 @@
+# PARTS table for the SAM D10 family. One row per DEVICE VARIANT -- the granularity DSU
+# `DID.DEVSEL` resolves (table 2-1), which is the finest distinction that changes flash or pads.
+# The 13 ordering codes in ch 2 collapse onto these 7: the trailing letters are carrier and
+# temperature grade (`T` = tape and reel, `U` = -40..85C, `N` = -40..105C) and buy the same die.
+#
+# THE NAME IS A CANDIDATE SET AND NOT A PART, TWICE OVER ON THIS FAMILY. The ch 2 decoder reads
+# `D = 20/24 pins` -- one letter, two package sizes -- and `14 = 16KB, 13 = 8KB`, so "ATSAMD10D14A"
+# still names three packages, and "ATSAMD10D" names six variants across two flash densities.
+#
+# Pin lists are COMPLETE GPIO SETS for their package, read off the ch 4 package drawings and
+# cross-checked against the GPIO counts in table 1-1. A complete GPIO set is still not a PAD SPACE:
+# it omits VDD, GND and any pad that is not general-purpose I/O.
+
+[table]
+kind = "parts"
+family = "samd10"
+sources = [
+    "SAM D10 datasheet Atmel-42242H-SAM-D10-Datasheet_09/2016: ch 1 table 1-1 (configuration summary), ch 2 (ordering information + table 2-1 device identification), ch 4 (pinouts per package)",
+]
+notes = [
+    "THIS FAMILY'S BOOK CONTRADICTS ITSELF ON DEVICE SELECTION, AND THE ROWS ABOVE FOLLOW TABLE 2-1. Atmel-42242H table 12-12 (device selection, in the DSU chapter) names the 14-pin parts 'SAMD10D14A' and 'SAMD10D13A' -- a D where both are the C series -- and marks DEVSEL 0x8-0xFF reserved, omitting 0x09 (SAMD10D14AU, the WLCSP part) that table 2-1 lists. Table 2-1 and the ch 2 ordering codes agree with each other (ATSAMD10C14A-SSUT/-SSNT and ATSAMD10C13A-SSUT/-SSNT), so 2-1 is the authority and 12-12 is stale. A transcription taking 12-12 at face value would ship the C variant under a D name and lose the WLCSP variant entirely. Corroborated independently by a bench read of both boards.",
+    "The SAM D10 has NO USB. Table 1-1 carries no USB row where the SAM D11's does, and the ch 2 decoder spells the series as '10 = Cortex M0+ DMA' where the D11's reads '11 = Cortex M0+ DMA, USB'. Two independent statements in the same document, which is why it is recorded as a family fact rather than an omission.",
+    "Device IDs are 0x10020rXX on this family and 0x10030rXX on the SAM D11 -- a different die number, not just a different selection field.",
+]
+
+[[parts]]
+part = "atsamd10d14am"
+package = "24-pin QFN"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02-PA11", "PA14-PA17", "PA22-PA25", "PA27-PA28", "PA30-PA31"]
+source = "Atmel-42242H ch 4.4 (24-pin QFN pinout) for the pad set; table 1-1 column 1 for 22 GPIOs / 4KB SRAM; ordering codes ATSAMD10D14A-MUT and -MNT (ch 2.4), 16K. DSU DID.DEVSEL = 0x00, DID = 0x10020r00 (table 2-1, variant SAMD10D14AM). This is the part on ATSAMD10-XMINI, settled by reading the die rather than the documentation: the board's user guide (Atmel-42387) names no part number, no package and no flash size, and its 22 header pads select this PACKAGE while leaving 16K and 8K indistinguishable. A DSU read on the board returns DID 0x10020100 -- DEVSEL 0x00, this row -- and NVMCTRL independently reports 256 pages of 64 B, which is the same 16 KB by a different register. PA28 is the RESET pad, marked RESET/GPIO in ch 4.4; whether it is available as I/O is a fuse question this row does not answer."
+
+[[parts]]
+part = "atsamd10d13am"
+package = "24-pin QFN"
+flash = 0x2000
+ram = 0x1000
+pins = ["PA02-PA11", "PA14-PA17", "PA22-PA25", "PA27-PA28", "PA30-PA31"]
+source = "Atmel-42242H ch 4.4 (24-pin QFN pinout); ordering codes ATSAMD10D13A-MUT and -MNT (ch 2.4), 8K. DSU DID.DEVSEL = 0x01, DID = 0x10020r01 (table 2-1, variant SAMD10D13AM). Pad-identical to atsamd10d14am and half its flash: nothing in a pin list, a package marking or a header table separates the two, and only DID.DEVSEL does. It was the other candidate for ATSAMD10-XMINI until that board's DSU read returned DEVSEL 0x00; this row is not that board."
+
+[[parts]]
+part = "atsamd10d14ass"
+package = "20-pin SOIC"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02-PA09", "PA14-PA16", "PA22-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42242H ch 4.2 (20-pin SOIC pinout); table 1-1 column 2 for 18 GPIOs; ordering codes ATSAMD10D14A-SSUT and -SSNT (ch 2.2), 16K. DSU DID.DEVSEL = 0x03, DID = 0x10020r03. Lacks PA10, PA11, PA17 and PA27, which the 24-pin QFN carries."
+
+[[parts]]
+part = "atsamd10d13ass"
+package = "20-pin SOIC"
+flash = 0x2000
+ram = 0x1000
+pins = ["PA02-PA09", "PA14-PA16", "PA22-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42242H ch 4.2 (20-pin SOIC pinout); ordering codes ATSAMD10D13A-SSUT and -SSNT (ch 2.2), 8K. DSU DID.DEVSEL = 0x04, DID = 0x10020r04."
+
+[[parts]]
+part = "atsamd10d14au"
+package = "20-ball WLCSP"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02-PA09", "PA14-PA16", "PA22-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42242H ch 4.3 (20-ball WLCSP ball map); ordering code ATSAMD10D14A-UUT (ch 2.3), 16K. DSU DID.DEVSEL = 0x09, DID = 0x10020r09. Table 1-1 groups this with the 20-pin SOIC in one column, so the identical pin list is READ OFF THE BALL MAP rather than inherited from that grouping: the two sets were compared pad by pad and are the same 18. There is no 8K WLCSP ordering code in ch 2.3, so this package ships in one density only."
+
+[[parts]]
+part = "atsamd10c14a"
+package = "14-pin SOIC"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02", "PA04-PA05", "PA08-PA09", "PA14-PA15", "PA24-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42242H ch 4.1 (14-pin SOIC pinout); table 1-1 column 3 for 12 GPIOs; ordering codes ATSAMD10C14A-SSUT and -SSNT (ch 2.1), 16K. DSU DID.DEVSEL = 0x06, DID = 0x10020r06. This is the D10C series, not D10D: it carries 2 SERCOMs where the D10D carries 3, and 5 ADC channels against 8 or 10 (table 1-1), so it is a different part rather than a smaller package of the same one."
+
+[[parts]]
+part = "atsamd10c13a"
+package = "14-pin SOIC"
+flash = 0x2000
+ram = 0x1000
+pins = ["PA02", "PA04-PA05", "PA08-PA09", "PA14-PA15", "PA24-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42242H ch 4.1 (14-pin SOIC pinout); ordering codes ATSAMD10C13A-SSUT and -SSNT (ch 2.1), 8K. DSU DID.DEVSEL = 0x07, DID = 0x10020r07."

@@ -105,26 +105,34 @@ pub fn compile_pattern(source: &str, flags: Flags) -> Result<Compiled, Error> {
     let program = crate::compile::compile(
         &pattern.node,
         pattern.groups,
-        Options { multiline: flags.multiline, fold: backreference_fold(flags) },
+        Options { multiline: flags.multiline, fold: pattern_fold(flags) },
     );
     Ok(Compiled { program, flags, groups: pattern.groups, names: pattern.names })
 }
 
-/// Which canonicalization a backreference uses, which is the ONE place the two `i` rules diverge
-/// at run time rather than at parse time.
+/// Which canonicalization this pattern uses AT ITS TOP LEVEL, for the instructions compiled from it.
 ///
-/// 22.2.2.9 `Canonicalize` branches on the `u` flag: with it the answer is Unicode simple case
-/// folding, without it the character's `toUppercase` mapping under a rule that refuses to carry a
-/// non-ASCII character into ASCII. **The front end resolves every LITERAL and CLASS against that
-/// difference already** -- it is why [`widen_for_ignore_case`] adds U+212A and U+017F only in
-/// code-point mode -- and a backreference is the one construct it cannot, because the characters
-/// being compared come from the SUBJECT.
+/// ECMA-262 17th ed, 22.2.2.7.3 (`Canonicalize`) branches on the `u` flag: with it the answer is
+/// Unicode simple case folding, without it the character's `toUppercase` mapping under a rule that
+/// refuses to carry a non-ASCII character into ASCII -- step 9, which returns the character
+/// unchanged when a non-ASCII input would uppercase into ASCII.
+///
+/// **This is not pattern-wide, despite the flag being one.** 22.2.2.7.4 `UpdateModifiers` scopes
+/// `i` to a subexpression for `(?i:...)`, so this answers only what the pattern opens with; the
+/// fold that decides a comparison rides on the instruction that makes it.
+///
+/// **The front end resolves the ASCII range at COMPILE time and the matcher resolves the rest**,
+/// and the split is not arbitrary: widening enumerates counterparts, which needs the fold
+/// equivalence class and is available only for ASCII, while comparing needs the forward function
+/// alone. So `[a-z]` arrives widened -- it is why [`widen_for_ignore_case`] adds U+212A and U+017F
+/// only in code-point mode -- and `σ` arrives as itself, to be folded against whatever the subject
+/// offers.
 ///
 /// [`Fold::Ascii`] is therefore a published deviation rather than the standard's rule, and it is on
 /// the list under `regexp-backreference-case-is-ascii-without-u`. The mapping table it would need
 /// does not exist to read: the shared Unicode home ships the case PROPERTIES and the FOLD tables,
 /// and no `toUppercase` data at all.
-fn backreference_fold(flags: Flags) -> crate::program::Fold {
+fn pattern_fold(flags: Flags) -> crate::program::Fold {
     use crate::program::Fold;
     match (flags.ignore_case, flags.code_point_mode()) {
         (false, _) => Fold::None,
@@ -222,10 +230,11 @@ mod tests {
     /// code rather than against itself.
     #[test]
     fn every_listed_absence_actually_refuses_under_its_own_id() {
-        let cases: [(&str, &str, &str); 3] = [
+        let cases: [(&str, &str, &str); 4] = [
             ("regexp-property-escapes", r"\p{L}", "u"),
             ("regexp-v-flag", "a", "v"),
-            ("regexp-case-folding", "\u{3C3}", "ui"),
+            ("regexp-case-folding", "[\u{3B1}-\u{3C9}]", "ui"),
+            ("regexp-case-folding", "\u{3C3}", "i"),
         ];
         for (id, source, flags) in cases {
             let flags = Flags::parse(flags).expect("legal flags");

@@ -1205,6 +1205,11 @@ mod tests {
     /// already in this file: `i64.extend_i32_u` is 0xAD and `f32.convert_i32_s` is 0xB2, and the
     /// four opcodes between them are `i64.trunc_f32_s`, `_u`, `i64.trunc_f64_s`, `_u` in that
     /// order. So 0xAE and 0xB0 are forced by entries the assembler already emits.
+    ///
+    /// The gap they fill was a BUILD BREAK rather than a wrong encoding: `wasm::emit_convert`
+    /// called both methods, neither existed, and nothing compiled `lamella-aot --features wasm`
+    /// -- the crate's default is `arm32`, so the workspace run never selected the backend that
+    /// stopped building.
     #[test]
     fn the_signed_float_to_i64_truncations_encode_as_their_neighbours_require() {
         let mut body = Func::new(0);

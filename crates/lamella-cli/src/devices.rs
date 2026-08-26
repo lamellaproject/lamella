@@ -26,18 +26,29 @@ struct Attached {
     what: String,
 }
 
+const USAGE: &str = "\
+usage: lamella devices [--identify]
+
+Lists what is attached and, for each, THE WORD YOU PASS TO ANOTHER VERB -- so the first column can
+be copied straight into --target or --probe rather than translated.
+
+A board in its bootloader is listed here too. It is still attached, and it is the one somebody
+holding a new board is most likely to be looking for.
+
+--identify asks each board what it is, over the wire, rather than reporting what the operating
+system said about the port. That costs a round trip per board and is the answer worth having when
+two boards look alike.";
+
 pub fn devices_command(args: &[String]) -> ExitCode {
-    let spec = Spec { verb: "devices", values: &[], flags: &["--identify"] };
-    let parsed = match args::parse(args, &spec) {
+    let spec =
+        Spec { verb: "devices", usage: Some(USAGE), values: &[], flags: &["--identify"] };
+    let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+        Err(halt) => return halt.code(),
     };
 
     let mut attached = enumerate();
-    for waiting in crate::bootsel::waiting() {
+    for waiting in lamella_flash_routes::bootsel::waiting() {
         let what = format!("{}  ({})", waiting.state(), waiting.volume);
         attached.push(Attached { target: waiting.describe(), carrier: "volume", what });
     }
@@ -314,4 +325,18 @@ mod tests {
         assert!(text.contains("does NOT need Lamella"), "and that firmware is not the reason");
         assert!(text.contains("charge-only"), "and names the commonest real cause");
     }
+    /// **A VERB WITH NO USAGE TEXT ANSWERS `--help` BY PRINTING NOTHING AND EXITING 0**, which
+    /// reads to a person as "this tool has no help" and to a script as success.
+    ///
+    /// Asserting the FIRST LINE rather than the presence of a string also catches the likelier
+    /// drift: a usage block copied from a neighbouring verb and not renamed.
+    #[test]
+    fn the_usage_opens_with_the_verb_it_belongs_to() {
+        assert!(
+            USAGE.starts_with("usage: lamella devices"),
+            "`devices` must open with the line a reader retypes: {}",
+            USAGE.lines().next().unwrap_or_default()
+        );
+    }
+
 }

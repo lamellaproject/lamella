@@ -1009,10 +1009,9 @@ mod tests {
 
     /// A FAULTED session must report a NON-ZERO exit, and this is the regression it exists to catch.
     ///
-    /// The fault arm used to emit `terminated` with no `exited` at all. A host with no `exited` event
-    /// has nothing to read an exit code from, so it shows the default -- success. Measured: a trapped
-    /// program reported "Ready" and exit 0, with the only evidence of failure one line of stderr in a
-    /// pane the user may not be looking at.
+    /// **A fault arm emitting `terminated` with no `exited` leaves a host nothing to read an exit code
+    /// from, so it shows the default -- success.** A trapped program then reports "Ready" and exit 0,
+    /// with the only evidence of failure one line of stderr in a pane the user may not be looking at.
     ///
     /// The remedy belongs here rather than in each host: a host inferring failure by grepping stderr for
     /// trap text is a heuristic every consumer would reimplement slightly differently.

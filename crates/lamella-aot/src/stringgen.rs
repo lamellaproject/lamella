@@ -196,8 +196,8 @@ pub(crate) fn lower_int_to_string(program: &mut Vec<Function>, string: Option<u3
 
 /// Rewrites each `WriteInt` to a call to a generated `__write_int` helper, so `Console.WriteLine(int)`
 /// (and the Python front end's `print` of an int) formats in SHARED MIR and hands the bytes to the
-/// per-target console seam -- rather than each backend carrying its own hand-encoded itoa. ARM had
-/// one; RISC-V had none, which is why `Console.WriteLine(int)` did not compile there at all.
+/// per-target console seam -- rather than each backend carrying its own hand-encoded itoa. A
+/// backend without one cannot compile `Console.WriteLine(int)` at all.
 ///
 /// OBJECT PATH ONLY, by the caller's choice: the helper ends in a `PInvoke` of
 /// [`CONSOLE_WRITE_BYTES`], and a flat image has no linker to resolve an extern against. The flat
@@ -609,6 +609,7 @@ fn int_to_string_mir(string: Option<u32>) -> Function {
                             length: v(18),
                             element_size: 2,
                             element_kind: ELEMENT_KIND_UTF16_UNIT,
+                            element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
                         },
                     ),
                     (v(20), bin(BinOp::Sub, v(18), v(2))),
@@ -949,6 +950,7 @@ fn string_concat_mir(string: Option<u32>) -> Function {
                             length: v(4),
                             element_size: 2,
                             element_kind: ELEMENT_KIND_UTF16_UNIT,
+                            element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
                         },
                     ),
                     (v(6), ci(0)),

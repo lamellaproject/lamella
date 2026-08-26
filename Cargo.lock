@@ -342,6 +342,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-catalog"
+version = "0.0.0"
+dependencies = [
+ "lamella-bsp-gen",
+]
+
+[[package]]
 name = "lamella-cil"
 version = "0.0.0"
 dependencies = [
@@ -367,9 +374,14 @@ dependencies = [
  "lamella-aot",
  "lamella-assemble",
  "lamella-bsp-gen",
- "lamella-cmsis-dap",
+ "lamella-catalog",
  "lamella-cmsis-dap-nrf",
+ "lamella-cmsis-dap-rp2350",
  "lamella-debug-backend",
+ "lamella-elf",
+ "lamella-flash-backend",
+ "lamella-flash-format",
+ "lamella-flash-routes",
  "lamella-load",
  "lamella-metadata",
  "lamella-probe",
@@ -378,7 +390,6 @@ dependencies = [
  "lamella-py-frontend",
  "lamella-py-runtime",
  "lamella-syntax",
- "lamella-usbbulk",
  "lamella-wire",
  "lamella-wire-host",
 ]
@@ -515,10 +526,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-flash-backend"
+version = "0.0.0"
+dependencies = [
+ "lamella-probe-core",
+]
+
+[[package]]
 name = "lamella-flash-format"
 version = "0.0.0"
 dependencies = [
  "lamella-elf",
+]
+
+[[package]]
+name = "lamella-flash-routes"
+version = "0.0.0"
+dependencies = [
+ "lamella-aot",
+ "lamella-catalog",
+ "lamella-cmsis-dap-nrf",
+ "lamella-cmsis-dap-rp2350",
+ "lamella-cmsis-dap-stm32",
+ "lamella-elf",
+ "lamella-flash-backend",
+ "lamella-flash-format",
+ "lamella-pe",
+ "lamella-probe",
+ "lamella-probe-core",
+ "lamella-stlink",
+ "serde_json",
 ]
 
 [[package]]
@@ -604,8 +641,12 @@ name = "lamella-mcp"
 version = "0.0.0"
 dependencies = [
  "lamella-assemble",
+ "lamella-bsp-gen",
+ "lamella-catalog",
  "lamella-dap",
  "lamella-debug-backend",
+ "lamella-flash-backend",
+ "lamella-flash-routes",
  "lamella-load",
  "lamella-metadata",
  "lamella-token",

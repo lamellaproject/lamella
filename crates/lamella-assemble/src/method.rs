@@ -135,6 +135,12 @@ impl Labels<'_> {
     /// also do is harmless -- it empties an evaluation stack that a statement boundary has already
     /// left empty -- so the test only has to be conservative in one direction.
     ///
+    /// **ONE FUNCTION FOR ALL SEVEN STATEMENT BRANCHES, BECAUSE THE RULE IS THE SAME AT EVERY
+    /// ONE.** `return`, `goto`, `break`, `continue`, `goto case`, `goto case <string>` and
+    /// `goto default` all leave a protected region the same way, and any of them emitting a bare
+    /// `br` is rejected by ILVerify as `BranchOutOfTry` (or `BranchOutOfHandler`), with the runtime
+    /// refusing the image outright as `InvalidProgramException`.
+    ///
     /// **THE DEPTHS ARE COMPARED RATHER THAN TESTED AGAINST ZERO**, and the difference is two
     /// programs: a `break` whose loop is ITSELF inside a `try` leaves nothing and wants `br`, and
     /// so does one inside a `finally` whose loop is also inside it. Asking only *"does this method

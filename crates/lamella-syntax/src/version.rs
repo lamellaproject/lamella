@@ -444,6 +444,21 @@ pub enum Feature {
     /// beside the method form. (csc has further kinds, notably expression-bodied constructors and
     /// accessors at C# 7.0; they get variants when there is a site to raise them from.)
     ExpressionBodiedProperty,
+    /// An expression-bodied INDEXER, `int this[int i] => 1;`. Introduced in **C# 6.0**.
+    ///
+    /// **csc gives an indexer its OWN noun rather than calling it a property**, measured at ISO-1:
+    /// *'expression-bodied indexer'*. Everywhere else in this compiler an indexer is a property
+    /// with parameters (17.8), and here it is not -- the message is a search key, so the name is
+    /// copied rather than derived from the member kind.
+    ExpressionBodiedIndexer,
+    /// An expression-bodied ACCESSOR, `get => 1;`. Introduced in **C# 7.0** -- a rung LATER than
+    /// the member forms that share the token, which is why it is a fourth variant rather than a
+    /// spelling of the other three.
+    ///
+    /// Its name is not spelled like the other three: csc says *'expression body property accessor'*
+    /// -- no hyphens on "expression body", and the noun is *property* even for an indexer's
+    /// accessor.
+    ExpressionBodiedAccessor,
     /// An object initializer, `new C { F = 1 }`. Introduced in C# 3.0.
     ///
     /// **csc names the two initializer forms differently and this one is the DEFAULT**: an empty
@@ -518,13 +533,40 @@ pub enum Feature {
     /// separator'' is not available in C# 7.0"), measured. So a compiler that implemented C# 7.0
     /// separators and allowed a leading one would ACCEPT what csc rejects -- the serious column.
     LeadingDigitSeparator,
-    /// A record type -- a class or struct with generated value equality, `with`, `ToString` and
-    /// `Deconstruct`. Introduced in C# 9.0.
+    /// A record CLASS -- `record R(int X);` and `record R { ... }` -- with its generated value
+    /// equality, `<Clone>$`, `ToString`/`PrintMembers` and `Deconstruct`. C# 9.0.
+    ///
+    /// **`record class` AND `record struct` ARE A DIFFERENT csc GATE AT C# 10, AND csc CALLS BOTH
+    /// `'record structs'`** -- plural, for the CLASS form too. Measured one compilation per rung,
+    /// 7.3 through 12; this variant is the C# 9 form and does not cover the keyword pair.
+    ///
+    /// **csc DOES NOT GATE `record R(int X);` BY NAME BELOW C# 9**: it fails to recognize the
+    /// syntax and reports `CS0106`, so there is no `Feature '...'` sentence to copy from that
+    /// spelling. The name `records` does exist -- a `with` expression is the only spelling that
+    /// surfaces it, `CS8370`/`CS8400 Feature 'records'` at 7.3 and 8.0.
     ///
     /// **Sequenced AFTER generics deliberately**: a record is a code generator whose output binds
-    /// `IEquatable<T>`, so it cannot land before the thing it generates against. 44 uses in
-    /// dotnet/iot, 11 in nanoFramework.
+    /// `IEquatable<T>`, so it cannot land before the thing it generates against. 92 files and 93
+    /// declarations in dotnet/iot (measured by `tools/lang-gap/corpus-census.ps1`; an earlier
+    /// figure of 44 here was low by more than 2x), 11 in nanoFramework. 38 of the 92 are
+    /// positional.
     Records,
+    /// The `record class` / `record struct` KEYWORD forms -- C# 10, and a csc feature separate
+    /// from [`Feature::Records`].
+    ///
+    /// **csc CALLS BOTH `'record structs'`, PLURAL, INCLUDING THE CLASS FORM**, which is not what
+    /// either name suggests: `record class R(int X);` at C# 9 reports *Feature 'record structs' is
+    /// not available in C# 9.0*. Measured one compilation per rung, and `readonly record struct`
+    /// reports the same.
+    ///
+    RecordStructs,
+    /// An `init` accessor in place of a property or indexer `set` -- C# 9.0.
+    ///
+    /// **csc's OWN FEATURE, GATED SEPARATELY FROM `records`**, and named `'init-only setters'`.
+    /// Measured one compilation per rung: CS8370 at 7.3, CS8400 at 8.0, clean at 9. A record needs
+    /// it -- a positional record's properties are `{ get; init; }` -- but it stands on its own and
+    /// a program may use it with no record in sight.
+    InitOnlySetters,
     /// A default (bodied) member on an interface -- C# 8.0. Gated in the BINDER rather than the
     /// parser: the syntax is an ordinary member with a body and only the enclosing type's kind
     /// makes it a feature.
@@ -565,11 +607,59 @@ pub enum Feature {
     /// split: the state machine for a generic method is a synthesized generic type, which lands
     /// beside `Task<T>` (in real code the two populations are nearly the same methods).
     AsyncGenericMethod,
+    /// A CALLER-INFO ATTRIBUTE on an optional parameter -- `[CallerMemberName]`,
+    /// `[CallerFilePath]`, `[CallerLineNumber]` (**C# 5.0**).
+    ///
+    /// **ONE VARIANT FOR ALL THREE**, because they are one feature: the call site substitutes a
+    /// constant for an omitted argument, and which constant it is does not change what has to be
+    /// built.
+    ///
+    ///
+    /// csc has no gate to copy -- the attributes are ordinary BCL types and it never reports a
+    /// feature message for them -- so the description below is OURS, in csc's style.
+    CallerInfoAttribute,
+    /// The `nameof` operator -- `nameof(x)`, whose value is the FINAL IDENTIFIER of its operand
+    /// as a compile-time constant string. Introduced in **C# 6.0**.
+    ///
+    /// **`nameof` IS NOT A KEYWORD AND THIS FEATURE DOES NOT OWN THE WORD.** A declaration named
+    /// `nameof` in scope WINS -- measured against csc one compilation each for a local, a method
+    /// and a property, and in all three the user's declaration was called. So the gate is raised
+    /// from the BINDER, after resolution has been tried, exactly as
+    /// [`Feature::ImplicitlyTypedLocalVariable`]'s is and for the same reason.
+    ///
+    /// It is also not the operator unless the invocation has EXACTLY ONE positional argument:
+    /// `nameof()`, `nameof(a, b)` and `nameof(x: a)` are all `CS0103 The name 'nameof' does not
+    /// exist in the current context` -- csc falls back to reading the word as an ordinary
+    /// identifier rather than reporting a bad `nameof`. Measured.
+    NameOf,
+    /// An INTERPOLATED STRING -- `$"a{b}c"` and its verbatim form `$@"a{b}c"`. Introduced in
+    /// **C# 6.0**.
+    ///
+    /// **`$"..."` IS FOUR csc FEATURES AT FOUR RUNGS, and this variant is only the first**, the
+    /// same shape as `=>` (see [`Feature::ExpressionBodiedMethod`]). Measured one compilation per
+    /// rung:
+    ///
+    /// | construct | rung | how csc refuses it below that |
+    /// |---|---|---|
+    /// | `$"..."`, `$@"..."` | C# 6.0 | `Feature 'interpolated strings'` -- this variant |
+    /// | `@$"..."` | C# 8.0 | **`CS8401`, which is not the `Feature '...'` family at all** |
+    /// | a CONSTANT one | C# 10.0 | `Feature 'constant interpolated strings'` -- [`Feature::ConstantInterpolatedStrings`] |
+    /// | `"""..."""` | C# 11.0 | `Feature 'raw string literals'` -- a separate lexical form, unbuilt |
+    ///
+    /// PLURAL, unlike most of this table: csc says *'interpolated strings'* for one occurrence.
+    InterpolatedStrings,
+    /// An interpolated string used where a CONSTANT is required -- a `const` initializer, a
+    /// `case` label, an attribute argument. Introduced in **C# 10.0**, four rungs after the
+    /// interpolated string itself.
+    ///
+    ///
+    /// Gated and not built: lcsc folds the same way csc does but does not admit the result where a
+    /// constant is required, so the refusal is `LAM0001` at C# 10 and up and the version gate
+    /// below it. Both are honest; neither claims the other's cause.
+    ConstantInterpolatedStrings,
     /// An `await` inside a `catch` or `finally` block -- introduced in **C# 6.0**. Below 6 the
     /// refusal is csc's own CS1985/CS1984 (measured, and the two texts are asymmetric); at 6 and
-    /// above csc compiles it (measured at both rungs), so what remains for lcsc is the
-    /// permitted-but-unbuilt half: the machinery that resumes inside a handler (exception
-    /// spilling, pending-fault rethrow) is not part of phase 1.
+    /// above csc compiles it (measured at both rungs).
     AwaitInCatchOrFinally,
 }
 
@@ -601,31 +691,37 @@ impl Feature {
             Feature::PragmaDirective | Feature::AutoProperties => true,
             Feature::AccessorAccessibility => true,
             Feature::NullableValueTypes => true,
+            Feature::ExpressionBodiedMethod
+            | Feature::ExpressionBodiedProperty
+            | Feature::ExpressionBodiedIndexer
+            | Feature::ExpressionBodiedAccessor => true,
+            Feature::RequiredMembers | Feature::LeadingDigitSeparator => true,
+            Feature::DefaultParameterValues => true,
             Feature::AnonymousMethods
             | Feature::NamespaceAlias
             | Feature::LambdaExpression
-            | Feature::ExpressionBodiedMethod
-            | Feature::ExpressionBodiedProperty
             | Feature::AnonymousObjectCreation
-            | Feature::DefaultParameterValues
             | Feature::NamedArguments
             | Feature::NullConditional
             | Feature::UsingStatic
             | Feature::ReadonlyAutoProperty
             | Feature::SwitchOnBool
-
             | Feature::TopLevelStatements
-            | Feature::LeadingDigitSeparator
-            | Feature::RequiredMembers
             | Feature::Records
+            | Feature::RecordStructs
             | Feature::DefaultInterfaceImplementation
             | Feature::ParameterlessStructConstructor => false,
+            Feature::InitOnlySetters => true,
             Feature::AsyncFunction => true,
             Feature::PartialTypes => true,
             Feature::AsyncMain => false,
             Feature::AsyncTaskOfT
             | Feature::AsyncGenericMethod
-            | Feature::AwaitInCatchOrFinally => false,
+            | Feature::AwaitInCatchOrFinally
+            | Feature::CallerInfoAttribute => false,
+            Feature::NameOf => true,
+            Feature::InterpolatedStrings => true,
+            Feature::ConstantInterpolatedStrings => false,
         }
     }
 
@@ -633,16 +729,15 @@ impl Feature {
     /// transcribed.
     ///
     ///
-    /// **A HAND-WRITTEN LIST OF FEATURES IS A LIST OF THE FEATURES SOMEBODY REMEMBERED.** The
-    /// rung tests below used to name their own table, and it had drifted to seventeen of
-    /// twenty-seven -- ten features, including `Records`, `RequiredMembers` and
-    /// `TopLevelStatements`, were asserted about by nothing at all. A gate whose population is
-    /// typed out by hand tests the day it was written.
+    /// **A HAND-WRITTEN LIST OF FEATURES IS A LIST OF THE FEATURES SOMEBODY REMEMBERED.** Rung
+    /// tests naming their own table drift silently: features such as `Records`, `RequiredMembers`
+    /// and `TopLevelStatements` end up asserted about by nothing at all, while the gate stays green.
+    /// **A gate whose population is typed out by hand tests the day it was written.**
     ///
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 38] = [
+    pub const ALL: [Feature; 46] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -656,6 +751,8 @@ impl Feature {
         Feature::LambdaExpression,
         Feature::ExpressionBodiedMethod,
         Feature::ExpressionBodiedProperty,
+        Feature::ExpressionBodiedIndexer,
+        Feature::ExpressionBodiedAccessor,
         Feature::ObjectInitializer,
         Feature::CollectionInitializer,
         Feature::AnonymousObjectCreation,
@@ -673,6 +770,8 @@ impl Feature {
         Feature::RequiredMembers,
         Feature::LeadingDigitSeparator,
         Feature::Records,
+        Feature::RecordStructs,
+        Feature::InitOnlySetters,
         Feature::DefaultInterfaceImplementation,
         Feature::ParameterlessStructConstructor,
         Feature::AsyncFunction,
@@ -681,6 +780,10 @@ impl Feature {
         Feature::AsyncGenericMethod,
         Feature::AwaitInCatchOrFinally,
         Feature::PartialTypes,
+        Feature::CallerInfoAttribute,
+        Feature::NameOf,
+        Feature::InterpolatedStrings,
+        Feature::ConstantInterpolatedStrings,
     ];
 
     /// The first language version in which this feature is available.
@@ -705,15 +808,21 @@ impl Feature {
             Feature::DefaultParameterValues | Feature::NamedArguments => LanguageVersion::CSharp4,
             Feature::SwitchOnBool => LanguageVersion::CSharp2,
             Feature::AutoProperties => LanguageVersion::CSharp3,
-            Feature::ExpressionBodiedMethod | Feature::ExpressionBodiedProperty => {
-                LanguageVersion::CSharp6
-            }
+            Feature::ExpressionBodiedMethod
+            | Feature::ExpressionBodiedProperty
+            | Feature::ExpressionBodiedIndexer => LanguageVersion::CSharp6,
+            Feature::ExpressionBodiedAccessor => LanguageVersion::CSharp7,
             Feature::NullConditional
             | Feature::UsingStatic
+            | Feature::NameOf
+            | Feature::InterpolatedStrings
             | Feature::ReadonlyAutoProperty => LanguageVersion::CSharp6,
+            Feature::ConstantInterpolatedStrings => LanguageVersion::CSharp10,
             Feature::BinaryLiterals | Feature::DigitSeparators => LanguageVersion::CSharp7,
             Feature::LeadingDigitSeparator => LanguageVersion::CSharp7_2,
             Feature::TopLevelStatements | Feature::Records => LanguageVersion::CSharp9,
+            Feature::RecordStructs => LanguageVersion::CSharp10,
+            Feature::InitOnlySetters => LanguageVersion::CSharp9,
             Feature::FileScopedNamespaces => LanguageVersion::CSharp10,
             Feature::RequiredMembers => LanguageVersion::CSharp11,
             Feature::DefaultInterfaceImplementation => LanguageVersion::CSharp8,
@@ -721,6 +830,7 @@ impl Feature {
             Feature::AsyncFunction => LanguageVersion::CSharp5,
             Feature::AsyncMain => LanguageVersion::CSharp7_1,
             Feature::AsyncTaskOfT | Feature::AsyncGenericMethod => LanguageVersion::CSharp5,
+            Feature::CallerInfoAttribute => LanguageVersion::CSharp5,
             Feature::AwaitInCatchOrFinally => LanguageVersion::CSharp6,
         }
     }
@@ -765,6 +875,8 @@ impl Feature {
             Feature::LambdaExpression => "lambda expression",
             Feature::ExpressionBodiedMethod => "expression-bodied method",
             Feature::ExpressionBodiedProperty => "expression-bodied property",
+            Feature::ExpressionBodiedIndexer => "expression-bodied indexer",
+            Feature::ExpressionBodiedAccessor => "expression body property accessor",
             Feature::ObjectInitializer => "object initializer",
             Feature::CollectionInitializer => "collection initializer",
             Feature::AnonymousObjectCreation => "anonymous types",
@@ -783,6 +895,8 @@ impl Feature {
             Feature::FileScopedNamespaces => "file-scoped namespace",
             Feature::RequiredMembers => "required members",
             Feature::Records => "records",
+            Feature::RecordStructs => "record structs",
+            Feature::InitOnlySetters => "init-only setters",
             Feature::DefaultInterfaceImplementation => "default interface implementation",
             Feature::ParameterlessStructConstructor => "parameterless struct constructors",
             Feature::AsyncFunction => "async function",
@@ -790,9 +904,51 @@ impl Feature {
             Feature::AsyncMain => "async main",
             Feature::AsyncTaskOfT => "async method returning Task<T>",
             Feature::AsyncGenericMethod => "generic async method",
+            Feature::CallerInfoAttribute => "caller information attribute",
             Feature::AwaitInCatchOrFinally => "await in a catch or finally clause",
+            Feature::NameOf => "nameof operator",
+            Feature::InterpolatedStrings => "interpolated strings",
+            Feature::ConstantInterpolatedStrings => "constant interpolated strings",
         }
     }
+
+    /// Whether `version` admits this feature, and if not, WHICH of the two bits refused it.
+    ///
+    /// **THE TWO-BIT RULE, STATED ONCE.** A construct needs its dialect to PERMIT it
+    /// ([`Self::introduced_in`]) and this build to have BUILT it ([`Self::is_implemented`]), and
+    /// the two failures want different diagnostics because they want different actions from the
+    /// reader: raising `/langversion` fixes the first and cannot touch the second.
+    ///
+    #[must_use]
+    pub fn gate_against(self, version: LanguageVersion) -> Option<FeatureGate> {
+        if !version.supports(self) {
+            Some(FeatureGate::RequiresLaterVersion {
+                required: self.introduced_in().required_name(),
+            })
+        } else if !self.is_implemented() {
+            Some(FeatureGate::NotInThisBuild)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a [`Feature`] is refused, from [`Feature::gate_against`].
+///
+/// The two variants are the two bits, and they are disjoint by construction: a dialect that does
+/// not permit a construct never reaches the question of whether it was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureGate {
+    /// The dialect being compiled predates the feature. csc's `CS8022` family; the message names
+    /// the version that would work, and moving `/langversion` up fixes it.
+    RequiresLaterVersion {
+        /// The version that introduced it, as csc renders a REQUIRED version -- `"2"`, `"7.0"`.
+        required: &'static str,
+    },
+    /// The dialect permits it and this build cannot produce it. `LAM0001`, and **moving
+    /// `/langversion` up does NOT fix it** -- which is exactly why it must not borrow the other
+    /// message.
+    NotInThisBuild,
 }
 
 /// The reason a `/langversion` value could not be turned into a
@@ -919,6 +1075,8 @@ mod tests {
                 | Feature::LambdaExpression
                 | Feature::ExpressionBodiedMethod
                 | Feature::ExpressionBodiedProperty
+                | Feature::ExpressionBodiedIndexer
+                | Feature::ExpressionBodiedAccessor
                 | Feature::ObjectInitializer
                 | Feature::CollectionInitializer
                 | Feature::AnonymousObjectCreation
@@ -936,6 +1094,8 @@ mod tests {
                 | Feature::RequiredMembers
                 | Feature::LeadingDigitSeparator
                 | Feature::Records
+                | Feature::RecordStructs
+                | Feature::InitOnlySetters
                 | Feature::DefaultInterfaceImplementation
                 | Feature::ParameterlessStructConstructor
                 | Feature::AsyncFunction
@@ -943,12 +1103,16 @@ mod tests {
                 | Feature::AsyncTaskOfT
                 | Feature::AsyncGenericMethod
                 | Feature::AwaitInCatchOrFinally
+                | Feature::CallerInfoAttribute
+                | Feature::NameOf
+                | Feature::InterpolatedStrings
+                | Feature::ConstantInterpolatedStrings
                 | Feature::PartialTypes => {}
             }
         }
         assert_eq!(
             Feature::ALL.len(),
-            38,
+            46,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }
@@ -1149,5 +1313,67 @@ mod tests {
     fn flag_value_round_trips_for_supported_versions() {
         let v1 = LanguageVersion::CSharp1;
         assert_eq!(LanguageVersion::parse_flag(v1.flag_value()), Ok(v1));
+    }
+
+    /// A FEATURE THE CEILING PERMITS AND THIS BUILD LACKS MUST NEVER BE TOLD TO RAISE ITS
+    /// LANGUAGE VERSION -- there is no higher version to raise it to.
+    ///
+    /// **RED-PROOF: revert `gate_against` to asking `supports` alone and this fails**, because
+    /// every unbuilt feature at the ceiling comes back `None` -- silently admitted -- and the
+    /// `NotInThisBuild` arm is never reached. That is the state this test was written against:
+    /// six of the seventy-eight `feature-matrix` probes answered *"not available in C# 11.0.
+    /// Please use language version 4 or greater"* at `/langversion:11`.
+    ///
+    /// Derived over [`Feature::ALL`] rather than over a list, so a feature added tomorrow is
+    /// covered without anyone remembering to add it here.
+    #[test]
+    fn a_permitted_but_unbuilt_feature_is_never_told_to_raise_its_language_version() {
+        let ceiling = LanguageVersion::SELECTABLE_MAX;
+        let mut unbuilt = 0;
+        for feature in Feature::ALL {
+            match feature.gate_against(ceiling) {
+                None => assert!(
+                    feature.is_implemented(),
+                    "{} is admitted at the ceiling while is_implemented() says it is not built",
+                    feature.description()
+                ),
+                Some(FeatureGate::NotInThisBuild) => {
+                    unbuilt += 1;
+                    assert!(ceiling.supports(feature));
+                    assert!(!feature.is_implemented());
+                }
+                Some(FeatureGate::RequiresLaterVersion { required }) => assert!(
+                    !ceiling.supports(feature),
+                    "{} asks for language version {required} at a compilation that is already at                      the ceiling -- advice the reader has already taken",
+                    feature.description()
+                ),
+            }
+        }
+        assert!(unbuilt > 0, "no unbuilt feature left for this test to be about");
+    }
+
+    /// The two bits are asked in the order that makes the message right: a dialect that does not
+    /// permit a construct never reaches the question of whether it was built.
+    #[test]
+    fn the_version_bit_is_asked_first() {
+        assert!(!Feature::Records.is_implemented());
+        assert!(matches!(
+            Feature::Records.gate_against(LanguageVersion::CSharp1),
+            Some(FeatureGate::RequiresLaterVersion { required: "9.0" })
+        ));
+        assert!(matches!(
+            Feature::Records.gate_against(LanguageVersion::CSharp9),
+            Some(FeatureGate::NotInThisBuild)
+        ));
+    }
+
+    /// Both of these read `false` while the compiler emitted them correctly, and nothing noticed
+    /// because no gate site consulted `is_implemented` at all.
+    #[test]
+    fn two_features_that_were_marked_unbuilt_while_being_built() {
+        assert!(Feature::RequiredMembers.is_implemented());
+        assert!(Feature::LeadingDigitSeparator.is_implemented());
+        assert_eq!(Feature::RequiredMembers.gate_against(LanguageVersion::CSharp11), None);
+        assert_eq!(Feature::LeadingDigitSeparator.gate_against(LanguageVersion::CSharp7_2), None);
     }
 }

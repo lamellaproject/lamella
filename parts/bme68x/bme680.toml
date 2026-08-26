@@ -44,7 +44,7 @@ validation = "none"
 #
 # One accepted value, and the datasheet documents no sample-revision alternatives for it.
 #
-# THE SET HAS ONE MEMBER AND STILL DOES NOT IDENTIFY THE PART. Everywhere else in this catalogue
+# THE SET HAS ONE MEMBER AND STILL DOES NOT IDENTIFY THE PART. Everywhere else in this catalog
 # the identity register answers the question the address could not; here it answers a strictly
 # smaller one. A reading of 0x61 at 0xD0 on an address in this range establishes that the part is a
 # BME680 OR a BME688, and no further read of this register will ever separate the two.
@@ -63,7 +63,7 @@ notes = "The BME688 answers this same value at this same register. What separate
 # here and `run_gas_h` there, which is the vendor acknowledging the move.
 #
 # A driver that identified the part by its identity register -- the only discriminator this
-# catalogue models -- would enable the wrong bit on one of the two. Nothing reports an error: the
+# catalog models -- would enable the wrong bit on one of the two. Nothing reports an error: the
 # gas conversion simply never runs, and the gas result reads as an unset measurement.
 
 [registers.ctrl_gas_1]

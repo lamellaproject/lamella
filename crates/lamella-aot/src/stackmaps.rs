@@ -107,7 +107,8 @@ pub(crate) fn is_ref_cell(ty: MirType) -> bool {
 
 /// Every GC root one value's frame slot contributes, as `(byte offset from the slot base, kind)`.
 ///
-/// **THE POINT OF THIS FUNCTION IS THAT TWO PLACES MUST AGREE AND USED TO AGREE BY CONVENTION.**
+/// **THE POINT OF THIS FUNCTION IS THAT TWO PLACES MUST AGREE, AND AGREEING BY CONVENTION IS NOT
+/// ENOUGH.**
 /// The per-method record builder says which words the collector VISITS; the entry zero-init says
 /// which words are guaranteed to read null before anything writes them. A word in the first list and
 /// not the second is stack garbage traced -- and RELOCATED -- as a pointer; a word in neither is a

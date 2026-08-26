@@ -12,7 +12,12 @@ pub const FAMILY_RP2350_ARM_S: u32 = 0xe48b_ff59;
 /// where a flat `.bin` begins with its second-stage bootloader at offset zero.
 pub const XIP_BASE: u32 = 0x1000_0000;
 
-const MAGIC_START0: u32 = 0x0A32_4655;
+/// The first word of every UF2 block, which is how a reader recognizes one.
+///
+/// **PUBLIC BECAUSE "IS THIS ALREADY A UF2" IS A QUESTION A WRITER HAS TO ASK.** An image reaches a
+/// bootloader volume either already wrapped or as a flat binary that must be wrapped, and wrapping
+/// a UF2 a second time produces a file the bootloader silently ignores.
+pub const MAGIC_START0: u32 = 0x0A32_4655;
 const MAGIC_START1: u32 = 0x9E5D_5157;
 const MAGIC_END: u32 = 0x0AB1_6F30;
 

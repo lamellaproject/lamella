@@ -14,7 +14,8 @@ use lamella_metadata::{
 use lamella_token::Token;
 
 use crate::cil::{
-    Array2DOp, ArrayElement, ArrayMDOp, CallInfo, CallResolver, CallTarget, CilError, Intrinsic,
+    Array2DOp, ArrayCastTest, ArrayElement, ArrayElementTest, ArrayMDOp, CallInfo, CallResolver,
+    CallTarget, CilError, Intrinsic,
     PInvokeCall, ReferenceLayout, lower_method_typed,
 };
 
@@ -51,6 +52,39 @@ fn reference_handle(ordinal: usize, type_def_token: u32) -> TypeHandle {
     TypeHandle(
         (REFERENCE_HANDLE_TABLE << 24) | ((ordinal as u32) << REFERENCE_ORDINAL_SHIFT) | row,
     )
+}
+
+/// The identity handle for `token` as seen from `assembly` with `references` attached: a TypeRef
+/// that resolves through them becomes the REFERENCE-OWNED handle (see [`REFERENCE_HANDLE_TABLE`]),
+/// and every other token keeps its raw value.
+///
+/// The free-standing half of
+/// [`MetadataResolver::qualified_type_handle`](MetadataResolver::qualified_type_handle), extracted
+/// so the two slot-typing twins that hold no resolver -- [`mir_type_across`] and `build::mir_type`
+/// -- mint the SAME identity as every path that does hold one. While they did not, a cross-assembly
+/// value type had TWO handles carrying identical size and identical trace map, and the verifier
+/// rejected the slot where they met: `System.Decimal` reached through the program is that program's
+/// own TypeRef row, and reached through the references is the corlib's TypeDef row.
+///
+/// An ARGUMENT-WORLD-MARKED token is returned untouched. The mark says the row belongs to the
+/// CALLER's assembly, which `references` does not describe, so rebasing it would name a row in the
+/// wrong world. The mark also lifts the token's table byte clear of `TYPE_REF`, so this is the
+/// behavior the resolver method already had -- said out loud rather than left to the bit pattern.
+pub(crate) fn qualified_handle_across<'x>(
+    assembly: &Assembly<'x>,
+    token: Token,
+    references: &[&Assembly<'x>],
+) -> TypeHandle {
+    if argument_world_token(token).is_none() && token.table() == table::TYPE_REF {
+        if let Some((namespace, name)) = assembly.type_token_full_name(token) {
+            if let Some((ordinal, ref_td)) =
+                Assembly::find_in_references(references, &namespace, &name)
+            {
+                return reference_handle(ordinal, ref_td.token().0);
+            }
+        }
+    }
+    TypeHandle(token.0)
 }
 
 /// The MIR slot for an instantiation of a VALUE type -- `Holder<int>` -- laid out under its
@@ -520,6 +554,15 @@ impl<'a> MetadataResolver<'a> {
         self
     }
 
+    /// The plan this resolver carries, for the passes that must number STATICS the same way the
+    /// lowering reads them -- see [`generic_static_slots`]. Handing the plan back rather than
+    /// cloning it into a second holder is the point: two copies is how the emitter and the
+    /// collector come to disagree about a slot.
+    #[must_use]
+    pub(crate) fn monomorphized(&self) -> &crate::generics::MonoPlan {
+        &self.mono
+    }
+
     /// How a call to a method THIS resolver's assembly declares is named -- the module's own
     /// function index, or, when the resolver is REBASED, an extern to the symbol the owner's own
     /// object defines.
@@ -974,14 +1017,7 @@ impl<'a> MetadataResolver<'a> {
     /// single-assembly behavior, where the 0x01-keyed descriptor is the only identity anyone
     /// mints and every compare is self-consistent.
     fn qualified_type_handle(&self, token: Token) -> TypeHandle {
-        if token.table() == table::TYPE_REF {
-            if let Some((namespace, name)) = self.assembly.type_token_full_name(token) {
-                if let Some((ordinal, _, ref_td)) = self.find_reference_type(&namespace, &name) {
-                    return reference_handle(ordinal, ref_td.token().0);
-                }
-            }
-        }
-        TypeHandle(token.0)
+        qualified_handle_across(self.assembly, token, &self.references)
     }
 
     /// Wraps an assembly to resolve calls among the methods of a module: `method_rids` are
@@ -1649,6 +1685,43 @@ impl<'a> MetadataResolver<'a> {
         }
         let (ordinal, _, type_def) = self.find_reference_type("System", "String")?;
         self.reference_type_meta(reference_handle(ordinal, type_def.token().0))
+    }
+
+    /// `System.String`'s canonical HANDLE for this build -- the identity, where
+    /// [`string_type_meta`](Self::string_type_meta) is the description.
+    ///
+    /// The two are not the same question, and a self-contained build is where they come apart:
+    /// [`string_type_meta`](Self::string_type_meta) answers only when a corlib is attached, because a
+    /// description needs the owner's vtable to be read out of. An identity needs no owner. So on a
+    /// tier that attaches no references -- the browser `.wasm`, which takes one assembly -- the meta
+    /// is `None` while the handle is still perfectly well defined: it is the raw `TypeRef` token,
+    /// which is the identity [`qualified_type_handle`](Self::qualified_type_handle) already mints
+    /// there for every other consumer of the type.
+    ///
+    /// That is what makes a string LITERAL's header and a `string[]`'s `element_desc@16` name ONE
+    /// descriptor. They reach the type by different routes -- a literal names it nowhere in the
+    /// metadata at all -- so without one function answering for both, they name two, and a legal
+    /// covariant store into a `string[]` compares a literal's identity against a different address
+    /// and refuses.
+    ///
+    /// `None` only when the assembly neither declares nor references `System.String`, which is a
+    /// program with no strings in it.
+    #[must_use]
+    pub fn string_type_handle(&self) -> Option<TypeHandle> {
+        let own = self.assembly.type_defs().find(|type_def| {
+            self.assembly
+                .type_token_name(type_def.token())
+                .is_some_and(|name| name.namespace == "System" && name.name == "String")
+        });
+        if let Some(type_def) = own {
+            return Some(TypeHandle(type_def.token().0));
+        }
+        let type_ref = self.assembly.type_refs().find(|type_ref| {
+            type_ref
+                .name()
+                .is_some_and(|name| name.namespace == "System" && name.name == "String")
+        })?;
+        Some(self.qualified_type_handle(type_ref.token()))
     }
 
     /// `System.Array`'s own [`TypeMeta`] -- the vtable EVERY array type dispatches through.
@@ -2765,14 +2838,36 @@ pub const STORAGE_IS_BYTES: bool =
 /// The DISPATCH half is unaffected by the tier: word 2 and the vtable laid before the words are what
 /// `s.ToString()` and `o is string` read, and those are right in all three tiers.
 #[must_use]
-pub fn string_descriptor_words(type_tag: u32) -> [u32; 5] {
+pub fn string_descriptor_words(type_tag: u32) -> [u32; ARRAY_DESC_WORDS] {
     let element_kind = if STORAGE_IS_BYTES {
         ELEMENT_KIND_OPAQUE
     } else {
         ELEMENT_KIND_UTF16_UNIT
     };
-    [ARRAY_DESC_MARK | 1, element_kind, type_tag, 0, 0]
+    [
+        ARRAY_DESC_MARK | 1,
+        element_kind,
+        type_tag,
+        0,
+        0,
+        ARRAY_CAST_CLASS_NONE,
+    ]
 }
+
+/// How many header words an ARRAY descriptor lays:
+/// `[MARK|rank@0][element_kind@4][type_tag@8][base_ptr@12][element_desc@16][element_cast_class@20]`.
+///
+/// **IT IS FIXED, AND THAT IS WHAT LETS AN ARRAY CARRY AN ITABLE AT ALL.** A class descriptor's
+/// itable is found from `nrefs@4` -- `desc + 16 + nrefs*4` -- and an array's word 1 is its element
+/// KIND, not a reference count, so that arithmetic lands past the words on nothing. An array's
+/// itable is therefore found at a CONSTANT offset, and this count is where the constant comes from.
+///
+/// Every array-form descriptor is this long, [`string_descriptor_words`] included.
+pub const ARRAY_DESC_WORDS: usize = 6;
+
+/// The byte offset of an ARRAY descriptor's itable COUNT word -- immediately past its fixed header,
+/// where every backend lays the itable it lays for a class. See [`ARRAY_DESC_WORDS`].
+pub const ARRAY_ITABLE_OFFSET: u32 = ARRAY_DESC_WORDS as u32 * 4;
 
 /// The mask selecting [`ARRAY_DESC_MARK`] out of word 0; the remainder is the rank.
 pub const ARRAY_DESC_MARK_MASK: u32 = 0xFF00_0000;
@@ -2794,6 +2889,40 @@ pub const ELEMENT_KIND_OPAQUE: u32 = 0xFF;
 /// NON-references, so a collector strides past them instead of tracing code units as pointers.
 /// Pinned against [`primitive_element_kind`] by test rather than restated as a literal.
 pub const ELEMENT_KIND_UTF16_UNIT: u32 = 4;
+
+/// The element KIND for an array element the name table cannot answer for -- a `TypeSpec`, which
+/// has no name row -- read off the signature that spells it.
+///
+/// **THE SIGNATURE STATES THE SHAPE EVEN WHERE IT WITHHOLDS THE NAME, and these two cases are worth
+/// reading rather than defaulting.**
+///
+///   * A NESTED ARRAY is a reference whatever its own element is: `int[][]` holds pointers to
+///     `int[]` objects. Calling it [`ELEMENT_KIND_OPAQUE`] told a collector it could neither trace
+///     nor stride an array of LIVE references, and told `Array.GetValue` to box an element that is
+///     already an object -- against `element_desc@16`, which for a nested array is absent.
+///   * A GENERIC INSTANTIATION says which it is in its own lead byte: II.23.2.12 encodes
+///     `GENERICINST` with `CLASS` or `VALUETYPE`, so `Box<int>[]` and `Pair<int>[]` are told apart
+///     with no resolution at all -- which is also right where the definition lives in an assembly
+///     this build cannot reach.
+///
+/// Everything else stays OPAQUE. **The default is the honest direction and not merely the cautious
+/// one**: OPAQUE means "do not stride and do not trace", and a collector told to trace a value
+/// follows whatever the first word of a struct happens to hold.
+///
+/// A FUNCTION rather than a match arm at its one call site, because the rule reads several
+/// descriptor consumers at once -- the collector's stride and trace, `Array.GetValue`'s box-or-read
+/// branch, and an `(object[])` cast -- and a rule that has a name is one a reader can look for.
+#[must_use]
+fn type_spec_element_kind(signature: Option<&SigType>) -> u32 {
+    match signature {
+        Some(SigType::SzArray(_) | SigType::Array { .. }) => ELEMENT_KIND_REFERENCE,
+        Some(SigType::GenericInst { definition, .. }) => match definition.as_ref() {
+            SigType::Class(_) => ELEMENT_KIND_REFERENCE,
+            _ => ELEMENT_KIND_OPAQUE,
+        },
+        _ => ELEMENT_KIND_OPAQUE,
+    }
+}
 
 /// The frozen primitive element code for a `System` primitive by name, or `None` if it is not one.
 ///
@@ -3126,6 +3255,8 @@ impl<'a> MetadataResolver<'a> {
                 handle: lamella_ir::array_handle(element),
                 element: Some(element),
                 element_size: primitive_value_size(namespace, name).unwrap_or(4),
+                element_cast_class: array_element_cast_class_by_name(namespace, name)
+                    .map_or(ARRAY_CAST_CLASS_NONE, u32::from),
                 element_kind: primitive_element_kind(namespace, name)
                     .unwrap_or(ELEMENT_KIND_REFERENCE),
             });
@@ -3144,6 +3275,7 @@ impl<'a> MetadataResolver<'a> {
                     element: Some(element),
                     element_size: 4,
                     element_kind: ELEMENT_KIND_REFERENCE,
+                    element_cast_class: ARRAY_CAST_CLASS_NONE,
                 })
             }
             SigType::ValueType(token) => {
@@ -3163,6 +3295,12 @@ impl<'a> MetadataResolver<'a> {
                     element: Some(element),
                     element_size: layout.size,
                     element_kind: ELEMENT_KIND_OPAQUE,
+                    element_cast_class: array_element_cast_class(
+                        self.assembly,
+                        *token,
+                        self.references(),
+                    )
+                    .map_or(ARRAY_CAST_CLASS_NONE, u32::from),
                 })
             }
             _ => None,
@@ -3250,8 +3388,8 @@ impl<'a> MetadataResolver<'a> {
     /// [`Self::instantiation_dispatch`], and whether the build may proceed without either is
     /// `build::refuse_undispatchable_instantiations`.
     ///
-    /// **THE VIRTUAL/INTERFACE REFUSAL USED TO LIVE HERE, AND HERE IS A FILTER RATHER THAN A
-    /// GATE.** Declining the LAYOUT withheld the descriptor and let the image out with none: the
+    /// **THE VIRTUAL/INTERFACE REFUSAL BELONGS IN A GATE, AND THIS IS A FILTER.** Declining the
+    /// LAYOUT withholds the descriptor and lets the image out with none: the
     /// bodies still lowered, the allocation still proceeded, and the dispatch went through a
     /// descriptor that was not there. MEASURED, one variable changed -- a program whose generic
     /// definition gained one `virtual` BUILT CLEANLY and then HARD FAULTED on an emulated
@@ -3375,8 +3513,10 @@ impl<'a> MetadataResolver<'a> {
 /// the EXCEPTION tag (`exception.rs`) and dispatches interfaces by signature key, never by this hash.
 /// What the tag IS, is cross-ASSEMBLY ABI: it is baked into emitted code and into itable entries in
 /// type descriptors, so a program object and a library object built at different times must agree
-/// about every byte of it. That is why its encoding cannot change once artifacts exist in the wild,
-/// and the reason is narrower than the cross-tier one previously recorded.
+/// about every byte of it. That is why its encoding cannot change once artifacts exist in the wild.
+/// The constraint is that ONE boundary and not a cross-tier one: the interpreter carries the
+/// EXCEPTION tag and dispatches interfaces by signature key, so nothing outside the AOT object ABI
+/// reads this hash.
 ///
 /// WHAT GENERICS MUST SETTLE BEFORE THAT POINT, because it cannot be settled after. The interface's
 /// identity here is its NAME, and a name carries no type arguments -- so `IList<Foo>::Add` and
@@ -3646,6 +3786,9 @@ impl CallResolver for MetadataResolver<'_> {
             MethodKind::Definition(_) | MethodKind::Reference if is_int32_tostring(&method) => {
                 CallTarget::Intrinsic(Intrinsic::IntToString)
             }
+            MethodKind::Definition(_) | MethodKind::Reference if is_string_concat(&method) => {
+                CallTarget::Intrinsic(Intrinsic::StringConcat)
+            }
             MethodKind::Definition(rid) => self.own_call_target(rid)?,
             MethodKind::Reference if is_debug_writeline(&method) => {
                 CallTarget::Intrinsic(Intrinsic::DebugWriteLine)
@@ -3655,9 +3798,6 @@ impl CallResolver for MetadataResolver<'_> {
             }
             MethodKind::Reference if is_string_op_equality(&method) => {
                 CallTarget::Intrinsic(Intrinsic::StringEquals)
-            }
-            MethodKind::Reference if is_string_concat(&method) => {
-                CallTarget::Intrinsic(Intrinsic::StringConcat)
             }
             MethodKind::Reference if is_noop_base_ctor(&method) => {
                 CallTarget::Intrinsic(Intrinsic::ObjectCtor)
@@ -3812,6 +3952,85 @@ impl CallResolver for MetadataResolver<'_> {
         }
     }
 
+    fn array_cast_test(&self, operand: &Operand) -> Option<ArrayCastTest> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let SigType::SzArray(element) = self.assembly.type_spec_signature(*token)? else {
+            return None;
+        };
+        let element = self.apply_instantiation(&element).unwrap_or(*element);
+        if matches!(element, SigType::Object) {
+            return Some(ArrayCastTest {
+                rank: 1,
+                element: ArrayElementTest::Reference,
+            });
+        }
+        if let Some((namespace, name)) = primitive_sig_name(&element) {
+            if let Some(class) = array_element_cast_class_by_name(namespace, name) {
+                return Some(ArrayCastTest {
+                    rank: 1,
+                    element: ArrayElementTest::Class(u32::from(class)),
+                });
+            }
+            let token = self
+                .assembly
+                .find_type(namespace, name)
+                .map(|t| TypeHandle(t.token().0))
+                .or_else(|| {
+                    self.find_reference_type(namespace, name)
+                        .map(|(ordinal, _, t)| reference_handle(ordinal, t.token().0))
+                })?;
+            return Some(ArrayCastTest {
+                rank: 1,
+                element: ArrayElementTest::Chain(token),
+            });
+        }
+        let element_token = match element {
+            SigType::ValueType(t) | SigType::Class(t) => t,
+            _ => return None,
+        };
+        if let Some(class) = array_element_cast_class(self.assembly, element_token, self.references())
+        {
+            return Some(ArrayCastTest {
+                rank: 1,
+                element: ArrayElementTest::Class(u32::from(class)),
+            });
+        }
+        if matches!(element, SigType::ValueType(_)) {
+            return None;
+        }
+        let element_operand = Operand::Token(element_token);
+        if let Some(tag) = self.cast_interface_tag(&element_operand) {
+            return Some(ArrayCastTest {
+                rank: 1,
+                element: ArrayElementTest::Interface(tag),
+            });
+        }
+        self.cast_target_chain(&element_operand).map(|target| ArrayCastTest {
+            rank: 1,
+            element: ArrayElementTest::Chain(target),
+        })
+    }
+
+    fn primitive_sizeof(&self, operand: &Operand) -> Option<u32> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let name = self.assembly.type_token_name(*token)?;
+        if name.namespace != "System" {
+            return None;
+        }
+        Some(match name.name {
+            "Boolean" | "SByte" | "Byte" => 1,
+            "Int16" | "UInt16" | "Char" => 2,
+            "Int32" | "UInt32" | "Single" => 4,
+            "Int64" | "UInt64" | "Double" => 8,
+            "IntPtr" | "UIntPtr" => 4,
+            _ => return None,
+        })
+    }
+
     fn value_type_cell(&self, operand: &Operand) -> Option<(u32, lamella_ir::RefWords)> {
         let Operand::Token(token) = operand else {
             return None;
@@ -3857,16 +4076,31 @@ impl CallResolver for MetadataResolver<'_> {
     }
 
     fn newobj_value_type(&self, operand: &Operand) -> Option<MirType> {
-        let type_def = self.newobj_type_def(operand)?;
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
+        let (handle, owner, type_def) =
+            match self.assembly.find_type(declaring.namespace, declaring.name) {
+                Some(type_def) => (TypeHandle(type_def.token().0), self.assembly, type_def),
+                None => {
+                    let (ordinal, reference, type_def) =
+                        self.find_reference_type(declaring.namespace, declaring.name)?;
+                    (
+                        reference_handle(ordinal, type_def.token().0),
+                        reference,
+                        type_def,
+                    )
+                }
+            };
         if !type_def.is_value_type() {
             return None;
         }
-        let layout = self
-            .assembly
+        let layout = owner
             .value_type_layout(type_def.token(), &TargetLayout::ilp32())
             .ok()?;
         Some(MirType::ValueType {
-            handle: TypeHandle(type_def.token().0),
+            handle,
             size: layout.size,
             refs: ref_words_of(&layout.reference_offsets)?,
         })
@@ -4031,7 +4265,7 @@ impl CallResolver for MetadataResolver<'_> {
                     _ => ELEMENT_KIND_REFERENCE,
                 }
             }),
-            None => ELEMENT_KIND_OPAQUE,
+            None => type_spec_element_kind(self.assembly.type_spec_signature(*token).as_ref()),
         };
         let element = self
             .assembly
@@ -4042,6 +4276,8 @@ impl CallResolver for MetadataResolver<'_> {
             element,
             element_size,
             element_kind,
+            element_cast_class: array_element_cast_class(self.assembly, *token, self.references())
+                .map_or(ARRAY_CAST_CLASS_NONE, u32::from),
         })
     }
 
@@ -4073,6 +4309,7 @@ impl CallResolver for MetadataResolver<'_> {
                     .unwrap_or(MirType::I32),
             }),
             "Set" => Some(Array2DOp::Set { element_size }),
+            "Address" => Some(Array2DOp::Address { element_size }),
             _ => None,
         }
     }
@@ -4108,6 +4345,7 @@ impl CallResolver for MetadataResolver<'_> {
                 rank,
             }),
             "Set" => Some(ArrayMDOp::Set { element_size, rank }),
+            "Address" => Some(ArrayMDOp::Address { element_size, rank }),
             _ => None,
         }
     }
@@ -4127,6 +4365,28 @@ impl CallResolver for MetadataResolver<'_> {
                         .map_or(StaticOwner::Own, |o| StaticOwner::Reference(o.ordinal));
                     (owner, slot * 4)
                 }),
+            table::MEMBER_REF
+                if self
+                    .assembly
+                    .member_ref(token.row())
+                    .is_some_and(|m| m.is_field() && m.parent().table() == table::TYPE_SPEC) =>
+            {
+                let member = self.assembly.member_ref(token.row())?;
+                let signature = self.assembly.type_spec_signature(member.parent())?;
+                let closed = self
+                    .apply_instantiation(&signature)
+                    .unwrap_or(signature);
+                let name = crate::generics::spell_sig(self.assembly, &closed)?;
+                let field_name = member.name()?;
+                let slot = band_slot_of(self.assembly, &self.mono, &name, &|row| {
+                    field_row_is_named(self.assembly, row, field_name)
+                })?;
+                let owner = self
+                    .reference_owner
+                    .as_ref()
+                    .map_or(StaticOwner::Own, |o| StaticOwner::Reference(o.ordinal));
+                Some((owner, slot * 4))
+            }
             table::MEMBER_REF => {
                 let member = self.assembly.member_ref(token.row())?;
                 if !member.is_field() {
@@ -4500,9 +4760,17 @@ impl CallResolver for MetadataResolver<'_> {
                 reference_offsets: Vec::new(),
             });
         }
-        let layout = self
-            .assembly
-            .value_type_layout(*token, &TargetLayout::ilp32())
+        if let Ok(layout) = self.assembly.value_type_layout(*token, &TargetLayout::ilp32()) {
+            return Some(ReferenceLayout {
+                handle,
+                size: layout.size,
+                reference_offsets: layout.reference_offsets,
+            });
+        }
+        let (namespace, name) = self.assembly.type_token_full_name(*token)?;
+        let (_, owner, type_def) = self.find_reference_type(&namespace, &name)?;
+        let layout = owner
+            .value_type_layout(type_def.token(), &TargetLayout::ilp32())
             .ok()?;
         Some(ReferenceLayout {
             handle,
@@ -4578,15 +4846,20 @@ impl CallResolver for MetadataResolver<'_> {
         {
             return Some(underlying);
         }
-        if let Ok(layout) = self
-            .assembly
-            .value_type_layout(*token, &TargetLayout::ilp32())
+        if let Some((declaring, type_def)) =
+            resolve_value_type_def(self.assembly, *token, self.references())
         {
-            return Some(MirType::ValueType {
-                handle: TypeHandle(token.0),
-                size: layout.size,
-                refs: ref_words_of(&layout.reference_offsets)?,
-            });
+            if type_def.is_value_type() {
+                if let Ok(layout) =
+                    declaring.value_type_layout(type_def.token(), &TargetLayout::ilp32())
+                {
+                    return Some(MirType::ValueType {
+                        handle: qualified_handle_across(self.assembly, *token, self.references()),
+                        size: layout.size,
+                        refs: ref_words_of(&layout.reference_offsets)?,
+                    });
+                }
+            }
         }
         Some(MirType::ObjectRef)
     }
@@ -4827,7 +5100,11 @@ fn mir_type_across<'x>(
                 let layout =
                     value_type_layout_across(assembly, argument_world, *token, references, target)?;
                 MirType::ValueType {
-                    handle: TypeHandle(marked_handle_token(*token, argument_world).0),
+                    handle: qualified_handle_across(
+                        assembly,
+                        marked_handle_token(*token, argument_world),
+                        references,
+                    ),
                     size: layout.size,
                     refs: ref_words_of(&layout.reference_offsets)?,
                 }
@@ -5002,7 +5279,96 @@ pub(crate) fn type_init_thunk_symbol(assembly: &Assembly, type_row: u32) -> Opti
 /// initializing itself would write into a neighbor's statics, and the two assemblies would disagree
 /// silently rather than fail to link.
 #[cfg(any(feature = "arm32", feature = "riscv32"))]
-pub(crate) fn static_region_words(assembly: &Assembly) -> u32 {
+pub(crate) fn static_region_words(assembly: &Assembly, plan: &crate::generics::MonoPlan) -> u32 {
+    generic_static_slots(assembly, plan)
+        .last()
+        .map_or_else(
+            || non_generic_region_words(assembly),
+            |(_, _, slot, words, _)| slot + words,
+        )
+}
+
+/// The static-field slots a MONOMORPHIZED INSTANTIATION owns, as
+/// `(canonical instantiation spelling, field row, slot, words)`.
+///
+/// **A GENERIC TYPE HAS ONE FIELD ROW AND N INSTANTIATIONS, AND THEY ARE N DIFFERENT STORAGE
+/// LOCATIONS.** `Cmp<int>.Count` and `Cmp<string>.Count` are unrelated variables, so
+/// [`static_field_slots`]' dense per-ROW numbering cannot express them: it would hand every
+/// instantiation the same word. This is the second numbering, keyed by the pair.
+///
+/// **IT IS APPENDED, NOT INTERLEAVED, AND THAT IS THE WHOLE OF THE COMPATIBILITY ARGUMENT.** It
+/// starts past the fields AND past the precise-init flags, so every slot those two already
+/// assigned keeps its number -- the `ldsfld`/`stsfld` offsets, the collector's global-roots record
+/// and the `.cctor` flag words are all unmoved, and a non-generic program's region is
+/// byte-identical to before. Only [`static_region_words`] grows.
+///
+/// Instantiation order is the plan's own first-appearance order, which is deterministic for a given
+/// program, so two walks of the same build agree. **The slot is not a stable ABI across builds** --
+/// neither is the row numbering it extends, for the same reason: both are derived from the image
+/// being built, and the emitter and the collector read them from this one function.
+///
+#[must_use]
+pub(crate) fn generic_static_slots(
+    assembly: &Assembly,
+    plan: &crate::generics::MonoPlan,
+) -> Vec<(String, u32, u32, u32, bool)> {
+    let mut out = Vec::new();
+    let mut next = non_generic_region_words(assembly);
+    for (name, spec) in plan.instantiations() {
+        let Some(SigType::GenericInst {
+            definition,
+            arguments,
+        }) = assembly.type_spec_signature(spec)
+        else {
+            continue;
+        };
+        let (SigType::Class(token) | SigType::ValueType(token)) = definition.as_ref() else {
+            continue;
+        };
+        if token.table() != table::TYPE_DEF {
+            continue;
+        }
+        let Some(type_def) = assembly.type_def(token.row()) else {
+            continue;
+        };
+        for field in type_def.fields() {
+            if !field.is_static() || field.is_literal() {
+                continue;
+            }
+            let signature = field.signature();
+            let words = match signature
+                .as_ref()
+                .and_then(|sig| mir_type(sig, assembly, &TargetLayout::ilp32()))
+            {
+                Some(MirType::I64 | MirType::F64) => 2,
+                _ => 1,
+            };
+            let is_reference = signature
+                .as_ref()
+                .is_some_and(|sig| signature_is_reference(sig, &arguments));
+            out.push((
+                alloc::string::String::from(name),
+                field.token().row(),
+                next,
+                words,
+                is_reference,
+            ));
+            next += words;
+        }
+    }
+    out
+}
+
+/// The word count the FIELD and PRECISE-INIT bands span together -- where [`generic_static_slots`]
+/// begins. Factored out of [`static_region_words`] so the two cannot disagree about the boundary.
+///
+/// **UNGATED, UNLIKE `static_region_words`, AND THE DIFFERENCE IS ITS CALLERS.** That one is gated
+/// with `build::assembly_statics`, the only thing that wants a region SIZE, and the wasm path places
+/// its statics at a fixed base and emits no region record. This one is also read by
+/// [`generic_static_slots`], which every code model reaches through `static_field_offset` -- so a
+/// `#[cfg]` here is not a smaller wasm build, it is a wasm build that does not compile. Measured by
+/// the code-model matrix the moment it was written that way.
+fn non_generic_region_words(assembly: &Assembly) -> u32 {
     let fields = static_field_slots(assembly)
         .iter()
         .map(|(_, slot, words)| slot + words)
@@ -5011,6 +5377,57 @@ pub(crate) fn static_region_words(assembly: &Assembly) -> u32 {
     precise_init_types(assembly)
         .last()
         .map_or(fields, |(_, _, slot)| slot + 1)
+}
+
+/// Whether a static field of this signature holds a TRACED REFERENCE, once the instantiation's
+/// arguments are in hand.
+///
+/// **THE SHAPE TEST THE NON-GENERIC PATH USES CANNOT ANSWER THIS, AND ANSWERS `false`, WHICH IS THE
+/// DANGEROUS DIRECTION.** It matches `Class`/`Object`/`String`/array and nothing else -- but the two
+/// signatures a generic static actually has are neither:
+///
+///   * `static Cmp<T> def`  is a `GENERICINST`, whose CLASS form is a reference;
+///   * `static T value`     is a `VAR`, and whether it is a reference depends on the ARGUMENT --
+///     `Holder<string>` holds one and `Holder<int>` does not, from ONE field row.
+///
+/// Getting this wrong the `false` way writes a live object into a word the collector does not scan,
+/// so the reference is freed while reachable. That is strictly worse than the refusal that preceded
+/// the band, which is why ref-ness is computed HERE, per instantiation, instead of being read off a
+/// row-keyed set.
+fn signature_is_reference(sig: &SigType, arguments: &[SigType]) -> bool {
+    match sig {
+        SigType::Class(_) | SigType::Object | SigType::String => true,
+        SigType::SzArray(_) | SigType::Array { .. } => true,
+        SigType::GenericInst { definition, .. } => matches!(definition.as_ref(), SigType::Class(_)),
+        SigType::Var(index) => arguments
+            .get(*index as usize)
+            .is_some_and(|argument| signature_is_reference(argument, arguments)),
+        _ => false,
+    }
+}
+
+/// The band slot of a static field row under a named instantiation -- the shared half of the two
+/// lookups [`MetadataResolver::static_field_offset`] makes, so the key is compared one way.
+fn band_slot_of(
+    assembly: &Assembly,
+    plan: &crate::generics::MonoPlan,
+    instantiation: &str,
+    matches: &dyn Fn(u32) -> bool,
+) -> Option<u32> {
+    generic_static_slots(assembly, plan)
+        .into_iter()
+        .find(|(name, row, _, _, _)| name == instantiation && matches(*row))
+        .map(|(_, _, slot, _, _)| slot)
+}
+
+/// Whether the field at `row` is named `field_name`. A row is only ever compared against the
+/// definition that declares it, so the walk is over this assembly's own tables.
+fn field_row_is_named(assembly: &Assembly, row: u32, field_name: &str) -> bool {
+    assembly.type_defs().any(|type_def| {
+        type_def
+            .fields()
+            .any(|field| field.token().row() == row && field.name() == Some(field_name))
+    })
 }
 
 /// A type's dotted full name (`namespace.name`, or just `name` in the global namespace) -- what a
@@ -5389,6 +5806,71 @@ pub(crate) fn unbox_normal_form<'x>(
     Some(sig_element_byte(&underlying))
 }
 
+/// The class two ARRAY ELEMENTS must share for a `castclass`/`isinst` between their ARRAY types to
+/// succeed -- ECMA-335 4th ed, III.4.3 notes 2 and 3 ("if Foo can be cast to Bar, then Foo[] can be
+/// cast to Bar[]", and "enums are treated as their underlying type"). `None` for an element whose
+/// only compatible partner is its own exact identity -- a real struct, and every reference type.
+///
+/// **THIS IS [`unbox_normal_form`] PLUS EXACTLY ONE FOLD, AND THE DIFFERENCE IS THE POINT.** Unbox
+/// asks about TYPE IDENTITY -- an `int` box does not unbox as `uint` -- so it keeps every element
+/// byte apart. An array cast is looser in ONE direction: the CLR performs `(uint[])intArr`, so the
+/// signed and unsigned byte of each integer width are one class here.
+///
+/// AND ONLY IN THAT DIRECTION. `BOOLEAN`, `CHAR`, `R4` and `R8` keep their own bytes and fold with
+/// nothing, so `(bool[])byteArr` and `(char[])ushortArr` THROW -- both measured against the .NET
+/// oracle rather than read off the clause, and both pinned as differential rows.
+///
+/// **[`primitive_element_kind`] CANNOT SERVE, AND IS WRONG IN FOUR WAYS AT ONCE.** It answers a
+/// question about WIDTH, so it collapses `Byte`/`Boolean` into code 2 and `UInt16`/`Char` into code 4
+/// (which must be DISTINCT here) while splitting `SByte`/`Byte` and `Int16`/`UInt16` (which must be
+/// the SAME here). A cast built on it would accept and reject the wrong rows in both directions,
+/// which is worse to debug than the missing check it replaced.
+///
+/// I.8.7 (assignment compatibility) is NOT this rule and using it fails the oracle: its array
+/// clause requires both elements to be reference types or interfaces, which makes `int[]` ->
+/// `uint[]` illegal -- and the CLR performs it. `castclass` is the looser RUNTIME rule.
+pub(crate) fn array_element_cast_class<'x>(
+    assembly: &'x Assembly<'x>,
+    token: Token,
+    references: &[&'x Assembly<'x>],
+) -> Option<u8> {
+    Some(fold_signed_unsigned(unbox_normal_form(assembly, token, references)?))
+}
+
+/// [`array_element_cast_class`] for an element named rather than tokenized -- the closed form of a
+/// generic array whose element is a primitive or `String`, which the signature spells as a BYTE and
+/// so names no metadata row to resolve.
+///
+/// `None` for `String` and for every other name that is not a primitive: a reference element's only
+/// partner is its own identity, which the descriptor's `element_desc` answers instead.
+pub(crate) fn array_element_cast_class_by_name(namespace: &str, name: &str) -> Option<u8> {
+    Some(fold_signed_unsigned(sig_element_byte(&primitive_sig_type(
+        namespace, name,
+    )?)))
+}
+
+/// The one fold that separates an ARRAY cast from an UNBOX: the signed and unsigned element byte of
+/// each integer width are one class. Shared by both entry points so they cannot drift.
+fn fold_signed_unsigned(byte: u8) -> u8 {
+    match byte {
+        lamella_metadata::signature::element::U1 => lamella_metadata::signature::element::I1,
+        lamella_metadata::signature::element::U2 => lamella_metadata::signature::element::I2,
+        lamella_metadata::signature::element::U4 => lamella_metadata::signature::element::I4,
+        lamella_metadata::signature::element::U8 => lamella_metadata::signature::element::I8,
+        lamella_metadata::signature::element::U => lamella_metadata::signature::element::I,
+        other => other,
+    }
+}
+
+/// The array descriptor's cast-class word for an element that has no class of its own -- a reference
+/// element, and a real struct.
+///
+/// **ZERO IS FREE AND THAT IS CHECKED RATHER THAN ASSUMED**: II.23.1.16 assigns no element byte 0
+/// (`END` is 0x00 and is not a type), and [`array_element_cast_class`] only ever answers a primitive
+/// byte, so no value element can collide with this. A `string[]` therefore cannot match an `int[]`
+/// target by carrying a class word that happens to equal one.
+pub const ARRAY_CAST_CLASS_NONE: u32 = 0;
+
 /// The `SigType` a `System` primitive's NAME denotes, so a boxed primitive can be normalized by the
 /// same element-byte encoding a signature parameter uses. `None` for anything that is not one of
 /// them (including `System.Enum` itself, which is abstract and never boxed as such).
@@ -5710,6 +6192,55 @@ mod tests {
     /// **Two REFERENCE arguments, deliberately.** A pair like `IList<int>` against
     /// `IList<string>` passes under BOTH the by-name spelling and the collapsed one, because a
     /// VALUE argument is not what the shortcut collapses -- so it would separate nothing.
+    /// **`ldobj`/`ldelem` NAMING A CLASS MUST PRODUCE A REFERENCE, NOT AN INLINE STRUCT.**
+    ///
+    /// Nothing on the `type_operand_mir` path asks `is_value_type()`. `Assembly::value_type_layout`
+    /// checks only that the token is a `TypeDef` and then sums its instance fields, which a CLASS row
+    /// answers perfectly well -- so the value-type arm claims a class and the `ObjectRef`
+    /// fallthrough below it is never reached. The consequence is not a wrong width alone: a reference
+    /// typed as a struct is described to the GC stack map as inline words instead of a traced root,
+    /// and this collector is mark-compact.
+    ///
+    /// `ldelem <class>` is legal CIL. csc emits `ldelem.ref` for a reference element, which is why no
+    /// corpus program asks it and why 679 programs could not have caught this.
+    ///
+    /// **BOTH ROWS, CHECKED TO THE SAME DEPTH.** `arraydesc.dll` declares `Thing` (a class with an
+    /// instance field) beside `Point` (a struct with two), so this asserts that the guard
+    /// DISCRIMINATES rather than that it refuses everything -- a guard that answered `ObjectRef` for
+    /// both would pass a class-only test and silently un-inline every struct.
+    #[test]
+    fn a_class_token_at_ldobj_is_a_reference_and_a_struct_token_is_not() {
+        let Some(dll) = fixture_bytes("arraydesc.dll") else {
+            return;
+        };
+        let assembly = Assembly::read(&dll).expect("parse the fixture");
+        let resolver = MetadataResolver::new(&assembly);
+        let named = |wanted: &str| {
+            assembly
+                .type_defs()
+                .find(|type_def| type_def.name().is_some_and(|n| n.name == wanted))
+                .unwrap_or_else(|| panic!("the fixture declares {wanted}"))
+        };
+
+        let class = named("Thing");
+        assert!(!class.is_value_type(), "Thing is the CLASS row of this pair");
+        assert_eq!(
+            resolver.type_operand_mir(&Operand::Token(class.token())),
+            Some(MirType::ObjectRef),
+            "a class token typed as a ValueType puts a reference in untraced inline words"
+        );
+
+        let structure = named("Point");
+        assert!(structure.is_value_type(), "Point is the STRUCT row of this pair");
+        assert!(
+            matches!(
+                resolver.type_operand_mir(&Operand::Token(structure.token())),
+                Some(MirType::ValueType { .. })
+            ),
+            "a struct token must still be an inline value type, or the guard has un-inlined every struct"
+        );
+    }
+
     #[test]
     fn an_instantiations_interface_tag_takes_the_canonical_spelling() {
         use lamella_generics::TypeArg;
@@ -5883,7 +6414,122 @@ mod tests {
 
 
 
+    /// THE ARRAY-ELEMENT CAST CLASS, PINNED ROW BY ROW AGAINST THE .NET ORACLE.
+    ///
+    /// Every row here is a cast the differential puts to .NET directly, so its expected value is
+    /// measured rather than derived: ECMA-335 4th ed III.4.3 note 2 says "if Foo can be
+    /// cast to Bar, then Foo[] can be cast to Bar[]" and does not enumerate which primitives those
+    /// are, so the fold is fixed by the oracle and pinned here.
+    ///
+    /// I.8.7 (assignment compatibility) is the WRONG clause and would fail half of these: its
+    /// array rule requires reference elements, making `int[]` -> `uint[]` illegal where the CLR
+    /// performs it.
+    /// THE FOUR SHAPES A `TypeSpec` ELEMENT CAN BE, AND WHICH OF THEM A COLLECTOR MAY TRACE.
+    ///
+    /// Three consumers read this one word and none of them can tell a wrong answer from a right
+    /// one: the collector strides and traces by it, `Array.GetValue` boxes or reads by it, and an
+    /// `(object[])` cast accepts or refuses by it. The two REFERENCE rows are the ones that were
+    /// wrong, and the `Pair<int>` row is the one that must not follow them.
     #[test]
+    fn a_type_spec_element_is_a_reference_only_where_the_signature_says_so() {
+        let boxed = alloc::boxed::Box::new;
+        let inst = |definition: SigType| SigType::GenericInst {
+            definition: boxed(definition),
+            arguments: alloc::vec![SigType::I4],
+        };
+        let class = SigType::Class(Token::new(table::TYPE_DEF, 1));
+        let value = SigType::ValueType(Token::new(table::TYPE_DEF, 2));
+
+        assert_eq!(
+            type_spec_element_kind(Some(&SigType::SzArray(boxed(SigType::I4)))),
+            ELEMENT_KIND_REFERENCE,
+            "a nested array's elements are references, and a collector must trace them"
+        );
+        assert_eq!(
+            type_spec_element_kind(Some(&SigType::Array {
+                element: boxed(SigType::I4),
+                rank: 2,
+            })),
+            ELEMENT_KIND_REFERENCE
+        );
+        assert_eq!(type_spec_element_kind(Some(&inst(class))), ELEMENT_KIND_REFERENCE);
+        assert_eq!(
+            type_spec_element_kind(Some(&inst(value))),
+            ELEMENT_KIND_OPAQUE,
+            "a generic STRUCT element is a value: tracing it would follow its first field as a pointer"
+        );
+        assert_eq!(
+            type_spec_element_kind(Some(&SigType::Pointer(boxed(SigType::I4)))),
+            ELEMENT_KIND_OPAQUE
+        );
+        assert_eq!(type_spec_element_kind(None), ELEMENT_KIND_OPAQUE);
+    }
+
+    /// EVERY ARRAY-FORM DESCRIPTOR IS THE SAME LENGTH, and `System.String`'s is the one that can
+    /// drift: it is the only reference type whose descriptor takes the array form, and it is built
+    /// from a constant rather than at an allocation site. An array's itable is found at a CONSTANT
+    /// offset -- there is no `nrefs` to compute one from -- so a short string descriptor would put
+    /// its count word where a reader is compiled to expect the cast class, and the reader would take
+    /// the first itable ENTRY's tag for an entry count.
+    #[test]
+    fn the_string_descriptor_is_as_long_as_every_other_array_descriptor() {
+        let words = string_descriptor_words(0x1234_5678);
+        assert_eq!(
+            words.len(),
+            ARRAY_DESC_WORDS,
+            "the itable follows the words, and its offset is this count"
+        );
+        assert_eq!(
+            words[ARRAY_DESC_WORDS - 1],
+            ARRAY_CAST_CLASS_NONE,
+            "a string's storage is not an array anyone casts as one, so its cast class is NONE -- \
+             and the word must be PRESENT to say so, not merely absent"
+        );
+        assert_eq!(
+            ARRAY_ITABLE_OFFSET as usize,
+            ARRAY_DESC_WORDS * 4,
+            "the constant the backends read with is derived from the count, not restated"
+        );
+    }
+
+    #[test]
+    fn an_array_element_cast_class_folds_sign_and_nothing_else() {
+        let class = |name: &str| {
+            array_element_cast_class_by_name("System", name).expect("a primitive has a class")
+        };
+        assert_eq!(class("Int32"), class("UInt32"), "(uint[])intArr succeeds");
+        assert_eq!(class("SByte"), class("Byte"), "(sbyte[])byteArr succeeds");
+        assert_eq!(class("Int16"), class("UInt16"));
+        assert_eq!(class("Int64"), class("UInt64"));
+        assert_eq!(class("IntPtr"), class("UIntPtr"));
+
+        assert_ne!(class("Byte"), class("Boolean"), "(bool[])byteArr THROWS");
+        assert_ne!(class("UInt16"), class("Char"), "(char[])ushortArr THROWS");
+        assert_ne!(class("Int32"), class("Int64"), "(long[])intArr THROWS");
+        assert_ne!(class("Int32"), class("Single"), "(float[])intArr THROWS");
+        assert_ne!(class("Single"), class("Double"));
+
+        assert_eq!(array_element_cast_class_by_name("System", "String"), None);
+        assert_eq!(array_element_cast_class_by_name("System", "Object"), None);
+        assert_eq!(array_element_cast_class_by_name("Foo", "Int32"), None);
+    }
+
+    /// THE CONTROL, AND IT IS THE REASON THE FUNCTION ABOVE EXISTS: the element KIND cannot answer
+    /// this question, and is wrong in BOTH directions at once.
+    ///
+    /// `primitive_element_kind` answers a question about WIDTH -- what a collector strides by -- so
+    /// it must collapse types an array cast has to tell apart, and split ones it has to join. If a
+    /// future change made these two agree, one of them would have stopped answering its own
+    /// question.
+    #[test]
+    fn the_element_kind_cannot_answer_the_cast_question() {
+        let kind = |name: &str| primitive_element_kind("System", name).expect("a primitive kind");
+        assert_eq!(kind("Byte"), kind("Boolean"));
+        assert_eq!(kind("UInt16"), kind("Char"));
+        assert_ne!(kind("SByte"), kind("Byte"));
+        assert_ne!(kind("Int16"), kind("UInt16"));
+    }
+
     fn the_frozen_primitive_element_codes_match_the_runtime_enum() {
         for (name, code) in [
             ("SByte", 1),
@@ -6040,11 +6686,10 @@ mod tests {
         assert_eq!(primitive_sig_name(&SigType::Var(0)), None);
     }
 
-    /// THE DEFECT, STATED: `Pointer` and `ByRef` had no arm in `sig_element_byte` and fell to a
-    /// `_ => 0x00` fallback, so three overloads that differ only in those parameter types produced
-    /// ONE tag -- and a tag IS the dispatch key, so two of the three would have dispatched to the
-    /// third's implementation. The `assert_ne!`s below are the defect: every one of them held as
-    /// `assert_eq!` before the fallback was removed.
+    /// `Pointer` AND `ByRef` NEED THEIR OWN ARM IN `sig_element_byte`. Falling to a `_ => 0x00`
+    /// fallback gives three overloads that differ only in those parameter types ONE tag -- and a tag
+    /// IS the dispatch key, so two of the three dispatch to the third's implementation. The
+    /// `assert_ne!`s below are what a fallback turns into `assert_eq!`s.
     #[test]
     fn pointer_and_byref_parameters_no_longer_collapse_to_one_tag() {
         let Some(dll) = fixture_bytes("interface.dll") else {
@@ -6160,12 +6805,12 @@ mod tests {
     /// file while making `List<int>` and `List<string>` ONE TAG. The first row is what tells those
     /// two candidates apart.
     ///
-    /// **THE SEPARATION IT NOW ALSO ACHIEVES: THE DEFINITION, AND THE NAMED ARGUMENT.** A definition
-    /// used to fold its KIND byte, so `List<int>` and `HashSet<int>` were one tag and so were
-    /// `List<Foo>` and `List<Bar>`. An instantiation folds its CANONICAL SPELLING instead, which is
-    /// the only identity that survives the assembly boundary -- a token is assembly-relative and
-    /// therefore unusable in a cross-assembly tag. **Both of those rows were `assert_eq!` and are
-    /// now `assert_ne!`; that inversion IS the change.**
+    /// **THE SEPARATION IT ACHIEVES: THE DEFINITION, AND THE NAMED ARGUMENT.** Folding a
+    /// definition's KIND byte makes `List<int>` and `HashSet<int>` one tag, and `List<Foo>` and
+    /// `List<Bar>` another. An instantiation folds its CANONICAL SPELLING instead, which is the only
+    /// identity that survives the assembly boundary -- a token is assembly-relative and therefore
+    /// unusable in a cross-assembly tag. **The `assert_ne!`s below are what a kind-byte fold turns
+    /// into `assert_eq!`s.**
     ///
     /// **THE TOKENS ARE READ FROM A REAL ASSEMBLY AND NOT BUILT HERE, AND THAT IS LOAD-BEARING.**
     /// The fold RESOLVES a token, so an invented one -- `Class(Token::new(0x01, 7))`, a row no

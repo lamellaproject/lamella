@@ -1,0 +1,106 @@
+# INSTANCE map for the STM32L053 (L0x3, category 3): where each block copy sits, plus its RCC
+# clock-enable routing. `-1` = the row gates nothing (the RCC itself).
+#
+# THE PORT SET IS CATEGORY 3's AND IT IS NOT CATEGORY 1's. RM0367 table 2 gives GPIOA, GPIOB and
+# GPIOC full, GPIOD as [2] alone, and GPIOH as [0:1]. csp/stm32l0's category 1 set is GPIOA full,
+# GPIOB [0:9] and GPIOC [14:15] with no D or H at all. Neither map can be derived from the other.
+#
+# AND USART1 EXISTS HERE. RM0367 table 2 marks it full-featured on category 3, and the bootloader
+# section says the same from the other side -- "For category 3 devices: USART1, USART2, SPI1 or
+# SPI2". On category 1 it is absent, which is the finding csp/stm32l0/instances.toml records.
+#
+
+[table]
+kind = "instances"
+family = "stm32l053"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32L0x3 reference manual RM0367 Rev 8 section 2.2.2 table 3 (peripheral register boundary addresses): GPIOA 0x50000000 in 0x400 steps, RCC 0x40021000, USART1 0x40013800, USART2 0x40004400, SPI1 0x40013000",
+    "RM0367 Rev 8 sections 7.3.12, 7.3.14 and 7.3.15 (RCC_IOPENR, RCC_APB2ENR, RCC_APB1ENR) for the enable bits -- IOPAEN 0, IOPBEN 1, IOPCEN 2, IOPDEN 3, IOPHEN 7, SPI1EN 12, USART1EN 14, USART2EN 17 -- and table 42 (RCC register map) for the offsets IOPENR 0x2C, APB2ENR 0x34, APB1ENR 0x38",
+    "RM0367 Rev 8 table 2 (overview of features per category) for which of these a category 3 device implements",
+    "RM0367 Rev 8 table 3 for EXTI at 0x40010400 and SYSCFG at 0x40010000",
+    "RM0367 Rev 8 section 7.3.14 for SYSCFGEN, bit 0 of RCC_APB2ENR",
+]
+notes = [
+    "RM0367's section numbers are NOT RM0377's. The GPIO chapter is 9 here and 8 there; RCC_IOPENR is 7.3.12 here and 7.3.11 there. The offsets and bit positions agree, so only a citation carried across would be wrong -- which is exactly the kind of error that survives review.",
+]
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x50000000
+rcc_en_off = 0x2C
+rcc_en_bit = 0
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x50000400
+rcc_en_off = 0x2C
+rcc_en_bit = 1
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x50000800
+rcc_en_off = 0x2C
+rcc_en_bit = 2
+
+[[instances]]
+name = "gpiod"
+block = "gpio"
+base = 0x50000C00
+rcc_en_off = 0x2C
+rcc_en_bit = 3
+
+[[instances]]
+name = "gpioh"
+block = "gpio"
+base = 0x50001C00
+rcc_en_off = 0x2C
+rcc_en_bit = 7
+
+[[instances]]
+name = "usart1"
+block = "usart"
+base = 0x40013800
+rcc_en_off = 0x34
+rcc_en_bit = 14
+
+[[instances]]
+name = "usart2"
+block = "usart"
+base = 0x40004400
+rcc_en_off = 0x38
+rcc_en_bit = 17
+
+[[instances]]
+name = "spi1"
+block = "spi"
+base = 0x40013000
+rcc_en_off = 0x34
+rcc_en_bit = 12
+
+# --- the external-interrupt path ------------------------------------------------------------
+#
+
+[[instances]]
+name = "exti"
+block = "exti"
+base = 0x40010400
+rcc_en_off = -1
+rcc_en_bit = -1
+
+[[instances]]
+name = "syscfg"
+block = "syscfg"
+base = 0x40010000
+rcc_en_off = 0x34
+rcc_en_bit = 0
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x40021000
+rcc_en_off = -1
+rcc_en_bit = -1

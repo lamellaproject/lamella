@@ -895,7 +895,7 @@ struct LockTable {
     grant_depth: [u32; MAX_THREADS],
 }
 
-/// Fixed device RAM directly after [`SCHED_COUNTER`] (no `.bss` -- task #15): 176 bytes at
+/// Fixed device RAM directly after [`SCHED_COUNTER`], placed rather than `.bss`: 176 bytes at
 /// 0x8040_4810..0x8040_48C0, clear of the mock reactor cells (0x8040_4C00+) and the worker stacks
 /// (0x8040_0000..0x8040_3000). QEMU zeroes RAM (= every slot free); a silicon boot zeroes it
 /// alongside SCHED.

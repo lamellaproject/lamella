@@ -22,6 +22,60 @@ impl Expr {
     pub fn new(kind: ExprKind, span: Span) -> Expr {
         Expr { kind, span }
     }
+
+    /// Creates a simple-name expression that was NOT written verbatim -- the shape every
+    /// desugaring wants, since a name a compiler synthesized has no `@` to record.
+    #[must_use]
+    pub fn name(name: impl Into<Box<str>>, span: Span) -> Expr {
+        Expr::new(
+            ExprKind::Name {
+                name: name.into(),
+                verbatim: false,
+            },
+            span,
+        )
+    }
+
+    /// This expression's simple-name text WHEN IT MAY BE READ AS A CONTEXTUAL KEYWORD -- `None`
+    /// for anything that is not a bare name, and `None` for a verbatim one, which 9.4.2 forces
+    /// back to an ordinary identifier.
+    ///
+    /// **THE EXPRESSION-POSITION HALF OF THE RULE `Parser::current_contextual_keyword` SPENDS FOR
+    /// TOKENS.** The parser's sites see a token and can read its `@` directly; a binder site sees
+    /// an [`Expr`] whose name has already had the `@` dropped, so the flag has to travel on the
+    /// node and be spent here rather than at whichever site notices first. `@nameof(x)` is a call
+    /// to a method called `nameof` -- csc reports `CS0103` when no such method exists, measured --
+    /// and a site comparing the text alone reads it as the operator and accepts an invalid
+    /// program in silence.
+    #[must_use]
+    pub fn contextual_keyword(&self) -> Option<&str> {
+        match &self.kind {
+            ExprKind::Name {
+                name,
+                verbatim: false,
+            } => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// One piece of an [`ExprKind::InterpolatedString`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterpolationPart {
+    /// Literal text, escapes and `{{`/`}}` already decoded. Adjacent literals never occur, so a
+    /// piece is always maximal -- which matters because the `String.Concat` overload the binder
+    /// picks is chosen by COUNTING the pieces.
+    Literal(Box<[u16]>),
+    /// A `{ expression [, alignment] [: format] }` hole.
+    Hole {
+        /// The interpolated expression.
+        expression: Box<Expr>,
+        /// The alignment after a `,`, as an expression -- csc binds it as a constant one, so
+        /// `$"{n,99999999999}"` draws `CS0266`/`CS0150` rather than a lexical complaint.
+        alignment: Option<Box<Expr>>,
+        /// The format specifier after a `:`, taken literally. Never `Some("")`.
+        format: Option<Box<str>>,
+    },
 }
 
 /// The kind of an [`Expr`], with any child expressions (ECMA-334 1st ed, 14).
@@ -30,7 +84,15 @@ pub enum ExprKind {
     /// A literal value (14.5.1): the lexer decoded it; this carries the result.
     Literal(Literal),
     /// A simple name (14.5.2): a bare identifier, its `@` prefix already removed.
-    Name(Box<str>),
+    Name {
+        /// The identifier, without the `@` of a verbatim spelling -- `@nameof` is `nameof` here,
+        /// because that is the identifier it denotes (9.4.2) and what it must bind to.
+        name: Box<str>,
+        /// Whether the `@` was written. **THE NAME ALONE CANNOT SAY**, and an expression-position
+        /// contextual keyword needs to know: `@nameof(x)` is a call to something called `nameof`
+        /// and never the operator. Ask [`Expr::contextual_keyword`] rather than reading this.
+        verbatim: bool,
+    },
     /// A predefined type in expression position (14.5.4): the left side of a
     /// static member access such as `int.Parse`. Binding rejects it anywhere a
     /// value, rather than a type name, is required.
@@ -158,6 +220,11 @@ pub enum ExprKind {
         /// The value assigned.
         value: Box<Expr>,
     },
+    /// An INTERPOLATED STRING (C# 6.0): `$"a{b}c"` and its verbatim form, as literal pieces and
+    /// holes. The scanner already decoded the escapes and split the holes out; what survives to
+    /// here is the SHAPE, because the shape is what decides the lowering and the binder is the
+    /// first thing that knows the holes' types.
+    InterpolatedString(Vec<InterpolationPart>),
     /// A `typeof` expression (14.5.11): `typeof ( type )`.
     TypeOf(TypeRef),
     /// A `sizeof` expression (unsafe, III.4.25): `sizeof ( type )`. Its value is the type's
@@ -891,8 +958,44 @@ pub struct TypeDecl {
     pub constraints: Vec<TypeParameterConstraintClause>,
     /// The type's members.
     pub members: Vec<Member>,
+    /// The RECORD half of the declaration (C# 9), or `None` for an ordinary class, struct or
+    /// interface.
+    ///
+    /// **A RECORD IS A CLASS AND IS MODELLED AS ONE**, with [`TypeDecl::kind`] still
+    /// [`TypeKind::Class`]. A fourth `TypeKind` variant would make every existing
+    /// `TypeKind::Class` arm wrong by omission -- a record IS-A class at nearly all of them, so
+    /// the default behaviour has to be the class behaviour and only the sites that synthesize
+    /// members may ask. `record struct` (C# 10) is the same field on a `TypeKind::Struct`.
+    pub record: Option<RecordParts>,
     /// The byte range the declaration covers.
     pub span: Span,
+}
+
+/// What a `record` declaration carries beyond an ordinary class (C# 9).
+///
+/// Its presence on a [`TypeDecl`] is what makes the type a record; the fields describe only the
+/// parts that vary between record FORMS, because everything else csc generates -- value equality,
+/// `ToString`/`PrintMembers`, `<Clone>$`, the copy constructor -- is emitted for every form alike
+/// and so needs nothing recorded here. Measured over three forms against csc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordParts {
+    /// The positional parameter list, `None` when none was written.
+    ///
+    /// **`None` AND `Some(vec![])` ARE DIFFERENT DECLARATIONS**: `record R { }` has no parameter
+    /// list and gets a parameterless constructor and no `Deconstruct`; `record R();` HAS an empty
+    /// one and gets both. Collapsing them to a `Vec` would make the two forms identical here and
+    /// silently drop a `Deconstruct` csc emits.
+    pub parameters: Option<Vec<Parameter>>,
+    /// The argument list on a base record -- the `(X)` of `record D(int X, int Y) : B(X)` (14.5.11
+    /// applies to the arguments; the base type itself is the first entry in [`TypeDecl::bases`]).
+    /// `None` when the base list carries no argument list.
+    pub base_arguments: Option<Vec<Expr>>,
+    /// Whether the `class` or `struct` keyword was written after `record` -- `record class R` and
+    /// `record struct R`, which are a SEPARATE csc feature at C# 10 called `'record structs'`,
+    /// PLURAL, for the class form too. Measured one compilation per rung.
+    pub keyword_form: bool,
+    /// The byte range the `record` keyword itself covers, which is where the feature gate points.
+    pub keyword_span: Span,
 }
 
 /// One declared type parameter (C# 2.0): the `T` in `class Box<T>` or `T M<T>(T)`.
@@ -1508,6 +1611,21 @@ pub struct Accessor {
     pub modifiers: Vec<Modifier>,
     /// The accessor body, or `None` for a bare `;`.
     pub body: Option<Stmt>,
+    /// Whether a property or indexer SETTER was spelled `init` rather than `set` (C# 9).
+    ///
+    /// **AN `init` ACCESSOR OCCUPIES THE SET SLOT, AND THAT IS MEASURED**: `int P { init { } set
+    /// { } }` is `CS1007 Property accessor already defined`, so the two are one accessor spelled
+    /// two ways and not two accessors. It is a field here rather than a separate slot on the
+    /// property for exactly that reason.
+    ///
+    /// Always `false` for a GETTER and for an EVENT accessor, the same way [`Accessor::modifiers`]
+    /// is always empty for an event's -- the grammar parses no such spelling there.
+    ///
+    /// What the flag COSTS downstream is a `modreq(System.Runtime.CompilerServices.IsExternalInit)`
+    /// on the emitted `set_` accessor's return type, which is the whole of how the distinction
+    /// survives into metadata: an init-only setter has an ordinary setter's signature otherwise,
+    /// and a reader that drops the modifier cannot tell them apart.
+    pub is_init: bool,
     /// The byte range the accessor covers.
     pub span: Span,
 }
@@ -1521,6 +1639,16 @@ pub struct Parameter {
     pub ty: TypeRef,
     /// The parameter name.
     pub name: Box<str>,
+    /// The DEFAULT ARGUMENT `= expr` that makes this parameter optional (C# 4.0, 15.6.2.13).
+    ///
+    /// Carried unevaluated, because whether the expression is a constant of the parameter's type
+    /// is a question only the binder can answer -- it needs the resolved type and the enum members
+    /// in scope. The parser's job ends at "there was an `= expr` here, and it spans this".
+    ///
+    /// **Present even at a dialect that forbids it.** The gate is reported and the tree is built
+    /// anyway, so the binder still sees a parameter list of the shape the author wrote and a
+    /// program does not cascade into a second, unrelated diagnostic on the `=`.
+    pub default_value: Option<Expr>,
     /// The byte range the parameter covers.
     pub span: Span,
 }

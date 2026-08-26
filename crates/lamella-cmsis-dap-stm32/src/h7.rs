@@ -1,5 +1,6 @@
 //! STM32H7 embedded-flash programming, per RM0399 (H745/H747/H755/H757).
 
+use crate::FlashWait;
 use lamella_probe_core::{ProbeError, TargetAccess};
 
 /// Bank 1's register block. Bank 2's is the same layout [`H7_BANK_STRIDE`] higher.
@@ -29,7 +30,13 @@ const H7_SR_QW: u32 = 1 << 2;
 /// End-of-program, cleared through CCR like the error flags.
 const H7_SR_EOP: u32 = 1 << 16;
 /// Every error flag SR reports for a write or erase; the same bit positions clear them in CCR.
-const H7_SR_ERRORS: u32 =
+///
+/// RM0399 4.9.5 lists two more that are deliberately NOT here, and the omission is a scope rather
+/// than an oversight: `SNECCERR1` (25) and `DBECCERR1` (26) are ECC flags raised by a READ, not by
+/// a program or an erase. Reading erased H7 flash is itself an ECC double-detection, so folding
+/// `DBECCERR` into this mask would make a correct read-back verify of an erased region report an
+/// error against an operation that succeeded.
+pub(crate) const H7_SR_ERRORS: u32 =
     (1 << 17) | (1 << 18) | (1 << 19) | (1 << 21) | (1 << 22) | (1 << 23) | (1 << 24);
 
 /// The programming granule: 256 bits.
@@ -91,12 +98,25 @@ fn h7_sector_of(address: u32) -> u32 {
 ///
 /// IT WAITS ON `QW` AS WELL AS `BSY`, which is the reason this is not the F4's routine with
 /// different constants -- see the module note.
-fn h7_wait_idle<A: TargetAccess>(target: &mut A, address: u32) -> Result<(), ProbeError> {
+///
+/// On [`FlashWait::BeforeOperation`] the latched flags are cleared and NOT reported -- see the
+/// enum, which records the board this distinction was measured on.
+pub(crate) fn h7_wait_idle<A: TargetAccess>(
+    target: &mut A,
+    address: u32,
+    phase: FlashWait,
+) -> Result<(), ProbeError> {
     let sr_at = h7_reg(address, H7_SR);
     for _ in 0..200_000 {
         let sr = target.read_word(sr_at)?;
         if sr & (H7_SR_BSY | H7_SR_QW) != 0 {
             continue;
+        }
+        if phase == FlashWait::BeforeOperation {
+            if sr & (H7_SR_ERRORS | H7_SR_EOP) != 0 {
+                target.write_word(h7_reg(address, H7_CCR), H7_SR_ERRORS | H7_SR_EOP)?;
+            }
+            return Ok(());
         }
         if let Some(text) = h7_error_text(sr) {
             target.write_word(h7_reg(address, H7_CCR), H7_SR_ERRORS | H7_SR_EOP)?;
@@ -150,12 +170,12 @@ impl<A: TargetAccess> Stm32H7Flash for A {
     }
 
     fn h7_erase_sector(&mut self, address: u32) -> Result<(), ProbeError> {
-        h7_wait_idle(self, address)?;
+        h7_wait_idle(self, address, FlashWait::BeforeOperation)?;
         let cr_at = h7_reg(address, H7_CR);
         let snb = (h7_sector_of(address) << H7_CR_SNB_SHIFT) & H7_CR_SNB_MASK;
         self.write_word(cr_at, H7_CR_SER | H7_CR_PSIZE_WORD | snb)?;
         self.write_word(cr_at, H7_CR_SER | H7_CR_PSIZE_WORD | snb | H7_CR_START)?;
-        h7_wait_idle(self, address)?;
+        h7_wait_idle(self, address, FlashWait::AfterOperation)?;
         self.write_word(cr_at, H7_CR_PSIZE_WORD)
     }
 
@@ -163,7 +183,7 @@ impl<A: TargetAccess> Stm32H7Flash for A {
         if address as usize % STM32H7_FLASH_WORD != 0 {
             return Err(ProbeError::Device("STM32H7 programming starts on a 32-byte flash-word boundary"));
         }
-        h7_wait_idle(self, address)?;
+        h7_wait_idle(self, address, FlashWait::BeforeOperation)?;
         let cr_at = h7_reg(address, H7_CR);
         self.write_word(cr_at, H7_CR_PG | H7_CR_PSIZE_WORD)?;
 
@@ -175,7 +195,7 @@ impl<A: TargetAccess> Stm32H7Flash for A {
                 u32::from_le_bytes([word[i * 4], word[i * 4 + 1], word[i * 4 + 2], word[i * 4 + 3]])
             });
             self.write_words(at, &words)?;
-            h7_wait_idle(self, at)?;
+            h7_wait_idle(self, at, FlashWait::AfterOperation)?;
             at += STM32H7_FLASH_WORD as u32;
         }
 

@@ -1,0 +1,46 @@
+# BOARD binding: the ST NUCLEO-L011K4. Board truth ONLY: role bindings, the carrier, and the clock
+# plan. Chip truth lives in csp/stm32l0/.
+#
+# THIS BOARD'S VCP IS NOT ON THE PAIR EVERY OTHER NUCLEO USES. UM1956 puts the transmit line on PA2
+# and the RECEIVE line on PA15, not PA3 -- each behind its own solder bridge, SB2 and SB3, both ON
+# by default. PA3 is a real USART2_RX pad on this part and is left for the Arduino Nano header
+# instead, so the choice is the board's and not the chip's.
+
+[table]
+kind = "board"
+board = "nucleo-l011k4"
+vendor = "st"
+family = "stm32l0"
+part = "stm32l011k4t"
+board_model = 39            # lamella_wire::board_model::NUCLEO_L011K4
+sources = [
+    "STM32 Nucleo-32 boards user manual UM1956 Rev 5 (MB1180), which covers NUCLEO-L011K4 by name: section 7.9 and table 7 for the virtual COM port (SB2 ON connects PA2 as VCP TX, SB3 ON connects PA15 as VCP RX, both default), and the LED section for the green user LED LD3 on PB3 at Arduino Nano signal D13",
+    "UM1956 Rev 5 naming the fitted part as STM32L011K4T6",
+]
+notes = [
+    "THE GREEN USER LED AND THE HEADER'S SPI CLOCK ARE THE SAME PAD. LD3 is PB3, which UM1956 also gives as Arduino Nano D13, and PB3 is SPI1_SCK at AF0 on this part. Driving the LED and clocking SPI1 through that pad are mutually exclusive, and nothing in the chip reports it. Solder bridge SB15 is what ties LD3 to the D13 signal.",
+    "THE RESET CLOCK DOES NOT DIVIDE EVENLY INTO 115200 AND THE PLAN BELOW KEEPS THE RESET CLOCK. 2097000 / 115200 is 18.2, so the divisor rounds to 18 and the line runs at about 116500 baud -- roughly +1.1%, inside the usual tolerance for an 8-bit frame but not zero. Firmware wanting margin raises MSI and states that as its own plan rather than editing this one.",
+    "PA2 doubles as Arduino Nano analog input A7: UM1956 table 7 says SB2 OFF disconnects it from the ST-LINK USART and connects it to CN4 pin 5. So enabling the header's A7 costs the virtual COM port's transmit line.",
+]
+
+[[carriers]]
+kind = "stlink-vcp"         # the on-board ST-LINK/V2-1 bridge
+role = "vcp"
+baud = 115200
+plan = "msi-2mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "usart2"
+function = "AF4"            # NOT AF7: that is the L4's number for this signal, and AF7 here is COMP2_OUT
+tx = { pin = "PA2" }
+rx = { pin = "PA15" }
+
+[[plans]]
+name = "msi-2mhz"
+default = true
+source = "msi"
+msi_hz = 2097000            # the reset clock: RM0377 7.2.3 gives MSI 2.097 MHz as the system clock
+pclk_hz = 2097000           # source after power reset, with all prescalers at 1

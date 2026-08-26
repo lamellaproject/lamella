@@ -1,7 +1,7 @@
 # PART: NXP (Freescale) MMA8653FC, a three-axis 10-bit accelerometer.
 #
 #
-# ITS DEVICE ID SHARES A REGISTER WITH OTHER PARTS IN THIS CATALOGUE. Register 0x0D is WHO_AM_I here
+# ITS DEVICE ID SHARES A REGISTER WITH OTHER PARTS IN THIS CATALOG. Register 0x0D is WHO_AM_I here
 # and on the FXOS8700CQ, which is this vendor's convention rather than a coincidence. That matters
 # because their addresses OVERLAP: this part is fixed at 0x1D and the FXOS8700CQ selects among 0x1C,
 # 0x1D, 0x1E and 0x1F. At 0x1D the two are separated by the VALUE alone -- 0x5A here, 0xC7 there --

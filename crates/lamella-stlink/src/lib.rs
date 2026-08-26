@@ -543,10 +543,10 @@ impl StLink {
 
     /// Asks the probe whether the last read or write completed, and turns "no" into an error.
     ///
-    /// WHICH QUERY IS NOT A DETAIL -- IT IS THE DIFFERENCE BETWEEN READING MEMORY AND NOT. This
-    /// used to send `GETLASTRWSTATUS` unconditionally, and recorded that choosing between the two
-    /// forms was not worth a version check. It was: **an ST-Link/V3 answers the older form with
-    /// `0x42` -- to a good read, to a failed read, and before any transfer has happened at all.**
+    /// WHICH QUERY IS NOT A DETAIL -- IT IS THE DIFFERENCE BETWEEN READING MEMORY AND NOT. Sending
+    /// `GETLASTRWSTATUS` unconditionally looks like a choice not worth a version check, and is not:
+    /// **an ST-Link/V3 answers the older form with `0x42` -- to a good read, to a failed read, and
+    /// before any transfer has happened at all.**
     /// Every memory access through a V3 therefore returned correct data and was then thrown away by
     /// this function, which is how "the V3 cannot read memory on an H7" came to be believed. It
     /// could read it the whole time; nothing on the wire was ever wrong.

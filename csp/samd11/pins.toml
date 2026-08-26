@@ -1,0 +1,81 @@
+# The SAM D11 pin-function map: pin x function -> (instance, signal). PARTIAL and append-only:
+# rows exist for the bindings a board package uses, each with its source; grow the table with the
+# boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
+#
+# THE FUNCTION LETTER IS THE WHOLE ROW, and it is not derivable from the SERCOM number. Column C is
+# SERCOM and column D is SERCOM-ALT, so the SAME instance appears under different letters on
+# different pins: SERCOM0/PAD[0] is function C on PA06 and SERCOM0/PAD[2] is function D on PA08. A
+# row that carried the right instance under the wrong letter would mux a different peripheral onto
+# the pad and report success.
+#
+# The rows below are the ATSAMD11-XPRO's EDBG-facing wiring. Every one is sourced to Atmel-42363H
+# table 6-1 for the letter and corroborated by the kit user guide Atmel-42349, which states the
+# SERCOM and PAD for each pin independently.
+
+[table]
+kind = "pins"
+family = "samd11"
+sources = [
+    "SAM D11 datasheet Atmel-42363H-SAM-D11-Datasheet_09/2016 table 6-1 (PORT function multiplexing), column C = SERCOM and column D = SERCOM-ALT",
+    "SAM D11 Xplained Pro user guide Atmel-42349, which names the SERCOM and PAD for each EDBG-facing pin -- used as corroboration for the rows below, never as their source",
+]
+notes = [
+    "Atmel-42349 also prints an extension-header table giving PA08 as SERCOM2/PAD[0] SDA and PA09 as SERCOM2/PAD[1] SCL. Table 6-1 offers NEITHER pad a SERCOM2 function: PA08 is SERCOM1/PAD[2] on C and SERCOM0/PAD[2] on D, and PA09 is SERCOM1/PAD[3] on C and SERCOM0/PAD[3] on D. The two documents disagree and the datasheet is the authority here, so no SERCOM2 row exists for those pins. Anyone wiring that header should resolve it against silicon before assuming either.",
+    "PA30 and PA31 carry SWCLK and SWDIO under function G. They are not listed below because nothing muxes them -- but a board that reassigns either loses its debug connection, which is the one mistake this table cannot warn about after the fact.",
+]
+
+[[pins]]
+pin = "PA06"
+function = "C"
+instance = "sercom0"
+signal = "pad0"
+source = "Atmel-42363H table 6-1: PA06 column C = SERCOM0/PAD[0]. Atmel-42349 wires it as EDBG SPI MOSI."
+
+[[pins]]
+pin = "PA07"
+function = "C"
+instance = "sercom0"
+signal = "pad1"
+source = "Atmel-42363H table 6-1: PA07 column C = SERCOM0/PAD[1]. Atmel-42349 wires it as EDBG SPI SCK."
+
+[[pins]]
+pin = "PA08"                # function D, not C: PA08's column C is SERCOM1/PAD[2], and the SPI
+function = "D"             # this board wires is SERCOM0 -- so the ALT column is the one that
+instance = "sercom0"       # carries it. The instance number alone would have chosen wrong.
+signal = "pad2"
+source = "Atmel-42363H table 6-1: PA08 column D (SERCOM-ALT) = SERCOM0/PAD[2]. Atmel-42349 wires it as SPI SS_A, and notes the pad is shared with a 32kHz crystal footprint."
+
+[[pins]]
+pin = "PA09"
+function = "D"
+instance = "sercom0"
+signal = "pad3"
+source = "Atmel-42363H table 6-1: PA09 column D (SERCOM-ALT) = SERCOM0/PAD[3]. Atmel-42349 wires it as EDBG SPI MISO, and notes the pad is shared with a 32kHz crystal footprint."
+
+[[pins]]
+pin = "PA10"
+function = "D"
+instance = "sercom2"
+signal = "pad2"
+source = "Atmel-42363H table 6-1: PA10 column D (SERCOM-ALT) = SERCOM2/PAD[2]. Atmel-42349 wires it as the EDBG virtual COM port's UART TX."
+
+[[pins]]
+pin = "PA11"
+function = "D"
+instance = "sercom2"
+signal = "pad3"
+source = "Atmel-42363H table 6-1: PA11 column D (SERCOM-ALT) = SERCOM2/PAD[3]. Atmel-42349 wires it as the EDBG virtual COM port's UART RX."
+
+[[pins]]
+pin = "PA22"
+function = "C"
+instance = "sercom1"
+signal = "pad0"
+source = "Atmel-42363H table 6-1: PA22 column C = SERCOM1/PAD[0], and the Type column marks the pad I2C-capable. Atmel-42349 wires it as EDBG I2C SDA."
+
+[[pins]]
+pin = "PA23"
+function = "C"
+instance = "sercom1"
+signal = "pad1"
+source = "Atmel-42363H table 6-1: PA23 column C = SERCOM1/PAD[1], and the Type column marks the pad I2C-capable. Atmel-42349 wires it as EDBG I2C SCL."

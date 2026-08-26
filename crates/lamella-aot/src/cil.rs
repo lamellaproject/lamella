@@ -450,6 +450,24 @@ pub trait CallResolver {
         Vec::new()
     }
 
+    /// How a `castclass`/`isinst` tests an ARRAY target, or `None` when the target is not an array
+    /// type this can decide. Defaults to `None`, which keeps the pre-existing behaviour: `isinst`
+    /// refuses the build and `castclass` emits no check.
+    fn array_cast_test(&self, _operand: &Operand) -> Option<ArrayCastTest> {
+        None
+    }
+
+    /// The EXACT byte size of a `sizeof` operand that this module cannot lay out itself: a `System`
+    /// primitive, which is a corlib TypeRef. Defaults to `None`.
+    ///
+    /// SEPARATE FROM [`Self::value_type_cell`] BECAUSE A STACK TYPE IS NOT A SIZE. Every other
+    /// cross-assembly primitive question here answers a [`MirType`], and `Boolean`, `Byte`, `Char`
+    /// and `Int16` all answer `I32` -- correct for the stack and wrong by a factor of four for
+    /// `sizeof`. This answers storage width, so it cannot be served by widening one of those.
+    fn primitive_sizeof(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
     /// The MIR type a `box`/`unbox.any` value type lowers to: `i32` for a sub-word or 32-bit scalar,
     /// `f32`/`i64`/`f64` for the wider scalars, or a `ValueType` for a struct. Used to type the
     /// `unbox.any` result so a multi-word scalar reads its full width. Defaults to None.
@@ -544,6 +562,61 @@ pub struct ArrayElement {
     /// baked at each access site; this is the same fact carried at RUN TIME, which is what an
     /// untyped `System.Array` body and a tracing collector need.
     pub element_kind: u32,
+    /// Which elements this array's may be cast BETWEEN -- ECMA-335 III.4.3's array-element rule,
+    /// carried at run time so `castclass`/`isinst` on an array target can decide it. See
+    /// [`crate::resolver::array_element_cast_class`];
+    /// [`crate::resolver::ARRAY_CAST_CLASS_NONE`] for a reference element or a real struct, whose
+    /// only compatible partner is its own exact identity.
+    ///
+    /// **IT IS A WORD OF ITS OWN AND NOT SPARE BITS OF `element_kind`, WHICH WAS MEASURED RATHER
+    /// THAN ASSUMED.** `element_kind` looks like it has 24 free bits, and it does not: `Array`'s
+    /// `GetValue`/`SetValue` compare that word for EXACT EQUALITY against
+    /// `ELEMENT_KIND_REFERENCE` at run time, and the collector's scan-by-kind uses it as a SHIFT
+    /// amount. Packing anything above it turns a legal `GetValue` on a reference array into a trap.
+    pub element_cast_class: u32,
+}
+
+/// How a `castclass`/`isinst` whose TARGET is an ARRAY type tests the object -- ECMA-335 4th ed
+/// III.4.3 notes 2 and 3, which is a different and LOOSER rule than I.8.7's assignment
+/// compatibility (that one requires reference elements, and the CLR performs `(uint[])intArr`).
+///
+/// The object must be an array of the same rank whose ELEMENT passes [`ArrayCastTest::element`].
+#[derive(Clone, Copy)]
+pub struct ArrayCastTest {
+    /// The rank the object's descriptor must carry beside the array mark in word 0.
+    pub rank: u32,
+    /// How the element is judged.
+    pub element: ArrayElementTest,
+}
+
+/// How an array cast judges the object's ELEMENT, which depends on what the TARGET's element is.
+///
+/// **THE ARMS READ DIFFERENT DESCRIPTOR WORDS, AND EACH IS THE ONLY ONE SOUND FOR ITS CASE.**
+/// A value element compares `element_cast_class@20`, which is always emitted; a named reference
+/// element walks `element_desc@16`, which the emitter guarantees for a reference element and DROPS
+/// for a value one (a value element's descriptor may be a minimal type-test stand-in, so the word is
+/// 0 and would read alike for `int[]`, `uint[]` and `long[]`); and `System.Object` as a target
+/// element reads `element_kind@4`, because for THAT target the question is not which type the
+/// element is.
+#[derive(Clone, Copy)]
+pub enum ArrayElementTest {
+    /// A VALUE element: `element_cast_class@20` must equal this exactly. Sign-folded, so `int[]` and
+    /// `uint[]` share one class and `bool[]`/`byte[]` and `char[]`/`ushort[]` do not.
+    Class(u32),
+    /// ANY REFERENCE element -- the whole of the rule when the TARGET's element is `System.Object`,
+    /// since every reference type is assignable to `object` and no value type is.
+    ///
+    /// **IT IS A SEPARATE ARM RATHER THAN `Chain(System.Object)`, AND THE REASON IS THE ONE WORD IT
+    /// DOES NOT READ.** A chain walk starts at `element_desc@16`, and that edge is ABSENT for an
+    /// element no metadata row names -- a nested array, which is exactly the `int[][]` case
+    /// `(object[])` has to accept. Reading `element_kind@4` instead needs no element descriptor at
+    /// all, so it answers for a jagged array and a `string[]` by the same rule.
+    Reference,
+    /// A REFERENCE element: the object's `element_desc@16` must reach this descriptor by the
+    /// base-pointer chain -- the same walk `castclass` uses on an object, run one level in.
+    Chain(TypeHandle),
+    /// An INTERFACE element: the object's `element_desc@16` must carry this tag in its itable.
+    Interface(u32),
 }
 
 /// Which of ECMA-335 I.8.9.5's type-initializer triggers a site is, as the opcode reveals it.
@@ -610,6 +683,12 @@ pub enum Array2DOp {
         /// The size in bytes of one element.
         element_size: u32,
     },
+    /// `call int[,]::Address(i, j)` -- the element's ADDRESS. The fourth pseudo-method a
+    /// multidimensional array type declares, and the one `fixed (int* p = m)` pins through.
+    Address {
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
 }
 
 /// A rank-N (N>=3) rectangular-array pseudo-method a `newobj`/`call` names (`int[,,]::.ctor`/`Get`/`Set`
@@ -643,6 +722,14 @@ pub enum ArrayMDOp {
         /// The size in bytes of one element.
         element_size: u32,
         /// The array's rank -- the number of index arguments (before the value).
+        rank: usize,
+    },
+    /// `call int[,,]::Address(i0, ..., i(N-1))` -- the element's ADDRESS, the rank-N twin of
+    /// [`Array2DOp::Address`].
+    Address {
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// The array's rank -- the number of index arguments.
         rank: usize,
     },
 }
@@ -1178,7 +1265,7 @@ fn lower_with_source(
         let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
         let mut segment: Option<usize> = None;
-        let mut last_local_addr: Option<(AddrOf, u32)> = None;
+        let mut last_local_addr: Option<PendingAddr> = None;
 
         let mut pending_constrained: Option<Operand> = None;
 
@@ -1693,15 +1780,69 @@ fn emit_type_init_check(
     ));
 }
 
-/// The compile-time integer a stack value holds, if it is defined by a `ConstInt` in this block. Used to
-/// fold a constant `localloc`/`stackalloc` size (csc emits `ldc; conv.u; localloc` for `stackalloc T[n]`
-/// with a constant `n`, and `conv.u`/`conv.i` are no-ops here, so the const IS the operand); a value that
-/// does not trace to a constant is a runtime size, which this SP-relative backend does not lower.
-fn const_value(insts: &[(ValueId, Inst)], value: ValueId) -> Option<i64> {
-    insts.iter().rev().find_map(|(v, inst)| match inst {
-        Inst::ConstInt { value: n, .. } if *v == value => Some(*n),
+/// The compile-time integer a stack value holds, if it FOLDS to one in this block. Used for a constant
+/// `localloc`/`stackalloc` size -- a value that does not fold is a runtime size, which this
+/// SP-relative backend does not lower -- and to mask a constant shift count at no runtime cost.
+///
+/// IT FOLDS AN EXPRESSION AND NOT ONLY A LITERAL, because the producers do not fold it for us. This
+/// function's first version accepted a bare `ConstInt`, on the documented assumption that
+/// `stackalloc T[n]` reaches CIL as `ldc <n*sizeof(T)>; conv.u; localloc` with the multiply already
+/// done. Measured: it reaches us as `ldc 5; ldc 4; mul; localloc` -- the multiply is left to the
+/// consumer -- so every `stackalloc` in the corpus was refused as a runtime size. Six programs.
+///
+/// **A DIVIDE IS DELIBERATELY NOT FOLDED.** A zero divisor is a program that must TRAP, and folding
+/// it here would either panic or invent an answer for it; leaving it unfolded routes it to the
+/// runtime check that already exists.
+///
+/// The result is truncated to the OPERAND's width at every step, because CIL `int32` arithmetic wraps
+/// at 32 bits: folding in `i64` throughout would answer `0x8000_0000` where the program computes
+/// `-2147483648`, which is the shape of silent fold bug this tree has paid for elsewhere.
+fn const_value(insts: &[(ValueId, Inst)], value_types: &[MirType], value: ValueId) -> Option<i64> {
+    const_fold(insts, value_types, value, 16)
+}
+
+/// [`const_value`]'s bounded walk. `fuel` stops a malformed body whose definitions form a cycle.
+fn const_fold(
+    insts: &[(ValueId, Inst)],
+    value_types: &[MirType],
+    value: ValueId,
+    fuel: u32,
+) -> Option<i64> {
+    if fuel == 0 {
+        return None;
+    }
+    let defining = insts
+        .iter()
+        .rev()
+        .find_map(|(v, inst)| (*v == value).then_some(inst))?;
+    let narrow = |n: i64| match value_types.get(value.index()) {
+        Some(MirType::I64) => n,
+        _ => i64::from(n as i32),
+    };
+    match defining {
+        Inst::ConstInt { value: n, .. } => Some(*n),
+        Inst::Convert {
+            value: inner,
+            kind: ConvKind::ToNativeInt | ConvKind::RefToInt,
+        } => const_fold(insts, value_types, *inner, fuel - 1),
+        Inst::Binary { op, lhs, rhs } => {
+            let a = const_fold(insts, value_types, *lhs, fuel - 1)?;
+            let b = const_fold(insts, value_types, *rhs, fuel - 1)?;
+            Some(narrow(match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                BinOp::And => a & b,
+                BinOp::Or => a | b,
+                BinOp::Xor => a ^ b,
+                BinOp::Shl => a.wrapping_shl(b as u32),
+                BinOp::ShrSigned => a.wrapping_shr(b as u32),
+                BinOp::ShrUnsigned => (a as u64).wrapping_shr(b as u32) as i64,
+                _ => return None,
+            }))
+        }
         _ => None,
-    })
+    }
 }
 
 /// Pushes an integer constant: a new value defined by a `ConstInt`.
@@ -1742,7 +1883,7 @@ fn binary(
         .unwrap_or(MirType::I32);
     let rhs = if matches!(op, BinOp::Shl | BinOp::ShrSigned | BinOp::ShrUnsigned) {
         let mask = if matches!(lty, MirType::I64) { 63 } else { 31 };
-        match const_value(insts, rhs) {
+        match const_value(insts, value_types, rhs) {
             Some(count) if count & !mask != 0 => {
                 let masked = new_value(value_types, rty);
                 insts.push((
@@ -1785,6 +1926,20 @@ fn binary(
         let ri = reinterpret_word(rhs, rty, value_types, insts);
         let result = new_value(value_types, MirType::I32);
         insts.push((result, Inst::Binary { op, lhs: li, rhs: ri }));
+        let native = lty == MirType::NativeInt || rty == MirType::NativeInt;
+        let managed = lty == MirType::ManagedPtr || rty == MirType::ManagedPtr;
+        if native && !managed {
+            let retyped = new_value(value_types, MirType::NativeInt);
+            insts.push((
+                retyped,
+                Inst::Convert {
+                    value: result,
+                    kind: ConvKind::ToNativeInt,
+                },
+            ));
+            stack.push(retyped);
+            return Ok(());
+        }
         stack.push(result);
         return Ok(());
     }
@@ -2022,6 +2177,128 @@ enum AddrOf {
     Arg(usize),
 }
 
+/// A `ldloca`/`ldarga` address that has been RECORDED rather than pushed, plus the evaluation-stack
+/// DEPTH it would have occupied had it been pushed.
+///
+/// The depth is what makes the record a stack SLOT rather than a side register. CIL puts `&x` on the
+/// evaluation stack like any other value, so a second address, or an instruction that reads down to
+/// that position, has to see it there. Materializing late without the depth would push the address
+/// ABOVE values that were stacked after it and silently reorder the operands.
+#[derive(Clone, Copy)]
+struct PendingAddr {
+    source: AddrOf,
+    /// The accumulated `ldflda` field offset -- `&s.inner.f` stays deferred and adds to this.
+    offset: u32,
+    /// `stack.len()` when the address was recorded: where it belongs if it is materialized.
+    depth: usize,
+}
+
+/// How many operands an opcode takes off the evaluation stack, for the ONE question
+/// [`materialize_pending_if_read`] asks: does this instruction reach down to a pending address?
+///
+/// `None` means UNMODELED, and unmodeled keeps the deferral -- so an opcode missing from this table
+/// behaves exactly as it did before the table existed. That direction is deliberate: an omission
+/// costs a refusal, which is loud, where a wrong entry would materialize an address into a stack
+/// position that nothing consumes and reorder the operands under it.
+///
+/// The consumers of a pending address are NOT here and must not be: `ldfld`, `stfld`, `ldflda`,
+/// `initobj` and the calls take the record directly, which is the deferral working.
+fn pending_operand_reads(opcode: Opcode) -> Option<usize> {
+    Some(match opcode {
+        Opcode::Dup | Opcode::Pop => 1,
+        Opcode::Stloc0
+        | Opcode::Stloc1
+        | Opcode::Stloc2
+        | Opcode::Stloc3
+        | Opcode::StlocS
+        | Opcode::Stloc
+        | Opcode::StargS
+        | Opcode::Starg
+        | Opcode::Stsfld => 1,
+        Opcode::ConvI | Opcode::ConvU => 1,
+        Opcode::LdindI1
+        | Opcode::LdindU1
+        | Opcode::LdindI2
+        | Opcode::LdindU2
+        | Opcode::LdindI4
+        | Opcode::LdindU4
+        | Opcode::LdindI8
+        | Opcode::LdindI
+        | Opcode::LdindR4
+        | Opcode::LdindR8
+        | Opcode::LdindRef
+        | Opcode::Ldobj => 1,
+        Opcode::StindI1
+        | Opcode::StindI2
+        | Opcode::StindI4
+        | Opcode::StindI8
+        | Opcode::StindI
+        | Opcode::StindR4
+        | Opcode::StindR8
+        | Opcode::StindRef
+        | Opcode::Stobj
+        | Opcode::Cpobj => 2,
+        _ => return None,
+    })
+}
+
+/// Puts a recorded address on the evaluation stack, at the depth it was recorded, and returns it.
+///
+/// `addr_base` resolves the record's source to the local's or argument's MIR value -- for a struct
+/// that value IS the slot -- and the offset-carrying `FieldAddr` turns it into a real managed
+/// pointer. `insert` rather than `push`, because values stacked after the record belong above it.
+fn materialize_pending(
+    pending: PendingAddr,
+    stack: &mut Vec<ValueId>,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<ValueId, CilError> {
+    let base = addr_base(pending.source, locals, local_types, args, value_types, insts)?;
+    let addr = new_value(value_types, MirType::ManagedPtr);
+    insts.push((
+        addr,
+        Inst::FieldAddr {
+            base,
+            offset: pending.offset,
+        },
+    ));
+    let at = pending.depth.min(stack.len());
+    stack.insert(at, addr);
+    Ok(addr)
+}
+
+/// Records a `ldloca`/`ldarga` address, materializing whatever was already pending.
+///
+/// TWO ADDRESSES CAN BE LIVE AT ONCE, AND THE OLDER ONE IS DEEPER. A user-defined operator is the
+/// ordinary shape: `Vec operator +(Vec a, Vec b)` compiles to `ldloca r; ldarga a; ldfld X;
+/// ldarga b; ldfld X; add; stfld X` -- the destination `&r` is recorded first and read last, across
+/// two `ldarga`/`ldfld` pairs that each record an address of their own. A single-slot record loses
+/// `&r` at the first `ldarga`, and the `stfld` then has no base to store through.
+#[allow(clippy::too_many_arguments)]
+fn record_pending_addr(
+    source: AddrOf,
+    last_local_addr: &mut Option<PendingAddr>,
+    stack: &mut Vec<ValueId>,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<(), CilError> {
+    if let Some(previous) = last_local_addr.take() {
+        materialize_pending(previous, stack, locals, local_types, args, value_types, insts)?;
+    }
+    *last_local_addr = Some(PendingAddr {
+        source,
+        offset: 0,
+        depth: stack.len(),
+    });
+    Ok(())
+}
+
 impl AddrOf {
     /// The MIR value of the addressed local or argument, if defined.
     fn value(self, locals: &[Option<ValueId>], args: &[ValueId]) -> Option<ValueId> {
@@ -2091,7 +2368,7 @@ fn addr_base(
 fn box_constrained_receiver(
     constrained: &Operand,
     resolver: &dyn CallResolver,
-    pending: Option<(AddrOf, u32)>,
+    pending: Option<PendingAddr>,
     stack: &mut Vec<ValueId>,
     locals: &mut [Option<ValueId>],
     local_types: &[MirType],
@@ -2103,8 +2380,10 @@ fn box_constrained_receiver(
         .boxed_layout(constrained)
         .ok_or(CilError::BadOperand)?;
     let value = match pending {
-        Some((source, 0)) => addr_base(source, locals, local_types, args, value_types, insts)?,
-        Some((source, offset)) => {
+        Some(PendingAddr { source, offset: 0, .. }) => {
+            addr_base(source, locals, local_types, args, value_types, insts)?
+        }
+        Some(PendingAddr { source, offset, .. }) => {
             let base = addr_base(source, locals, local_types, args, value_types, insts)?;
             let ty = resolver
                 .boxed_value_type(constrained)
@@ -2163,12 +2442,19 @@ fn apply_value_op(
     insts: &mut Vec<(ValueId, Inst)>,
     strings: &mut Vec<(ValueId, Box<[u16]>)>,
     resolver: &dyn CallResolver,
-    last_local_addr: &mut Option<(AddrOf, u32)>,
+    last_local_addr: &mut Option<PendingAddr>,
     pending_constrained: &mut Option<Operand>,
     mem_elem: &[Option<MirType>],
     arg_cells: &[Option<ValueId>],
     promoted_arg: &[Option<usize>],
 ) -> Result<(), CilError> {
+    if let Some(pending) = *last_local_addr
+        && let Some(pops) = pending_operand_reads(inst.opcode)
+        && stack.len() < pending.depth + pops
+    {
+        *last_local_addr = None;
+        materialize_pending(pending, stack, locals, local_types, args, value_types, insts)?;
+    }
     match inst.opcode {
         Opcode::Nop => {}
         Opcode::Constrained => {
@@ -2396,6 +2682,7 @@ fn apply_value_op(
             let size = resolver
                 .value_type_cell(&inst.operand)
                 .map(|(size, _)| size)
+                .or_else(|| resolver.primitive_sizeof(&inst.operand))
                 .ok_or(CilError::Unsupported(inst.opcode))?;
             push_const(value_types, stack, insts, i64::from(size));
         }
@@ -2409,7 +2696,7 @@ fn apply_value_op(
         }
         Opcode::Localloc => {
             let size = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let bytes = const_value(insts, size)
+            let bytes = const_value(insts, value_types, size)
                 .and_then(|n| u32::try_from(n).ok())
                 .filter(|n| *n > 0)
                 .ok_or(CilError::Unsupported(Opcode::Localloc))?;
@@ -2714,11 +3001,11 @@ fn apply_value_op(
                 let arg_count = param_is_string.len();
                 let by_ref = last_local_addr
                     .take()
-                    .map(|(source, off)| -> Result<ValueId, CilError> {
+                    .map(|p: PendingAddr| -> Result<ValueId, CilError> {
                         let base =
-                            addr_base(source, locals, local_types, args, value_types, insts)?;
+                            addr_base(p.source, locals, local_types, args, value_types, insts)?;
                         let ptr = new_value(value_types, MirType::ManagedPtr);
-                        insts.push((ptr, Inst::FieldAddr { base, offset: off }));
+                        insts.push((ptr, Inst::FieldAddr { base, offset: p.offset }));
                         Ok(ptr)
                     })
                     .transpose()?;
@@ -2813,6 +3100,23 @@ fn apply_value_op(
                     stack.push(result);
                     return Ok(());
                 }
+                Some(Array2DOp::Address { element_size }) => {
+                    let index1 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let index0 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, MirType::ManagedPtr);
+                    insts.push((
+                        result,
+                        Inst::Array2DElemAddr {
+                            array,
+                            index0,
+                            index1,
+                            element_size,
+                        },
+                    ));
+                    stack.push(result);
+                    return Ok(());
+                }
                 Some(Array2DOp::Set { element_size }) => {
                     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let index1 = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -2859,6 +3163,25 @@ fn apply_value_op(
                     stack.push(result);
                     return Ok(());
                 }
+                Some(ArrayMDOp::Address { element_size, rank }) => {
+                    let mut indices = Vec::with_capacity(rank);
+                    for _ in 0..rank {
+                        indices.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+                    }
+                    indices.reverse();
+                    let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, MirType::ManagedPtr);
+                    insts.push((
+                        result,
+                        Inst::ArrayMDElemAddr {
+                            array,
+                            indices: indices.into_boxed_slice(),
+                            element_size,
+                        },
+                    ));
+                    stack.push(result);
+                    return Ok(());
+                }
                 Some(ArrayMDOp::Set { element_size, rank }) => {
                     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let mut indices = Vec::with_capacity(rank);
@@ -2893,7 +3216,7 @@ fn apply_value_op(
             };
             if matches!(info.target, CallTarget::Intrinsic(Intrinsic::IntToString)) {
                 let value = match last_local_addr.take() {
-                    Some((source, _)) => {
+                    Some(PendingAddr { source, .. }) => {
                         addr_base(source, locals, local_types, args, value_types, insts)?
                     }
                     None => {
@@ -2936,11 +3259,11 @@ fn apply_value_op(
                     insts,
                 )?),
                 _ => match pending {
-                    Some((source, off)) => {
+                    Some(PendingAddr { source, offset, .. }) => {
                         let base =
                             addr_base(source, locals, local_types, args, value_types, insts)?;
                         let ptr = new_value(value_types, MirType::ManagedPtr);
-                        insts.push((ptr, Inst::FieldAddr { base, offset: off }));
+                        insts.push((ptr, Inst::FieldAddr { base, offset }));
                         Some(ptr)
                     }
                     None if constrained.is_some() => {
@@ -3114,7 +3437,16 @@ fn apply_value_op(
                 ));
                 stack.push(ptr);
             } else {
-                *last_local_addr = Some((AddrOf::Local(n), 0));
+                record_pending_addr(
+                    AddrOf::Local(n),
+                    last_local_addr,
+                    stack,
+                    locals,
+                    local_types,
+                    args,
+                    value_types,
+                    insts,
+                )?;
             }
         }
         Opcode::LdargaS | Opcode::Ldarga => {
@@ -3133,7 +3465,16 @@ fn apply_value_op(
                 ));
                 stack.push(ptr);
             } else {
-                *last_local_addr = Some((AddrOf::Arg(n), 0));
+                record_pending_addr(
+                    AddrOf::Arg(n),
+                    last_local_addr,
+                    stack,
+                    locals,
+                    local_types,
+                    args,
+                    value_types,
+                    insts,
+                )?;
             }
         }
         Opcode::Ldflda => {
@@ -3141,8 +3482,11 @@ fn apply_value_op(
                 .field_offset(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
             match last_local_addr.take() {
-                Some((source, offset)) => {
-                    *last_local_addr = Some((source, offset + field));
+                Some(pending) => {
+                    *last_local_addr = Some(PendingAddr {
+                        offset: pending.offset + field,
+                        ..pending
+                    });
                 }
                 None => {
                     let base = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -3153,7 +3497,7 @@ fn apply_value_op(
             }
         }
         Opcode::Initobj => match last_local_addr.take() {
-            Some((AddrOf::Local(n), _)) => {
+            Some(PendingAddr { source: AddrOf::Local(n), .. }) => {
                 let (handle, size, refs) = match resolver.type_operand_mir(&inst.operand) {
                     Some(MirType::ValueType { handle, size, refs }) => (handle, size, refs),
                     _ => {
@@ -3212,9 +3556,9 @@ fn apply_value_op(
         },
         Opcode::Ldfld => {
             let (base, base_offset) = match last_local_addr.take() {
-                Some((source, off)) => (
+                Some(PendingAddr { source, offset, .. }) => (
                     addr_base(source, locals, local_types, args, value_types, insts)?,
-                    off,
+                    offset,
                 ),
                 None => (stack.pop().ok_or(CilError::StackUnderflow)?, 0),
             };
@@ -3241,9 +3585,9 @@ fn apply_value_op(
         Opcode::Stfld => {
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
             let (base, base_offset) = match last_local_addr.take() {
-                Some((source, off)) => (
+                Some(PendingAddr { source, offset, .. }) => (
                     addr_base(source, locals, local_types, args, value_types, insts)?,
-                    off,
+                    offset,
                 ),
                 None => (stack.pop().ok_or(CilError::StackUnderflow)?, 0),
             };
@@ -3284,6 +3628,7 @@ fn apply_value_op(
                     handle: element.handle,
                     element: element.element,
                     length,
+                    element_cast_class: element.element_cast_class,
                     element_size: element.element_size,
                     element_kind: element.element_kind,
                 },
@@ -3656,6 +4001,21 @@ fn apply_value_op(
             insts.push((result, Inst::StaticLoad { owner, offset }));
             stack.push(result);
         }
+        Opcode::Ldsflda => {
+            emit_type_init_check(
+                resolver,
+                &inst.operand,
+                InitTrigger::StaticField,
+                value_types,
+                insts,
+            );
+            let (owner, offset) = resolver
+                .static_field_offset(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let result = new_value(value_types, MirType::ManagedPtr);
+            insts.push((result, Inst::StaticAddr { owner, offset }));
+            stack.push(result);
+        }
         Opcode::Stsfld => {
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
             emit_type_init_check(
@@ -3890,7 +4250,9 @@ fn apply_value_op(
             let chain_target = resolver
                 .cast_target_chain(&inst.operand)
                 .filter(|target| crate::resolver::reference_handle_parts(*target).is_some());
-            let matched = if let Some(tag) = resolver.cast_interface_tag(&inst.operand) {
+            let matched = if let Some(test) = resolver.array_cast_test(&inst.operand) {
+                array_cast_match(&test, object_desc, value_types, insts)
+            } else if let Some(tag) = resolver.cast_interface_tag(&inst.operand) {
                 let present = new_value(value_types, MirType::I32);
                 insts.push((
                     present,
@@ -4355,6 +4717,17 @@ fn classify_catch_binding(
             | Opcode::BrtrueS
             | Opcode::Brfalse
             | Opcode::BrfalseS => true,
+            Opcode::Ldnull => matches!(
+                code.get(i + 2).map(|after| after.opcode),
+                Some(
+                    Opcode::Ceq
+                        | Opcode::CgtUn
+                        | Opcode::Beq
+                        | Opcode::BeqS
+                        | Opcode::BneUn
+                        | Opcode::BneUnS
+                )
+            ),
             Opcode::Call | Opcode::Callvirt => {
                 resolver.resolve(&next.operand).is_some_and(|info| info.args == 1)
             }
@@ -4708,6 +5081,9 @@ enum TrapKind {
     /// `castclass T` for an in-program TypeDef T: walk the object's TypeDesc base_ptr chain for T's
     /// descriptor (the exact base-pointer scan). O(depth), no per-subtype compares -> `InvalidCastException`.
     CastClassChain(TypeHandle),
+    /// `castclass T[]`: the object must be an array of the same rank whose element passes
+    /// ECMA-335 III.4.3's array-element rule. Shares its predicate with `isinst`'s.
+    CastArray(ArrayCastTest),
     /// `castclass I` for an INTERFACE I: the object's type must IMPLEMENT it, which is an itable lookup
     /// of one of I's method tags rather than any kind of subtype test -> `InvalidCastException`. NULL
     /// passes, as it does for every reference cast. See [`lamella_ir::Inst::InterfaceHasTag`].
@@ -4749,7 +5125,7 @@ const CAST_CHAIN_THRESHOLD: usize = 4;
 /// The trap a block's FIRST instruction needs, or `None` if it is not a trap-leader: a bounds check
 /// for an array access, or a null check for a field access (`ldfld`/`stfld`) whose field is declared
 /// on a REFERENCE type (so its object can be null). The reference-type gate is the same one
-/// `discover_blocks` used to make the leader, so the two agree.
+/// `discover_blocks` applies when it makes the leader, so the two agree.
 fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapKind> {
     let opcode = inst.opcode;
     if control_flow::is_may_trap_access(opcode) {
@@ -4770,6 +5146,9 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
         }
     }
     if opcode == Opcode::Castclass {
+        if let Some(test) = resolver.array_cast_test(&inst.operand) {
+            return Some(TrapKind::CastArray(test));
+        }
         if let Some(tag) = resolver.cast_interface_tag(&inst.operand) {
             return Some(TrapKind::CastInterface(tag));
         }
@@ -4851,14 +5230,21 @@ fn eval_stack_widths(
     arg_types: &[MirType],
     local_types: &[MirType],
     resolver: &dyn CallResolver,
-) -> Vec<bool> {
-    let i64w = |t: Option<MirType>| t == Some(MirType::I64);
-    let mut stack: Vec<bool> = Vec::new();
-    let mut widths = alloc::vec![false; code.len()];
+) -> Vec<MirType> {
+    let slot = |t: Option<MirType>| match t {
+        Some(MirType::I64) => MirType::I64,
+        Some(MirType::F32) => MirType::F32,
+        Some(MirType::F64) => MirType::F64,
+        _ => MirType::I32,
+    };
+    let mut stack: Vec<MirType> = Vec::new();
+    let mut widths = alloc::vec![MirType::I32; code.len()];
     for (i, inst) in code.iter().enumerate() {
-        widths[i] = stack.last().copied().unwrap_or(false);
+        widths[i] = stack.last().copied().unwrap_or(MirType::I32);
         match inst.opcode {
-            Opcode::LdcI8 => stack.push(true),
+            Opcode::LdcI8 => stack.push(MirType::I64),
+            Opcode::LdcR4 => stack.push(MirType::F32),
+            Opcode::LdcR8 => stack.push(MirType::F64),
             Opcode::LdcI4M1
             | Opcode::LdcI40
             | Opcode::LdcI41
@@ -4871,41 +5257,50 @@ fn eval_stack_widths(
             | Opcode::LdcI48
             | Opcode::LdcI4S
             | Opcode::LdcI4
-            | Opcode::LdcR4
-            | Opcode::LdcR8
             | Opcode::Ldstr
-            | Opcode::Ldnull => stack.push(false),
-            Opcode::Ldarg0 => stack.push(i64w(arg_types.first().copied())),
-            Opcode::Ldarg1 => stack.push(i64w(arg_types.get(1).copied())),
-            Opcode::Ldarg2 => stack.push(i64w(arg_types.get(2).copied())),
-            Opcode::Ldarg3 => stack.push(i64w(arg_types.get(3).copied())),
+            | Opcode::Ldnull => stack.push(MirType::I32),
+            Opcode::Ldarg0 => stack.push(slot(arg_types.first().copied())),
+            Opcode::Ldarg1 => stack.push(slot(arg_types.get(1).copied())),
+            Opcode::Ldarg2 => stack.push(slot(arg_types.get(2).copied())),
+            Opcode::Ldarg3 => stack.push(slot(arg_types.get(3).copied())),
             Opcode::LdargS | Opcode::Ldarg => {
                 let n = match inst.operand {
                     Operand::Variable(n) => n as usize,
                     _ => 0,
                 };
-                stack.push(i64w(arg_types.get(n).copied()));
+                stack.push(slot(arg_types.get(n).copied()));
             }
-            Opcode::Ldloc0 => stack.push(i64w(local_types.first().copied())),
-            Opcode::Ldloc1 => stack.push(i64w(local_types.get(1).copied())),
-            Opcode::Ldloc2 => stack.push(i64w(local_types.get(2).copied())),
-            Opcode::Ldloc3 => stack.push(i64w(local_types.get(3).copied())),
+            Opcode::Ldloc0 => stack.push(slot(local_types.first().copied())),
+            Opcode::Ldloc1 => stack.push(slot(local_types.get(1).copied())),
+            Opcode::Ldloc2 => stack.push(slot(local_types.get(2).copied())),
+            Opcode::Ldloc3 => stack.push(slot(local_types.get(3).copied())),
             Opcode::LdlocS | Opcode::Ldloc => {
                 let n = match inst.operand {
                     Operand::Variable(n) => n as usize,
                     _ => 0,
                 };
-                stack.push(i64w(local_types.get(n).copied()));
+                stack.push(slot(local_types.get(n).copied()));
             }
-            Opcode::Ldsfld => stack.push(i64w(resolver.field_type(&inst.operand))),
+            Opcode::Ldsfld => stack.push(slot(resolver.field_type(&inst.operand))),
+            Opcode::Ldsflda => stack.push(MirType::I32),
             Opcode::Ldfld => {
                 stack.pop();
-                stack.push(i64w(resolver.field_type(&inst.operand)));
+                stack.push(slot(resolver.field_type(&inst.operand)));
             }
-            Opcode::LdelemI8 | Opcode::LdelemR8 => {
+            Opcode::LdelemI8 => {
                 stack.pop();
                 stack.pop();
-                stack.push(true);
+                stack.push(MirType::I64);
+            }
+            Opcode::LdelemR8 => {
+                stack.pop();
+                stack.pop();
+                stack.push(MirType::F64);
+            }
+            Opcode::LdelemR4 => {
+                stack.pop();
+                stack.pop();
+                stack.push(MirType::F32);
             }
             Opcode::LdelemI1
             | Opcode::LdelemU1
@@ -4913,22 +5308,21 @@ fn eval_stack_widths(
             | Opcode::LdelemU2
             | Opcode::LdelemI4
             | Opcode::LdelemU4
-            | Opcode::LdelemR4
             | Opcode::LdelemI
             | Opcode::LdelemRef
             | Opcode::Ldelema => {
                 stack.pop();
                 stack.pop();
-                stack.push(false);
+                stack.push(MirType::I32);
             }
             Opcode::Ldobj => {
                 stack.pop();
-                stack.push(i64w(resolver.type_operand_mir(&inst.operand)));
+                stack.push(slot(resolver.type_operand_mir(&inst.operand)));
             }
             Opcode::Ldelem => {
                 stack.pop();
                 stack.pop();
-                stack.push(i64w(resolver.type_operand_mir(&inst.operand)));
+                stack.push(slot(resolver.type_operand_mir(&inst.operand)));
             }
             Opcode::Stobj | Opcode::Cpobj => {
                 stack.pop();
@@ -4944,11 +5338,17 @@ fn eval_stack_widths(
             | Opcode::ConvOvfI8
             | Opcode::ConvOvfU8
             | Opcode::ConvOvfI8Un
-            | Opcode::ConvOvfU8Un
-            | Opcode::ConvR8
-            | Opcode::ConvRUn => {
+            | Opcode::ConvOvfU8Un => {
                 stack.pop();
-                stack.push(true);
+                stack.push(MirType::I64);
+            }
+            Opcode::ConvR8 | Opcode::ConvRUn => {
+                stack.pop();
+                stack.push(MirType::F64);
+            }
+            Opcode::ConvR4 => {
+                stack.pop();
+                stack.push(MirType::F32);
             }
             Opcode::ConvI1
             | Opcode::ConvU1
@@ -4969,10 +5369,9 @@ fn eval_stack_widths(
             | Opcode::ConvOvfI4Un
             | Opcode::ConvOvfU4Un
             | Opcode::ConvOvfIUn
-            | Opcode::ConvOvfUUn
-            | Opcode::ConvR4 => {
+            | Opcode::ConvOvfUUn => {
                 stack.pop();
-                stack.push(false);
+                stack.push(MirType::I32);
             }
             Opcode::Add
             | Opcode::AddOvf
@@ -4990,25 +5389,25 @@ fn eval_stack_widths(
             | Opcode::DivUn
             | Opcode::Rem
             | Opcode::RemUn => {
-                let w = stack.pop().unwrap_or(false);
+                let w = stack.pop().unwrap_or(MirType::I32);
                 stack.pop();
                 stack.push(w);
             }
             Opcode::Shl | Opcode::Shr | Opcode::ShrUn => {
                 stack.pop();
-                let w = stack.pop().unwrap_or(false);
+                let w = stack.pop().unwrap_or(MirType::I32);
                 stack.push(w);
             }
             Opcode::Neg | Opcode::Not => {
-                let w = stack.pop().unwrap_or(false);
+                let w = stack.pop().unwrap_or(MirType::I32);
                 stack.push(w);
             }
             Opcode::Ceq | Opcode::Cgt | Opcode::CgtUn | Opcode::Clt | Opcode::CltUn => {
                 stack.pop();
                 stack.pop();
-                stack.push(false);
+                stack.push(MirType::I32);
             }
-            Opcode::Dup => stack.push(stack.last().copied().unwrap_or(false)),
+            Opcode::Dup => stack.push(stack.last().copied().unwrap_or(MirType::I32)),
             Opcode::Pop => {
                 stack.pop();
             }
@@ -5018,14 +5417,14 @@ fn eval_stack_widths(
                         stack.pop();
                     }
                     if info.has_result {
-                        stack.push(i64w(info.result_type));
+                        stack.push(slot(info.result_type));
                     }
                 }
                 None => stack.clear(),
             },
             Opcode::Localloc => {
                 stack.pop();
-                stack.push(false);
+                stack.push(MirType::I32);
             }
             Opcode::Nop => {}
             _ => stack.clear(),
@@ -5034,7 +5433,7 @@ fn eval_stack_widths(
     widths
 }
 
-fn trap_operand_types(inst: &Instruction, wide: bool, resolver: &dyn CallResolver) -> Vec<MirType> {
+fn trap_operand_types(inst: &Instruction, slot: MirType, resolver: &dyn CallResolver) -> Vec<MirType> {
     let opcode = inst.opcode;
     if matches!(
         opcode,
@@ -5068,7 +5467,7 @@ fn trap_operand_types(inst: &Instruction, wide: bool, resolver: &dyn CallResolve
             | Opcode::ConvOvfIUn
             | Opcode::ConvOvfUUn
     ) {
-        return vec![if wide { MirType::I64 } else { MirType::I32 }];
+        return vec![slot];
     }
     if matches!(
         opcode,
@@ -5083,7 +5482,11 @@ fn trap_operand_types(inst: &Instruction, wide: bool, resolver: &dyn CallResolve
             | Opcode::MulOvf
             | Opcode::MulOvfUn
     ) {
-        let w = if wide { MirType::I64 } else { MirType::I32 };
+        let w = if slot == MirType::I64 {
+            MirType::I64
+        } else {
+            MirType::I32
+        };
         return vec![w, w];
     }
     let value = match opcode {
@@ -5111,9 +5514,14 @@ fn emit_overflow_check(
     b: ValueId,
     value_types: &mut Vec<MirType>,
     insts: &mut Vec<(ValueId, Inst)>,
-) -> ValueId {
-    let bin = |op: BinOp, lhs, rhs, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
-        let v = new_value(vts, MirType::I32);
+) -> Result<ValueId, CilError> {
+    let bin = |op: BinOp,
+               lhs: ValueId,
+               rhs: ValueId,
+               vts: &mut Vec<MirType>,
+               is: &mut Vec<(ValueId, Inst)>| {
+        let ty = vts[lhs.index()];
+        let v = new_value(vts, ty);
         is.push((v, Inst::Binary { op, lhs, rhs }));
         v
     };
@@ -5122,18 +5530,21 @@ fn emit_overflow_check(
         is.push((v, Inst::Compare { op, lhs, rhs }));
         v
     };
-    let neg = |value, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
-        let zero = new_value(vts, MirType::I32);
-        is.push((
-            zero,
-            Inst::ConstInt {
-                ty: MirType::I32,
-                value: 0,
-            },
-        ));
+    let neg = |value: ValueId, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
+        let ty = vts[value.index()];
+        let zero = new_value(vts, ty);
+        is.push((zero, Inst::ConstInt { ty, value: 0 }));
         cmp_value(CmpOp::SignedLt, value, zero, vts, is)
     };
-    match kind {
+    if matches!(kind, OverflowKind::MulSigned | OverflowKind::MulUnsigned)
+        && value_types[a.index()] != MirType::I32
+    {
+        return Err(CilError::Unsupported(match kind {
+            OverflowKind::MulUnsigned => Opcode::MulOvfUn,
+            _ => Opcode::MulOvf,
+        }));
+    }
+    Ok(match kind {
         OverflowKind::AddUnsigned => {
             let sum = bin(BinOp::Add, a, b, value_types, insts);
             cmp(CmpOp::UnsignedLt, sum, a, value_types, insts)
@@ -5235,7 +5646,71 @@ fn emit_overflow_check(
             ));
             cmp(CmpOp::UnsignedGt, prod, max, value_types, insts)
         }
-    }
+    })
+}
+
+/// The overflow test for a checked conversion FROM A FLOAT: `NOT (lo <= value <= hi)`, which is true
+/// for NaN because both ordered comparisons are false for it. Returns the condition and the exception
+/// it raises, matching the integer arm's shape.
+///
+/// Refuses when a bound does not ROUND-TRIP through the source float type. `conv.ovf.i4` from an
+/// `f32` is the case: `i32::MAX` is 2147483647 and the nearest `f32` is 2147483648, so a `value <= hi`
+/// written in `f32` would ACCEPT 2147483648.0 -- a value that does not fit the target. A bound that
+/// cannot be spelled exactly is refused rather than rounded, because rounding it outward admits
+/// exactly the values the check exists to reject.
+fn emit_float_conv_overflow(
+    ty: MirType,
+    value: ValueId,
+    lo: i64,
+    hi: Option<i64>,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<(ValueId, &'static str), CilError> {
+    let exact_bits = |bound: i64| -> Option<i64> {
+        if ty == MirType::F32 {
+            let f = bound as f32;
+            (f as i64 == bound).then(|| i64::from(f.to_bits()))
+        } else {
+            let f = bound as f64;
+            (f as i64 == bound).then(|| f.to_bits() as i64)
+        }
+    };
+    let mut constant = |bits: i64, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
+        let v = new_value(vts, ty);
+        is.push((v, Inst::ConstInt { ty, value: bits }));
+        v
+    };
+    let lo_bits = exact_bits(lo).ok_or(CilError::Unsupported(Opcode::ConvOvfI4))?;
+    let lo_c = constant(lo_bits, value_types, insts);
+    let in_range = cmp_value(CmpOp::SignedGe, value, lo_c, value_types, insts);
+    let in_range = match hi {
+        Some(hi) => {
+            let hi_bits = exact_bits(hi).ok_or(CilError::Unsupported(Opcode::ConvOvfI4))?;
+            let hi_c = constant(hi_bits, value_types, insts);
+            let below = cmp_value(CmpOp::SignedLe, value, hi_c, value_types, insts);
+            let both = new_value(value_types, MirType::I32);
+            insts.push((
+                both,
+                Inst::Binary {
+                    op: BinOp::And,
+                    lhs: in_range,
+                    rhs: below,
+                },
+            ));
+            both
+        }
+        None => in_range,
+    };
+    let zero = new_value(value_types, MirType::I32);
+    insts.push((
+        zero,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: 0,
+        },
+    ));
+    let ovf = cmp_value(CmpOp::Eq, in_range, zero, value_types, insts);
+    Ok((ovf, "OverflowException"))
 }
 
 /// Pushes a `Compare` of `lhs`/`rhs` and returns its boolean value.
@@ -5307,6 +5782,298 @@ fn null_passes_the_cast(
 /// It is 0 when the build had no descriptor to name for the element type, which is a real emitted
 /// shape rather than a defect -- see the covariant-store check, which must not throw on it.
 const ARRAY_ELEMENT_DESC_OFFSET: i32 = 16;
+
+/// The byte offset of `element_cast_class` -- the SIXTH word of an array descriptor, ECMA-335
+/// III.4.3's array-element class for its element type. `0` where only the element's own identity
+/// will do (every reference element, and every real struct).
+const ARRAY_CAST_CLASS_OFFSET: i32 = 20;
+
+/// The byte offset of `element_kind` -- the SECOND word, the frozen code saying what ONE ELEMENT IS
+/// (a reference, or which primitive). It is the only element fact an array descriptor carries
+/// unconditionally, which is what makes it the right word for the `object[]` question.
+const ARRAY_ELEMENT_KIND_OFFSET: i32 = 4;
+
+/// Reads one word of a descriptor whose address is already in hand.
+fn descriptor_word(
+    descriptor: ValueId,
+    offset: i32,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let at = new_value(value_types, MirType::I32);
+    let off = new_value(value_types, MirType::I32);
+    insts.push((
+        off,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(offset),
+        },
+    ));
+    insts.push((
+        at,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: descriptor,
+            rhs: off,
+        },
+    ));
+    let word = new_value(value_types, MirType::I32);
+    insts.push((
+        word,
+        Inst::Load {
+            address: at,
+            width: 4,
+            signed: false,
+        },
+    ));
+    word
+}
+
+/// The 0/1 predicate for "the object whose descriptor is `object_desc` is an array this cast
+/// accepts" -- ECMA-335 4th ed III.4.3 notes 2 and 3, shared by `castclass`'s trap and `isinst`'s
+/// value so the two opcodes cannot disagree about one rule.
+///
+/// **IT COMPOSES FROM INSTRUCTIONS EVERY BACKEND ALREADY LOWERS**, so an array cast needs no new IR
+/// and no per-backend work: the descriptor words are read the way the covariant-store check reads
+/// `element_desc@16`, and a reference element reuses `CastClassScan` / `InterfaceHasTag` run one
+/// level in -- on the ELEMENT's descriptor rather than on the object's.
+///
+/// A NULL object needs no branch. `LoadTypeDesc` answers 0 for it, this reads words through that 0
+/// (readable on every target here -- the same reading the store check already makes), and the final
+/// term ANDs the whole answer with `object_desc != 0`, so a null is never an array. `castclass`
+/// additionally lets null through via `null_passes_the_cast`, which is where `(T[])null` succeeds.
+///
+/// READING a word through that 0 is safe; DERIVING AN ADDRESS from it is not, and the
+/// reference-element arms do the second -- see [`array_element_descriptor`], which masks it. The
+/// final AND cannot stand in for that guard: a fault happens while the terms are being computed,
+/// not after they are combined.
+fn array_cast_match(
+    test: &ArrayCastTest,
+    object_desc: ValueId,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let konst = |v: i64, value_types: &mut Vec<MirType>, insts: &mut Vec<(ValueId, Inst)>| {
+        let c = new_value(value_types, MirType::I32);
+        insts.push((
+            c,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: v,
+            },
+        ));
+        c
+    };
+    let and = |a: ValueId,
+               b: ValueId,
+               value_types: &mut Vec<MirType>,
+               insts: &mut Vec<(ValueId, Inst)>| {
+        let r = new_value(value_types, MirType::I32);
+        insts.push((
+            r,
+            Inst::Binary {
+                op: BinOp::And,
+                lhs: a,
+                rhs: b,
+            },
+        ));
+        r
+    };
+
+    let word0 = descriptor_word(object_desc, 0, value_types, insts);
+    let want = konst(
+        i64::from(crate::resolver::ARRAY_DESC_MARK | test.rank),
+        value_types,
+        insts,
+    );
+    let is_array = new_value(value_types, MirType::I32);
+    insts.push((
+        is_array,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: word0,
+            rhs: want,
+        },
+    ));
+    let zero = konst(0, value_types, insts);
+
+    let element_ok = match &test.element {
+        ArrayElementTest::Class(class) => {
+            let laid = descriptor_word(object_desc, ARRAY_CAST_CLASS_OFFSET, value_types, insts);
+            let want = konst(i64::from(*class), value_types, insts);
+            let eq = new_value(value_types, MirType::I32);
+            insts.push((
+                eq,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: laid,
+                    rhs: want,
+                },
+            ));
+            let nonzero = new_value(value_types, MirType::I32);
+            insts.push((
+                nonzero,
+                Inst::Compare {
+                    op: CmpOp::Ne,
+                    lhs: laid,
+                    rhs: zero,
+                },
+            ));
+            and(eq, nonzero, value_types, insts)
+        }
+        ArrayElementTest::Reference => {
+            let kind = descriptor_word(
+                object_desc,
+                ARRAY_ELEMENT_KIND_OFFSET,
+                value_types,
+                insts,
+            );
+            let want = konst(
+                i64::from(crate::resolver::ELEMENT_KIND_REFERENCE),
+                value_types,
+                insts,
+            );
+            let matched = new_value(value_types, MirType::I32);
+            insts.push((
+                matched,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: kind,
+                    rhs: want,
+                },
+            ));
+            matched
+        }
+        ArrayElementTest::Chain(target) => {
+            let target = *target;
+            let element_desc = array_element_descriptor(object_desc, value_types, insts);
+            let target_desc = new_value(value_types, MirType::I32);
+            insts.push((target_desc, Inst::TypeDescAddr { handle: target }));
+            let scanned = new_value(value_types, MirType::I32);
+            insts.push((
+                scanned,
+                Inst::CastClassScan {
+                    args: alloc::vec![element_desc, target_desc],
+                },
+            ));
+            let matched = new_value(value_types, MirType::I32);
+            insts.push((
+                matched,
+                Inst::Compare {
+                    op: CmpOp::Ne,
+                    lhs: scanned,
+                    rhs: zero,
+                },
+            ));
+            matched
+        }
+        ArrayElementTest::Interface(tag) => {
+            let element_desc = array_element_descriptor(object_desc, value_types, insts);
+            let present = new_value(value_types, MirType::I32);
+            insts.push((
+                present,
+                Inst::InterfaceHasTag {
+                    descriptor: element_desc,
+                    tag: *tag,
+                },
+            ));
+            let matched = new_value(value_types, MirType::I32);
+            insts.push((
+                matched,
+                Inst::Compare {
+                    op: CmpOp::Ne,
+                    lhs: present,
+                    rhs: zero,
+                },
+            ));
+            matched
+        }
+    };
+
+    let described = new_value(value_types, MirType::I32);
+    insts.push((
+        described,
+        Inst::Compare {
+            op: CmpOp::Ne,
+            lhs: object_desc,
+            rhs: zero,
+        },
+    ));
+    let a = and(is_array, element_ok, value_types, insts);
+    and(a, described, value_types, insts)
+}
+
+/// The ELEMENT type's descriptor address, from an array descriptor's `element_desc@16`, or 0 when
+/// the object had no descriptor at all.
+///
+/// **THE WORD IS A RELATIVE DISPLACEMENT, NOT AN ADDRESS** -- the `R_LAMELLA_REL_DESC` relocation
+/// stores `element_descriptor - array_descriptor`, so the array descriptor's own address is added
+/// back. That is the established reading: `CastClassScan` makes it of `base_ptr@12` one word
+/// earlier, and the covariant-store check makes it of this very word.
+///
+/// **A NULL OBJECT IS MASKED TO 0 HERE, AND READING THE WORD IS NOT THE PART THAT NEEDED IT.**
+/// `LoadTypeDesc` answers 0 for a null reference, and every other term of the cast reads a word
+/// THROUGH that 0 and compares it, which is harmless. This one DERIVES AN ADDRESS from it -- `0 +
+/// [16]`, whatever the image happens to hold at address 16 -- and hands it to `CastClassScan` or
+/// `InterfaceHasTag`, which then dereference it. Both of those guard a descriptor of 0 and neither
+/// can guard a plausible-looking garbage address, so the guard belongs here, once, rather than at
+/// each of the two arms that call this.
+///
+/// Branch-free, in the shape `isinst` already uses to select null: `0 - (desc != 0)` is all-ones on
+/// a real object and zero on a null, so the AND either leaves the address alone or produces the 0
+/// both consumers answer "no" to.
+fn array_element_descriptor(
+    object_desc: ValueId,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let rel = descriptor_word(object_desc, ARRAY_ELEMENT_DESC_OFFSET, value_types, insts);
+    let addr = new_value(value_types, MirType::I32);
+    insts.push((
+        addr,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: object_desc,
+            rhs: rel,
+        },
+    ));
+    let zero = new_value(value_types, MirType::I32);
+    insts.push((
+        zero,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: 0,
+        },
+    ));
+    let described = new_value(value_types, MirType::I32);
+    insts.push((
+        described,
+        Inst::Compare {
+            op: CmpOp::Ne,
+            lhs: object_desc,
+            rhs: zero,
+        },
+    ));
+    let mask = new_value(value_types, MirType::I32);
+    insts.push((
+        mask,
+        Inst::Binary {
+            op: BinOp::Sub,
+            lhs: zero,
+            rhs: described,
+        },
+    ));
+    let guarded = new_value(value_types, MirType::I32);
+    insts.push((
+        guarded,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: addr,
+            rhs: mask,
+        },
+    ));
+    guarded
+}
 
 /// Builds a block that raises a builtin exception by name and routes it like a `throw`, returning
 /// its block index. The tag is the name-hash a matching `catch` computes, so it dispatches.
@@ -5573,6 +6340,31 @@ fn build_trap_access_check(
             let mismatch = null_passes_the_cast(insts, value_types, object_desc, zero, unmatched);
             (mismatch, "InvalidCastException")
         }
+        TrapKind::CastArray(test) => {
+            let object = operands[0];
+            let object_desc = new_value(value_types, MirType::I32);
+            insts.push((object_desc, Inst::LoadTypeDesc { object }));
+            let matched = array_cast_match(&test, object_desc, value_types, insts);
+            let zero = new_value(value_types, MirType::I32);
+            insts.push((
+                zero,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ));
+            let unmatched = new_value(value_types, MirType::I32);
+            insts.push((
+                unmatched,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: matched,
+                    rhs: zero,
+                },
+            ));
+            let mismatch = null_passes_the_cast(insts, value_types, object_desc, zero, unmatched);
+            (mismatch, "InvalidCastException")
+        }
         TrapKind::CastClassChain(target) => {
             let object = operands[0];
             let object_desc = new_value(value_types, MirType::I32);
@@ -5632,7 +6424,7 @@ fn build_trap_access_check(
             (is_zero, "DivideByZeroException")
         }
         TrapKind::Overflow(kind) => {
-            let ovf = emit_overflow_check(kind, operands[0], operands[1], value_types, insts);
+            let ovf = emit_overflow_check(kind, operands[0], operands[1], value_types, insts)?;
             (ovf, "OverflowException")
         }
         TrapKind::ConvOverflow {
@@ -5645,7 +6437,9 @@ fn build_trap_access_check(
                 .get(value.0 as usize)
                 .copied()
                 .unwrap_or(MirType::I32);
-            if unsigned_source {
+            if ty.is_float() {
+                emit_float_conv_overflow(ty, value, lo, hi, value_types, insts)?
+            } else if unsigned_source {
                 let source_umax: u64 = if ty == MirType::I64 {
                     u64::MAX
                 } else {
@@ -6696,6 +7490,7 @@ mod control_flow {
                     }
                 ))
         );
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -6747,6 +7542,7 @@ mod control_flow {
             .collect();
         assert_eq!(stores, vec![1, 2]);
         assert_eq!(loads, vec![(1, true), (1, false), (2, false)]);
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -6786,6 +7582,7 @@ mod control_flow {
             insts.iter().any(|i| matches!(i, Inst::FillBlock { .. })),
             "initblk -> FillBlock"
         );
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -6846,6 +7643,7 @@ mod control_flow {
         assert!(insts.iter().any(|i| matches!(i, Inst::InitStruct)));
         assert!(insts.iter().any(|i| matches!(i, Inst::FieldStore { .. })));
         assert!(insts.iter().any(|i| matches!(i, Inst::FieldLoad { .. })));
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -7505,6 +8303,7 @@ mod tests {
                 .any(|(_, i)| matches!(i, Inst::WriteInt { .. }))
         );
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -7532,7 +8331,7 @@ mod tests {
             code: vec![
                 Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
                 Instruction::new(Opcode::LdcI4S, Operand::Int8(99)),
-                Instruction::new(Opcode::Stfld, Operand::Token(Token::new(0x04, 1))),
+                Instruction::new(Opcode::Stfld, Operand::Token(lamella_token::Token::new(0x04, 1))),
                 Instruction::simple(Opcode::Ret),
             ]
             .into_boxed_slice(),
@@ -7717,7 +8516,7 @@ mod tests {
             local_var_sig: None,
             code: vec![
                 Instruction::simple(Opcode::Ldarg0),
-                Instruction::new(Opcode::Ldflda, Operand::Token(Token::new(0x04, 1))),
+                Instruction::new(Opcode::Ldflda, Operand::Token(lamella_token::Token::new(0x04, 1))),
                 Instruction::simple(Opcode::LdindI4),
                 Instruction::simple(Opcode::Ret),
             ]
@@ -7890,6 +8689,814 @@ mod tests {
         assert!(
             !raises_overflow(Opcode::ConvI4),
             "conv.i4 is unchecked and must not raise: it truncates by definition"
+        );
+    }
+
+
+    /// A resolver that resolves nothing and tags every builtin exception, so a checked op's trap
+    /// leader is emitted and findable. The shape `a_checked_conversion_outside_a_try_is_still_range_checked`
+    /// uses, lifted so the width and float tests below share it.
+    struct TagsEveryException;
+
+    impl CallResolver for TagsEveryException {
+        fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+            None
+        }
+        fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+            Some(0x00C0_FFEE)
+        }
+    }
+
+    /// Lowers `body` with two arguments of `arg` type and returns the function.
+    fn lower_two_arg(body: MethodBodyImage, arg: MirType) -> Result<Function, CilError> {
+        lower_method_typed(&body, &TagsEveryException, &[arg, arg], &[]).map(|(f, _)| f)
+    }
+
+    /// A two-argument body applying one binary opcode: `T M(T a, T b) { return a OP b; }`.
+    fn binary_body(op: Opcode) -> MethodBodyImage {
+        MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::simple(op),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        }
+    }
+
+
+
+
+
+    /// A `stackalloc` SIZE IS FOLDED FROM AN EXPRESSION, not just read off a literal.
+    ///
+    /// `localloc` lowers only a compile-time-constant size -- a runtime one needs a dynamic stack
+    /// pointer this SP-relative backend does not have.
+    ///
+    /// **THE MULTIPLY IS LEFT TO THE CONSUMER, so a size lookup that accepts a bare `ConstInt`
+    /// refuses every `stackalloc` as a runtime size.** `stackalloc int[5]` reaches CIL as
+    /// `ldc.i4 5; ldc.i4 4; mul; localloc` -- `n * sizeof(T)` is NOT already folded, and assuming
+    /// it is fails on every backend at once.
+    #[test]
+    fn a_stackalloc_size_folds_through_a_constant_expression() {
+        let folded = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(5)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(4)),
+                Instruction::simple(Opcode::Mul),
+                Instruction::simple(Opcode::Localloc),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&folded, &NoCalls, &[], &[])
+            .expect("a stackalloc whose size is a constant EXPRESSION lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        let cell = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(result, inst)| match inst {
+                Inst::InitStruct => func.value_types.get(result.index()).copied(),
+                _ => None,
+            })
+            .expect("the stackalloc block is a zeroed cell");
+        assert_eq!(
+            cell,
+            MirType::ValueType {
+                handle: lamella_ir::TypeHandle(0),
+                size: 20,
+                refs: lamella_ir::RefWords::NONE,
+            },
+            "20 bytes: the multiply is folded, not one of its operands taken"
+        );
+
+        let runtime = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(4)),
+                Instruction::simple(Opcode::Mul),
+                Instruction::simple(Opcode::Localloc),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        assert!(
+            matches!(
+                lower_method_typed(&runtime, &NoCalls, &[MirType::I32], &[]),
+                Err(CilError::Unsupported(Opcode::Localloc))
+            ),
+            "a size multiplied by an ARGUMENT is a runtime size and stays refused"
+        );
+
+        let divided = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(20)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(4)),
+                Instruction::simple(Opcode::Div),
+                Instruction::simple(Opcode::Localloc),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        assert!(
+            lower_method_typed(&divided, &NoCalls, &[], &[]).is_err(),
+            "a divided size is left to run rather than folded"
+        );
+    }
+
+    /// A rectangular array's `Address` PSEUDO-METHOD yields the element's address.
+    ///
+    /// A multidimensional array type declares four pseudo-methods -- `.ctor`, `Get`, `Set`,
+    /// `Address` -- and only the first three were lowered; the resolver's own comment said so. The
+    /// fourth is not optional surface: `fixed (int* p = m)` over a rectangular array pins it and
+    /// points at element `[0, ..]` THROUGH `Address`, because the 1-D `ldelema` cannot express a
+    /// rank-N index. So a `fixed` statement over `int[,]` refused to build at all.
+    ///
+    /// The address is bounds-checked like the load and store beside it -- on every backend it is the
+    /// same element-address computation, kept as a value rather than read through.
+    #[test]
+    fn a_rectangular_array_address_pseudo_method_yields_the_element_address() {
+        struct A2D;
+        impl CallResolver for A2D {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn array_2d_op(&self, _: &Operand) -> Option<Array2DOp> {
+                Some(Array2DOp::Address { element_size: 4 })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::new(Opcode::Call, Operand::Token(lamella_token::Token::new(0x0A, 1))),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &A2D, &[], &[MirType::ObjectRef])
+            .expect("int[,]::Address lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        let addr = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(result, inst)| match inst {
+                Inst::Array2DElemAddr { element_size, .. } => Some((*result, *element_size)),
+                _ => None,
+            })
+            .expect("an Array2DElemAddr is emitted");
+        assert_eq!(addr.1, 4);
+        assert_eq!(
+            func.value_types[addr.0.index()],
+            MirType::ManagedPtr,
+            "the result is a managed pointer, which is what `fixed` pins"
+        );
+        assert!(
+            !func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::Array2DLoad { .. })),
+            "the element is addressed, never read"
+        );
+    }
+
+    /// `ldsflda` ADDRESSES A STATIC FIELD RATHER THAN READING IT, and the address is the FIELD's.
+    ///
+    /// It is not a convenience over `ldsfld`. An instance method on a value type receives a managed
+    /// pointer, so calling one on a static struct field -- `double.MaxValue.CompareTo(x)`, which csc
+    /// spells `ldsflda; ldarg; call` -- has no other spelling. Loading the value and addressing a
+    /// TEMPORARY would hand the callee a copy: indistinguishable for a reader, and silently wrong for
+    /// anything that writes through it.
+    ///
+    /// The opcode had no lowering at all, so three corpus programs refused with
+    /// `Unsupported(Ldsflda)` on every backend at once.
+    #[test]
+    fn ldsflda_addresses_the_static_field_and_runs_its_type_initializer() {
+        struct AStaticAt12;
+        impl CallResolver for AStaticAt12 {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn static_field_offset(&self, _: &Operand) -> Option<(lamella_ir::StaticOwner, u32)> {
+                Some((lamella_ir::StaticOwner::Own, 12))
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldsflda, Operand::Token(lamella_token::Token::new(0x04, 1))),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &AStaticAt12, &[], &[])
+            .expect("ldsflda lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        let addr = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(result, inst)| match inst {
+                Inst::StaticAddr { owner, offset } => Some((*result, *owner, *offset)),
+                _ => None,
+            });
+        let (result, owner, offset) = addr.expect("a StaticAddr is emitted");
+        assert_eq!(owner, lamella_ir::StaticOwner::Own);
+        assert_eq!(offset, 12, "the field's own offset, not a copy's");
+        assert_eq!(
+            func.value_types[result.index()],
+            MirType::ManagedPtr,
+            "an address is a managed pointer whatever the field holds"
+        );
+        assert!(
+            !func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::StaticLoad { .. })),
+            "the field is addressed, never read"
+        );
+    }
+
+    /// `sizeof` OF A PRIMITIVE ANSWERS ITS STORAGE WIDTH, WHICH ITS STACK TYPE CANNOT GIVE.
+    ///
+    /// A `System` primitive is a corlib TypeRef with no layout on this side of the reference list,
+    /// so `value_type_cell` declines it and the opcode refused. It is reachable prose rather than a
+    /// corner: `sizeof(IntPtr)` is not a compile-time constant in C# -- its value is the target's --
+    /// so a program asking the pointer width emits the opcode and both producers leave it alone.
+    ///
+    /// The sub-word row is the one that matters. `Boolean`, `Byte`, `Char` and `Int16` all have
+    /// stack type `i32`, so an answer derived from the stack type is 4 for every one of them, and
+    /// `sizeof(byte)` would silently be four times too large.
+    #[test]
+    fn sizeof_of_a_primitive_is_its_storage_width_not_its_stack_width() {
+        struct Primitives;
+        impl CallResolver for Primitives {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn primitive_sizeof(&self, op: &Operand) -> Option<u32> {
+                match op {
+                    Operand::Token(t) if (t.0 & 0x00FF_FFFF) == 1 => Some(1),
+                    Operand::Token(t) if (t.0 & 0x00FF_FFFF) == 2 => Some(4),
+                    _ => None,
+                }
+            }
+        }
+        let sized = |row: u32| {
+            let body = MethodBodyImage {
+                max_stack: 1,
+                init_locals: false,
+                local_var_sig: None,
+                code: vec![
+                    Instruction::new(
+                        Opcode::Sizeof,
+                        Operand::Token(lamella_token::Token::new(0x01, row)),
+                    ),
+                    Instruction::simple(Opcode::Ret),
+                ]
+                .into_boxed_slice(),
+                handlers: Vec::new().into_boxed_slice(),
+            };
+            let (func, _) = lower_method_typed(&body, &Primitives, &[], &[])
+                .expect("`sizeof` of a primitive lowers");
+            assert!(lamella_ir::verify(&func).is_ok());
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find_map(|(_, i)| match i {
+                    Inst::ConstInt { value, .. } => Some(*value),
+                    _ => None,
+                })
+                .expect("a constant is pushed")
+        };
+        assert_eq!(sized(1), 1, "`sizeof(byte)` is 1, not its i32 stack width");
+        assert_eq!(sized(2), 4, "`sizeof(IntPtr)` is the target's pointer width");
+
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(
+                    Opcode::Sizeof,
+                    Operand::Token(lamella_token::Token::new(0x01, 9)),
+                ),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        assert!(
+            matches!(
+                lower_method_typed(&body, &Primitives, &[], &[]),
+                Err(CilError::Unsupported(Opcode::Sizeof))
+            ),
+            "an unsizeable operand refuses rather than guessing a width"
+        );
+    }
+
+    /// A SECOND DEFERRED ADDRESS DOES NOT CLOBBER THE FIRST -- TWO ARE LIVE AT ONCE, AND ORDER MATTERS.
+    ///
+    /// `ldloca`/`ldarga` record the addressed slot instead of pushing it, and the record was a single
+    /// slot. CIL puts an address on the evaluation stack like any other value, so two can be live
+    /// together, and a user-defined operator is the ordinary shape rather than a corner:
+    /// `Vec operator +(Vec a, Vec b) { Vec r; r.X = a.X + b.X; ... }` compiles to
+    /// `ldloca r; ldarga a; ldfld X; ldarga b; ldfld X; add; stfld X`. The destination address is
+    /// recorded FIRST and read LAST, across two `ldarga`/`ldfld` pairs that each record one of their
+    /// own -- so the `stfld` looked for a base that the first `ldarga` had overwritten.
+    ///
+    /// The older record is materialized at the DEPTH it was recorded, not pushed on top: it belongs
+    /// beneath the sum, and pushing it would swap the operands.
+    #[test]
+    fn an_older_deferred_address_survives_a_second_one() {
+        struct OneIntField;
+        impl CallResolver for OneIntField {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(0)
+            }
+            fn field_type(&self, _: &Operand) -> Option<MirType> {
+                Some(MirType::I32)
+            }
+        }
+        let struct_ty = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(1),
+            size: 8,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let field = || Operand::Token(lamella_token::Token::new(0x04, 1));
+        let body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldloca, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldarga, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldfld, field()),
+                Instruction::new(Opcode::Ldarga, Operand::Variable(1)),
+                Instruction::new(Opcode::Ldfld, field()),
+                Instruction::simple(Opcode::Add),
+                Instruction::new(Opcode::Stfld, field()),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) =
+            lower_method_typed(&body, &OneIntField, &[struct_ty, struct_ty], &[struct_ty])
+                .expect("two live deferred addresses lower");
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|(_, i)| matches!(i, Inst::FieldAddr { .. }))
+                .count(),
+            1,
+            "only the clobbered record materializes"
+        );
+        let addr = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(result, inst)| matches!(inst, Inst::FieldAddr { .. }).then_some(*result))
+            .expect("a FieldAddr is emitted");
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::FieldStore { base, .. } if *base == addr)),
+            "the store goes through the materialized address, not through the summed value"
+        );
+    }
+
+    /// A DEFERRED ADDRESS THAT ESCAPES INTO A POINTER LOCAL IS MATERIALIZED -- `S* p = &s;`.
+    ///
+    /// `stloc` is not a consumer of the record and takes one operand, so with nothing stacked above
+    /// the record it reads exactly the position the record occupies. That is the general test: an
+    /// instruction reaches the record when it takes more operands than the values stacked above it.
+    #[test]
+    fn a_deferred_address_stored_into_a_pointer_local_is_materialized() {
+        struct NoFields;
+        impl CallResolver for NoFields {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+        }
+        let struct_ty = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(1),
+            size: 8,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldloca, Operand::Variable(0)),
+                Instruction::new(Opcode::Stloc, Operand::Variable(1)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoFields, &[struct_ty, MirType::NativeInt], &[])
+            .expect("an address stored into a pointer local lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { .. })),
+            "the escaping address is materialized rather than dropped"
+        );
+    }
+
+    /// THE CONTROL FOR THE TWO ABOVE: an intervening PUSH does NOT end the deferral.
+    ///
+    /// `ldloca s; ldc.i4 99; stfld X` is the ordinary `s.X = 99`. The constant is stacked ABOVE the
+    /// record, so `stfld` -- which takes the value from the stack and the base from the record --
+    /// never reads the record's position. Materializing here would form an address for a field store
+    /// that does not need one, and that over-generalization was measured and rejected before the
+    /// pop-count test replaced it.
+    #[test]
+    fn an_intervening_push_does_not_end_the_deferral() {
+        struct OneIntField;
+        impl CallResolver for OneIntField {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(0)
+            }
+            fn field_type(&self, _: &Operand) -> Option<MirType> {
+                Some(MirType::I32)
+            }
+        }
+        let struct_ty = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(1),
+            size: 8,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldloca, Operand::Variable(0)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(99)),
+                Instruction::new(
+                    Opcode::Stfld,
+                    Operand::Token(lamella_token::Token::new(0x04, 1)),
+                ),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &OneIntField, &[struct_ty], &[])
+            .expect("a field store through a deferred address lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            !func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { .. })),
+            "the field store reads the record directly, with no address formed"
+        );
+    }
+
+    /// A DEFERRED ADDRESS IS MATERIALIZED FOR AN OPCODE THAT IS NOT ONE OF ITS CONSUMERS.
+    ///
+    /// `ldloca`/`ldarga` record the addressed slot instead of pushing it and `ldflda` accumulates a
+    /// field offset onto that record, so `ldarga s; ldflda f; ldfld g` reaches the field with no
+    /// address materialized. Every consumer of the record has to know about it -- and an opcode that
+    /// does not saw an EMPTY STACK.
+    ///
+    /// `s.f += 10` is that opcode: csc compiles it to `ldarga s; ldflda f; dup; ldind.i4; ldc.i4 10;
+    /// add; stind.i4`, and the `dup` has to duplicate a real address. A CALL had already been given
+    /// its own case for this; the rule is enumerated in ONE place now so `dup` is not the second of
+    /// three.
+    #[test]
+    fn a_deferred_field_address_is_materialized_for_a_dup() {
+        struct OneIntField;
+        impl CallResolver for OneIntField {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(0)
+            }
+            fn field_type(&self, _: &Operand) -> Option<MirType> {
+                Some(MirType::I32)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldflda, Operand::Token(lamella_token::Token::new(0x04, 1))),
+                Instruction::simple(Opcode::Dup),
+                Instruction::simple(Opcode::LdindI4),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(10)),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::StindI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &OneIntField, &[MirType::ManagedPtr], &[])
+            .expect("a compound assignment through a deferred field address lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<&Inst> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|(_, i)| i)
+            .collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::FieldAddr { .. })),
+            "the deferred address is materialized"
+        );
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Load { .. })),
+            "the duplicated address is read through"
+        );
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Store { .. })),
+            "and written back through the duplicate"
+        );
+    }
+
+    /// THE CONTROL: the deferral still happens where a consumer DOES follow, so the assertion above
+    /// is about the missing case and not about the mechanism having been removed. `ldarga; ldflda;
+    /// ldfld` reaches the nested field with no address materialized at all.
+    #[test]
+    fn a_deferred_field_address_is_still_deferred_for_its_own_consumers() {
+        struct OneIntField;
+        impl CallResolver for OneIntField {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(4)
+            }
+            fn field_type(&self, _: &Operand) -> Option<MirType> {
+                Some(MirType::I32)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldflda, Operand::Token(lamella_token::Token::new(0x04, 1))),
+                Instruction::new(Opcode::Ldfld, Operand::Token(lamella_token::Token::new(0x04, 2))),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &OneIntField, &[MirType::ManagedPtr], &[])
+            .expect("the deferred chain lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            !func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { .. })),
+            "a consumer that reads the record needs no materialized address -- the offsets fold \
+             into one FieldLoad"
+        );
+    }
+
+    /// A CHECKED ADD/SUB ON 64-BIT OPERANDS IS CHECKED AT 64 BITS. The overflow test is the sign-bit
+    /// identity over the operation's own arithmetic -- the sum or difference, and two xors and an and
+    /// over it -- and every one of those values is as wide as the operands.
+    ///
+    /// They were typed `I32` unconditionally, which made a 64-bit `add.ovf`/`sub.ovf` carry a 32-bit
+    /// overflow SEQUENCE: ill-formed MIR that every backend's verifier refuses, and -- on any path
+    /// that did not verify -- a 32-bit sign test on a 64-bit result, which is a wrong answer rather
+    /// than a refusal. `checked(-long.MinValue)` is the smallest program that reaches it, and csc
+    /// lowers that negation to exactly this `sub.ovf`.
+    #[test]
+    fn a_64_bit_checked_add_or_sub_is_checked_at_64_bit_width() {
+        for op in [Opcode::AddOvf, Opcode::SubOvf, Opcode::AddOvfUn, Opcode::SubOvfUn] {
+            let func = lower_two_arg(binary_body(op), MirType::I64)
+                .unwrap_or_else(|e| panic!("{op:?} on i64 operands lowers: {e:?}"));
+            assert!(
+                lamella_ir::verify(&func).is_ok(),
+                "{op:?} on i64 operands must produce well-formed MIR"
+            );
+            for block in &func.blocks {
+                for (result, inst) in &block.insts {
+                    if let Inst::Binary { lhs, .. } = inst {
+                        if func.value_types[lhs.index()] == MirType::I64 {
+                            assert_eq!(
+                                func.value_types[result.index()],
+                                MirType::I64,
+                                "{op:?}: a Binary over i64 operands must yield i64"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let narrow = lower_two_arg(binary_body(Opcode::AddOvf), MirType::I32)
+            .expect("add.ovf on i32 operands lowers");
+        assert!(lamella_ir::verify(&narrow).is_ok());
+        assert!(
+            narrow
+                .value_types
+                .iter()
+                .all(|t| *t != MirType::I64),
+            "a 32-bit checked add introduces no 64-bit value"
+        );
+    }
+
+    /// A 64-BIT CHECKED MULTIPLY IS REFUSED, NOT LOWERED AT 32 BITS. The multiply arms of the
+    /// overflow check are a 32-bit strategy: they WIDEN both operands to `i64` and test the exact
+    /// product against the 32-bit range. On 64-bit operands the widen has nothing to widen and the
+    /// range tested is the wrong one, and the opcode alone selected the strategy -- nothing consulted
+    /// the operand WIDTH.
+    ///
+    /// The emitted module was invalid on WASM (`i64.extend_i32_s` applied to an `i64`, which the
+    /// assembler rejects) and sign-extended a half on the native targets, where it is a wrong answer.
+    /// A refusal that names the opcode is what a caller can act on.
+    #[test]
+    fn a_64_bit_checked_multiply_is_refused_rather_than_checked_at_32_bits() {
+        for (op, refused) in [
+            (Opcode::MulOvf, Opcode::MulOvf),
+            (Opcode::MulOvfUn, Opcode::MulOvfUn),
+        ] {
+            match lower_two_arg(binary_body(op), MirType::I64) {
+                Err(CilError::Unsupported(named)) => assert_eq!(
+                    named, refused,
+                    "the refusal names the opcode that could not be lowered"
+                ),
+                other => panic!("{op:?} on i64 operands must be refused, got {other:?}"),
+            }
+        }
+        for op in [Opcode::MulOvf, Opcode::MulOvfUn] {
+            let func = lower_two_arg(binary_body(op), MirType::I32)
+                .unwrap_or_else(|e| panic!("{op:?} on i32 operands lowers: {e:?}"));
+            assert!(lamella_ir::verify(&func).is_ok());
+        }
+    }
+
+    /// A CHECKED CONVERSION FROM A FLOAT ASKS THE NEGATION OF AN IN-RANGE TEST, WHICH IS WHAT MAKES
+    /// NaN OVERFLOW. The out-of-range form asks `value < lo OR value > hi`, and for NaN both are
+    /// false under the ordered comparisons a float lowers to -- so that form reports "in range" and
+    /// lets the conversion proceed, where ECMA-335 III.3.19 requires OverflowException.
+    ///
+    /// Two things carry it: the trap leader's operand is typed at the SOURCE type, so an `F64` flows
+    /// into an `F64` parameter; and each bound is laid as the IEEE BITS of a float, which is what a
+    /// float compare reads.
+    #[test]
+    fn a_checked_conversion_from_a_float_overflows_on_nan() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::ConvOvfI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &TagsEveryException, &[MirType::F64], &[])
+            .expect("a checked narrowing from a double lowers");
+        assert!(
+            lamella_ir::verify(&func).is_ok(),
+            "the trap leader's operand must be typed F64, not I32"
+        );
+        let insts: Vec<&Inst> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|(_, i)| i)
+            .collect();
+        for bound in [f64::from(i32::MIN), f64::from(i32::MAX)] {
+            assert!(
+                insts.iter().any(|i| matches!(
+                    i,
+                    Inst::ConstInt { ty: MirType::F64, value } if *value == bound.to_bits() as i64
+                )),
+                "the {bound} bound is laid as the IEEE bits of a double"
+            );
+        }
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedGe, .. })),
+            "the lower bound is an inclusive ordered compare"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedLe, .. })),
+            "the upper bound is an inclusive ordered compare"
+        );
+        assert!(
+            !insts
+                .iter()
+                .any(|i| matches!(i, Inst::Compare { op: CmpOp::SignedLt, .. })),
+            "and NOT the out-of-range form, which answers FALSE for NaN in both directions"
+        );
+        let (int_func, _) = lower_method_typed(&body, &TagsEveryException, &[MirType::I64], &[])
+            .expect("a checked narrowing from a long lowers");
+        assert!(lamella_ir::verify(&int_func).is_ok());
+        assert!(
+            int_func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::Compare { op: CmpOp::SignedLt, .. })),
+            "a long source is still checked with the out-of-range form"
+        );
+    }
+
+    /// POINTER ARITHMETIC KEEPS ITS `native int` STACK TYPE. ECMA-335 III.1.5: `native int + int32`
+    /// is a `native int`. The operation itself still runs on reinterpreted i32 words -- a `Binary`'s
+    /// result must match its operands -- so the type is restored after it by the same no-op word
+    /// retype that took it away, leaving the bits alone.
+    ///
+    /// The stack type is what a later MERGE reads, and that is where losing it showed:
+    /// `fixed (char* p = s)` branches on the pinned reference and the two arms meet at one block
+    /// parameter -- one carrying the `conv.i` result (`NativeInt`), the other this sum. Typed `I32`,
+    /// the two disagreed and the whole method was ill-formed.
+    #[test]
+    fn pointer_arithmetic_keeps_the_native_int_stack_type() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::ConvI),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(4)),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) =
+            lower_method_typed(&body, &TagsEveryException, &[MirType::ObjectRef], &[])
+                .expect("pointer arithmetic lowers");
+        assert!(lamella_ir::verify(&func).is_ok());
+        let returned = match func.blocks.last().and_then(|b| b.terminator.as_ref()) {
+            Some(Terminator::Return(Some(v))) => *v,
+            other => panic!("expected a returned value, got {other:?}"),
+        };
+        assert_eq!(
+            func.value_types[returned.index()],
+            MirType::NativeInt,
+            "native int + int32 is a native int, and the merge downstream reads that type"
         );
     }
 
@@ -8527,6 +10134,7 @@ mod tests {
         );
         assert_eq!(func.ret, Some(MirType::I32));
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -8632,6 +10240,7 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(func.value_types.len() > 8);
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -8734,6 +10343,7 @@ mod tests {
         assert_eq!(func.blocks.len(), 3);
         assert!(lamella_ir::verify(&func).is_ok());
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -8760,6 +10370,7 @@ mod tests {
         let func = lower_method(&body).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.blocks.len(), 4);
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -8809,6 +10420,7 @@ mod tests {
             })
             .count();
         assert_eq!(back_edges, 1);
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -8923,6 +10535,7 @@ mod tests {
         assert_eq!(eq_tests, 3);
         assert_eq!(func.blocks.len(), 7);
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -8945,6 +10558,7 @@ mod tests {
         let func = lower_method(&body).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.blocks.len(), 4);
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -8973,6 +10587,74 @@ mod tests {
         assert_eq!(preds[4], vec![0]);
     }
 
+    /// `(object[])x` READS THE ELEMENT KIND AND NEVER THE ELEMENT DESCRIPTOR, which is the whole
+    /// reason it is its own arm.
+    ///
+    /// `element_desc@16` is ABSENT for an element no metadata row names -- a nested array -- so a
+    /// chain walk from it starts at the ARRAY's own descriptor and answers a question nobody asked.
+    /// `element_kind@4` is emitted unconditionally and separates a traced pointer from every value
+    /// element in one compare, so `int[][]` and `string[]` are accepted and `int[]` and a struct
+    /// array are refused by the same word.
+    ///
+    /// The negative half is the load-bearing one: if a later edit routes this through
+    /// [`ArrayElementTest::Chain`] it will still pass every `string[]` row and silently start
+    /// answering `(object[])int[][]` wrong, which is the row no corpus program covers.
+    #[test]
+    fn an_object_array_cast_reads_the_element_kind_and_not_the_element_descriptor() {
+        struct ObjectArray;
+        impl CallResolver for ObjectArray {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn array_cast_test(&self, _: &Operand) -> Option<ArrayCastTest> {
+                Some(ArrayCastTest {
+                    rank: 1,
+                    element: ArrayElementTest::Reference,
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldnull),
+                Instruction::new(
+                    Opcode::Isinst,
+                    Operand::Token(lamella_token::Token::new(0x1b, 1)),
+                ),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &ObjectArray).expect("isinst object[] lowers");
+        assert!(lamella_ir::verify(&func).is_ok(), "the emitted MIR verifies");
+
+        let constants: Vec<i64> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|(_, i)| match i {
+                Inst::ConstInt { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            constants.contains(&i64::from(ARRAY_ELEMENT_KIND_OFFSET)),
+            "the test must reach `element_kind@4`; constants were {constants:?}"
+        );
+        assert!(
+            !constants.contains(&i64::from(ARRAY_ELEMENT_DESC_OFFSET)),
+            "reading `element_desc@16` is the defect this arm exists to avoid -- it is ABSENT for a \
+             nested array, and a walk from it lands on the array's own descriptor"
+        );
+        assert!(
+            constants.contains(&i64::from(crate::resolver::ELEMENT_KIND_REFERENCE)),
+            "the kind is compared against REFERENCE, so every value element is refused"
+        );
+    }
+
     #[test]
     fn lowers_reference_array_element_access() {
         struct Arrays;
@@ -8986,6 +10668,7 @@ mod tests {
                     element: None,
                     element_size: 4,
                     element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
+                    element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
                 })
             }
         }
@@ -9041,6 +10724,7 @@ mod tests {
                     element: None,
                     element_size: 8,
                     element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
+                    element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
                 })
             }
         }
@@ -9415,6 +11099,7 @@ mod tests {
             }
         )));
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -9447,6 +11132,7 @@ mod tests {
             })
             .expect("ldind.r8 lowers to an 8-byte Load");
         assert_eq!(func.value_types[load.index()], MirType::F64);
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -9504,6 +11190,7 @@ mod tests {
                 .any(|(_, i)| matches!(i, Inst::Load { width: 4, .. }))
         );
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -9545,6 +11232,7 @@ mod tests {
                 .iter()
                 .any(|(_, i)| matches!(i, Inst::FieldLoad { offset: 0, .. }))
         );
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -9590,6 +11278,7 @@ mod tests {
                 .count()
                 >= 2
         );
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -9637,6 +11326,7 @@ mod tests {
             "the merged value must be a fresh merge parameter, not an incoming argument"
         );
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -9676,6 +11366,7 @@ mod tests {
             })
             .expect("ldind.r8 lowers to an 8-byte Load");
         assert_eq!(func.value_types[load.index()], MirType::F64);
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -9720,6 +11411,7 @@ mod tests {
                 ..
             }
         )));
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -9779,6 +11471,7 @@ mod tests {
         )));
         assert_eq!(func.ret, Some(MirType::I32));
         #[cfg(feature = "arm32")]
+        #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
 
@@ -9815,6 +11508,7 @@ mod tests {
             }
         )));
         assert_eq!(func.ret, Some(MirType::I32));
+        #[cfg(feature = "arm32")]
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower(&func).is_ok());
     }
@@ -9863,7 +11557,7 @@ mod tests {
             local_var_sig: None,
             code: vec![
                 Instruction::simple(Opcode::Ldarg0),
-                Instruction::new(Opcode::Ldflda, Operand::Token(Token::new(0x04, 1))),
+                Instruction::new(Opcode::Ldflda, Operand::Token(lamella_token::Token::new(0x04, 1))),
                 Instruction::new(Opcode::StlocS, Operand::Variable(0)),
                 Instruction::new(Opcode::LdlocS, Operand::Variable(0)),
                 Instruction::simple(Opcode::LdindI4),

@@ -401,10 +401,11 @@ pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let (funcs, plan) = lower_assembly(&assembly, entry, &[])?;
     let exports = method_exports(&assembly, entry.is_some());
     let export_refs: Vec<(&str, u32)> = exports.iter().map(|(n, i)| (n.as_str(), *i)).collect();
-    let descriptors = MetadataResolver::new(&assembly)
-        .with_monomorphized(plan)
-        .image_descriptors();
-    wasm::lower_module_with_exports(&funcs, &export_refs, &descriptors)
+    let resolver = MetadataResolver::new(&assembly).with_monomorphized(plan);
+    let mut descriptors = resolver.image_descriptors();
+    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
+    let string_handle = resolver.string_type_handle().map(|handle| handle.0);
+    wasm::lower_module_with_exports(&funcs, &export_refs, &descriptors, string_handle)
         .map_err(BuildError::LowerWasm)
 }
 
@@ -1013,7 +1014,7 @@ pub fn build_object_with_corlib_debug(
     replace_exception_message(&assembly, &mut funcs);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, true);
+    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized());
     let qualifiers = crate::resolver::DescQualifiers::default();
 
     let files: Vec<alloc::string::String> = (0..funcs.len())
@@ -1235,7 +1236,7 @@ fn build_object_core(
         }
     }
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, true);
+    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized());
     if !defer {
         let bytes = arm32::lower_object_vtables_statics(
             &funcs,
@@ -1296,7 +1297,7 @@ fn build_object_core(
 /// program, where descriptors are STRONG -- clobber the owner's rich WEAK copy at the link's
 /// dedupe, breaking every virtual dispatch through it. Array and unresolved handles pass through
 /// untouched (`reference_type_meta` only answers for reference-owned handles).
-#[cfg(any(feature = "arm32", feature = "riscv32"))]
+#[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
 fn append_reference_descriptors(
     funcs: &[Function],
     resolver: &MetadataResolver,
@@ -1331,8 +1332,8 @@ fn append_reference_descriptors(
                             handle: *handle,
                             type_tag: 0,
                             vtable: base.vtable.clone(),
-                            itable: Vec::new(),
-                            base: None,
+                            itable: base.itable.clone(),
+                            base: Some(base.handle),
                             words: None,
                             exported: false,
                             full_name: None,
@@ -1875,6 +1876,7 @@ fn assembly_statics(
     cil: &[u8],
     assembly: &Assembly,
     include_eh_row: bool,
+    plan: &crate::generics::MonoPlan,
 ) -> crate::stackmaps::AssemblyStatics {
     let slots = crate::resolver::static_field_slots(assembly);
     let mut roots = Vec::new();
@@ -1904,9 +1906,14 @@ fn assembly_statics(
             roots.push((*slot as u16) | (crate::stackmaps::STACKMAP_KIND_OBJECT_REF << 14));
         }
     }
+    for (_, _, slot, _, is_reference) in crate::resolver::generic_static_slots(assembly, plan) {
+        if slot < 0x4000 && is_reference {
+            roots.push((slot as u16) | (crate::stackmaps::STACKMAP_KIND_OBJECT_REF << 14));
+        }
+    }
     crate::stackmaps::AssemblyStatics {
         suffix: alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, cil)),
-        region_bytes: crate::resolver::static_region_words(assembly) * 4,
+        region_bytes: crate::resolver::static_region_words(assembly, plan) * 4,
         roots,
     }
 }
@@ -2031,11 +2038,14 @@ fn build_object_riscv_inner(
             total: silent_edges.len(),
         });
     }
-    let statics = assembly_statics(cil, &assembly, true);
+    let statics = assembly_statics(cil, &assembly, true, resolver.monomorphized());
     let reference_regions: Vec<alloc::string::String> = reference_cils
         .iter()
         .zip(&reference_assemblies)
-        .map(|(bytes, reference)| assembly_statics(bytes, reference, false).region_symbol())
+        .map(|(bytes, reference)| {
+            assembly_statics(bytes, reference, false, &crate::generics::MonoPlan::default())
+                .region_symbol()
+        })
         .collect();
     let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
     let qualifiers = crate::resolver::DescQualifiers {
@@ -2427,9 +2437,9 @@ fn library_function_symbols<'a>(
 /// ungated, so a `#[cfg(any(feature = "arm32", feature = "riscv32"))]` here stops
 /// `--no-default-features --features wasm` compiling the crate at all -- not a missing feature, a
 /// missing FUNCTION. `default = ["arm32"]` and `cargo test --workspace` never build that
-/// configuration, so `tools/verify-aot-code-models.ps1` is the only thing that holds it. A `#[cfg]`
-/// on a function reached from ungated code is not a smaller build, it is a build that does not
-/// exist.
+/// configuration, so the only thing that holds it is a build of each code model IN ISOLATION. A
+/// `#[cfg]` on a function reached from ungated code is not a smaller build, it is a build that does
+/// not exist.
 pub fn lower_monomorphized_method_body<'a>(
     assembly: &'a Assembly<'a>,
     resolver: &MetadataResolver<'a>,
@@ -2729,11 +2739,14 @@ fn build_library_object_riscv_inner(
     replace_exception_message(&assembly, &mut funcs);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, false);
+    let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized());
     let reference_regions: Vec<alloc::string::String> = reference_cils
         .iter()
         .zip(&reference_assemblies)
-        .map(|(bytes, reference)| assembly_statics(bytes, reference, false).region_symbol())
+        .map(|(bytes, reference)| {
+            assembly_statics(bytes, reference, false, &crate::generics::MonoPlan::default())
+                .region_symbol()
+        })
         .collect();
     let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
     let qualifiers = crate::resolver::DescQualifiers {
@@ -3018,7 +3031,7 @@ fn build_library_object_inner(
     replace_exception_message(&assembly, &mut funcs);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     append_reference_descriptors(&funcs, &resolver, &mut descriptors);
-    let statics = assembly_statics(cil, &assembly, false);
+    let statics = assembly_statics(cil, &assembly, false, resolver.monomorphized());
     let (bytes, stubs) = arm32::lower_object_library_vtables_report(
         &funcs,
         &name_refs,
@@ -3596,8 +3609,10 @@ fn mir_type<'x>(
                     None => lamella_ir::RefWords::NONE,
                 };
                 MirType::ValueType {
-                    handle: TypeHandle(
-                        crate::resolver::marked_handle_token(*token, argument_world).0,
+                    handle: crate::resolver::qualified_handle_across(
+                        assembly,
+                        crate::resolver::marked_handle_token(*token, argument_world),
+                        references,
                     ),
                     size,
                     refs,
@@ -4483,6 +4498,7 @@ enum SeamEmission {
 fn console_seam_body(name: Option<&str>, params: &[SigType]) -> Option<Function> {
     let s = |sym| Some(sym);
     match (name, params) {
+    (Some("WriteLine"), []) => Some(console_body(None, false, None, true)),
     (Some("Write"), [SigType::String]) => Some(console_body(
         Some(MirType::ObjectRef),
         true,
@@ -5378,6 +5394,7 @@ pub fn delegate_combine_body() -> Function {
             length: total,
             element_size: 4,
             element_kind: ELEMENT_KIND_REFERENCE,
+            element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
         },
     );
     let listi = mb.emit(i32t, refint(list));
@@ -5640,6 +5657,7 @@ pub fn delegate_remove_body() -> Function {
             length: new_n,
             element_size: 4,
             element_kind: ELEMENT_KIND_REFERENCE,
+            element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
         },
     );
     let nli = mb.emit(i32t, refint(nl));
@@ -5754,6 +5772,7 @@ pub fn delegate_remove_body() -> Function {
             length: new_nb,
             element_size: 4,
             element_kind: ELEMENT_KIND_REFERENCE,
+            element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
         },
     );
     let nlib = mb.emit(i32t, refint(nlb));
@@ -8205,8 +8224,8 @@ mod tests {
     /// [`cortex_m_boot_image`]'s own refusal, which the public entry points can never reach because
     /// they filter first. It is tested directly rather than left to inspection: the arm is what keeps
     /// the function TOTAL, and without it an unlisted chip would fall through to the Nordic arm and
-    /// silently receive a micro:bit vector table -- which is what the code did before this was split
-    /// out, safely, because one guarded caller stood in front of it. A second caller now exists.
+    /// silently receive a micro:bit vector table. A single guarded caller hides that; a second caller
+    /// does not, and there is one.
     #[test]
     fn the_boot_image_builder_refuses_a_chip_rather_than_defaulting_to_nordic() {
         assert!(matches!(

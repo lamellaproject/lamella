@@ -1,0 +1,104 @@
+# The SAM D11 PORT block: the pin-mux and pin-config machinery. PMUX and PINCFG are PER-PIN
+# ARRAYS: the offsets below are the m = 0 element; element addresses derive as
+#   PMUX[m]   = group_base + 0x30 + m        (m = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
+#   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
+# The generator owns those derivations; drivers receive resolved addresses through their bindings.
+#
+# THIS FAMILY HAS ONE PORT GROUP. Every register in 22.8 is stated as `<offset>+n*0x80 [n=0..0]`,
+# and n=0..0 is the datasheet saying group 0 is the only one -- consistent with table 1-1, which
+# caps I/O at 22 pads, all named PA. The 0x80 group stride is still in the register spelling, so a
+# reader who later meets a two-group part in this family has the arithmetic; there is no such part
+# in Atmel-42363H.
+
+
+[table]
+kind = "block"
+family = "samd11"
+block = "port"
+sources = [
+    "SAM D11 datasheet Atmel-42363H-SAM-D11-Datasheet_09/2016 ch 22.8 register descriptions, each section stating its own offset in prose: 22.8.1 DIR 0x00, 22.8.2 DIRCLR 0x04, 22.8.3 DIRSET 0x08, 22.8.4 DIRTGL 0x0C, 22.8.5 OUT 0x10, 22.8.6 OUTCLR 0x14, 22.8.7 OUTSET 0x18, 22.8.8 OUTTGL 0x1C, 22.8.9 IN 0x20, 22.8.12 PMUX 0x30, 22.8.13 PINCFG 0x40",
+    "SAM D11 datasheet Atmel-42363H ch 22.7 table 22-2 (register summary), used as a cross-check on the above -- it agrees register for register",
+    "SAM D11 datasheet Atmel-42363H table 22-4 (peripheral multiplexing even) for the function-letter values A..H = 0x0..0x7",
+]
+notes = [
+    "PMUX[m] covers pins 2m (PMUXE, low nibble) and 2m+1 (PMUXO, high nibble); function values A..H = 0..7, per table 22-4. The datasheet adds that not every value is valid on every pin -- the pin map is what says which, and this block states only the encoding.",
+    "PINCFG: PMUXEN hands the pin to the muxed function; INEN enables the input buffer (required for any pin the peripheral READS -- an RX line, MISO); PULLEN enables the pull, whose DIRECTION is selected by that pin's OUT bit.",
+    "The offsets here were taken from the per-register sections in 22.8 AND cross-checked against the 22.7 summary table, which agrees register for register. The cross-check is recorded rather than assumed, so a reader reaching for either source knows the two have been compared.",
+]
+
+[registers.DIR]
+offset = 0x00
+width = 32
+fields = { DIR = [0, 32] }
+notes = "The direction word, readable: 1 = output. A driver reporting a pin's CURRENT mode reads this rather than shadowing it, so a pin another driver configured is described honestly."
+
+[registers.DIRCLR]
+offset = 0x04
+width = 32
+fields = { DIRCLR = [0, 32] }
+notes = "Write 1s to make pins INPUTS."
+
+[registers.DIRSET]
+offset = 0x08
+width = 32
+fields = { DIRSET = [0, 32] }
+notes = "Write 1s to make pins outputs."
+
+[registers.DIRTGL]
+offset = 0x0C
+width = 32
+fields = { DIRTGL = [0, 32] }
+notes = "Write 1s to invert a pin's direction."
+
+[registers.OUT]
+offset = 0x10
+width = 32
+fields = { OUT = [0, 32] }
+notes = "The output drive level, readable. Load-bearing beyond writing a level: with PINCFG.PULLEN set on an INPUT pin, this bit SELECTS THE PULL DIRECTION (1 = pull-up, 0 = pull-down), so a driver offering InputPullUp/InputPullDown cannot be written without it."
+
+[registers.OUTCLR]
+offset = 0x14
+width = 32
+fields = { OUTCLR = [0, 32] }
+notes = "Write 1s to drive pins low."
+
+[registers.OUTSET]
+offset = 0x18
+width = 32
+fields = { OUTSET = [0, 32] }
+notes = "Write 1s to drive pins high."
+
+[registers.OUTTGL]
+offset = 0x1C
+width = 32
+fields = { OUTTGL = [0, 32] }
+notes = "Write 1s to invert a pin's output level."
+
+[registers.IN]
+offset = 0x20
+width = 32
+fields = { IN = [0, 32] }
+notes = "The input samples (INEN pins only)."
+
+[registers.PMUX0]
+offset = 0x30
+width = 8
+fields = { PMUXE = [0, 4], PMUXO = [4, 4] }
+notes = "Element 0 of the per-pin-pair mux array; see the block header for the element derivation. Bit assignment read from 22.8.12: PMUXE occupies bits 3:0 and PMUXO bits 7:4."
+
+[registers.PINCFG0]
+offset = 0x40
+width = 8
+fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
+notes = "Element 0 of the per-pin config array; see the block header for the element derivation. Bit assignment read from 22.8.13; bits 5:3 and 7 read as reserved on this family."
+
+# Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
+[constants]
+FUNC_A = 0
+FUNC_B = 1
+FUNC_C = 2
+FUNC_D = 3
+FUNC_E = 4
+FUNC_F = 5
+FUNC_G = 6
+FUNC_H = 7

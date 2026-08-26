@@ -1,0 +1,48 @@
+[package]
+name = "lamella-flash-routes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Which mechanism writes which board, and the backends that drive them. Shared by the `lamella` CLI and the MCP server so a board means the same thing to both -- the routes, the artifact formats a route takes, and the bootloader-volume enumeration."
+publish = false
+
+[dependencies]
+# The contract and the probe-neutral target seam. The backends here implement the first and drive
+# their parts through the second.
+lamella-flash-backend = { path = "../lamella-flash-backend" }
+lamella-probe-core = { path = "../lamella-probe-core" }
+# Probe ENUMERATION and selection. `usbbulk` is not optional: without it this sees CMSIS-DAP v1
+# (HID) probes only, and every RPi Debug Probe is v2 over USB bulk -- so a bench full of them would
+# resolve to nothing while reporting that it had looked.
+lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
+# The per-part flash controllers these backends sequence.
+lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", features = ["microbit"] }
+lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350" }
+lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32" }
+# The UF2 container: emitting one, and recognizing one that is already wrapped.
+lamella-flash-format = { path = "../lamella-flash-format" }
+# Flattening a linked ELF by physical address -- the `objcopy -O binary` computation, in-tree.
+lamella-elf = { path = "../lamella-elf" }
+# Board resolution, so a board id means the same thing here as in every verdict verb.
+lamella-catalog = { path = "../lamella-catalog" }
+# The digest that identifies a linked image in its sidecar record, and the JSON that record is
+# written in. `sha256` is public in `lamella-pe` for exactly this consumer -- one hash in the tree
+# rather than two, because two implementations of a digest disagreeing is silent and total.
+lamella-pe = { path = "../lamella-pe" }
+serde_json = "1"
+# The ST-LINK soldered to a NUCLEO or Discovery board, which is how those parts are reached.
+# A backend stays generic over `TargetAccess` so that CHOOSING a probe belongs to its caller; this
+# crate is that caller, and it depends on `lamella-probe` for the same reason. A route that cannot
+# open anything is not a route.
+lamella-stlink = { path = "../lamella-stlink" }
+
+[dev-dependencies]
+# The ahead-of-time backend, for the census that proves every board in the table names a target it
+# actually knows and builds a bootable image. A DEV dependency: the routes do not compile anything,
+# but a table row that names a target the backend cannot build is a row nothing else would catch.
+lamella-aot = { path = "../lamella-aot" }
+
+[lints]
+workspace = true

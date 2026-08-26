@@ -3,11 +3,11 @@ namespace System
 {
     public struct DateTime : IComparable
     {
-        public const long TicksPerMillisecond = 10000;
-        public const long TicksPerSecond = 10000000;
-        public const long TicksPerMinute = 600000000;
-        public const long TicksPerHour = 36000000000;
-        public const long TicksPerDay = 864000000000;
+        private const long TicksPerMillisecond = 10000;
+        private const long TicksPerSecond = 10000000;
+        private const long TicksPerMinute = 600000000;
+        private const long TicksPerHour = 36000000000;
+        private const long TicksPerDay = 864000000000;
 
         private static readonly int[] DaysToMonth365 =
             { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365 };

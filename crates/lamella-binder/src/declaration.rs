@@ -220,7 +220,7 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
     match &expr.kind {
         ExprKind::Literal(literal) => Some(literal.clone()),
         ExprKind::Parenthesized(inner) => fold_const(inner, lookup),
-        ExprKind::Name(name) => lookup(name),
+        ExprKind::Name { name, .. } => lookup(name),
         ExprKind::Unary { operator, operand } => {
             fold_const_unary(*operator, &fold_const(operand, lookup)?)
         }
@@ -253,11 +253,129 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
     }
 }
 
+/// A DEFAULT ARGUMENT's constant value (15.6.2.13), folded without the model.
+///
+/// The declaration-order half of the two-stage treatment a `const` field already gets: what folds
+/// from the expression alone folds here, and `resolve_constants` fills what needs the whole model
+/// (`PinMode.Input` names a type this pass may not have collected). `None` means "not yet known",
+/// never "required" -- only the second pass settles that.
+///
+/// **`default(T)` IS NOT `fold_const`'s BUSINESS AND IS THIS FUNCTION'S**, because a default
+/// argument is the only constant position where the shape appears at all. It is folded to the
+/// value csc EMITS rather than to the one the language describes, and those differ in a way no
+/// reading of 15.6.2.13 would predict:
+///
+/// ```text
+///     default(int)     Int32 0            the type's zero, as expected
+///     default(string)  NullReference      as expected
+///     default(S)       NullReference      MEASURED. A STRUCT, spelled as a null reference.
+/// ```
+///
+/// The third row is the one to keep: a struct has no null value, and csc writes a `NullReference`
+/// constant for it regardless -- so any predefined value type folds to its zero and everything
+/// else, struct or not, folds to null.
+pub fn fold_parameter_default(expr: &Expr) -> Option<Literal> {
+    if let ExprKind::DefaultValue(target) = &expr.kind {
+        return Some(default_value_literal(target));
+    }
+    fold_const(expr, &|_| None)
+}
+
+/// What `default(T)` contributes as a parameter's default: the zero of a predefined value type,
+/// and `Literal::Null` for everything else. See [`fold_parameter_default`] for why a STRUCT lands
+/// in the second group.
+fn default_value_literal(target: &lamella_syntax::ast::TypeRef) -> Literal {
+    use lamella_syntax::ast::{PredefinedType, TypeRefKind};
+    let TypeRefKind::Predefined(predefined) = &target.kind else {
+        return Literal::Null;
+    };
+    match predefined {
+        PredefinedType::Bool => Literal::Boolean(false),
+        PredefinedType::Char => Literal::Character(0),
+        PredefinedType::Float => Literal::Real {
+            bits: 0.0f64.to_bits(),
+            suffix: lamella_syntax::token::RealSuffix::Float,
+        },
+        PredefinedType::Double => Literal::Real {
+            bits: 0.0f64.to_bits(),
+            suffix: lamella_syntax::token::RealSuffix::Double,
+        },
+        PredefinedType::Decimal => Literal::Decimal {
+            lo: 0,
+            mid: 0,
+            hi: 0,
+            scale: 0,
+            negative: false,
+        },
+        PredefinedType::Sbyte
+        | PredefinedType::Byte
+        | PredefinedType::Short
+        | PredefinedType::Ushort
+        | PredefinedType::Int
+        | PredefinedType::Uint
+        | PredefinedType::Long
+        | PredefinedType::Ulong => integer_literal(0),
+        _ => Literal::Null,
+    }
+}
+
+/// A DEFAULT ARGUMENT's constant value against the WHOLE model (15.6.2.13) -- the form every
+/// consumer asks once the model is complete.
+///
+/// [`fold_parameter_default`] answers what the expression alone can settle; this adds the three
+/// shapes that need to look something up, and between them they cover every default form in the
+/// 34-row control table this was measured against:
+///
+/// ```text
+///     E.B          an enum member of another type   -- by far the commonest in driver code
+///     K            a `const` of the ENCLOSING type
+///     (E)7         a cast to a named type, which neither const folder will coerce to
+/// ```
+///
+/// **The `(E)7` arm is guarded on the target really being an enum.** An enum's constant IS its
+/// underlying integer and the width comes from the PARAMETER's type, so the value is all that is
+/// needed -- but a cast to some other named type has to fold to nothing rather than to a
+/// plausible wrong number.
+#[must_use]
+pub fn parameter_default_in_model(
+    model: &Model,
+    containing: &TypeSymbol,
+    expr: &Expr,
+) -> Option<Literal> {
+    if let Some(literal) = fold_parameter_default(expr) {
+        return Some(literal);
+    }
+    match &expr.kind {
+        ExprKind::Parenthesized(inner) => parameter_default_in_model(model, containing, inner),
+        ExprKind::MemberAccess { receiver, name } => {
+            let ExprKind::Name { name: type_name, .. } = &receiver.kind else {
+                return None;
+            };
+            let owner = TypeSymbol::Named([type_name.clone()].into());
+            model.get_by_symbol(&owner)?.find_field(name)?.constant.clone()
+        }
+        ExprKind::Name { name, .. } => model
+            .get_by_symbol(containing)?
+            .find_field(name)?
+            .constant
+            .clone(),
+        ExprKind::Cast { target, operand } => {
+            let target_ty = bind_type(target);
+            if model.get_by_symbol(&target_ty)?.kind != crate::symbols::TypeKind::Enum {
+                return None;
+            }
+            let inner = parameter_default_in_model(model, containing, operand)?;
+            Some(integer_literal(literal_int_value(&inner)?))
+        }
+        _ => None,
+    }
+}
+
 /// Collects the bare `Name` operands a constant-expression references, walking the same forms as
 /// [`fold_const`]. Used to build the const-reference graph for CS0110 circular-constant detection.
 pub(crate) fn const_expr_references(expr: &Expr, out: &mut Vec<Box<str>>) {
     match &expr.kind {
-        ExprKind::Name(name) => out.push(name.clone()),
+        ExprKind::Name { name, .. } => out.push(name.clone()),
         ExprKind::Parenthesized(inner) => const_expr_references(inner, out),
         ExprKind::Unary { operand, .. } => const_expr_references(operand, out),
         ExprKind::Binary { left, right, .. } => {
@@ -282,18 +400,43 @@ pub(crate) fn const_expr_references(expr: &Expr, out: &mut Vec<Box<str>>) {
     }
 }
 
+/// The literal a unary minus produces for the two values 9.4.4.2 gives a SPECIAL rule -- `2^63`
+/// becoming `long.MinValue` and `2^31` becoming `int.MinValue` -- with the special type each takes.
+/// `None` for every other operand, which negates ordinarily.
+pub(crate) fn negated_integer_min_literal(operand: &Literal) -> Option<(Literal, SpecialType)> {
+    match operand {
+        Literal::Integer {
+            value: 9_223_372_036_854_775_808,
+            suffix: IntegerSuffix::None | IntegerSuffix::Long,
+        } => Some((
+            Literal::Integer {
+                value: 9_223_372_036_854_775_808,
+                suffix: IntegerSuffix::Long,
+            },
+            SpecialType::Int64,
+        )),
+        Literal::Integer {
+            value: 2_147_483_648,
+            suffix: IntegerSuffix::None,
+        } => Some((
+            Literal::Integer {
+                value: (-2_147_483_648i64) as u64,
+                suffix: IntegerSuffix::None,
+            },
+            SpecialType::Int32,
+        )),
+        _ => None,
+    }
+}
+
 /// Folds a unary operator applied to an already-folded constant operand (14.6).
 pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Option<Literal> {
     match operator {
         UnaryOperator::Plus => Some(operand.clone()),
+        UnaryOperator::Minus if negated_integer_min_literal(operand).is_some() => {
+            negated_integer_min_literal(operand).map(|(literal, _)| literal)
+        }
         UnaryOperator::Minus => match operand {
-            Literal::Integer {
-                value: 9_223_372_036_854_775_808,
-                suffix: IntegerSuffix::None,
-            } => Some(Literal::Integer {
-                value: 9_223_372_036_854_775_808,
-                suffix: IntegerSuffix::Long,
-            }),
             Literal::Real { bits, suffix } => Some(Literal::Real {
                 bits: (-f64::from_bits(*bits)).to_bits(),
                 suffix: *suffix,
@@ -412,6 +555,20 @@ struct ConstDecl<'a> {
     init: &'a Expr,
 }
 
+/// One parameter's DEFAULT ARGUMENT, keyed well enough to find its method again in the model.
+///
+/// **NAME PLUS PARAMETER COUNT IS THE KEY, and it is sufficient rather than merely convenient**:
+/// two methods of one type cannot share a name and an arity unless they differ by `ref`/`out`
+/// alone, and this pass is STRICTLY ADDITIVE -- it fills a slot only where the slot is still
+/// empty and the fold succeeds -- so even that collision can at worst write the same value twice.
+struct ParamDefaultDecl<'a> {
+    type_full: String,
+    method: &'a str,
+    arity: usize,
+    index: usize,
+    init: &'a Expr,
+}
+
 /// Model-aware, dependency-ordered constant resolution (14.15). A second pass that folds the
 /// `const` fields the declaration-order pass in [`type_info`] left unresolved -- a FORWARD reference
 /// (`const A = B; const B = 42;`) or a QUALIFIED reference (`const A = Other.Value;`), each of which
@@ -429,6 +586,7 @@ pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
         }
     }
     if pending.is_empty() {
+        resolve_parameter_defaults(model, units, &model_const_values(model));
         return;
     }
     let mut values = model_const_values(model);
@@ -462,6 +620,62 @@ pub fn resolve_constants(model: &mut Model, units: &[CompilationUnit]) {
             }
         }
     }
+    resolve_parameter_defaults(model, units, &values);
+}
+
+/// Fills the DEFAULT ARGUMENTS the declaration-order pass could not fold, against the whole model.
+///
+/// Runs AFTER the const fields and enum members above are in `values`, because that is what it
+/// folds against: `void M(PinMode mode = PinMode.Input)` is a qualified reference to a member of
+/// another type, which is exactly the shape [`resolve_const_expr`] exists for and exactly the shape
+/// the first pass cannot see.
+///
+/// STRICTLY ADDITIVE, like the field fill it follows: a slot the first pass already resolved is
+/// left alone, and an initializer that does not fold leaves the slot `None`. **A parameter whose
+/// default never folds is REQUIRED as far as the rest of the compiler is concerned**, which is the
+/// safe direction -- a caller is asked for an argument it could have omitted, rather than being
+/// allowed to omit one this compiler cannot supply a value for. `CS1736` reports it separately.
+fn resolve_parameter_defaults(
+    model: &mut Model,
+    units: &[CompilationUnit],
+    values: &BTreeMap<(String, String), Literal>,
+) {
+    let mut pending: Vec<ParamDefaultDecl> = Vec::new();
+    for unit in units {
+        for member in &unit.members {
+            collect_param_default_decls(member, "", &mut pending);
+        }
+    }
+    let folded: Vec<(&ParamDefaultDecl, Literal)> = pending
+        .iter()
+        .filter_map(|decl| {
+            let containing = type_symbol_of(&decl.type_full);
+            let literal = parameter_default_in_model(model, &containing, decl.init)
+                .or_else(|| resolve_const_expr(decl.init, &decl.type_full, values))?;
+            Some((decl, literal))
+        })
+        .collect();
+    for (decl, literal) in folded {
+        let (namespace, name) = split_type_full(&decl.type_full);
+        let Some(info) = model.get_mut(&namespace, name) else {
+            continue;
+        };
+        for method in info.methods.iter_mut() {
+            if &*method.name != decl.method || method.parameters.len() != decl.arity {
+                continue;
+            }
+            if let Some(slot) = method.parameter_info.get_mut(decl.index)
+                && slot.default.is_none()
+            {
+                slot.default = Some(literal.clone());
+            }
+        }
+    }
+}
+
+/// A type's dotted full name as the [`TypeSymbol`] the model is keyed by.
+fn type_symbol_of(type_full: &str) -> TypeSymbol {
+    TypeSymbol::Named(type_full.split('.').map(Box::<str>::from).collect())
 }
 
 /// Re-numbers every enum against the WHOLE model, which the first pass could not do.
@@ -594,6 +808,55 @@ fn collect_const_field_decls<'a>(
     }
 }
 
+/// Collects every DEFAULT ARGUMENT written in `member`, descending namespaces and nested types.
+///
+/// A constructor is keyed under `.ctor`, which is the name it carries in the model, so the two
+/// member kinds need no separate handling downstream. Accessors are not collected: a property or
+/// an indexer accessor's parameters are synthesized, and the one an indexer CAN declare a default
+/// on reaches the model through `get_Item`/`set_Item` rather than through this walk.
+fn collect_param_default_decls<'a>(
+    member: &'a NamespaceMember,
+    namespace: &str,
+    out: &mut Vec<ParamDefaultDecl<'a>>,
+) {
+    match member {
+        NamespaceMember::Namespace(declaration) => {
+            let inner = join_namespace(namespace, &declaration.name);
+            for nested in &declaration.members {
+                collect_param_default_decls(nested, &inner, out);
+            }
+        }
+        NamespaceMember::Type(declaration) => {
+            let full = declared_full_name(namespace, declaration);
+            for member in &declaration.members {
+                let (name, parameters) = match member {
+                    Member::Method {
+                        name, parameters, ..
+                    } => (&**name, parameters),
+                    Member::Constructor { parameters, .. } => (".ctor", parameters),
+                    Member::NestedType(nested) => {
+                        collect_param_default_decls(nested, &full, out);
+                        continue;
+                    }
+                    _ => continue,
+                };
+                for (index, parameter) in parameters.iter().enumerate() {
+                    if let Some(init) = &parameter.default_value {
+                        out.push(ParamDefaultDecl {
+                            type_full: full.clone(),
+                            method: name,
+                            arity: parameters.len(),
+                            index,
+                            init,
+                        });
+                    }
+                }
+            }
+        }
+        NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
+    }
+}
+
 /// Folds a constant expression against `values` -- the constants collected across the whole model --
 /// so a simple name resolves to a `const`/enum member of `containing`, and a qualified `Type.Member`
 /// resolves against the named type. Mirrors [`fold_const`]'s operator/cast/conditional handling.
@@ -605,7 +868,7 @@ pub(crate) fn resolve_const_expr(
     match &expr.kind {
         ExprKind::Literal(literal) => Some(literal.clone()),
         ExprKind::Parenthesized(inner) => resolve_const_expr(inner, containing, values),
-        ExprKind::Name(name) => values
+        ExprKind::Name { name, .. } => values
             .get(&(containing.to_string(), name.to_string()))
             .cloned(),
         ExprKind::MemberAccess { receiver, name } => {
@@ -650,7 +913,7 @@ pub(crate) fn resolve_const_expr(
 /// `None` for anything else -- used to read the type name out of a qualified constant reference.
 fn dotted_name(expr: &Expr) -> Option<String> {
     match &expr.kind {
-        ExprKind::Name(name) => Some(name.to_string()),
+        ExprKind::Name { name, .. } => Some(name.to_string()),
         ExprKind::MemberAccess { receiver, name } => {
             Some(alloc::format!("{}.{}", dotted_name(receiver)?, name))
         }
@@ -760,7 +1023,7 @@ fn dotted_suffixes(full: &str) -> Vec<String> {
 /// `false` result means the SHAPE alone rules it out, so the use site is non-constant.
 pub(crate) fn is_constant_form(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Literal(_) | ExprKind::Name(_) | ExprKind::PredefinedType(_) => true,
+        ExprKind::Literal(_) | ExprKind::Name { .. } | ExprKind::PredefinedType(_) => true,
         ExprKind::Parenthesized(inner) => is_constant_form(inner),
         ExprKind::MemberAccess { receiver, .. } => is_constant_form(receiver),
         ExprKind::Unary { operator, operand } => {
@@ -774,6 +1037,16 @@ pub(crate) fn is_constant_form(expr: &Expr) -> bool {
         }
         ExprKind::Binary { left, right, .. } => is_constant_form(left) && is_constant_form(right),
         ExprKind::Cast { operand, .. } => is_constant_form(operand),
+        ExprKind::Invocation {
+            receiver,
+            type_arguments,
+            arguments,
+        } => {
+            receiver.contextual_keyword() == Some("nameof")
+                && type_arguments.is_empty()
+                && arguments.len() == 1
+        }
+        ExprKind::InterpolatedString(_) => false,
         ExprKind::Conditional {
             condition,
             when_true,
@@ -941,6 +1214,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         is_static,
                         accessibility,
                         is_abstract: is_abstract_member(modifiers, info.kind),
+                        is_virtual: is_virtual(modifiers),
+                        is_override: is_override(modifiers),
+                        is_sealed: is_sealed_member(modifiers),
                     });
                 }
             }
@@ -948,14 +1224,23 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 modifiers,
                 ty,
                 name,
-                explicit_interface: None,
+                explicit_interface,
                 ..
             } => info.events.push(EventSymbol {
-                name: name.clone(),
+                name: match explicit_interface {
+                    Some(interface) => explicit_interface_member_name(interface, name).into(),
+                    None => name.clone(),
+                },
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
-                accessibility: access(modifiers),
+                accessibility: match explicit_interface {
+                    Some(_) => Accessibility::Private,
+                    None => access(modifiers),
+                },
                 is_abstract: is_abstract_member(modifiers, info.kind),
+                is_virtual: is_virtual(modifiers),
+                is_override: is_override(modifiers),
+                is_sealed: is_sealed_member(modifiers),
             }),
             Member::Method {
                 modifiers,
@@ -1056,18 +1341,21 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 name,
                 getter,
                 setter,
+                explicit_interface,
                 ..
             } => info.properties.push(PropertySymbol {
                 name: name.clone(),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
                 accessibility: access(modifiers),
+                explicit_interface: explicit_interface.as_ref().map(bind_type),
                 is_virtual: is_virtual(modifiers),
                 is_abstract: is_abstract_member(modifiers, info.kind),
                 is_override: is_override(modifiers),
                 is_sealed: is_sealed_member(modifiers),
                 has_getter: getter.is_some(),
                 has_setter: setter.is_some(),
+                is_init: setter.as_ref().is_some_and(|accessor| accessor.is_init),
                 getter_accessibility: getter
                     .as_ref()
                     .map(|accessor| accessor_access(accessor, modifiers)),
@@ -1114,10 +1402,10 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 }
                 if setter.is_some() {
                     let mut info_with_value = crate::bind::parameter_infos(parameters);
-                    info_with_value.push(crate::symbols::ParameterInfo {
-                        name: "value".into(),
-                        mode: crate::symbols::ParameterMode::Value,
-                    });
+                    info_with_value.push(crate::symbols::ParameterInfo::required(
+                        "value".into(),
+                        crate::symbols::ParameterMode::Value,
+                    ));
                     let mut parameters = indices;
                     parameters.push(element);
                     info.methods.push(MethodSymbol {

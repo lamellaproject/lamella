@@ -26,7 +26,7 @@ lamella-stlink = { path = "../lamella-stlink" }
 # and over USB BULK on its V3.x firmware, so the same physical probe needs both paths available and
 # the tool has to pick at run time.
 lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
-lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["usbbulk"] }
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["usbbulk", "test-util"] }
 # Real-probe HID access for the examples (native USB-HID; e.g. an Atmel-ICE, or an MCU-Link Pro on
 # firmware older than V3).
 lamella-usbhid = { path = "../lamella-usbhid" }

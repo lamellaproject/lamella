@@ -25,4 +25,4 @@ pub use ast::{Assertion, ClassEntry, Greed, Node};
 pub use compile::{compile, Options};
 pub use haystack::{CodePointInput, CodeUnitInput, Haystack};
 pub use matcher::{run, Fuel, Match, Outcome};
-pub use program::{Direction, Instruction, Program};
+pub use program::{Direction, Fold, Instruction, Program};

@@ -39,7 +39,7 @@ use lamella_syntax::span::Span;
 /// [`Default`] is "no command line behind this compilation": nothing was omitted, and the dialect
 /// is [`LanguageVersion::DEFAULT`]. Only a driver that actually parsed options departs from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BindOptions {
+pub struct BindOptions<'a> {
     /// Whether the command line OMITTED `/unsafe`, in which case `unsafe` in the source is
     /// `CS0227`. Inverted at the driver rather than at the report site, so the binder reads the
     /// question it actually asks.
@@ -48,13 +48,19 @@ pub struct BindOptions {
     /// gate on the SAME one -- two sources for one selection is how a `??` gets lexed under C# 2
     /// and then bound under C# 1.
     pub language_version: LanguageVersion,
+    /// The simple name of the assembly being BUILT, which a reference's
+    /// `[assembly: InternalsVisibleTo]` may name -- the one fact that decides whether that
+    /// reference's `internal` members are imported at all. `""` where the compilation produces no
+    /// assembly (a diagnostics-only bind), which no friend declaration can match.
+    pub compiling_assembly: &'a str,
 }
 
-impl Default for BindOptions {
-    fn default() -> BindOptions {
+impl Default for BindOptions<'_> {
+    fn default() -> BindOptions<'static> {
         BindOptions {
             unsafe_option_missing: false,
             language_version: LanguageVersion::DEFAULT,
+            compiling_assembly: "",
         }
     }
 }
@@ -62,7 +68,7 @@ impl Default for BindOptions {
 /// Applies `options` to `binder`. **THE ONLY PLACE EITHER OPTION IS APPLIED**, which is the whole
 /// point of [`BindOptions`]: a path that builds a binder without coming through here is the defect
 /// this function exists to make impossible to reintroduce quietly.
-fn apply_bind_options(binder: &mut Binder, options: BindOptions) {
+fn apply_bind_options(binder: &mut Binder, options: BindOptions<'_>) {
     binder.set_unsafe_option_missing(options.unsafe_option_missing);
     binder.set_language_version(options.language_version);
 }
@@ -122,6 +128,7 @@ pub fn bind_compilation_unit_with_dialect(
         BindOptions {
             unsafe_option_missing,
             language_version,
+            compiling_assembly: "",
         },
     )
 }
@@ -133,11 +140,11 @@ pub fn bind_compilation_unit_with_dialect(
 pub fn bind_compilation_unit_with_options(
     unit: &CompilationUnit,
     references: &[Assembly],
-    options: BindOptions,
+    options: BindOptions<'_>,
 ) -> Vec<Diagnostic> {
     let mut model = Model::new();
     for reference in references {
-        load_assembly(&mut model, reference);
+        load_assembly(&mut model, reference, options.compiling_assembly);
     }
     collect_into(&mut model, unit);
     let mut binder = Binder::with_model(model);
@@ -758,11 +765,11 @@ pub fn bind_compilation_units_with_references_and_options(
 pub fn bind_compilation_units_with_options(
     units: &[CompilationUnit],
     references: &[Assembly],
-    options: BindOptions,
+    options: BindOptions<'_>,
 ) -> Vec<Vec<Diagnostic>> {
     let mut model = Model::new();
     for reference in references {
-        load_assembly(&mut model, reference);
+        load_assembly(&mut model, reference, options.compiling_assembly);
     }
     for unit in units {
         collect_into(&mut model, unit);
@@ -975,11 +982,11 @@ fn bind_namespace_body(
 /// The validations a namespace member receives, WHEREVER IT IS DECLARED.
 ///
 /// **A TYPE NESTED IN A TYPE IS THE SAME DECLARATION IN A DIFFERENT PLACE, AND THIS FUNCTION IS
-/// WHAT MAKES THAT TRUE.** The nested walk used to recurse only into `NamespaceMember::Type`, so a
-/// nested DELEGATE and a nested ENUM reached no validation at all -- measured against csc:
-/// `class C { public abstract delegate void D(); }` and `class C { public abstract enum E { A } }`
-/// are both CS0106 there and were both silent here, while the identical declarations one scope out
-/// were reported correctly. A member's legality is not a property of where it sits.
+/// WHAT MAKES THAT TRUE.** The nested walk must reach every `NamespaceMember`, not only
+/// `::Type`: a walk that recurses into types alone leaves a nested DELEGATE and a nested ENUM with
+/// no validation. Measured against csc, `class C { public abstract delegate void D(); }` and
+/// `class C { public abstract enum E { A } }` are both CS0106, and the identical declarations one
+/// scope out are reported either way. A member's legality is not a property of where it sits.
 ///
 /// The `Namespace` arm is absent because a namespace cannot be declared inside a type; the
 /// namespace walk handles its own recursion, which is a different question (an import scope).
@@ -2974,26 +2981,74 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             }
         }
     }
+    let abstract_member = |modifiers: &[Modifier]| {
+        modifiers
+            .iter()
+            .any(|modifier| matches!(modifier, Modifier::Abstract))
+    };
     for member in &declaration.members {
-        if let Member::Method {
-            modifiers,
-            name,
-            body: Some(_),
-            span,
-            ..
-        } = member
-        {
-            if modifiers
-                .iter()
-                .any(|modifier| matches!(modifier, Modifier::Abstract))
-            {
+        match member {
+            Member::Method {
+                modifiers,
+                name,
+                parameters,
+                body: Some(_),
+                span,
+                ..
+            } if abstract_member(modifiers) => {
                 binder.report(Diagnostic::new(
                     DiagnosticKind::AbstractMethodWithBody {
-                        member: name.clone(),
+                        member: method_signature(&declaration.name, name, parameters),
                     },
                     *span,
                 ));
             }
+            Member::Property {
+                modifiers,
+                name,
+                getter,
+                setter,
+                ..
+            } if abstract_member(modifiers) => {
+                report_abstract_accessor_bodies(
+                    binder,
+                    &alloc::format!("{}.{}", declaration.name, name),
+                    getter.as_ref(),
+                    setter.as_ref(),
+                );
+            }
+            Member::Indexer {
+                modifiers,
+                parameters,
+                getter,
+                setter,
+                ..
+            } if abstract_member(modifiers) => {
+                report_abstract_accessor_bodies(
+                    binder,
+                    &alloc::format!(
+                        "{}.this[{}]",
+                        declaration.name,
+                        parameter_type_list(parameters)
+                    ),
+                    getter.as_ref(),
+                    setter.as_ref(),
+                );
+            }
+            Member::Event {
+                modifiers,
+                name,
+                span,
+                ..
+            } if abstract_member(modifiers) => {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::AbstractEventWithAccessors {
+                        member: alloc::format!("{}.{}", declaration.name, name).into(),
+                    },
+                    *span,
+                ));
+            }
+            _ => {}
         }
     }
     if declaration.kind != TypeKind::Interface {
@@ -3411,7 +3466,12 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                         );
                     }
                 }
-                Member::Indexer { modifiers, span, .. } => {
+                Member::Indexer {
+                    modifiers,
+                    parameters,
+                    span,
+                    ..
+                } => {
                     if modifiers.iter().any(|m| matches!(m, Modifier::Static)) {
                         binder.report(Diagnostic::new(
                             DiagnosticKind::ModifierNotValidForItem {
@@ -3419,8 +3479,48 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                             },
                             *span,
                         ));
+                    } else {
+                        check_member_modifier_validity(
+                            binder,
+                            is_struct,
+                            modifiers,
+                            &alloc::format!(
+                                "{}.this[{}]",
+                                declaration.name,
+                                parameter_type_list(parameters)
+                            ),
+                            *span,
+                        );
                     }
                 }
+                Member::EventField {
+                    modifiers,
+                    declarators,
+                    ..
+                } => {
+                    for declarator in declarators {
+                        check_member_modifier_validity(
+                            binder,
+                            is_struct,
+                            modifiers,
+                            &alloc::format!("{}.{}", declaration.name, declarator.name),
+                            declarator.span,
+                        );
+                    }
+                }
+                Member::Event {
+                    modifiers,
+                    name,
+                    explicit_interface: None,
+                    span,
+                    ..
+                } => check_member_modifier_validity(
+                    binder,
+                    is_struct,
+                    modifiers,
+                    &alloc::format!("{}.{}", declaration.name, name),
+                    *span,
+                ),
                 _ => {}
             }
         }
@@ -3492,6 +3592,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             _ => continue,
         };
         check_params_usage(binder, parameters);
+        check_optional_parameters(binder, &enclosing, parameters);
     }
     binder.enter_type(enclosing.clone());
     let container_mask = {
@@ -4195,6 +4296,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     binder.check_interface_implementations(&enclosing, declaration);
     binder.check_overrides_have_base(&enclosing, declaration);
     binder.check_property_overrides_have_base(&enclosing, declaration);
+    binder.check_event_overrides_have_base(&enclosing, declaration);
     binder.check_abstract_implementations(&enclosing, declaration);
     binder.exit_type();
     binder.exit_type_parameters(signature_scope);
@@ -4336,6 +4438,27 @@ fn is_static_member(modifiers: &[lamella_syntax::ast::Modifier]) -> bool {
 /// with any explicit accessibility is CS0106 (a private one is CS0621, reported by the
 /// abstract/virtual-soundness pass); a `sealed` member that is not an `override` is CS0238, in
 /// a class or a struct; a struct's `protected` (or `protected internal`) member is CS0666.
+/// `CS0500` for each accessor of an `abstract` property or indexer that carries a body. csc names
+/// the accessor rather than the member (`C.P.get`), so the two accessors of one declaration give
+/// two diagnostics -- which is why this takes both and reports per accessor rather than once.
+fn report_abstract_accessor_bodies(
+    binder: &mut Binder,
+    member: &str,
+    getter: Option<&lamella_syntax::ast::Accessor>,
+    setter: Option<&lamella_syntax::ast::Accessor>,
+) {
+    for (suffix, accessor) in [("get", getter), ("set", setter)] {
+        let Some(accessor) = accessor else { continue };
+        let Some(body) = &accessor.body else { continue };
+        binder.report(Diagnostic::new(
+            DiagnosticKind::AbstractMethodWithBody {
+                member: alloc::format!("{member}.{suffix}").into(),
+            },
+            body.span,
+        ));
+    }
+}
+
 /// `display` is the member's qualified name/signature, used by CS0238 and CS0666.
 fn check_member_modifier_validity(
     binder: &mut Binder,
@@ -4400,6 +4523,116 @@ fn check_params_usage(binder: &mut Binder, parameters: &[Parameter]) {
             binder.report(Diagnostic::new(DiagnosticKind::ParamsNotArray, parameter.span));
         }
     }
+}
+
+/// The four declaration rules a DEFAULT ARGUMENT has to obey (15.6.2.13), each measured against
+/// csc. **Every one of them fails as an ACCEPTS-INVALID rather than a wrong diagnostic**, which is
+/// the direction that compiles clean and is discovered by the reader.
+///
+/// ```text
+///     CS1737  int a = 1, int b        a required parameter after an optional one
+///     CS1741  ref int a = 1           a byref parameter with a default
+///     CS1751  params int[] a = null   a parameter collection with a default
+///     CS1736  int a = F()             a default that is not a compile-time constant
+///     CS1750  int a = "s"             a constant that does not convert to the parameter's type
+/// ```
+///
+/// **CS1737 EXEMPTS A `params` ARRAY**: `M(int a = 1, params int[] rest)` is legal, because the
+/// trailing array is not a parameter a call has to supply.
+///
+/// **CS1736 AND CS1750 ARE DIFFERENT QUESTIONS.** Not-a-constant is CS1736; a constant of the
+/// wrong type is CS1750, whose message names both types.
+fn check_optional_parameters(
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    parameters: &[Parameter],
+) {
+    let mut seen_optional = false;
+    for parameter in parameters {
+        let is_params = matches!(parameter.modifier, Some(ParameterModifier::Params));
+        let Some(expr) = &parameter.default_value else {
+            if seen_optional && !is_params {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::RequiredAfterOptionalParameter,
+                    parameter.span,
+                ));
+            }
+            continue;
+        };
+        seen_optional = true;
+        if matches!(
+            parameter.modifier,
+            Some(ParameterModifier::Ref | ParameterModifier::Out)
+        ) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ByRefParameterWithDefault,
+                parameter.span,
+            ));
+            continue;
+        }
+        if is_params {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ParamsParameterWithDefault,
+                parameter.span,
+            ));
+            continue;
+        }
+        let declared = binder.canonicalize(&bind_type(&parameter.ty));
+        let Some(literal) =
+            crate::declaration::parameter_default_in_model(binder.model(), enclosing, expr)
+        else {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::DefaultValueNotConstant {
+                    parameter: parameter.name.clone(),
+                },
+                parameter.span,
+            ));
+            continue;
+        };
+        let signed = literal_int_value(&literal);
+        let value_ty = match signed {
+            Some(value) if i32::try_from(value).is_ok() && matches!(literal, lamella_syntax::ast::Literal::Integer { .. }) => {
+                TypeSymbol::Special(crate::special::SpecialType::Int32)
+            }
+            _ => crate::bound::literal_type(&literal),
+        };
+        let converts = match &expr.kind {
+            lamella_syntax::ast::ExprKind::DefaultValue(target) => {
+                let target_ty = binder.canonicalize(&bind_type(target));
+                target_ty == declared || binder.converts(&target_ty, &declared)
+            }
+            _ if binder.is_enum_type(&declared) => {
+                !matches!(literal, lamella_syntax::ast::Literal::Null)
+            }
+            _ if matches!(literal, lamella_syntax::ast::Literal::Null) => {
+                !binder.is_value_type(&declared) || lamella_binder_nullable(&declared)
+            }
+            _ => binder.constant_assignable(&value_ty, signed, &declared),
+        };
+        if !converts {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::DefaultValueWrongType {
+                    from: default_value_type_name(&literal, &value_ty).into(),
+                    to: declared.to_string().into(),
+                },
+                parameter.span,
+            ));
+        }
+    }
+}
+
+/// Whether `ty` is `System.Nullable<T>`, for the `= null` admissibility test above.
+fn lamella_binder_nullable(ty: &TypeSymbol) -> bool {
+    crate::conversion::nullable_underlying(ty).is_some()
+}
+
+/// How csc names a default's own type in CS1750: `<null>` for the null literal, and the type's
+/// ordinary rendering otherwise. Measured -- `int a = null` reports *a value of type '<null>'*.
+fn default_value_type_name(literal: &lamella_syntax::ast::Literal, value_ty: &TypeSymbol) -> alloc::string::String {
+    if matches!(literal, lamella_syntax::ast::Literal::Null) {
+        return "<null>".into();
+    }
+    value_ty.to_string()
 }
 
 /// Reports CS0542 when a member's name repeats its enclosing type's -- illegal for every member
@@ -4689,6 +4922,73 @@ mod tests {
     use crate::diagnostic::CodeNamespace;
     use alloc::vec::Vec;
     use lamella_syntax::parser::parse_compilation_unit;
+
+    /// **A TYPE'S OWN ACCESSIBILITY IS ENFORCED AT A USE SITE (10.5.4), AND IT HAS TWO HALVES.**
+    /// Naming a `private` nested type from outside its enclosing class is `CS0122` under csc, and so
+    /// is naming ANY non-public type of a referenced assembly. The second half is undetectable
+    /// unless `reference.rs` reads a `TypeDef`'s visibility bits: unread, every imported type
+    /// arrives claiming to be public.
+    ///
+    /// Measured against csc over 31 declarations covering both halves. The rows here are the
+    /// same-assembly half; the cross-assembly half needs a real reference and lives in the
+    /// emitter's consumer tests.
+    ///
+    /// `internal` is ACCESSIBLE in the same assembly, which is why those rows are clean rather than
+    /// diagnosed: a rule that fired on every non-public type would pass the private rows and refuse
+    /// every ordinary program.
+    #[test]
+    fn a_type_that_cannot_be_named_here_is_cs0122() {
+        assert_eq!(
+            sorted_codes(
+                "class Outer { private class Buried { } } \
+                 class P { static void M() { Outer.Buried b = null; } }"
+            ),
+            [122]
+        );
+        assert_eq!(
+            sorted_codes(
+                "namespace N { public class Outer { private class Buried { } } } \
+                 namespace Q { class P { static void M() { N.Outer.Buried b = null; } } }"
+            ),
+            [122]
+        );
+        assert_eq!(
+            sorted_codes(
+                "namespace N { public class Outer { protected class Guarded { } } } \
+                 namespace Q { class P { static void M() { N.Outer.Guarded g = null; } } }"
+            ),
+            [122]
+        );
+
+        assert_eq!(
+            sorted_codes(
+                "namespace N { internal class Hidden { } } \
+                 namespace Q { class P { static void M() { N.Hidden h = null; } } }"
+            ),
+            [219]
+        );
+        assert_eq!(
+            sorted_codes(
+                "class Outer { private class Buried { } \
+                 void M() { Outer.Buried b = null; if (b == null) { } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "namespace N { public class Outer { public class Shown { } } } \
+                 namespace Q { class P { static void M() { N.Outer.Shown s = null; if (s == null) { } } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "class Outer { protected class Guarded { } } \
+                 class D : Outer { void M() { Outer.Guarded g = null; if (g == null) { } } }"
+            ),
+            []
+        );
+    }
 
     fn sorted_codes(unit: &str) -> Vec<u16> {
         let unit = parse_compilation_unit(unit).unit;
@@ -8179,11 +8479,11 @@ mod tests {
 
     /// The diagnostic half of implicitly typed locals (C# 3.0 spec, 8.5.1 and 8.8.4).
     ///
-    /// **THE OTHER HALF IS `tools/csharp3-parity.ps1`, AND NEITHER INSTRUMENT CAN DO THIS ONE'S
-    /// JOB.** That harness compiles and RUNS each probe, which is the only way to see which type
-    /// was inferred -- but when both compilers reject a program it scores them SAME and cannot tell
-    /// `CS0818` from the `CS0246` this feature existed to stop reporting. So the codes are pinned
-    /// here and the inferred types are pinned there.
+    /// **THE OTHER HALF IS A PARITY HARNESS, AND NEITHER INSTRUMENT CAN DO THIS ONE'S JOB.** A
+    /// harness that compiles and RUNS each probe is the only way to see which type was inferred --
+    /// but when both compilers reject a program it scores them SAME, and cannot tell `CS0818` from
+    /// the `CS0246` this feature exists to stop reporting. So the codes are pinned here and the
+    /// inferred types are pinned there.
     ///
     /// **EVERY ROW WAS MEASURED AGAINST csc BEFORE IT WAS WRITTEN DOWN**, one compilation each,
     /// including the rows expected to PASS -- a refusal that is too WIDE is invisible in a table

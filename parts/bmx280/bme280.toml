@@ -61,7 +61,7 @@ resolution_bits = "16..20 with the filter off, always 20 with the filter enabled
 
 # --- the standby encoding this member does NOT share --------------------------------------------
 #
-# MICROSECONDS, as integers. The catalogue has to work on a no-float tier, so a facts table that
+# MICROSECONDS, as integers. The catalog has to work on a no-float tier, so a facts table that
 # carried 0.5 as a float would force a float into every emitted language for the sake of one row.
 
 [enums.standby_us]

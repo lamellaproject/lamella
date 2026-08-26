@@ -97,6 +97,7 @@ use lamella_cil_runtime::intrinsics::{
     marshal_write_int32, marshal_write_int64, marshal_size_of,
     intptr_from_raw_value, intptr_to_raw_value,
     mmio_read32, mmio_write32, mmio_read8, mmio_write8, mmio_read16, mmio_write16,
+    value_type_equals,
 };
 #[cfg(feature = "exceptions")]
 use lamella_cil_runtime::intrinsics::type_initialization_exception_runtime_type_name;
@@ -535,6 +536,39 @@ pub type SourceAssembly<'pe> = Assembly<'pe>;
 /// See the default form above for the full rationale.
 #[cfg(feature = "flash-image")]
 pub type SourceAssembly<'pe> = Assembly<'static>;
+
+/// PE bytes a HOST caller can hand to a resident load entry point, whatever this build's
+/// [`SourceAssembly`] demands: the borrow unchanged by default, and a leaked `'static` copy under
+/// `flash-image`, which is the "or a host `Box::leak`" the alias above describes.
+///
+/// # Why this lives here rather than at the call site
+///
+/// A crate cannot see its dependencies' features, so a caller wanting to know whether THIS crate
+/// was built with `flash-image` can only enumerate the features it believes forward it -- and that
+/// enumeration is a list that goes stale silently every time a new path reaches the same condition.
+/// `lamella-runner` carried exactly such a list, widened once already, and a third path
+/// (`lamella-wasm`'s baker, which selects `code-in-place` on this crate DIRECTLY rather than through
+/// the runner) then reached `flash-image` without being named. The failure was a build error rather
+/// than a wrong answer, which is the good half; the bad half is that it fired only on a
+/// COMBINATION, so every one-feature-at-a-time gate stayed green over it.
+///
+/// Asking the question in the crate whose feature it is makes the answer structural: Cargo unifies
+/// `flash-image` across the whole build, so a path nobody has thought of yet gets the right form
+/// without anybody widening a list.
+///
+#[cfg(not(feature = "flash-image"))]
+#[must_use]
+pub fn resident_bytes(bytes: &[u8]) -> &[u8] {
+    bytes
+}
+
+/// The `flash-image` form of [`resident_bytes`]: a leaked `'static` copy, because a resident load
+/// borrows method CIL out of these bytes for the lifetime of the [`Module`].
+#[cfg(feature = "flash-image")]
+#[must_use]
+pub fn resident_bytes(bytes: &[u8]) -> &'static [u8] {
+    alloc::boxed::Box::leak(bytes.to_vec().into_boxed_slice())
+}
 
 /// Decides where one method's raw CIL LIVES, for a load reading a PE that is valid for `'pe`.
 ///
@@ -1232,8 +1266,18 @@ fn bind_delta_field(
         return Ok(None);
     }
     let signature = member.field_type().ok_or(DeltaError::UntypedFieldRef)?;
-    let default =
-        default_field_value_of(delta, Some(signature), &context.resolution.field_index.enum_zeros);
+    let mut default = default_field_value_of(
+        delta,
+        Some(signature.clone()),
+        &context.resolution.field_index.enum_zeros,
+    );
+    if let Some(zero) = pending_struct_field_type(&default, Some(signature))
+        .and_then(|value_type| delta.type_token_name(value_type))
+        .and_then(|named| context.resolution.type_index.get(&type_name_key(named)).copied())
+        .and_then(|type_id| module.type_field_defaults(type_id))
+    {
+        default = Value::Struct(zero.into_boxed_slice());
+    }
     let slot = module
         .add_type_field(context.repl_type, default.clone())
         .unwrap_or(0);
@@ -1321,6 +1365,10 @@ struct CorlibField {
     token: Token,
     name: String,
     default: Value,
+    /// The value type this field's zero is still WAITING on, or `None` when `default` is final.
+    /// A struct-typed field's zero is a zero INSTANCE, so the type has to be materialized before
+    /// the zero exists -- the same dependency the base type has, resolved the same way.
+    pending_struct: Option<Token>,
 }
 
 /// What materializing one corlib type needs from its `TypeDef`.
@@ -1712,6 +1760,41 @@ fn materialize_corlib_refs<'c>(
                 name,
                 &mut walk,
             );
+        }
+    }
+    {
+        let mut bases: Vec<TypeName<'_>> = Vec::new();
+        for type_def in assembly.type_defs() {
+            if let Some(name) = assembly.type_token_name(type_def.extends()) {
+                if corlib_defines_type(corlib, name) {
+                    bases.push(name);
+                }
+            }
+        }
+        let mut index = 0;
+        while let Some(&name) = bases.get(index) {
+            index += 1;
+            if bases[..index - 1]
+                .iter()
+                .any(|seen| seen.namespace == name.namespace && seen.name == name.name)
+            {
+                continue;
+            }
+            materialize_corlib_type(module, resolution, corlib, name, &mut walk);
+            for type_def in corlib.type_defs() {
+                let Some(defined) = type_def.name() else {
+                    continue;
+                };
+                if defined.namespace != name.namespace || defined.name != name.name {
+                    continue;
+                }
+                if let Some(base) = corlib.type_token_name(type_def.extends()) {
+                    if corlib_defines_type(corlib, base) {
+                        bases.push(base);
+                    }
+                }
+                break;
+            }
         }
     }
     for name in boxed_type_arguments {
@@ -2388,14 +2471,16 @@ fn materialize_corlib_type<'c>(
                 }
                 continue;
             }
+            let default = default_field_value_of(
+                corlib,
+                field.signature(),
+                &resolution.field_index.enum_zeros,
+            );
             let entry = CorlibField {
                 token,
                 name: field.name().unwrap_or("").into(),
-                default: default_field_value_of(
-                    corlib,
-                    field.signature(),
-                    &resolution.field_index.enum_zeros,
-                ),
+                pending_struct: pending_struct_field_type(&default, field.signature()),
+                default,
             };
             if field.is_static() {
                 own_static.push(entry);
@@ -2451,6 +2536,26 @@ fn materialize_corlib_type<'c>(
     } else {
         Vec::new()
     };
+    let mut own_instance = own_instance;
+    for index in 0..own_instance.len() {
+        let Some(value_type) = own_instance[index].pending_struct else {
+            continue;
+        };
+        let Some(field_type) =
+            corlib.type_token_name(value_type).filter(|named| !resolution.is_materializing(*named))
+        else {
+            continue;
+        };
+        if !corlib_defines_type(corlib, field_type) {
+            continue;
+        }
+        let field_type_id =
+            materialize_corlib_type(module, resolution, corlib, field_type, walk);
+        if let Some(fields) = module.type_field_defaults(field_type_id) {
+            own_instance[index].default = Value::Struct(fields.into_boxed_slice());
+            own_instance[index].pending_struct = None;
+        }
+    }
     let base_count = base_defaults.len();
     let mut full = base_defaults;
     full.extend(own_instance.iter().map(|field| field.default.clone()));
@@ -2493,7 +2598,18 @@ fn materialize_corlib_type<'c>(
     }
     let statics_start = module.static_field_count() as u32;
     for field in &own_static {
-        module.bind_static_field(LAZY_CORLIB_ASM, field.token, field.default.clone());
+        let default = field
+            .pending_struct
+            .filter(|_| matches!(field.default, Value::Null))
+            .and_then(|value_type| corlib.type_token_name(value_type))
+            .filter(|named| !resolution.is_materializing(*named))
+            .filter(|named| corlib_defines_type(corlib, *named))
+            .map(|named| materialize_corlib_type(module, resolution, corlib, named, walk))
+            .and_then(|field_type_id| module.type_field_defaults(field_type_id))
+            .map_or_else(|| field.default.clone(), |fields| {
+                Value::Struct(fields.into_boxed_slice())
+            });
+        module.bind_static_field(LAZY_CORLIB_ASM, field.token, default);
         if let Some(slot) = module.static_field_slot(LAZY_CORLIB_ASM, field.token) {
             resolution
                 .field_index
@@ -3037,7 +3153,8 @@ fn load_assembly<'pe>(
     let mut type_virtuals: Vec<Vec<VirtualMethod>> = Vec::new();
     let mut type_nonvirtuals: Vec<Vec<VirtualMethod>> = Vec::new();
     let mut type_is_value_type: Vec<bool> = Vec::new();
-    let mut own_fields: Vec<Vec<(Token, Value)>> = Vec::new();
+    let mut own_fields: Vec<Vec<(Token, Value, Option<Token>)>> = Vec::new();
+    let mut pending_static_structs: Vec<(usize, Token)> = Vec::new();
     let mut instance_field_keys: BTreeMap<u32, String> = BTreeMap::new();
     let mut method_row: u32 = 0;
     let mut field_row: u32 = 0;
@@ -3064,7 +3181,13 @@ fn load_assembly<'pe>(
                 if !field.is_literal() {
                     let default =
                         default_field_value_of(assembly, field.signature(), &field_index.enum_zeros);
+                    let pending = pending_struct_field_type(&default, field.signature());
                     module.bind_static_field(asm, token, default);
+                    if let (Some(value_type), Some(slot)) =
+                        (pending, module.static_field_slot(asm, token))
+                    {
+                        pending_static_structs.push((slot, value_type));
+                    }
                     if let (Some(field_name), Some(slot)) =
                         (field.name(), module.static_field_slot(asm, token))
                     {
@@ -3098,10 +3221,10 @@ fn load_assembly<'pe>(
             if let (Some((ns, tn)), Some(field_name)) = (key_type_name(assembly, &type_def), field.name()) {
                 instance_field_keys.insert(token.0, field_key(&ns, &tn, field_name));
             }
-            own.push((
-                token,
-                default_field_value_of(assembly, field.signature(), &field_index.enum_zeros),
-            ));
+            let default =
+                default_field_value_of(assembly, field.signature(), &field_index.enum_zeros);
+            let pending = pending_struct_field_type(&default, field.signature());
+            own.push((token, default, pending));
         }
         let type_id = module.add_type(Vec::new());
         module.bind_static_slot_range(
@@ -3138,7 +3261,7 @@ fn load_assembly<'pe>(
                 module.set_primitive_type_token(asm, Token::new(TYPE_DEF, type_row), &kind);
             }
         }
-        for (token, _) in &own {
+        for (token, _, _) in &own {
             module.bind_field_type(asm, *token, type_id);
         }
         own_fields.push(own);
@@ -3419,6 +3542,14 @@ fn load_assembly<'pe>(
     bind_type_names(assembly, module, asm, type_index, &ldtoken_type_tokens);
     classify_type_test_tokens(assembly, module, asm, type_index, &type_test_tokens);
     bind_type_sizes(assembly, module, asm, &value_type_tokens, &sizeof_tokens);
+    resolve_struct_field_defaults(
+        module,
+        assembly,
+        type_offset,
+        type_index,
+        &mut own_fields,
+        &pending_static_structs,
+    );
     build_field_layouts(
         module,
         assembly,
@@ -4297,6 +4428,10 @@ fn bcl_intrinsic(
             _ => None,
         },
         ("Object", "Finalize") => Some(intrinsic!(object_ctor)),
+        ("ValueType", "Equals") => match parameters_of(signature) {
+            [SigType::Object] => Some(intrinsic!(value_type_equals)),
+            _ => None,
+        },
         ("Object", "GetType") => match parameters_of(signature) {
             [] => Some(intrinsic!(object_get_type)),
             _ => None,
@@ -4552,8 +4687,11 @@ fn object_ctor_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u
 /// `Int32(0)` and answers FALSE with nothing reported, and `(int)_mode` traps on `conv.i4`. The
 /// silent half is the dangerous one -- a driver reads "this is not Skipped" for a field that is.
 ///
-/// Non-enum value types still fall back to null: they are not laid out inline yet, and handing a
-/// struct field a numeric zero would be a different wrong answer rather than a fix.
+/// A non-enum value type gets a PLACEHOLDER null here and its real zero later: that zero is a zero
+/// INSTANCE of the struct, so it does not exist until the struct's field layout does, which is
+/// after every type in the assembly has been added. [`pending_struct_field_type`] marks the slot
+/// and [`resolve_struct_field_defaults`] fills it in. A numeric zero would be a different wrong
+/// answer rather than a fix, which is why the placeholder is null and not `Int32(0)`.
 fn default_field_value_of(
     assembly: &Assembly,
     signature: Option<SigType>,
@@ -4594,8 +4732,13 @@ fn index_enum_zeros(assembly: &Assembly, enum_zeros: &mut BTreeMap<String, Value
 
 /// The zero value a freshly allocated instance field of this signature holds
 /// (ECMA-335 III.4.21 zero-initializes instances): the numeric zero of its width,
-/// or null for a reference. Value types other than these primitives are not laid out
-/// inline yet, so they fall back to null.
+/// or null for a reference.
+///
+/// A STRUCT signature answers null here too, and that answer is a PLACEHOLDER rather than the
+/// final zero -- a struct's zero is a zero instance, which needs a field layout that does not
+/// exist this early. Every caller pairs this with [`pending_struct_field_type`] so the slot is
+/// revisited; a caller that does not would ship the null, which is the defect this pairing exists
+/// to prevent.
 fn default_field_value(signature: Option<SigType>) -> Value {
     match signature {
         Some(SigType::I8 | SigType::U8) => Value::Int64(0),
@@ -4617,6 +4760,104 @@ fn default_field_value(signature: Option<SigType>) -> Value {
     }
 }
 
+/// The value type a field's zero is still WAITING on, or `None` when the zero is already final.
+///
+/// A struct-typed field is the one case [`default_field_value`] cannot answer: its zero is a zero
+/// INSTANCE of that struct, and no instance layout exists until every type has been added. It is
+/// exactly the pair (a null default, a `ValueType` signature) -- an ENUM-typed field has already
+/// been given its underlying zero by [`default_field_value_of`], so it does not reach here.
+fn pending_struct_field_type(default: &Value, signature: Option<SigType>) -> Option<Token> {
+    match (default, signature) {
+        (Value::Null, Some(SigType::ValueType(token))) => Some(token),
+        _ => None,
+    }
+}
+
+/// A zero INSTANCE of the value type `value_type` names, or `None` while it is not yet knowable.
+///
+/// A struct declared in THIS assembly is being resolved in the same pass, so it is usable only once
+/// none of its own fields are still pending -- which is what makes the fixed point converge from
+/// the innermost struct outward. A struct in another assembly (corlib's `Decimal` or `DateTime`,
+/// named by a program's `TypeRef`) is already fully loaded, so its layout is final.
+fn struct_field_zero(
+    module: &Module,
+    assembly: &Assembly,
+    type_offset: usize,
+    type_index: &TypeNameIndex,
+    own_fields: &[Vec<(Token, Value, Option<Token>)>],
+    value_type: Token,
+) -> Option<Value> {
+    let name = assembly.type_token_name(value_type)?;
+    let global = type_index.get(&type_name_key(name)).copied()?;
+    if let Some(local) =
+        (global as usize).checked_sub(type_offset).filter(|&index| index < own_fields.len())
+    {
+        if own_fields[local].iter().any(|(_, _, pending)| pending.is_some()) {
+            return None;
+        }
+        let fields: Vec<Value> =
+            own_fields[local].iter().map(|(_, default, _)| default.clone()).collect();
+        return Some(Value::Struct(fields.into_boxed_slice()));
+    }
+    Some(Value::Struct(module.type_field_defaults(global)?.into_boxed_slice()))
+}
+
+/// Replaces every struct-typed field's placeholder zero with a zero INSTANCE of that struct, now
+/// that every type in this assembly has been added. ECMA-335 III.4.21 zero-initializes an instance,
+/// and a struct field's zero is a zeroed struct rather than a null reference -- left null, a
+/// `decimal` field reaching an intrinsic traps and a `DateTime` one answers wrongly.
+///
+/// Iterates to a fixed point because a struct field's type can itself have struct fields, and each
+/// round resolves at least the shallowest unresolved level. A struct cannot contain itself, so the
+/// nesting is finite; the round bound is what makes malformed cyclic metadata terminate instead of
+/// looping. A field whose type never resolves keeps its null, which is what it had before.
+fn resolve_struct_field_defaults(
+    module: &mut Module,
+    assembly: &Assembly,
+    type_offset: usize,
+    type_index: &TypeNameIndex,
+    own_fields: &mut [Vec<(Token, Value, Option<Token>)>],
+    pending_statics: &[(usize, Token)],
+) {
+    for _round in 0..=own_fields.len() {
+        let mut resolved: Vec<(usize, usize, Value)> = Vec::new();
+        for (local, fields) in own_fields.iter().enumerate() {
+            for (index, (_, _, pending)) in fields.iter().enumerate() {
+                let Some(value_type) = *pending else { continue };
+                if let Some(zero) = struct_field_zero(
+                    module,
+                    assembly,
+                    type_offset,
+                    type_index,
+                    own_fields,
+                    value_type,
+                ) {
+                    resolved.push((local, index, zero));
+                }
+            }
+        }
+        if resolved.is_empty() {
+            break;
+        }
+        for (local, index, zero) in resolved {
+            own_fields[local][index].1 = zero;
+            own_fields[local][index].2 = None;
+        }
+    }
+    for (slot, value_type) in pending_statics {
+        if let Some(zero) = struct_field_zero(
+            module,
+            assembly,
+            type_offset,
+            type_index,
+            own_fields,
+            *value_type,
+        ) {
+            module.set_static_default(*slot, zero);
+        }
+    }
+}
+
 /// Binds each `newarr` element-type token to its elements' zero value, and -- for a sized
 /// primitive element type -- the element type's [`PrimKind`], so `newarr` packs the array's
 /// element storage at the true byte width (and `System.Buffer` can size its byte image; a
@@ -4630,8 +4871,9 @@ fn bind_array_defaults(
     tokens: &BTreeSet<Token>,
 ) {
     for token in tokens {
-        let default = array_element_default(assembly, *token, enum_zeros);
-        module.bind_array_default(asm, *token, default);
+        if let Some(default) = array_element_default(assembly, *token, enum_zeros) {
+            module.bind_array_default(asm, *token, default);
+        }
         if let Some(kind) = assembly
             .type_token_name(*token)
             .and_then(|name| array_prim_kind_of(name.namespace, name.name))
@@ -5495,27 +5737,31 @@ fn primitive_type_size(namespace: &str, name: &str, pointer_size: u32) -> Option
     })
 }
 
-/// The zero value an array's elements take (ECMA-335 III.4.20): the numeric zero of a
-/// primitive element, or null for a reference element. The `newarr` operand names the
-/// element type; a `System` primitive -- whether a program's `TypeRef` or the corlib's own
-/// `TypeDef` (it defines `System.Int32` etc.) -- gets its numeric zero; a user `TypeDef`, a
-/// `TypeSpec` (array/generic), and unrecognized names are references (value-type array
-/// elements are not laid out inline yet).
+/// The zero value an array's elements take (ECMA-335 III.4.20), when it can be decided HERE:
+/// the numeric zero of a primitive element, or an enum element's underlying zero. The `newarr`
+/// operand names the element type; a `System` primitive -- whether a program's `TypeRef` or the
+/// corlib's own `TypeDef` (it defines `System.Int32` etc.) -- gets its numeric zero.
+///
+/// `None` means UNDECIDABLE AT LOAD, not "a reference": a user `TypeDef`, a non-primitive
+/// `System` value type (`Decimal`, `DateTime`), a `TypeSpec` (array/generic) and an unrecognized
+/// name all land here, and a struct's zero is a zero INSTANCE whose field layout is not computed
+/// until [`build_field_layouts`] has run -- after this. `newarr` decides those at run time, where
+/// every layout is known, and distinguishes a struct element (a zero instance) from a reference
+/// element (null) by the value-type flag recorded at load.
+///
 fn array_element_default(
     assembly: &Assembly,
     element_type: Token,
     enum_zeros: &BTreeMap<String, Value>,
-) -> Value {
-    let Some(name) = assembly.type_token_name(element_type) else {
-        return Value::Null;
-    };
+) -> Option<Value> {
+    let name = assembly.type_token_name(element_type)?;
     if let Some(zero) = enum_zeros.get(&type_name_key(name)) {
-        return zero.clone();
+        return Some(zero.clone());
     }
     if name.namespace != "System" {
-        return Value::Null;
+        return None;
     }
-    match name.name {
+    Some(match name.name {
         "Int32" | "UInt32" | "Int16" | "UInt16" | "SByte" | "Byte" | "Boolean" | "Char" => {
             Value::Int32(0)
         }
@@ -5525,8 +5771,8 @@ fn array_element_default(
         #[cfg(feature = "float")]
         "Double" => Value::Float(0.0),
         "IntPtr" | "UIntPtr" => Value::NativeInt(0),
-        _ => Value::Null,
-    }
+        _ => return None,
+    })
 }
 
 /// The representative evaluation-stack [`Value`] kind a `System` primitive value type loads
@@ -5614,7 +5860,7 @@ fn build_field_layouts(
     type_offset: usize,
     type_index: &TypeNameIndex,
     extends: &[Token],
-    own_fields: &[Vec<(Token, Value)>],
+    own_fields: &[Vec<(Token, Value, Option<Token>)>],
     field_index: &mut FieldNameIndex,
     instance_field_keys: &BTreeMap<u32, String>,
 ) {
@@ -5625,7 +5871,7 @@ fn build_field_layouts(
     for local in 0..extends.len() {
         let full = field_layout(local, &bases, own_fields, &mut memo);
         let base_count = full.len() - own_fields[local].len();
-        for (index, (token, _)) in own_fields[local].iter().enumerate() {
+        for (index, (token, _, _)) in own_fields[local].iter().enumerate() {
             let slot = (base_count + index) as u32;
             module.bind_field(asm, *token, slot);
             if let Some(key) = instance_field_keys.get(&token.0) {
@@ -5641,7 +5887,7 @@ fn build_field_layouts(
 fn field_layout(
     type_id: usize,
     bases: &[BaseFields],
-    own_fields: &[Vec<(Token, Value)>],
+    own_fields: &[Vec<(Token, Value, Option<Token>)>],
     memo: &mut [Option<Vec<Value>>],
 ) -> Vec<Value> {
     if let Some(layout) = &memo[type_id] {
@@ -5655,7 +5901,7 @@ fn field_layout(
     layout.extend(
         own_fields[type_id]
             .iter()
-            .map(|(_, default)| default.clone()),
+            .map(|(_, default, _)| default.clone()),
     );
     memo[type_id] = Some(layout.clone());
     layout
@@ -7055,7 +7301,7 @@ mod extended {
             }
             #[cfg(feature = "NETMFv4_4")]
             ("Math", "Sign") => math_sign_overload(signature),
-            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+            #[cfg(feature = "float")]
             ("Math", "Floor") => math_unary_f64_overload(intrinsic!(math_floor_f64), signature),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Ceiling") => math_unary_f64_overload(intrinsic!(math_ceiling_f64), signature),

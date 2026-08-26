@@ -1,0 +1,89 @@
+# SERCOM in USART mode on the SAM D10 family -- the BLOCK layout: register offsets are
+# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
+# plan. Instance bases/ids live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+#
+# THE REGISTER SUMMARY DOCUMENTS TWO USARTs, NOT ONE. Table 25-4 lists CTRLB, INTENCLR, INTENSET
+# and INTFLAG TWICE at the same offsets, once per clocking variant: the internal-clock USART has
+# SFDE and RXS where the external-clock one leaves those bits reserved. The fields below are the
+# INTERNAL-CLOCK set, which is the mode CTRLA.MODE = 1 selects and the only one this tree drives.
+# A reader who finds a bit here that its part appears to ignore should check which variant they are
+# in before concluding the transcription is wrong.
+
+[table]
+kind = "block"
+family = "samd10"
+block = "sercom"
+mode = "usart"
+sources = [
+    "SAM D10 datasheet Atmel-42242H-SAM-D10-Datasheet_09/2016 ch 25.7 table 25-4 (register summary) for the register set and offsets: CTRLA 0x00, CTRLB 0x04, BAUD 0x0C, RXPL 0x0E, INTENCLR 0x14, INTENSET 0x16, INTFLAG 0x18, STATUS 0x1A, SYNCBUSY 0x1C, DATA 0x28, DBGCTRL 0x30",
+    "SAM D10 datasheet Atmel-42242H ch 25.8 per-register field lists for every bit position stated below",
+    "SAM D10 datasheet Atmel-42242H ch 25.6.6 (synchronization): SWRST, ENABLE, CTRLB.RXEN and CTRLB.TXEN are write-synchronized, and writing one while its SYNCBUSY bit is set raises a bus error",
+]
+notes = [
+    "READ FROM THIS FAMILY'S OWN DATASHEET AND THEN COMPARED: every offset and bit position below was taken from Atmel-42242H ch 25.7 / 25.8, and each one turned out to equal the SAM D11's. That agreement is a MEASUREMENT rather than an inheritance -- the two families are separate documents and separate dies (0x1002rXX against 0x1003rXX), and the SAM D10 has no USB where the D11 does, so agreement was never safe to assume. A future revision that diverges should fail a reader's expectation here, not slip through it.",
+    "Every write to a synchronized register (CTRLA.SWRST, CTRLA.ENABLE, CTRLB) must wait the matching SYNCBUSY bit clear. The datasheet is stronger than 'should': writing while SYNCBUSY is set generates a peripheral bus error, and a write to any register except CTRLA.SWRST during enable synchronization is DISCARDED.",
+    "16x async arithmetic mode: BAUD = 65536 - (65536 * 16 * baud_hz) / f_core_hz, where f_core_hz is the routed GCLK generator's rate -- a PLAN fact, never stated here.",
+    "BAUD is one 16-bit register with two readings. In arithmetic mode it is BAUD[15:0]; in fractional mode the top three bits become FP[2:0] and the value is BAUD[12:0]. CTRLA.SAMPR selects which, so the same bytes mean different things depending on a field in another register.",
+    "The RX pin needs PORT PINCFG.INEN as well as PMUXEN; the TX pin, being a peripheral output, needs only PMUXEN. That is PORT block truth, restated here because every USART bring-up on this family trips it.",
+    "DORD = LSB-first (1), MODE = USART with internal clock (1), CHSIZE = 8-bit (0), SBMODE = one stop bit (0), PMODE unused = 8N1.",
+]
+
+[registers.CTRLA]
+offset = 0x0
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], MODE = [2, 3], RUNSTDBY = [7, 1], IBON = [8, 1], SAMPR = [13, 3], TXPO = [16, 2], RXPO = [20, 2], SAMPA = [22, 2], FORM = [24, 4], CMODE = [28, 1], CPOL = [29, 1], DORD = [30, 1] }
+notes = "MODE 1 = USART with internal clock. TXPO/RXPO select the TX/RX pads (binding-derived). DORD 1 = LSB-first. SAMPR 0 = 16x oversampling, arithmetic baud."
+
+[registers.CTRLB]
+offset = 0x4
+width = 32
+fields = { CHSIZE = [0, 3], SBMODE = [6, 1], COLDEN = [8, 1], SFDE = [9, 1], ENC = [10, 1], PMODE = [13, 1], TXEN = [16, 1], RXEN = [17, 1] }
+notes = "CHSIZE 0 = 8-bit. SBMODE 0 = 1 stop bit. PMODE unused (no parity). TXEN | RXEN enable the transmitter/receiver, and both are write-synchronized through SYNCBUSY.CTRLB."
+
+[registers.BAUD]
+offset = 0xC
+width = 16
+fields = { BAUD = [0, 16] }
+notes = "Arithmetic-mode divisor; see the block formula note. In fractional mode this register reads as FP[2:0] over BAUD[12:0] instead -- CTRLA.SAMPR decides."
+
+[registers.RXPL]
+offset = 0xE
+width = 8
+fields = { RXPL = [0, 8] }
+notes = "Receive pulse length, used only by the LIN/collision-detect paths."
+
+[registers.INTENCLR]
+offset = 0x14
+width = 8
+fields = { DRE = [0, 1], TXC = [1, 1], RXC = [2, 1], RXS = [3, 1], CTSIC = [4, 1], RXBRK = [5, 1], ERROR = [7, 1] }
+notes = "Write 1 to disable an interrupt; reading returns the enable mask."
+
+[registers.INTENSET]
+offset = 0x16
+width = 8
+fields = { DRE = [0, 1], TXC = [1, 1], RXC = [2, 1], RXS = [3, 1], CTSIC = [4, 1], RXBRK = [5, 1], ERROR = [7, 1] }
+notes = "Write 1 to enable an interrupt; reading returns the enable mask."
+
+[registers.INTFLAG]
+offset = 0x18
+width = 8
+fields = { DRE = [0, 1], TXC = [1, 1], RXC = [2, 1], RXS = [3, 1], CTSIC = [4, 1], RXBRK = [5, 1], ERROR = [7, 1] }
+notes = "DRE is set while the transmit buffer is empty and is cleared by WRITING DATA, not by writing the flag. RXC is cleared by READING DATA. The write-1-to-clear rule holds for the others."
+
+[registers.STATUS]
+offset = 0x1A
+width = 16
+fields = { PERR = [0, 1], FERR = [1, 1], BUFOVF = [2, 1], CTS = [3, 1], ISF = [4, 1], COLL = [5, 1] }
+notes = "Receive error status, write-1-to-clear. A frame carrying an error sets its bit here at the same time INTFLAG.ERROR is raised; the flag says an error happened and this says which."
+
+[registers.SYNCBUSY]
+offset = 0x1C
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], CTRLB = [2, 1] }
+notes = "Read-only. One bit per synchronized write; wait the matching bit clear before the next access to that register."
+
+[registers.DATA]
+offset = 0x28
+width = 16
+fields = { DATA = [0, 9] }
+notes = "Nine bits wide because CHSIZE reaches 9-bit characters; an 8-bit configuration uses the low byte. Writing it clears INTFLAG.DRE, reading it clears INTFLAG.RXC."

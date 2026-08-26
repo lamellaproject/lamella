@@ -33,7 +33,7 @@ notes = [
 [sourcing]
 facts = "primary"
 validation = "identified"
-evidence = "A physical part answered the identity register on a micro:bit v1.3B, over the nRF51's TWI0 at 100 kHz on the board's internal bus: register 0x07 read 0xC4 at address 0x0E, the single value this table accepts at the single address it states, repeated across eight consecutive passes with 0 faulted of 112 addresses walked in each. THE NEGATIVE CONTROL RAN IN TWO PARTS. First, on that same bus in those same passes, reads of other parts' identity registers at addresses where nothing was fitted ABORTED every time, so this bus reports an absence as an abort rather than as a byte. Second, the identical read of the identical register at the identical address, 0x07 at 0x0E, was run on a micro:bit v2 -- a board that does not fit this part -- and ABORTED across ten consecutive passes; that arm is on a different controller of the same family, which is stated because it is what makes it a second arm rather than a repetition of the first. THE REGISTER IS THE POINT OF THIS ONE: two other parts from this vendor in this catalogue answer their identity at 0x0D, and this part answers at 0x07 while holding writable offset configuration at 0x0D -- so an instrument that assumed a vendor convention would have read this part's user Z offset and compared it against a device id. It was asked at its own register and answered. EVERY NUMBER IN THE CHECK -- the address, the register and the accepted value -- was taken from this table's own emitted artifact by a bench program that includes it."
+evidence = "A physical part answered the identity register on a micro:bit v1.3B, over the nRF51's TWI0 at 100 kHz on the board's internal bus: register 0x07 read 0xC4 at address 0x0E, the single value this table accepts at the single address it states, repeated across eight consecutive passes with 0 faulted of 112 addresses walked in each. THE NEGATIVE CONTROL RAN IN TWO PARTS. First, on that same bus in those same passes, reads of other parts' identity registers at addresses where nothing was fitted ABORTED every time, so this bus reports an absence as an abort rather than as a byte. Second, the identical read of the identical register at the identical address, 0x07 at 0x0E, was run on a micro:bit v2 -- a board that does not fit this part -- and ABORTED across ten consecutive passes; that arm is on a different controller of the same family, which is stated because it is what makes it a second arm rather than a repetition of the first. THE REGISTER IS THE POINT OF THIS ONE: two other parts from this vendor in this catalog answer their identity at 0x0D, and this part answers at 0x07 while holding writable offset configuration at 0x0D -- so an instrument that assumed a vendor convention would have read this part's user Z offset and compared it against a device id. It was asked at its own register and answered. EVERY NUMBER IN THE CHECK -- the address, the register and the accepted value -- was taken from this table's own emitted artifact by a bench program that includes it."
 
 # --- identity ------------------------------------------------------------------------------------
 
@@ -41,7 +41,7 @@ evidence = "A physical part answered the identity register on a micro:bit v1.3B,
 reg = 0x07
 width = 8
 values = [0xC4]
-notes = "Device ID Number, reset value 0xC4. NOT at 0x0D, where two other parts from this vendor in this catalogue answer theirs -- on this part 0x0D is the high byte of the user Z offset, which is writable configuration rather than an identity."
+notes = "Device ID Number, reset value 0xC4. NOT at 0x0D, where two other parts from this vendor in this catalog answer theirs -- on this part 0x0D is the high byte of the user Z offset, which is writable configuration rather than an identity."
 
 # --- address: FIXED, and a SIBLING PART TAKES THE NEXT ONE ------------------------------------------
 #
@@ -105,7 +105,7 @@ notes = "The current system mode."
 
 # The hard-iron offsets the user writes, six bytes from 0x09, high byte first per axis. They are
 # NOT a factory calibration: the data sheet says so explicitly, which is the opposite of the
-# boot-loaded calibration other parts in this catalogue warn against overwriting.
+# boot-loaded calibration other parts in this catalog warn against overwriting.
 [registers.off_x]
 reg = 0x09
 width = 16

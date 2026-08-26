@@ -1,0 +1,38 @@
+# PARTS table for the STM32L0x3 family, category 3 (STM32L053x). Every row is an ORDERABLE variant.
+#
+# THIS IS A DIFFERENT FAMILY FROM csp/stm32l0, AND THE MANUAL IS THE REASON. csp/stm32l0 is the
+# L0x1 line, read from RM0377 and scoped to category 1. This is the L0x3 line, read from RM0367,
+# and it is category 3. Two reference manuals and two datasheets, which is the split
+# csp/stm32u585's header states as the rule: a family owns one of each.
+#
+# AND THE DIFFERENCE IS NOT COSMETIC. RM0367 table 2 gives category 3 GPIOA, GPIOB and GPIOC FULL,
+# plus GPIOD[2] and GPIOH[0:1], where RM0377 gives category 1 GPIOB as [0:9] and GPIOC as [14:15]
+# only. Category 3 also carries USART1, which category 1 does not have at all. An instance map
+# copied between them would be wrong in both directions.
+#
+
+[table]
+kind = "parts"
+family = "stm32l053"
+sources = [
+    "STM32L053C6/C8/R6/R8 datasheet DS10152 Rev 10: table 15 (pin definitions) LQFP64 column for the pad set, and the feature list for 64 Kbytes of flash, 8 Kbytes of SRAM and 2 Kbytes of data EEPROM",
+    "STM32L0x3 reference manual RM0367 Rev 8 table 1 (memory density), which places STM32L053x in category 3 at 32 and 64 Kbytes, and table 2 (overview of features per category) for what category 3 carries",
+    "A read of the part on a NUCLEO-L053R8: F_SIZE reports 64 Kbytes, and the SRAM was bounded from both sides at 0x20000000-0x20001FFF, which is 8 Kbytes exactly",
+]
+notes = [
+    "RAM is 8 Kbytes and it is MEASURED rather than relayed. RM0367 has the same defect RM0377 does -- its only sizing sentence is a line-wide ceiling, 'up to 20 Kbytes of static SRAM' -- so the manual cannot settle a part. The datasheet feature line and a both-sides-bounded read on silicon agree on 8.",
+    "THE LQFP64 BONDS OUT EVERY GPIO THE DIE HAS, which is not true of every package and is worth stating rather than leaving to be inferred: 51 pads is exactly PA0-PA15 + PB0-PB15 + PC0-PC15 + PD2 + PH0-PH1, and that is category 3's whole port population per RM0367 table 2. A present-list and a die set coincide HERE and must not be assumed to coincide elsewhere.",
+    "PC14 and PC15 are the low-speed oscillator pins and PH0/PH1 the high-speed ones, so a board fitting either crystal loses those pads as I/O. PA13 and PA14 are SWDIO and SWCLK and come out of reset in alternate function.",
+    "Data EEPROM is 2 Kbytes and is a SEPARATE non-volatile array from the program flash. It is not part of the flash figure and this schema has no field for it.",
+    "CATEGORY 5 IS THE OTHER HALF OF THIS MANUAL AND IT IS NOT THIS FAMILY. RM0367 covers category 3 and category 5 in one book, so a reader here has the category 5 pages in front of them and may take a value from the wrong column. What table 2 states as differing: GPIOD goes from [2] to full, GPIOE goes from ABSENT to full, GPIOH goes from [0:1] to [0:1][9:10], the NVM goes from single bank to dual, and DAC2 goes from absent to present. A category 5 part therefore has a port this family's instance map does not name at all, which is why it is a separate family rather than another row.",
+    "CATEGORY 3 REACHES 32 AND 64 KBYTES AND NO MORE. RM0367 table 1 places every larger density -- 128 and 192 Kbytes -- in category 5, as STM32L073x and STM32L083x. So a 192-Kbyte STM32L053x is not a part that exists, and a density is enough to decide a category on this line.",
+]
+
+
+[[parts]]
+part = "stm32l053r8t6"
+package = "64-pin LQFP"
+flash = 0x10000
+ram = 0x2000
+pins = ["PA0-PA15", "PB0-PB15", "PC0-PC15", "PD2", "PH0-PH1"]
+source = "DS10152 Rev 10 table 15, LQFP64 pin-number column, for the 51-pad set. Flash 64 Kbytes and RAM 8 Kbytes from the datasheet feature list, both corroborated on silicon -- F_SIZE reads 64 Kbytes and the SRAM was bounded at 0x20000000-0x20001FFF. RM0367 table 1 places STM32L053x in category 3. This is the part on the NUCLEO-L053R8: UM1724 names it STM32L053R8T6 explicitly and states its package in its own words, an STM32 microcontroller in an LQFP64 package. The core is an Arm Cortex-M0+."

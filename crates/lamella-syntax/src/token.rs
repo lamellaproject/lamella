@@ -2,6 +2,7 @@
 
 use crate::span::Span;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 /// Defines a small enum over a fixed set of textual symbols, together with the
 /// spelling lookups in both directions and the full list. Driving all three
@@ -191,6 +192,7 @@ spelled_enum! {
         "<<=" => LessThanLessThanEquals,
         ">>=" => GreaterThanGreaterThanEquals,
         "->" => Arrow,
+        "=>" => EqualsGreaterThan,
     }
 }
 
@@ -302,6 +304,9 @@ pub enum TokenKind {
     /// `u16`: a regular string may contain lone surrogates via `\u` escapes, so
     /// the value is not always well-formed UTF-8 and cannot be a `str`.
     StringLiteral(Box<[u16]>),
+    /// An interpolated string literal (`$"..."`, `$@"..."`, `@$"..."`) -- C# 6.0. Boxed because it
+    /// is by far the largest payload here and every other token would otherwise carry its width.
+    InterpolatedString(Box<InterpolatedString>),
     /// A pre-processing directive line (9.5), consumed in full, leading `#`
     /// through to but not including the line terminator. Directives are not part
     /// of the syntactic grammar; the scanner resolves them and their effects, so
@@ -334,6 +339,53 @@ impl TokenKind {
                 | TokenKind::SkippedText
         )
     }
+}
+
+/// An interpolated string literal (`$"a{b}c"`, `$@"a{b}c"`) as the scanner resolved it: the
+/// literal pieces with their escapes already decoded, and the holes with their expression TOKENS
+/// already scanned.
+///
+/// **THE HOLES CARRY TOKENS RATHER THAN TEXT, AND THAT IS THE WHOLE REASON THIS TYPE EXISTS.** A
+/// hole holds an arbitrary expression, so something has to lex it; doing that in a second pass
+/// over a slice of the hole's text would give every token inside a hole a span measured from the
+/// hole rather than from the file, and a diagnostic inside an interpolation would point at the
+/// wrong place -- or at nothing, once the offsets ran past the end of a short file. Scanning the
+/// hole with the same scanner, in place, keeps every span a real file offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterpolatedString {
+    /// The literal pieces and holes, in source order. Adjacent literals are never produced --
+    /// `{{` merges into the piece around it -- so a piece is always maximal.
+    pub parts: Vec<InterpolatedPart>,
+    /// Whether it was written verbatim (`$@"..."` or `@$"..."`): no backslash escapes, `""` for a
+    /// quote, and line terminators belong to the value.
+    pub verbatim: bool,
+}
+
+/// One piece of an [`InterpolatedString`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterpolatedPart {
+    /// Literal text between holes, with `{{`/`}}` and (when not verbatim) backslash escapes
+    /// already decoded to their characters. May be empty only when the whole string is.
+    Literal(Box<[u16]>),
+    /// A `{ ... }` hole.
+    Hole(InterpolatedHole),
+}
+
+/// A `{ expression [, alignment] [: format] }` hole in an interpolated string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterpolatedHole {
+    /// The expression's tokens, trivia included, ending WITHOUT an end-of-file marker. Spans are
+    /// offsets into the original file.
+    pub tokens: Vec<Token>,
+    /// The alignment expression's tokens, when a `,` was present; empty otherwise. It is an
+    /// expression rather than a number because csc binds it as one -- `$"{n,99999999999}"` draws
+    /// `CS0266`/`CS0150`, the ordinary constant-conversion pair, measured.
+    pub alignment: Vec<Token>,
+    /// The format specifier's text after a `:`, taken literally. `None` when there was no `:`;
+    /// never `Some("")`, which is `CS8089`.
+    pub format: Option<Box<str>>,
+    /// The hole's extent in the source, `{` through `}`.
+    pub span: Span,
 }
 
 /// A single lexical element: a [`TokenKind`] and the [`Span`] it covers.
@@ -430,7 +482,7 @@ mod tests {
     /// (`try_gate_post_1_0_operator`), not its absence from this table. 45 -> 46 when `??` landed.
     #[test]
     fn there_are_forty_six_operators_and_punctuators() {
-        assert_eq!(Punctuator::all().len(), 46);
+        assert_eq!(Punctuator::all().len(), 47);
     }
 
     #[test]

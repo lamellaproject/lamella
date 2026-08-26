@@ -4,12 +4,12 @@ use lamella_bsp_gen::strata::{BoardTable, PartRow, Strata, parse};
 
 /// The board and part fact files, emitted by `build.rs` from `bsp/` and `csp/`.
 mod generated {
-    include!(concat!(env!("OUT_DIR"), "/catalogue.rs"));
+    include!(concat!(env!("OUT_DIR"), "/catalog.rs"));
 }
 
 pub use generated::{BOARD_PYTHON, BOARDS, MODULES, PARTS};
 
-/// The board with `id`, parsed from the embedded catalogue.
+/// The board with `id`, parsed from the embedded catalog.
 #[must_use]
 pub fn load_board(id: &str) -> Option<BoardTable> {
     let (_, text) = BOARDS.iter().find(|(board, _)| *board == id)?;
@@ -46,7 +46,7 @@ pub fn load_part(board: &BoardTable) -> Option<PartRow> {
 /// A board and its part row together, or a message saying which hop failed.
 ///
 /// The two failures read differently to whoever typed the id and the message says which: an id
-/// that is not in the catalogue is a typo, and an id that resolves to no part row is a hole in the
+/// that is not in the catalog is a typo, and an id that resolves to no part row is a hole in the
 /// fact tables. Naming them alike would send a reader to check their spelling when the tables are
 /// what is incomplete.
 ///
@@ -70,7 +70,7 @@ mod tests {
     use super::*;
 
     /// **A CENSUS, NOT AN EXAMPLE, AND IT IS WHAT FINDS THE NEXT SHAPE.** Every board in the
-    /// catalogue must resolve to a part row with a real RAM figure. Written after running the tool
+    /// catalog must resolve to a part row with a real RAM figure. Written after running the tool
     /// by hand found that module-carrying boards resolved to an EMPTY part id -- a shape a
     /// hand-picked Pico row passes straight over. A new board whose form this resolver cannot
     /// follow now fails here rather than at a user's prompt.
@@ -78,7 +78,7 @@ mod tests {
     /// It reports EVERY failure before asserting: a census that panics on the first one answers
     /// "is there a hole" when the question is "where are the holes".
     #[test]
-    fn every_board_in_the_catalogue_resolves_to_a_part_row() {
+    fn every_board_in_the_catalog_resolves_to_a_part_row() {
         let mut unresolved = Vec::new();
         for (id, _) in BOARDS {
             let Some(board) = load_board(id) else {
@@ -97,10 +97,10 @@ mod tests {
         assert!(unresolved.is_empty(), "boards with no resolvable part row: {unresolved:#?}");
     }
 
-    /// The catalogue is generated from the directory, so an empty one means the build script found
+    /// The catalog is generated from the directory, so an empty one means the build script found
     /// nothing -- which would make every other test here vacuously true.
     #[test]
-    fn the_catalogue_is_not_empty() {
+    fn the_catalog_is_not_empty() {
         assert!(BOARDS.len() > 20, "got {} boards", BOARDS.len());
         assert!(!PARTS.is_empty());
         assert!(!MODULES.is_empty(), "module-carrying boards need these");

@@ -91,6 +91,54 @@ pub enum DiagnosticKind {
         /// The text following `#warning` on the directive line.
         message: Box<str>,
     },
+    /// An interpolation hole, or its alignment after the `,`, held no expression at all --
+    /// `$"{}"`, `$"{n,}"` (csc `CS1733`).
+    ///
+    /// A DIFFERENT CODE FROM `CS1525`, measured: csc says *Expected expression* where a term is
+    /// simply ABSENT and *Invalid expression term* where one is present and cannot begin an
+    /// expression. Both sentences exist in csc and they are not interchangeable.
+    ExpectedExpression,
+    /// An interpolated string's hole was opened with `{` and the string ended before its `}`
+    /// (csc `CS8076`).
+    InterpolationCloseDelimiterExpected,
+    /// CS1007: a property or indexer declaring the same accessor twice.
+    ///
+    /// **`set` AND `init` ARE THE SAME ACCESSOR**, so `int P { init { } set { } }` draws this and
+    /// not a "cannot mix" complaint of its own -- measured. That is also what says the two spellings
+    /// name ONE slot rather than two, which is why the tree keeps `init` as a flag on the setter.
+    DuplicateAccessor,
+    /// CS8856: an `init` accessor on a STATIC property or indexer.
+    ///
+    /// An `init` accessor exists to be callable during construction of an INSTANCE -- in an object
+    /// initializer, or on `this`/`base` in a constructor -- and a static property has no instance
+    /// to be constructed, so the spelling has no meaning there rather than merely being unusual.
+    InitAccessorOnStaticMember,
+    /// A lone `}` in an interpolated string's literal text: outside a hole it has to be doubled
+    /// (csc `CS8086`).
+    ///
+    /// Asymmetric with `{`, and that asymmetry is the language's: a lone `{` OPENS a hole, so it
+    /// is reported as the unclosed-hole `CS8076` above, while a lone `}` can open nothing and gets
+    /// this. One character class, two diagnostics.
+    UnescapedCloseBraceInInterpolation,
+    /// An interpolation's `:` was followed immediately by the closing `}` -- `$"{n:}"` (csc
+    /// `CS8089`). An absent specifier is written by leaving the `:` out.
+    EmptyFormatSpecifier,
+    /// A conditional expression written directly in an interpolation hole, where its `:` is read
+    /// as the start of the format specifier -- `$"{c ? a : b}"` (csc `CS8361`).
+    ///
+    /// **THE `:` ALWAYS ENDS THE HOLE; csc DOES NOT DISAMBIGUATE, IT REPORTS.** Measured, and it
+    /// is the reason this diagnostic exists at all rather than a cleverer scan: the fix csc names
+    /// -- parenthesize -- is the only one, because inside `(...)` the `:` is at a nesting depth
+    /// the format specifier never reaches.
+    ConditionalInInterpolation,
+    /// An interpolated verbatim string spelled `@$"..."` rather than `$@"..."`, under a dialect
+    /// before C# 8.0 (csc `CS8401`).
+    ///
+    /// **NOT the `Feature '...'` gate family**, which is why it is its own kind: csc gives the
+    /// two orderings different rungs (`$@` is C# 6.0, `@$` is C# 8.0) and refuses the late one
+    /// with a sentence of its own that names neither a feature nor the CURRENT version. Measured
+    /// at every dialect from 1 to 8.
+    AtDollarRequiresLaterVersion,
     /// A primary expression was expected, but the token there cannot begin one
     /// (ECMA-334 1st ed, 14.5).
     ExpressionExpected,
@@ -166,6 +214,20 @@ pub enum DiagnosticKind {
         /// The version being COMPILED, which selects the code and the message''s "in C# N".
         current: crate::version::LanguageVersion,
     },
+    /// The selected dialect PERMITS this construct and this build cannot produce it: `LAM0001`,
+    /// the other half of the two-bit rule in [`crate::version::Feature::gate_against`].
+    ///
+    /// **The message must NOT send the reader after a language version.** That is the whole reason
+    /// this is not a `CS8022`: they already passed the version that permits the construct, so
+    /// *"please use language version N or greater"* is advice they have already taken.
+    ///
+    FeatureNotInThisBuild {
+        /// The feature's noun phrase, from [`crate::version::Feature::description`].
+        feature: &'static str,
+        /// The dialect that permits it. Naming it is the load-bearing half: without it the
+        /// reader's first guess is the language version, which is the one thing that is not wrong.
+        permitted_by: crate::version::LanguageVersion,
+    },
     /// A second file-scoped namespace declaration (`namespace N;`) appeared inside the first one's
     /// body (csc CS8954).
     ///
@@ -213,7 +275,66 @@ pub enum DiagnosticKind {
     AwaitInUnsafe,
 }
 
+/// The namespace a diagnostic code belongs to.
+///
+/// **`CS` MEANS WHAT csc MEANS BY IT, ALWAYS.** A code is a search key: a developer who hits
+/// `CS0649` will look it up and land on
+/// csc's documentation, so lcsc may only spell a condition `CS` when csc has that same concept. It
+/// follows that a condition csc has NO concept of cannot borrow a `CS` number -- an unused one
+/// today is one a future Roslyn release may claim, and then the same key means two things
+/// depending on which compiler emitted it.
+///
+/// **`LAM` IS FOR EXACTLY THOSE CONDITIONS, AND IT IS A SMALL FAMILY.** Almost everything routes to
+/// csc's own codes: a BCL surface we do not ship reports as `CS0246`/`CS0234` (which is also how
+/// nanoFramework expresses a restricted platform, measured), a construct above the selected dialect
+/// reports as the `CS8022` family, and a language feature missing a compiler-required member reports
+/// as `CS0518`/`CS0656`. What is left is the condition none of those describe: the dialect permits
+/// the construct and THIS BUILD cannot produce it.
+///
+/// **The user-visible payoff is that the prefix says which kind of problem it is.** A `CS` code is a
+/// statement about the language; a `LAM` code is a statement about this build's coverage, and the
+/// second kind changes as the compiler grows where the first does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeNamespace {
+    /// csc's namespace, for conditions csc also has.
+    Cs,
+    /// Lamella's, for conditions csc has no concept of.
+    Lam,
+}
+
+impl CodeNamespace {
+    /// The literal prefix that precedes the digits: `CS` or `LAM`.
+    ///
+    /// Chosen against the widths a Problems pane already carries -- `CS0649` and `CA1822` at six
+    /// characters, `IDE0051` and `MSB3021` at seven -- so `LAM0001` costs nothing in a pane already
+    /// sized for the built-in analyzers, and one character in raw terminal output where the path
+    /// dominates the line anyway. Four digits rather than three because the extra character buys
+    /// ranges (compiler coverage, backend, linker, runtime) and three would not.
+    #[must_use]
+    pub fn prefix(self) -> &'static str {
+        match self {
+            CodeNamespace::Cs => "CS",
+            CodeNamespace::Lam => "LAM",
+        }
+    }
+}
+
+
+
 impl DiagnosticKind {
+    /// Which namespace this kind's code belongs to.
+    ///
+    /// `Cs` for everything csc also has a concept of, which is nearly all of it. A new arm here is
+    /// a claim that csc has NO code for the condition -- check before adding one.
+    ///
+    #[must_use]
+    pub fn namespace(&self) -> CodeNamespace {
+        match self {
+            DiagnosticKind::FeatureNotInThisBuild { .. } => CodeNamespace::Lam,
+            _ => CodeNamespace::Cs,
+        }
+    }
+
     /// The C# compiler code for this diagnostic, that is, the number `N` in
     /// `CSN`. Codes match the reference compiler where an equivalent exists.
     #[must_use]
@@ -243,6 +364,14 @@ impl DiagnosticKind {
             DiagnosticKind::InvalidPreprocessorExpression => 1517,
             DiagnosticKind::InvalidLineDirective => 1576,
             DiagnosticKind::LineNumberOutOfRange => 1687,
+            DiagnosticKind::ExpectedExpression => 1733,
+            DiagnosticKind::InterpolationCloseDelimiterExpected => 8076,
+            DiagnosticKind::DuplicateAccessor => 1007,
+            DiagnosticKind::InitAccessorOnStaticMember => 8856,
+            DiagnosticKind::UnescapedCloseBraceInInterpolation => 8086,
+            DiagnosticKind::EmptyFormatSpecifier => 8089,
+            DiagnosticKind::ConditionalInInterpolation => 8361,
+            DiagnosticKind::AtDollarRequiresLaterVersion => 8401,
             DiagnosticKind::ExpressionExpected => 1525,
             DiagnosticKind::TokenExpected { .. } => 1003,
             DiagnosticKind::TypeExpected => 1031,
@@ -259,6 +388,7 @@ impl DiagnosticKind {
             DiagnosticKind::OverloadableOperatorExpected => 1037,
             DiagnosticKind::InExpected => 1515,
             DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
+            DiagnosticKind::FeatureNotInThisBuild { .. } => 1,
             DiagnosticKind::OnlyOneFileScopedNamespace => 8954,
             DiagnosticKind::BothFileScopedAndNormalNamespaces => 8955,
             DiagnosticKind::FileScopedNamespaceMustPrecedeMembers => 8956,
@@ -332,6 +462,31 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::LineNumberOutOfRange => {
                 f.write_str("The line number specified for #line directive is out of range")
             }
+            DiagnosticKind::ExpectedExpression => f.write_str("Expected expression"),
+            DiagnosticKind::DuplicateAccessor => f.write_str("Property accessor already defined"),
+            DiagnosticKind::InitAccessorOnStaticMember => {
+                f.write_str("The 'init' accessor is not valid on static members")
+            }
+            DiagnosticKind::InterpolationCloseDelimiterExpected => f.write_str(
+                "Missing close delimiter '}' for interpolated expression started with '{'.",
+            ),
+            DiagnosticKind::UnescapedCloseBraceInInterpolation => f.write_str(
+                "A '}' character must be escaped (by doubling) in an interpolated string.",
+            ),
+            DiagnosticKind::EmptyFormatSpecifier => f.write_str("Empty format specifier."),
+            DiagnosticKind::ConditionalInInterpolation => f.write_str(
+                concat!(
+                    "A conditional expression cannot be used directly in a string ",
+                    "interpolation because the ':' ends the interpolation. ",
+                    "Parenthesize the conditional expression.",
+                ),
+            ),
+            DiagnosticKind::AtDollarRequiresLaterVersion => f.write_str(
+                concat!(
+                    "To use '@$' instead of '$@' for an interpolated verbatim string, ",
+                    "please use language version '8.0' or greater.",
+                ),
+            ),
             DiagnosticKind::ExpressionExpected => f.write_str("Invalid expression term"),
             DiagnosticKind::TokenExpected { expected } => {
                 write!(f, "Syntax error, '{expected}' expected")
@@ -379,6 +534,14 @@ impl fmt::Display for DiagnosticKind {
                     current.message_name()
                 )
             }
+            DiagnosticKind::FeatureNotInThisBuild {
+                feature,
+                permitted_by,
+            } => write!(
+                f,
+                "Feature '{feature}' is permitted by C# {} but is not provided by this build of Lamella.",
+                permitted_by.message_name()
+            ),
             DiagnosticKind::OnlyOneFileScopedNamespace => {
                 f.write_str("Source file can only contain one file-scoped namespace declaration.")
             }

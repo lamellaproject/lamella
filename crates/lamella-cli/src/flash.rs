@@ -1,107 +1,19 @@
 //! Writing bytes to a chip: the `flash` verb, and the mechanism `deploy --board` writes through.
 
 use crate::args::{self, Spec};
-use crate::catalogue;
+pub use lamella_flash_routes::{can_flash, uf2_family_for_board};
+use lamella_flash_routes::{
+    Programmer, check_base, check_rp2350_stamp, is_uf2, programmer_for, route_for,
+    selector_for, write,
+};
 use std::path::Path;
 use std::process::ExitCode;
 
-/// How a board takes an image, and what the ahead-of-time backend calls its chip.
-///
-/// **HOW A BOARD IS PROGRAMMED IS NOT WHAT ITS `[[carriers]]` DECLARES, AND THE TWO READ ALIKE.**
-/// A carrier records the path the Lamella Link console takes through a RUNNING board; this table
-/// records how firmware reaches a BLANK one. A bridge usually offers both, which is why one is so
-/// easily mistaken for the other.
-///
-/// The table lives here in ONE place with a census over it, so a board missing from it fails
-/// loudly rather than quietly.
-struct Programming {
-    /// The board id, as `lamella boards` lists it.
-    board: &'static str,
-    /// The chip name `lamella_aot::build::build_cortex_m` knows this board by.
-    aot_target: &'static str,
-    /// How the image reaches the board.
-    programmer: Programmer,
-}
 
-/// The ways an image reaches a board. One variant per mechanism, not per board.
-#[derive(Clone, Copy)]
-enum Programmer {
-    /// The micro:bit v1's on-board DAPLink probe, over SWD.
-    MicrobitV1Daplink,
-    /// The micro:bit v2's on-board DAPLink probe, over SWD. A separate variant from the v1's
-    /// because the part differs: the write path checks the debug port's IDCODE BEFORE it erases,
-    /// so pointing a v2 image at a v1 board stops at a message rather than erasing the board and
-    /// then writing an image its core cannot run.
-    MicrobitV2Daplink,
-    /// A UF2 bootloader volume: the image is COPIED to a drive the halted chip presents. Needs no
-    /// probe at all, which is why it is the shortest path from nothing to a running board -- and
-    /// why it is the one a person with a brand-new board can follow.
-    Uf2Volume {
-        /// The chip family the bootloader checks the image against, so one built for another part
-        /// is refused instead of run.
-        family: u32,
-        /// Where the image belongs in the chip's address space.
-        base: u32,
-    },
-}
 
-impl Programmer {
-    /// What this mechanism is, for a person reading the output.
-    fn description(self) -> &'static str {
-        match self {
-            Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => {
-                "the board's on-board DAPLink probe, over SWD"
-            }
-            Programmer::Uf2Volume { .. } => "the board's bootloader volume, by copying the image",
-        }
-    }
 
-    /// The address this mechanism writes an image from.
-    ///
-    /// **ONE PLACE STATES IT, so the address a `build --format` file declares is the address a
-    /// write actually uses.** A file that said one thing while the writer did another would be
-    /// wrong in the way nothing catches: it would flash correctly here and be rejected, or
-    /// misplaced, by somebody else's programmer.
-    fn flash_base(self) -> u32 {
-        match self {
-            Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => 0,
-            Programmer::Uf2Volume { base, .. } => base,
-        }
-    }
 
-    /// The format an image must be written in to reach this mechanism, where the mechanism decides
-    /// it. A probe takes raw bytes; a bootloader volume takes a file, and which file matters.
-    fn required_format(self) -> Option<crate::artifact::Format> {
-        match self {
-            Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => None,
-            Programmer::Uf2Volume { family, .. } => {
-                Some(crate::artifact::Format::Uf2 { family })
-            }
-        }
-    }
 
-    /// The USB vendor and product this mechanism's probes present, taken from the crate that owns
-    /// the fact rather than restated here.
-    fn usb_identity(self) -> Option<(u16, u16)> {
-        match self {
-            Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => {
-                Some(lamella_cmsis_dap_nrf::MICROBIT_DAPLINK)
-            }
-            Programmer::Uf2Volume { .. } => None,
-        }
-    }
-}
-
-/// The RP2350 in its Arm secure profile, as its bootloader checks it. `bin2uf2` states the same
-/// number and this is the second place it appears; when a third wants it, it wants a home in
-/// `lamella-wire` beside the other wire-visible identifiers rather than a third copy.
-const RP2350_UF2_FAMILY: u32 = 0xe48b_ff59;
-
-/// The RP2040's family id, for the same bootloader on the older part.
-const RP2040_UF2_FAMILY: u32 = 0xe48b_ff56;
-
-/// Where an RP2350 or RP2040 image belongs: the base of execute-in-place flash.
-const RP2_XIP_BASE: u32 = 0x1000_0000;
 
 /// Settle WHICH board to write, adding an interactive rung STRICTLY BELOW the refusal.
 ///
@@ -184,45 +96,7 @@ fn list_of(candidates: &[String]) -> String {
         .join("\n")
 }
 
-/// Every board this build can write, and how.
-const PROGRAMMING: &[Programming] = &[
-    Programming {
-        board: "micro-bit-v1",
-        aot_target: "microbit",
-        programmer: Programmer::MicrobitV1Daplink,
-    },
-    Programming {
-        board: "micro-bit-v2",
-        aot_target: "nrf52833",
-        programmer: Programmer::MicrobitV2Daplink,
-    },
-    Programming {
-        board: "rpi-pico2",
-        aot_target: "rp2350",
-        programmer: Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE },
-    },
-    Programming {
-        board: "rpi-pico2-w",
-        aot_target: "rp2350",
-        programmer: Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE },
-    },
-    Programming {
-        board: "rpi-pico",
-        aot_target: "rp2040",
-        programmer: Programmer::Uf2Volume { family: RP2040_UF2_FAMILY, base: RP2_XIP_BASE },
-    },
-    Programming {
-        board: "rpi-pico-w",
-        aot_target: "rp2040",
-        programmer: Programmer::Uf2Volume { family: RP2040_UF2_FAMILY, base: RP2_XIP_BASE },
-    },
-];
 
-/// Whether `lamella flash` can write `board`, for the `boards` listing's coverage column.
-#[must_use]
-pub fn can_flash(board: &str) -> bool {
-    PROGRAMMING.iter().any(|row| row.board == board)
-}
 
 /// `lamella flash <artifact> --board <id>`: write bytes that are already an image.
 ///
@@ -231,25 +105,69 @@ pub fn can_flash(board: &str) -> bool {
 /// whole reason the verb exists separately -- a tool with two words for one job teaches nobody
 /// anything, and "flash a `.cs` file" is not a sentence about the hardware.
 pub fn flash_command(args: &[String]) -> ExitCode {
-    let spec = Spec { verb: "flash", values: &["--board", "--probe"], flags: &[] };
-    let parsed = match args::parse(args, &spec) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+    let spec = Spec {
+        verb: "flash",
+        usage: Some(USAGE),
+        values: &["--board", "--probe", "--volume", "--via"],
+        flags: &[],
     };
-    let path = match parsed.only_positional("flash", "prebuilt image") {
+    let parsed = match args::parse_or_halt(args, &spec) {
+        Ok(parsed) => parsed,
+        Err(halt) => return halt.code(),
+    };
+    let path = match parsed.only_positional("flash", POSITIONAL) {
         Ok(path) => Path::new(path).to_path_buf(),
         Err(error) => {
             eprintln!("{error}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
-    let Some(board_id) = parsed.value("--board") else {
-        eprintln!("lamella flash: --board is required -- it says which chip is written.\n\n{USAGE}");
-        return ExitCode::FAILURE;
+    let manifest = match lamella_flash_routes::manifest::read(&path) {
+        Ok(manifest) => manifest,
+        Err(why) => {
+            eprintln!(
+                "lamella flash: {why}\n\n\
+                 A sidecar that is present and cannot be read is a claim about this image that \
+                 nobody can\ncheck, which is why it stops the write. Delete it to flash the bytes \
+                 unchecked."
+            );
+            return ExitCode::FAILURE;
+        }
     };
+    let board_id = match (parsed.value("--board"), manifest.as_ref()) {
+        (Some(named), Some(manifest)) => {
+            if let Err(why) = lamella_flash_routes::manifest::check_board(manifest, named) {
+                eprintln!("lamella flash: {why}");
+                return ExitCode::FAILURE;
+            }
+            named
+        }
+        (Some(named), None) => named,
+        (None, Some(manifest)) => manifest.board.as_str(),
+        (None, None) => {
+            eprintln!(
+                "lamella flash: --board is required -- it says which chip is written.\n\n{USAGE}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(manifest) = manifest.as_ref() {
+        let shipped = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("lamella flash: read {}: {error}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let extension = lamella_flash_routes::artifact::classify_format(&path);
+        if let Err(why) =
+            lamella_flash_routes::manifest::check_identity(manifest, &shipped, extension.as_deref())
+        {
+            eprintln!("lamella flash: {why}");
+            return ExitCode::FAILURE;
+        }
+        println!("{}", lamella_flash_routes::manifest::attestation(manifest));
+    }
     let row = match programmer_for(board_id) {
         Ok(row) => row,
         Err(error) => {
@@ -257,10 +175,17 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let chosen = match route_for(row, parsed.value("--via")) {
+        Ok(programmer) => programmer,
+        Err(error) => {
+            eprintln!("lamella flash: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match crate::artifact::classify(&path) {
-        crate::artifact::Kind::ChipImage => {}
-        crate::artifact::Kind::Source => {
+    match lamella_flash_routes::artifact::classify(&path) {
+        lamella_flash_routes::artifact::Kind::ChipImage => {}
+        lamella_flash_routes::artifact::Kind::Source => {
             eprintln!(
                 "lamella flash: {} is source, and this verb writes bytes that are already an \
                  image.\n\n\
@@ -273,7 +198,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
-        crate::artifact::Kind::WirePayload => {
+        lamella_flash_routes::artifact::Kind::WirePayload => {
             eprintln!(
                 "lamella flash: {} is loaded BY firmware rather than written to a chip -- it needs \
                  a board that\nis already running Lamella, not a probe.\n\n\
@@ -285,9 +210,9 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let (bytes, described) = match row.programmer.required_format() {
+    let (bytes, described) = match chosen.required_format() {
         Some(required) => {
-            let named = crate::artifact::classify_format(&path);
+            let named = lamella_flash_routes::artifact::classify_format(&path);
             let raw = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -295,20 +220,18 @@ pub fn flash_command(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match named {
+            match named.as_deref() {
                 Some(extension) if extension == required.extension() => {
                     let count = raw.len();
                     (raw, format!("{count} B of {}", required.description()))
                 }
                 Some("bin") => {
-                    let wrapped = required.render(&raw, row.programmer.flash_base());
-                    let described = format!(
-                        "{} B of raw binary, wrapped as {} at {:#010x}",
-                        raw.len(),
-                        required.description(),
-                        row.programmer.flash_base()
-                    );
-                    (wrapped, described)
+                    if let Err(why) = check_rp2350_stamp(&raw, row.aot_target) {
+                        eprintln!("lamella flash: {why}");
+                        return ExitCode::FAILURE;
+                    }
+                    let count = raw.len();
+                    (raw, format!("{count} B of raw binary"))
                 }
                 _ => {
                     eprintln!(
@@ -324,15 +247,19 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             }
         }
         None => {
-            let artifact = match crate::artifact::read(&path) {
+            let artifact = match lamella_flash_routes::artifact::read(&path) {
                 Ok(artifact) => artifact,
                 Err(error) => {
                     eprintln!("lamella flash: {error}");
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(error) = check_base(&artifact, row.programmer) {
+            if let Err(error) = check_base(&artifact, chosen) {
                 eprintln!("lamella flash: {error}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(why) = check_rp2350_stamp(&artifact.bytes, row.aot_target) {
+                eprintln!("lamella flash: {why}");
                 return ExitCode::FAILURE;
             }
             let described = format!("{} B of {}", artifact.bytes.len(), artifact.format);
@@ -340,41 +267,100 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         }
     };
     println!("read {described} from {}", path.display());
-    write_image(row, &bytes, parsed.value("--probe"))
+    let selector = match selector_for(chosen, parsed.value("--probe"), parsed.value("--volume")) {
+        Ok(selector) => selector,
+        Err(error) => {
+            eprintln!("lamella flash: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    write_image(chosen, row.aot_target, &bytes, selector.as_deref())
 }
 
-/// The mechanism for `board_id`, or the message explaining why there is none.
+
+
+
+/// What to tell the reader about a completed write.
 ///
-/// # Errors
-/// An unknown board id, or one no mechanism covers. The two read differently on purpose.
-fn programmer_for(board_id: &str) -> Result<&'static Programming, String> {
-    catalogue::resolve(board_id).map_err(|error| format!("lamella flash: {error}\n"))?;
-    PROGRAMMING
-        .iter()
-        .find(|row| row.board == board_id)
-        .ok_or_else(|| cannot_write(board_id))
+/// **IT IS NOT THE SAME SENTENCE ON BOTH ROUTES.** A probe write reads every word back and may
+/// therefore report a verification; a bootloader-volume write cannot, so it says what the
+/// bootloader checked and states plainly that nothing read the flash. Most boards this build can write
+/// take the volume route, so a single shared sentence claiming verification would
+/// be wrong more often than right -- and wrong in the direction that reassures, since a reader
+/// checking whether their image landed would be told a check had passed that never ran.
+///
+/// A pure function so the wording is testable without a board.
+fn completion_line(programmer: Programmer, report: &lamella_flash_backend::Report) -> String {
+    let units = programmer.units(report.bytes);
+    match report.verification {
+        lamella_flash_backend::Verification::ReadBack => {
+            format!("wrote and verified {} B ({units}); the board is running it.", report.bytes)
+        }
+        lamella_flash_backend::Verification::NotPossible(_) => {
+            let mut line =
+                format!("wrote {} B ({units}); the board is running it.
+", report.bytes);
+            line.push_str(
+                "The bootloader admitted the image -- its family id and every block's magic and ",
+            );
+            line.push_str(
+                "index checked out --
+but NOTHING READ THE FLASH BACK: this route hands over a ",
+            );
+            line.push_str("file and the volume unmounts.");
+            line
+        }
+        lamella_flash_backend::Verification::Skipped => format!(
+            "wrote {} B ({units}); the board is running it.
+VERIFICATION WAS SKIPPED at your              request -- this route can read every byte back and was told not to.",
+            report.bytes
+        ),
+    }
 }
+
+
+
 
 /// Write `image` to the board `row` describes, settling which physical board first.
 ///
 /// Shared by `flash` and by `deploy --board`, so the probe ladder, the interactive rung and the
 /// reporting are identical whether the bytes were compiled a moment ago or read off disk. The
 /// board cannot tell the difference and neither should the output.
-fn write_image(row: &Programming, image: &[u8], probe: Option<&str>) -> ExitCode {
-    let probe = match choose_board(row.programmer, probe) {
+fn write_image(
+    programmer: Programmer,
+    _aot_target: Option<&str>,
+    image: &[u8],
+    probe: Option<&str>,
+) -> ExitCode {
+    let probe = match choose_board(programmer, probe) {
         Ok(chosen) => chosen,
         Err(error) => {
             eprintln!("lamella: {error}");
             return ExitCode::FAILURE;
         }
     };
-    println!("writing over {}...", row.programmer.description());
-    match write(row.programmer, image, probe.as_deref()) {
+    let wrapped;
+    let image = match programmer.required_format() {
+        Some(lamella_flash_routes::artifact::Format::Uf2 { family }) if !is_uf2(image) => {
+            wrapped = lamella_flash_routes::artifact::Format::Uf2 { family }
+                .render(image, programmer.flash_base());
+            println!(
+                "wrapped {} B as UF2 at {:#010x} (family {family:#010x})",
+                image.len(),
+                programmer.flash_base()
+            );
+            &wrapped[..]
+        }
+        _ => image,
+    };
+    println!("writing over {}...", programmer.description());
+    match write(programmer, image, probe.as_deref()) {
         Ok(report) => {
             println!(
-                "wrote and verified {} B ({} words); the board is running it.",
-                report.bytes, report.words
+                "  the part answered {:#x} -- {}",
+                report.identity.value, report.identity.what
             );
+            println!("{}", completion_line(programmer, &report));
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -394,6 +380,7 @@ pub fn deploy_to_chip(
     path: &Path,
     board_id: &str,
     probe: Option<&str>,
+    via: Option<&str>,
     unsafe_code: bool,
 ) -> ExitCode {
     let row = match programmer_for(board_id) {
@@ -410,7 +397,11 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
-    let image = match build_image(path, &source, row.aot_target, unsafe_code) {
+    let Some(aot_target) = row.aot_target else {
+        eprintln!("{}", cannot_build_for(board_id));
+        return ExitCode::FAILURE;
+    };
+    let image = match build_image(path, &source, aot_target, unsafe_code) {
         Ok(image) => image,
         Err(error) => {
             eprintln!("{error}");
@@ -420,9 +411,16 @@ pub fn deploy_to_chip(
     println!(
         "built {} B for {board_id} ({}), ahead of time -- no firmware needed on the board",
         image.len(),
-        row.aot_target
+        aot_target
     );
-    write_image(row, &image, probe)
+    let chosen = match route_for(row, via) {
+        Ok(programmer) => programmer,
+        Err(error) => {
+            eprintln!("lamella deploy: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    write_image(chosen, row.aot_target, &image, probe)
 }
 
 /// The bare-metal image for `board_id`, and the address it belongs at -- what `build --format`
@@ -441,22 +439,35 @@ pub fn image_for_board(
     unsafe_code: bool,
 ) -> Result<(Vec<u8>, u32), String> {
     let row = programmer_for(board_id)?;
-    let image = build_image(path, source, row.aot_target, unsafe_code)?;
+    let aot_target = row.aot_target.ok_or_else(|| cannot_build_for(board_id))?;
+    let image = build_image(path, source, aot_target, unsafe_code)?;
     Ok((image, row.programmer.flash_base()))
 }
 
-/// The chip family a UF2 for `board_id` must declare, when its mechanism uses one.
+
+/// The message for a board this tree can WRITE and cannot BUILD FOR.
 ///
-/// **THE FAMILY BELONGS TO THE CHIP AND SO IT COMES FROM THE BOARD.** A `--format uf2` on the
-/// command line cannot supply it, and a UF2 carrying the wrong one is refused by the bootloader --
-/// which is the behavior worth preserving, so it is filled in from here rather than defaulted.
-#[must_use]
-pub fn uf2_family_for_board(board_id: &str) -> Option<u32> {
-    let row = PROGRAMMING.iter().find(|row| row.board == board_id)?;
-    match row.programmer {
-        Programmer::Uf2Volume { family, .. } => Some(family),
-        _ => None,
-    }
+/// **THE TWO VERBS DIVERGE HERE AND A READER HAS TO BE TOLD WHICH ONE THEY WANT.** `flash` takes an
+/// image that already exists and does not care what built it; `deploy` compiles first, so a board
+/// with no ahead-of-time target has nothing for it to compile TO. Saying "unsupported board" would
+/// be false -- the board is in the table precisely because it can be written.
+fn cannot_build_for(board_id: &str) -> String {
+    let mut message = format!(
+        "lamella deploy: {board_id} can be FLASHED but not BUILT FOR -- the ahead-of-time
+"
+    );
+    message.push_str("backend has no target for its chip, so there is nothing to compile this
+");
+    message.push_str("program into.
+
+");
+    message.push_str(&format!("    lamella flash <image> --board {board_id}
+
+"));
+    message.push_str("writes an image that already exists, which is the verb this board
+");
+    message.push_str("supports today.");
+    message
 }
 
 /// Compile `source` and lower it ahead of time to a bare-metal image for `aot_target`.
@@ -488,28 +499,6 @@ fn build_image(
     })
 }
 
-/// Check that a prebuilt image belongs where this mechanism writes.
-///
-/// **A FILE THAT STATES AN ADDRESS IS BELIEVED ABOUT ITS OWN ADDRESS, NOT ABOUT OURS.** Intel HEX
-/// carries a base, and every mechanism here writes from a fixed one; a file built for a different
-/// part -- an STM32 image at `0x0800_0000`, say -- is well-formed, parses cleanly, and would be
-/// written to the wrong place on a Nordic part where flash begins at zero. That is a silent bad
-/// flash, so the disagreement is a refusal rather than a warning.
-///
-/// # Errors
-/// When the artifact states a base this mechanism does not write to.
-fn check_base(artifact: &crate::artifact::Artifact, programmer: Programmer) -> Result<(), String> {
-    let expected = programmer.flash_base();
-    if artifact.base == expected {
-        return Ok(());
-    }
-    Err(format!(
-        "this image states it belongs at {:#010x}, and this board is written from {expected:#010x}.\n\
-         It was almost certainly built for a different part -- writing it here would put the right \
-         bytes\nin the wrong place, which a board reports as nothing at all.",
-        artifact.base
-    ))
-}
 
 /// Whether `assembly` declares a static method named `Main`.
 ///
@@ -525,165 +514,163 @@ fn has_static_main(assembly: &[u8]) -> bool {
     })
 }
 
-/// What a write reported.
-struct Written {
-    bytes: usize,
-    words: usize,
-}
 
-/// Write `image` to the board through `programmer`.
-fn write(
-    programmer: Programmer,
-    image: &[u8],
-    probe: Option<&str>,
-) -> Result<Written, String> {
-    let report = match programmer {
-        Programmer::MicrobitV1Daplink => lamella_cmsis_dap_nrf::flash_microbit(image, probe),
-        Programmer::MicrobitV2Daplink => lamella_cmsis_dap_nrf::flash_microbit_v2(image, probe),
-        Programmer::Uf2Volume { .. } => return copy_to_volume(image, probe),
-    };
-    report
-        .map(|report| Written { bytes: report.bytes, words: report.words })
-        .map_err(describe)
-}
 
-/// Copy `image` to a bootloader volume, and settle WHICH volume first.
-///
-/// **THE VOLUME CANNOT BE CHOSEN BY LABEL AND THIS IS NOT A DETAIL.** Two RP2350s in BOOTSEL mount
-/// as two drives both labelled `RP2350`, with byte-identical `INFO_UF2.TXT` files -- measured. So
-/// nothing readable from a volume distinguishes them, and a copy aimed at "the RP2350 drive" is a
-/// coin flip whose wrong outcome is somebody else's board taking your program. With more than one
-/// mounted, this REFUSES and names them, exactly as the probe ladder does.
-fn copy_to_volume(image: &[u8], requested: Option<&str>) -> Result<Written, String> {
-    let mounted: Vec<crate::bootsel::Waiting> = crate::bootsel::waiting()
-        .into_iter()
-        .filter(|found| found.via == crate::bootsel::Via::Bootloader)
-        .collect();
-    let volume = match requested {
-        Some(named) => named.to_owned(),
-        None => match mounted.as_slice() {
-            [] => {
-                return Err(
-                    "no board is in its bootloader. Hold BOOTSEL while plugging the board in \
-                     (or press RESET\nwith BOOTSEL held), and it will appear as a drive."
-                        .to_owned(),
-                );
-            }
-            [only] => only.volume.clone(),
-            several => {
-                let list: Vec<&str> =
-                    several.iter().map(|found| found.volume.as_str()).collect();
-                return Err(format!(
-                    "{} boards are in their bootloader and nothing on a volume tells them apart: \
-                     {}\n\nName one with --probe <volume>. Their labels and their INFO_UF2.TXT \
-                     files are identical, so\nthis will not guess -- the wrong choice puts your \
-                     program on somebody else's board.",
-                    several.len(),
-                    list.join(", ")
-                ));
-            }
-        },
-    };
-    let destination = std::path::Path::new(&volume).join("lamella.uf2");
-    write_through(&destination, image)
-        .map_err(|error| format!("copying to {}: {error}", destination.display()))?;
-    Ok(Written { bytes: image.len(), words: image.len() / UF2_BLOCK })
-}
 
-/// Write `bytes` to `path` and make sure they have actually reached the device.
-///
-/// **`fs::write` IS NOT ENOUGH HERE AND THE FAILURE IS SILENT.** It writes and closes, which hands
-/// the data to the operating system; on a removable volume the operating system is entitled to
-/// hold it in cache. A bootloader volume is not a disk -- it is a device watching for blocks, and
-/// it acts the moment they arrive. Without a flush the copy reports success, the file stays in the
-/// directory listing, and the board stays in its bootloader, because nothing has been delivered:
-/// every layer reports success and nothing happens.
-///
-/// `sync_all` is the difference: it flushes the file's buffers through to the device before the
-/// call returns, so a success here means the board has the bytes.
-fn write_through(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
 
-/// A UF2 block, for reporting how many crossed.
-const UF2_BLOCK: usize = 512;
 
-/// A write failure in terms that name the next move.
-fn describe(error: lamella_cmsis_dap_nrf::FlashError) -> String {
-    match error {
-        lamella_cmsis_dap_nrf::FlashError::ProbeOpen(text) => format!(
-            "{text}\n\nName the board with --probe <serial>, or set LAMELLA_PROBE_SERIAL. \
-             `lamella devices`\nlists what is attached. A bench with more than one board of a \
-             family is refused rather than\nguessed at, because a write to the wrong board \
-             succeeds and says nothing."
-        ),
-        other => format!("{other:?}"),
-    }
-}
 
-/// What to print for a board this build cannot write.
-///
-/// **IT NAMES WHAT IS MISSING RATHER THAN REPORTING A CAPABILITY GAP.** The reader's question is
-/// "can I use my board", and the honest answer distinguishes a board nobody has taught this tool
-/// about from one that cannot work -- they are completely different waits.
-fn cannot_write(board: &str) -> String {
-    let mut text = format!("lamella flash: this build cannot write {board}.\n\n");
-    text.push_str("it can write:\n");
-    for row in PROGRAMMING {
-        text.push_str(&format!("  {:<16} {}\n", row.board, row.programmer.description()));
-    }
-    text.push_str(
-        "\nthat list is short because how a board is PROGRAMMED is not yet stated in any board \
-         file --\nthe board files declare how a running board is TALKED TO, which is a different \
-         fact. Every\nmechanism here has to be added by hand until it is.\n\n\
-         `lamella build <file> --board ",
-    );
-    text.push_str(board);
-    text.push_str("` still builds and measures an image for it.\n");
-    text
-}
+
+
+
+
+
 
 const USAGE: &str = "\
-usage: lamella flash <file.cs> --board <id> [--probe <serial>]
+usage: lamella flash <image> [--board <id>] [--via probe|volume]
+                          [--probe <serial>]  which probe, on a probe route
+                          [--volume <name>]   which drive, on a volume route
 
-Builds the program ahead of time and writes it to the board over its debug probe. The board needs
-nothing on it first -- the image IS the program.
+Writes an image that ALREADY EXISTS to the board's chip, over its debug probe. It does not compile
+anything -- `lamella build <file> --board <id> --format <f>` produces what this takes, and
+`lamella deploy` is the two steps in one. The board needs nothing on it first.
 
---probe names WHICH board when more than one of a family is attached. Without it, LAMELLA_PROBE_SERIAL
-is used, then the sole attached board of that family, and otherwise the write is REFUSED with every
-candidate named. A write to the wrong board succeeds and reports nothing, so it is never guessed at.
+The image is read by extension: .hex, .bin, .s19, .elf, or the .uf2 a bootloader-volume board
+takes. A linked .elf is flattened the way `objcopy -O binary` would, by physical address, so an
+image another toolchain produced needs no conversion step. A .bin for a bootloader-volume board is
+wrapped into a .uf2 here, because the address and the family id that requires are facts about the
+board and are already known.
+
+--probe names WHICH probe when more than one is attached; --volume names which drive. They are
+different questions and each belongs to one route, so naming the wrong one is refused rather than
+ignored. Without either, LAMELLA_PROBE_SERIAL is used, then the sole candidate, and otherwise the
+write is REFUSED with every candidate named. A write to the wrong board succeeds and reports
+nothing, so it is never guessed at.
+
+WITHOUT --via, the board is written by ITS OWN mechanism: a debugger soldered to it if it has one,
+otherwise its bootloader drive. That needs no hardware you do not already own, and it is never a
+guess -- a debugger on the board cannot be the one wired to something else, so having an external
+probe plugged in as well changes nothing and you are not asked to choose.
+
+--via asks for a DIFFERENT route than the board's own:
+
+  volume   the bootloader drive. What a Pico takes by default, since it has no debugger of its
+           own. It CANNOT read the flash back; what it can tell you is whether the board
+           rebooted, which is the bootloader's acknowledgement that it took the image.
+  probe    an EXTERNAL SWD probe. Reads every byte back and compares it, which is the only way
+           to know the image is really there. Takes .bin/.hex/.elf/.s19, never a .uf2.
+
+An external probe could be wired to any board, so when more than one is attached --via probe
+REFUSES until you name one with --probe <serial>. That is the same rule as everywhere else and not
+a stricter one: with a board's own debugger there is nothing to disambiguate, and here there is.
+
+A SIDECAR beside the image -- <image>.manifest.json -- says which board it was built for and what
+its bytes hash to. When one is there, --board is optional and is checked against it, and the image
+is checked against its own digest before any probe is opened. A file of bytes cannot say which
+board it belongs to, and two boards on a bench with two images in a directory is how the wrong one
+gets written. An absent sidecar changes nothing; a sidecar that will not parse stops the write,
+because a claim nobody can check is worse than no claim.
 ";
+
+/// What `flash` calls the word it wants, in the one place both the error and the usage read it
+/// from.
+///
+/// **THE ERROR AND THE USAGE ARE PRINTED TOGETHER, SO THEY MUST NAME THE SAME THING.**
+/// `only_positional` builds the complaint from this noun and [`USAGE`] is printed directly beneath
+/// it; taking both from here is what keeps the two sentences a reader sees from disagreeing.
+const POSITIONAL: &str = "prebuilt image";
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamella_flash_routes::{PROGRAMMING, RP2_XIP_BASE, RP2350_UF2_FAMILY, cannot_write};
 
-    /// **A CENSUS OVER THE TABLE, BECAUSE THE TABLE IS HAND-MAINTAINED AND IN THE WRONG PLACE.**
-    /// Every board it names must exist in the catalogue and must name a chip the backend knows. A
-    /// typo in either column would otherwise surface as "cannot write that board" or as a build
-    /// failure at a user's prompt, neither of which points at this file.
-    #[test]
-    fn every_programmable_board_resolves_and_names_a_target_the_backend_knows() {
-        for row in PROGRAMMING {
-            assert!(
-                catalogue::load_board(row.board).is_some(),
-                "{}: not a board in the catalogue -- `lamella boards` does not list it",
-                row.board
-            );
-            assert!(
-                lamella_aot::build::CORTEX_M_TARGETS.contains(&row.aot_target),
-                "{}: the backend does not know a chip called {:?}; it knows {:?}",
-                row.board,
-                row.aot_target,
-                lamella_aot::build::CORTEX_M_TARGETS
-            );
+    /// **THE TWO STRINGS ARE PRINTED TOGETHER, SO THEY MUST AGREE.** `eprintln!("{error}\n\n{USAGE}")`
+    /// puts *give a prebuilt image* directly above the usage, and for as long as this verb compiled
+    /// source and then stopped, the usage below it said `<file.cs>` and *Builds the program ahead of
+    /// time*. Nothing could see it: the module header, `main.rs` and the error line were all right,
+    /// and the one wrong string was the one a reader is shown at the moment they need it.
+    ///
+    /// Asserting the NOUN rather than the whole sentence is what makes this cheap enough to keep:
+    /// the usage may be rewritten freely, and it may not stop naming the thing the verb asks for.
+    /// **AND IT MUST NOT ASK FOR SOURCE.** The positive check above passes on a usage that says
+    /// `<image>` and then goes on to describe compiling one, which is exactly the state this was
+    /// found in. `flash` takes what `build` produced; `deploy` is the verb that compiles.
+    /// **A BOARD WITH ITS OWN DEBUGGER IS NEVER AMBIGUOUS WITH AN EXTERNAL PROBE**, and this is
+    /// the assertion that keeps it that way.
+    ///
+    /// A debugger soldered to a board cannot be wired to a different one, so naming the board has
+    /// already named the debugger. Somebody who owns a micro:bit AND a Debug Probe must not be
+    /// asked which to use -- the answer is the board's own, every time, without a prompt.
+    ///
+    /// The vendor/product filter is what delivers that: the external probe does not match it and
+    /// is never a candidate. A future change that widened these routes to "any attached probe"
+    /// would turn a bench with two pieces of hardware into a refusal, which is why the filter's
+    /// PRESENCE is asserted rather than left as an implementation detail.
+    /// **A DRIVE AND A PROBE ARE DIFFERENT QUESTIONS**, so naming the wrong one is refused rather
+    /// than quietly dropped -- a reader who typed `--probe` at a volume route believed they had
+    /// said which board.
+    /// `--via probe` must be a deliberate act, never something a board falls into.
+    ///
+    /// **THE DEFAULT MATTERS MORE THAN THE OPTION.** Somebody opening a new Pico owns no probe, and
+    /// a tool that reached for one by default would be unusable to them at exactly the moment they
+    /// are deciding whether it works at all.
+    /// A route a board does not have is refused BY NAME rather than silently ignored.
+    ///
+    /// Ignoring it would write the board over the volume while the reader believed a probe had
+    /// been used -- and believed, therefore, that the image had been read back.
+    /// An unknown `--via` value names both routes rather than restating the grammar.
+    /// **THE PROBE ROUTE TAKES RAW BYTES AND THE VOLUME ROUTE TAKES A UF2**, so the artifact a verb
+    /// demands has to follow the route rather than the board. Getting this backwards would write a
+    /// UF2 CONTAINER into flash -- headers and all -- which boots into nothing.
+    /// A UF2 must not be wrapped twice, and a flat image must be wrapped once.
+    ///
+    /// A report for wording tests, so the tests state the SITUATION and not the sentence.
+    fn report(bytes: usize, verification: lamella_flash_backend::Verification)
+        -> lamella_flash_backend::Report {
+        lamella_flash_backend::Report {
+            mechanism: "test",
+            identity: lamella_flash_backend::PartIdentity { value: 0, what: "test" },
+            base: 0,
+            bytes,
+            verification,
         }
-        assert!(!PROGRAMMING.is_empty(), "an empty table would pass every assertion above");
     }
 
+    /// **THE THREE OUTCOMES MUST READ DIFFERENTLY, AND ONE SHARED SENTENCE CANNOT CARRY THEM.** Most
+    /// boards this build can write take the bootloader-volume route, where nothing reads anything
+    /// back -- so a shared "wrote and verified" would be false more often than true, and false in
+    /// the direction that reassures a reader checking whether their image landed.
+    /// A read-back that really did happen must still be reported as one, or avoiding that claim
+    /// would trade one false sentence for another.
+    /// A skipped verification is a THIRD thing and must not read as either of the others.
+    ///
+    /// It is the state a reader is most likely to misread, because the write succeeded and the
+    /// board is running: nothing about the outcome hints that a check the route CAN do was not done.
+    ///
+    /// **AN UNSTAMPED RP2350 IMAGE MUST BE REFUSED HERE, BECAUSE THE BOARD WILL NOT SAY ANYTHING.**
+    /// The bootrom scans the first 4 KB for a PICOBIN block and, finding none, does not boot: no
+    /// fault, no output, nothing to read back. A correct-but-unstamped image is indistinguishable
+    /// from a blank chip and from a program that hung on its first instruction.
+    /// **AND A STAMPED ONE MUST PASS, WHEREVER THE BLOCK SITS.** `lamella_aot` puts it at 0x40,
+    /// right after the vector table; another toolchain may place it anywhere the bootrom looks, so
+    /// a guard stricter than the bootrom would refuse images that boot. Both positions, because a
+    /// fixed-offset check passes the first and fails the second.
+    /// **THE GUARD IS FOR ONE PART AND MUST NOT REACH THE OTHERS.** A micro:bit image carries no
+    /// PICOBIN block and never should; a guard that fired on every board would refuse every image
+    /// this tool has ever written.
+    /// An image shorter than the scan window is scanned as far as it goes rather than indexing off
+    /// the end -- a trivial program builds to a few hundred bytes, well under the 4 KB window.
+    /// **THE POSITIVE CONTROL, AND IT CROSSES THE CRATE BOUNDARY ON PURPOSE.** A guard that has
+    /// only ever been seen to refuse is not a guard: this asserts that the image `lamella_aot`
+    /// emits for an RP2350 passes it. The two sides state the same magic word independently -- the
+    /// builder writes it, this reads it -- so a change to either that broke the pair would fail
+    /// here rather than on a board that says nothing.
+    /// **A CENSUS OVER THE TABLE, BECAUSE THE TABLE IS HAND-MAINTAINED AND IN THE WRONG PLACE.**
+    /// Every board it names must exist in the catalog and must name a chip the backend knows. A
+    /// typo in either column would otherwise surface as "cannot write that board" or as a build
+    /// failure at a user's prompt, neither of which points at this file.
     /// A self-contained program of the shape the flat path covers: device registers written
     /// through raw pointers, then a loop that never returns. The addresses are the micro:bit v1's;
     /// what is under test is the PIPELINE, which lowers the same way whatever the constants are.
@@ -725,14 +712,105 @@ class Program
         }
     }
 
+    /// **THE UF2 A BOARD GETS MUST NAME THAT BOARD'S CHIP FAMILY**, or its bootloader refuses it.
+    /// Asserted against the table rather than a literal at the call site, because the family is a
+    /// property of the part and the two Pico generations do not share one.
+    /// A program with no static `Main` is refused BEFORE an image exists, because the reset vector
+    /// would otherwise point at whatever lowered first -- which looks like a board that took the
+    /// write and then misbehaved.
+    /// Two boards must not claim one entry, and one board must not appear twice with different
+    /// mechanisms -- the second would make which one runs depend on table order.
+    /// **THE MESSAGE FOR AN UNWRITABLE BOARD IS THE PRODUCT HERE**, since most boards are in that
+    /// case. It has to separate "nobody taught the tool" from "this cannot work", and leave the
+    /// reader something that still works today.
+    /// The coverage column `boards` prints has to agree with the table `flash` dispatches on.
+    /// **WITH NO TERMINAL THERE IS NOBODY TO ASK, AND THE ANSWER MUST STILL BE A REFUSAL.** A test
+    /// process has no terminal, which is what makes this assertable here -- and it is the case
+    /// that matters, because a script, a build, or an agent driving this tool is the situation in
+    /// which a silent fallback would write somebody else's board.
+    /// The numbered list a person reads has to be the list the answer indexes into.
+    /// **AN EXPLICIT SERIAL MUST NOT REACH THE PROMPT.** The interactive rung sits below the
+    /// refusal, which is below every rung that names a board -- so a named board is written
+    /// without a question even on an ambiguous bench. Asserted without hardware: a serial nothing
+    /// matches still comes back as itself, because the decision was already made.
+    #[test]
+    fn the_usage_names_the_same_thing_the_error_asks_for() {
+        assert!(
+            USAGE.contains(POSITIONAL) || USAGE.contains("<image>"),
+            "the error says {POSITIONAL:?} and the usage printed beside it does not mention it:\n{USAGE}"
+        );
+    }
+
+    #[test]
+    fn the_usage_does_not_promise_to_compile() {
+        assert!(!USAGE.contains("file.cs"), "flash takes an image, not source:\n{USAGE}");
+        assert!(
+            !USAGE.contains("Builds the program"),
+            "that sentence describes `deploy`, not `flash`:\n{USAGE}"
+        );
+        assert!(USAGE.contains("does not compile"), "it has to say so outright:\n{USAGE}");
+    }
+
+    #[test]
+    fn a_write_that_could_not_be_checked_does_not_claim_it_was() {
+        let volume = Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE };
+        let line = completion_line(
+            volume,
+            &report(4096, lamella_flash_backend::Verification::NotPossible("the bootloader")),
+        );
+        assert!(!line.contains("verified"), "this route verifies nothing: {line}");
+        assert!(line.contains("NOTHING READ THE FLASH BACK"), "and it must say so: {line}");
+        assert!(
+            line.contains("bootloader admitted"),
+            "while crediting the check that DID run: {line}"
+        );
+    }
+
+    #[test]
+    fn a_write_that_was_checked_reports_it() {
+        for probe in [Programmer::MicrobitV1Daplink, Programmer::MicrobitV2Daplink] {
+            let line =
+                completion_line(probe, &report(270, lamella_flash_backend::Verification::ReadBack));
+            assert!(line.contains("verified"), "a probe write reads every word back: {line}");
+            assert!(!line.contains("NOTHING READ"), "and must not disclaim it: {line}");
+        }
+    }
+
+    #[test]
+    fn a_skipped_verification_reads_as_neither_of_the_other_two() {
+        let line = completion_line(
+            Programmer::MicrobitV2Daplink,
+            &report(64, lamella_flash_backend::Verification::Skipped),
+        );
+        assert!(line.contains("SKIPPED"), "the reader has to be told: {line}");
+        assert!(!line.contains("and verified"), "nothing was verified: {line}");
+        assert!(
+            !line.contains("NOTHING READ THE FLASH BACK"),
+            "that sentence belongs to a route that CANNOT read back, not one that was told not to:              {line}"
+        );
+    }
+
     #[test]
     fn every_programmable_board_builds_a_bootable_image_from_a_blink_program() {
         if lamella_wire_host::engine::LcscCompiler::discover().is_err() {
             return;
         }
         let path = Path::new("Blink.cs");
+        let mut built = 0;
         for row in PROGRAMMING {
-            let image = build_image(path, BLINK, row.aot_target, true)
+            let Some(target) = row.aot_target else {
+                let refusal = cannot_build_for(row.board);
+                assert!(refusal.contains(row.board), "{}: {refusal}", row.board);
+                assert!(refusal.contains("lamella flash"), "{}: {refusal}", row.board);
+                assert!(
+                    image_for_board(path, BLINK, row.board, true).is_err(),
+                    "{}: names no target, so building for it must refuse",
+                    row.board
+                );
+                continue;
+            };
+            built += 1;
+            let image = build_image(path, BLINK, target, true)
                 .unwrap_or_else(|error| panic!("{}: {error}", row.board));
             assert!(
                 image.len() > 64,
@@ -740,7 +818,7 @@ class Program
                 row.board,
                 image.len()
             );
-            let at = vector_offset(row.aot_target);
+            let at = vector_offset(target);
             let sp = u32::from_le_bytes(image[at..at + 4].try_into().expect("four bytes"));
             let reset = u32::from_le_bytes(image[at + 4..at + 8].try_into().expect("four bytes"));
             assert!(
@@ -750,26 +828,30 @@ class Program
             );
             assert!(reset & 1 == 1, "{}: reset vector {reset:#010x} has no Thumb bit", row.board);
         }
+        assert!(built > 0, "no row named a target, so this proved nothing");
     }
 
-    /// **THE UF2 A BOARD GETS MUST NAME THAT BOARD'S CHIP FAMILY**, or its bootloader refuses it.
-    /// Asserted against the table rather than a literal at the call site, because the family is a
-    /// property of the part and the two Pico generations do not share one.
     #[test]
-    fn a_uf2_board_names_its_chip_family_and_a_probe_board_names_none() {
-        assert_eq!(uf2_family_for_board("rpi-pico2"), Some(RP2350_UF2_FAMILY));
-        assert_eq!(uf2_family_for_board("rpi-pico2-w"), Some(RP2350_UF2_FAMILY));
-        assert_eq!(uf2_family_for_board("rpi-pico"), Some(RP2040_UF2_FAMILY));
-        assert_ne!(
-            RP2350_UF2_FAMILY, RP2040_UF2_FAMILY,
-            "the two generations must not share a family, or each would accept the other's image"
-        );
-        assert_eq!(uf2_family_for_board("micro-bit-v2"), None, "written over a probe, not a volume");
+    fn the_cannot_build_message_renders_without_stray_columns() {
+        let message = cannot_build_for("nucleo-l053r8");
+        for line in message.lines() {
+            assert!(line == line.trim_end(), "a line ends in whitespace:
+{message}");
+            assert!(
+                !line.starts_with(' ') || line.starts_with("    lamella "),
+                "a continuation kept its source indentation:
+{message}"
+            );
+            if !line.starts_with("    lamella ") {
+                assert!(!line.contains("  "), "a doubled space mid-line:
+{message}");
+            }
+        }
+        assert!(message.contains("nucleo-l053r8"), "{message}");
+        assert!(message.contains("lamella flash"), "it names the verb that works:
+{message}");
     }
 
-    /// A program with no static `Main` is refused BEFORE an image exists, because the reset vector
-    /// would otherwise point at whatever lowered first -- which looks like a board that took the
-    /// write and then misbehaved.
     #[test]
     fn a_program_with_no_entry_is_refused_by_name() {
         if lamella_wire_host::engine::LcscCompiler::discover().is_err() {
@@ -782,20 +864,6 @@ class Program
         assert!(error.contains("Run()"), "and the shape it is telling apart: {error}");
     }
 
-    /// Two boards must not claim one entry, and one board must not appear twice with different
-    /// mechanisms -- the second would make which one runs depend on table order.
-    #[test]
-    fn no_board_appears_twice() {
-        let mut seen: Vec<&str> = PROGRAMMING.iter().map(|row| row.board).collect();
-        seen.sort_unstable();
-        let count = seen.len();
-        seen.dedup();
-        assert_eq!(seen.len(), count, "a board is listed twice: {seen:?}");
-    }
-
-    /// **THE MESSAGE FOR AN UNWRITABLE BOARD IS THE PRODUCT HERE**, since most boards are in that
-    /// case. It has to separate "nobody taught the tool" from "this cannot work", and leave the
-    /// reader something that still works today.
     #[test]
     fn the_refusal_names_the_missing_fact_and_what_still_works() {
         let text = cannot_write("rpi-pico2");
@@ -805,7 +873,6 @@ class Program
         assert!(text.contains("rpi-pico2"), "and names the board asked for");
     }
 
-    /// The coverage column `boards` prints has to agree with the table `flash` dispatches on.
     #[test]
     fn the_coverage_column_agrees_with_the_table() {
         assert!(can_flash("micro-bit-v1"));
@@ -814,10 +881,6 @@ class Program
         assert!(!can_flash("no-such-board"));
     }
 
-    /// **WITH NO TERMINAL THERE IS NOBODY TO ASK, AND THE ANSWER MUST STILL BE A REFUSAL.** A test
-    /// process has no terminal, which is what makes this assertable here -- and it is the case
-    /// that matters, because a script, a build, or an agent driving this tool is the situation in
-    /// which a silent fallback would write somebody else's board.
     #[test]
     fn an_ambiguous_bench_with_no_terminal_refuses_and_names_the_candidates() {
         let candidates =
@@ -829,7 +892,6 @@ class Program
         assert!(error.contains("succeeds and reports nothing"), "and why it will not guess");
     }
 
-    /// The numbered list a person reads has to be the list the answer indexes into.
     #[test]
     fn the_candidate_list_is_numbered_from_one() {
         let text = list_of(&["AAA".to_owned(), "BBB".to_owned()]);
@@ -837,10 +899,6 @@ class Program
         assert!(text.contains("2. BBB"), "got {text}");
     }
 
-    /// **AN EXPLICIT SERIAL MUST NOT REACH THE PROMPT.** The interactive rung sits below the
-    /// refusal, which is below every rung that names a board -- so a named board is written
-    /// without a question even on an ambiguous bench. Asserted without hardware: a serial nothing
-    /// matches still comes back as itself, because the decision was already made.
     #[test]
     fn a_named_board_is_passed_through_without_asking() {
         let chosen = choose_board(Programmer::MicrobitV1Daplink, Some("A-SERIAL"))

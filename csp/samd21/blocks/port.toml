@@ -6,6 +6,7 @@
 # The generator owns those derivations; drivers receive resolved
 # addresses through their bindings.
 
+
 [table]
 kind = "block"
 family = "samd21"
@@ -18,7 +19,7 @@ notes = [
     "PMUX[n] covers pins 2n (PMUXE, low nibble) and 2n+1 (PMUXO, high nibble); function values A..H = 0..7.",
     "PINCFG: PMUXEN hands the pin to the muxed function; INEN enables the input buffer (required for any pin the peripheral READS -- an RX line, MISO).",
     "DIRSET/OUTSET/OUTCLR/IN are the raw GPIO word registers (group-base-relative), used by soft chip-selects and module control pins.",
-    "THESE OFFSETS COME FROM THE PER-REGISTER SECTIONS IN 23.8, which state each one in prose, and NOT from the register-summary table in 23.7. The two disagree: read off the summary, the sequence comes out as DIRCLR 0x08 / DIRSET 0x0C / OUT 0x18, every entry shifted by one register. The offsets stated here (DIRSET 0x08, OUTCLR 0x14, OUTSET 0x18, IN 0x20) are the 23.8 values. Anyone re-deriving them should use 23.8 as well, and should expect the summary table to contradict it.",
+    "The offsets here are the per-register values from 23.8, and the 23.7 register-summary table agrees with them register for register: Table 23-1 states DIR 0x00, DIRCLR 0x04, DIRSET 0x08, DIRTGL 0x0C, OUT 0x10, OUTCLR 0x14, OUTSET 0x18, OUTTGL 0x1C, IN 0x20. Either source may be used.",
 ]
 
 [registers.DIR]

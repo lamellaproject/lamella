@@ -1,0 +1,81 @@
+# INSTANCE map: where each STM32L0x1 block copy sits, plus its RCC clock-enable routing.
+# The record carries the enable REGISTER OFFSET as data because ST spreads the gates across banked
+# enable registers whose layout differs per line: this family gates its GPIO ports from a
+# DEDICATED register, RCC_IOPENR at offset 0x2C, where the L4 gates them from AHB2ENR at 0x4C and
+# the F0 from AHBENR. `[base, rcc_en_off, rcc_en_bit]` states each gate in full so that no
+# consumer has to know which line it is looking at. `-1` = the row gates nothing (the RCC itself).
+#
+# THE ROWS BELOW ARE THE CATEGORY 1 SET, WHICH IS WHAT STM32L011x IS, AND THAT IS A NARROWER CLAIM
+# THAN THE MEMORY MAP MAKES. RM0377 documents one memory map for the whole L0x1 line and a
+# SEPARATE table of which peripherals each category actually implements. The two disagree about
+# this part in a way that a transcription of the map alone cannot see:
+#
+#   USART1   table 3 gives it a base address (0x40013800); table 2 records it as ABSENT on
+#            category 1. It is not an instance here, because the die does not have one. A SECOND
+#            and independent passage agrees, from a different chapter: the bootloader's list of
+#            serial interfaces per category (2.4) reads "For category 1 devices: USART2 or SPI1"
+#            and names USART1 only for categories 3 and 5.
+#   GPIOD/E/H  likewise: addressed in the map, absent from category 1 per table 2.
+#   GPIOB    present, but only bits [0:9] -- and BOOT0 shares the PB9 pin.
+#   GPIOC    present, but only bits [14:15].
+#
+
+[table]
+kind = "instances"
+family = "stm32l0"
+record = ["base", "rcc_en_off", "rcc_en_bit"]
+sources = [
+    "STM32L0x1 reference manual RM0377 Rev 10 section 2.2.2 table 3 (STM32L0x1 peripheral register boundary addresses) for every base address",
+    "RM0377 Rev 10 section 7.3.21 table 44 (RCC register map) for the enable-register offsets: IOPENR 0x2C, AHBENR 0x30, APB2ENR 0x34, APB1ENR 0x38",
+    "RM0377 Rev 10 sections 7.3.11, 7.3.13 and 7.3.14 (per-register descriptions) for the enable bit positions -- IOPAEN 0, IOPBEN 1, IOPCEN 2, SPI1EN 12 in APB2ENR, USART2EN 17 and LPUART1EN 18 in APB1ENR -- used as an independent cross-check on table 44, which it agrees with",
+    "RM0377 Rev 10 table 2 (overview of features per category) for which of these instances a category 1 device implements",
+]
+
+[[instances]]
+name = "gpioa"
+block = "gpio"
+base = 0x50000000
+rcc_en_off = 0x2C
+rcc_en_bit = 0
+
+[[instances]]
+name = "gpiob"
+block = "gpio"
+base = 0x50000400
+rcc_en_off = 0x2C
+rcc_en_bit = 1
+
+[[instances]]
+name = "gpioc"
+block = "gpio"
+base = 0x50000800
+rcc_en_off = 0x2C
+rcc_en_bit = 2
+
+[[instances]]
+name = "usart2"
+block = "usart"
+base = 0x40004400
+rcc_en_off = 0x38
+rcc_en_bit = 17
+
+[[instances]]
+name = "lpuart1"
+block = "lpuart"
+base = 0x40004800
+rcc_en_off = 0x38
+rcc_en_bit = 18
+
+[[instances]]
+name = "spi1"
+block = "spi"
+base = 0x40013000
+rcc_en_off = 0x34
+rcc_en_bit = 12
+
+[[instances]]
+name = "rcc"
+block = "rcc"
+base = 0x40021000
+rcc_en_off = -1
+rcc_en_bit = -1

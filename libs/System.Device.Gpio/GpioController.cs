@@ -50,9 +50,7 @@ namespace System.Device.Gpio
         /// <summary>Opens a pin so it is ready to use.</summary>
         public GpioPin OpenPin(int pinNumber)
         {
-            int logical = Logical(pinNumber);
-            _driver.OpenPin(logical);
-            _open[logical] = true;
+            OpenPinCore(pinNumber);
             return new GpioPin(this, pinNumber);
         }
 
@@ -77,6 +75,22 @@ namespace System.Device.Gpio
 
         /// <summary>Closes an open pin.</summary>
         public void ClosePin(int pinNumber)
+        {
+            ClosePinCore(pinNumber);
+        }
+
+        /// <summary>Opens a pin. The overridable half of <see cref="OpenPin(int)"/>.</summary>
+        /// <param name="pinNumber">The pin number, in this controller's numbering scheme.</param>
+        protected virtual void OpenPinCore(int pinNumber)
+        {
+            int logical = Logical(pinNumber);
+            _driver.OpenPin(logical);
+            _open[logical] = true;
+        }
+
+        /// <summary>Closes a pin. The overridable half of <see cref="ClosePin(int)"/>.</summary>
+        /// <param name="pinNumber">The pin number, in this controller's numbering scheme.</param>
+        protected virtual void ClosePinCore(int pinNumber)
         {
             int logical = Logical(pinNumber);
             _driver.ClosePin(logical);
@@ -117,6 +131,51 @@ namespace System.Device.Gpio
         }
 
         /// <summary>Disposes the controller and its driver.</summary>
-        public void Dispose() { _driver.Dispose(); }
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+
+        /// <summary>Releases the resources this controller holds.</summary>
+        /// <param name="disposing">
+        /// True when called from <see cref="Dispose()"/>; false when called from a finalizer.
+        /// </param>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _driver.Dispose();
+            }
+        }
+
+        /// <summary>Blocks until an edge of one of <paramref name="eventTypes"/> is seen on a pin, or the timeout elapses.</summary>
+        /// <param name="pinNumber">The pin number, in this controller's numbering scheme.</param>
+        /// <param name="eventTypes">The edges to wait for.</param>
+        /// <param name="timeout">How long to wait before giving up.</param>
+        /// <returns>Which edge was seen, or a result whose TimedOut is true.</returns>
+        public WaitForEventResult WaitForEvent(int pinNumber, PinEventTypes eventTypes, System.TimeSpan timeout)
+        {
+            WaitForEventResult result = new WaitForEventResult();
+            PinValue start = Read(pinNumber);
+            long deadline = System.DateTime.UtcNow.Ticks + timeout.Ticks;
+            while (System.DateTime.UtcNow.Ticks < deadline)
+            {
+                PinValue now = Read(pinNumber);
+                if (now != start)
+                {
+                    PinEventTypes edge = (now == PinValue.High) ? PinEventTypes.Rising : PinEventTypes.Falling;
+                    if ((eventTypes & edge) != PinEventTypes.None)
+                    {
+                        result.EventTypes = edge;
+                        result.TimedOut = false;
+                        return result;
+                    }
+                    start = now;
+                }
+            }
+            result.EventTypes = PinEventTypes.None;
+            result.TimedOut = true;
+            return result;
+        }
     }
 }

@@ -75,9 +75,7 @@ namespace Lamella.Net.Time
 
         private static SyncResult Fail(string warning)
         {
-            return new SyncResult(
-                false, "sntp", false, 0,
-                new TimeSpan(0), new TimeSpan(0), new DateTime(0), warning);
+            return SyncResult.Failed("sntp", warning);
         }
     }
 }

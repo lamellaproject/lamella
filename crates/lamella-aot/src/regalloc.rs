@@ -322,6 +322,12 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     index0,
                     index1,
                     ..
+                }
+                | Inst::Array2DElemAddr {
+                    array,
+                    index0,
+                    index1,
+                    ..
                 } => {
                     mark(&mut lo, &mut hi, &mut defined, *array, ip);
                     mark(&mut lo, &mut hi, &mut defined, *index0, ip);
@@ -344,7 +350,8 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                         mark(&mut lo, &mut hi, &mut defined, d, ip);
                     }
                 }
-                Inst::ArrayMDLoad { array, indices, .. } => {
+                Inst::ArrayMDLoad { array, indices, .. }
+                | Inst::ArrayMDElemAddr { array, indices, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *array, ip);
                     for &i in indices.iter() {
                         mark(&mut lo, &mut hi, &mut defined, i, ip);
@@ -362,7 +369,7 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     }
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
-                Inst::StaticLoad { .. } => {}
+                Inst::StaticLoad { .. } | Inst::StaticAddr { .. } => {}
                 Inst::StaticStore { value, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
@@ -715,6 +722,12 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             index0,
             index1,
             ..
+        }
+        | Inst::Array2DElemAddr {
+            array,
+            index0,
+            index1,
+            ..
         } => {
             f(*array);
             f(*index0);
@@ -733,7 +746,8 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*value);
         }
         Inst::AllocArrayMD { dims, .. } => dims.iter().for_each(|&d| f(d)),
-        Inst::ArrayMDLoad { array, indices, .. } => {
+        Inst::ArrayMDLoad { array, indices, .. }
+        | Inst::ArrayMDElemAddr { array, indices, .. } => {
             f(*array);
             indices.iter().for_each(|&i| f(i));
         }
@@ -747,7 +761,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             indices.iter().for_each(|&i| f(i));
             f(*value);
         }
-        Inst::StaticLoad { .. } => {}
+        Inst::StaticLoad { .. } | Inst::StaticAddr { .. } => {}
         Inst::StaticStore { value, .. } => f(*value),
     }
 }

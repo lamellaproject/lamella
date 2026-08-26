@@ -1,5 +1,6 @@
 //! STM32C0 embedded-flash programming, per RM0490 (C011/C031/C051/C071/C091).
 
+use crate::FlashWait;
 use lamella_probe_core::{ProbeError, TargetAccess};
 
 /// The C0 flash interface register block (RM0490 s2.2.2 memory map).
@@ -24,7 +25,7 @@ const C0_SR_BSY: u32 = 1 << 16;
 /// Set when the first word of a double word is sent, cleared when the second completes.
 const C0_SR_CFGBSY: u32 = 1 << 18;
 /// Every error the status register reports for a program or erase; the same bits clear them.
-const C0_SR_ERRORS: u32 =
+pub(crate) const C0_SR_ERRORS: u32 =
     (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 15);
 
 /// The C0's flash page: 2 KB on every part in the series.
@@ -73,11 +74,20 @@ fn c0_page_of(address: u32) -> u32 {
 /// Polls `CFGBSY` as well as `BSY` -- see the module note. Clearing the flags before returning the
 /// error is deliberate: RM0490 requires a clean status register before the next operation, so
 /// leaving them set turns one failure into every subsequent failure.
-fn c0_wait_idle<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
+///
+/// On [`FlashWait::BeforeOperation`] the latched flags are cleared and NOT reported -- see the
+/// enum, which records the board this distinction was measured on.
+pub(crate) fn c0_wait_idle<A: TargetAccess>(target: &mut A, phase: FlashWait) -> Result<(), ProbeError> {
     for _ in 0..200_000 {
         let sr = target.read_word(C0_SR)?;
         if sr & (C0_SR_BSY | C0_SR_CFGBSY) != 0 {
             continue;
+        }
+        if phase == FlashWait::BeforeOperation {
+            if sr & (C0_SR_ERRORS | C0_SR_EOP) != 0 {
+                target.write_word(C0_SR, C0_SR_ERRORS | C0_SR_EOP)?;
+            }
+            return Ok(());
         }
         if let Some(text) = c0_error_text(sr) {
             target.write_word(C0_SR, C0_SR_ERRORS | C0_SR_EOP)?;
@@ -131,11 +141,11 @@ impl<A: TargetAccess> Stm32C0Flash for A {
     }
 
     fn c0_erase_page(&mut self, address: u32) -> Result<(), ProbeError> {
-        c0_wait_idle(self)?;
+        c0_wait_idle(self, FlashWait::BeforeOperation)?;
         let pnb = (c0_page_of(address) << C0_CR_PNB_SHIFT) & C0_CR_PNB_MASK;
         self.write_word(C0_CR, C0_CR_PER | pnb)?;
         self.write_word(C0_CR, C0_CR_PER | pnb | C0_CR_STRT)?;
-        c0_wait_idle(self)?;
+        c0_wait_idle(self, FlashWait::AfterOperation)?;
         self.write_word(C0_CR, 0)
     }
 
@@ -143,7 +153,7 @@ impl<A: TargetAccess> Stm32C0Flash for A {
         if address as usize % STM32C0_DOUBLE_WORD != 0 {
             return Err(ProbeError::Device("STM32C0 programming starts on an 8-byte double-word boundary"));
         }
-        c0_wait_idle(self)?;
+        c0_wait_idle(self, FlashWait::BeforeOperation)?;
         self.write_word(C0_CR, C0_CR_PG)?;
 
         let mut at = address;
@@ -154,7 +164,7 @@ impl<A: TargetAccess> Stm32C0Flash for A {
             let high = u32::from_le_bytes([dword[4], dword[5], dword[6], dword[7]]);
             self.write_word(at, low)?;
             self.write_word(at + 4, high)?;
-            c0_wait_idle(self)?;
+            c0_wait_idle(self, FlashWait::AfterOperation)?;
             at += STM32C0_DOUBLE_WORD as u32;
         }
 

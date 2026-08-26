@@ -1,0 +1,106 @@
+# BLOCK layout: the STM32L0x1 USART block. Offsets are instance-base-relative; the instance bases
+# live in ../instances.toml.
+#
+# READ THE PRESENCE TABLE BEFORE YOU TRUST THIS LAYOUT ON A GIVEN PART. RM0377 documents ONE
+# USART register map for the whole L0x1 line, but the line's categories do not all implement the
+# same USART. On category 1 devices -- which is what STM32L011x is -- RM0377 table 2 records
+# USART2 as having 'no synchronous mode, no LIN mode, no dual clock, no receiver timeout, no
+# ModBus, no autobaudrate'. The bits for all six are in the map below, because the map is the
+# superset. A driver that sets RTOEN, ABREN or LINEN on a category 1 part is writing to a feature
+# the silicon does not implement, and the register map alone will never say so.
+#
+
+[table]
+kind = "block"
+family = "stm32l0"
+block = "usart"
+sources = [
+    "STM32L0x1 reference manual RM0377 Rev 10 section 24.8.12 table 125 (USART register map and reset values) for the offsets and the bit positions",
+    "RM0377 Rev 10 sections 24.8.1 to 24.8.11 (per-register descriptions), each stating its own offset in prose -- 24.8.1 CR1 0x00, 24.8.4 BRR 0x0C, 24.8.8 ISR 0x1C, 24.8.10 RDR 0x24, 24.8.11 TDR 0x28 -- used as an independent cross-check on table 125, which it agrees with",
+    "RM0377 Rev 10 table 2 (overview of features per category) for which of these fields a category 1 device actually implements",
+]
+notes = [
+    "THE WORD-LENGTH FIELD IS SPLIT AND NOT CONTIGUOUS: M0 is CR1 bit 12 and M1 is CR1 bit 28. RM0377 24.8.1 gives the pair one encoding -- M[1:0] = 00 is 8 data bits, 01 is 9, 10 is 7 -- so a driver that reads or writes M as one adjacent field is wrong about every setting except the reset one.",
+    "Most of CR1 and CR2 can only be written while the USART is DISABLED (UE = 0); the per-bit descriptions in 24.8.1 and 24.8.2 say so bit by bit. Reconfiguring a running port therefore means clearing UE first, not just writing the new value.",
+    "ISR reset value is 0x0200 00C0, which is TC and TXE already set plus TCBGT. An empty transmit holding register is the RESET state, so 'TXE is set' is not by itself evidence that a driver's configuration took effect.",
+    "ISR is read-only; flags are cleared by writing 1 to the matching bit of ICR at 0x20, not by writing ISR. RDR and TDR are 9 bits wide because a 9-data-bit word format exists.",
+    "THE LPUART IS A DIFFERENT BLOCK AND ITS REGISTERS ARE NOT THESE, EVEN WHERE THE NAMES AND BIT POSITIONS MATCH. RM0377 gives LPUART1 its own chapter and its own register map (25.7.10), and the encodings diverge silently: CR2 bits 13:12 are STOP[1:0] in both, but 01 and 11 are 0.5 and 1.5 stop bits on the USART and RESERVED on the LPUART. Category 1 devices carry LPUART1, so on this family that is a live confusion rather than a hypothetical one -- an lpuart block belongs in its own file, read from chapter 25.",
+    "BRR holds the whole divider in bits 15:0. With OVER8 = 1 the divider's low nibble moves -- 24.8.4 states the arithmetic -- so oversampling and baud rate cannot be chosen independently of each other.",
+]
+
+[registers.CR1]
+offset = 0x00
+width = 32
+fields = { UE = [0, 1], UESM = [1, 1], RE = [2, 1], TE = [3, 1], IDLEIE = [4, 1], RXNEIE = [5, 1], TCIE = [6, 1], TXEIE = [7, 1], PEIE = [8, 1], PS = [9, 1], PCE = [10, 1], WAKE = [11, 1], M0 = [12, 1], MME = [13, 1], CMIE = [14, 1], OVER8 = [15, 1], DEDT = [16, 5], DEAT = [21, 5], RTOIE = [26, 1], EOBIE = [27, 1], M1 = [28, 1] }
+notes = "Control register 1. UE enables the port; TE and RE enable the two directions independently. RTOIE is the receiver-timeout interrupt and is inert on a category 1 part."
+
+[registers.CR2]
+offset = 0x04
+width = 32
+fields = { ADDM7 = [4, 1], LBDL = [5, 1], LBDIE = [6, 1], LBCL = [8, 1], CPHA = [9, 1], CPOL = [10, 1], CLKEN = [11, 1], STOP = [12, 2], LINEN = [14, 1], SWAP = [15, 1], RXINV = [16, 1], TXINV = [17, 1], DATAINV = [18, 1], MSBFIRST = [19, 1], ABREN = [20, 1], ABRMOD = [21, 2], RTOEN = [23, 1], ADD = [24, 8] }
+notes = "Control register 2. STOP selects the stop-bit count. LINEN, CLKEN/CPOL/CPHA/LBCL, ABREN/ABRMOD and RTOEN are LIN, synchronous mode, autobaudrate and receiver timeout respectively -- table 2 records all four as absent on category 1."
+
+[registers.CR3]
+offset = 0x08
+width = 32
+fields = { EIE = [0, 1], IREN = [1, 1], IRLP = [2, 1], HDSEL = [3, 1], NACK = [4, 1], SCEN = [5, 1], DMAR = [6, 1], DMAT = [7, 1], RTSE = [8, 1], CTSE = [9, 1], CTSIE = [10, 1], ONEBIT = [11, 1], OVRDIS = [12, 1], DDRE = [13, 1], DEM = [14, 1], DEP = [15, 1], SCARCNT = [17, 3], WUS = [20, 2], WUFIE = [22, 1], UCESM = [23, 1], TCBGTIE = [24, 1] }
+notes = "Control register 3. OVRDIS disables the overrun detection that otherwise stalls a receiver nobody is draining, which is the bit a polled driver most often wants."
+
+[registers.BRR]
+offset = 0x0C
+width = 32
+fields = { BRR = [0, 16] }
+notes = "Baud rate divider. Bits 31:16 are reserved."
+
+[registers.GTPR]
+offset = 0x10
+width = 32
+fields = { PSC = [0, 8], GT = [8, 8] }
+notes = "Guard time and prescaler, for smartcard and IrDA modes."
+
+[registers.RTOR]
+offset = 0x14
+width = 32
+fields = { RTO = [0, 24], BLEN = [24, 8] }
+notes = "Receiver timeout and block length. Table 2 records the receiver timeout as absent on category 1 devices."
+
+[registers.RQR]
+offset = 0x18
+width = 32
+fields = { ABRRQ = [0, 1], SBKRQ = [1, 1], MMRQ = [2, 1], RXFRQ = [3, 1], TXFRQ = [4, 1] }
+notes = "Request register, write-only. RXFRQ discards a stale received byte, which is how a driver flushes without reading."
+
+[registers.ISR]
+offset = 0x1C
+width = 32
+fields = { PE = [0, 1], FE = [1, 1], NF = [2, 1], ORE = [3, 1], IDLE = [4, 1], RXNE = [5, 1], TC = [6, 1], TXE = [7, 1], LBDF = [8, 1], CTSIF = [9, 1], CTS = [10, 1], RTOF = [11, 1], EOBF = [12, 1], ABRE = [14, 1], ABRF = [15, 1], BUSY = [16, 1], CMF = [17, 1], SBKF = [18, 1], RWU = [19, 1], WUF = [20, 1], TEACK = [21, 1], REACK = [22, 1], TCBGT = [25, 1] }
+notes = "Interrupt and status, read-only. TXE says the holding register is free; TC says the shift register has finished on the wire. A driver that powers the port down on TXE truncates the byte in flight, and TC is the flag that does not."
+
+[registers.ICR]
+offset = 0x20
+width = 32
+fields = { PECF = [0, 1], FECF = [1, 1], NCF = [2, 1], ORECF = [3, 1], IDLECF = [4, 1], TCCF = [6, 1], TCBGTCF = [7, 1], LBDCF = [8, 1], CTSCF = [9, 1], RTOCF = [11, 1], EOBCF = [12, 1], CMCF = [17, 1], WUCF = [20, 1] }
+notes = "Interrupt flag clear: write 1 to clear the matching ISR flag."
+
+[registers.RDR]
+offset = 0x24
+width = 32
+fields = { RDR = [0, 9] }
+notes = "Receive data, read-only, 9 bits. Reading it clears RXNE."
+
+[registers.TDR]
+offset = 0x28
+width = 32
+fields = { TDR = [0, 9] }
+notes = "Transmit data, 9 bits. Write only when TXE is set, or the byte already staged is overwritten."
+
+# CR1 M[1:0] word-length encoding (24.8.1), stated as whole values because the field is split
+# across bits 28 and 12 and cannot be written as one span.
+[constants]
+WORD_LENGTH_8 = 0
+WORD_LENGTH_9 = 1
+WORD_LENGTH_7 = 2
+STOP_1 = 0
+STOP_0_5 = 1
+STOP_2 = 2
+STOP_1_5 = 3

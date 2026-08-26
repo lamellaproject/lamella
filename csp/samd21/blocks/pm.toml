@@ -1,5 +1,5 @@
 # The SAMD21 Power Manager block: only the register the peripheral bring-up paths touch
-# is transcribed so far (partial, append-only, schema total). Offsets are PM-base-relative;
+# is transcribed here (partial, append-only, schema total). Offsets are PM-base-relative;
 # the base lives in ../instances.toml.
 
 [table]

@@ -51,7 +51,7 @@ evidence = "A physical part answered the identity register on a Raspberry Pi Pic
 # 0x56 or 0x57 and mass-production parts answer 0x58, all three documented by the vendor as valid
 # chip_id readings for a BMP280. A driver that accepts only the mass-production value rejects a
 # genuine part -- so an identity is a SET, and a schema that models it as one value is wrong for
-# the second part the catalogue describes rather than the hundredth.
+# the second part the catalog describes rather than the hundredth.
 
 [identity]
 reg = 0xD0
@@ -71,7 +71,7 @@ resolution_bits = "16..20, depending only on the oversampling setting"
 
 # --- the standby encoding this member does NOT share ---------------------------------------------
 #
-# MICROSECONDS, as integers, for the same reason the sibling gives: the catalogue has to work on a
+# MICROSECONDS, as integers, for the same reason the sibling gives: the catalog has to work on a
 # no-float tier, and one 0.5 would force a float into every emitted language.
 
 [enums.standby_us]

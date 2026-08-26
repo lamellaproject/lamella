@@ -2675,8 +2675,8 @@ impl Interpreter {
     /// claiming it yielded undefined "for the WHOLE chain rather than for this link" -- leaves the
     /// enclosing `.c` reading a property of `undefined`, so the program gets a TypeError where the
     /// standard gives a value, and every side effect further along the chain runs on the way there.
-    /// **The comment asserted the behaviour the code did not have**, which is the only kind of
-    /// comment that is worse than none.
+    /// **A comment asserting the behaviour the code does not have is the one kind of comment
+    /// worse than none.**
     ///
     /// THE CHAIN IS THE SPINE OF OBJECTS AND CALLEES AND NOTHING ELSE. A computed key, an
     /// argument and a parenthesized expression all go through [`Self::expression_node`], which is

@@ -1,0 +1,56 @@
+# PARTS table for the SAM D11 family. Every row is an ORDERABLE part rather than a marketing
+# name, because on this family the marketing name does not select one: "ATSAMD11D14A" names four
+# ordering codes across THREE packages with three different pad counts, and the datasheet's own
+# pin-count letter says so -- "D = 20/24 pins", one letter covering two package sizes.
+#
+# The packages are told apart at RUN TIME as well as on paper: DSU DID.DEVSEL differs per package
+# variant (table 2-1), so a part row here can be checked against silicon rather than trusted. That
+# is narrower than it sounds and does NOT settle a board: a device ID describes the die, never what
+# is wired to the pads, so a board-fit verdict still owes the probe+board+wiring tuple.
+#
+# Pin lists here are COMPLETE GPIO SETS for their package, read off the ch 4 package drawings and
+# cross-checked against the GPIO counts in table 1-1 -- unlike `csp/samd21/parts.toml`, whose lists
+# are partial present-lists. A consumer must still not read a complete GPIO set as a PAD SPACE:
+# it omits VDD, GND and any pad that is not general-purpose I/O.
+
+[table]
+kind = "parts"
+family = "samd11"
+sources = [
+    "SAM D11 datasheet Atmel-42363H-SAM-D11-Datasheet_09/2016: ch 1 table 1-1 (configuration summary), ch 2 (ordering information + table 2-1 device identification), ch 4 (pinouts per package)",
+]
+notes = [
+    "THIS BOOK CONTRADICTS ITSELF ON DEVICE SELECTION, AND THE ROWS BELOW FOLLOW TABLE 2-1. Atmel-42363H table 12-12 (device selection, in the DSU chapter) names the 14-pin part 'SAMD11D14A' -- a D where it is the C series -- and marks DEVSEL 0x8-0xFF reserved, omitting 0x09 (SAMD11D14AU, the WLCSP part) that table 2-1 lists. Table 2-1 and the ch 2 ordering codes agree with each other (the 14-pin part orders as ATSAMD11C14A-SSUT/-SSNT), so 2-1 is the authority and 12-12 is stale. A transcription taking 12-12 at face value would ship the C variant under a D name and lose the WLCSP variant entirely. Corroborated independently by a bench read of this board.",
+]
+
+[[parts]]
+part = "atsamd11d14am"
+package = "24-pin QFN"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02-PA11", "PA14-PA17", "PA22-PA25", "PA27-PA28", "PA30-PA31"]
+source = "Atmel-42363H ch 4.4 (24-pin QFN pinout) for the pad set; table 1-1 column 1 for 22 GPIOs / 16KB flash / 4KB SRAM; ordering codes ATSAMD11D14A-MUT and -MNT (ch 2.4). DSU DID.DEVSEL = 0x00, DID = 0x10030r00 (table 2-1, variant SAMD11D14AM). This is the part on ATSAMD11-XPRO: the kit user guide (Atmel-42349) never states a package, but its connector tables name PA10, PA11, PA17 and PA27, and those four pads exist on NO other package in this family -- so the board is identified by difference rather than by the ambiguous ATSAMD11D14A it prints. Confirmed on silicon afterwards: a DSU read on the board returns DID 0x10030100, whose DEVSEL 0x00 is this row. PA28 is the RESET pad; the ch 4.4 legend marks it RESET/GPIO, and whether it is available as I/O is a fuse question this row does not answer."
+
+[[parts]]
+part = "atsamd11d14ass"
+package = "20-pin SOIC"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02-PA09", "PA14-PA16", "PA22-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42363H ch 4.2 (20-pin SOIC pinout); table 1-1 column 2 for 18 GPIOs; ordering codes ATSAMD11D14A-SSUT and -SSNT (ch 2.2). DSU DID.DEVSEL = 0x03, DID = 0x10030r03 (table 2-1, variant SAMD11D14ASS). Lacks PA10, PA11, PA17 and PA27, which the 24-pin QFN has -- that difference is what identifies a populated board. PA28 is the RESET pad, as above."
+
+[[parts]]
+part = "atsamd11d14au"
+package = "20-ball WLCSP"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02-PA09", "PA14-PA16", "PA22-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42363H ch 4.3 (20-ball WLCSP ball map); ordering code ATSAMD11D14A-UUT (ch 2.3). DSU DID.DEVSEL = 0x09, DID = 0x10030r09 (table 2-1, variant SAMD11D14AU). Table 1-1 groups this with the 20-pin SOIC in one column, so the identical pin list here is READ OFF THE BALL MAP rather than inherited from that grouping: the two sets were compared pad by pad and are the same 18. Its ch 4.3 legend marks PA28 RESET PIN where ch 4.2's marks the same pad RESET/GPIO PIN; that legend difference is unresolved and is not asserted either way here."
+
+[[parts]]
+part = "atsamd11c14a"
+package = "14-pin SOIC"
+flash = 0x4000
+ram = 0x1000
+pins = ["PA02", "PA04-PA05", "PA08-PA09", "PA14-PA15", "PA24-PA25", "PA28", "PA30-PA31"]
+source = "Atmel-42363H ch 4.1 (14-pin SOIC pinout); table 1-1 column 3 for 12 GPIOs; ordering codes ATSAMD11C14A-SSUT and -SSNT (ch 2.1). DSU DID.DEVSEL = 0x06, DID = 0x10030r06 (table 2-1, variant SAMD11C14A). This is the D11C series, not D11D: it carries 2 SERCOMs where the D11D carries 3, and 5 ADC channels where the D11D carries 8 or 10 (table 1-1), so it is a different part rather than a smaller package of the same one."

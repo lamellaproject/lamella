@@ -5,7 +5,7 @@
 #
 # WHAT A READER SHOULD TAKE FROM THIS FILE BEFORE ANY OTHER FACT IN IT: the identity value below is
 # the SAME value the BME680 answers, at the same register, in the same two-address range. Every
-# difference recorded in this file is invisible to the register this catalogue identifies parts by.
+# difference recorded in this file is invisible to the register this catalog identifies parts by.
 
 [table]
 kind = "device"
@@ -54,7 +54,7 @@ notes = "The BME680 answers this same value at this same register. What separate
 # --- the variant register, which is the only documented discriminator -----------------------------
 #
 # The one register whose value the two datasheets state differently. It is not the identity
-# register, and this catalogue's identity model has no way to say that a second register is what
+# register, and this catalog's identity model has no way to say that a second register is what
 # settles a part's type.
 #
 # TWO REASONS IT IS A WEAKER DISCRIMINATOR THAN IT LOOKS, both from the vendor's own text:
@@ -80,7 +80,7 @@ notes = "Answers 0x01 on this part. Early engineering samples marked 688E HR1 ha
 # `run_gas_l` there, which is the vendor acknowledging the move.
 #
 # A driver that identified the part by its identity register -- the only discriminator this
-# catalogue models -- would enable the wrong bit on one of the two. Nothing reports an error: the
+# catalog models -- would enable the wrong bit on one of the two. Nothing reports an error: the
 # gas conversion simply never runs.
 
 [registers.ctrl_gas_1]

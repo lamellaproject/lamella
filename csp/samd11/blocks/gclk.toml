@@ -1,0 +1,55 @@
+# The SAM D11 Generic Clock Controller block: the channel-routing registers the peripheral
+# bring-up paths touch (partial, append-only). Offsets are GCLK-base-relative; the base lives in
+# ../instances.toml. WHICH generator runs at WHAT rate is a PLAN fact (board.toml), never here.
+#
+# The whole register file sits in the first twelve bytes and is deliberately sub-word: CTRL is one
+# byte at 0x0, STATUS one byte at 0x1, and CLKCTRL a 16-bit register at the UNALIGNED offset 0x2.
+# A driver that reaches CLKCTRL with a 32-bit access takes CTRL and STATUS with it.
+
+[table]
+kind = "block"
+family = "samd11"
+block = "gclk"
+sources = [
+    "SAM D11 datasheet Atmel-42363H-SAM-D11-Datasheet_09/2016 ch 14.8 register descriptions, each stating its own offset: 14.8.1 CTRL 0x0, 14.8.2 STATUS 0x1, 14.8.3 CLKCTRL 0x2, 14.8.4 GENCTRL 0x4, 14.8.5 GENDIV 0x8",
+    "SAM D11 datasheet Atmel-42363H ch 14.8.3 bit table: ID[5:0] bits 5:0, GEN[3:0] bits 11:8, CLKEN bit 14, WRTLOCK bit 15",
+    "SAM D11 datasheet Atmel-42363H ch 14.8.2 bit table: SYNCBUSY bit 7, read-only",
+    "SAM D11 datasheet Atmel-42363H ch 14.8.1 bit table: SWRST bit 0",
+    "SAM D11 datasheet Atmel-42363H ch 14.8.4 field list: ID[3:0] bits 3:0, SRC[4:0] bits 12:8, GENEN bit 16 (also IDC 17, OOV 18, OE 19, DIVSEL 20, RUNSTDBY 21, not stated below)",
+    "SAM D11 datasheet Atmel-42363H ch 14.8.5 field list: ID[3:0] bits 3:0, DIV[15:0] bits 23:8",
+]
+notes = [
+    "Route a generator to a peripheral channel: write CLKCTRL = ID | (GEN << 8) | CLKEN, then wait STATUS.SYNCBUSY clear. Each instance row carries its CLKCTRL ID.",
+    "The datasheet is explicit that CLKCTRL takes a SINGLE 16-BIT WRITE carrying the ID and the configuration together -- the ID is not a separate select step, so a read-modify-write of one field is not available here.",
+    "WRTLOCK latches a channel's configuration until a reset. A channel whose CLKCTRL writes appear to take no effect has this bit set, and no status flag reports it -- which is why the field is stated here rather than left out of a partial transcription.",
+]
+
+[registers.CTRL]
+offset = 0x0
+width = 8
+fields = { SWRST = [0, 1] }
+notes = "Software reset: writing 1 returns the whole GCLK to its reset state, which un-routes every channel."
+
+[registers.STATUS]
+offset = 0x1
+width = 8
+fields = { SYNCBUSY = [7, 1] }
+notes = "Wait SYNCBUSY clear after a CLKCTRL write."
+
+[registers.CLKCTRL]
+offset = 0x2
+width = 16
+fields = { ID = [0, 6], GEN = [8, 4], CLKEN = [14, 1], WRTLOCK = [15, 1] }
+notes = "Peripheral channel control: ID selects the peripheral channel, GEN the source generator, CLKEN enables the route."
+
+[registers.GENCTRL]
+offset = 0x4
+width = 32
+fields = { ID = [0, 4], SRC = [8, 5], GENEN = [16, 1] }
+notes = "Generator control: which clock source a generator runs from. A PLAN decides the values; this states where they go."
+
+[registers.GENDIV]
+offset = 0x8
+width = 32
+fields = { ID = [0, 4], DIV = [8, 16] }
+notes = "Generator divider. Paired with GENCTRL: both select the generator by ID in their low bits."

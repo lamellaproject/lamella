@@ -419,22 +419,32 @@ pub struct LcscCompiler {
 
 #[cfg(feature = "repl-host")]
 impl LcscCompiler {
-    /// Sources the reference assemblies to bind against, corlib-first: `LAMELLA_CORLIB` (an
-    /// explicit Lamella corlib.dll -- fully self-hosted), else a `corlib.dll` beside the
-    /// executable or in the working directory, else the dev tree's built corlib fixture, else
-    /// every `*.dll` in the directory named by `LAMELLA_REF_DIR`. `Err` only when none is found;
-    /// a fresh checkout builds its own corlib from the shipped sources
-    /// (`lcsc corlib/*/*.cs /out:corlib.dll`).
+    /// Sources the reference assemblies to bind against, corlib FIRST: the directory named by
+    /// `LAMELLA_REF_DIR`, else `LAMELLA_CORLIB` (an explicit Lamella corlib.dll -- fully
+    /// self-hosted), else a `corlib.dll` beside the executable or in the working directory, else
+    /// the dev tree's built corlib fixture. `Err` only when none is found; a fresh checkout builds
+    /// its own corlib from the shipped sources (`lcsc corlib/*/*.cs /out:corlib.dll`).
+    ///
+    /// **IT SOURCES A SET, NOT A FILE.** Whatever [`Self::references`] hands back is the whole
+    /// binding surface a host offers, so a corlib-only answer makes every shipped library invisible
+    /// -- a program naming `GpioController` fails CS0246 against a library sitting beside the
+    /// corlib that was just loaded.
+    ///
+    /// `LAMELLA_REF_DIR` is consulted BEFORE the corlib probes, because each probe returns on its
+    /// first hit: an explicit override that a default can silence is not an override.
     pub fn discover() -> Result<LcscCompiler, String> {
+        if let Some(dir) = std::env::var_os("LAMELLA_REF_DIR") {
+            let references = Self::references_in_dir(std::path::Path::new(&dir))?;
+            if !references.is_empty() {
+                return Ok(LcscCompiler { references });
+            }
+        }
         if let Some(path) = std::env::var_os("LAMELLA_CORLIB") {
-            let bytes = std::fs::read(&path).map_err(|error| {
-                format!(
-                    "cannot read LAMELLA_CORLIB {}: {error}",
-                    std::path::PathBuf::from(&path).display()
-                )
-            })?;
+            let path = std::path::PathBuf::from(&path);
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("cannot read LAMELLA_CORLIB {}: {error}", path.display()))?;
             return Ok(LcscCompiler {
-                references: vec![bytes],
+                references: Self::with_libraries_beside(&path, bytes),
             });
         }
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -451,29 +461,105 @@ impl LcscCompiler {
         for candidate in candidates {
             if let Ok(bytes) = std::fs::read(&candidate) {
                 return Ok(LcscCompiler {
-                    references: vec![bytes],
+                    references: Self::with_libraries_beside(&candidate, bytes),
                 });
-            }
-        }
-        if let Some(dir) = std::env::var_os("LAMELLA_REF_DIR") {
-            let dir = std::path::PathBuf::from(dir);
-            let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-                .map_err(|error| format!("cannot read LAMELLA_REF_DIR {}: {error}", dir.display()))?
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
-                .collect();
-            paths.sort();
-            let references: Vec<Vec<u8>> =
-                paths.iter().filter_map(|path| std::fs::read(path).ok()).collect();
-            if !references.is_empty() {
-                return Ok(LcscCompiler { references });
             }
         }
         Err("no reference assemblies: set LAMELLA_CORLIB to a Lamella corlib.dll (build one from \
              the shipped sources: `lcsc corlib/*/*.cs /out:corlib.dll`), put a corlib.dll beside \
              the executable, or set LAMELLA_REF_DIR to a directory of reference assemblies"
             .to_owned())
+    }
+
+    /// Every `*.dll` in `dir` as a reference set, **corlib first**.
+    ///
+    /// **The corlib is HOISTED rather than left where the sort puts it.** A path sort is a byte
+    /// sort, and every shipped library begins with an uppercase letter -- which sorts before
+    /// lowercase -- so a plain sort answers `System.Device.Gpio.dll` at element 0. A caller that
+    /// reads `references()[0]` as the corlib (`lamella-cli` does, to give it to [`LoopbackLink`])
+    /// would then run the program against a library.
+    ///
+    /// # Errors
+    /// If the directory cannot be read, or holds no corlib.
+    fn references_in_dir(dir: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map_err(|error| format!("cannot read reference directory {}: {error}", dir.display()))?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
+            .collect();
+        paths.sort();
+        let corlib = paths.iter().position(|path| Self::is_corlib(path)).ok_or_else(|| {
+            format!(
+                "reference directory {} holds no corlib.dll; the set must carry one, because the \
+                 first assembly is the corlib every caller binds and runs against",
+                dir.display()
+            )
+        })?;
+        paths.swap(0, corlib);
+        Ok(paths.iter().filter_map(|path| std::fs::read(path).ok()).collect())
+    }
+
+    /// Whether a path names a corlib, by file name and case-insensitively.
+    fn is_corlib(path: &std::path::Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("corlib.dll"))
+    }
+
+    /// The corlib bytes, then the shipped libraries sitting beside it.
+    ///
+    /// **WHICH SIBLINGS COUNT IS DECIDED BY `libs/` WHEN `libs/` IS VISIBLE, AND BY THE DIRECTORY
+    /// OTHERWISE, BECAUSE THE TWO LAYOUTS DIFFER IN KIND.** An installed layout holds the reference
+    /// set and nothing else, so every `.dll` beside the corlib belongs. **The dev tree's fixture
+    /// directory does not**: it holds the built libraries beside ~136 compiled TEST PROGRAMS, and
+    /// handing those to the compiler as reference assemblies would bind a user's program against a
+    /// test. `libs/` is the tree's own statement of which libraries exist, so it is read rather
+    /// than a list being kept here -- a second list would be a second thing to forget.
+    ///
+    /// A `libs/` entry with no built `.dll` beside the corlib is simply absent from the set, so
+    /// sources that build INTO another assembly (`System.Device.Model`, `System.Device.Pwm`) and
+    /// the non-library `checks/` directory need no special case.
+    fn with_libraries_beside(corlib: &std::path::Path, bytes: Vec<u8>) -> Vec<Vec<u8>> {
+        let mut references = vec![bytes];
+        let Some(dir) = corlib.parent() else {
+            return references;
+        };
+        let libs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libs");
+        let mut names: Vec<std::ffi::OsString> = if let Ok(entries) = std::fs::read_dir(&libs) {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| {
+                    let mut name = entry.file_name();
+                    name.push(".dll");
+                    name
+                })
+                .collect()
+        } else {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.file_name())
+                .filter(|name| {
+                    std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+                })
+                .collect()
+        };
+        names.sort();
+        for name in names {
+            let path = dir.join(&name);
+            if Self::is_corlib(&path) {
+                continue;
+            }
+            if let Ok(library) = std::fs::read(&path) {
+                references.push(library);
+            }
+        }
+        references
     }
 
     /// The reference-assembly bytes [`discover`](Self::discover) found, corlib first.
@@ -523,9 +609,185 @@ impl ReplCompiler for LcscCompiler {
     }
 }
 
+
+
+struct LiteralScan {
+    state: ScanState,
+}
+
+#[derive(PartialEq)]
+enum ScanState {
+    Normal,
+    String,
+    StringEscape,
+    Char,
+    CharEscape,
+}
+
+impl LiteralScan {
+    fn new() -> LiteralScan {
+        LiteralScan {
+            state: ScanState::Normal,
+        }
+    }
+
+    fn step(&mut self, ch: char) -> bool {
+        match self.state {
+            ScanState::Normal => match ch {
+                '"' => {
+                    self.state = ScanState::String;
+                    true
+                }
+                '\'' => {
+                    self.state = ScanState::Char;
+                    true
+                }
+                _ => false,
+            },
+            ScanState::String => {
+                self.state = match ch {
+                    '\\' => ScanState::StringEscape,
+                    '"' => ScanState::Normal,
+                    _ => ScanState::String,
+                };
+                true
+            }
+            ScanState::StringEscape => {
+                self.state = ScanState::String;
+                true
+            }
+            ScanState::Char => {
+                self.state = match ch {
+                    '\\' => ScanState::CharEscape,
+                    '\'' => ScanState::Normal,
+                    _ => ScanState::Char,
+                };
+                true
+            }
+            ScanState::CharEscape => {
+                self.state = ScanState::Char;
+                true
+            }
+        }
+    }
+
+    fn in_literal(&self) -> bool {
+        self.state != ScanState::Normal
+    }
+}
+
+/// Whether an accumulated multi-line submission looks COMPLETE and ready to run, used by the
+/// interactive `--session` loop to decide between submitting and showing a continuation prompt.
+/// This is a surface heuristic (the real arbiter is the compiler), tuned so the common cases never strand
+/// the user: a blank line in the loop force-submits regardless of what this returns.
+///
+/// `text` is complete when, ignoring string/char literals:
+/// - every `()`, `[]`, `{}` is balanced (and none closed before it opened -- an over-closed line
+///   is treated as complete so its compiler error surfaces rather than trapping the user), and the
+///   scan did not end inside a literal; and
+/// - either the trimmed text ends with `;` or `}` (a finished statement or block), or it is a
+///   bare expression -- one that neither begins with a body-requiring keyword (`if`, `for`,
+///   `while`, `foreach`, `do`, `else`, `switch`, `using`, `lock`, `fixed`, `try`, `catch`,
+///   `finally`) nor ends with a dangling operator/separator (`= + - * / % & | ^ < > , . ? :`,
+///   or a trailing `&&` / `||` / `=>`).
+///
+/// Everything else (open brackets, mid-literal, a dangling operator, or an unterminated control
+/// statement) is INCOMPLETE, so the caller keeps reading.
+#[must_use]
+pub fn submission_is_complete(text: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut over_closed = false;
+    let mut scan = LiteralScan::new();
+    for ch in text.chars() {
+        if scan.step(ch) {
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    over_closed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if over_closed {
+        return true;
+    }
+    if depth > 0 || scan.in_literal() {
+        return false;
+    }
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.ends_with(';') || trimmed.ends_with('}') {
+        return true;
+    }
+    !begins_with_body_keyword(trimmed) && !ends_with_dangling_operator(trimmed)
+}
+
+fn begins_with_body_keyword(text: &str) -> bool {
+    let head: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    matches!(
+        head.as_str(),
+        "if" | "for"
+            | "foreach"
+            | "while"
+            | "do"
+            | "else"
+            | "switch"
+            | "using"
+            | "lock"
+            | "fixed"
+            | "try"
+            | "catch"
+            | "finally"
+    )
+}
+
+fn ends_with_dangling_operator(text: &str) -> bool {
+    let text = text.trim_end();
+    if text.ends_with("&&") || text.ends_with("||") || text.ends_with("=>") {
+        return true;
+    }
+    matches!(
+        text.chars().next_back(),
+        Some('=' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '<' | '>' | ',' | '.' | '?' | ':')
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_completeness_predicate() {
+        use super::submission_is_complete;
+        assert!(submission_is_complete("int x = 5;"));
+        assert!(submission_is_complete("if (x > 0) { y = 1; }"));
+        assert!(submission_is_complete("new[] { 1, 2, 3 }"));
+        assert!(submission_is_complete("1 + 2"));
+        assert!(submission_is_complete("x * 2"));
+        assert!(!submission_is_complete("if (x > 0) {"));
+        assert!(!submission_is_complete("System.Math.Max(1,"));
+        assert!(!submission_is_complete("new[] { 1, 2"));
+        assert!(!submission_is_complete("int x ="));
+        assert!(!submission_is_complete("1 +"));
+        assert!(!submission_is_complete("a &&"));
+        assert!(!submission_is_complete("if (c)"));
+        assert!(!submission_is_complete("while (true)"));
+        assert!(submission_is_complete("Console.WriteLine(\"a)b\");"));
+        assert!(submission_is_complete("char c = ')';"));
+        assert!(!submission_is_complete("string s = \"oops"));
+        assert!(submission_is_complete("y = 1; }"));
+    }
 
     fn corlib() -> Option<Vec<u8>> {
         std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll")).ok()
@@ -624,4 +886,84 @@ mod tests {
         assert_eq!(repl.transcript().count(), 2);
     }
 
+
+    /// The fixture directory the dev-tree probe finds: the built libraries beside ~136 compiled
+    /// test programs. Absent from a published checkout, where these tests skip.
+    fn fixtures() -> Option<std::path::PathBuf> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures");
+        dir.join("corlib.dll").exists().then_some(dir)
+    }
+
+    /// A scratch directory named for the test using it, so two tests never collide.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lamella-refset-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        dir
+    }
+
+    #[test]
+    fn the_set_beside_a_corlib_carries_the_shipped_libraries() {
+        let Some(fixtures) = fixtures() else { return };
+        let corlib = std::fs::read(fixtures.join("corlib.dll")).expect("read the corlib fixture");
+        let gpio = std::fs::read(fixtures.join("System.Device.Gpio.dll")).expect("read the gpio fixture");
+
+        let set = LcscCompiler::with_libraries_beside(&fixtures.join("corlib.dll"), corlib.clone());
+
+        assert_eq!(set.first(), Some(&corlib), "the corlib is first, because a caller reads element 0 as one");
+        assert!(set.contains(&gpio), "System.Device.Gpio is in the set: it is the story that could not compile");
+        assert!(set.len() > 1, "a set of one is the defect this replaced");
+    }
+
+    #[test]
+    fn the_set_beside_a_corlib_excludes_the_test_programs_sharing_that_directory() {
+        let Some(fixtures) = fixtures() else { return };
+        let corlib = std::fs::read(fixtures.join("corlib.dll")).expect("read the corlib fixture");
+        let present = std::fs::read_dir(&fixtures)
+            .expect("read the fixture directory")
+            .flatten()
+            .filter(|entry| {
+                entry.path().extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+            })
+            .count();
+
+        let set = LcscCompiler::with_libraries_beside(&fixtures.join("corlib.dll"), corlib);
+
+        assert!(present > 100, "the fixture directory is the crowded one this test is about ({present} dlls)");
+        assert!(
+            set.len() * 4 < present,
+            "the set is the shipped libraries, not the directory: {} of {present}",
+            set.len()
+        );
+    }
+
+    #[test]
+    fn a_reference_directory_answers_with_the_corlib_first_whatever_the_sort_says() {
+        let Some(fixtures) = fixtures() else { return };
+        let dir = scratch("corlib-first");
+        for name in ["corlib.dll", "System.Device.Gpio.dll"] {
+            std::fs::copy(fixtures.join(name), dir.join(name)).expect("stage the reference set");
+        }
+        assert!("System.Device.Gpio.dll" < "corlib.dll", "the sort this test is about");
+
+        let set = LcscCompiler::references_in_dir(&dir).expect("a directory holding a corlib");
+
+        let corlib = std::fs::read(dir.join("corlib.dll")).expect("read back the staged corlib");
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.first(), Some(&corlib), "the corlib is hoisted, not left where the sort put it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reference_directory_without_a_corlib_is_refused_by_name() {
+        let Some(fixtures) = fixtures() else { return };
+        let dir = scratch("no-corlib");
+        std::fs::copy(fixtures.join("System.Device.Gpio.dll"), dir.join("System.Device.Gpio.dll"))
+            .expect("stage a library");
+
+        let error = LcscCompiler::references_in_dir(&dir).expect_err("a set without a corlib");
+
+        assert!(error.contains("no corlib.dll"), "the reason names what is missing: {error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

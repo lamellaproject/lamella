@@ -128,13 +128,33 @@ fn install_flag_accessors(interpreter: &mut Interpreter, prototype: ObjectId) {
     });
 
     accessor(interpreter, prototype, "flags", "get flags", |interpreter, this, _| {
-        match data(interpreter, &this) {
-            Some(data) => Completion::Normal(JsValue::String(JsString::from(data.flags.as_str()))),
-            None if is_regexp_prototype(interpreter, &this) => {
-                Completion::Normal(JsValue::string(""))
+        let id = match this {
+            JsValue::Object(id) => id,
+            _ => return interpreter.type_error("RegExp.prototype.flags requires an object"),
+        };
+
+        const FLAGS: [(&str, char); 8] = [
+            ("hasIndices", 'd'),
+            ("global", 'g'),
+            ("ignoreCase", 'i'),
+            ("multiline", 'm'),
+            ("dotAll", 's'),
+            ("unicode", 'u'),
+            ("unicodeSets", 'v'),
+            ("sticky", 'y'),
+        ];
+
+        let mut text = String::new();
+        for (name, letter) in FLAGS {
+            let value = match interpreter.get_property(id, &PropertyKey::from_str(name)) {
+                Completion::Normal(value) => value,
+                abrupt => return abrupt,
+            };
+            if crate::abstract_ops::to_boolean(&value) {
+                text.push(letter);
             }
-            None => interpreter.type_error("RegExp.prototype.flags requires a regular expression"),
         }
+        Completion::Normal(JsValue::string(&text))
     });
 
     accessor(interpreter, prototype, "hasIndices", "get hasIndices", |i, t, _| flag(i, &t, 'd'));
@@ -432,7 +452,65 @@ fn build_result(
     };
     set_own(interpreter, array, "groups", groups);
 
+    if data.compiled.flags.has_indices {
+        let indices = build_indices(interpreter, data, slots, match_start, match_end);
+        set_own(interpreter, array, "indices", indices);
+    }
+
     array
+}
+
+/// `MakeMatchIndicesIndexPairArray` (22.2.7.8): the `[start, end]` pair per capture, under `d`.
+///
+/// # AN ACCEPTED FLAG THAT BUILDS NOTHING IS THE ONE STATE THE PROFILE FORBIDS
+///
+/// **A feature is either absent AND LISTED, or it is correct.** A parser that accepts `d` and a
+/// `hasIndices` that answers `true` commit this to building the property: without it a program
+/// asking for `indices` reads `undefined` and fails on the next member access, and nothing can
+/// report the gap -- nothing refuses the flag, so nothing can publish its absence.
+///
+/// It parallels the `groups` construction above rather than sharing code with it, because the two
+/// disagree on the one thing that matters: a non-participating group is `undefined` in BOTH, but
+/// here the participating case is a two-element array of NUMBERS rather than the matched text.
+fn build_indices(
+    interpreter: &mut Interpreter,
+    data: &RegExpData,
+    slots: &[Option<usize>],
+    match_start: usize,
+    match_end: usize,
+) -> JsValue {
+    let pair = |interpreter: &mut Interpreter, start: usize, end: usize| {
+        let elements = crate::vec![JsValue::Number(start as f64), JsValue::Number(end as f64)];
+        JsValue::Object(interpreter.new_array(elements))
+    };
+    let at = |interpreter: &mut Interpreter, group: usize| {
+        match (slots.get(group * 2).copied().flatten(), slots.get(group * 2 + 1).copied().flatten())
+        {
+            (Some(start), Some(end)) => pair(interpreter, start, end),
+            _ => JsValue::Undefined,
+        }
+    };
+
+    let mut elements = crate::vec![pair(interpreter, match_start, match_end)];
+    for group in 1..=data.compiled.groups as usize {
+        let value = at(interpreter, group);
+        elements.push(value);
+    }
+    let array = interpreter.new_array(elements);
+
+    let groups = if data.compiled.names.is_empty() {
+        JsValue::Undefined
+    } else {
+        let holder = interpreter.allocate(Object::new(None));
+        for (name, index) in data.compiled.names.clone() {
+            let value = at(interpreter, index as usize);
+            set_own(interpreter, holder, name.as_str(), value);
+        }
+        JsValue::Object(holder)
+    };
+    set_own(interpreter, array, "groups", groups);
+
+    JsValue::Object(array)
 }
 
 /// An ordinary own data property: writable, enumerable and configurable, which is what the result

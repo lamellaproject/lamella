@@ -233,6 +233,7 @@ fn materialize_array(
             length,
             element_size,
             element_kind: list_element_kind(elem),
+            element_cast_class: 0,
         },
         MirType::ObjectRef,
     );
@@ -314,6 +315,7 @@ fn materialize_empty_growlist(
             length: cap,
             element_size: elem_size(elem),
             element_kind: list_element_kind(elem),
+            element_cast_class: 0,
         },
         MirType::ObjectRef,
     );

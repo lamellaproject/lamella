@@ -1,7 +1,7 @@
 //! `lamella run` and `lamella build`: a program, in whichever language it is written.
 
 use crate::args::{self, Spec};
-use crate::catalogue::{self, BOARD_PYTHON};
+use lamella_catalog::{self as catalog, BOARD_PYTHON};
 use lamella_bsp_gen::fit::fit;
 use lamella_wire_host::engine::{LcscCompiler, LoopbackLink, Outcome, Repl};
 use std::path::Path;
@@ -32,15 +32,29 @@ impl Language {
     }
 }
 
+const RUN_USAGE: &str = "\
+usage: lamella run <file.cs|file.py> [--board <id> | --target <t>]
+
+Compiles and runs the program, and STAYS until it ends -- its output appears here as it is
+printed. A program written to loop forever runs until you stop this tool.
+
+With neither option it runs on this machine, which needs no hardware and is the fastest way to
+find out whether a program compiles and does what you meant.
+
+--target <t> runs it ON a board that already has firmware, with the output still appearing here.
+`lamella devices` prints the word to pass. A cycle is about a second, and the board keeps its
+firmware.
+
+--board <id> answers whether the program would FIT that board. It does not write anything; that
+is `deploy`.";
+
 /// `lamella run <file> [--board <id>]`: compile and run on this machine.
 pub fn run_command(args: &[String]) -> ExitCode {
-    let spec = Spec { verb: "run", values: &["--board", "--target"], flags: &[] };
-    let parsed = match args::parse(args, &spec) {
+    let spec =
+        Spec { verb: "run", usage: Some(RUN_USAGE), values: &["--board", "--target"], flags: &[] };
+    let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+        Err(halt) => return halt.code(),
     };
     let path = match parsed.only_positional("run", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
@@ -51,7 +65,7 @@ pub fn run_command(args: &[String]) -> ExitCode {
     };
     let board = parsed.value("--board");
     if let Some(id) = board
-        && let Err(error) = catalogue::resolve(id)
+        && let Err(error) = catalog::resolve(id)
     {
         eprintln!("lamella run: {error}");
         return ExitCode::FAILURE;
@@ -222,13 +236,10 @@ fn report_trap(model: &mut lamella_py_runtime::ObjectModel, trap: &lamella_py_ru
 /// `lamella build <file> [--board <id>] [--out <path>]`: produce the artifact a device runs.
 pub fn build_command(args: &[String]) -> ExitCode {
     let spec =
-        Spec { verb: "build", values: &["--board", "--out", "--format"], flags: &["--unsafe"] };
-    let parsed = match args::parse(args, &spec) {
+        Spec { verb: "build", usage: Some(USAGE), values: &["--board", "--out", "--format"], flags: &["--unsafe"] };
+    let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+        Err(halt) => return halt.code(),
     };
     let path = match parsed.only_positional("build", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
@@ -313,7 +324,7 @@ fn build_flashable(
     out: Option<&str>,
     unsafe_code: bool,
 ) -> ExitCode {
-    let format = match crate::artifact::Format::parse(format_name) {
+    let format = match lamella_flash_routes::artifact::Format::parse(format_name) {
         Ok(format) => format,
         Err(error) => {
             eprintln!("lamella build: {error}");
@@ -344,7 +355,7 @@ fn build_flashable(
         }
     };
     let format = match (format, crate::flash::uf2_family_for_board(board_id)) {
-        (crate::artifact::Format::Uf2 { .. }, None) => {
+        (lamella_flash_routes::artifact::Format::Uf2 { .. }, None) => {
             eprintln!(
                 "lamella build: {board_id} is not written by copying an image to a volume, so a \
                  UF2 for it\nwould name no chip family and every bootloader would refuse it. Try \
@@ -541,7 +552,7 @@ fn build_python(path: &Path, source: &str, board: Option<&str>) -> Result<Built,
 /// is the verb that produces one; without it the question can be asked only by somebody who
 /// already knows the answer.
 fn answer_fit(board_id: &str, built: &Built) -> ExitCode {
-    let (board, part) = match catalogue::resolve(board_id) {
+    let (board, part) = match catalog::resolve(board_id) {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("lamella build: {error}");
@@ -624,9 +635,9 @@ mod tests {
     #[test]
     fn every_board_carries_its_generated_python_module() {
         assert!(
-            BOARD_PYTHON.len() >= catalogue::BOARDS.len(),
+            BOARD_PYTHON.len() >= catalog::BOARDS.len(),
             "{} boards but {} python modules -- a board with none cannot be simulated",
-            catalogue::BOARDS.len(),
+            catalog::BOARDS.len(),
             BOARD_PYTHON.len()
         );
         let (_, text) = BOARD_PYTHON
@@ -664,4 +675,23 @@ mod tests {
             );
         }
     }
+    /// **A VERB WITH NO USAGE TEXT ANSWERS `--help` BY PRINTING NOTHING AND EXITING 0**, which
+    /// reads to a person as "this tool has no help" and to a script as success.
+    ///
+    /// Asserting the FIRST LINE rather than the presence of a string also catches the likelier
+    /// drift: a usage block copied from a neighbouring verb and not renamed.
+    #[test]
+    fn the_usage_opens_with_the_verb_it_belongs_to() {
+        assert!(
+            RUN_USAGE.starts_with("usage: lamella run"),
+            "`run` must open with the line a reader retypes: {}",
+            RUN_USAGE.lines().next().unwrap_or_default()
+        );
+        assert!(
+            USAGE.starts_with("usage: lamella build"),
+            "`build` must open with the line a reader retypes: {}",
+            USAGE.lines().next().unwrap_or_default()
+        );
+    }
+
 }

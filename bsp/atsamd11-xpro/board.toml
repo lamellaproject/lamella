@@ -1,0 +1,51 @@
+# The SAM D11 Xplained Pro: board truth only -- what is wired to what. Chip truth lives in
+# csp/samd11/. Kit ATSAMD11-XPRO, part ATSAMD11D14AM (24-pin QFN): its EDBG virtual COM port is
+# SERCOM2 on PA10/PA11 at peripheral function D.
+#
+# THE PART IS STATED HERE BECAUSE THE BOARD CANNOT STATE IT. The kit and its user guide print
+# "ATSAMD11D14A", which names four ordering codes across three packages with 22, 18 and 18 pads.
+# This board is the 24-pin QFN: its connector tables name PA10, PA11, PA17 and PA27, and those four
+# pads exist on no other package in the family. A DSU read returns DID 0x10030100, whose DEVSEL of
+# 0x00 is that same variant.
+
+
+[table]
+kind = "board"
+board = "atsamd11-xpro"
+vendor = "microchip"
+family = "samd11"
+part = "atsamd11d14am"
+board_model = 37
+sources = [
+    "SAM D11 Xplained Pro user guide Atmel-42349: EDBG virtual COM port = SERCOM2, PA10 (PAD2) UART TX / PA11 (PAD3) UART RX",
+    "SAM D11 datasheet Atmel-42363H table 6-1: PA10 and PA11 reach SERCOM2/PAD[2] and SERCOM2/PAD[3] at peripheral function D (their function C is SERCOM0)",
+    "USB vendor and product ids read off the board's own EDBG enumeration, 03eb:2111",
+]
+notes = [
+    "The EDBG also wires an SPI (PA06/PA07/PA08/PA09) and an I2C (PA22/PA23) to the target. Both sets of pads carry pin-map rows in csp/samd11/pins.toml; neither has a binding below.",
+    "Atmel-42349's extension-header table gives PA08 and PA09 SERCOM2 functions that the datasheet's table 6-1 does not offer on either pad. That conflict is recorded in csp/samd11/pins.toml and is unresolved; no binding here depends on it.",
+]
+
+[[carriers]]
+kind = "edbg-vcp"
+usb_vid = 0x03EB
+usb_pid = 0x2111
+role = "vcp"
+baud = 115200
+plan = "osc8m-8mhz"
+default = true
+
+[[bindings]]
+role = "vcp"
+kind = "uart"
+instance = "sercom2"
+function = "D"
+gclk_gen = 0
+tx = { pin = "PA10", pad = 2 }
+rx = { pin = "PA11", pad = 3 }
+
+[[plans]]
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000

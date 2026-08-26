@@ -1636,8 +1636,8 @@ mod tests {
         assert_eq!(codes("switch (1) { case 0: goto case 1; case 1: break; }"), []);
     }
 
-    /// A `try` transfers out of its section when its body and every handler do (8.10) -- and the
-    /// predicate had no arm for one, so every shape below was CS8070 on a program csc compiles.
+    /// A `try` transfers out of its section when its body and every handler do (8.10). A predicate
+    /// with no arm for it reports CS8070 on every shape below, all of which csc compiles.
     ///
     /// **THE `lock` AND `using` ROWS ARE THE POINT, NOT AN EXTRA.** The arm list already NAMED
     /// both constructs, so a reader had every reason to believe they were covered; binding

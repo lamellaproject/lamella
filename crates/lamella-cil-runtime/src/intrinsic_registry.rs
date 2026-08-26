@@ -266,7 +266,6 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "math-transcendental")]
     entry!(math_exp_f64),
-    #[cfg(feature = "NETMFv4_4")]
     #[cfg(feature = "float")]
     entry!(math_floor_f64),
     #[cfg(feature = "NETMFv4_4")]
@@ -549,6 +548,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     #[cfg(feature = "reflection")]
     entry!(type_is_value_type),
     entry!(type_property_custom_attributes),
+    entry!(value_type_equals),
     #[cfg(feature = "finalizers")]
     entry!(wait_for_pending_finalizers),
     #[cfg(feature = "gc")]

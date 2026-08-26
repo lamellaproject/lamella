@@ -4,6 +4,12 @@ namespace System.Device.Gpio
     /// <summary>Base class for GPIO drivers: read from and write to digital I/O pins.</summary>
     public abstract class GpioDriver : System.IDisposable
     {
+        /// <summary>Releases the driver's resources if it was never disposed explicitly.</summary>
+        ~GpioDriver()
+        {
+            Dispose(false);
+        }
+
         /// <summary>The number of pins provided by the driver.</summary>
         protected internal abstract int PinCount { get; }
 
@@ -18,6 +24,16 @@ namespace System.Device.Gpio
 
         /// <summary>Sets the mode of a pin (input/output/pull-up/pull-down).</summary>
         protected internal abstract void SetPinMode(int pinNumber, PinMode mode);
+
+        /// <summary>Sets a pin's mode and drives an initial value.</summary>
+        /// <param name="pinNumber">The pin number, in the driver's logical scheme.</param>
+        /// <param name="mode">The mode to set.</param>
+        /// <param name="initialValue">The value to drive once the mode is set.</param>
+        protected internal virtual void SetPinMode(int pinNumber, PinMode mode, PinValue initialValue)
+        {
+            SetPinMode(pinNumber, mode);
+            Write(pinNumber, initialValue);
+        }
 
         /// <summary>Gets the mode of a pin.</summary>
         protected internal abstract PinMode GetPinMode(int pinNumber);
@@ -52,6 +68,7 @@ namespace System.Device.Gpio
         public void Dispose()
         {
             Dispose(true);
+            System.GC.SuppressFinalize(this);
         }
 
         /// <summary>Releases the driver's resources.</summary>

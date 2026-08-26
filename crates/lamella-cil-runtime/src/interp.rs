@@ -95,8 +95,9 @@ pub struct Vm {
     /// `catch`'s tag against it exactly as it does a managed exception's
     /// [`Module::exception_base_chain`]. Keyed by the fault object; empty/absent without the
     /// `exceptions` feature.
+    ///
     #[cfg(feature = "exceptions")]
-    exception_chains: BTreeMap<ObjectRef, Vec<u32>>,
+    exception_faults: Vec<(ObjectRef, FaultIdentity)>,
     /// Whether a finalizer is currently running: the collector is paused (a GC triggered
     /// from within a finalizer is a no-op) so the in-flight f-reachable list stays valid.
     #[cfg(feature = "finalizers")]
@@ -1149,7 +1150,7 @@ impl Vm {
     /// stays inaccessible (II.10.5.3.1 guarantee 3) and this access must fail the way the first
     /// one did.
     ///
-    pub fn take_pending_cctor(
+    pub(crate) fn take_pending_cctor(
         &mut self,
         module: &Module,
         type_id: TypeId,
@@ -1175,7 +1176,7 @@ impl Vm {
     /// sail past into unassigned statics.
     #[cfg(feature = "exceptions")]
     #[must_use]
-    pub fn cctor_failure(&self, type_id: TypeId) -> Option<ObjectRef> {
+    pub(crate) fn cctor_failure(&self, type_id: TypeId) -> Option<ObjectRef> {
         self.cctors_failed
             .iter()
             .find(|&&(failed, _)| failed == type_id)
@@ -1195,7 +1196,7 @@ impl Vm {
     ///
     #[cfg(feature = "exceptions")]
     #[must_use]
-    pub fn failed_type_of(&self, exception: ObjectRef) -> Option<TypeId> {
+    pub(crate) fn failed_type_of(&self, exception: ObjectRef) -> Option<TypeId> {
         self.cctors_failed
             .iter()
             .find(|&&(_, wrapper)| wrapper == exception)
@@ -1368,29 +1369,54 @@ impl Vm {
     /// storage at all, so a `TypeInitializationException` the VES mints cannot assign the
     /// `_innerException` field a managed constructor would have. Without this the wrapper's
     /// `InnerException` reads null, which is a divergence from .NET in a BCL class.
-    pub fn set_exception_inner(&mut self, exception: ObjectRef, inner: ObjectRef) {
+    pub(crate) fn set_exception_inner(&mut self, exception: ObjectRef, inner: ObjectRef) {
         self.exception_inners.insert(exception, inner);
     }
 
     /// The exception `exception` wraps, if the runtime recorded one.
     #[must_use]
-    pub fn exception_inner(&self, exception: ObjectRef) -> Option<ObjectRef> {
+    pub(crate) fn exception_inner(&self, exception: ObjectRef) -> Option<ObjectRef> {
         self.exception_inners.get(&exception).copied()
     }
 
-    /// Records the base-chain TAG vector of a runtime-fault `exception` (a type external to the
-    /// loaded module), so the handler search can match a `catch` against it. The `chain` is
-    /// leaf-first up to `System.Object`.
+    /// Records what the VES knows about a runtime-fault `exception`: its base-chain TAG vector
+    /// (leaf-first up to `System.Object`, what a `catch` is matched against) and its leaf `Type`
+    /// handle (what `GetType()` answers), which is `None` when that type is not among the loaded
+    /// types -- a program running without the managed corlib names `System.DivideByZeroException`
+    /// nowhere, so there is no handle to record and `GetType()` keeps its previous answer rather
+    /// than inventing one.
     #[cfg(feature = "exceptions")]
-    fn set_exception_chain(&mut self, exception: ObjectRef, chain: Vec<u32>) {
-        self.exception_chains.insert(exception, chain);
+    fn set_exception_identity(
+        &mut self,
+        exception: ObjectRef,
+        chain: Vec<u32>,
+        type_handle: Option<u64>,
+    ) {
+        let identity = FaultIdentity { chain, type_handle };
+        match self.exception_faults.iter_mut().find(|(key, _)| *key == exception) {
+            Some(slot) => slot.1 = identity,
+            None => self.exception_faults.push((exception, identity)),
+        }
     }
 
     /// The recorded base-chain tag vector of a runtime-fault `exception`, if one was set.
     #[cfg(feature = "exceptions")]
     #[must_use]
     fn exception_chain(&self, exception: ObjectRef) -> Option<&[u32]> {
-        self.exception_chains.get(&exception).map(Vec::as_slice)
+        self.exception_faults
+            .iter()
+            .find(|(key, _)| *key == exception)
+            .map(|(_, fault)| fault.chain.as_slice())
+    }
+
+    /// The recorded `Type` handle of a runtime-fault `exception`, if its leaf type was loaded.
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub(crate) fn exception_type_handle(&self, exception: ObjectRef) -> Option<u64> {
+        self.exception_faults
+            .iter()
+            .find(|(key, _)| *key == exception)
+            .and_then(|(_, fault)| fault.type_handle)
     }
 
     /// Records `exception` as the one currently propagating (set as a throw/fault begins its
@@ -2939,7 +2965,7 @@ impl Session {
         let flow = match step(top, current, code.len(), Some(module), vm, instruction) {
             Ok(flow) => flow,
             #[cfg(feature = "exceptions")]
-            Err(trap) => match catchable_fault(&trap, vm) {
+            Err(trap) => match catchable_fault(&trap, module, vm) {
                 Some(exception) => Flow::Throw(exception),
                 None => return Err(trap),
             },
@@ -3030,7 +3056,7 @@ impl Session {
                             Ok(Status::Running)
                         }
                         #[cfg(feature = "exceptions")]
-                        Err(trap) => match catchable_fault(&trap, vm) {
+                        Err(trap) => match catchable_fault(&trap, module, vm) {
                             Some(exception) => {
                                 vm.note_unhandled(exception);
                                 raise(frames, module, vm, exception)
@@ -3141,7 +3167,7 @@ impl Session {
                     Ok(Status::Running)
                 }
                 #[cfg(feature = "exceptions")]
-                Err(trap) => match catchable_fault(&trap, vm) {
+                Err(trap) => match catchable_fault(&trap, module, vm) {
                     Some(exception) => {
                         vm.note_unhandled(exception);
                         raise(frames, module, vm, exception)
@@ -3685,23 +3711,46 @@ fn read_byref(frames: &[Frame], vm: &Vm, location: Location) -> Value {
 /// local/argument of this frame, or a heap field/element/static) -- for Enum.ToString.
 #[cfg(feature = "bcl")]
 fn read_enum_value(frame: &Frame, frame_index: usize, vm: &Vm, location: Location) -> Option<i64> {
-    let value = match location {
-        Location::Local { frame: f, slot } if f == frame_index => frame.locals.get(slot).cloned(),
-        Location::Arg { frame: f, slot } if f == frame_index => frame.args.get(slot).cloned(),
-        Location::Field { object, slot } => vm.heap().instance_field(object, slot),
+    match read_constrained_receiver(frame, frame_index, vm, &location)? {
+        Value::Int32(n) => Some(i64::from(n)),
+        Value::Int64(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// The whole value a `constrained.` receiver's managed pointer names, for the III.2.1 box below --
+/// the same location set [`read_enum_value`] reads (this frame's locals and arguments, a heap
+/// field, an array element, a static, a box interior), widened from an enum's integer to any value.
+///
+/// Restricted to the CURRENT frame because a `constrained.` receiver is formed by `ldloca` /
+/// `ldarga` in the method making the call, or is a heap location that needs no frame at all; a
+/// pointer into an OUTER frame cannot arise at this site and reads as absent rather than as a
+/// wrong slot in this one.
+fn read_constrained_receiver(
+    frame: &Frame,
+    frame_index: usize,
+    vm: &Vm,
+    location: &Location,
+) -> Option<Value> {
+    match location {
+        Location::Local { frame: f, slot } if *f == frame_index => frame.locals.get(*slot).cloned(),
+        Location::Arg { frame: f, slot } if *f == frame_index => frame.args.get(*slot).cloned(),
+        Location::Field { object, slot } => vm.heap().instance_field(*object, *slot),
         Location::Element {
             array,
             index,
             byte_offset,
         } => vm
             .heap()
-            .array_get(array, array_element_index(vm, array, index, byte_offset)),
-        Location::Static { slot } => vm.static_field(slot),
-        _ => None,
-    }?;
-    match value {
-        Value::Int32(n) => Some(i64::from(n)),
-        Value::Int64(n) => Some(n),
+            .array_get(*array, array_element_index(vm, *array, *index, *byte_offset)),
+        Location::Static { slot } => vm.static_field(*slot),
+        Location::Boxed { object } => vm.heap().boxed_value(*object),
+        Location::Nested { base, slot } => {
+            match read_constrained_receiver(frame, frame_index, vm, base) {
+                Some(Value::Struct(fields)) => fields.get(*slot as usize).cloned(),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -4069,8 +4118,25 @@ fn method_handlers(module: &Module, id: MethodId) -> Result<Vec<EhClause>, Trap>
 /// is an intrinsic (e.g. `System.Exception`). No loaded type has this id, so it has no
 /// field layout or vtable, and `sig_dispatch` finds nothing for it (callvirt falls back to
 /// the bound intrinsic). A runtime-fault exception records its base-chain tag vector
-/// separately (`Vm::set_exception_chain`) so `catch` still matches it by type.
+/// separately (`Vm::set_exception_chain`) so `catch` still matches it by type, and its leaf
+/// `Type` handle separately again (`Vm::set_exception_type`) so `GetType()` can answer.
+///
 const EXTERNAL_TYPE_ID: u32 = u32::MAX;
+
+/// What the VES knows about one runtime-raised exception, whose managed type is external to the
+/// loaded module and so carries neither a base chain to walk nor a type handle to read.
+///
+/// Both facts are recorded at the moment the object is minted and are relocated together by the
+/// collector, which is why they share one entry rather than one table each.
+#[cfg(feature = "exceptions")]
+#[derive(Debug)]
+struct FaultIdentity {
+    /// The base-chain tag vector, leaf-first up to `System.Object` -- what a `catch`'s tag is
+    /// tested against, identical to what `Module::exception_base_chain` yields for a managed throw.
+    chain: Vec<u32>,
+    /// The leaf type's asm-folded `Type` handle, or `None` when that type is not loaded.
+    type_handle: Option<u64>,
+}
 
 /// The .NET exception type a catchable runtime fault surfaces as: a default message and the
 /// type's base-chain full names leaf-first up to `System.Object`. The handler search needs the
@@ -4240,7 +4306,8 @@ fn poison_failed_type(
         .copied()
         .map(crate::exception::exception_tag)
         .collect();
-    vm.set_exception_chain(wrapper, chain);
+    let type_handle = TYPE_INIT.first().and_then(|leaf| module.type_handle_by_name(leaf));
+    vm.set_exception_identity(wrapper, chain, type_handle);
     vm.set_exception_inner(wrapper, exception);
     vm.note_cctor_failed(type_id, wrapper);
     wrapper
@@ -4251,7 +4318,7 @@ fn poison_failed_type(
 /// for traps that should still abort execution (a stack overflow, an unresolved token,
 /// malformed CIL, ...).
 #[cfg(feature = "exceptions")]
-fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
+fn catchable_fault(trap: &Trap, module: &Module, vm: &mut Vm) -> Option<ObjectRef> {
     if let Trap::TypeInitializationFailed(type_id) = *trap {
         return vm.cctor_failure(type_id);
     }
@@ -4264,7 +4331,8 @@ fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
     let exception = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
     let message = vm.heap_mut().alloc_text(&text);
     vm.set_exception_message(exception, message);
-    vm.set_exception_chain(exception, chain);
+    let type_handle = chain_names.first().and_then(|leaf| module.type_handle_by_name(leaf));
+    vm.set_exception_identity(exception, chain, type_handle);
     Some(exception)
 }
 
@@ -4881,6 +4949,22 @@ fn step(
                     }
                 }
             }
+            if let Some(constraint) = constraint {
+                if !module.method_declares_value_type(method) {
+                    if let Some(Value::ByRef(location)) = args.first().cloned() {
+                        match read_constrained_receiver(frame, frame_index, vm, &location) {
+                            None => {}
+                            Some(value @ (Value::Object(_) | Value::Null)) => args[0] = value,
+                            Some(value) => {
+                                check_alloc_budget(vm)?;
+                                let boxed =
+                                    vm.heap_mut().alloc_boxed(asm_key(asm, constraint.0), value);
+                                args[0] = Value::Object(boxed);
+                            }
+                        }
+                    }
+                }
+            }
             if module.method_declares_value_type(method) {
                 if let Some(&Value::Object(reference)) = args.first() {
                     if vm.heap().boxed_type_token(reference).is_some() {
@@ -5489,12 +5573,14 @@ fn step(
                 _ => {
                     let default = match module.array_default(asm, token) {
                         Some(default) => default,
-                        None => module
+                        None if !module.is_enum_by_handle(element_type) => module
                             .type_id_of(asm, token)
+                            .filter(|&type_id| module.type_is_value_type(type_id))
                             .and_then(|type_id| module.type_field_defaults(type_id))
                             .map_or(Value::Null, |fields| {
                                 Value::Struct(fields.into_boxed_slice())
                             }),
+                        None => Value::Int32(0),
                     };
                     vm.heap_mut()
                         .alloc_typed_array(alloc::vec![default; length], element_type)
@@ -6619,6 +6705,25 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         });
     }
 
+    #[cfg(feature = "float")]
+    if matches!(opcode, Opcode::ConvU8 | Opcode::ConvU) {
+        let float = match value {
+            Value::Float(f) => Some(f),
+            Value::Single(f) => Some(f64::from(f)),
+            _ => None,
+        };
+        if let Some(f) = float {
+            if (9_223_372_036_854_775_808.0..18_446_744_073_709_551_616.0).contains(&f) {
+                let unsigned = f as u64;
+                return Ok(if opcode == Opcode::ConvU8 {
+                    Value::Int64(unsigned as i64)
+                } else {
+                    Value::NativeInt(unsigned as i64)
+                });
+            }
+        }
+    }
+
     let (source, from_32) = match value {
         Value::Int32(x) => (i64::from(x), true),
         Value::Int64(x) => (x, false),
@@ -6935,6 +7040,18 @@ fn resolve_callvirt(
     if let (Some(key), Some(type_id)) = (sig_key, runtime_type) {
         if let Some(method) = module.sig_dispatch(type_id, key) {
             return Some(method);
+        }
+        let mut ancestor = type_id;
+        for _ in 0..module.type_count() {
+            match module.type_base(ancestor) {
+                Some(base) => {
+                    if let Some(method) = module.sig_dispatch(base, key) {
+                        return Some(method);
+                    }
+                    ancestor = base;
+                }
+                None => break,
+            }
         }
         if static_method.is_none() {
             if let Some(method) = module.sig_dispatch_nonvirtual(type_id, key) {
@@ -7427,6 +7544,10 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
         failed_keys.push(type_id);
         failed_values.push(Value::Object(exception));
     }
+    #[cfg(feature = "exceptions")]
+    let mut fault_keys: Vec<Value> =
+        vm.exception_faults.iter().map(|(key, _)| Value::Object(*key)).collect();
+
     let mut lock_states: Vec<LockState> = Vec::with_capacity(vm.locks.len());
     let mut lock_keys: Vec<Value> = Vec::with_capacity(vm.locks.len());
     for (key, state) in core::mem::take(&mut vm.locks) {
@@ -7450,6 +7571,10 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
         for value in failed_values.iter_mut() {
             visit(value);
         }
+        #[cfg(feature = "exceptions")]
+        for value in fault_keys.iter_mut() {
+            visit(value);
+        }
         for value in lock_keys.iter_mut() {
             visit(value);
         }
@@ -7469,6 +7594,12 @@ fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn F
             _ => None,
         })
         .collect();
+    #[cfg(feature = "exceptions")]
+    for (slot, key) in vm.exception_faults.iter_mut().zip(&fault_keys) {
+        if let Value::Object(reference) = key {
+            slot.0 = *reference;
+        }
+    }
     #[cfg(feature = "exceptions")]
     {
         vm.cctors_failed = failed_keys
@@ -8255,6 +8386,35 @@ mod tests {
         assert_eq!(signed, Ok(Some(Value::Int64(-1))));
         let unsigned = run_convert(Opcode::ConvU8, Operand::Int32(-1), Opcode::LdcI4);
         assert_eq!(unsigned, Ok(Some(Value::Int64(0xFFFF_FFFF))));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn conv_u8_from_a_float_reaches_the_top_half_of_the_ulong_range() {
+        let two_pow_63 = run_convert(
+            Opcode::ConvU8,
+            Operand::Float64(9_223_372_036_854_775_808.0),
+            Opcode::LdcR8,
+        );
+        assert_eq!(two_pow_63, Ok(Some(Value::Int64(i64::MIN))));
+        let near_max = run_convert(
+            Opcode::ConvU8,
+            Operand::Float64(18_446_744_073_709_549_568.0),
+            Opcode::LdcR8,
+        );
+        assert_eq!(
+            near_max,
+            Ok(Some(Value::Int64(18_446_744_073_709_549_568_u64 as i64)))
+        );
+        let signed = run_convert(Opcode::ConvI8, Operand::Float64(3.9), Opcode::LdcR8);
+        assert_eq!(signed, Ok(Some(Value::Int64(3))));
+        let small = run_convert(Opcode::ConvU8, Operand::Float64(42.7), Opcode::LdcR8);
+        assert_eq!(small, Ok(Some(Value::Int64(42))));
+        let minus_one = run_convert(Opcode::ConvU8, Operand::Float64(-1.0), Opcode::LdcR8);
+        assert_eq!(minus_one, Ok(Some(Value::Int64(-1))));
+        let minus_two_point_five =
+            run_convert(Opcode::ConvU8, Operand::Float64(-2.5), Opcode::LdcR8);
+        assert_eq!(minus_two_point_five, Ok(Some(Value::Int64(-2))));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The verdicts that need no hardware: `boards`, `fit`, and `reconcile`.
 
 use crate::args::{self, Spec};
-use crate::catalogue::{self, BOARDS};
+use lamella_catalog::{self as catalog, BOARDS};
 use lamella_bsp_gen::fit::{Budget, BudgetSource, Fit, FitVerdict, fit};
 use lamella_bsp_gen::reconcile::{
     Claim, ClaimStatus, Observation, Outcome, ReconcileVerdict, reconcile,
@@ -9,13 +9,46 @@ use lamella_bsp_gen::reconcile::{
 use lamella_bsp_gen::strata::{Strata, parse};
 use std::process::ExitCode;
 
-/// Prints every board id the catalogue carries, with the part it is built around and whether this
+/// Prints every board id the catalog carries, with the part it is built around and whether this
 /// build can write it.
 ///
 /// **THE COVERAGE COLUMN IS PRINTED PER BOARD RATHER THAN SUMMARIZED**, because a capability that
 /// reaches some of a list and is described in a sentence reads as reaching all of it. A reader
 /// scanning for their own board gets the answer on their own row.
-pub fn boards_command() -> ExitCode {
+const BOARDS_USAGE: &str = "\
+usage: lamella boards
+
+Every board this build knows, with the part it carries and whether `lamella flash` can write it.
+
+A `-` in the FLASH column means nobody has stated how that board is programmed yet -- not that it
+cannot be. The board id in the first column is what --board takes everywhere else.";
+
+const FIT_USAGE: &str = "\
+usage: lamella fit --board <id> --image-bytes <n>
+
+Answers whether an image of <n> bytes fits that board, from the board facts alone -- no hardware,
+no image, no compiler. `lamella build --format` prints the byte count to pass.
+
+It answers about FLASH. A program that fits may still fail to run for want of RAM, which is a
+different question this verb does not claim to answer.";
+
+const RECONCILE_USAGE: &str = "\
+usage: lamella reconcile --board <id> [--read <name>=<value>]...
+
+Asks whether the board in front of you is the one you assumed. Give the readings you took and it
+compares them against what <id> should answer.
+
+--read repeats, once per discriminator: --read chip_id=0x4c013477 --read flash_jedec=0x1840ef
+
+The readings come from the command line rather than from a probe on purpose. Taking them off the
+wire belongs to whatever drives the board; the COMPARISON is the part that has to be right, and
+keeping them apart is what lets this be exercised with nothing plugged in.";
+
+pub fn boards_command(args: &[String]) -> ExitCode {
+    let spec = Spec { verb: "boards", usage: Some(BOARDS_USAGE), values: &[], flags: &[] };
+    if let Err(halt) = args::parse_or_halt(args, &spec) {
+        return halt.code();
+    }
     println!("{:<28} {:<14} {}", "BOARD", "PART", "FLASH");
     for (id, text) in BOARDS {
         let can = if crate::flash::can_flash(id) { "yes" } else { "-" };
@@ -36,13 +69,15 @@ pub fn boards_command() -> ExitCode {
 }
 
 pub fn fit_command(args: &[String]) -> ExitCode {
-    let spec = Spec { verb: "fit", values: &["--board", "--image-bytes"], flags: &[] };
-    let parsed = match args::parse(args, &spec) {
+    let spec = Spec {
+        verb: "fit",
+        usage: Some(FIT_USAGE),
+        values: &["--board", "--image-bytes"],
+        flags: &[],
+    };
+    let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+        Err(halt) => return halt.code(),
     };
     let (Some(board_id), Some(image_bytes)) = (
         parsed.value("--board"),
@@ -56,7 +91,7 @@ pub fn fit_command(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let (board, part) = match catalogue::resolve(board_id) {
+    let (board, part) = match catalog::resolve(board_id) {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("lamella fit: {error}");
@@ -89,13 +124,15 @@ pub fn exit_for(verdict: &FitVerdict) -> ExitCode {
 /// be right, and separating them is what lets this be exercised, and answered, with nothing
 /// plugged in.
 pub fn reconcile_command(args: &[String]) -> ExitCode {
-    let spec = Spec { verb: "reconcile", values: &["--board", "--read"], flags: &[] };
-    let parsed = match args::parse(args, &spec) {
+    let spec = Spec {
+        verb: "reconcile",
+        usage: Some(RECONCILE_USAGE),
+        values: &["--board", "--read"],
+        flags: &[],
+    };
+    let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+        Err(halt) => return halt.code(),
     };
     let mut observed = Vec::new();
     let mut index = 0;
@@ -128,7 +165,7 @@ pub fn reconcile_command(args: &[String]) -> ExitCode {
         eprintln!("usage: lamella reconcile --board <id> [--read <discriminator>=<value>]");
         return ExitCode::FAILURE;
     };
-    let (board, part) = match catalogue::resolve(board_id) {
+    let (board, part) = match catalog::resolve(board_id) {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("lamella reconcile: {error}");
@@ -253,7 +290,7 @@ mod tests {
     /// The rendered verdict names the id the user typed even when the board file states another.
     #[test]
     fn the_rendering_leads_with_the_id_the_user_selected() {
-        let (board, part) = catalogue::resolve("rpi-pico").expect("the pico board and its part");
+        let (board, part) = catalog::resolve("rpi-pico").expect("the pico board and its part");
         let text = render("rpi-pico", &fit(&board, &part, 100_000));
         assert!(text.starts_with("board rpi-pico"), "got {text:?}");
         assert!(text.contains("\"pico\""), "and discloses the file's own id: {text:?}");
@@ -264,11 +301,36 @@ mod tests {
     /// An image over the budget is a failure exit; one whose budget is unknown is not.
     #[test]
     fn only_exceeding_the_budget_is_a_failure_exit() {
-        let (board, part) = catalogue::resolve("rpi-pico").expect("the pico board and its part");
+        let (board, part) = catalog::resolve("rpi-pico").expect("the pico board and its part");
         let fits = fit(&board, &part, 1_000);
         let exceeds = fit(&board, &part, 1_000_000_000);
         assert!(matches!(exceeds.flash_fit, Fit::Exceeds { .. }), "got {:?}", exceeds.flash_fit);
         assert_eq!(format!("{:?}", exit_for(&fits)), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(format!("{:?}", exit_for(&exceeds)), format!("{:?}", ExitCode::FAILURE));
     }
+    /// **A VERB WITH NO USAGE TEXT ANSWERS `--help` BY PRINTING NOTHING AND EXITING 0**, which
+    /// reads to a person as "this tool has no help" and to a script as success. Five verbs did
+    /// exactly that until they were given one.
+    ///
+    /// Asserting the FIRST LINE rather than the presence of a string also catches the likelier
+    /// drift: a usage block copied from a neighbouring verb and not renamed.
+    #[test]
+    fn the_usage_opens_with_the_verb_it_belongs_to() {
+        assert!(
+            BOARDS_USAGE.starts_with("usage: lamella boards"),
+            "`boards` must open with the line a reader retypes: {}",
+            BOARDS_USAGE.lines().next().unwrap_or_default()
+        );
+        assert!(
+            FIT_USAGE.starts_with("usage: lamella fit"),
+            "`fit` must open with the line a reader retypes: {}",
+            FIT_USAGE.lines().next().unwrap_or_default()
+        );
+        assert!(
+            RECONCILE_USAGE.starts_with("usage: lamella reconcile"),
+            "`reconcile` must open with the line a reader retypes: {}",
+            RECONCILE_USAGE.lines().next().unwrap_or_default()
+        );
+    }
+
 }

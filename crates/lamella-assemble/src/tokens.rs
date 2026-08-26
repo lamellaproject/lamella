@@ -91,6 +91,17 @@ pub struct Tokens {
     /// Async methods whose machines and stub bodies land after the source types; see
     /// `compile::emit_async_machine`.
     pub(crate) pending_async: Vec<crate::compile::PendingAsync>,
+    /// Set just before emitting an `init` accessor: its return type is written
+    /// `void modreq(System.Runtime.CompilerServices.IsExternalInit)` rather than plain `void`.
+    /// CONSUMED (cleared) by the emit that reads it, so a forgotten reset cannot reach the next
+    /// member -- the same pre-set-and-self-clear shape `Binder::next_method_vararg` already uses,
+    /// and for the same reason: `emit_method_body` takes seventeen parameters and an eighteenth
+    /// would be `None` at twelve of its thirteen call sites.
+    ///
+    /// **THE MODIFIER IS THE FEATURE.** An init-only setter is otherwise an ordinary
+    /// `void set_P(T)`, so a build that drops it emits metadata in which the two are the same
+    /// method -- and any consumer, csc included, will assign the property wherever it likes.
+    pub(crate) next_return_is_external_init: bool,
     /// Per-enclosing-type counter over async methods, so `<M>d__N` names two same-named
     /// overloads apart. Keyed like `types`.
     pub(crate) async_counters: BTreeMap<String, usize>,

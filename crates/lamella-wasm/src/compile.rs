@@ -138,6 +138,12 @@ pub unsafe extern "C" fn lamella_compile_release(
     result_buffer(compile_with(source, refs, false))
 }
 
+/// The `compiling_assembly` the three IDE services pass when they load a reference. They answer
+/// questions ABOUT a source buffer and emit nothing, so there is no `/out` name for a reference's
+/// `[assembly: InternalsVisibleTo]` to have named -- and the strict setting is also the one that
+/// keeps completion honest, since it offers exactly the members a compile would accept.
+const NO_OUTPUT_ASSEMBLY: &str = "";
+
 /// Builds completion JSON (`{ items: [{ label, kind, detail }] }`) for the caret at byte
 /// `offset` in `source`, against `refs`. Parses + builds the model (BCL refs + the unit),
 /// then asks the binder's completion engine.
@@ -147,7 +153,7 @@ fn complete_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
     let mut model = lamella_binder::Model::new();
     for blob in split_refs(refs) {
         if let Ok(assembly) = Assembly::read(blob) {
-            lamella_binder::load_assembly(&mut model, &assembly);
+            lamella_binder::load_assembly(&mut model, &assembly, NO_OUTPUT_ASSEMBLY);
         }
     }
     lamella_binder::collect_into(&mut model, &unit);
@@ -213,7 +219,7 @@ fn hover_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
     let mut model = lamella_binder::Model::new();
     for blob in split_refs(refs) {
         if let Ok(assembly) = Assembly::read(blob) {
-            lamella_binder::load_assembly(&mut model, &assembly);
+            lamella_binder::load_assembly(&mut model, &assembly, NO_OUTPUT_ASSEMBLY);
         }
     }
     lamella_binder::collect_into(&mut model, &unit);
@@ -236,7 +242,7 @@ fn signature_help_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
     let mut model = lamella_binder::Model::new();
     for blob in split_refs(refs) {
         if let Ok(assembly) = Assembly::read(blob) {
-            lamella_binder::load_assembly(&mut model, &assembly);
+            lamella_binder::load_assembly(&mut model, &assembly, NO_OUTPUT_ASSEMBLY);
         }
     }
     lamella_binder::collect_into(&mut model, &unit);

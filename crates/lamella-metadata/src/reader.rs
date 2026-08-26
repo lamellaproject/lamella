@@ -1342,6 +1342,49 @@ impl<'a> Assembly<'a> {
         found
     }
 
+    /// The simple names of the assemblies this one declares as FRIENDS: the string argument of
+    /// every `[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("...")]` row on the
+    /// Assembly manifest (II.22.2's row 1, II.22.10's parent).
+    ///
+    /// THE ARGUMENT IS AN ASSEMBLY DISPLAY NAME, NOT A SIMPLE NAME. A strong-named friend is
+    /// spelled `"Friend, PublicKey=0024..."`, so everything from the first comma is dropped and the
+    /// remainder trimmed -- a reader that compared the whole string would match no strong-named
+    /// reference assembly at all, which is the majority of the .NET reference pack.
+    ///
+    /// The constructor signature is known statically (one `string`) rather than resolved, because
+    /// the ctor of an attribute declared in ANOTHER assembly arrives as a `MemberRef` whose
+    /// signature this reader would have to decode to learn what it already knows.
+    #[must_use]
+    pub fn friend_assemblies(&self) -> Vec<&'a str> {
+        let assembly_row = Token::new(table::ASSEMBLY, 1);
+        let mut friends = Vec::new();
+        for attribute in self.custom_attributes(assembly_row) {
+            let names = self
+                .resolve_method(attribute.constructor)
+                .and_then(|ctor| ctor.declaring_type);
+            let is_ivt = names.is_some_and(|declaring| {
+                declaring.namespace == "System.Runtime.CompilerServices"
+                    && declaring.name == "InternalsVisibleToAttribute"
+            });
+            if !is_ivt {
+                continue;
+            }
+            let decoded =
+                decode_custom_attribute(attribute.value, &[SigType::String], &|_| element::I4);
+            if let Some(decoded) = decoded
+                && let Some(AttrArg::Str(display_name)) = decoded.fixed.first()
+            {
+                let simple = display_name
+                    .split(',')
+                    .next()
+                    .unwrap_or(display_name)
+                    .trim();
+                friends.push(simple);
+            }
+        }
+        friends
+    }
+
     /// Whether `method_token` is a `[Lamella.Runtime.RuntimeProvided]` seam: a method whose body the
     /// VES supplies, carrying only a placeholder in source.
     #[must_use]
@@ -2177,6 +2220,16 @@ impl<'a> Param<'a> {
     #[must_use]
     pub fn token(&self) -> Token {
         Token::new(table::PARAM, self.index)
+    }
+
+    /// The parameter's DEFAULT ARGUMENT, if it has one -- the `Constant` row (II.22.9) an
+    /// optional parameter carries, which is how a default crosses an assembly boundary.
+    ///
+    /// `Constant` is keyed on a `HasConstant` coded index, so a `Param` parent reads exactly as a
+    /// `Field` parent does; only the token's table differs.
+    #[must_use]
+    pub fn constant(&self) -> Option<ConstantValue> {
+        self.assembly.constant(Token::new(table::PARAM, self.index))
     }
 }
 

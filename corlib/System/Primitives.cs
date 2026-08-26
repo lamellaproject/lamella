@@ -2,5 +2,8 @@
 namespace System
 {
     public struct Void { }
-    public abstract class ValueType : Object { }
+    public abstract class ValueType : Object
+    {
+        [Lamella.Runtime.RuntimeProvided] public override bool Equals(object obj) { return false; }
+    }
 }

@@ -1,0 +1,14 @@
+[package]
+name = "lamella-flash-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The contract every board flashing backend implements, and the driver that owns the ORDER those steps run in. Consumed by the `lamella` CLI and the MCP server; implemented by the per-part flashing crates, including ones written outside this project."
+publish = false
+
+[dependencies]
+# The probe-neutral seam a backend reaches its part through. Named here so the contract's error
+# type can carry a probe failure without every backend inventing its own wrapper.
+lamella-probe-core = { path = "../lamella-probe-core" }

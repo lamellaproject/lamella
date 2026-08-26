@@ -2,7 +2,7 @@
 //! Each submission is compiled and run so declarations persist and an expression prints its value.
 
 use lamella_cil_runtime::{Value, Vm, run};
-use lamella_load::load;
+use lamella_load::{load, resident_bytes};
 use lamella_metadata::Assembly;
 use lamella_wire::TransportError;
 use lamella_wire_host::RunResult;
@@ -59,6 +59,7 @@ impl ReplLink for InProcLink {
 /// Load and run a compiled program on a fresh VM, returning its exit code + console output. A
 /// read/load failure is reported as exit -1 with the reason as output; an unhandled trap is exit 70.
 fn run_in_proc(program_bytes: &[u8]) -> RunResult {
+    let program_bytes = resident_bytes(program_bytes);
     let Ok(assembly) = Assembly::read(program_bytes) else {
         return RunResult { exit: -1, stdout: "could not read the compiled program".to_owned() };
     };

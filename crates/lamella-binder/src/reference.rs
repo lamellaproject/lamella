@@ -27,8 +27,26 @@ const REQUIRED_MEMBER_ATTRIBUTE_NAME: &str = "RequiredMemberAttribute";
 use lamella_syntax::token::RealSuffix;
 use lamella_token::Token;
 
-/// Adds every type defined in `assembly` to `model`.
-pub fn load_assembly(model: &mut Model, assembly: &Assembly) {
+/// Adds every type defined in `assembly` to `model`, as they are VISIBLE to an assembly named
+/// `compiling_assembly`.
+///
+/// **A REFERENCED ASSEMBLY'S `private` AND `internal` MEMBERS ARE NOT IMPORTED AT ALL**, which is
+/// how csc models a reference (Roslyn's `MetadataImportOptions`) and is the whole reason the
+/// diagnostics come out matching: a member that is not in the model cannot be named, so a call to
+/// one is `CS1061` and a `new` on one is `CS1729` -- *there is no such member* -- rather than the
+/// `CS0122` an accessibility CHECK would report. `protected` and `protected internal` members ARE
+/// imported, because a derived class in this assembly may legitimately reach them; they are judged
+/// at the use site, where `CS0122` is csc's answer. All four codes are measured, not reasoned.
+///
+/// `compiling_assembly` names the assembly being built, so an `[assembly: InternalsVisibleTo]` on
+/// the reference can grant it the `internal` half. Pass `""` where there is no output assembly
+/// (a diagnostics-only bind): no friend declaration can match it, which is the strict answer.
+pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly: &str) {
+    let internals_visible = !compiling_assembly.is_empty()
+        && assembly
+            .friend_assemblies()
+            .iter()
+            .any(|friend| friend.eq_ignore_ascii_case(compiling_assembly));
     let param_array = assembly.param_array_params();
     let conditional = assembly.conditional_symbols();
     let type_parameters = assembly.type_parameter_names();
@@ -55,6 +73,7 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly) {
             own_parameters,
             &required_members,
             &sets_required,
+            internals_visible,
         ) {
             let mut info = info;
             if let Some(names) = type_parameters.get(&type_def.token().row()) {
@@ -130,6 +149,7 @@ fn type_info(
     own_parameters: &[&str],
     required_members: &BTreeSet<lamella_token::Token>,
     sets_required: &BTreeSet<lamella_token::Token>,
+    internals_visible: bool,
 ) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
     if name == "<Module>" {
@@ -162,7 +182,10 @@ fn type_info(
 
     let mut info = TypeInfo::new(namespace, name, kind);
     info.is_external = true;
+    info.internals_visible = internals_visible;
     info.is_sealed = type_def.is_sealed();
+    info.is_abstract = type_def.is_abstract();
+    info.accessibility = type_visibility(type_def.flags());
     info.enclosing = enclosing;
     info.assembly = assembly.assembly_name().map(Box::from);
     if let Some(base) = base {
@@ -176,6 +199,9 @@ fn type_info(
         }
     }
     for field in type_def.fields() {
+        if !member_is_imported(field.flags(), internals_visible) {
+            continue;
+        }
         if let (Some(field_name), Some(signature)) = (field.name(), field.signature()) {
             let constant = field.constant().and_then(constant_to_literal);
             info.fields.push(FieldSymbol {
@@ -197,6 +223,10 @@ fn type_info(
         .filter_map(|property| property.name())
         .collect();
     for method in type_def.methods() {
+        if !method_is_imported(method.flags(), internals_visible) {
+            info.hidden_constructors |= method.name() == Some(".ctor");
+            continue;
+        }
         let Some(method_name) = method.name() else {
             continue;
         };
@@ -207,6 +237,13 @@ fn type_info(
         let method_own_parameters: &[&str] = method_type_parameters
             .get(&method.rid())
             .map_or(&[], Vec::as_slice);
+        let returns_init_only = signature
+            .return_type_required_modifiers
+            .iter()
+            .any(|modifier| {
+                token_type_symbol(assembly, *modifier)
+                    == named_symbol("System.Runtime.CompilerServices", "IsExternalInit")
+            });
         let symbol = MethodSymbol {
             explicit_interface: None,
             name: method_name.into(),
@@ -259,8 +296,11 @@ fn type_info(
                 .find(|property| &*property.name == property_name)
             {
                 if method_name.starts_with("get_") {
+                    existing.has_getter = true;
                     existing.getter_accessibility.get_or_insert(symbol.accessibility);
                 } else if method_name.starts_with("set_") {
+                    existing.has_setter = true;
+                    existing.is_init = returns_init_only;
                     existing.setter_accessibility.get_or_insert(symbol.accessibility);
                 }
             }
@@ -270,12 +310,14 @@ fn type_info(
                     ty,
                     is_static: symbol.is_static,
                     accessibility: Accessibility::Public,
+                    explicit_interface: None,
                     is_virtual: symbol.is_virtual,
                     is_abstract: symbol.is_abstract,
                     is_override: symbol.is_override,
                     is_sealed: symbol.is_sealed,
                     has_getter: method_name.starts_with("get_"),
                     has_setter: method_name.starts_with("set_"),
+                    is_init: method_name.starts_with("set_") && returns_init_only,
                     getter_accessibility: method_name
                         .starts_with("get_")
                         .then_some(symbol.accessibility),
@@ -299,6 +341,9 @@ fn type_info(
                     is_static: symbol.is_static,
                     accessibility: symbol.accessibility,
                     is_abstract: symbol.is_abstract,
+                    is_virtual: symbol.is_virtual,
+                    is_override: symbol.is_override,
+                    is_sealed: symbol.is_sealed,
                 });
             }
         }
@@ -333,13 +378,7 @@ fn imported_parameter_info(
 ) -> Vec<crate::symbols::ParameterInfo> {
     use crate::symbols::{ParameterInfo, ParameterMode};
     const PARAM_OUT: u32 = 0x0002;
-    let mut info = alloc::vec![
-        ParameterInfo {
-            name: "".into(),
-            mode: ParameterMode::Value,
-        };
-        count
-    ];
+    let mut info = alloc::vec![ParameterInfo::required("".into(), ParameterMode::Value); count];
     let mut any = false;
     for param in method.params() {
         let sequence = param.sequence();
@@ -357,8 +396,82 @@ fn imported_parameter_info(
             slot.mode = ParameterMode::Out;
             any = true;
         }
+        if let Some(value) = param.constant()
+            && let Some(literal) = constant_to_literal(value)
+        {
+            slot.default = Some(literal);
+            any = true;
+        }
     }
     if any { info } else { Vec::new() }
+}
+
+/// Whether a referenced assembly's member is IMPORTED at all, given whether that assembly has
+/// named this compilation a friend. Reads the same `MemberAccess` mask as [`member_accessibility`]
+/// (II.23.1.5 / II.23.1.10).
+///
+/// **THIS IS THE csc RULE, AND IT IS A VISIBILITY RULE RATHER THAN AN ACCESSIBILITY ONE.** Roslyn
+/// reads a reference at `MetadataImportOptions.Public` -- public, `protected` and
+/// `protected internal` only -- and switches it to `.Internal` for an assembly an
+/// `InternalsVisibleTo` names. `private` is never imported at either setting, friend or not, which
+/// is why the friend flag does not reach the `Private`/`FamANDAssem` arms below.
+///
+/// Measured against csc on a 63-row table before it was written, because the two rules answer with
+/// DIFFERENT diagnostics and the difference is the whole point: an imported `internal` method is
+/// `CS1061` ("does not contain a definition"), an imported `internal` constructor is `CS1729`
+/// ("does not contain a constructor that takes N arguments"), and only the `protected` family --
+/// which IS imported -- reaches `CS0122`. A binder that imported everything and then checked
+/// accessibility would report `CS0122` for all of them and match csc on none.
+///
+/// `FamANDAssem` (`private protected`) is imported as though it were `private`, so a friend
+/// assembly's DERIVED class cannot reach one where csc lets it. That is the under-permissive
+/// direction: it refuses nothing a C# 1.0 or 2.0 source can write, because neither rung has a
+/// spelling for `private protected` at all -- that keyword arrives in C# 7.2.
+///
+/// A METHOD asks [`method_is_imported`] instead, which adds the one exemption a field cannot need.
+/// A `TypeDef`'s declared accessibility, from its visibility bits (II.23.1.15).
+///
+/// **THE TOP-LEVEL AND NESTED RANGES ARE DISJOINT AND MEAN DIFFERENT THINGS.** A top-level type is
+/// `Public` (1) or `NotPublic` (0) and nothing else -- C# has no other choice for one -- so
+/// `NotPublic` is `internal`. A nested type has the full five, because it is a member of its
+/// enclosing type and carries a member's accessibility.
+fn type_visibility(flags: u32) -> Accessibility {
+    match flags & 0x0000_0007 {
+        0x0000_0001 | 0x0000_0002 => Accessibility::Public,
+        0x0000_0003 => Accessibility::Private,
+        0x0000_0004 => Accessibility::Protected,
+        0x0000_0007 => Accessibility::ProtectedInternal,
+        _ => Accessibility::Internal,
+    }
+}
+
+fn member_is_imported(flags: u32, internals_visible: bool) -> bool {
+    match flags & 0x0007 {
+        0x0000 => false,
+        0x0001 => false,
+        0x0002 => false,
+        0x0003 => internals_visible,
+        _ => true,
+    }
+}
+
+/// Whether a referenced assembly's METHOD is imported: [`member_is_imported`], except that a
+/// VIRTUAL method is imported whatever its access.
+///
+/// **THE EXEMPTION IS NOT A REFINEMENT.** A method holding a vtable slot is part of the contract a
+/// DERIVED type inherits, whether or not this compilation may CALL it: an `internal abstract`
+/// member of a public class is exactly the member a derived class in another assembly cannot
+/// supply, so a filter that drops it lets `class D : ImportedBase { }` compile where csc reports
+/// `CS0534` naming it -- a contract that does not fail, but disappears.
+///
+/// **MEASURED, ON THE PAIR THAT SEPARATES THIS RULE FROM AN ABSTRACT-ONLY ONE:** an
+/// `internal virtual` method of a referenced assembly is `CS0122` from another one -- present, and
+/// inaccessible -- while the `internal` method beside it, identical but for the keyword, is
+/// `CS1061`. Only a rule keyed on VIRTUAL answers both, and it is csc's own predicate.
+///
+/// A FIELD is never virtual, so the field walk keeps asking [`member_is_imported`] directly.
+fn method_is_imported(flags: u32, internals_visible: bool) -> bool {
+    flags & 0x0040 != 0 || member_is_imported(flags, internals_visible)
 }
 
 fn member_accessibility(flags: u32) -> Accessibility {

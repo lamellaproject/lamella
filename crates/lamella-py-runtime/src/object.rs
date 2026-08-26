@@ -3690,8 +3690,8 @@ impl ObjectModel {
     /// families of wording because CPython has four: `%d`/`%i`/`%u` want "a real number",
     /// `%o`/`%x`/`%X` want "an integer" (a float is refused outright, never truncated), the float
     /// codes want "must be real number", and `%c` wants "an int or a unicode character". A character
-    /// `%`-format does not define at all (`%b`, `%n`) is a `ValueError` naming its position -- this
-    /// runtime used to render `"%b" % 5` as `"101"`, which is output CPython never produces.
+    /// `%`-format does not define at all (`%b`, `%n`) is a `ValueError` naming its position. Rendering
+    /// `"%b" % 5` as `"101"` is output CPython never produces.
     fn coerce_percent_arg(&mut self, ty: char, ty_index: usize, arg: Value) -> Result<Value, Trap> {
         let is_int = self.is_integer_value(arg);
         match ty {

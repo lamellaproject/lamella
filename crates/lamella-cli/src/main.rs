@@ -3,13 +3,10 @@
 use std::process::ExitCode;
 
 mod args;
-mod artifact;
 #[cfg(feature = "bake")]
 mod attach;
 #[cfg(feature = "bake")]
 mod bake;
-mod bootsel;
-mod catalogue;
 mod deploy;
 mod devices;
 mod flash;
@@ -25,7 +22,7 @@ fn main() -> ExitCode {
         Some("build") => program::build_command(rest),
         Some("flash") => flash::flash_command(rest),
         Some("deploy") => deploy::deploy_command(rest),
-        Some("boards") => verdicts::boards_command(),
+        Some("boards") => verdicts::boards_command(rest),
         Some("fit") => verdicts::fit_command(rest),
         Some("reconcile") => verdicts::reconcile_command(rest),
         Some("--help" | "-h" | "help") | None => {
@@ -106,5 +103,46 @@ mod tests {
     #[test]
     fn the_usage_says_which_verbs_need_no_hardware() {
         assert!(super::USAGE.contains("NEEDS HARDWARE"), "the usage buries the best property");
+    }
+
+    /// **EVERY VERB ANSWERS `--help`, INCLUDING ONE THAT TAKES NO OPTIONS.** A verb reading no
+    /// arguments would print its table for `--help` and for `--nonsense` alike and exit 0 both
+    /// times -- a verb silently swallowing an option, which is the single thing `args`'s own
+    /// header says this tool must never do. Taking no options is not a reason to skip the parser;
+    /// it is what makes the omission invisible.
+    ///
+    /// Driven through the real command functions rather than through a list of specs, because a
+    /// spec list would agree with itself by construction. Both spellings return before any verb
+    /// does work, so nothing here touches hardware, a file, or a board.
+    ///
+    #[test]
+    fn every_verb_answers_help_and_refuses_an_unknown_option() {
+        fn code(exit: std::process::ExitCode) -> String {
+            format!("{exit:?}")
+        }
+        let ok = code(std::process::ExitCode::SUCCESS);
+        let bad = code(std::process::ExitCode::FAILURE);
+        assert_ne!(ok, bad, "the two codes must be distinguishable for this test to mean anything");
+
+        let help = vec!["--help".to_owned()];
+        let junk = vec!["--surely-no-verb-takes-this".to_owned()];
+        let verbs: [(&str, fn(&[String]) -> std::process::ExitCode); 8] = [
+            ("boards", super::verdicts::boards_command),
+            ("fit", super::verdicts::fit_command),
+            ("reconcile", super::verdicts::reconcile_command),
+            ("run", super::program::run_command),
+            ("build", super::program::build_command),
+            ("flash", super::flash::flash_command),
+            ("devices", super::devices::devices_command),
+            ("deploy", super::deploy::deploy_command),
+        ];
+        for (verb, command) in verbs {
+            assert_eq!(code(command(&help)), ok, "`lamella {verb} --help` must succeed");
+            assert_eq!(
+                code(command(&junk)),
+                bad,
+                "`lamella {verb}` must REFUSE an option it does not take, not ignore it"
+            );
+        }
     }
 }

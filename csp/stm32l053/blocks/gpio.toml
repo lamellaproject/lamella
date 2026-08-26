@@ -1,0 +1,105 @@
+# BLOCK layout: the STM32L0x3 GPIO port block. Offsets are instance-base-relative; the port
+# instance bases live in ../instances.toml.
+#
+# IT IS NOT csp/stm32l0's GPIO BLOCK, AND THE DIFFERENCE IS A WHOLE REGISTER. This line adds
+# GPIOx_BRR at 0x28 -- a bit-reset register beside BSRR -- which RM0377 does not give the L0x1 at
+# all. Reading the L0x1's layout across would place the first ten registers correctly and then
+# simply lack the eleventh.
+#
+# THE RESET MODE IS ANALOG, NOT INPUT. 11 is the reset state, so an untouched pin has its input
+# buffer off and IDR reads zero forever. An alternate-function setup must CLEAR a pin's 2-bit field
+# before OR-ing its value in; an OR alone leaves the pin analog.
+#
+# AND GPIOA's MODER RESET IS NOT ALL-ANALOG, because PA13 and PA14 come out of reset as SWDIO and
+# SWCLK. Table 48 gives port A its own row for that reason. A driver assuming a uniform analog reset
+# across ports is wrong about exactly the two pins a debugger is holding.
+#
+
+[table]
+kind = "block"
+family = "stm32l053"
+block = "gpio"
+sources = [
+    "STM32L0x3 reference manual RM0367 Rev 8, per-register sections each stating its own address offset: 9.4.1 GPIOx_MODER 0x00, 9.4.2 GPIOx_OTYPER 0x04, 9.4.3 GPIOx_OSPEEDR 0x08, 9.4.4 GPIOx_PUPDR 0x0C, 9.4.5 GPIOx_IDR 0x10, 9.4.6 GPIOx_ODR 0x14, 9.4.7 GPIOx_BSRR 0x18, 9.4.9 GPIOx_AFRL 0x20, 9.4.10 GPIOx_AFRH 0x24, 9.4.11 GPIOx_BRR 0x28",
+    "RM0367 Rev 8 section 9.4.1 for the mode encoding -- 00 input, 01 general purpose output, 10 alternate function, 11 analog (reset state) -- and 9.4.10 for the AF0..AF7 encoding, values above 0111 being reserved",
+    "RM0367 Rev 8 section 9.4.12 table 48 (GPIO register map and reset values), used as an independent cross-check on the offsets and for GPIOA's distinct MODER reset value",
+]
+notes = [
+    "GPIO config is read-modify-write: MODER holds 2 bits per pin and an AFR nibble 4, so a pin's field span must be CLEARED before the set value is OR-ed in.",
+    "WHICH AFR REGISTER A PIN USES IS DECIDED BY THE PIN NUMBER, NOT BY THE FUNCTION: AFRL covers pins 0..7 and AFRH pins 8..15, each with 4 bits per pin counted from its OWN base. Pin 10's nibble is at bit 8 of AFRH, not at bit 40 of anything.",
+    "OTYPER, IDR, ODR, BSRR and BRR carry ONE bit per pin rather than two, so their shift is the pin index itself and not twice it.",
+    "BSRR's low half SETS a pin and its high half CLEARS one. BRR at 0x28 is a SECOND way to clear: its low half alone does what BSRR's high half does. Two registers reaching one effect is worth knowing before reading a driver that uses one and a manual passage describing the other.",
+    "This family populates AF0 to AF7 only. A nibble above 7 is reserved and selects nothing.",
+]
+
+[registers.MODER]
+offset = 0x0
+width = 32
+fields = { MODE2 = [4, 2], MODE3 = [6, 2], MODE5 = [10, 2] }
+notes = "Port mode, 2 bits per pin at [2n, 2]. PARTIAL: pins 2, 3 and 5 stated, the three the board's bindings reach. RM0367 names the fields MODEy, not MODERy."
+
+[registers.OTYPER]
+offset = 0x4
+width = 32
+fields = { }
+notes = "Output type, ONE bit per pin at [n]: 0 = push-pull (reset), 1 = open drain. Bits 31:16 reserved."
+
+[registers.OSPEEDR]
+offset = 0x8
+width = 32
+fields = { }
+notes = "Output speed, 2 bits per pin at [2n]. A slew-rate setting rather than a clock."
+
+[registers.PUPDR]
+offset = 0xC
+width = 32
+fields = { }
+notes = "Pull-up/pull-down, 2 bits per pin at [2n]: 00 none, 01 pull-up, 10 pull-down. Whether an EXTERNAL pull is fitted is a board fact and never this table's."
+
+[registers.IDR]
+offset = 0x10
+width = 32
+fields = { }
+notes = "Input data, ONE bit per pin at [n], read-only. Reads zero until MODER takes the pin out of analog mode."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { }
+notes = "Output data, ONE bit per pin at [n]. Read-modify-write; BSRR and BRR are the single-write alternatives."
+
+[registers.BSRR]
+offset = 0x18
+width = 32
+fields = { }
+notes = "Bit set/reset, write-only: bit [n] SETS pin n and bit [n+16] CLEARS it."
+
+[registers.AFRL]
+offset = 0x20
+width = 32
+fields = { AFSEL0 = [0, 4], AFSEL1 = [4, 4], AFSEL2 = [8, 4], AFSEL3 = [12, 4], AFSEL4 = [16, 4], AFSEL5 = [20, 4], AFSEL6 = [24, 4], AFSEL7 = [28, 4] }
+notes = "Alternate function for pins 0..7, 4 bits per pin. The nibble's value IS the AF number."
+
+[registers.AFRH]
+offset = 0x24
+width = 32
+fields = { AFSEL8 = [0, 4], AFSEL9 = [4, 4], AFSEL10 = [8, 4], AFSEL11 = [12, 4], AFSEL12 = [16, 4], AFSEL13 = [20, 4], AFSEL14 = [24, 4], AFSEL15 = [28, 4] }
+notes = "Alternate function for pins 8..15, 4 bits per pin. Nibble n of this register is pin 8+n, not pin n."
+
+[registers.BRR]
+offset = 0x28
+width = 32
+fields = { }
+notes = "Bit reset, write-only: bit [n] CLEARS pin n. NOT PRESENT on the L0x1 line -- this register is one of the differences between the two books."
+
+# MODER field values (9.4.1). MODER_MODE_AF is the name the shared STM32 uart resolver reads.
+[constants]
+MODER_MODE_INPUT = 0
+MODER_MODE_OUTPUT = 1
+MODER_MODE_AF = 2
+MODER_MODE_ANALOG = 3
+PUPD_NONE = 0
+PUPD_UP = 1
+PUPD_DOWN = 2
+OTYPE_PUSH_PULL = 0
+OTYPE_OPEN_DRAIN = 1

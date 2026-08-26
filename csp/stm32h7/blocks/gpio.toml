@@ -92,7 +92,7 @@ notes = "Configuration lock. Freezes a pin's control and alternate-function regi
 offset = 0x20
 width = 32
 fields = { }
-notes = "Alternate function for pins 0..7, 4 bits per pin at [4n, 4]. No pin this family muxes falls in this half yet."
+notes = "Alternate function for pins 0..7, 4 bits per pin at [4n, 4]. No pin this family muxes falls in this half."
 
 [registers.AFRH]
 offset = 0x24

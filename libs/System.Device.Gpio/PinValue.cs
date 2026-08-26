@@ -41,6 +41,10 @@ namespace System.Device.Gpio
         /// <summary>Indicates whether this instance and a specified object are equal.</summary>
         public override bool Equals(object obj) { return (obj is PinValue) && (this == (PinValue)obj); }
 
+        /// <summary>Whether this value equals another, without boxing.</summary>
+        /// <param name="other">The value to compare with.</param>
+        public bool Equals(PinValue other) { return this == other; }
+
         /// <summary>Returns the hash code for this instance.</summary>
         public override int GetHashCode() { return _value; }
 

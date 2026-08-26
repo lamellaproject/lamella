@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use lamella_asm_arm32::{AssembleError, Cond, Encoder, Label, Reg, RelocKind};
 use lamella_ir::{
     BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, StaticOwner, Terminator, ValueId,
+    VerifyError,
 };
 
 use crate::target::TargetLowering;
@@ -14,7 +15,14 @@ use crate::target::TargetLowering;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     /// The function did not pass [`lamella_ir::verify`].
-    NotWellFormed,
+    ///
+    /// CARRIES THE VERIFIER'S OWN ERRORS, for the same reason [`LowerError::CodeTooLarge`] carries
+    /// its site: a bare "not well formed" names neither the malformed instruction nor the types that
+    /// disagreed, so a refusing corpus row reported no reason at all and needed a second run under a
+    /// different tool to classify.
+    NotWellFormed {
+        errors: Vec<VerifyError>,
+    },
     /// A control-flow shape this tracer does not handle yet: a branch target with
     /// parameters (merges must go through Jump) or a dangling block reference.
     ControlFlowUnsupported,
@@ -281,12 +289,15 @@ fn lower_inst(
         | Inst::ArrayElemAddr { .. }
         | Inst::AllocArray2D { .. }
         | Inst::Array2DLoad { .. }
+        | Inst::Array2DElemAddr { .. }
+        | Inst::ArrayMDElemAddr { .. }
         | Inst::Array2DStore { .. }
         | Inst::AllocArrayMD { .. }
         | Inst::ArrayMDLoad { .. }
         | Inst::ArrayMDStore { .. }
         | Inst::StaticLoad { .. }
         | Inst::StaticStore { .. }
+        | Inst::StaticAddr { .. }
         | Inst::LoadTypeDesc { .. }
         | Inst::TypeDescAddr { .. } => {
             return Err(LowerError::CallUnsupported);
@@ -662,12 +673,22 @@ fn load_call_args(
     Ok(())
 }
 
-/// Whether a field-access base is a pointer to dereference -- a managed pointer (`this`) or
-/// a heap object reference -- rather than a value type held inline in its own stack slot.
+/// Whether a field-access base is a pointer to dereference -- a managed pointer (`this`), a heap
+/// object reference or an unmanaged pointer -- rather than a value type held inline in its own
+/// stack slot.
+///
+/// A `NativeInt` base IS a pointer, and the distinction is not a performance one. An UNMANAGED
+/// pointer (`T*`) is CIL's `native int`: `conv.u`/`conv.i` is where a managed pointer stops being
+/// tracked, and a pointer local is declared `NativeInt` outright, so `p->f` through an `S* p`
+/// arrives here with a `NativeInt` base. The two answers read DIFFERENT MEMORY -- a pointer base is
+/// dereferenced, anything else is taken as an instance living in the value's own slot -- so
+/// classifying one as inline answers the pointer itself where the field was asked for, and stores to
+/// the pointer instead of through it. Nothing else can be a field base: a base is an address or an
+/// inline struct, and an inline struct is a `ValueType`.
 fn is_pointer_base(value_types: &[MirType], base: ValueId) -> bool {
     matches!(
         value_types.get(base.0 as usize),
-        Some(MirType::ManagedPtr | MirType::ObjectRef)
+        Some(MirType::ManagedPtr | MirType::ObjectRef | MirType::NativeInt)
     )
 }
 
@@ -986,12 +1007,26 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
+            let array_form = enc.new_label();
+            let have_itable = enc.new_label();
+            enc.ldr_imm(Reg::R1, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsrs_imm(Reg::R1, Reg::R1, 24)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, array_form);
             enc.ldr_imm(Reg::R1, Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.lsls_imm(Reg::R1, Reg::R1, 2)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.adds_imm8(Reg::R1, 16)
                 .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(have_itable);
+            enc.bind_label(array_form);
+            enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(have_itable);
             enc.adds(Reg::R1, Reg::R0, Reg::R1)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_imm(Reg::R2, Reg::R1, 0)
@@ -1114,19 +1149,26 @@ fn lower_spilled_inst(
             enc.cmp_imm(Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.b_cond(Cond::Eq, miss);
+            let array_form = enc.new_label();
+            let have_itable = enc.new_label();
             enc.ldr_imm(Reg::R1, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.lsrs_imm(Reg::R1, Reg::R1, 24)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, miss);
+            enc.b_cond(Cond::Eq, array_form);
             enc.ldr_imm(Reg::R1, Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.lsls_imm(Reg::R1, Reg::R1, 2)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.adds_imm8(Reg::R1, 16)
                 .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(have_itable);
+            enc.bind_label(array_form);
+            enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(have_itable);
             enc.adds(Reg::R1, Reg::R0, Reg::R1)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_imm(Reg::R2, Reg::R1, 0)
@@ -1480,6 +1522,9 @@ fn lower_spilled_inst(
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::StaticAddr { owner, offset } => {
+            static_slot_addr(enc, pool, sym_pool, relocate, *owner, *offset)?;
+        }
         Inst::StaticStore {
             owner,
             offset,
@@ -1515,22 +1560,7 @@ fn lower_spilled_inst(
             element_size,
             signed,
         } => {
-            slot_load(enc, Reg::R0, slot(*array))?;
-            slot_load(enc, Reg::R1, slot(*index0))?;
-            emit_dim_bounds_check(enc, 0)?;
-            slot_load(enc, Reg::R1, slot(*index1))?;
-            emit_dim_bounds_check(enc, 4)?;
-            slot_load(enc, Reg::R1, slot(*index0))?;
-            enc.ldr_imm(Reg::R2, Reg::R0, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.muls(Reg::R1, Reg::R2)
-                .map_err(|_| LowerError::TooManyValues)?;
-            slot_load(enc, Reg::R2, slot(*index1))?;
-            enc.adds(Reg::R1, Reg::R1, Reg::R2)
-                .map_err(|_| LowerError::TooManyValues)?;
-            scale_index(enc, pool, *element_size)?;
-            enc.adds_imm8(Reg::R0, 8)
-                .map_err(|_| LowerError::TooManyValues)?;
+            emit_2d_element_parts(enc, pool, &slot, *array, *index0, *index1, *element_size)?;
             if *element_size == 8 {
                 enc.adds(Reg::R2, Reg::R0, Reg::R1)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -1549,6 +1579,16 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             }
         }
+        Inst::Array2DElemAddr {
+            array,
+            index0,
+            index1,
+            element_size,
+        } => {
+            emit_2d_element_parts(enc, pool, &slot, *array, *index0, *index1, *element_size)?;
+            enc.adds(Reg::R0, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
         Inst::Array2DStore {
             array,
             index0,
@@ -1556,22 +1596,7 @@ fn lower_spilled_inst(
             value,
             element_size,
         } => {
-            slot_load(enc, Reg::R0, slot(*array))?;
-            slot_load(enc, Reg::R1, slot(*index0))?;
-            emit_dim_bounds_check(enc, 0)?;
-            slot_load(enc, Reg::R1, slot(*index1))?;
-            emit_dim_bounds_check(enc, 4)?;
-            slot_load(enc, Reg::R1, slot(*index0))?;
-            enc.ldr_imm(Reg::R2, Reg::R0, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.muls(Reg::R1, Reg::R2)
-                .map_err(|_| LowerError::TooManyValues)?;
-            slot_load(enc, Reg::R2, slot(*index1))?;
-            enc.adds(Reg::R1, Reg::R1, Reg::R2)
-                .map_err(|_| LowerError::TooManyValues)?;
-            scale_index(enc, pool, *element_size)?;
-            enc.adds_imm8(Reg::R0, 8)
-                .map_err(|_| LowerError::TooManyValues)?;
+            emit_2d_element_parts(enc, pool, &slot, *array, *index0, *index1, *element_size)?;
             if *element_size == 8 {
                 enc.adds(Reg::R0, Reg::R0, Reg::R1)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -1607,6 +1632,14 @@ fn lower_spilled_inst(
             } else {
                 emit_sized_load(enc, Reg::R0, Reg::R0, *element_size, *signed)?;
             }
+        }
+        Inst::ArrayMDElemAddr {
+            array,
+            indices,
+            element_size,
+        } => {
+            slot_load(enc, Reg::R0, slot(*array))?;
+            emit_md_element_address(enc, pool, slot, indices, *element_size)?;
         }
         Inst::ArrayMDStore {
             array,
@@ -1687,6 +1720,41 @@ fn emit_sized_load(
             .ldr_imm(rt, rn, 0)
             .map_err(|_| LowerError::TooManyValues)?,
     }
+    Ok(())
+}
+
+/// Bounds-checks `(index0, index1)` against a 2-D array's two dimension words and leaves the element
+/// location in TWO registers: the elements' base in r0 and the scaled byte offset in r1.
+///
+/// A PAIR rather than one pointer because the load and store that follow use the halves as a
+/// register-offset addressing mode -- `ldr r0, [r0, r1]` -- which the address form then adds together
+/// itself. Extracted rather than written a third time: the load and the store carried
+/// character-identical copies, and `Address` would have been the third place to keep in step.
+fn emit_2d_element_parts(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    slot: &impl Fn(ValueId) -> u16,
+    array: ValueId,
+    index0: ValueId,
+    index1: ValueId,
+    element_size: u32,
+) -> Result<(), LowerError> {
+    slot_load(enc, Reg::R0, slot(array))?;
+    slot_load(enc, Reg::R1, slot(index0))?;
+    emit_dim_bounds_check(enc, 0)?;
+    slot_load(enc, Reg::R1, slot(index1))?;
+    emit_dim_bounds_check(enc, 4)?;
+    slot_load(enc, Reg::R1, slot(index0))?;
+    enc.ldr_imm(Reg::R2, Reg::R0, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.muls(Reg::R1, Reg::R2)
+        .map_err(|_| LowerError::TooManyValues)?;
+    slot_load(enc, Reg::R2, slot(index1))?;
+    enc.adds(Reg::R1, Reg::R1, Reg::R2)
+        .map_err(|_| LowerError::TooManyValues)?;
+    scale_index(enc, pool, element_size)?;
+    enc.adds_imm8(Reg::R0, 8)
+        .map_err(|_| LowerError::TooManyValues)?;
     Ok(())
 }
 
@@ -2710,6 +2778,7 @@ fn lower_spilled_into(
                 length,
                 element_size,
                 element_kind,
+                element_cast_class,
             } = inst
             {
                 let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
@@ -2719,8 +2788,13 @@ fn lower_spilled_into(
                         let label = enc.new_label();
                         type_descs.push((
                             label,
-                            alloc::vec![ARRAY_DESC_MARK | 1, *element_kind, 0u32]
-                                .into_boxed_slice(),
+                            alloc::vec![
+                                ARRAY_DESC_MARK | 1,
+                                *element_kind,
+                                0u32,
+                                *element_cast_class
+                            ]
+                            .into_boxed_slice(),
                         ));
                         type_desc_labels.push((*handle, label));
                         if let Some(element) = element {
@@ -3080,18 +3154,16 @@ fn lower_spilled_into(
         for &word in words.iter().skip(3) {
             enc.emit_word(word);
         }
-        if let Some(meta) = meta {
-            if !meta.itable.is_empty() {
-                enc.emit_word(meta.itable.len() as u32);
-                for (tag, impl_) in &meta.itable {
-                    enc.emit_word(*tag);
-                    let crate::resolver::VtableEntry::Func(func_index) = impl_ else {
-                        continue;
-                    };
-                    if let Some(&label) = func_labels.get(*func_index as usize) {
-                        enc.data_word_diff(entry, label);
-                    }
-                }
+        let empty = Vec::new();
+        let itable = meta.map_or(&empty, |m| &m.itable);
+        enc.emit_word(itable.len() as u32);
+        for (tag, impl_) in itable {
+            enc.emit_word(*tag);
+            let crate::resolver::VtableEntry::Func(func_index) = impl_ else {
+                continue;
+            };
+            if let Some(&label) = func_labels.get(*func_index as usize) {
+                enc.data_word_diff(entry, label);
             }
         }
     }
@@ -3128,8 +3200,8 @@ enum Assignment {
 
 /// Verifies `func` and decides where its values live.
 fn prepare(func: &Function) -> Result<Assignment, LowerError> {
-    if lamella_ir::verify(func).is_err() {
-        return Err(LowerError::NotWellFormed);
+    if let Err(errors) = lamella_ir::verify(func) {
+        return Err(LowerError::NotWellFormed { errors });
     }
     if func.value_types.iter().any(|ty| ty.is_float()) {
         return Ok(Assignment::Spilled);
@@ -3904,11 +3976,11 @@ impl StackMaps {
     /// `ObjectRef` roots; `tagged_offsets` are `PyValue` roots the collector traces by tag. The
     /// tagged fields are always present -- a C# image emits `ntagged = 0`.
     ///
-    /// The OBJECT path no longer calls this. There, `return_pc` is only knowable after the linker
-    /// has dead-stripped and laid out the text, so the map is synthesized by `lamella-link` from the
-    /// [`lamella_elf::STACKMAP_GCMAP_SECTION`] fragments -- same bytes, same symbol, built where the
-    /// addresses are true. This stays the encoder for the FLAT path, which has no linker and whose
-    /// offsets are final at lowering time.
+    /// THIS IS THE FLAT PATH'S ENCODER ONLY. The OBJECT path does not call it: there `return_pc`
+    /// is knowable only after the linker has dead-stripped and laid out the text, so `lamella-link`
+    /// synthesizes the map from the [`lamella_elf::STACKMAP_GCMAP_SECTION`] fragments -- same bytes,
+    /// same symbol, built where the addresses are true. The flat path has no linker and its offsets
+    /// are final at lowering time, which is what lets this encode them directly.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -4572,6 +4644,7 @@ fn lower_runtime_calls(
                 length,
                 element_size,
                 element_kind,
+                element_cast_class,
             } = &inst
             {
                 let symbol = intern_extern(externs, "lamella_gc_alloc");
@@ -4622,8 +4695,15 @@ fn lower_runtime_calls(
                     typedesc,
                     Inst::TypeDescLiteral {
                         handle: handle.0,
-                        words: alloc::vec![ARRAY_DESC_MARK | 1, *element_kind, type_tag, 0, 0]
-                            .into_boxed_slice(),
+                        words: alloc::vec![
+                            ARRAY_DESC_MARK | 1,
+                            *element_kind,
+                            type_tag,
+                            0,
+                            0,
+                            *element_cast_class
+                        ]
+                        .into_boxed_slice(),
                         vtable: descriptor_vtable(
                             descriptors.iter().find(|m| m.handle == *handle),
                             externs,
@@ -4954,8 +5034,8 @@ fn lower_one_func(
     lines: &mut Vec<(u32, u32)>,
     string_header: Option<(u32, i32)>,
 ) -> Result<(), LowerError> {
-    if lamella_ir::verify(func).is_err() {
-        return Err(LowerError::NotWellFormed);
+    if let Err(errors) = lamella_ir::verify(func) {
+        return Err(LowerError::NotWellFormed { errors });
     }
     match prepare(func)? {
         Assignment::Registers { regs, saved } => lower_into(
@@ -6117,6 +6197,33 @@ impl TargetLowering for Arm32 {
 mod tests {
     use super::*;
     use lamella_ir::{BasicBlock, BlockId, MirType};
+
+    /// A `NativeInt` base is an UNMANAGED POINTER and is dereferenced, not read as an inline struct.
+    ///
+    /// The two branches here are not "fast and slow" -- they read DIFFERENT MEMORY. A pointer base
+    /// loads the address and accesses `[address + offset]`; anything else takes the base's own stack
+    /// slot as the instance. So `p->f` through an `S* p` misclassified as inline answers the pointer
+    /// itself, and `p->f = x` overwrites the pointer. That is silent on this backend -- there is no
+    /// refusal branch to hit -- which is why the classification is pinned rather than inferred.
+    #[test]
+    fn an_unmanaged_pointer_is_a_dereferenceable_field_base() {
+        let types = [
+            MirType::ObjectRef,
+            MirType::ManagedPtr,
+            MirType::NativeInt,
+            MirType::I32,
+            MirType::ValueType {
+                handle: lamella_ir::TypeHandle(0),
+                size: 8,
+                refs: lamella_ir::RefWords::NONE,
+            },
+        ];
+        assert!(is_pointer_base(&types, ValueId(0)));
+        assert!(is_pointer_base(&types, ValueId(1)));
+        assert!(is_pointer_base(&types, ValueId(2)), "`T*` is `native int`");
+        assert!(!is_pointer_base(&types, ValueId(3)));
+        assert!(!is_pointer_base(&types, ValueId(4)));
+    }
 
     #[test]
     fn lowers_constant_return() {
@@ -9301,6 +9408,7 @@ mod tests {
                             length: ValueId(0),
                             element_size: 8,
                             element_kind: 8,
+                            element_cast_class: 0,
                         },
                     ),
                     (
@@ -9496,6 +9604,7 @@ mod tests {
                         length: ValueId(0),
                         element_size: 4,
                         element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
+                        element_cast_class: 0,
                     },
                 )],
                 terminator: Some(Terminator::Return(Some(ValueId(1)))),
@@ -10693,10 +10802,10 @@ mod tests {
 
     /// A big-struct (sret) return reserves the result-pointer word in the SHARED
     /// `spilled_slot_offsets`, below the first value slot -- so `method_record_roots` reports a ref
-    /// root at the SAME offset `lower_spilled_into` stores it at. Before the fix the sret word was
-    /// reserved only in the lowering (which remapped value offsets `+4`), while the record builder
-    /// read the unshifted offsets, skewing a big-struct-return spilled function's stack-map roots by
-    /// 4 bytes -- a latent moving-GC mis-walk. This pins the two back in lockstep.
+    /// root at the SAME offset `lower_spilled_into` stores it at. Reserving the sret word only in the
+    /// lowering -- which remaps value offsets `+4` -- while the record builder reads the unshifted
+    /// ones skews a big-struct-return spilled function's stack-map roots by 4 bytes: a latent
+    /// moving-GC mis-walk. This pins the two in lockstep.
     #[test]
     fn sret_return_shifts_value_slots_for_the_record_builder() {
         let big = MirType::ValueType {
@@ -11601,6 +11710,7 @@ mod tests {
                             length: ValueId(0),
                             element_size: 8,
                             element_kind: 8,
+                            element_cast_class: 0,
                         },
                     ),
                 ],
@@ -11611,15 +11721,19 @@ mod tests {
             lower_module_gc(&[func], 0x2000_0000).expect("the flat GC path lowers an AllocArray");
         let at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
         let words: Vec<u32> = (0..bytes.len() / 4).map(|i| at(i * 4)).collect();
-        assert!(
-            words
-                .windows(4)
-                .any(|w| w[0] == ARRAY_DESC_MARK | 1 && w[1] == 8 && w[2] == 0 && w[3] == 0),
-            "no array descriptor with the ratified header [MARK|rank@0][element_kind@4][tag@8][base_ptr@12]"
+        let mark = words
+            .iter()
+            .position(|&w| w == ARRAY_DESC_MARK | 1)
+            .expect("no array descriptor marker was emitted");
+        assert_eq!(
+            &words[mark..mark + 7],
+            &[ARRAY_DESC_MARK | 1, 8, 0, 0, 0, 0, 0],
+            "the ratified array header is              [MARK|rank@0][element_kind@4][tag@8][base_ptr@12][element_desc@16][cast_class@20], then the itable COUNT"
         );
-        assert!(
-            words.windows(4).all(|w| w != [0, 0, 0, 0]),
-            "an all-zero (unmarked) array descriptor is still being emitted"
+        assert_eq!(
+            (mark + crate::resolver::ARRAY_DESC_WORDS) * 4 - mark * 4,
+            crate::resolver::ARRAY_ITABLE_OFFSET as usize,
+            "the count word's offset is the one the reader is compiled with"
         );
         let marks = words.iter().filter(|&&w| w == ARRAY_DESC_MARK | 1).count();
         assert_eq!(marks, 1, "expected exactly one array descriptor");
@@ -11669,6 +11783,7 @@ mod tests {
                             length: ValueId(0),
                             element_size: 4,
                             element_kind: 5,
+                            element_cast_class: 0,
                         },
                     ),
                 ],

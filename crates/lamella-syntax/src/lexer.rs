@@ -3,9 +3,10 @@
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::span::Span;
 use crate::token::{
-    IntegerSuffix, Keyword, Punctuator, RealSuffix, Token, TokenKind, TypedRefKeyword,
+    IntegerSuffix, InterpolatedHole, InterpolatedPart, InterpolatedString, Keyword, Punctuator,
+    RealSuffix, Token, TokenKind, TypedRefKeyword,
 };
-use crate::version::{Feature, LanguageVersion};
+use crate::version::{Feature, FeatureGate, LanguageVersion};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
@@ -327,6 +328,8 @@ impl<'a> Lexer<'a> {
             || (c == '\\' && matches!(self.peek_second(), Some('u' | 'U')))
         {
             self.scan_identifier_or_keyword(start, false)
+        } else if c == '$' && matches!(self.peek_second(), Some('"' | '@')) {
+            self.scan_interpolated_string(start)
         } else if c == '@' {
             self.scan_verbatim(start)
         } else if c.is_ascii_digit()
@@ -576,15 +579,8 @@ impl<'a> Lexer<'a> {
     /// there is not: it is not part of this compilation.
     ///
     fn scan_pragma(&mut self, start: usize, active: bool) {
-        if !self.options.version.supports(Feature::PragmaDirective) {
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: Feature::PragmaDirective.description(),
-                    required: Feature::PragmaDirective.introduced_in().required_name(),
-                    current: self.options.version,
-                },
-                start,
-            );
+        if Feature::PragmaDirective.gate_against(self.options.version).is_some() {
+            self.gate_feature(Feature::PragmaDirective, start);
             self.consume_to_line_end();
             return;
         }
@@ -1023,6 +1019,12 @@ impl<'a> Lexer<'a> {
     fn scan_verbatim(&mut self, start: usize) -> TokenKind {
         match self.peek_second() {
             Some('"') => self.scan_verbatim_string(start),
+            Some('$') if self.remaining().starts_with("@$\"") => {
+                if self.options.version < LanguageVersion::CSharp8 {
+                    self.report(DiagnosticKind::AtDollarRequiresLaterVersion, start);
+                }
+                self.scan_interpolated_string(start)
+            }
             Some(c) if c == '\\' || is_identifier_start(c) => {
                 self.bump();
                 self.scan_identifier_or_keyword(self.position, true)
@@ -1166,6 +1168,242 @@ impl<'a> Lexer<'a> {
         TokenKind::StringLiteral(units.into())
     }
 
+
+    /// Scans an interpolated string literal (C# 6.0): `$"..."`, `$@"..."`, or `@$"..."`, with the
+    /// cursor on the `$` (the `@` of the reversed spelling having already been consumed).
+    ///
+    /// The literal pieces are decoded here -- `{{`/`}}` to single braces, and, when not verbatim,
+    /// the backslash escapes -- and each hole is scanned by [`Self::scan_interpolation_hole`],
+    /// which runs THIS SAME SCANNER over the hole's expression so its tokens carry real file
+    /// offsets. See [`crate::token::InterpolatedString`] for why that matters.
+    ///
+    /// **A NEWLINE IN A NON-VERBATIM ONE IS `CS1039`, NOT THE `CS1010` A PLAIN STRING GETS.**
+    /// Measured: `$"a<newline>b"` reports *Unterminated string literal* where `"a<newline>b"`
+    /// reports *Newline in constant*. Two lexical forms one character apart, two codes.
+    fn scan_interpolated_string(&mut self, start: usize) -> TokenKind {
+        let mut verbatim = false;
+        while matches!(self.peek(), Some('$' | '@')) {
+            verbatim |= self.peek() == Some('@');
+            self.bump();
+        }
+        self.bump();
+        self.gate_feature(Feature::InterpolatedStrings, start);
+
+        let mut parts: Vec<InterpolatedPart> = Vec::new();
+        let mut literal: Vec<u16> = Vec::new();
+        loop {
+            match self.peek() {
+                None => {
+                    self.report(DiagnosticKind::UnterminatedStringLiteral, start);
+                    break;
+                }
+                Some(c) if !verbatim && is_new_line(c) => {
+                    self.report(DiagnosticKind::UnterminatedStringLiteral, start);
+                    break;
+                }
+                Some('"') if verbatim && self.peek_second() == Some('"') => {
+                    self.bump();
+                    self.bump();
+                    literal.push(u16::from(b'"'));
+                }
+                Some('"') => {
+                    self.bump();
+                    break;
+                }
+                Some('{') if self.peek_second() == Some('{') => {
+                    self.bump();
+                    self.bump();
+                    literal.push(u16::from(b'{'));
+                }
+                Some('{') => {
+                    if !literal.is_empty() {
+                        parts.push(InterpolatedPart::Literal(
+                            core::mem::take(&mut literal).into(),
+                        ));
+                    }
+                    let scanned = self.scan_interpolation_hole(verbatim);
+                    let unterminated = scanned.unterminated;
+                    parts.push(InterpolatedPart::Hole(scanned.hole));
+                    if unterminated {
+                        break;
+                    }
+                }
+                Some('}') if self.peek_second() == Some('}') => {
+                    self.bump();
+                    self.bump();
+                    literal.push(u16::from(b'}'));
+                }
+                Some('}') => {
+                    let brace = self.position;
+                    self.bump();
+                    self.report(DiagnosticKind::UnescapedCloseBraceInInterpolation, brace);
+                }
+                Some('\\') if !verbatim => self.scan_escape_sequence(&mut literal),
+                Some(c) => {
+                    self.bump();
+                    push_utf16(&mut literal, c);
+                }
+            }
+        }
+        if !literal.is_empty() || parts.is_empty() {
+            parts.push(InterpolatedPart::Literal(literal.into()));
+        }
+        TokenKind::InterpolatedString(Box::new(InterpolatedString { parts, verbatim }))
+    }
+
+    /// Scans one `{ expression [, alignment] [: format] }` hole, with the cursor on the `{`.
+    ///
+    /// The expression and the alignment are collected as TOKENS by re-entering
+    /// [`Self::next_token`], so a string literal, a comment or a nested interpolation inside a
+    /// hole is scanned by the code that already knows how -- and its braces, commas and colons
+    /// cannot be mistaken for this hole's delimiters, because they never reach this loop as bare
+    /// punctuators.
+    ///
+    /// **A `:` AT NESTING DEPTH 0 ALWAYS ENDS THE EXPRESSION, EVEN WITH A `?` OPEN.** That is
+    /// csc's rule rather than a simplification of it: `$"{c ? a : b}"` is `CS8361` telling the
+    /// reader to parenthesize, and the reason parenthesizing works is exactly that `(` raises the
+    /// depth this test is about.
+    fn scan_interpolation_hole(&mut self, verbatim: bool) -> ScannedHole {
+        let hole_start = self.position;
+        let mark = self.diagnostics.len();
+        self.bump();
+        let mut tokens: Vec<Token> = Vec::new();
+        let mut alignment: Vec<Token> = Vec::new();
+        let mut format: Option<Box<str>> = None;
+        let mut depth: u32 = 0;
+        let mut open_conditionals: u32 = 0;
+        let mut in_alignment = false;
+        let mut unterminated = false;
+        loop {
+            let token = self.next_token();
+            let mut ended = false;
+            match &token.kind {
+                TokenKind::EndOfFile => {
+                    self.diagnostics.insert(
+                        mark.min(self.diagnostics.len()),
+                        Diagnostic::new(
+                            DiagnosticKind::InterpolationCloseDelimiterExpected,
+                            Span::new(hole_start as u32, self.position as u32),
+                        ),
+                    );
+                    unterminated = true;
+                    ended = true;
+                }
+                TokenKind::Punctuator(
+                    Punctuator::OpenParen | Punctuator::OpenBracket | Punctuator::OpenBrace,
+                ) => depth += 1,
+                TokenKind::Punctuator(Punctuator::CloseParen | Punctuator::CloseBracket) => {
+                    depth = depth.saturating_sub(1);
+                }
+                TokenKind::Punctuator(Punctuator::CloseBrace) => {
+                    if depth == 0 {
+                        ended = true;
+                    } else {
+                        depth -= 1;
+                    }
+                }
+                TokenKind::Punctuator(Punctuator::Comma) if depth == 0 && !in_alignment => {
+                    in_alignment = true;
+                    continue;
+                }
+                TokenKind::Punctuator(Punctuator::Question) if depth == 0 => open_conditionals += 1,
+                TokenKind::Punctuator(Punctuator::Colon) if depth == 0 => {
+                    if open_conditionals > 0 {
+                        self.report(
+                            DiagnosticKind::ConditionalInInterpolation,
+                            token.span.start as usize,
+                        );
+                    }
+                    let scanned = self.scan_interpolation_format(hole_start, verbatim);
+                    format = scanned.text;
+                    unterminated = scanned.unterminated;
+                    ended = true;
+                }
+                _ => {}
+            }
+            if ended {
+                break;
+            }
+            if in_alignment {
+                alignment.push(token);
+            } else {
+                tokens.push(token);
+            }
+        }
+        if !tokens.iter().any(|token| !token.is_trivia()) {
+            self.report(DiagnosticKind::ExpectedExpression, hole_start);
+        }
+        if in_alignment && !alignment.iter().any(|token| !token.is_trivia()) {
+            self.report(DiagnosticKind::ExpectedExpression, hole_start);
+        }
+        ScannedHole {
+            hole: InterpolatedHole {
+                tokens,
+                alignment,
+                format,
+                span: Span::new(hole_start as u32, self.position as u32),
+            },
+            unterminated,
+        }
+    }
+
+    /// Scans a hole's format specifier, with the cursor just past the `:`. The text is taken
+    /// LITERALLY -- no backslash escapes even in a non-verbatim string, because the specifier is
+    /// `String.Format`'s to interpret and not the lexer's -- up to the `}` that closes the hole.
+    /// A doubled `}}` stands for one `}`; a `{` there is `CS1056`, measured.
+    fn scan_interpolation_format(&mut self, hole_start: usize, verbatim: bool) -> ScannedFormat {
+        let mut text = String::new();
+        let mut unterminated = false;
+        loop {
+            match self.peek() {
+                None => {
+                    self.report(
+                        DiagnosticKind::InterpolationCloseDelimiterExpected,
+                        hole_start,
+                    );
+                    unterminated = true;
+                    break;
+                }
+                Some(c) if !verbatim && is_new_line(c) => {
+                    self.report(
+                        DiagnosticKind::InterpolationCloseDelimiterExpected,
+                        hole_start,
+                    );
+                    unterminated = true;
+                    break;
+                }
+                Some('"') => {
+                    self.report(
+                        DiagnosticKind::InterpolationCloseDelimiterExpected,
+                        hole_start,
+                    );
+                    unterminated = true;
+                    break;
+                }
+                Some('}') => {
+                    self.bump();
+                    break;
+                }
+                Some('{') => {
+                    let brace = self.position;
+                    self.bump();
+                    self.report(DiagnosticKind::UnexpectedCharacter { character: '{' }, brace);
+                }
+                Some(c) => {
+                    self.bump();
+                    text.push(c);
+                }
+            }
+        }
+        if text.is_empty() && !unterminated {
+            self.report(DiagnosticKind::EmptyFormatSpecifier, hole_start);
+        }
+        ScannedFormat {
+            text: if text.is_empty() { None } else { Some(text.into()) },
+            unterminated,
+        }
+    }
+
     /// Decodes one backslash escape (9.4.4.4, 9.4.1) into `units`, with the
     /// scanner positioned at the backslash. An unrecognised escape, a `\x` with
     /// no hex digits, a `\u`/`\U` with too few, or a `\U` above U+10FFFF is
@@ -1275,10 +1513,8 @@ impl<'a> Lexer<'a> {
         if let Some((radix, gated)) = prefixed {
             self.bump();
             self.bump();
-            if let Some(feature) = gated
-                && !self.options.version.supports(feature)
-            {
-                self.report_feature(feature, start);
+            if let Some(feature) = gated {
+                self.gate_feature(feature, start);
             }
             let digits_start = self.position;
             let run = self.consume_digit_run(radix);
@@ -1406,25 +1642,40 @@ impl<'a> Lexer<'a> {
             self.report(DiagnosticKind::MalformedNumericLiteral, start);
             return;
         }
-        if run.separator && !self.options.version.supports(Feature::DigitSeparators) {
-            self.report_feature(Feature::DigitSeparators, start);
+        if run.separator && Feature::DigitSeparators.gate_against(self.options.version).is_some() {
+            self.gate_feature(Feature::DigitSeparators, start);
         } else if run.leading_separator
-            && !self.options.version.supports(Feature::LeadingDigitSeparator)
+            && Feature::LeadingDigitSeparator
+                .gate_against(self.options.version)
+                .is_some()
         {
-            self.report_feature(Feature::LeadingDigitSeparator, start);
+            self.gate_feature(Feature::LeadingDigitSeparator, start);
         }
     }
 
-    /// Reports `feature` as unavailable in the dialect being compiled.
-    fn report_feature(&mut self, feature: Feature, start: usize) {
-        self.report(
-            DiagnosticKind::FeatureRequiresLaterVersion {
+    /// Refuses `feature` at `start` unless this compilation can admit it, and says WHICH of the
+    /// two bits refused it.
+    ///
+    /// **THE ONLY PLACE IN THE LEXER THAT RAISES A FEATURE GATE**, and the decision is
+    /// [`Feature::gate_against`]'s -- the same one the parser's `gate_feature` and the binder's
+    /// use, so a construct cannot be refused one way lexically and another way semantically.
+    ///
+    fn gate_feature(&mut self, feature: Feature, start: usize) {
+        let kind = match feature.gate_against(self.options.version) {
+            None => return,
+            Some(FeatureGate::RequiresLaterVersion { required }) => {
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: feature.description(),
+                    required,
+                    current: self.options.version,
+                }
+            }
+            Some(FeatureGate::NotInThisBuild) => DiagnosticKind::FeatureNotInThisBuild {
                 feature: feature.description(),
-                required: feature.introduced_in().required_name(),
-                current: self.options.version,
+                permitted_by: self.options.version,
             },
-            start,
-        );
+        };
+        self.report(kind, start);
     }
 
     /// Consumes an `e`/`E` exponent if one is present, returning whether it was and the shape of
@@ -1506,7 +1757,6 @@ impl<'a> Lexer<'a> {
     /// cascade is dropped downstream (`without_gated_operator_cascades`) so only this CS8022 stands.
     fn try_gate_post_1_0_operator(&mut self, start: usize) -> Option<TokenKind> {
         const GATED: &[(&str, Feature)] = &[
-            ("=>", Feature::LambdaExpression),
             ("??", Feature::NullCoalescing),
             ("?[", Feature::NullConditional),
             ("?.", Feature::NullConditional),
@@ -1514,21 +1764,16 @@ impl<'a> Lexer<'a> {
         ];
         let rest = self.remaining();
         for &(spelling, feature) in GATED {
-            if !rest.starts_with(spelling) || self.options.version.supports(feature) {
+            if !rest.starts_with(spelling)
+                || feature.gate_against(self.options.version).is_none()
+            {
                 continue;
             }
             if spelling == "?." && rest[spelling.len()..].starts_with(|c: char| c.is_ascii_digit()) {
                 continue;
             }
             self.position += spelling.len();
-            self.report(
-                DiagnosticKind::FeatureRequiresLaterVersion {
-                    feature: feature.description(),
-                    required: feature.introduced_in().required_name(),
-                    current: self.options.version,
-                },
-                start,
-            );
+            self.gate_feature(feature, start);
             return Some(TokenKind::Unknown);
         }
         None
@@ -1574,6 +1819,21 @@ impl<'a> Lexer<'a> {
         self.position += c.len_utf8();
         Some(c)
     }
+}
+
+/// What [`Lexer::scan_interpolation_hole`] found: the hole, and whether the string was cut short
+/// inside it. The flag is separate from the hole because the ENCLOSING scanner is the one that has
+/// to stop -- without it a `$"a{b` would keep looking for a closing quote that the hole already
+/// ran past, and report the same file twice.
+struct ScannedHole {
+    hole: InterpolatedHole,
+    unterminated: bool,
+}
+
+/// What [`Lexer::scan_interpolation_format`] found, for the same reason.
+struct ScannedFormat {
+    text: Option<Box<str>>,
+    unterminated: bool,
 }
 
 /// A line terminator (9.3.1). A CR/LF pair is combined into one by the scanner.
@@ -1760,6 +2020,178 @@ fn push_utf16(units: &mut Vec<u16>, scalar: char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scans `source` at `version` and returns its one interpolated-string token, or `None`.
+    fn interpolated(source: &str, version: LanguageVersion) -> Option<InterpolatedString> {
+        let mut options = LexOptions::default();
+        options.version = version;
+        tokenize_with(source, options)
+            .tokens
+            .into_iter()
+            .find_map(|token| match token.kind {
+                TokenKind::InterpolatedString(string) => Some(*string),
+                _ => None,
+            })
+    }
+
+    /// The literal pieces and the hole SOURCE of an interpolated string, rendered flat so a test
+    /// reads as the shape it is asserting: `a`, `{b}`, `c`.
+    fn interpolation_shape(source: &str) -> String {
+        let string = interpolated(source, LanguageVersion::CSharp6).expect("an interpolated string");
+        let mut out = String::new();
+        for part in &string.parts {
+            match part {
+                InterpolatedPart::Literal(units) => {
+                    out.push('[');
+                    out.push_str(&String::from_utf16_lossy(units));
+                    out.push(']');
+                }
+                InterpolatedPart::Hole(hole) => {
+                    out.push('{');
+                    for token in &hole.tokens {
+                        if !token.is_trivia() {
+                            out.push_str(&source[token.span.start as usize..token.span.end as usize]);
+                        }
+                    }
+                    if !hole.alignment.is_empty() {
+                        out.push(',');
+                        for token in &hole.alignment {
+                            if !token.is_trivia() {
+                                out.push_str(
+                                    &source[token.span.start as usize..token.span.end as usize],
+                                );
+                            }
+                        }
+                    }
+                    if let Some(format) = &hole.format {
+                        out.push(':');
+                        out.push_str(format);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_interpolated_string_splits_into_literals_and_holes() {
+        assert_eq!(interpolation_shape("$\"plain\""), "[plain]");
+        assert_eq!(interpolation_shape("$\"a{b}c\""), "[a]{b}[c]");
+        assert_eq!(interpolation_shape("$\"{b}\""), "{b}");
+        assert_eq!(interpolation_shape("$\"\""), "[]");
+        assert_eq!(interpolation_shape("$\"{n,10}\""), "{n,10}");
+        assert_eq!(interpolation_shape("$\"{n:X}\""), "{n:X}");
+        assert_eq!(interpolation_shape("$\"{n,-8:X4}\""), "{n,-8:X4}");
+    }
+
+    #[test]
+    fn a_doubled_brace_is_one_brace_and_does_not_open_a_hole() {
+        assert_eq!(interpolation_shape("$\"a{{b}}c\""), "[a{b}c]");
+        assert_eq!(interpolation_shape("$\"{{{n}}}\""), "[{]{n}[}]");
+    }
+
+    #[test]
+    fn a_hole_is_scanned_by_the_whole_scanner_so_its_nesting_is_free() {
+        assert_eq!(interpolation_shape("$\"{\"}\"}\""), "{\"}\"}");
+        assert_eq!(interpolation_shape("$\"{f(a,b)}\""), "{f(a,b)}");
+        assert_eq!(interpolation_shape("$\"{(c?1:2)}\""), "{(c?1:2)}");
+        assert_eq!(interpolation_shape("$\"{a[0]}\""), "{a[0]}");
+        assert_eq!(interpolation_shape("$\"a{$\"i{s}\"}b\""), "[a]{$\"i{s}\"}[b]");
+    }
+
+    #[test]
+    fn a_newline_inside_a_hole_is_fine_and_one_in_the_text_is_not() {
+        assert_eq!(interpolation_shape("$\"{n\n}\""), "{n}");
+        let mut options = LexOptions::default();
+        options.version = LanguageVersion::CSharp6;
+        let codes: Vec<u16> = tokenize_with("$\"a\nb\"", options)
+            .diagnostics
+            .iter()
+            .map(|d| d.kind.code())
+            .collect();
+        assert_eq!(codes.first(), Some(&1039), "expected CS1039 first, got {codes:?}");
+    }
+
+    #[test]
+    fn a_verbatim_interpolated_string_takes_backslashes_literally() {
+        assert_eq!(interpolation_shape("$@\"a\\b{s}\""), "[a\\b]{s}");
+        assert_eq!(interpolation_shape("$@\"a\"\"b\""), "[a\"b]");
+        assert_eq!(interpolation_shape("$\"a\\tb\""), "[a\tb]");
+    }
+
+    #[test]
+    fn each_malformed_interpolation_draws_cscs_own_code() {
+        let codes = |source: &str| -> Vec<u16> {
+            let mut options = LexOptions::default();
+            options.version = LanguageVersion::CSharp6;
+            tokenize_with(source, options)
+                .diagnostics
+                .iter()
+                .map(|d| d.kind.code())
+                .collect()
+        };
+        assert!(codes("$\"a{b\"").contains(&8076), "unclosed hole is CS8076");
+        assert!(codes("$\"a}b\"").contains(&8086), "a lone `}}` is CS8086");
+        assert!(codes("$\"{}\"").contains(&1733), "an empty hole is CS1733");
+        assert!(codes("$\"{n,}\"").contains(&1733), "an empty alignment is CS1733");
+        assert!(codes("$\"{n:}\"").contains(&8089), "an empty specifier is CS8089");
+        assert!(codes("$\"{c ? a : b}\"").contains(&8361), "a bare conditional is CS8361");
+        assert!(codes("$\"{n:0;{0}}\"").contains(&1056), "a `{{` in a specifier is CS1056");
+        assert!(!codes("$\"{(c ? a : b)}\"").contains(&8361));
+    }
+
+    #[test]
+    fn the_two_orderings_of_the_prefix_are_two_rungs() {
+        let codes = |source: &str, version: LanguageVersion| -> Vec<u16> {
+            let mut options = LexOptions::default();
+            options.version = version;
+            tokenize_with(source, options)
+                .diagnostics
+                .iter()
+                .map(|d| d.kind.code())
+                .collect()
+        };
+        assert!(codes("@$\"a{b}\"", LanguageVersion::CSharp6).contains(&8401));
+        assert!(codes("@$\"a{b}\"", LanguageVersion::CSharp7).contains(&8401));
+        assert!(!codes("@$\"a{b}\"", LanguageVersion::CSharp8).contains(&8401));
+        assert!(!codes("$@\"a{b}\"", LanguageVersion::CSharp6).contains(&8401));
+        assert_eq!(
+            interpolated("@$\"a\\b{s}\"", LanguageVersion::CSharp8),
+            interpolated("$@\"a\\b{s}\"", LanguageVersion::CSharp8)
+        );
+    }
+
+    #[test]
+    fn a_dollar_that_begins_no_interpolation_is_cs1056() {
+        let codes = |source: &str| -> Vec<u16> {
+            let mut options = LexOptions::default();
+            options.version = LanguageVersion::CSharp6;
+            tokenize_with(source, options)
+                .diagnostics
+                .iter()
+                .map(|d| d.kind.code())
+                .collect()
+        };
+        assert_eq!(codes("$"), alloc::vec![1056]);
+        assert_eq!(codes("$'a'"), alloc::vec![1056]);
+    }
+
+    #[test]
+    fn the_interpolation_gate_is_the_c_sharp_6_one_and_names_the_feature() {
+        let mut options = LexOptions::default();
+        options.version = LanguageVersion::CSharp5;
+        let diagnostics = tokenize_with("$\"a{b}\"", options).diagnostics;
+        let gate = diagnostics
+            .iter()
+            .find(|d| d.kind.code() == 8026)
+            .expect("the C# 5 gate code");
+        assert_eq!(
+            alloc::format!("{}", gate.kind),
+            "Feature 'interpolated strings' is not available in C# 5. \
+             Please use language version 6 or greater."
+        );
+    }
     use crate::diagnostic::Severity;
     use alloc::string::String;
     use alloc::vec;
@@ -2077,7 +2509,7 @@ class C { }
 
     #[test]
     fn post_1_0_operators_report_cs8022_under_csharp1() {
-        for src in ["a => b", "a ?? b", "a?.b", "a?[0]", "global::System"] {
+        for src in ["a ?? b", "a?.b", "a?[0]", "global::System"] {
             let diagnostics = tokenize(src).diagnostics;
             assert!(
                 diagnostics.iter().any(|d| d.code() == 8022),

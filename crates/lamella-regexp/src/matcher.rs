@@ -1,6 +1,6 @@
 //! The backtracking matcher: one loop, one explicit stack, no recursion on the subject.
 
-use crate::ast::Assertion;
+use crate::ast::{Assertion, ClassEntry};
 use crate::haystack::Haystack;
 use crate::program::{Direction, Fold, Instruction, Program};
 use crate::Vec;
@@ -129,20 +129,23 @@ fn execute<H: Haystack>(
         let advanced = match instruction {
             Instruction::Match | Instruction::LookEnd => return Step::Matched,
 
-            Instruction::Char { ch, direction } => match read(haystack, pos, *direction) {
-                Some((value, width)) if value == *ch => {
+            Instruction::Char { ch, direction, fold } => match read(haystack, pos, *direction) {
+                Some((value, width)) if fold.same(value, *ch) => {
                     pos = step(pos, width, *direction);
                     true
                 }
                 _ => false,
             },
 
-            Instruction::Class { start, len, negated, direction } => {
+            Instruction::Class { start, len, negated, direction, fold } => {
                 match read(haystack, pos, *direction) {
                     Some((value, width)) => {
                         let from = *start as usize;
                         let to = from + *len as usize;
-                        let inside = program.classes[from..to].iter().any(|e| e.contains(value));
+                        let inside = program.classes[from..to].iter().any(|e| match e {
+                            ClassEntry::Single(member) => fold.same(*member, value),
+                            ClassEntry::Range(..) => e.contains(value),
+                        });
                         if inside != *negated {
                             pos = step(pos, width, *direction);
                             true
@@ -199,8 +202,7 @@ fn execute<H: Haystack>(
             }
 
             Instruction::Backreference { group, direction, fold } => {
-                match backreference(program, haystack, state, *group, pos, *direction, *fold)
-                {
+                match backreference(haystack, state, *group, pos, *direction, *fold) {
                     Some(next) => {
                         pos = next;
                         true
@@ -390,7 +392,6 @@ fn holds<H: Haystack>(
 /// tolerated -- `/(?:(a)|b)\1/` relies on it -- and treating it as a failure changes which strings
 /// the pattern accepts.
 fn backreference<H: Haystack>(
-    _program: &Program,
     haystack: &H,
     state: &State,
     group: u32,

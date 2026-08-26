@@ -29,7 +29,23 @@ const METHOD_HIDE_BY_SIG: u16 = 0x0080;
 /// this bit a consumer, a debugger and reflection all see an `out` parameter as a `ref` one.
 pub const PARAM_OUT: u16 = 0x0002;
 
+/// `ParameterAttributes.Optional` (II.23.1.13): the parameter may be omitted at a call site.
+pub const PARAM_OPTIONAL: u16 = 0x0010;
+
+/// `ParameterAttributes.HasDefault` (II.23.1.13): a `Constant` row carries this parameter's
+/// default value.
+///
+/// **SET WITH `PARAM_OPTIONAL` AND NOT INSTEAD OF IT.** Measured across 34 default forms, csc
+/// writes `0x1010` for every parameter whose default IS a constant, and a bare `0x0010` for the
+/// one shape that cannot have a `Constant` row -- a `decimal`, which takes a
+/// `[DecimalConstant]` attribute instead.
+pub const PARAM_HAS_DEFAULT: u16 = 0x1000;
+
 /// One `Param` row (II.22.33): the declared name, and the flags that say how the argument travels.
+///
+/// **THE FLAGS TRAVEL WITH THE NAME, BECAUSE A NAME-ONLY PARAMETER LIST HAS NOWHERE TO PUT THEM.**
+/// A row whose Flags column is a literal zero carries no `Out`, `In` or `Optional`, and nothing
+/// downstream can recover what the signature meant.
 #[derive(Debug, Clone)]
 pub struct ParamRow {
     /// The declared name, so a debugger shows `count` rather than `arg1`.
@@ -623,12 +639,13 @@ impl ImageBuilder {
     /// Adds a `Constant` row (II.22.9): the literal value attached to `parent` (a
     /// Field/Param/Property token). `element_type` is the value's element-type byte
     /// (II.23.1.16) and `value` its little-endian blob -- the form an enum member or
-    /// a `const` field takes. The table is sorted by parent (a `HasConstant` coded
-    /// index), so callers must add constants in increasing parent-row order; its
-    /// sorted bit is set so a reader (the CLR) may binary-search it.
+    /// a `const` field takes.
+    ///
+    /// **ROWS MAY BE ADDED IN ANY ORDER; `finish` SORTS THE TABLE.** `Constant` is required-sorted
+    /// by its `HasConstant` parent, which encodes the table tag in the low bits -- so `Param` row 1
+    /// sorts BEFORE `Field` row 5, and emission order is per-type rather than per-table.
     pub fn add_constant(&mut self, parent: Token, element_type: u8, value: &[u8]) {
         let blob = self.blobs.intern(value);
-        self.tables.mark_sorted(table::CONSTANT);
         self.tables.add_row(
             table::CONSTANT,
             alloc::vec![
@@ -770,6 +787,10 @@ impl ImageBuilder {
 
     /// THE ONE PLACE A `MethodDef` ROW IS WRITTEN, AND THE ONE PLACE ITS FLAGS ARE FINALIZED.
     ///
+    /// **A FLAG THAT BELONGS ON EVERY METHOD IS SET HERE AND NOWHERE ELSE.** The row is written for
+    /// a body, a DEFERRED body and no body alike, so anything spelled at the call sites instead
+    /// reaches only the positions somebody remembered.
+    ///
     /// **`HideBySig` IS UNCONDITIONAL HERE BECAUSE IT IS THE C# CONTRACT, NOT A DEFAULT.** Every
     /// `MethodDef` this builder writes comes from C# source, and C# hides by name AND signature.
     /// Without the flag the runtime hides by NAME alone (II.23.1.10), so a derived method hides
@@ -893,6 +914,32 @@ impl ImageBuilder {
         };
         let end = param_list(method.row() + 1).unwrap_or_else(|| self.tables.row_count(table::PARAM) + 1);
         (first..end).map(|row| Token::new(table::PARAM, row)).collect()
+    }
+
+    /// Sets an already-written `Param` row's `Flags` (II.23.1.13).
+    ///
+    /// **The row exists before its declaration facts are read back**, because a `Constant` row has
+    /// to name the `Param` token and the token does not exist until the row is added. So the
+    /// optional-parameter bits are applied here rather than at row creation, in the same pass that
+    /// adds the constant -- one place, after the run is known.
+    pub fn set_param_flags(&mut self, param: Token, flags: u16) {
+        if param.table() != table::PARAM {
+            return;
+        }
+        self.tables
+            .set_cell(table::PARAM, param.row(), 0, Column::U16(flags));
+    }
+
+    /// An already-written `Param` row's `Flags`, so a caller can add bits rather than replace them.
+    #[must_use]
+    pub fn param_flags(&self, param: Token) -> u16 {
+        if param.table() != table::PARAM {
+            return 0;
+        }
+        match self.tables.cell(table::PARAM, param.row(), 0) {
+            Some(&Column::U16(flags)) => flags,
+            _ => 0,
+        }
     }
 
     /// Adds a `Param` row (II.22.33) for a method's return value: `Flags` 0, `Sequence` 0,
@@ -1121,6 +1168,7 @@ impl ImageBuilder {
         );
         align4(&mut self.bodies);
         self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
+        self.tables.sort_by_coded_column(table::CONSTANT, 1);
         self.tables.sort_by_coded_column(table::METHOD_SEMANTICS, 2);
         self.tables.sort_by_coded_column_remapping(
             table::GENERIC_PARAM,

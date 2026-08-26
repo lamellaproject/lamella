@@ -1,0 +1,69 @@
+# PARTS table for the STM32L0x1 family, category 1 (STM32L011x). Every row is an ORDERABLE
+# variant rather than a marketing name: on this family the package letter and the flash digit are
+# separate positions in the ordering code, and two parts sharing a marketing name can differ in
+# BOTH pad count and memory.
+#
+# THE ORDERING CODE IS DECODED FROM THE DATASHEET'S OWN SCHEME, NOT FROM ITS SHAPE. DS027973
+# section 8 prints the decode against the example STM32L011K4T6D: K = 32 pins, 4 = 16 Kbytes flash,
+# T = LQFP, 6 = industrial -40 to 85 C, D = the 1.65-3.6 V no-BOR option, and a trailing TR is
+# tape-and-reel packing that says nothing about the silicon.
+#
+# TWO PACKAGES SHARE THE PIN-COUNT LETTER AND THEY DO NOT HAVE THE SAME PADS. `K` is 32 pins, and
+# the 32-pin packages are LQFP32 (T) and UFQFPN32 (U). Table 2's own footnote states the split --
+# "the devices feature 26 and 28 GPIOs on LQFP32 and UFQFPN32, respectively" -- and table 13 says
+# which two: PB2 and PB8 have no LQFP32 pin number and do have a UFQFPN32 one. So the package
+# letter, not the pin-count letter, is what selects a pad set.
+#
+# PIN LISTS HERE ARE COMPLETE GPIO SETS for their package, taken from the per-package pin-number
+# columns of table 13 and cross-checked against the GPIO counts in table 2. A consumer must still
+# not read one as a PAD SPACE: it omits VDD, VSS, VDDA and NRST, none of which is general-purpose
+# I/O.
+#
+
+[table]
+kind = "parts"
+family = "stm32l0"
+sources = [
+    "STM32L011x3/STM32L011x4 datasheet DocID027973 Rev 5: table 2 (device features and peripheral counts) for flash, RAM, data EEPROM and the per-package GPIO counts; table 13 (pin definitions) for the per-package pin-number columns; table 76 (ordering information scheme) for the decode of the ordering code",
+    "STM32L0x1 reference manual RM0377 Rev 10 table 1 (memory density) for STM32L011x being a category 1 line at 8 and 16 Kbytes, and section 27.4.1 for DEV_ID 0x457 identifying a category 1 device",
+]
+notes = [
+    "RAM is 2 Kbytes on EVERY variant of this line -- table 2 states one figure across all ten columns -- so it does not distinguish a part and cannot be used to identify one. Flash and pad count are what differ.",
+    "Table 2 gives 512 bytes of data EEPROM in addition to the two figures above. It is a separate non-volatile array, not part of either, and this schema has no field for it.",
+    "PB9 IS SHARED WITH BOOT0 and the datasheet spells the pin name itself 'PB9-BOOT0'. RM0377 table 2 states the same from the other side. A design using PB9 as general-purpose I/O is also choosing a boot configuration, and nothing in the chip reports the conflict.",
+    "PC14 and PC15 are spelled 'PC14-OSC32_IN' and 'PC15-OSC32_OUT': they are general-purpose I/O and the low-speed oscillator pins, so a board fitting a 32 kHz crystal loses both as I/O.",
+    "PA13 and PA14 are SWDIO and SWCLK and come out of reset in ALTERNATE FUNCTION rather than analog. They are in the lists below because they are real GPIOs, but a design taking either away from the debug port loses the debug port.",
+    "Only the 32-pin (K) variants are rowed here. The same two tables carry TSSOP14 (D), UFQFPN20 and TSSOP20 (F), WLCSP25 (E) and UFQFPN28 (G) columns at 11, 16, 21 and 24 GPIOs, and a row for any of them is a transcription of the same columns rather than new work.",
+]
+
+[[parts]]
+part = "stm32l011k4t"
+package = "32-pin LQFP"
+flash = 0x4000
+ram = 0x800
+pins = ["PA0-PA15", "PB0-PB1", "PB3-PB7", "PB9", "PC14-PC15"]
+source = "DS027973 Rev 5 table 13, LQFP32 pin-number column, for the 26-pad set; table 2 column STM32L011K4 for 16 Kbytes flash, 2 Kbytes RAM and the 26-GPIO count on LQFP32; table 76 decoding STM32L011K4T6 as K = 32 pins, 4 = 16 Kbytes, T = LQFP. This is the part on the NUCLEO-L011K4: UM1956 names it STM32L011K4T6 explicitly. PB2 and PB8 are ABSENT from this package and present on the UFQFPN32 below, which is the difference between 26 pads and 28."
+
+[[parts]]
+part = "stm32l011k4u"
+package = "32-pin UFQFPN"
+flash = 0x4000
+ram = 0x800
+pins = ["PA0-PA15", "PB0-PB9", "PC14-PC15"]
+source = "DS027973 Rev 5 table 13, UFQFPN32 pin-number column, for the 28-pad set; table 2 column STM32L011K4 and its footnote 1 for the 28-GPIO count on UFQFPN32; table 76 decoding the U package letter as UFQFPN. Differs from the LQFP32 row by exactly PB2 and PB8."
+
+[[parts]]
+part = "stm32l011k3t"
+package = "32-pin LQFP"
+flash = 0x2000
+ram = 0x800
+pins = ["PA0-PA15", "PB0-PB1", "PB3-PB7", "PB9", "PC14-PC15"]
+source = "DS027973 Rev 5 table 2 column STM32L011K3 for 8 Kbytes flash and the same 2 Kbytes RAM; table 13 LQFP32 column for the pad set, which is identical to the K4's -- the flash digit and the package letter are independent positions in the ordering code, so this row differs from stm32l011k4t in memory ALONE."
+
+[[parts]]
+part = "stm32l011k3u"
+package = "32-pin UFQFPN"
+flash = 0x2000
+ram = 0x800
+pins = ["PA0-PA15", "PB0-PB9", "PC14-PC15"]
+source = "DS027973 Rev 5 table 2 column STM32L011K3 for 8 Kbytes flash; table 13 UFQFPN32 column for the 28-pad set. Differs from stm32l011k4u in memory alone."

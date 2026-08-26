@@ -6,7 +6,7 @@ namespace System.Device.Adc
     {
         private readonly AdcController _controller;
         private readonly int _channelNumber;
-        private bool _closed;
+        private bool _disposed;
 
         internal AdcChannel(AdcController controller, int channelNumber)
         {
@@ -19,9 +19,9 @@ namespace System.Device.Adc
         /// <summary>Reads the digital representation of the analog value from the ADC.</summary>
         public int ReadValue()
         {
-            if (_closed)
+            if (_disposed)
             {
-                throw new System.InvalidOperationException("channel is closed");
+                throw new System.InvalidOperationException("channel is disposed");
             }
             return _controller.ReadChannel(_channelNumber);
         }
@@ -34,20 +34,15 @@ namespace System.Device.Adc
         }
 #endif
 
-        /// <summary>Closes the connection on this channel, making it available to be opened
+        /// <summary>Releases the connection on this channel, making it available to be opened
         /// by others.</summary>
-        public void Close()
-        {
-            if (!_closed)
-            {
-                _controller.ReleaseChannel(_channelNumber);
-                _closed = true;
-            }
-        }
-
         public void Dispose()
         {
-            Close();
+            if (!_disposed)
+            {
+                _controller.ReleaseChannel(_channelNumber);
+                _disposed = true;
+            }
         }
     }
 }

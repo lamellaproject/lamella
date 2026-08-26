@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use lamella_asm_wasm::{BlockType, Func, FuncType, Limits, MemArg, Module, ValType};
 use lamella_ir::{
-    BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId,
+    BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId, VerifyError,
 };
 
 use crate::resolver::TypeMeta;
@@ -23,11 +23,28 @@ const HEAP_POINTER: u32 = 0;
 /// heap, so each static field lives at `STATIC_BASE + its offset`.
 const STATIC_BASE: i32 = 8;
 
+/// The ONE header word every managed object carries immediately before it, holding the address of
+/// the object's TYPE DESCRIPTOR. A class instance, an array and a string all take it, so `[obj - 4]`
+/// answers "what type is this" for every reference alike and [`Inst::LoadTypeDesc`] stays one load
+/// rather than a per-shape special case.
+///
+/// It is `const` rather than a `4` at each site because the shapes were not uniform until they all
+/// took it: arrays and string literals had NO header, so a type test on one read the previous
+/// allocation's tail -- a wrong answer that reads like a working one, since the word it lands on is
+/// usually a plausible small integer.
+const OBJECT_HEADER: u32 = 4;
+
 /// Why a function could not be lowered to WebAssembly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     /// The function did not pass IR verification.
-    NotWellFormed,
+    ///
+    /// CARRIES THE VERIFIER'S OWN ERRORS rather than collapsing them: a bare "not well formed" names
+    /// neither the malformed instruction nor the types that disagreed, so a refusing row reported no
+    /// reason at all.
+    NotWellFormed {
+        errors: Vec<VerifyError>,
+    },
     /// An instruction or type the WASM backend does not lower yet: a value type (no memory home in
     /// the local-per-value model yet), a static field, or a string literal.
     Unsupported,
@@ -57,7 +74,7 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
 /// vtable-aware single-function entry (mirrors [`lower_module_with_exports`]'s descriptors).
 pub fn lower_vtables(func: &Function, descriptors: &[TypeMeta]) -> Result<Vec<u8>, LowerError> {
     let main_export: &[(&str, u32)] = &[("main", 0)];
-    lower_module_inner(core::slice::from_ref(func), main_export, false, descriptors)
+    lower_module_inner(core::slice::from_ref(func), main_export, false, descriptors, None)
 }
 
 /// Lowers a module of [`Function`]s to WebAssembly. Module order fixes call indices -- function 0
@@ -70,7 +87,7 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
     } else {
         &[("main", 0)]
     };
-    lower_module_inner(funcs, main_export, false, &[])
+    lower_module_inner(funcs, main_export, false, &[], None)
 }
 
 /// Lowers a module, exporting each `(name, function_index)` in `exports` (the index is into `funcs`),
@@ -79,12 +96,19 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
 /// and uses `alloc`/`dealloc` to pass arrays/strings in. `lower_module` is the single-entry
 /// `main`-only case. Export names must be unique (the caller mangles overloads); a function appended
 /// by the string lowering keeps the original indices valid.
+///
+/// `string_handle` is `System.String`'s identity in this build, from
+/// [`MetadataResolver::string_type_handle`](crate::resolver::MetadataResolver::string_type_handle).
+/// It is what gives a string -- literal or built -- an object header naming the SAME descriptor a
+/// `string[]`'s element word names. `None` leaves strings headerless, which is what every caller
+/// that lowers hand-built MIR wants and what this backend did for every caller before.
 pub fn lower_module_with_exports(
     funcs: &[Function],
     exports: &[(&str, u32)],
     descriptors: &[TypeMeta],
+    string_handle: Option<u32>,
 ) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, exports, true, descriptors)
+    lower_module_inner(funcs, exports, true, descriptors, string_handle)
 }
 
 fn lower_module_inner(
@@ -92,24 +116,36 @@ fn lower_module_inner(
     exports: &[(&str, u32)],
     with_allocator: bool,
     descriptors: &[TypeMeta],
+    string_handle: Option<u32>,
 ) -> Result<Vec<u8>, LowerError> {
     let mut program: Vec<Function> = funcs.to_vec();
-    let strings = layout_strings(&mut program)?;
     crate::stringgen::lower_string_equals(&mut program);
-    crate::stringgen::lower_string_concat(&mut program, None);
-    crate::stringgen::lower_int_to_string(&mut program, None);
+    crate::stringgen::lower_string_concat(&mut program, string_handle);
+    crate::stringgen::lower_int_to_string(&mut program, string_handle);
+    let mut strings = layout_strings(&mut program)?;
 
     for func in &program {
-        if lamella_ir::verify(func).is_err() {
-            return Err(LowerError::NotWellFormed);
+        if let Err(errors) = lamella_ir::verify(func) {
+            return Err(LowerError::NotWellFormed { errors });
         }
     }
 
     let native_import_sigs = collect_native_imports(&program)?;
     let import_count = native_import_sigs.len() as u32;
 
-    let (desc_segments, desc_addr, desc_end) =
-        layout_descriptors(&program, descriptors, strings.heap_base as u32, import_count);
+    let (desc_segments, desc_addr, desc_end) = layout_descriptors(
+        &program,
+        descriptors,
+        string_handle,
+        strings.heap_base as u32,
+        import_count,
+    );
+    patch_string_headers(
+        &mut strings.segments,
+        string_handle
+            .and_then(|handle| desc_addr.get(&handle).copied())
+            .unwrap_or(0),
+    );
 
     let mut module = Module::new();
     let has_memory =
@@ -244,8 +280,15 @@ struct StringLayout {
     heap_base: i64,
 }
 
-/// Interns each `StringLiteral` to a `[u32 length][UTF-16LE]` blob at an offset from [`STRING_BASE`],
-/// rewriting the instruction to a constant `ObjectRef` pointer, and returns the segments + heap base.
+/// Interns each `StringLiteral` to an OBJECT -- a [`OBJECT_HEADER`] word then the
+/// `[u32 length][UTF-16LE]` blob -- at an offset from [`STRING_BASE`], rewriting the instruction to a
+/// constant `ObjectRef` pointing PAST the header (at the length word, where `String.Length` and the
+/// storage readers expect offset 0), and returns the segments + heap base.
+///
+/// The header word is laid ZERO here and patched by [`patch_string_headers`] once the descriptors
+/// have addresses. It cannot be filled in place: descriptors are laid FROM the heap base this
+/// function computes, so the address does not exist yet. Reserving the word and patching it is what
+/// makes that an ordering detail rather than a reason a literal has no header -- which is what it was.
 fn layout_strings(program: &mut [Function]) -> Result<StringLayout, LowerError> {
     let mut interned: Vec<(Vec<u16>, u32)> = Vec::new();
     let mut segments: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -255,20 +298,22 @@ fn layout_strings(program: &mut [Function]) -> Result<StringLayout, LowerError> 
             for (_, inst) in &mut block.insts {
                 if let Inst::StringLiteral { utf16 } = inst {
                     let units: Vec<u16> = utf16.to_vec();
-                    let offset = match interned.iter().find(|(c, _)| *c == units) {
-                        Some((_, offset)) => *offset,
+                    let object = match interned.iter().find(|(c, _)| *c == units) {
+                        Some((_, object)) => *object,
                         None => {
-                            let blob = string_blob(&units)?;
-                            let offset = next;
+                            let mut blob = alloc::vec![0u8; OBJECT_HEADER as usize];
+                            blob.extend_from_slice(&string_blob(&units)?);
+                            let base = next;
                             next = (next + blob.len() as u32).next_multiple_of(4);
-                            interned.push((units, offset));
-                            segments.push((offset, blob));
-                            offset
+                            segments.push((base, blob));
+                            let object = base + OBJECT_HEADER;
+                            interned.push((units, object));
+                            object
                         }
                     };
                     *inst = Inst::ConstInt {
                         ty: MirType::ObjectRef,
-                        value: i64::from(offset),
+                        value: i64::from(object),
                     };
                 }
             }
@@ -278,6 +323,20 @@ fn layout_strings(program: &mut [Function]) -> Result<StringLayout, LowerError> 
         segments,
         heap_base: i64::from(next.next_multiple_of(8)),
     })
+}
+
+/// Writes `desc` into the reserved header word of every literal segment [`layout_strings`] laid.
+///
+/// A build with no `System.String` descriptor to name leaves them ZERO, which is the same ABSENT
+/// value a null reference's `LoadTypeDesc` answers -- so a type test on a literal MISSES rather than
+/// reading whatever the word happens to hold. The literals are all of `segments`, so this walks it
+/// whole rather than carrying a second list of which entries are strings.
+fn patch_string_headers(segments: &mut [(u32, Vec<u8>)], desc: i32) {
+    for (_, blob) in segments.iter_mut() {
+        if let Some(header) = blob.get_mut(..OBJECT_HEADER as usize) {
+            header.copy_from_slice(&desc.to_le_bytes());
+        }
+    }
 }
 
 /// Builds a string blob in this build's storage encoding -- the unit count as a little-endian `u32`,
@@ -334,6 +393,8 @@ fn uses_memory(funcs: &[Function]) -> bool {
                     | Inst::ArrayStore { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::Array2DLoad { .. }
+                    | Inst::Array2DElemAddr { .. }
+                    | Inst::ArrayMDElemAddr { .. }
                     | Inst::Array2DStore { .. }
                     | Inst::AllocArrayMD { .. }
                     | Inst::ArrayMDLoad { .. }
@@ -465,17 +526,53 @@ fn collect_native_imports(
 /// `type handle -> descriptor address` map, and the next free linear-memory offset.
 type DescriptorLayout = (Vec<(u32, Vec<u8>)>, BTreeMap<u32, i32>, u32);
 
+/// What SHAPE a descriptor takes. The two forms differ in every word, which is why a consumer that
+/// reads one as the other gets a plausible wrong answer rather than a fault -- see the MARK guards on
+/// [`Inst::CastClassScan`], [`Inst::InterfaceHasTag`] and [`Inst::CallInterface`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DescShape {
+    /// A CLASS: `[id@0][base_ptr@4][itable_count@8][(tag, funcref-index)@12 ...]`, this target's own
+    /// form, with the vtable laid before it.
+    Class,
+    /// An ARRAY, in the format shared with the ARM and RISC-V backends:
+    /// `[MARK | rank@0][element_kind@4][type_tag@8][base_ptr@12][element_desc@16][cast_class@20]`.
+    ///
+    ///
+    /// It is not this target's class form with extra words -- word 1 is the element KIND where a
+    /// class has an itable count, and `element_desc@16` is the word the SHARED covariant-store check
+    /// reads. That check lives in `cil.rs` and is written against the ratified offsets, so an array
+    /// descriptor here has to be laid at them or the check reads two unrelated words and compares them.
+    Array {
+        /// Word 1: what one element IS, for a consumer that must stride or trace the payload.
+        element_kind: u32,
+        /// The ELEMENT type's handle, whose descriptor `element_desc@16` names. `None` lays the
+        /// word `0`, the ABSENT value the store check refuses to check against rather than guess.
+        element: Option<u32>,
+        /// Word 5: ECMA-335 III.4.3's array-element cast class, `0` where only the element's own
+        /// identity will do. It is carried HERE rather than derived from `element_kind` because the
+        /// kind answers a WIDTH question and names two types per code.
+        element_cast_class: u32,
+    },
+}
+
 /// Lays each allocated or queried type's descriptor in linear memory from `base`. Per type the vtable
 /// (function = table indices) is laid BEFORE a fixed metadata block so slot `k` is `[desc - 4 - k*4]`,
-/// and `desc` (the address in the map -- the object header + `TypeDescAddr` value) points at:
-/// `[id @ desc+0][base_ptr @ desc+4][itable_count @ desc+8][(tag, funcref-index) @ desc+12 ...]`. The
-/// `base_ptr` is the base type's descriptor address (0 at the chain's end), which a `castclass`/`isinst`
-/// scan walks; the base types are added transitively so the whole chain is present. Returns the data
-/// segments, the `handle -> descriptor address` map, and the next free offset. Two passes: assign every
-/// descriptor an address, then lay the bytes (so a `base_ptr` can reference an address assigned later).
+/// and `desc` (the address in the map -- the object header + `TypeDescAddr` value) points at the words
+/// of its [`DescShape`]. A class's `base_ptr` is the base type's descriptor address (0 at the chain's
+/// end), which a `castclass`/`isinst` scan walks; the base types are added transitively so the whole
+/// chain is present. Returns the data segments, the `handle -> descriptor address` map, and the next
+/// free offset. Two passes: assign every descriptor an address, then lay the bytes (so a `base_ptr` --
+/// or an `element_desc` -- can reference an address assigned later).
+///
+/// `string_handle` is `System.String`'s identity, and it is passed rather than discovered because
+/// NOTHING IN THE PROGRAM NAMES IT by the time this runs: `layout_strings` has already rewritten every
+/// literal to a bare `ConstInt`. A program that only prints text reaches the type through no `Alloc`,
+/// no cast and no `TypeDescAddr`, so without it laid here a literal's header word has no address to
+/// carry and every type test on a literal misses.
 fn layout_descriptors(
     program: &[Function],
     descriptors: &[TypeMeta],
+    string_handle: Option<u32>,
     base: u32,
     import_count: u32,
 ) -> DescriptorLayout {
@@ -486,41 +583,82 @@ fn layout_descriptors(
             .and_then(|m| m.base)
             .map(|b| b.0)
     };
-    let mut handles: Vec<u32> = Vec::new();
+    let tag_of = |h: u32| {
+        descriptors
+            .iter()
+            .find(|m| m.handle.0 == h)
+            .map_or(0, |m| m.type_tag)
+    };
+    let mut handles: Vec<(u32, DescShape)> = Vec::new();
+    if let Some(handle) = string_handle {
+        note_descriptor(
+            &mut handles,
+            handle,
+            DescShape::Array {
+                element_kind: crate::resolver::string_descriptor_words(0)[1],
+                element: None,
+                element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
+            },
+        );
+    }
     for (_, inst) in program
         .iter()
         .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
     {
-        let handle = match inst {
-            Inst::Alloc { handle, .. } | Inst::TypeDescAddr { handle } => handle.0,
+        match inst {
+            Inst::Alloc { handle, .. } | Inst::TypeDescAddr { handle } => {
+                note_descriptor(&mut handles, handle.0, DescShape::Class);
+            }
+            Inst::AllocArray {
+                handle,
+                element,
+                element_kind,
+                element_cast_class,
+                ..
+            } => {
+                note_descriptor(
+                    &mut handles,
+                    handle.0,
+                    DescShape::Array {
+                        element_kind: *element_kind,
+                        element: element.map(|e| e.0),
+                        element_cast_class: *element_cast_class,
+                    },
+                );
+                if let Some(element) = element {
+                    note_descriptor(&mut handles, element.0, DescShape::Class);
+                }
+            }
+            Inst::AllocArray2D { handle, .. } | Inst::AllocArrayMD { handle, .. } => {
+                note_descriptor(&mut handles, handle.0, DescShape::Class);
+            }
             _ => continue,
-        };
-        if !handles.contains(&handle) {
-            handles.push(handle);
         }
     }
     let mut i = 0;
     while i < handles.len() {
-        if let Some(b) = base_of(handles[i]) {
-            if !handles.contains(&b) {
-                handles.push(b);
-            }
+        if let Some(b) = base_of(handles[i].0) {
+            note_descriptor(&mut handles, b, DescShape::Class);
         }
         i += 1;
     }
 
     let mut map = BTreeMap::new();
     let mut next = base;
-    for &handle in &handles {
+    for &(handle, shape) in &handles {
         let meta = descriptors.iter().find(|m| m.handle.0 == handle);
         let vlen = meta.map(|m| m.vtable.len()).unwrap_or(0) as u32;
         let ilen = meta.map(|m| m.itable.len()).unwrap_or(0) as u32;
         map.insert(handle, (next + vlen * 4) as i32);
-        next += vlen * 4 + 12 + ilen * 8;
+        next += vlen * 4
+            + match shape {
+                DescShape::Class => 12 + ilen * 8,
+                DescShape::Array { .. } => crate::resolver::ARRAY_ITABLE_OFFSET + 4 + ilen * 8,
+            };
     }
 
     let mut segments = Vec::new();
-    for &handle in &handles {
+    for &(handle, shape) in &handles {
         let meta = descriptors.iter().find(|m| m.handle.0 == handle);
         let vtable = meta.map(|m| m.vtable.as_slice()).unwrap_or(&[]);
         let itable = meta.map(|m| m.itable.as_slice()).unwrap_or(&[]);
@@ -539,23 +677,70 @@ fn layout_descriptors(
             };
             blob.extend_from_slice(&(index + import_count).to_le_bytes());
         }
-        blob.extend_from_slice(&handle.to_le_bytes());
-        blob.extend_from_slice(&base_ptr.to_le_bytes());
-        blob.extend_from_slice(&(itable.len() as u32).to_le_bytes());
-        for (tag, impl_) in itable {
-            blob.extend_from_slice(&tag.to_le_bytes());
-            let func_index = match impl_ {
-                crate::resolver::VtableEntry::Func(index) => *index,
-                crate::resolver::VtableEntry::Extern(_) => {
-                    debug_assert!(false, "extern itable entry on the wasm path");
-                    0
+        match shape {
+            DescShape::Class => {
+                blob.extend_from_slice(&handle.to_le_bytes());
+                blob.extend_from_slice(&base_ptr.to_le_bytes());
+                blob.extend_from_slice(&(itable.len() as u32).to_le_bytes());
+                for (tag, impl_) in itable {
+                    blob.extend_from_slice(&tag.to_le_bytes());
+                    let func_index = match impl_ {
+                        crate::resolver::VtableEntry::Func(index) => *index,
+                        crate::resolver::VtableEntry::Extern(_) => {
+                            debug_assert!(false, "extern itable entry on the wasm path");
+                            0
+                        }
+                    };
+                    blob.extend_from_slice(&(func_index + import_count).to_le_bytes());
                 }
-            };
-            blob.extend_from_slice(&(func_index + import_count).to_le_bytes());
+            }
+            DescShape::Array {
+                element_kind,
+                element,
+                element_cast_class,
+            } => {
+                blob.extend_from_slice(&(crate::resolver::ARRAY_DESC_MARK | 1).to_le_bytes());
+                blob.extend_from_slice(&element_kind.to_le_bytes());
+                blob.extend_from_slice(&element.map_or_else(|| tag_of(handle), tag_of).to_le_bytes());
+                blob.extend_from_slice(&0u32.to_le_bytes());
+                let element_rel = element
+                    .and_then(|e| map.get(&e).copied())
+                    .map_or(0, |addr| (addr as u32).wrapping_sub(desc_addr));
+                blob.extend_from_slice(&element_rel.to_le_bytes());
+                blob.extend_from_slice(&element_cast_class.to_le_bytes());
+                blob.extend_from_slice(&(itable.len() as u32).to_le_bytes());
+                for (tag, impl_) in itable {
+                    blob.extend_from_slice(&tag.to_le_bytes());
+                    let func_index = match impl_ {
+                        crate::resolver::VtableEntry::Func(index) => *index,
+                        crate::resolver::VtableEntry::Extern(_) => {
+                            debug_assert!(false, "extern itable entry on the wasm path");
+                            0
+                        }
+                    };
+                    blob.extend_from_slice(&(func_index + import_count).to_le_bytes());
+                }
+            }
         }
         segments.push((desc_addr - (vtable.len() as u32) * 4, blob));
     }
     (segments, map, next)
+}
+
+/// Records that `handle` needs a descriptor of `shape`, keeping ONE entry per handle.
+///
+/// An ARRAY shape UPGRADES a class one and never the reverse. A handle can be reached both ways --
+/// `System.String` is staged as an array before the walk and then met again as a `string[]`'s
+/// element, which is a plain type reference -- and only the array form carries the element word the
+/// covariant-store check reads, so the richer shape has to win regardless of which order they arrive in.
+fn note_descriptor(handles: &mut Vec<(u32, DescShape)>, handle: u32, shape: DescShape) {
+    if let Some(entry) = handles.iter_mut().find(|(h, _)| *h == handle) {
+        if matches!(entry.1, DescShape::Class) {
+            entry.1 = shape;
+        }
+        return;
+    }
+    handles.push((handle, shape));
 }
 
 fn lower_function(func: &Function, ctx: &WasmCtx) -> Result<Func, LowerError> {
@@ -1243,13 +1428,37 @@ fn lower_inst(
                 .get(&handle.0)
                 .copied()
                 .unwrap_or(handle.0 as i32);
-            emit_bump(body, (4 + payload_size.next_multiple_of(8)) as i32);
+            emit_bump(
+                body,
+                (OBJECT_HEADER + payload_size.next_multiple_of(8)) as i32,
+            );
             body.local_set(local(result));
             body.local_get(local(result));
             body.i32_const(desc);
             body.i32_store(MemArg::new(4, 0));
             body.local_get(local(result));
-            body.i32_const(4);
+            body.i32_const(OBJECT_HEADER as i32);
+            body.i32_add();
+            body.local_set(local(result));
+        }
+        Inst::AllocDescribed {
+            descriptor,
+            payload_size,
+        } => {
+            body.local_get(local(*payload_size));
+            body.i32_const((OBJECT_HEADER + 7) as i32);
+            body.i32_add();
+            body.i32_const(!7);
+            body.i32_and();
+            body.global_get(HEAP_POINTER);
+            body.local_tee(local(result));
+            body.i32_add();
+            body.global_set(HEAP_POINTER);
+            body.local_get(local(result));
+            body.local_get(local(*descriptor));
+            body.i32_store(MemArg::new(4, 0));
+            body.local_get(local(result));
+            body.i32_const(OBJECT_HEADER as i32);
             body.i32_add();
             body.local_set(local(result));
         }
@@ -1309,14 +1518,20 @@ fn lower_inst(
             }
         }
         Inst::AllocArray {
+            handle,
             length,
             element_size,
             ..
         } => {
+            let desc = ctx
+                .desc_addr
+                .get(&handle.0)
+                .copied()
+                .unwrap_or(handle.0 as i32);
             body.local_get(local(*length));
             body.i32_const(*element_size as i32);
             body.i32_mul();
-            body.i32_const(4);
+            body.i32_const((OBJECT_HEADER + 4) as i32);
             body.i32_add();
             body.i32_const(7);
             body.i32_add();
@@ -1327,8 +1542,15 @@ fn lower_inst(
             body.i32_add();
             body.global_set(HEAP_POINTER);
             body.local_get(local(result));
-            body.local_get(local(*length));
+            body.i32_const(desc);
             body.i32_store(MemArg::new(4, 0));
+            body.local_get(local(result));
+            body.local_get(local(*length));
+            body.i32_store(MemArg::new(4, OBJECT_HEADER));
+            body.local_get(local(result));
+            body.i32_const(OBJECT_HEADER as i32);
+            body.i32_add();
+            body.local_set(local(result));
         }
         Inst::ArrayLoad {
             array,
@@ -1372,18 +1594,30 @@ fn lower_inst(
             body.local_get(local(*value));
             emit_typed_store(body, value_types[value.index()], *offset)?;
         }
+        Inst::StaticAddr { owner, offset } => {
+            if !matches!(owner, lamella_ir::StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
+            body.i32_const(STATIC_BASE + *offset as i32);
+            body.local_set(local(result));
+        }
         Inst::AllocArray2D {
+            handle,
             dim0,
             dim1,
             element_size,
-            ..
         } => {
+            let desc = ctx
+                .desc_addr
+                .get(&handle.0)
+                .copied()
+                .unwrap_or(handle.0 as i32);
             body.local_get(local(*dim0));
             body.local_get(local(*dim1));
             body.i32_mul();
             body.i32_const(*element_size as i32);
             body.i32_mul();
-            body.i32_const(8);
+            body.i32_const((OBJECT_HEADER + 8) as i32);
             body.i32_add();
             body.i32_const(7);
             body.i32_add();
@@ -1394,11 +1628,18 @@ fn lower_inst(
             body.i32_add();
             body.global_set(HEAP_POINTER);
             body.local_get(local(result));
-            body.local_get(local(*dim0));
+            body.i32_const(desc);
             body.i32_store(MemArg::new(4, 0));
             body.local_get(local(result));
+            body.local_get(local(*dim0));
+            body.i32_store(MemArg::new(4, OBJECT_HEADER));
+            body.local_get(local(result));
             body.local_get(local(*dim1));
-            body.i32_store(MemArg::new(4, 4));
+            body.i32_store(MemArg::new(4, OBJECT_HEADER + 4));
+            body.local_get(local(result));
+            body.i32_const(OBJECT_HEADER as i32);
+            body.i32_add();
+            body.local_set(local(result));
         }
         Inst::Array2DLoad {
             array,
@@ -1470,11 +1711,13 @@ fn lower_inst(
             body.local_set(present);
             body.local_get(local(*descriptor));
             body.if_(BlockType::Empty);
-            body.local_get(local(*descriptor));
-            body.i32_load(MemArg::new(4, 8));
+            emit_itable_base(body, local(*descriptor));
+            body.local_set(ptr);
+            body.local_get(ptr);
+            body.i32_load(MemArg::new(4, 0));
             body.local_set(count);
-            body.local_get(local(*descriptor));
-            body.i32_const(12);
+            body.local_get(ptr);
+            body.i32_const(4);
             body.i32_add();
             body.local_set(ptr);
             body.loop_(BlockType::Empty);
@@ -1527,11 +1770,13 @@ fn lower_inst(
             body.i32_sub();
             body.i32_load(MemArg::new(4, 0));
             body.local_set(desc);
-            body.local_get(desc);
-            body.i32_load(MemArg::new(4, 8));
+            emit_itable_base(body, desc);
+            body.local_set(ptr);
+            body.local_get(ptr);
+            body.i32_load(MemArg::new(4, 0));
             body.local_set(count);
-            body.local_get(desc);
-            body.i32_const(12);
+            body.local_get(ptr);
+            body.i32_const(4);
             body.i32_add();
             body.local_set(ptr);
             body.loop_(BlockType::Empty);
@@ -1671,8 +1916,7 @@ fn lower_inst(
             body.i32_const(1);
             body.local_set(res);
             body.else_();
-            body.local_get(cur);
-            body.i32_load(MemArg::new(4, 4));
+            emit_class_word_guarded(body, cur, 4);
             body.local_set(cur);
             body.local_get(cur);
             body.i32_eqz();
@@ -1715,10 +1959,15 @@ fn lower_inst(
             body.local_set(local(result));
         }
         Inst::AllocArrayMD {
+            handle,
             dims,
             element_size,
-            ..
         } => {
+            let desc = ctx
+                .desc_addr
+                .get(&handle.0)
+                .copied()
+                .unwrap_or(handle.0 as i32);
             body.local_get(local(dims[0]));
             for d in &dims[1..] {
                 body.local_get(local(*d));
@@ -1726,7 +1975,7 @@ fn lower_inst(
             }
             body.i32_const(*element_size as i32);
             body.i32_mul();
-            body.i32_const(4 * dims.len() as i32);
+            body.i32_const(OBJECT_HEADER as i32 + 4 * dims.len() as i32);
             body.i32_add();
             body.i32_const(7);
             body.i32_add();
@@ -1736,11 +1985,35 @@ fn lower_inst(
             body.local_tee(local(result));
             body.i32_add();
             body.global_set(HEAP_POINTER);
+            body.local_get(local(result));
+            body.i32_const(desc);
+            body.i32_store(MemArg::new(4, 0));
             for (k, d) in dims.iter().enumerate() {
                 body.local_get(local(result));
                 body.local_get(local(*d));
-                body.i32_store(MemArg::new(4, (4 * k) as u32));
+                body.i32_store(MemArg::new(4, OBJECT_HEADER + (4 * k) as u32));
             }
+            body.local_get(local(result));
+            body.i32_const(OBJECT_HEADER as i32);
+            body.i32_add();
+            body.local_set(local(result));
+        }
+        Inst::Array2DElemAddr {
+            array,
+            index0,
+            index1,
+            element_size,
+        } => {
+            emit_2d_element_address(body, local, *array, *index0, *index1, *element_size);
+            body.local_set(local(result));
+        }
+        Inst::ArrayMDElemAddr {
+            array,
+            indices,
+            element_size,
+        } => {
+            emit_md_element_address(body, local, *array, indices, *element_size);
+            body.local_set(local(result));
         }
         Inst::ArrayMDLoad {
             array,
@@ -1878,16 +2151,94 @@ fn emit_delegate_dispatch(
 }
 
 /// Whether `value`'s local holds a linear-memory address that a field access can dereference: a heap
-/// `ObjectRef`, a managed pointer, or a value-type instance (its local is the address of its slot).
+/// `ObjectRef`, a managed pointer, an unmanaged pointer, or a value-type instance (its local is the
+/// address of its slot).
+///
+/// A `NativeInt` base IS a pointer, and the distinction is not a performance one. An UNMANAGED
+/// pointer (`T*`) is CIL's `native int`: `conv.u`/`conv.i` is where a managed pointer stops being
+/// tracked, and a pointer local is declared `NativeInt` outright, so `p->f` through an `S* p`
+/// arrives here with a `NativeInt` base. The two answers read DIFFERENT MEMORY -- a pointer base is
+/// dereferenced, anything else is taken as an instance living in the value's own slot -- so
+/// classifying one as inline answers the pointer itself where the field was asked for, and stores to
+/// the pointer instead of through it. Nothing else can be a field base: a base is an address or an
+/// inline struct, and an inline struct is a `ValueType`.
 fn is_addressable(value_types: &[MirType], value: ValueId) -> bool {
     matches!(
         value_types.get(value.index()),
-        Some(MirType::ObjectRef | MirType::ManagedPtr | MirType::ValueType { .. })
+        Some(
+            MirType::ObjectRef
+                | MirType::ManagedPtr
+                | MirType::NativeInt
+                | MirType::ValueType { .. }
+        )
     )
 }
 
 /// Emits an inline bump allocation of `size` bytes, leaving the allocated address on the stack: read
 /// the heap pointer (the result), advance it by `size`, write it back.
+/// Pushes the word at `[descriptor + offset]` -- or `0` when `descriptor` is an ARRAY descriptor
+/// rather than a class one, which every caller reads as "there is nothing here".
+///
+/// THE TWO SHAPES DISAGREE ABOUT EVERY WORD BUT THEIR LAST TWO, so a class reader let loose on an
+/// array descriptor does not fault -- it gets a plausible number. `base_ptr@4` is the element KIND,
+/// so a `castclass` on an array would walk to address 4 or 5 and read a "descriptor" out of the null
+/// guard; `itable_count@8` is the TYPE TAG, so an interface search would scan tens of thousands of
+/// entries past the end of the descriptor and could match a tag by accident and `call_indirect`
+/// whatever word followed it. The MARK is in the top byte of word 0 precisely so ONE load and one
+/// compare separates them, and no handle can collide: handle table bytes are `0x01`..`0x0D` and
+/// `0x1B`, and [`ARRAY_DESC_MARK`](crate::resolver::ARRAY_DESC_MARK) is `0xA5`.
+///
+/// ONE READER TAKES THIS ANSWER NOW -- the base-chain scan -- because the two itable readers reach
+/// their word through [`emit_itable_base`] instead: an array HAS an itable, at a different offset,
+/// so "there is nothing here" stopped being true for them. It stays a function because the base
+/// chain is the position where the answer is still a refusal, and a refusal written out inline is
+/// the one that gets forgotten.
+fn emit_class_word_guarded(body: &mut Func, descriptor: u32, offset: u32) {
+    body.local_get(descriptor);
+    body.i32_load(MemArg::new(4, 0));
+    body.i32_const(24);
+    body.i32_shr_u();
+    body.i32_const((crate::resolver::ARRAY_DESC_MARK >> 24) as i32);
+    body.i32_eq();
+    body.if_(BlockType::Value(ValType::I32));
+    body.i32_const(0);
+    body.else_();
+    body.local_get(descriptor);
+    body.i32_load(MemArg::new(4, offset));
+    body.end();
+}
+
+/// Pushes the ADDRESS of a descriptor's itable COUNT word, for EITHER shape.
+///
+/// The two shapes keep their itable in the same relative place -- immediately past their header
+/// -- and disagree only about how long that header is. A class's varies
+/// (`[id][base_ptr][count]`, so the count is at 8); an array's is the fixed
+/// [`crate::resolver::ARRAY_DESC_WORDS`], so its count is at
+/// [`crate::resolver::ARRAY_ITABLE_OFFSET`]. Reading a class's offset out of an array
+/// descriptor lands on the TYPE TAG, which a search then treats as an entry count -- tens of
+/// thousands of entries past the descriptor, able to match a tag by accident.
+///
+/// One function rather than the choice written out at each reader, for the reason its neighbour
+/// above gives: they are two positions of one rule, and a third would otherwise be the third
+/// place to forget it.
+fn emit_itable_base(body: &mut Func, descriptor: u32) {
+    body.local_get(descriptor);
+    body.i32_load(MemArg::new(4, 0));
+    body.i32_const(24);
+    body.i32_shr_u();
+    body.i32_const((crate::resolver::ARRAY_DESC_MARK >> 24) as i32);
+    body.i32_eq();
+    body.if_(BlockType::Value(ValType::I32));
+    body.local_get(descriptor);
+    body.i32_const(crate::resolver::ARRAY_ITABLE_OFFSET as i32);
+    body.i32_add();
+    body.else_();
+    body.local_get(descriptor);
+    body.i32_const(8);
+    body.i32_add();
+    body.end();
+}
+
 fn emit_bump(body: &mut Func, size: i32) {
     body.global_get(HEAP_POINTER);
     body.global_get(HEAP_POINTER);
@@ -2193,6 +2544,25 @@ fn valtype(ty: MirType) -> Result<ValType, LowerError> {
 mod tests {
     use super::*;
     use lamella_ir::{BasicBlock, BlockId};
+
+    /// A `NativeInt` base is an UNMANAGED POINTER and holds a linear-memory address like any other.
+    ///
+    /// `T*` is CIL's `native int`, so `p->f` on a struct pointer arrives with one. Rejecting it
+    /// refuses a program this backend can lower -- and the same classification on ARM is a silent
+    /// wrong answer rather than a refusal, which is why it is pinned in each backend that has one.
+    #[test]
+    fn an_unmanaged_pointer_is_an_addressable_field_base() {
+        let types = [
+            MirType::ObjectRef,
+            MirType::ManagedPtr,
+            MirType::NativeInt,
+            MirType::I32,
+        ];
+        assert!(is_addressable(&types, ValueId(0)));
+        assert!(is_addressable(&types, ValueId(1)));
+        assert!(is_addressable(&types, ValueId(2)), "`T*` is `native int`");
+        assert!(!is_addressable(&types, ValueId(3)));
+    }
 
     /// `fn() -> i32 { 40 + 2 }` -- the first-milestone straight-line function.
     fn add_constants() -> Function {
@@ -2567,6 +2937,7 @@ mod tests {
                             length: ValueId(0),
                             element_size: 4,
                             element_kind: 5,
+                            element_cast_class: 0,
                         },
                     ),
                     (ValueId(2), cint(20)),
@@ -2782,7 +3153,7 @@ mod tests {
             exported: true,
             full_name: None,
         }];
-        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
+        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors, None)
             .expect("the callvirt lowers to WASM");
         assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
         assert!(bytes.contains(&0x11), "the call_indirect opcode is emitted");
@@ -2852,7 +3223,7 @@ mod tests {
             exported: true,
             full_name: None,
         }];
-        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
+        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors, None)
             .expect("the interface call lowers to WASM");
         assert!(bytes.contains(&0x11), "the call_indirect opcode is emitted");
         assert!(
@@ -2921,7 +3292,7 @@ mod tests {
                 full_name: None,
             },
         ];
-        let bytes = lower_module_with_exports(&[main], &[("main", 0)], &descriptors)
+        let bytes = lower_module_with_exports(&[main], &[("main", 0)], &descriptors, None)
             .expect("the castclass chain lowers to WASM");
         assert!(
             bytes.windows(4).any(|w| w == 1u32.to_le_bytes()),
@@ -2993,7 +3364,7 @@ mod tests {
             exported: true,
             full_name: None,
         }];
-        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
+        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors, None)
             .expect("the void callvirt lowers to WASM");
         assert!(
             bytes.windows(4).any(|w| w == [0x60, 0x01, 0x7F, 0x00]),
@@ -3504,5 +3875,325 @@ mod tests {
         let bytes = lower(&array_3d()).expect("a 3-D array lowers to WASM");
         assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
         assert!(uses_memory(&[array_3d()]));
+    }
+
+
+    /// `System.String` and `string[]` as this backend spells them: a TypeRef-keyed handle, which is
+    /// the identity a reference-less build mints (`qualified_type_handle` keeps a TypeRef's raw token
+    /// when no reference resolves it), lifted to the array's own by `array_handle`.
+    fn string_handles() -> (u32, u32) {
+        let string = lamella_ir::TypeHandle(0x0100_0008);
+        (string.0, lamella_ir::array_handle(string).0)
+    }
+
+    /// One function allocating a `string[]`, plus a `StringLiteral` per entry in `literals`.
+    fn string_array_program(literals: &[&str]) -> Function {
+        let (string, array) = string_handles();
+        let mut value_types = alloc::vec![MirType::I32, MirType::ObjectRef];
+        let mut insts = alloc::vec![
+            (
+                ValueId(0),
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 1,
+                },
+            ),
+            (
+                ValueId(1),
+                Inst::AllocArray {
+                    handle: lamella_ir::TypeHandle(array),
+                    element: Some(lamella_ir::TypeHandle(string)),
+                    length: ValueId(0),
+                    element_size: 4,
+                    element_kind: crate::resolver::ELEMENT_KIND_REFERENCE,
+                    element_cast_class: 0,
+                },
+            ),
+        ];
+        for text in literals {
+            let id = ValueId(value_types.len() as u32);
+            value_types.push(MirType::ObjectRef);
+            insts.push((
+                id,
+                Inst::StringLiteral {
+                    utf16: text.encode_utf16().collect::<Vec<u16>>().into_boxed_slice(),
+                },
+            ));
+        }
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types,
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts,
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        }
+    }
+
+    /// The address [`layout_strings`] rewrote the program's one literal to -- the OBJECT, past its
+    /// header.
+    fn literal_object(program: &[Function]) -> u32 {
+        program
+            .iter()
+            .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
+            .find_map(|(_, inst)| match inst {
+                Inst::ConstInt {
+                    ty: MirType::ObjectRef,
+                    value,
+                } => Some(*value as u32),
+                _ => None,
+            })
+            .expect("the literal was rewritten to an ObjectRef constant")
+    }
+
+    /// Reads `count` words of the descriptor at `addr` out of the laid segments.
+    fn descriptor_words(segments: &[(u32, Vec<u8>)], addr: u32, count: usize) -> Vec<u32> {
+        let (base, blob) = segments
+            .iter()
+            .find(|(base, blob)| addr >= *base && addr < base + blob.len() as u32)
+            .expect("the descriptor's address falls inside a laid segment");
+        let start = (addr - base) as usize;
+        blob[start..start + count * 4]
+            .chunks(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect()
+    }
+
+    /// An ARRAY descriptor takes the shared, ratified format --
+    /// `[MARK | rank][element_kind][type_tag][base_ptr][element_desc]` -- and its fifth word is a
+    /// RELATIVE displacement to the element type's descriptor, because the SHARED covariant-store
+    /// check in `cil.rs` reads it as one: it loads the word and adds the descriptor's own address
+    /// back on. An absolute address laid there would be read as a displacement and land on nothing.
+    #[test]
+    fn an_array_descriptor_takes_the_ratified_form_with_a_relative_element_edge() {
+        let (string, array) = string_handles();
+        let program = alloc::vec![string_array_program(&[])];
+        let (segments, map, _end) = layout_descriptors(&program, &[], Some(string), 0x400, 0);
+        let array_desc = map[&array] as u32;
+        let string_desc = map[&string] as u32;
+        let words = descriptor_words(&segments, array_desc, 5);
+        assert_eq!(
+            words[0],
+            crate::resolver::ARRAY_DESC_MARK | 1,
+            "word 0 is MARK | rank, which is what tells a class reader to stop"
+        );
+        assert_eq!(
+            words[1],
+            crate::resolver::ELEMENT_KIND_REFERENCE,
+            "word 1 is the element KIND, where a class descriptor carries its itable count"
+        );
+        assert_eq!(
+            words[3], 0,
+            "no base chain is laid for an array on this target"
+        );
+        assert_ne!(words[4], 0, "the element edge is present, not the ABSENT zero");
+        assert_eq!(
+            array_desc.wrapping_add(words[4]),
+            string_desc,
+            "element_desc@16 is a displacement that lands on System.String's descriptor"
+        );
+    }
+
+    /// A string LITERAL's object header and a `string[]`'s `element_desc@16` must name ONE address:
+    /// the store check scans the value's descriptor against the element's, so two identities for
+    /// `System.String` refuse a legal store, and a literal with no header at all reads a type out of
+    /// whatever precedes its blob.
+    #[test]
+    fn a_string_literal_and_a_string_array_element_name_one_descriptor() {
+        let (string, array) = string_handles();
+        let mut program = alloc::vec![string_array_program(&["hello"])];
+        let mut strings = layout_strings(&mut program).expect("the literal lays out");
+        let (segments, map, _end) =
+            layout_descriptors(&program, &[], Some(string), strings.heap_base as u32, 0);
+        let string_desc = map[&string] as u32;
+        patch_string_headers(&mut strings.segments, string_desc as i32);
+        let (base, literal) = &strings.segments[0];
+        let object = literal_object(&program);
+        assert_eq!(
+            object,
+            base + OBJECT_HEADER,
+            "the literal carries a header word before it"
+        );
+        let header = (object - OBJECT_HEADER - base) as usize;
+        assert_eq!(
+            u32::from_le_bytes([
+                literal[header],
+                literal[header + 1],
+                literal[header + 2],
+                literal[header + 3],
+            ]),
+            string_desc,
+            "and it names System.String's descriptor"
+        );
+        let element = descriptor_words(&segments, map[&array] as u32, 5)[4];
+        assert_eq!(
+            (map[&array] as u32).wrapping_add(element),
+            string_desc,
+            "and so does the array's element word -- ONE identity, reached two ways"
+        );
+    }
+
+    /// The literal's `ObjectRef` points PAST its header, at the length word -- so `String.Length`,
+    /// the storage readers and `[obj - 4]` all address what they expect.
+    #[test]
+    fn a_literal_points_past_its_header_at_the_length_word() {
+        let mut program = alloc::vec![string_array_program(&["hi"])];
+        let strings = layout_strings(&mut program).expect("the literal lays out");
+        let (base, blob) = &strings.segments[0];
+        let object = literal_object(&program);
+        assert_eq!(
+            object,
+            base + OBJECT_HEADER,
+            "the object begins past the header"
+        );
+        let length = (object - base) as usize;
+        assert_eq!(
+            u32::from_le_bytes([
+                blob[length],
+                blob[length + 1],
+                blob[length + 2],
+                blob[length + 3],
+            ]),
+            2,
+            "and offset 0 of the object is the unit count"
+        );
+    }
+
+    /// A rank-2+ array is HEADED but NOT marked as an array, and that is a recorded gap rather than
+    /// an accident: `AllocArray2D`/`AllocArrayMD` carry no element KIND, and word 1 of the array form
+    /// is exactly that. Marking one and guessing the kind would tell a consumer to stride or trace by
+    /// a width that is not the element's. The ARM backend makes the same choice; this pins it so that
+    /// closing it is deliberate on both rather than silent on one.
+    #[test]
+    fn a_rank_2_array_is_headed_but_not_marked_as_an_array() {
+        let handle = lamella_ir::TypeHandle(0x0500_0009);
+        let program = alloc::vec![Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 1,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::AllocArray2D {
+                            handle,
+                            dim0: ValueId(0),
+                            dim1: ValueId(0),
+                            element_size: 4,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        }];
+        let (segments, map, _end) = layout_descriptors(&program, &[], None, 0x400, 0);
+        let words = descriptor_words(&segments, map[&handle.0] as u32, 3);
+        assert_eq!(words[0], handle.0, "word 0 is the type id -- the class form");
+        assert_ne!(
+            words[0] & crate::resolver::ARRAY_DESC_MARK_MASK,
+            crate::resolver::ARRAY_DESC_MARK,
+            "and it carries no array MARK, so no consumer strides it"
+        );
+    }
+
+    /// Every reader of a CLASS descriptor's words guards on the MARK before reading one. The guard is
+    /// ONE shared emitter, so this looks for its signature -- `i32.const 24; i32.shr_u`, the top-byte
+    /// extraction it opens with -- rather than asserting three hand-written copies that could drift.
+    #[test]
+    fn a_class_word_reader_guards_on_the_array_mark() {
+        let (string, _array) = string_handles();
+        let mut program = string_array_program(&[]);
+        let desc = ValueId(program.value_types.len() as u32);
+        program.value_types.push(MirType::I32);
+        let target = ValueId(program.value_types.len() as u32);
+        program.value_types.push(MirType::I32);
+        let scan = ValueId(program.value_types.len() as u32);
+        program.value_types.push(MirType::I32);
+        program.blocks[0]
+            .insts
+            .push((desc, Inst::LoadTypeDesc { object: ValueId(1) }));
+        program.blocks[0].insts.push((
+            target,
+            Inst::TypeDescAddr {
+                handle: lamella_ir::TypeHandle(string),
+            },
+        ));
+        program.blocks[0].insts.push((
+            scan,
+            Inst::CastClassScan {
+                args: alloc::vec![desc, target],
+            },
+        ));
+        let bytes = lower_module_with_exports(
+            core::slice::from_ref(&program),
+            &[("main", 0)],
+            &[],
+            Some(string),
+        )
+        .expect("the scan lowers");
+        assert!(
+            bytes.windows(3).any(|w| w == [0x41, 0x18, 0x76]),
+            "the castclass walk extracts the descriptor's top byte before reading base_ptr@4"
+        );
+    }
+
+    /// A GENERATED HELPER EMITS LITERALS OF ITS OWN, so the string layout has to run AFTER the
+    /// helpers are appended. `null_safe_concat_operands` substitutes the empty string for a null
+    /// operand; laid first, that `StringLiteral` reached the per-instruction lowering un-interned and
+    /// fell through to `Unsupported`.
+    #[test]
+    fn a_concat_lowers_and_the_helpers_own_literals_are_interned() {
+        let (string, _array) = string_handles();
+        let program = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::ObjectRef, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::StringLiteral {
+                            utf16: alloc::vec![0x0061].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::StringLiteral {
+                            utf16: alloc::vec![0x0062].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::StringConcat {
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let bytes = lower_module_with_exports(
+            core::slice::from_ref(&program),
+            &[("main", 0)],
+            &[],
+            Some(string),
+        )
+        .expect("a concat lowers to WASM -- it did not, at any string handle, before the reorder");
+        assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
     }
 }

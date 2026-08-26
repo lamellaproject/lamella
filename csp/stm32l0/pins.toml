@@ -1,0 +1,49 @@
+# PIN map for the STM32L0x1 family, category 1: pin x function -> (instance, signal).
+# Function ids are the ST alternate-function numbers AF0..AF15 that the AFRL and AFRH nibbles
+# select; the GPIO block file states that machinery.
+#
+#
+#
+# THE ROWS ARE EVIDENCE-ONLY: a pin gains a row when something reaches it. The family's full
+# alternate-function matrix is table 14 of the datasheet and is larger than this.
+
+[table]
+kind = "pins"
+family = "stm32l0"
+sources = [
+    "STM32L011x3/STM32L011x4 datasheet DocID027973 Rev 5 table 14 (alternate functions): the AF0..AF7 columns against the port A and port B rows",
+    "STM32L0x1 reference manual RM0377 Rev 10 section 8.3.2 for the AF selection mechanism, and 27.3 for the reset state of the debug pins",
+]
+notes = [
+    "This family populates AF0 to AF7 only; table 14 has no AF8..AF15 columns, so a nibble value above 7 selects nothing on these pads.",
+    "PA3 AND PA15 ARE BOTH USART2_RX AT AF4, so the receive line has two possible pads and a board picks one. The NUCLEO-L011K4 picks PA15 and leaves PA3 for the Arduino Nano header, which is a BOARD decision and not a chip constraint -- the pin map states both because both are true of the silicon.",
+    "PB3 IS SPI1_SCK AT AF0 AND IS ALSO THE NUCLEO-L011K4's GREEN USER LED, wired to that header's D13. The two uses are mutually exclusive and nothing in the chip reports the conflict. It is recorded here as a chip fact; the board file records the LED.",
+]
+
+[[pins]]
+pin = "PA2"
+function = "AF4"
+instance = "usart2"
+signal = "tx"
+source = "DS027973 Rev 5 table 14, port A row PA2, AF4 column = USART2_TX. Its AF0 is TIM21_CH1, AF2 is TIM2_CH3, AF6 is LPUART1_TX and AF7 is COMP2_OUT -- four other real functions on the same pad."
+
+[[pins]]
+pin = "PA3"
+function = "AF4"
+instance = "usart2"
+signal = "rx"
+source = "DS027973 Rev 5 table 14, port A row PA3, AF4 column = USART2_RX."
+
+[[pins]]
+pin = "PA15"
+function = "AF4"
+instance = "usart2"
+signal = "rx"
+source = "DS027973 Rev 5 table 14, port A row PA15, AF4 column = USART2_RX. The second of two pads carrying this signal; the NUCLEO-L011K4 uses this one."
+
+[[pins]]
+pin = "PB3"
+function = "AF0"
+instance = "spi1"
+signal = "sck"
+source = "DS027973 Rev 5 table 14, port B row PB3, AF0 column = SPI1_SCK. On the NUCLEO-L011K4 this pad is also the green user LED LD3 on header signal D13, so a design driving the LED cannot also clock SPI1 through this pad."

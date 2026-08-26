@@ -1,0 +1,93 @@
+# INSTANCE map for the SAM D11 family: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+#
+# THE SHAPE MATCHES `csp/samd21` AND THE VALUES ARE NOT ITS VALUES. The two families clock and gate
+# the same way -- a GCLK core-clock id, a PM APBC mask bit and an NVIC line per instance -- and that
+# is where the resemblance stops. The clearest case is SERCOM0's generic-clock id: it is 14 here and
+# 0x14 (20) on the SAMD21. A row copied across would be off by six and would clock nothing.
+
+[table]
+kind = "instances"
+family = "samd11"
+record = ["base", "gclk_core_id", "apbc_bit", "irq"]
+sources = [
+    "SAM D11 datasheet Atmel-42363H-SAM-D11-Datasheet_09/2016: table 11-1 (peripherals configuration summary) -- base address, IRQ line, APB clock index and generic clock index, one row per peripheral",
+]
+notes = [
+    "The APB clock index in table 11-1 is PER BRIDGE, not global: PM/SYSCTRL/GCLK/WDT/RTC/EIC sit on bridge A, DSU/NVMCTRL/PORT/DMAC/USB on bridge B, and EVSYS/SERCOM0-2 on bridge C. Only the bridge-C rows have an apbc_bit; the others state -1 rather than an index from a different mask register.",
+    "SERCOM rows take the CORE generic-clock id (14, 15, 16). Table 11-1 gives each SERCOM a second id, 13 SLOW, shared by all three -- that is the low-power clock the I2C timeout logic needs, not the core clock, and it is deliberately not in this field.",
+    "SERCOM2 is a D11D instance. The D11C series carries two SERCOMs (table 1-1), so a binding that names sercom2 is D11D-only.",
+]
+
+[[instances]]
+name = "pm"
+block = "pm"
+base = 0x40000400
+gclk_core_id = -1
+apbc_bit = -1
+irq = 0
+
+[[instances]]
+name = "gclk"
+block = "gclk"
+base = 0x40000C00
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "porta"
+block = "port"
+base = 0x41004400   # the single PORT group on this family; table 1-1 caps I/O at 22 pads, all PA
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "dsu"
+block = "dsu"
+base = 0x41002000   # DID lives here, and DID.DEVSEL is what tells the packages apart (table 2-1)
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+[[instances]]
+name = "nvmctrl"
+block = "nvmctrl"
+base = 0x41004000
+gclk_core_id = 13
+apbc_bit = -1
+irq = 5
+
+[[instances]]
+name = "usb"
+block = "usb"
+base = 0x41005000   # the peripheral the SAM D10 does not have; its table 11-1 carries no USB row
+gclk_core_id = 6
+apbc_bit = -1       # bridge B, not C -- its APB index 5 belongs to a different mask register
+irq = 7
+
+[[instances]]
+name = "sercom0"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 14
+apbc_bit = 2
+irq = 9
+
+[[instances]]
+name = "sercom1"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 15
+apbc_bit = 3
+irq = 10
+
+[[instances]]
+name = "sercom2"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 16
+apbc_bit = 4
+irq = 11

@@ -34,6 +34,13 @@ namespace Lamella.Net.Time
             _warning = warning;
         }
 
+        public static SyncResult Failed(string protocol, string warning)
+        {
+            return new SyncResult(
+                false, protocol, false, 0,
+                new TimeSpan(0), new TimeSpan(0), new DateTime(0), warning);
+        }
+
         public bool Succeeded { get { return _succeeded; } }
 
         public string Protocol { get { return _protocol; } }

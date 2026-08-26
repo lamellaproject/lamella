@@ -1,0 +1,49 @@
+# PARTS table for the STM32U5A5, the part on the NUCLEO-U5A5ZJ-Q.
+#
+# WHY THIS IS ITS OWN FAMILY AND NOT A ROW IN csp/stm32u585, WHICH IS THE ASSUMPTION IT LOOKS LIKE
+# IT SHOULD BE. csp/stm32u585's own header states the rule this follows: a family owns ONE reference
+# manual AND one pin-function table, and RM0456 is titled for the series while its CONTENT is
+# per sub-group. Three of that manual's structures separate this part from the U585 rather than
+# joining them:
+#   * Table 6, the register boundary table, prints FOUR product columns -- STM32U535/545,
+#     STM32U575/585, STM32U59x/5Ax and STM32U5Fx/5Gx. This part is in the THIRD.
+#   * Table 7 (SRAM sizes) gives the U59x/5Ax column an SRAM5 of 832 Kbytes that the U575/585
+#     column does not have at all, and an SRAM3 of 832 against the U575/585's 512.
+#   * There are FOUR memory maps, one per sub-group: Figure 5 is the U59x/5Ax one.
+# And the pin-function table is the DATASHEET, which is per product: DS13086 is titled "STM32U585xx".
+# A U5A5 pin map cannot be filled from it.
+#
+# THE CONCRETE DIFFERENCE, so this is not an argument from document structure alone: Table 6 marks
+# GPIOJ present on STM32U59x/5Ax and STM32U5Fx/5Gx and ABSENT on STM32U575/585. This part has a
+# tenth GPIO port the U585 does not have, and its clock-enable bit is real either way -- RCC_AHB2ENR1
+# bit 9 GPIOJEN carries no sub-group qualifier in its own bit description, while the neighboring
+# ADC12EN at bit 10 does. The presence column is the only place the manual says it.
+#
+# FLASH AND RAM HERE ARE MEASURED ON THE PART AND CORROBORATED FROM THE MANUAL, INDEPENDENTLY.
+
+[table]
+kind = "parts"
+family = "stm32u5a5"
+sources = [
+    "STM32U5 series reference manual RM0456 Rev 7: Table 7 (SRAM sizes), STM32U59x/5Ax column -- SRAM1 768 Kbytes, SRAM2 64, SRAM3 832, SRAM4 16, SRAM5 832, BKSRAM 2, TOTAL 2514 Kbytes",
+    "RM0456 Rev 7 Table 6 (memory map and peripheral register boundary addresses), STM32U59x/5Ax column, for which peripherals this sub-group carries",
+    "STM32U5Axxx datasheet DS13543 Rev 3: section 7 (ordering information scheme) for the decode of STM32U5A5ZJT6Q, and figure 13 (LQFP144_SMPS pinout) for the pad set of the Q variant",
+    "A read of the part itself on a NUCLEO-U5A5ZJ-Q: the FLASH_SIZE register reports 4096 Kbytes, and the contiguous SRAM span was bounded from both sides at 0x20000000-0x2026FFFF with SRAM4 separately bounded at 0x28000000-0x28003FFF. TZEN = 0 and RDP level 0 on this kit",
+]
+notes = [
+    "ram is the CONTIGUOUS span a linker can believe, 2496 Kbytes, and it is NOT the manual's 2514 total. Table 7 composes the total from six memories: SRAM1 768 + SRAM2 64 + SRAM3 832 + SRAM5 832 are contiguous from 0x20000000, while SRAM4 (16 Kbytes) sits alone at 0x28000000 and the 2-Kbyte BKSRAM is in the backup domain among the peripherals. The manual's arithmetic and the bench measurement agree to the kilobyte, and they agree on the SPLIT as well as on the sum.",
+    "SAME TRAP AS THE U585 ROW, WITH DIFFERENT NUMBERS: anyone sanity-checking a linker length against the vendor's headline figure will compare 2496 against 2514 and read a 18-Kbyte discrepancy as an error in one of them. Both are right and they measure different things.",
+    "THE TRAILING Q IS NOT A PACKING SUFFIX AND IT CHANGES THE PAD SET. DS13543 decodes it as a dedicated pinout supporting the internal SMPS step-down converter, and the datasheet prints TWO complete sets of package columns for it -- table 27 heads one set SMPS and one not, so there are two columns both reading LQFP144, and two pinout figures, 13 and 14. Only the order code says which is yours. Reading the wrong one states something TRUE about a real STM32U5A5 in LQFP144 and WRONG about this part.",
+    "THE CONCRETE DIFFERENCE THE Q MAKES, so it is not an abstract warning: on figure 13 pins 68, 69 and 70 are VLXSMPS, VDDSMPS and VSSSMPS, and PB12 IS ABSENT FROM THE PART ENTIRELY. The non-SMPS variant carries I/O there. A pad set taken from figure 14 would claim general-purpose pins this part does not have.",
+    "THE DIE HAS TEN GPIO PORTS AND THIS PACKAGE BONDS OUT EIGHT. ../instances.toml lists gpioa through gpioj because RM0456 table 6 marks all ten present on this sub-group -- that is a statement about the silicon. Figure 13 has no PI or PJ pad at all, and the pad set above has none. A present-list is a PACKAGE fact and an instance list is a DIE fact, and on this part they genuinely differ.",
+    "PC4, PC5, PG11 and PH2 are likewise absent from this package while their ports are present, so the ranges above have holes in them on purpose rather than by transcription.",
+    "TrustZone is OFF on the kit as it arrived (TZEN = 0, a FLASH_OPTR user option byte rather than a property of the part), so the nonsecure aliases in ../instances.toml are the meaningful ones. That is chip STATE and can be changed; the instance table is correct either way, because with TZEN = 1 the secure alias exists in ADDITION at the same offset.",
+]
+
+[[parts]]
+part = "stm32u5a5zjt6q"
+package = "144-pin LQFP, dedicated SMPS pinout"
+flash = 0x400000
+ram = 0x270000
+pins = ["PA0-PA15", "PB0-PB11", "PB13-PB15", "PC0-PC3", "PC6-PC15", "PD0-PD15", "PE0-PE15", "PF0-PF15", "PG0-PG10", "PG12-PG15", "PH0-PH1", "PH3"]
+source = "DS13543 Rev 3 section 7 ordering information decodes STM32U5A5ZJT6Q as 5A5 = STM32U5A5xx with OTG_HS and hardware encryption accelerators, Z = 144 pins or 150 balls, J = 4 Mbytes flash, T = LQFP, 6 = industrial -40 to 85 C, and Q = DEDICATED PINOUT SUPPORTING INTERNAL SMPS STEP-DOWN CONVERTER. Z with T resolves to LQFP144, and the Q selects figure 13 (LQFP144_SMPS pinout) rather than figure 14 (LQFP144). The pad set above is the COMPLETE general-purpose I/O set of figure 13, 111 pads. flash 0x400000 is the 4096 Kbytes the part's own FLASH_SIZE register reports, read on a NUCLEO-U5A5ZJ-Q. ram 0x270000 is the 2496-Kbyte CONTIGUOUS span, bounded on silicon at 0x20000000-0x2026FFFF and independently equal to RM0456 Rev 7 table 7's SRAM1 768 + SRAM2 64 + SRAM3 832 + SRAM5 832 for the STM32U59x/5Ax column. The 16-Kbyte SRAM4 at 0x28000000-0x28003FFF and the 2-Kbyte backup SRAM are real and are NOT in this figure, because neither is contiguous with it. The core is an Arm Cortex-M33."

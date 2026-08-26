@@ -268,9 +268,7 @@ namespace Lamella.Net.Time
 
         private static SyncResult Fail(string warning)
         {
-            return new SyncResult(
-                false, "nts", false, 0,
-                new TimeSpan(0), new TimeSpan(0), new DateTime(0), warning);
+            return SyncResult.Failed("nts", warning);
         }
     }
 }

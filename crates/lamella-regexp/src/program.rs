@@ -27,6 +27,22 @@ pub enum Direction {
 /// selected an ASCII fold for BOTH -- correct for ASCII in both modes, and wrong for everything
 /// else in one of them. Resolving it in the front end keeps the matcher free of flags, which is the
 /// same rule [`Instruction::Any`] follows for `dotAll`.
+///
+/// # WHY EVERY COMPARING INSTRUCTION CARRIES ONE, RATHER THAN THE PROGRAM HOLDING IT ONCE
+///
+/// Case sensitivity READS like a property of the pattern, and in ECMAScript today it is one: `i` is
+/// a flag on the whole literal. **It is not a property of the matcher this crate provides.** A
+/// scoped inline modifier -- `(?i:...)` -- turns folding on for a SUBEXPRESSION, which no
+/// pattern-wide field can express.
+///
+/// This crate is a matcher no language owns, and the languages sharing it do not agree on that
+/// question: Python's `re` ships `(?i:...)` today, and ECMAScript is adding it. So the scope is
+/// per-instruction because the RULE is per-instruction, and a program-wide field would foreclose a
+/// shipped feature of one consumer to save one byte in another.
+///
+/// **The compiler is the single place that decides it** -- [`crate::compile::Builder`] carries the
+/// fold in force while it descends, so a future scoped modifier changes what that field holds over
+/// its subexpression and every emit site follows without a second rule to keep in step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fold {
     /// Compare code points exactly.
@@ -37,6 +53,11 @@ pub enum Fold {
     /// Canonicalization in this mode is defined by case MAPPING, which needs a `toUppercase`
     /// table. The shared Unicode home ships case PROPERTIES and fold tables and no mapping data,
     /// so the ASCII range is folded exactly and nothing outside it is folded at all.
+    ///
+    /// **THIS IS NOT THE STANDARD'S RULE FOR THIS MODE.** It is a published deviation, listed as
+    /// `regexp-backreference-case-is-ascii-without-u`, and a caller selecting this arm is choosing
+    /// it knowingly. **An absence a caller cannot see at the point of choosing is not published to
+    /// them**, whatever a generated document elsewhere says.
     ///
     /// **WARNING: THIS ARM CHANGES WHAT A PATTERN MATCHES.** It is not interchangeable with
     /// [`Fold::Simple`], and must not be selected to save space.
@@ -85,14 +106,18 @@ fn fold_ascii(ch: u32) -> u32 {
 /// to run, and the narrower field halves the size of the hottest structure in the crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
-    /// Consumes one character and requires it to equal `ch`.
-    Char { ch: u32, direction: Direction },
+    /// Consumes one character and requires it to be `ch` under `fold`.
+    ///
+    /// NOT an equality: under a folding mode the pattern's spelling and the subject's are two
+    /// spellings of one character, and which one arrives is the subject's business.
+    Char { ch: u32, direction: Direction, fold: Fold },
 
     /// Consumes one character and requires membership in a class-table range.
     ///
     /// The entries live in [`Program::classes`] as a shared table rather than inline, so a class
-    /// repeated across a pattern is stored once and the instruction stays small.
-    Class { start: u32, len: u32, negated: bool, direction: Direction },
+    /// repeated across a pattern is stored once and the instruction stays small. `fold` applies to
+    /// the SINGLE members only, which is [`Fold`]'s asymmetry and not this instruction's.
+    Class { start: u32, len: u32, negated: bool, direction: Direction, fold: Fold },
 
     /// The dot. `dot_all` decides whether the line terminators are members, resolved by the front
     /// end so the matcher never sees a flag.
@@ -119,6 +144,10 @@ pub enum Instruction {
     ///
     /// A group that has not participated matches the EMPTY STRING and does not fail, which is the
     /// rule that makes a backreference nullable.
+    ///
+    /// **This is the one comparison the front end cannot fold for**, so `fold` is not an
+    /// optimization here: `/(.)\1/` contains no cased character to widen, and both sides arrive
+    /// from the subject at match time.
     Backreference { group: u32, direction: Direction, fold: Fold },
 
     /// Records the current position into a progress register, for the empty-iteration guard.

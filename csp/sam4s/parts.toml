@@ -1,5 +1,5 @@
 # PARTS table for the SAM4S family. The pin
-# present-list is EMPTY (identity-first; no binding references a pin yet) and grows from
+# present-list is EMPTY (identity-first) and grows from
 # evidence as bindings land.
 #
 # flash = 0x200000 (2 MB): the ATSAM4SD32C is a DUAL-PLANE part -- 2 x 1 MB, one EEFC per

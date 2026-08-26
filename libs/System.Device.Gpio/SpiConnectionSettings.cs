@@ -13,6 +13,11 @@ namespace System.Device.Spi
         private SpiMode _mode;
 
         /// <summary>Initializes a new instance of the settings for the device on
+        /// <paramref name="busId"/> with no chip-select line, for a raw bus whose chip
+        /// select is hardware-framed or externally managed.</summary>
+        public SpiConnectionSettings(int busId) : this(busId, -1) { }
+
+        /// <summary>Initializes a new instance of the settings for the device on
         /// <paramref name="busId"/> using <paramref name="chipSelectLine"/> as the
         /// chip-select line (-1 for a raw bus / hardware-framed chip select).</summary>
         public SpiConnectionSettings(int busId, int chipSelectLine)

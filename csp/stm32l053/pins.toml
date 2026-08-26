@@ -1,0 +1,46 @@
+# PIN map for the STM32L053: pin x function -> (instance, signal). Function ids are the ST
+# alternate-function numbers AF0..AF7 that the AFRL and AFRH nibbles select.
+#
+#
+
+[table]
+kind = "pins"
+family = "stm32l053"
+sources = [
+    "STM32L053C6/C8/R6/R8 datasheet DS10152 Rev 10 table 16 (alternate function port A): PA2 AF4 = USART2_TX, PA3 AF4 = USART2_RX, PA5 AF0 = SPI1_SCK",
+    "STM32L0x3 reference manual RM0367 Rev 8 section 9.4.10 for the AF0..AF7 encoding",
+]
+notes = [
+    "PA5 IS SPI1_SCK AND IS ALSO THE NUCLEO-L053R8's GREEN USER LED, wired to that board's Arduino D13. The two uses are mutually exclusive and nothing in the chip reports the conflict. It is recorded here as a chip fact; the board file records the LED.",
+    "PA13 and PA14 are SWDIO and SWCLK at AF0 and are held by the debug port. They carry no row because nothing binds them.",
+    "PC13 CARRIES AN INTERRUPT ROW RATHER THAN AN ALTERNATE-FUNCTION ONE. An external interrupt is not muxed onto the pad: the pad stays a GPIO and SYSCFG routes it. So its `function` is EXTI and its `signal` is the line, and a consumer must not read the row as a mux setting.",
+]
+
+[[pins]]
+pin = "PA2"
+function = "AF4"
+instance = "usart2"
+signal = "tx"
+source = "DS10152 Rev 10 table 16, port A row PA2, AF4 column = USART2_TX. Its AF0 is TIM21_CH1, AF1 is LCD_SEG1, AF2 is TIM2_CH3, AF3 is TSC_G1_IO3 and AF7 is COMP2_OUT."
+
+[[pins]]
+pin = "PA3"
+function = "AF4"
+instance = "usart2"
+signal = "rx"
+source = "DS10152 Rev 10 table 16, port A row PA3, AF4 column = USART2_RX."
+
+
+[[pins]]
+pin = "PC13"
+function = "EXTI"
+instance = "exti"
+signal = "line13"
+source = "RM0367 Rev 8 section 10.2.7: EXTI line 13's source is selected by SYSCFG_EXTICR4's EXTI13 field, whose 0010 code selects PC[13]. The line number IS the pin index on this vendor, which the manual states rather than leaves to be derived. Delivered on NVIC position 7, EXTI[15:4], per table 55. This is the pad the NUCLEO-L053R8 wires its user button B1 to."
+
+[[pins]]
+pin = "PA5"
+function = "AF0"
+instance = "spi1"
+signal = "sck"
+source = "DS10152 Rev 10 table 16, port A row PA5, AF0 column = SPI1_SCK. On the NUCLEO-L053R8 this pad is also the green user LED LD2 on header signal D13, so a design driving the LED cannot also clock SPI1 through it."

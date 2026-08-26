@@ -24,15 +24,13 @@ const CHUNK: usize = 8 * 1024;
 pub fn deploy_command(args: &[String]) -> ExitCode {
     let spec = Spec {
         verb: "deploy",
-        values: &["--target", "--board", "--probe"],
+        usage: Some(USAGE),
+        values: &["--target", "--board", "--probe", "--via"],
         flags: &["--no-run", "--unsafe"],
     };
-    let parsed = match args::parse(args, &spec) {
+    let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+        Err(halt) => return halt.code(),
     };
     let path = match parsed.only_positional("deploy", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
@@ -41,8 +39,8 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let kind = crate::artifact::classify(&path);
-    if kind == crate::artifact::Kind::ChipImage {
+    let kind = lamella_flash_routes::artifact::classify(&path);
+    if kind == lamella_flash_routes::artifact::Kind::ChipImage {
         eprintln!(
             "lamella deploy: {} is an image for a CHIP, and this verb sends a program to firmware.\n\n\
              To write it to the chip:\n\
@@ -63,7 +61,7 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
             );
             ExitCode::FAILURE
         }
-        (Some(_), None) if kind == crate::artifact::Kind::WirePayload => {
+        (Some(_), None) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
             eprintln!(
                 "lamella deploy: {} is loaded by firmware already on the board, so it needs a \
                  --target rather\nthan a --board. Writing it to a bare chip would leave the board \
@@ -78,9 +76,10 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
             &path,
             board_id,
             parsed.value("--probe"),
+            parsed.value("--via"),
             parsed.flag("--unsafe"),
         ),
-        (None, Some(target)) if kind == crate::artifact::Kind::WirePayload => {
+        (None, Some(target)) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
             send_payload(&path, target, parsed.flag("--no-run"))
         }
         (None, Some(target)) => to_running_firmware(&path, target, parsed.flag("--no-run")),
@@ -97,11 +96,16 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
 
 const USAGE: &str = "\
 usage: lamella deploy <file.cs> --target <t> [--no-run]   into firmware already on the board
-       lamella deploy <file.cs> --board <id> [--probe <s>] onto the bare chip, over a probe
+       lamella deploy <file.cs> --board <id> [--via probe|volume] [--probe <s>]  onto the bare chip
 
 --target is a live connection (what `lamella devices` prints); --board is a board model (what
 `lamella boards` lists). The first keeps the board's firmware and takes about a second; the second
 replaces everything on the chip and needs nothing there first.
+
+--via chooses how the chip is written, on a board offering both routes. `volume` copies to the
+bootloader drive and needs no probe; `probe` writes over an attached SWD probe and reads every
+byte back to check it. The default is whatever the board takes without extra hardware. With more
+than one probe attached, `--via probe` refuses until you name one with --probe <serial>.
 ";
 
 /// Send a payload that is ALREADY built to firmware running at `target`.

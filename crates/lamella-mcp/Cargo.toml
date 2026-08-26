@@ -16,6 +16,16 @@ publish = false
 lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb", "debug-backend"] }
 # The wire protocol types: Capabilities / Negotiated / ProfileIdentity / board_model for the HELLO identify path.
 lamella-wire = { path = "../lamella-wire" }
+# The board/part fact tables and a board's resolution to its part row, and the RULE computed over
+# them. Both are shared with the `lamella` CLI rather than restated: a board that resolved one way
+# for a developer typing `lamella fit` and another way for an assistant calling `lamella_fit` is
+# the drift the fact strata exist to prevent, and nobody is positioned to see both answers at once.
+lamella-catalog = { path = "../lamella-catalog" }
+# The flashing routes and the contract, so `lamella_flash` writes a board by exactly the mechanism
+# `lamella flash` would -- one table, one set of refusals, two front ends.
+lamella-flash-routes = { path = "../lamella-flash-routes" }
+lamella-flash-backend = { path = "../lamella-flash-backend" }
+lamella-bsp-gen = { path = "../lamella-bsp-gen" }
 # JSON-RPC 2.0 framing, the DAP JSON, and the embedded tool contract. serde_json only -- no tokio, no MCP SDK.
 serde_json = "1"
 

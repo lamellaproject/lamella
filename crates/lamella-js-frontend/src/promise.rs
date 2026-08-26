@@ -359,10 +359,10 @@ fn get_promise_resolve(
 ///
 /// # IT IS A CALL, AND FOR THE INTRINSIC `Promise` A WRITE LOOKS EXACTLY THE SAME
 ///
-/// Every rejection path in `race` and in `combine` used to reach into the promise object and set
-/// its state. For a promise this engine built, that is what the capability's reject function would
-/// have done anyway, so every test that used `Promise.all` directly agreed. It is wrong the moment
-/// the constructor is not ours -- `Promise.all.call(BadPromise, iterable)`.
+/// A rejection path in `race` or `combine` must NOT reach into the promise object and set its
+/// state. For a promise this engine built, that is what the capability's reject function would do
+/// anyway, so every test using `Promise.all` directly agrees -- and it is wrong the moment the
+/// constructor is not ours: `Promise.all.call(BadPromise, iterable)`.
 ///
 /// `NewPromiseCapability(BadPromise)` hands back an ORDINARY OBJECT with no promise slot and the two
 /// functions `BadPromise` gave its executor. Writing the state then found no slot and returned

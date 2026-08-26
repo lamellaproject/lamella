@@ -1,5 +1,5 @@
 # PARTS table for the SAM E54 family. The pin present-list is EMPTY (identity-first; no
-# binding references a pin yet).
+# binding references a pin).
 
 [table]
 kind = "parts"

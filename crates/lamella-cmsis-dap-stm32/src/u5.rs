@@ -1,6 +1,7 @@
 //! STM32U5 embedded-flash programming, per RM0456 (U535/U545/U575/U585/U59x/U5Ax/U5Fx/U5Gx).
 
 
+use crate::FlashWait;
 use lamella_probe_core::{ProbeError, TargetAccess};
 
 /// The FLASH register block, non-secure alias (RM0456 Table 6).
@@ -27,7 +28,7 @@ const U5_SR_BSY: u32 = 1 << 16;
 /// Set while the controller is still waiting for the rest of a quad-word.
 const U5_SR_WDW: u32 = 1 << 17;
 /// Every error the status register reports for a program or erase; the same bits clear them.
-const U5_SR_ERRORS: u32 = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 13);
+pub(crate) const U5_SR_ERRORS: u32 = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 13);
 
 /// The U5's flash page: 8 KB.
 pub const STM32U5_PAGE: u32 = 8 * 1024;
@@ -35,8 +36,20 @@ pub const STM32U5_PAGE: u32 = 8 * 1024;
 pub const STM32U5_FLASH_BASE: u32 = 0x0800_0000;
 /// The programming granule: 128 bits, written as four 32-bit stores.
 pub const STM32U5_QUAD_WORD: usize = 16;
-/// The part's own flash-size register: bits 15:0 hold the size in KB (RM0456).
+/// The part's own flash-size register: bits 15:0 hold the size in KB (RM0456 76.2).
 pub const STM32U5_FLASH_SIZE_REG: u32 = 0x0BFA_07A0;
+
+/// The FLASH option register (RM0456 7.9.13), which states how the part's banks are arranged.
+///
+/// A NUCLEO-U5A5ZJ-Q answered `0x1FEFF8AA` here, which is exactly the "ST production value" RM0456
+/// prints for this register: `TZEN` clear (so the non-secure register set this module drives is the
+/// right one), `DUALBANK` set, `SWAP_BANK` clear, and `RDP` at 0xAA for level 0.
+const U5_OPTR: u32 = U5_FLASH_BASE + 0x40;
+/// `OPTR.DUALBANK`: 0 = one bank with contiguous addresses, 1 = two banks. Only meaningful on the
+/// half-density part of each line -- see [`u5_pages_per_bank`].
+const U5_OPTR_DUALBANK: u32 = 1 << 21;
+/// `OPTR.SWAP_BANK`: 1 = bank 1 and bank 2 addresses are exchanged.
+const U5_OPTR_SWAP_BANK: u32 = 1 << 20;
 
 /// The most pages a U5 bank can hold -- **a ceiling, not the answer for any given part.**
 ///
@@ -49,16 +62,45 @@ pub const STM32U5_FLASH_SIZE_REG: u32 = 0x0BFA_07A0;
 /// derived from the silicon rather than declared here -- see [`u5_pages_per_bank`].
 pub const STM32U5_MAX_PAGES_PER_BANK: u32 = 256;
 
-/// Reads the part's flash size and derives how many pages one of its two banks holds.
+/// Reads the part's flash size and its bank configuration, and derives how many pages one bank
+/// holds.
 ///
-/// One extra register read per erase, which is nothing against a page erase, and it removes a whole
+/// Two register reads per erase, which is nothing against a page erase, and they remove a whole
 /// class of "right for one board, wrong for its siblings" from this module.
+///
+/// **BANK COUNT IS READ, NEVER ASSUMED, AND RM0456 SAYS SO IN THE BIT'S OWN DESCRIPTION.** `DUALBANK`
+/// (`FLASH_OPTR` bit 21) is a real option on the HALF-density member of each line -- 2 Mbyte
+/// U59x/5Ax/5Fx/5Gx, 1 Mbyte U575/585, 256 and 128 Kbyte U535/545 -- where clearing it gives
+/// "single-bank flash memory with contiguous address in bank 1". Only the full-density parts are
+/// dual bank by construction. Halving such a part anyway puts the whole upper half one bank too far
+/// over: on a 1 MB U575 with `DUALBANK = 0`, the address at 512 KB is bank 1 page 64 and the old
+/// arithmetic called it bank 2 page 0, so the erase would have gone to the wrong bank rather than
+/// failing.
+///
+/// The last check is the one that makes a miscalculation loud instead of silent. `PNB` is eight
+/// bits, so any derivation yielding more than [`STM32U5_MAX_PAGES_PER_BANK`] pages cannot be
+/// expressed in the register at all and would simply wrap onto a low page of the right bank -- an
+/// erase of live flash reported as success. It is refused instead.
 fn u5_pages_per_bank<A: TargetAccess>(target: &mut A) -> Result<u32, ProbeError> {
     let kb = target.read_word(STM32U5_FLASH_SIZE_REG)? & 0xffff;
     if kb == 0 || kb > 2 * 1024 * 2 {
         return Err(ProbeError::Device("STM32U5 flash-size register reads implausibly -- is this a U5?"));
     }
-    Ok((kb * 1024 / 2) / STM32U5_PAGE)
+    let optr = target.read_word(U5_OPTR)?;
+    if optr & U5_OPTR_SWAP_BANK != 0 {
+        return Err(ProbeError::Device(
+            "STM32U5 has SWAP_BANK set -- page erase addressing is not verified for swapped banks",
+        ));
+    }
+    let total_pages = kb * 1024 / STM32U5_PAGE;
+    let pages_per_bank =
+        if optr & U5_OPTR_DUALBANK != 0 { total_pages / 2 } else { total_pages };
+    if pages_per_bank > STM32U5_MAX_PAGES_PER_BANK {
+        return Err(ProbeError::Device(
+            "STM32U5 bank works out larger than PNB can address -- the geometry read is wrong",
+        ));
+    }
+    Ok(pages_per_bank)
 }
 
 /// Names the error bits a failed operation left in `NSSR`.
@@ -102,11 +144,21 @@ fn u5_page_of(address: u32, pages_per_bank: u32) -> (u32, bool) {
 }
 
 /// Waits for the controller to go idle, then reports any error it left behind.
-fn u5_wait_idle<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
+///
+/// On [`FlashWait::BeforeOperation`] the latched flags are cleared and NOT reported. **This part is
+/// the one that proved the distinction was needed**: a NUCLEO-U5A5ZJ-Q was found holding `PGSERR` in
+/// `FLASH_NSSR` before anything in this session had written to it -- see [`FlashWait`].
+pub(crate) fn u5_wait_idle<A: TargetAccess>(target: &mut A, phase: FlashWait) -> Result<(), ProbeError> {
     for _ in 0..200_000 {
         let sr = target.read_word(U5_NSSR)?;
         if sr & (U5_SR_BSY | U5_SR_WDW) != 0 {
             continue;
+        }
+        if phase == FlashWait::BeforeOperation {
+            if sr & (U5_SR_ERRORS | U5_SR_EOP) != 0 {
+                target.write_word(U5_NSSR, U5_SR_ERRORS | U5_SR_EOP)?;
+            }
+            return Ok(());
         }
         if let Some(text) = u5_error_text(sr) {
             target.write_word(U5_NSSR, U5_SR_ERRORS | U5_SR_EOP)?;
@@ -154,7 +206,7 @@ impl<A: TargetAccess> Stm32U5Flash for A {
     }
 
     fn u5_erase_page(&mut self, address: u32) -> Result<(), ProbeError> {
-        u5_wait_idle(self)?;
+        u5_wait_idle(self, FlashWait::BeforeOperation)?;
         let pages_per_bank = u5_pages_per_bank(self)?;
         let (page, bank2) = u5_page_of(address, pages_per_bank);
         let mut cr = U5_CR_PER | ((page << U5_CR_PNB_SHIFT) & U5_CR_PNB_MASK);
@@ -163,7 +215,7 @@ impl<A: TargetAccess> Stm32U5Flash for A {
         }
         self.write_word(U5_NSCR, cr)?;
         self.write_word(U5_NSCR, cr | U5_CR_STRT)?;
-        u5_wait_idle(self)?;
+        u5_wait_idle(self, FlashWait::AfterOperation)?;
         self.write_word(U5_NSCR, 0)
     }
 
@@ -171,7 +223,7 @@ impl<A: TargetAccess> Stm32U5Flash for A {
         if address as usize % STM32U5_QUAD_WORD != 0 {
             return Err(ProbeError::Device("STM32U5 programming starts on a 16-byte quad-word boundary"));
         }
-        u5_wait_idle(self)?;
+        u5_wait_idle(self, FlashWait::BeforeOperation)?;
         self.write_word(U5_NSCR, U5_CR_PG)?;
 
         let mut at = address;
@@ -183,7 +235,7 @@ impl<A: TargetAccess> Stm32U5Flash for A {
                 let value = u32::from_le_bytes([quad[i], quad[i + 1], quad[i + 2], quad[i + 3]]);
                 self.write_word(at + word * 4, value)?;
             }
-            u5_wait_idle(self)?;
+            u5_wait_idle(self, FlashWait::AfterOperation)?;
             at += STM32U5_QUAD_WORD as u32;
         }
 
@@ -195,6 +247,70 @@ impl<A: TargetAccess> Stm32U5Flash for A {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bank derivation over every density RM0456 tabulates, in BOTH bank configurations.
+    ///
+    /// The arithmetic is factored out of [`u5_pages_per_bank`] here rather than driven through a
+    /// mock probe, because what is being checked is the derivation and not the two register reads
+    /// that feed it. The register facts those reads depend on are pinned in
+    /// `the_option_register_fields_are_where_rm0456_puts_them`.
+    fn pages_per_bank(kb: u32, dual: bool) -> Result<u32, &'static str> {
+        let total = kb * 1024 / STM32U5_PAGE;
+        let per_bank = if dual { total / 2 } else { total };
+        if per_bank > STM32U5_MAX_PAGES_PER_BANK { Err("wider than PNB") } else { Ok(per_bank) }
+    }
+
+    /// THE PART THAT LANDS EXACTLY ON THE LIMIT, AND THE SIBLING THAT READS THE SAME AND IS NOT.
+    ///
+    /// A 4 MB U5A5 is the first part this crate drives whose banks are the full 256 pages RM0456
+    /// allows, so its top page index is 255 -- the largest `PNB[7:0]` can hold, and the exact row
+    /// RM0456 prints as "11111111: page 255 (upper page for STM32U59x/5Ax/5Fx/5Gx)". One more page
+    /// anywhere in the derivation would not error, it would wrap.
+    ///
+    /// The half-density rows are the discriminating ones: two parts can report the same flash size
+    /// and still put a given address in different banks, because the bank count is an option bit
+    /// and not a function of the size.
+    #[test]
+    fn the_bank_derivation_holds_at_every_density_and_both_bank_configurations() {
+        assert_eq!(pages_per_bank(4096, true), Ok(256), "4 MB U5A5: banks of 256 pages");
+        assert_eq!(pages_per_bank(2048, true), Ok(128), "2 MB U575: banks of 128 pages");
+        assert_eq!(pages_per_bank(512, true), Ok(32), "512 KB U535/545");
+
+        assert_eq!(pages_per_bank(2048, false), Ok(256), "2 MB U5Ax, single bank");
+        assert_eq!(pages_per_bank(1024, false), Ok(128), "1 MB U575, single bank");
+        assert_ne!(pages_per_bank(1024, false), pages_per_bank(1024, true));
+
+        let at_512k = STM32U5_FLASH_BASE + 512 * 1024;
+        assert_eq!(u5_page_of(at_512k, pages_per_bank(1024, false).unwrap()), (64, false));
+        assert_eq!(u5_page_of(at_512k, pages_per_bank(1024, true).unwrap()), (0, true));
+
+        assert!(pages_per_bank(4096, false).is_err(), "512 pages cannot be addressed by PNB");
+        for pages in [0u32, 1, 255] {
+            assert_eq!(((pages << U5_CR_PNB_SHIFT) & U5_CR_PNB_MASK) >> U5_CR_PNB_SHIFT, pages);
+        }
+        assert_ne!(
+            (STM32U5_MAX_PAGES_PER_BANK << U5_CR_PNB_SHIFT) & U5_CR_PNB_MASK,
+            STM32U5_MAX_PAGES_PER_BANK << U5_CR_PNB_SHIFT,
+            "256 must NOT survive PNB -- that is why the ceiling is a refusal and not a clamp",
+        );
+    }
+
+    /// The option-register facts as RM0456 literals, and the value the board actually answered.
+    ///
+    /// Written out from section 7.9.13 rather than from the constants under test, so that moving a
+    /// bit has to disagree with the manual rather than with itself.
+    #[test]
+    fn the_option_register_fields_are_where_rm0456_puts_them() {
+        assert_eq!(U5_OPTR, 0x4002_2000 + 0x40);
+        assert_eq!(U5_OPTR_DUALBANK, 1 << 21);
+        assert_eq!(U5_OPTR_SWAP_BANK, 1 << 20);
+
+        let measured_optr = 0x1FEF_F8AA;
+        assert_ne!(measured_optr & U5_OPTR_DUALBANK, 0, "the measured part is dual bank");
+        assert_eq!(measured_optr & U5_OPTR_SWAP_BANK, 0, "and its banks are not swapped");
+        assert_eq!(measured_optr >> 31, 0, "and TZEN is clear, so the NS registers are the right set");
+        assert_eq!(measured_optr & 0xff, 0xaa, "and RDP is level 0");
+    }
 
     #[test]
     fn the_page_index_is_per_bank_and_fits_its_field() {

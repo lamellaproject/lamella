@@ -810,11 +810,8 @@ impl RunResult {
 /// trap is exit 70 (matching the interpreter's abort convention).
 #[must_use]
 pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
-    #[cfg(any(feature = "baked-image", feature = "corlib-lazy"))]
-    let (corlib_bytes, program_bytes): (&'static [u8], &'static [u8]) = (
-        Box::leak(corlib_bytes.to_vec().into_boxed_slice()),
-        Box::leak(program_bytes.to_vec().into_boxed_slice()),
-    );
+    let corlib_bytes = lamella_load::resident_bytes(corlib_bytes);
+    let program_bytes = lamella_load::resident_bytes(program_bytes);
     let corlib = match Assembly::read(corlib_bytes) {
         Ok(assembly) => assembly,
         Err(error) => return failure(&format!("corlib does not parse: {error:?}")),
@@ -945,7 +942,7 @@ fn note_resident_corlib(corlib: Option<&'static [u8]>) {
 ///
 /// One continued fold rather than two schemes stitched together -- the registry's fingerprint is
 /// FNV-1a, so this is the same walk carried on. A target with no resident corlib reports the
-/// fingerprint unchanged, which is what every such firmware reported before this existed.
+/// fingerprint unchanged, which is what a firmware holding no corlib has always reported.
 #[cfg(feature = "baked-image")]
 fn resident_surface_hash() -> u64 {
     use core::sync::atomic::Ordering;
@@ -2507,12 +2504,12 @@ pub fn run_deployed_with(
 /// Sent unsolicited at seq 0; a host that is not listening simply reads a frame it did not ask for,
 /// which the framing already tolerates.
 ///
-/// It lives in the runner rather than in each firmware because it was written in each firmware and
-/// **nine of the ten got it wrong.** One board sent the frame; the rest either printed the app's
-/// output to their raw UART as human text -- which is not a wire frame and reaches no host driver --
-/// or dropped the result on the floor. `DEPLOY_RUN` therefore never delivered a `RUN_RESULT` on
-/// almost every board in the tree, and the one place a host had to wait was a 120-second timeout.
-/// A firmware cannot forget a step it does not perform.
+/// **IT LIVES IN THE RUNNER RATHER THAN IN EACH FIRMWARE, AND THAT IS WHAT MAKES IT RELIABLE.**
+/// Written per firmware, the ways to get it wrong all look like working code: printing the app's
+/// output to a raw UART as human text is not a wire frame and reaches no host driver, and dropping
+/// the result on the floor leaves `DEPLOY_RUN` delivering no `RUN_RESULT` at all -- which a host
+/// meets as a 120-second timeout rather than as an error. **A firmware cannot forget a step it does
+/// not perform.**
 ///
 /// A carrier fault here is deliberately DROPPED rather than propagated. The run's outcome is the
 /// return value, and it already happened; failing to announce it must not turn a completed run into
@@ -3436,9 +3433,9 @@ mod tests {
         assert_eq!(frame.payload, vec![0xF0, 0x9F, 0x98, 0x80], "the pair must arrive as one character");
     }
 
-    /// The THREE states `try_recv_result` used to collapse into `Ok(None)`, each fed as the frame a
-    /// target really sends. Only the first may still be `Ok(None)`; the other two were polled to the
-    /// caller's deadline and reported as timeouts, which points the reader at a link that is fine.
+    /// THREE states `try_recv_result` must NOT collapse into `Ok(None)`, each fed as the frame a
+    /// target really sends. Only the first may answer `Ok(None)`; collapsing the other two polls
+    /// to the caller's deadline and reports a timeout, pointing the reader at a link that is fine.
     #[test]
     fn try_recv_result_separates_nothing_yet_from_a_refusal_and_from_a_malformed_reply() {
         use lamella_wire::{MemTransport, error, msg};
@@ -3546,9 +3543,8 @@ mod tests {
         );
     }
 
-    /// **THE DEFECT THIS CLOSES, STATED AS A TEST: two firmwares differing only in the corlib they hold
-    /// resident used to advertise the SAME surface hash.** A host cannot detect that difference any other
-    /// way, and getting it wrong is silent -- a corlib declaring a seam the firmware compiled out still
+    /// **TWO FIRMWARES DIFFERING ONLY IN THE CORLIB THEY HOLD RESIDENT MUST NOT ADVERTISE THE SAME
+    /// SURFACE HASH.** A host cannot detect that difference any other way, and getting it wrong is silent -- a corlib declaring a seam the firmware compiled out still
     /// loads, and the method keeps a placeholder body that returns zero.
     ///
     /// Exercised on the hash function rather than through two serve loops, because the statics behind it

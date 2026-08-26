@@ -1,0 +1,93 @@
+# SERCOM in I2C MASTER mode on the SAM D11 family -- the BLOCK layout: register offsets are
+# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
+# plan. Instance bases/ids live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+#
+# THE I2C CHAPTER CARRIES TWO REGISTER MAPS AND THEY OVERLAP AT EVERY OFFSET. Table 27-3 is SLAVE
+# mode (CTRLA.MODE = 100) and table 27-4 is MASTER (MODE = 101). Both define CTRLA at 0x00, CTRLB
+# at 0x04, STATUS at 0x1A and ADDR at 0x24, with different fields inside: the slave's CTRLB carries
+# AACKEN/GCMD/SMEN, the master's carries QCEN/SMEN and the CMD strobe, and the slave's STATUS
+# reports DIR/SR where the master's reports BUSSTATE and ARBLOST. THIS FILE IS THE MASTER MAP.
+
+[table]
+kind = "block"
+family = "samd11"
+block = "sercom"
+mode = "i2c-master"
+sources = [
+    "SAM D11 datasheet Atmel-42363H-SAM-D11-Datasheet_09/2016 ch 27.7 table 27-4 (register summary, MASTER mode) for the register set, offsets and bit positions: CTRLA 0x00, CTRLB 0x04, BAUD 0x0C, INTENCLR 0x14, INTENSET 0x16, INTFLAG 0x18, STATUS 0x1A, SYNCBUSY 0x1C, ADDR 0x24, DATA 0x28, DBGCTRL 0x30",
+    "SAM D11 datasheet Atmel-42363H ch 27.7 table 27-3 (SLAVE mode) read alongside it, to establish that the two maps share offsets and differ in fields -- this file states the master's",
+]
+notes = [
+    "MODE = 5 selects I2C master; the field sits at CTRLA[4:2], the same position the USART and SPI maps use, because it is the SERCOM's own mode selector rather than anything the modes share.",
+    "SPEED 0 = standard/fast (Sm/Fm, up to 400 kHz). PINOUT 0 = 2-wire. SDAHOLD sets the SDA hold time.",
+    "Addressing: ADDR.ADDR carries the 7-bit slave address SHIFTED LEFT ONE, with bit 0 as the read/write direction (0 = write). Writing ADDR is what starts the transaction -- there is no separate start command.",
+    "CTRLB.CMD is a strobe and always reads zero: 1 = ack action then repeated start, 2 = ack action then a byte read (master read only), 3 = ack action then stop. ACKACT 0 = ACK, 1 = NACK, meaningful only in master read.",
+    "INTFLAG.MB (master on bus) and INTFLAG.SB (slave on bus) are the gate on issuing the next CMD: MB is raised when an address or a written byte completes, SB when a byte has been received. A driver that issues a CMD without waiting one of them is writing into a bus transaction still in flight.",
+    "BAUD is four independent byte-wide fields in one word: BAUD and BAUDLOW for standard/fast mode, HSBAUD and HSBAUDLOW for high-speed. A driver targeting Sm/Fm writes the low byte and leaves the rest zero.",
+]
+
+[registers.CTRLA]
+offset = 0x0
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], MODE = [2, 3], RUNSTDBY = [7, 1], PINOUT = [16, 1], SDAHOLD = [20, 2], MEXTTOEN = [22, 1], SEXTTOEN = [23, 1], SPEED = [24, 2], SCLSM = [27, 1], INACTOUT = [28, 2], LOWTOUT = [30, 1] }
+notes = "MODE 5 = I2C master. SPEED 0 = Sm/Fm. PINOUT 0 = 2-wire. The timeout enables (MEXTTOEN, SEXTTOEN, LOWTOUT, INACTOUT) are off at reset and stay off unless a bus-hang policy asks for them."
+
+[registers.CTRLB]
+offset = 0x4
+width = 32
+fields = { SMEN = [8, 1], QCEN = [9, 1], CMD = [16, 2], ACKACT = [18, 1] }
+notes = "CMD is the transaction strobe and ACKACT chooses the acknowledge sent with it; see the block notes. SMEN is smart mode, QCEN quick command."
+
+[registers.BAUD]
+offset = 0xC
+width = 32
+fields = { BAUD = [0, 8], BAUDLOW = [8, 8], HSBAUD = [16, 8], HSBAUDLOW = [24, 8] }
+notes = "Four byte-wide divider fields in one word; the high-speed pair is unused at Sm/Fm. The rate derives from the routed GCLK generator, which is a PLAN fact and is not stated here."
+
+[registers.INTENCLR]
+offset = 0x14
+width = 8
+fields = { MB = [0, 1], SB = [1, 1], ERROR = [7, 1] }
+notes = "Write 1 to disable an interrupt; reading returns the enable mask."
+
+[registers.INTENSET]
+offset = 0x16
+width = 8
+fields = { MB = [0, 1], SB = [1, 1], ERROR = [7, 1] }
+notes = "Write 1 to enable an interrupt; reading returns the enable mask."
+
+[registers.INTFLAG]
+offset = 0x18
+width = 8
+fields = { MB = [0, 1], SB = [1, 1], ERROR = [7, 1] }
+notes = "MB and SB gate the next CMD; see the block notes. ERROR is raised when any of STATUS's error bits set, and is cleared by writing 1."
+
+[registers.STATUS]
+offset = 0x1A
+width = 16
+fields = { BUSERR = [0, 1], ARBLOST = [1, 1], RXNACK = [2, 1], BUSSTATE = [4, 2], LOWTOUT = [6, 1], CLKHOLD = [7, 1], MEXTTOUT = [8, 1], SEXTTOUT = [9, 1], LENERR = [10, 1] }
+notes = "BUSSTATE is the bus state machine: 0 = unknown, 1 = idle, 2 = owner, 3 = busy. A master that finds it stuck at 0 after enable has to force it to idle by writing 1 -- a fresh SERCOM does not start out owning an idle bus. RXNACK is how a missing device reports itself, and it is a STATUS bit rather than an error interrupt."
+
+[registers.SYNCBUSY]
+offset = 0x1C
+width = 32
+fields = { SWRST = [0, 1], ENABLE = [1, 1], SYSOP = [2, 1] }
+notes = "Read-only. SYSOP covers system operations -- writes to ADDR, DATA and CTRLB.CMD -- so it is the bit a transfer loop waits on, not CTRLB as in the USART and SPI maps."
+
+[registers.ADDR]
+offset = 0x24
+width = 32
+fields = { ADDR = [0, 11], LENEN = [13, 1], HS = [14, 1], TENBITEN = [15, 1], LEN = [16, 8] }
+notes = "Eleven bits wide to carry a 10-bit address plus the direction bit; a 7-bit address occupies ADDR[7:1] with the direction in ADDR[0]. Writing this register starts the transaction."
+
+[registers.DATA]
+offset = 0x28
+width = 8
+fields = { DATA = [0, 8] }
+notes = "One byte wide in this mode, unlike the USART and SPI maps' nine bits -- I2C has no 9-bit character."
+
+[registers.DBGCTRL]
+offset = 0x30
+width = 8
+fields = { DBGSTOP = [0, 1] }
+notes = "Whether the baud generator halts when the CPU is halted by the debugger. Left clear, a paused core keeps clocking the bus."

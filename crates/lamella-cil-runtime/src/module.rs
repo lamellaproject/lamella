@@ -4801,6 +4801,16 @@ impl Module {
         self.static_fields.insert(asm_key(asm, token.0), slot);
     }
 
+    /// Replaces the zero value of an already-bound static slot. The loader binds a static field
+    /// before it can know a STRUCT-typed one's zero -- that is a zero instance, and no instance
+    /// layout is final until every type in the assembly has been added -- so the struct-typed
+    /// statics are revisited once they are. Silently ignores an out-of-range slot.
+    pub fn set_static_default(&mut self, slot: usize, default: Value) {
+        if let Some(existing) = self.static_defaults.get_mut(slot) {
+            *existing = default;
+        }
+    }
+
     /// Reserves a static storage slot that belongs to NO metadata token, returning its index.
     ///
     /// A host needs this to park a value where managed code cannot reach it -- an incremental
@@ -4979,9 +4989,7 @@ impl Module {
         if let Some(name) = self.enum_value_name_by_handle(handle, value) {
             return Some(name);
         }
-        let type_id = self.type_id_by_handle(handle)?;
-        let canonical = self.type_handle_of(type_id)?;
-        self.enum_value_name_by_handle(canonical, value)
+        self.enum_value_name_by_handle(self.canonical_type_handle(handle)?, value)
     }
 
     /// The underlying value of the constant named `name` in the enum type `token` of
@@ -5060,9 +5068,7 @@ impl Module {
         if known(handle) {
             return true;
         }
-        self.type_id_by_handle(handle)
-            .and_then(|type_id| self.type_handle_of(type_id))
-            .is_some_and(known)
+        self.canonical_type_handle(handle).is_some_and(known)
     }
 
     /// The constant map of the enum named by `handle`, resolving ACROSS assemblies the same way
@@ -5074,8 +5080,7 @@ impl Module {
         if let Some(members) = self.enum_members_resolved_direct(handle) {
             return Some(members);
         }
-        let canonical = self.type_handle_of(self.type_id_by_handle(handle)?)?;
-        self.enum_members_resolved_direct(canonical)
+        self.enum_members_resolved_direct(self.canonical_type_handle(handle)?)
     }
 
     /// Records that the enum type `token` in assembly `asm` carries `[FlagsAttribute]`.
@@ -5090,8 +5095,7 @@ impl Module {
         if self.enum_flags_contains(handle) {
             return true;
         }
-        self.type_id_by_handle(handle)
-            .and_then(|type_id| self.type_handle_of(type_id))
+        self.canonical_type_handle(handle)
             .is_some_and(|canonical| self.enum_flags_contains(canonical))
     }
 
@@ -5117,8 +5121,7 @@ impl Module {
         }
         let unsigned = self.enum_unsigned.contains(&handle)
             || self
-                .type_id_by_handle(handle)
-                .and_then(|type_id| self.type_handle_of(type_id))
+                .canonical_type_handle(handle)
                 .is_some_and(|canonical| self.enum_unsigned.contains(&canonical));
         Some(match (self.enum_width_by_handle(handle), unsigned) {
             (1, false) => CastPrim::I1,
@@ -5139,8 +5142,7 @@ impl Module {
         if let Some(width) = self.enum_width_of(handle) {
             return width;
         }
-        self.type_id_by_handle(handle)
-            .and_then(|type_id| self.type_handle_of(type_id))
+        self.canonical_type_handle(handle)
             .and_then(|canonical| self.enum_width_of(canonical))
             .unwrap_or(4)
     }
@@ -5459,6 +5461,25 @@ impl Module {
     #[must_use]
     pub fn type_id_by_handle(&self, handle: u64) -> Option<TypeId> {
         self.frozen.type_tokens.get(&self.arena, handle).or_else(|| self.type_tokens.get(&handle).copied())
+    }
+
+    /// The DEFINING assembly's handle for the type `handle` names, when `handle` reaches it from
+    /// somewhere else -- `None` when `handle` is already canonical, names no declared type, or
+    /// the type has no recorded defining handle.
+    ///
+    /// `ldtoken` folds the EXECUTING assembly's id onto its token operand, so `typeof(T)` for a
+    /// `T` another assembly declares yields a handle in the naming assembly's `TypeRef` space,
+    /// while every load-time record for `T` is keyed by the DEFINING assembly's `TypeDef` handle.
+    /// Mapping `handle -> TypeId -> defining handle` crosses that gap; a lookup keyed by a type
+    /// handle wants it as a FALLBACK after its direct hit, never instead of one, so a
+    /// same-assembly answer is reached without the indirection and cannot be displaced by it.
+    ///
+    /// The `Some` case is exactly "these are two names for one type", which is why the callers
+    /// can retry against it without a second identity test.
+    #[must_use]
+    pub(crate) fn canonical_type_handle(&self, handle: u64) -> Option<u64> {
+        let canonical = self.type_handle_of(self.type_id_by_handle(handle)?)?;
+        (canonical != handle).then_some(canonical)
     }
 
     /// Whether `sub` is `ancestor` or a type derived from it, walking the base chain.
@@ -5908,10 +5929,19 @@ impl Module {
 
     /// The custom attributes recorded for the target whose asm-folded token is `target_handle`
     /// (a type or member), in application order. Empty if none.
+    ///
+    /// Resolves across assemblies through [`Self::canonical_type_handle`]: a program reading the
+    /// attributes of a type ANOTHER assembly declares carries that type's `TypeRef` handle, and
+    /// the attributes were recorded under the declaring assembly's `TypeDef` handle. A member
+    /// handle (a `Field` / `MethodDef` / `Property` token) names no type, so it keeps its own
+    /// identity -- which is the member identity the attribute store is already keyed by.
     #[must_use]
     pub fn custom_attributes_of(&self, target_handle: u64) -> &[LoadedAttribute] {
-        self.custom_attributes
-            .get(&target_handle)
+        if let Some(direct) = self.custom_attributes.get(&target_handle) {
+            return direct.as_slice();
+        }
+        self.canonical_type_handle(target_handle)
+            .and_then(|canonical| self.custom_attributes.get(&canonical))
             .map_or(&[], Vec::as_slice)
     }
 
@@ -5961,8 +5991,16 @@ impl Module {
 
     /// The asm-folded `Field` token of the field named `name` on the type whose handle is
     /// `type_handle` (the `FieldInfo` handle `Type.GetField` returns), or `None`.
+    /// Resolves across assemblies through [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_field_handle(&self, type_handle: u64, name: &str) -> Option<u64> {
+        self.type_field_handle_direct(type_handle, name).or_else(|| {
+            self.type_field_handle_direct(self.canonical_type_handle(type_handle)?, name)
+        })
+    }
+
+    /// [`Self::type_field_handle`] keyed DIRECTLY by `type_handle`, without the cross-assembly fold.
+    fn type_field_handle_direct(&self, type_handle: u64, name: &str) -> Option<u64> {
         self.frozen_name_lookup(self.frozen.fields_by_name, type_handle, name)
             .or_else(|| {
                 self.type_fields_by_name
@@ -5981,8 +6019,16 @@ impl Module {
 
     /// The asm-folded `MethodDef` token of the method named `name` on the type whose handle is
     /// `type_handle` (the `MethodInfo` handle `Type.GetMethod` returns), or `None`.
+    /// Resolves across assemblies through [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_method_handle(&self, type_handle: u64, name: &str) -> Option<u64> {
+        self.type_method_handle_direct(type_handle, name).or_else(|| {
+            self.type_method_handle_direct(self.canonical_type_handle(type_handle)?, name)
+        })
+    }
+
+    /// [`Self::type_method_handle`] keyed DIRECTLY by `type_handle`, without the cross-assembly fold.
+    fn type_method_handle_direct(&self, type_handle: u64, name: &str) -> Option<u64> {
         self.frozen_name_lookup(self.frozen.methods_by_name, type_handle, name)
             .or_else(|| {
                 self.type_methods_by_name
@@ -5993,8 +6039,16 @@ impl Module {
 
     /// The asm-folded `Property` token of the property named `name` on the type whose handle is
     /// `type_handle` (the `PropertyInfo` handle `Type.GetProperty` returns), or `None`.
+    /// Resolves across assemblies through [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_property_handle(&self, type_handle: u64, name: &str) -> Option<u64> {
+        self.type_property_handle_direct(type_handle, name).or_else(|| {
+            self.type_property_handle_direct(self.canonical_type_handle(type_handle)?, name)
+        })
+    }
+
+    /// [`Self::type_property_handle`] keyed DIRECTLY by `type_handle`, without the cross-assembly fold.
+    fn type_property_handle_direct(&self, type_handle: u64, name: &str) -> Option<u64> {
         self.frozen_name_lookup(self.frozen.properties_by_name, type_handle, name)
             .or_else(|| {
                 self.type_properties_by_name
@@ -6034,11 +6088,7 @@ impl Module {
         if let Some(direct) = self.reflect_type_direct(handle) {
             return Some(direct);
         }
-        let canonical = self.type_handle_of(self.type_id_by_handle(handle)?)?;
-        if canonical == handle {
-            return None;
-        }
-        self.reflect_type_direct(canonical)
+        self.reflect_type_direct(self.canonical_type_handle(handle)?)
     }
 
     /// The reflection record keyed DIRECTLY by `handle` (no cross-assembly folding): the frozen
@@ -6073,9 +6123,21 @@ impl Module {
     }
 
     /// The fields (declaration order) of the type whose asm-folded handle is `type_handle`, for
-    /// `Type.GetFields` enumeration; empty if none recorded.
+    /// `Type.GetFields` enumeration; empty if none recorded. Resolves across assemblies through
+    /// [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_fields(&self, type_handle: u64) -> Vec<ReflectField> {
+        let fields = self.type_fields_direct(type_handle);
+        if !fields.is_empty() {
+            return fields;
+        }
+        self.canonical_type_handle(type_handle)
+            .map(|canonical| self.type_fields_direct(canonical))
+            .unwrap_or_default()
+    }
+
+    /// [`Self::type_fields`] keyed DIRECTLY by `type_handle`, without the cross-assembly fold.
+    fn type_fields_direct(&self, type_handle: u64) -> Vec<ReflectField> {
         if let Some((offset, count)) = self.frozen.type_fields.get(&self.arena, type_handle) {
             return (0..count as usize)
                 .filter_map(|index| {
@@ -6099,9 +6161,16 @@ impl Module {
     }
 
     /// The parameterless instance constructor recorded for the type whose asm-folded handle is
-    /// `type_handle`, or `None`.
+    /// `type_handle`, or `None`. Resolves across assemblies through
+    /// [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_ctor(&self, type_handle: u64) -> Option<MethodId> {
+        self.type_ctor_direct(type_handle)
+            .or_else(|| self.type_ctor_direct(self.canonical_type_handle(type_handle)?))
+    }
+
+    /// [`Self::type_ctor`] keyed DIRECTLY by `type_handle`, without the cross-assembly fold.
+    fn type_ctor_direct(&self, type_handle: u64) -> Option<MethodId> {
         self.frozen
             .type_ctors
             .get(&self.arena, type_handle)
@@ -6118,9 +6187,21 @@ impl Module {
     }
 
     /// The instance constructors `(handle, parameter count)` of the type whose asm-folded handle is
-    /// `type_handle`, for `Type.GetConstructor` arity matching; empty if none recorded.
+    /// `type_handle`, for `Type.GetConstructor` arity matching; empty if none recorded. Resolves
+    /// across assemblies through [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_ctors_list(&self, type_handle: u64) -> Vec<(u64, usize)> {
+        let ctors = self.type_ctors_list_direct(type_handle);
+        if !ctors.is_empty() {
+            return ctors;
+        }
+        self.canonical_type_handle(type_handle)
+            .map(|canonical| self.type_ctors_list_direct(canonical))
+            .unwrap_or_default()
+    }
+
+    /// [`Self::type_ctors_list`] keyed DIRECTLY by `type_handle`, without the cross-assembly fold.
+    fn type_ctors_list_direct(&self, type_handle: u64) -> Vec<(u64, usize)> {
         if let Some((offset, count)) = self.frozen.type_ctors_list.get(&self.arena, type_handle) {
             return (0..count as usize)
                 .filter_map(|index| {
@@ -6145,9 +6226,21 @@ impl Module {
     }
 
     /// The methods (declaration order, constructors excluded) of the type whose asm-folded handle
-    /// is `type_handle`, for `Type.GetMethods` enumeration; empty if none recorded.
+    /// is `type_handle`, for `Type.GetMethods` enumeration; empty if none recorded. Resolves
+    /// across assemblies through [`Self::canonical_type_handle`].
     #[must_use]
     pub fn type_methods(&self, type_handle: u64) -> Vec<ReflectMethod> {
+        let methods = self.type_methods_direct(type_handle);
+        if !methods.is_empty() {
+            return methods;
+        }
+        self.canonical_type_handle(type_handle)
+            .map(|canonical| self.type_methods_direct(canonical))
+            .unwrap_or_default()
+    }
+
+    /// [`Self::type_methods`] keyed DIRECTLY by `type_handle`, without the cross-assembly fold.
+    fn type_methods_direct(&self, type_handle: u64) -> Vec<ReflectMethod> {
         if let Some((offset, count)) = self.frozen.type_methods.get(&self.arena, type_handle) {
             return (0..count as usize)
                 .filter_map(|index| {

@@ -1,5 +1,5 @@
 # PIN map for the SAM E54 family: pin x function -> (instance, signal). EMPTY on purpose --
-# identity-first, and no board binds a peripheral yet. Rows follow the samd21 shape
+# identity-first. Rows follow the samd21 shape
 # ((pin, function letter) -> (sercom, pad)) when the first binding demands them.
 
 [table]

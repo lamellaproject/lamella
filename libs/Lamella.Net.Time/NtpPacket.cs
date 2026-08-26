@@ -69,17 +69,17 @@ namespace Lamella.Net.Time
             long eraBase = new DateTime(1900, 1, 1).Ticks;
             if ((seconds & 0x80000000UL) == 0)
             {
-                eraBase = eraBase + 4294967296L * DateTime.TicksPerSecond;
+                eraBase = eraBase + 4294967296L * TimeSpan.TicksPerSecond;
             }
-            return eraBase + (long)seconds * DateTime.TicksPerSecond + fractionTicks;
+            return eraBase + (long)seconds * TimeSpan.TicksPerSecond + fractionTicks;
         }
 
         public static void WriteTimestamp(byte[] packet, int offset, long utcTicks)
         {
             long since1900 = utcTicks - new DateTime(1900, 1, 1).Ticks;
             if (since1900 < 0) return;
-            ulong seconds = (ulong)(since1900 / DateTime.TicksPerSecond) & 0xFFFFFFFFUL;
-            long remainderTicks = since1900 % DateTime.TicksPerSecond;
+            ulong seconds = (ulong)(since1900 / TimeSpan.TicksPerSecond) & 0xFFFFFFFFUL;
+            long remainderTicks = since1900 % TimeSpan.TicksPerSecond;
             ulong fraction = ((ulong)remainderTicks << 32) / 10000000UL;
             packet[offset] = (byte)(seconds >> 24);
             packet[offset + 1] = (byte)(seconds >> 16);
@@ -104,9 +104,7 @@ namespace Lamella.Net.Time
 
         private static SyncResult Fail(string protocol, string warning)
         {
-            return new SyncResult(
-                false, protocol, false, 0,
-                new TimeSpan(0), new TimeSpan(0), new DateTime(0), warning);
+            return SyncResult.Failed(protocol, warning);
         }
     }
 }

@@ -42,6 +42,18 @@ pub struct BlockTable {
     /// Declarative calibration records (`[calibration.*]`): form + integer coefficients,
     /// never an expression language.
     pub calibrations: Vec<Calibration>,
+    /// What a word of this block's array reads as when ERASED, for a flash block.
+    ///
+    /// REQUIRED of a flash block and refused on any other, because it is a property of the
+    /// CONTROLLER rather than of a die: it does not vary by package, density or ordering code,
+    /// which is what a parts row is for. Stating it once per BLOCK means a part inherits it by
+    /// naming its block, and a family that ever splits gets a NEW block rather than a per-part
+    /// override, so the split is visible.
+    ///
+    /// DELIBERATELY NOT DEFAULTED. Most flash controllers erase to ones and some erase to zero,
+    /// so a default would be silently wrong wherever the minority case holds -- and that is the
+    /// direction nobody checks.
+    pub erased_value: Option<Int>,
 }
 
 impl BlockRegister {
@@ -346,6 +358,15 @@ pub struct Binding {
     pub function: String,
     /// The GCLK generator the instance's core clock rides under the default plan (-1 = n/a).
     pub gclk_gen: i64,
+    /// The OPAQUE token an interrupt binding hands the runtime (-1 = not stated), legal only on
+    /// an `interrupt` binding.
+    ///
+    /// MINTED BY THE BOARD AND NEVER DECODED BY THE RUNTIME. It travels from the BSP's ISR through
+    /// `lamella_isr_notify` to the managed side and back to the driver, which maps it to a pin.
+    /// Keeping it opaque is what keeps the pad-to-line-to-vector mapping in the strata and the
+    /// runtime free of any per-chip table. It is deliberately NOT the line number: two pads can
+    /// share a line, so a line does not identify a pad.
+    pub token: i64,
     /// The board's ADC reference voltage in microvolts (-1 = not stated). BOARD truth (the
     /// rail the converter measures against), legal only on an `adc` binding -- it is a
     /// property of the board's wiring, not of the chip.
@@ -1250,13 +1271,33 @@ fn build_block(
     header: &[(usize, String, RawValue)],
     items: &[(usize, Item)],
 ) -> Result<BlockTable, String> {
-    header_reject_unknown(header, &["kind", "family", "block", "mode", "sources", "notes"])?;
+    header_reject_unknown(header, &["kind", "family", "block", "mode", "erased_value", "sources", "notes"])?;
     let mut table = BlockTable {
         family: header_str(header, "family")?,
         block: header_str(header, "block")?,
         mode: header_str_opt(header, "mode")?,
         ..BlockTable::default()
     };
+
+    table.erased_value = match header.iter().find(|(_, k, _)| k == "erased_value") {
+        Some((line, k, v)) => Some(as_int(*line, k, v)?),
+        None => None,
+    };
+    if table.block == "flash" && table.erased_value.is_none() {
+        return Err(format!(
+            "block {}/{}: a flash block must declare `erased_value` -- what a word of the array reads \n             as when erased. It is NOT defaulted, because 0xffffffff is right for every part in \n             this tree except the STM32L0, so a default would be silently wrong exactly where the \n             value matters. Ask the part's own manual before writing one",
+            table.family, table.block
+        ));
+    }
+    if table.block != "flash" && table.erased_value.is_some() {
+        return Err(format!(
+            "block {}/{}: `erased_value` belongs to a flash block and this is not one -- a block with \n             no array to erase would be declaring a field nothing reads",
+            table.family, table.block
+        ));
+    }
+    if let Some(value) = table.erased_value {
+        table.constants.push((String::from("ERASED_VALUE"), value));
+    }
 
     enum At {
         None,
@@ -1435,7 +1476,7 @@ fn unquote(key: &str) -> &str {
 }
 
 /// Refuses a non-integer number ANYWHERE in a device table, at any array/inline-table depth.
-/// A part catalogue's premise is the no-float tier: one `0.5` in one row would force a float
+/// A part catalog's premise is the no-float tier: one `0.5` in one row would force a float
 /// into every emitted language, so a fact that is not an integer must be restated as one (the
 /// standby codes are microseconds for exactly this reason) or expressed as a named dispatch.
 fn reject_floats(line: usize, key: &str, value: &RawValue) -> Result<(), String> {
@@ -2338,7 +2379,7 @@ fn build_parts(
 
 fn build_binding(line: usize) -> Binding {
     let _ = line;
-    Binding { gclk_gen: -1, reference_uv: -1, ..Default::default() }
+    Binding { gclk_gen: -1, reference_uv: -1, token: -1, ..Default::default() }
 }
 
 fn binding_key(
@@ -2353,6 +2394,7 @@ fn binding_key(
         ("instance", RawValue::Str(s)) => binding.instance = s.clone(),
         ("function", RawValue::Str(s)) => binding.function = s.clone(),
         ("gclk_gen", RawValue::Int(i)) => binding.gclk_gen = i.value,
+        ("token", RawValue::Int(i)) => binding.token = i.value,
         ("reference_uv", RawValue::Int(i)) => binding.reference_uv = i.value,
         ("source", RawValue::Str(_)) => {}
         (signal, v @ RawValue::Inline(_)) => {
@@ -4734,6 +4776,46 @@ struct StUartPin {
 /// AHB bit) and lets ONE arm serve them all -- the per-pin GPIO facts, the APB rate feeding this
 /// instance, and the carrier rate's BRR divisor (16x oversampling, ROUNDED division: e.g. 0x23 @
 /// 4 MHz, 0x45 @ 8 MHz, 0x8B @ 16 MHz).
+/// One ST external-interrupt binding: what an ISR needs that is not a register.
+///
+/// THE TOKEN IS OPAQUE AND THAT IS THE CONTRACT. The runtime never decodes it -- it carries the
+/// value from the BSP's ISR to the managed side and hands it back to the driver, which maps it to
+/// a pin. Keeping it opaque is what keeps the pad-to-line-to-vector mapping entirely in the strata
+/// and the runtime free of any per-chip table.
+///
+/// THE VECTOR IS LOOKED UP, NOT COMPUTED. Three vectors cover sixteen lines on this vendor and a
+/// SAM D EIC delivers every line on one, so the grouping is per-family DATA in the block table.
+struct StInterruptEmission {
+    prefix: String,
+    role: String,
+    token: i64,
+    line: i64,
+    /// `1 << line` -- the bit this line occupies in EVERY register of this controller, because
+    /// each of them is one bit per line at [n]. Emitted rather than left to a consumer's shift:
+    /// the shift is trivial and getting it from the wrong number (the pad index, the vector) is
+    /// not, and on a family whose controller is not one-bit-per-line this stops being a shift.
+    line_mask: i64,
+    nvic_position: i64,
+    exti_base: i64,
+    /// The pending register, absolute. WRITE ONE TO CLEAR: an ISR that returns without writing
+    /// its line's bit here is re-entered immediately.
+    pr_reg: i64,
+    /// The interrupt-mask register, absolute. A line reaches the NVIC only with its bit set here.
+    imr_reg: i64,
+    /// The rising-edge trigger register, absolute.
+    rtsr_reg: i64,
+    /// The falling-edge trigger register, absolute. Setting BOTH this and RTSR for a line is how
+    /// a both-edges pin change is asked for, which is what the `ValueChanged` surface means.
+    ftsr_reg: i64,
+    port_rcc_en_reg: i64,
+    port_rcc_en_mask: i64,
+    syscfg_rcc_en_reg: i64,
+    syscfg_rcc_en_mask: i64,
+    exticr_reg: i64,
+    exticr_mask: i64,
+    exticr_value: i64,
+}
+
 struct StUartEmission {
     prefix: String,
     role: String,
@@ -4804,6 +4886,118 @@ fn st_mux_pin(
         afr_reg: group_base + afr.offset.value,
         afr_mask: 0xF << (4 * nibble),
         afr_value: af << (4 * nibble),
+    })
+}
+
+/// Resolves an ST external-interrupt binding into the facts an ISR needs.
+///
+/// EVERY VALUE COMES FROM A TABLE AND NONE IS COMPUTED FROM A VENDOR ASSUMPTION. The line is the
+/// pin row's stated signal, the vector is looked up per line in the block, and the EXTICR geometry
+/// is the block's own constants -- so a family whose controller groups lines differently, or
+/// selects a port differently, changes its DATA rather than this function.
+fn resolve_interrupt_stm32(
+    set: &FamilySet,
+    resolved: &ResolvedBoard,
+    binding: &Binding,
+) -> Result<StInterruptEmission, String> {
+    let board = &resolved.board.board;
+    let instances = &set.instances;
+    let exti = set.block("exti", "").ok_or_else(|| format!("{board}: no exti block table"))?;
+    let konst = |name: &str| -> Result<i64, String> {
+        exti.constants
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.value)
+            .ok_or_else(|| format!("{board}: exti block states no `{name}`"))
+    };
+
+    let (_, pin) = binding
+        .pins
+        .first()
+        .ok_or_else(|| format!("{board}: interrupt binding '{}' names no pin", binding.role))?;
+
+    let row = set
+        .pin_row(&pin.pin, &binding.function)
+        .ok_or_else(|| format!(
+            "{board}: interrupt binding '{}' claims {} function {} but pins.toml has no such row              (grow the pin map from the datasheet, never from the binding)",
+            binding.role, pin.pin, binding.function
+        ))?;
+    let line: i64 = row
+        .signal
+        .strip_prefix("line")
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!(
+            "{board}: pin {} states signal '{}' -- an interrupt row's signal must be `line<n>`,              which is what carries the line NUMBER as a fact rather than as a guess at the pad index",
+            pin.pin, row.signal
+        ))?;
+
+    let rcc_base = instances
+        .value("rcc", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'rcc'"))?;
+    let rcc_enable = |name: &str| -> Result<(i64, i64), String> {
+        let off = instances
+            .value(name, "rcc_en_off")
+            .filter(|v| *v >= 0)
+            .ok_or_else(|| format!("{board}: instance '{name}' has no rcc_en_off"))?;
+        let bit = instances
+            .value(name, "rcc_en_bit")
+            .filter(|v| *v >= 0)
+            .ok_or_else(|| format!("{board}: instance '{name}' has no rcc_en_bit"))?;
+        Ok((rcc_base + off, 1i64 << bit))
+    };
+
+    let (port, _) = split_pin(&pin.pin)
+        .ok_or_else(|| format!("{board}: cannot read a port letter from pin '{}'", pin.pin))?;
+    let (port_rcc_en_reg, port_rcc_en_mask) = rcc_enable(&format!("gpio{}", port.to_ascii_lowercase()))?;
+    let (syscfg_rcc_en_reg, syscfg_rcc_en_mask) = rcc_enable("syscfg")?;
+
+    let syscfg_base = instances
+        .value("syscfg", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'syscfg'"))?;
+    let exti_base = instances
+        .value("exti", "base")
+        .ok_or_else(|| format!("{board}: no instance row for 'exti'"))?;
+
+    let per_reg = konst("EXTICR_LINES_PER_REG")?;
+    let field_bits = konst("EXTICR_FIELD_BITS")?;
+    let exticr_reg = syscfg_base + konst("EXTICR_FIRST_OFF")? + (line / per_reg) * konst("EXTICR_STRIDE")?;
+    let shift = (line % per_reg) * field_bits;
+    let exticr_mask = ((1i64 << field_bits) - 1) << shift;
+    let exticr_value = konst(&format!("EXTICR_PORT_{}", port.to_ascii_uppercase()))? << shift;
+    let nvic_position = konst(&format!("LINE{line}_VECTOR"))?;
+
+    let reg = |name: &str| -> Result<i64, String> {
+        exti.register(name)
+            .map(|r| exti_base + r.offset.value)
+            .ok_or_else(|| format!("{board}: exti block states no `{name}` register"))
+    };
+
+    Ok(StInterruptEmission {
+        prefix: binding.role.to_ascii_uppercase().replace('-', "_"),
+        role: binding.role.clone(),
+        token: if binding.token >= 0 {
+            binding.token
+        } else {
+            return Err(format!(
+                "{board}: interrupt binding '{}' states no `token` -- the runtime carries it back                  to the driver and cannot invent one, and it must not default to the line number                  because two pads can share a line",
+                binding.role
+            ));
+        },
+        line,
+        line_mask: 1i64 << line,
+        nvic_position,
+        exti_base,
+        pr_reg: reg("PR")?,
+        imr_reg: reg("IMR")?,
+        rtsr_reg: reg("RTSR")?,
+        ftsr_reg: reg("FTSR")?,
+        port_rcc_en_reg,
+        port_rcc_en_mask,
+        syscfg_rcc_en_reg,
+        syscfg_rcc_en_mask,
+        exticr_reg,
+        exticr_mask,
+        exticr_value,
     })
 }
 
@@ -5403,6 +5597,7 @@ struct BoardEmissions {
     esp_uarts: Vec<EspUartEmission>,
     sam3x_uarts: Vec<Sam3xUartEmission>,
     st_uarts: Vec<StUartEmission>,
+    st_interrupts: Vec<StInterruptEmission>,
     st_i2cs: Vec<StI2cEmission>,
     sercom_spis: Vec<SpiEmission>,
     sercom_i2cs: Vec<SercomI2cEmission>,
@@ -5461,6 +5656,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         esp_uarts: Vec::new(),
         sam3x_uarts: Vec::new(),
         st_uarts: Vec::new(),
+        st_interrupts: Vec::new(),
         st_i2cs: Vec::new(),
         sercom_spis: Vec::new(),
         sercom_i2cs: Vec::new(),
@@ -5475,12 +5671,14 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         let emitted_before = emissions.skipped.len();
         match binding.kind.as_str() {
             "uart" => match set.family.as_str() {
-                "samd21" => emissions.sercom_uarts.push(resolve_uart(set, resolved, binding)?),
+                "samd10" | "samd11" | "samd21" => {
+                    emissions.sercom_uarts.push(resolve_uart(set, resolved, binding)?)
+                }
                 "rp2040" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, false)?),
                 "rp2350" => emissions.rp_uarts.push(resolve_uart_rp(set, resolved, binding, true)?),
                 "esp32c6" => emissions.esp_uarts.push(resolve_uart_esp32c6(set, resolved, binding)?),
                 "sam3x" => emissions.sam3x_uarts.push(resolve_uart_sam3x(set, resolved, binding)?),
-                "stm32l476" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
+                "stm32l476" | "stm32l0" | "stm32l053" | "stm32u5a5" | "stm32f091" | "stm32f7" | "stm32f42x" | "stm32f769" | "stm32h7" => {
                     emissions.st_uarts.push(resolve_uart_stm32(set, resolved, binding)?);
                 }
                 other => {
@@ -5519,6 +5717,17 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
                     ));
                 }
             },
+            "interrupt" => match set.family.as_str() {
+                "stm32l053" => {
+                    emissions.st_interrupts.push(resolve_interrupt_stm32(set, resolved, binding)?);
+                }
+                other => {
+                    return Err(format!(
+                        "{}: no interrupt emission shape for family '{other}' -- add its derivation path first",
+                        resolved.board.board
+                    ));
+                }
+            },
             "adc" => match set.family.as_str() {
                 "rp2350" => emissions.rp_adcs.push(resolve_adc_rp(set, resolved, binding)?),
                 other => {
@@ -5534,7 +5743,52 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
             emissions.driver_families.push((binding.role.clone(), driver_family(set, binding)?));
         }
     }
+    refuse_colliding_interrupts(&resolved.board.board, &emissions.st_interrupts)?;
     Ok(emissions)
+}
+
+/// Refuses a board whose interrupt bindings collide on a LINE or on a TOKEN.
+///
+/// BOTH COLLISIONS ARE SILENT IN EVERY DIRECTION THAT MATTERS, which is the whole reason this is a
+/// refusal rather than a note. Neither one produces a bad address, a failed build or a fault: each
+/// produces a board that runs and answers the wrong pad.
+///
+/// A LINE COLLISION IS A PROPERTY OF THE VENDOR'S ENCODING. Here a line is the PIN INDEX and the
+/// port is a separate choice, so PA13 and PC13 raise the same line and only whichever one SYSCFG
+/// was programmed for last is live. The chip reports nothing -- the other pad simply never fires,
+/// which reads on a bench exactly like a broken solder joint. Downstream it is worse than dead: the
+/// generated handler body would carry an `if` per binding, both testing the same bit, and the second
+/// could never be reached.
+///
+/// A TOKEN COLLISION IS A PROPERTY OF OURS. The token is opaque to the runtime and is what a driver
+/// maps back to a pin, so two pads minted with one token are two pads the managed side cannot tell
+/// apart -- and it would hand both edges to whichever pin registered first.
+///
+/// It compares this board's bindings against each other and nothing else. A pad the carrier has
+/// wired to something that is not a binding at all remains unguarded here.
+fn refuse_colliding_interrupts(board: &str, interrupts: &[StInterruptEmission]) -> Result<(), String> {
+    for (index, irq) in interrupts.iter().enumerate() {
+        for other in &interrupts[index + 1..] {
+            if irq.line == other.line {
+                return Err(format!(
+                    "{board}: interrupt bindings '{}' and '{}' both claim line {} -- a line is the \
+                     pin INDEX and the port is a separate choice, so these two pads compete for one \
+                     line and only the one SYSCFG selects can ever fire. Nothing in the chip \
+                     reports the loser; bind one of them",
+                    irq.role, other.role, irq.line
+                ));
+            }
+            if irq.token == other.token {
+                return Err(format!(
+                    "{board}: interrupt bindings '{}' and '{}' are both minted token {} -- the \
+                     runtime never decodes a token and hands it back to the driver as the identity \
+                     of a pad, so two pads sharing one cannot be told apart on the managed side",
+                    irq.role, other.role, irq.token
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Emits a board's C# bindings class: per uart role the resolved descriptor values, control
@@ -5555,6 +5809,7 @@ pub fn emit_board_csharp(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_interrupts,
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
@@ -5669,6 +5924,26 @@ pub fn emit_board_csharp(
         }
     }
 
+    for irq in &st_interrupts {
+        let p = &irq.prefix;
+        out.push_str(&format!("\n        // -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it\n        // from the ISR to the managed side and never decodes it. Clear EXTI_PR before returning\n        // or the interrupt re-enters. --\n"));
+        push_const(&mut out, "uint", &format!("{p}_TOKEN"), &irq.token.to_string());
+        push_const(&mut out, "uint", &format!("{p}_EXTI_LINE"), &irq.line.to_string());
+        push_const(&mut out, "uint", &format!("{p}_EXTI_LINE_MASK"), &format!("0x{:X}", irq.line_mask));
+        push_const(&mut out, "uint", &format!("{p}_NVIC_POSITION"), &irq.nvic_position.to_string());
+        push_const(&mut out, "uint", &format!("{p}_EXTI_BASE"), &format!("0x{:X}", irq.exti_base));
+        push_const(&mut out, "uint", &format!("{p}_EXTI_PR_REG"), &format!("0x{:X}", irq.pr_reg));
+        push_const(&mut out, "uint", &format!("{p}_EXTI_IMR_REG"), &format!("0x{:X}", irq.imr_reg));
+        push_const(&mut out, "uint", &format!("{p}_EXTI_RTSR_REG"), &format!("0x{:X}", irq.rtsr_reg));
+        push_const(&mut out, "uint", &format!("{p}_EXTI_FTSR_REG"), &format!("0x{:X}", irq.ftsr_reg));
+        push_const(&mut out, "uint", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", irq.port_rcc_en_reg));
+        push_const(&mut out, "uint", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", irq.port_rcc_en_mask));
+        push_const(&mut out, "uint", &format!("{p}_SYSCFG_RCC_EN_REG"), &format!("0x{:X}", irq.syscfg_rcc_en_reg));
+        push_const(&mut out, "uint", &format!("{p}_SYSCFG_RCC_EN_MASK"), &format!("0x{:X}", irq.syscfg_rcc_en_mask));
+        push_const(&mut out, "uint", &format!("{p}_EXTICR_REG"), &format!("0x{:X}", irq.exticr_reg));
+        push_const(&mut out, "uint", &format!("{p}_EXTICR_MASK"), &format!("0x{:X}", irq.exticr_mask));
+        push_const(&mut out, "uint", &format!("{p}_EXTICR_VALUE"), &format!("0x{:X}", irq.exticr_value));
+    }
     for uart in &st_uarts {
         let p = &uart.prefix;
         out.push_str(&format!("\n        // -- {p}: an st-usart binding descriptor --\n"));
@@ -6434,6 +6709,83 @@ fn push_rust_const(out: &mut String, kind: &str, name: &str, value: &str) {
     out.push_str(&format!("pub const {name}: {kind} = {value};\n"));
 }
 
+/// Emits the interrupt handler BODY for each NVIC vector this board binds a line on.
+///
+/// RUST ONLY, AND THAT IS THE POINT OF THE SPLIT. The constants above go to every language,
+/// because a host tool, a driver and a test all describe the same board; a handler runs on the
+/// part, in native code, so there is exactly one language it can be written in.
+///
+/// ONE FUNCTION PER VECTOR RATHER THAN PER BINDING, because the vendor's grouping is data: three
+/// vectors cover sixteen lines here, so a single entry can find several of this board's lines
+/// pending, and a per-binding function would leave the caller to rediscover which of them share an
+/// entry. Grouping here is a lookup over the emission list, not a rule about ranges.
+///
+/// The body is generated rather than left to each board's firmware for one reason: clearing the
+/// pending bit is not optional and the register, the offset and the bit are per-chip facts. A
+/// hand-written handler that forgot the write would not fail visibly -- it would re-enter forever.
+fn push_rust_isr_bodies(out: &mut String, interrupts: &[StInterruptEmission]) {
+    let mut vectors: Vec<i64> = interrupts.iter().map(|irq| irq.nvic_position).collect();
+    vectors.sort_unstable();
+    vectors.dedup();
+
+    for vector in vectors {
+        let bound: Vec<&StInterruptEmission> =
+            interrupts.iter().filter(|irq| irq.nvic_position == vector).collect();
+        let roles = bound.iter().map(|irq| irq.role.as_str()).collect::<Vec<_>>().join(", ");
+
+        out.push_str(&format!(
+            "\n/// Takes one pending interrupt line this board has bound on NVIC position {vector}: clears it\n\
+             /// and answers its TOKEN, or `None` when no line of this board's is pending there.\n\
+             ///\n\
+             /// THE CLEAR HAPPENS BEFORE THE ANSWER, and that ordering is why this is a function rather\n\
+             /// than another constant. The pending register is write-one-to-clear, so a handler that\n\
+             /// returns without writing its line's bit is re-entered immediately and the board makes no\n\
+             /// progress. Clearing FIRST also settles the fate of an edge that arrives mid-handler: it\n\
+             /// re-pends and the vector is entered again, where answering first and clearing afterwards\n\
+             /// would write the new edge away together with the old one.\n\
+             ///\n\
+             /// CALL IT IN A LOOP, from the vector for NVIC position {vector}. One entry can find several\n\
+             /// bound lines pending and each carries its own token:\n\
+             ///\n\
+             /// ```text\n\
+             /// #[unsafe(no_mangle)]\n\
+             /// pub extern \"C\" fn exti_isr() {{\n\
+             ///     while let Some(token) = unsafe {{ board::isr_vector_{vector}_take() }} {{\n\
+             ///         unsafe {{ lamella_isr_notify(token) }};\n\
+             ///     }}\n\
+             /// }}\n\
+             /// ```\n\
+             ///\n\
+             /// The token travels whole and is never decoded on the way: the runtime carries it to the\n\
+             /// managed side and hands it back to the driver, which is the only place that knows it means\n\
+             /// a pin. That is what keeps the pad-to-line-to-vector mapping here and out of the runtime.\n\
+             ///\n\
+             /// IT ANSWERS ONLY THE LINES THIS BOARD BOUND -- here, {roles}. A line the firmware enabled\n\
+             /// for its own use can share this vector and is neither reported nor cleared, because\n\
+             /// clearing a line this board did not bind would swallow that firmware's interrupt in\n\
+             /// silence. Such a firmware clears its own line in the same handler.\n\
+             ///\n\
+             /// # Safety\n\
+             /// Reads and writes the pending register through raw MMIO. Call it only from the interrupt\n\
+             /// vector for NVIC position {vector}.\n\
+             pub unsafe fn isr_vector_{vector}_take() -> Option<u32> {{\n"
+        ));
+
+        for irq in &bound {
+            let p = &irq.prefix;
+            out.push_str(&format!(
+                "    let pending = unsafe {{ core::ptr::read_volatile({p}_EXTI_PR_REG as *const u32) }};\n\
+                 \x20   if pending & {p}_EXTI_LINE_MASK != 0 {{\n\
+                 \x20       unsafe {{ core::ptr::write_volatile({p}_EXTI_PR_REG as *mut u32, {p}_EXTI_LINE_MASK) }};\n\
+                 \x20       return Some({p}_TOKEN);\n\
+                 \x20   }}\n"
+            ));
+        }
+
+        out.push_str("    None\n}\n");
+    }
+}
+
 fn finish_rust(out: &str) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for line in out.lines() {
@@ -6642,6 +6994,7 @@ pub fn emit_board_rust(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_interrupts,
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
@@ -6757,6 +7110,27 @@ pub fn emit_board_rust(
         }
     }
 
+    for irq in &st_interrupts {
+        let p = &irq.prefix;
+        out.push_str(&format!("\n// -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from the\n// ISR to the managed side and never decodes it. Clear EXTI_PR before returning or the\n// interrupt re-enters. --\n"));
+        push_rust_const(&mut out, "u32", &format!("{p}_TOKEN"), &irq.token.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTI_LINE"), &irq.line.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTI_LINE_MASK"), &format!("0x{:X}", irq.line_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_NVIC_POSITION"), &irq.nvic_position.to_string());
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTI_BASE"), &format!("0x{:X}", irq.exti_base));
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTI_PR_REG"), &format!("0x{:X}", irq.pr_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTI_IMR_REG"), &format!("0x{:X}", irq.imr_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTI_RTSR_REG"), &format!("0x{:X}", irq.rtsr_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTI_FTSR_REG"), &format!("0x{:X}", irq.ftsr_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", irq.port_rcc_en_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", irq.port_rcc_en_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_SYSCFG_RCC_EN_REG"), &format!("0x{:X}", irq.syscfg_rcc_en_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_SYSCFG_RCC_EN_MASK"), &format!("0x{:X}", irq.syscfg_rcc_en_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTICR_REG"), &format!("0x{:X}", irq.exticr_reg));
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTICR_MASK"), &format!("0x{:X}", irq.exticr_mask));
+        push_rust_const(&mut out, "u32", &format!("{p}_EXTICR_VALUE"), &format!("0x{:X}", irq.exticr_value));
+    }
+    push_rust_isr_bodies(&mut out, &st_interrupts);
     for uart in &st_uarts {
         let p = &uart.prefix;
         out.push_str(&format!("\n// -- {p}: an st-usart binding descriptor --\n"));
@@ -6990,8 +7364,12 @@ const SWIFT_FAMILIES: &[&str] = &[
     "nrf52833",
     "rp2040",
     "rp2350",
+    "samd10",
+    "samd11",
     "samd21",
     "stm32f7",
+    "stm32l0",
+    "stm32l053",
     "stm32l476",
 ];
 
@@ -7175,6 +7553,7 @@ pub fn emit_board_swift(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_interrupts,
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
@@ -7291,6 +7670,26 @@ pub fn emit_board_swift(
         }
     }
 
+    for irq in &st_interrupts {
+        let p = &irq.prefix;
+        out.push_str(&format!("\n    // -- {p}: an st-exti binding descriptor. TOKEN is opaque: the runtime carries it from\n    // the ISR to the managed side and never decodes it. Clear EXTI_PR before returning. --\n"));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_TOKEN"), &irq.token.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_LINE"), &irq.line.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_LINE_MASK"), &format!("0x{:X}", irq.line_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_NVIC_POSITION"), &irq.nvic_position.to_string());
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_BASE"), &format!("0x{:X}", irq.exti_base));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_PR_REG"), &format!("0x{:X}", irq.pr_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_IMR_REG"), &format!("0x{:X}", irq.imr_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_RTSR_REG"), &format!("0x{:X}", irq.rtsr_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTI_FTSR_REG"), &format!("0x{:X}", irq.ftsr_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_RCC_EN_REG"), &format!("0x{:X}", irq.port_rcc_en_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_PORT_RCC_EN_MASK"), &format!("0x{:X}", irq.port_rcc_en_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_SYSCFG_RCC_EN_REG"), &format!("0x{:X}", irq.syscfg_rcc_en_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_SYSCFG_RCC_EN_MASK"), &format!("0x{:X}", irq.syscfg_rcc_en_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTICR_REG"), &format!("0x{:X}", irq.exticr_reg));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTICR_MASK"), &format!("0x{:X}", irq.exticr_mask));
+        push_swift_const(&mut out, "UInt32", &format!("{p}_EXTICR_VALUE"), &format!("0x{:X}", irq.exticr_value));
+    }
     for uart in &st_uarts {
         let p = &uart.prefix;
         out.push_str(&format!("\n    // -- {p}: an st-usart binding descriptor --\n"));
@@ -7538,6 +7937,7 @@ pub fn emit_board_python(
         esp_uarts,
         sam3x_uarts,
         st_uarts,
+        st_interrupts,
         st_i2cs,
         sercom_spis,
         sercom_i2cs,
@@ -7670,6 +8070,28 @@ pub fn emit_board_python(
             rows.push((suffix.to_ascii_lowercase(), format!("0x{word:X}")));
         }
         roles.push((&i2c.role, rows));
+    }
+    for irq in &st_interrupts {
+        let rows = vec![
+            ("kind".to_string(), "\"interrupt\"".to_string()),
+            ("token".to_string(), irq.token.to_string()),
+            ("line".to_string(), irq.line.to_string()),
+            ("line_mask".to_string(), format!("0x{:X}", irq.line_mask)),
+            ("nvic_position".to_string(), irq.nvic_position.to_string()),
+            ("exti_base".to_string(), format!("0x{:X}", irq.exti_base)),
+            ("exti_pr_reg".to_string(), format!("0x{:X}", irq.pr_reg)),
+            ("exti_imr_reg".to_string(), format!("0x{:X}", irq.imr_reg)),
+            ("exti_rtsr_reg".to_string(), format!("0x{:X}", irq.rtsr_reg)),
+            ("exti_ftsr_reg".to_string(), format!("0x{:X}", irq.ftsr_reg)),
+            ("port_rcc_en_reg".to_string(), format!("0x{:X}", irq.port_rcc_en_reg)),
+            ("port_rcc_en_mask".to_string(), format!("0x{:X}", irq.port_rcc_en_mask)),
+            ("syscfg_rcc_en_reg".to_string(), format!("0x{:X}", irq.syscfg_rcc_en_reg)),
+            ("syscfg_rcc_en_mask".to_string(), format!("0x{:X}", irq.syscfg_rcc_en_mask)),
+            ("exticr_reg".to_string(), format!("0x{:X}", irq.exticr_reg)),
+            ("exticr_mask".to_string(), format!("0x{:X}", irq.exticr_mask)),
+            ("exticr_value".to_string(), format!("0x{:X}", irq.exticr_value)),
+        ];
+        roles.push((&irq.role, rows));
     }
     for uart in &st_uarts {
         let mut rows = vec![
@@ -8162,7 +8584,7 @@ fn validate_device(part: &DeviceTable) -> Result<(), String> {
     let who = format!("part '{}'", part.part);
     let sourcing = part.sourcing.as_ref().ok_or_else(|| {
         format!(
-            "{who} states no [sourcing] -- every part declares where its facts came from and how far it has been validated, so a catalogue can be ranked rather than trusted whole"
+            "{who} states no [sourcing] -- every part declares where its facts came from and how far it has been validated, so a catalog can be ranked rather than trusted whole"
         )
     })?;
     if !SOURCING_FACTS.contains(&sourcing.facts.as_str()) {
@@ -9488,6 +9910,7 @@ base = 0x1000
             function: "F".into(),
             pins: vec![("mosi".to_string(), PinRef { pin: "PA10".into(), ..Default::default() })],
             gclk_gen: -1,
+            token: -1,
             reference_uv: -1,
         };
         let error = validate_bindings(&with_binding, &[binding], "p", "b").unwrap_err();
@@ -10246,5 +10669,43 @@ resolution_bits = "16..20, depending only on the oversampling setting"
             assert!(rendered.contains("SOURCING_DERIVED_FROM"), "{rendered}");
             assert!(rendered.contains("SOURCING_VALIDATION"), "{rendered}");
         }
+    }
+
+    /// Two pads raising one line, and two pads minted one token. Both are refused, and the reason
+    /// both need a refusal rather than a warning is that neither fails visibly: the board builds,
+    /// flashes and runs, and one of the two pads is simply never heard from.
+    #[test]
+    fn colliding_interrupt_bindings_are_refused() {
+        let irq = |role: &str, line: i64, token: i64| StInterruptEmission {
+            prefix: role.to_ascii_uppercase(),
+            role: role.to_string(),
+            token,
+            line,
+            line_mask: 1 << line,
+            nvic_position: 7,
+            exti_base: 0x4001_0400,
+            pr_reg: 0x4001_0414,
+            imr_reg: 0x4001_0400,
+            rtsr_reg: 0x4001_0408,
+            ftsr_reg: 0x4001_040C,
+            port_rcc_en_reg: 0x4002_102C,
+            port_rcc_en_mask: 0x4,
+            syscfg_rcc_en_reg: 0x4002_1034,
+            syscfg_rcc_en_mask: 0x1,
+            exticr_reg: 0x4001_0014,
+            exticr_mask: 0xF0,
+            exticr_value: 0x20,
+        };
+
+        assert!(refuse_colliding_interrupts("b", &[irq("button", 13, 0)]).is_ok());
+        assert!(refuse_colliding_interrupts("b", &[irq("button", 13, 0), irq("wake", 2, 1)]).is_ok());
+
+        let error = refuse_colliding_interrupts("b", &[irq("button", 13, 0), irq("wake", 13, 1)])
+            .expect_err("two pads competing for one line must be refused");
+        assert!(error.contains("both claim line 13"), "{error}");
+
+        let error = refuse_colliding_interrupts("b", &[irq("button", 13, 0), irq("wake", 2, 0)])
+            .expect_err("two pads minted one token must be refused");
+        assert!(error.contains("minted token 0"), "{error}");
     }
 }

@@ -1,0 +1,26 @@
+# The SAM D11 Power Manager block: only the register the peripheral bring-up paths touch is
+# transcribed here (partial, append-only, schema total). Offsets are PM-base-relative; the base
+# lives in ../instances.toml.
+#
+# THE BIT ASSIGNMENT IS NOT THE SAMD21's AND THE OVERLAP IS THE TRAP. Both families put SERCOM0 at
+# bit 2, so the first bit anyone checks agrees -- and the D21 continues SERCOM1..5 through bit 7,
+# where this family runs out of SERCOMs at bit 4 and spends bits 5..7 on TCC0, TC1 and TC2. A mask
+# borrowed from the D21 would gate a timer believing it was gating a serial port.
+
+[table]
+kind = "block"
+family = "samd11"
+block = "pm"
+sources = [
+    "SAM D11 datasheet Atmel-42363H-SAM-D11-Datasheet_09/2016 ch 15.8.11 APBC Mask: offset 0x20, reset 0x00000100, bit table PAC2 0, EVSYS 1, SERCOM0 2, SERCOM1 3, SERCOM2 4, TCC0 5, TC1 6, TC2 7, ADC 8, AC 9, DAC 10, bits 31:11 reserved",
+]
+notes = [
+    "APBCMASK gates each peripheral's APB (bus) clock. This family has three SERCOMs, at bits 2..4. Read-modify-write in drivers: other peripherals share the register.",
+    "The reset value is 0x00000100, so ADC's gate is the one bit already set out of reset. A driver that WRITES this register rather than OR-ing into it silently stops the ADC's bus clock.",
+]
+
+[registers.APBCMASK]
+offset = 0x20
+width = 32
+fields = { PAC2 = [0, 1], EVSYS = [1, 1], SERCOM0 = [2, 1], SERCOM1 = [3, 1], SERCOM2 = [4, 1], TCC0 = [5, 1], TC1 = [6, 1], TC2 = [7, 1], ADC = [8, 1], AC = [9, 1], DAC = [10, 1] }
+notes = "One gate bit per APBC peripheral; a driver ORs in its instance's bit (the instance row carries the bit index)."

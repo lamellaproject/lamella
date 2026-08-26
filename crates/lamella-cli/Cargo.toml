@@ -17,6 +17,21 @@ path = "src/main.rs"
 # that rule, never a second implementation of it: the same function answers the MCP tool and the
 # editor, so a board's budget cannot mean one thing on one surface and another elsewhere.
 lamella-bsp-gen = { path = "../lamella-bsp-gen" }
+# The board and part fact files, compiled in from `bsp/` and `csp/`, and how a board resolves to its
+# part row. A CRATE rather than a module here so the MCP server resolves a board the SAME way: two
+# surfaces over one toolchain that disagreed about a board would be the drift the fact strata exist
+# to prevent, with nobody positioned to see both answers at once.
+lamella-catalog = { path = "../lamella-catalog" }
+# The flashing contract, and the probe-neutral target seam a backend drives its part through. The
+# backends live in `backends.rs`: a per-part crate owns its flash controller, and what sequences a
+# whole image onto a whole board is a separate layer with one home.
+lamella-flash-backend = { path = "../lamella-flash-backend" }
+# The routes: which mechanism writes which board, the backends that drive them, and the artifact
+# formats each route takes. A LIBRARY rather than modules here, because the MCP server has to reach
+# the same table -- a board that means one thing to `lamella flash` and another to `lamella_flash`
+# is the failure that split prevents.
+lamella-flash-routes = { path = "../lamella-flash-routes" }
+lamella-probe-core = { path = "../lamella-probe-core" }
 # The host compile-and-run seam (LcscCompiler + the REPL engine's LoopbackLink), the device
 # enumeration behind `devices`, and the target grammar every verb taking `--target` shares. The
 # SAME seams the MCP server and lamella-dap use.
@@ -39,11 +54,25 @@ lamella-syntax = { path = "../lamella-syntax" }
 # the FLAT, linker-free path, and it needs nothing on the board -- which is why `flash` works on a
 # board that has never run Lamella.
 lamella-aot = { path = "../lamella-aot", features = ["arm32"] }
+# Flattening a linked ELF into the bytes a flasher writes -- the same computation as
+# `objcopy -O binary`, in-tree, so taking an image somebody else's toolchain produced needs no
+# external tools. A linked ELF is the ordinary output of every toolchain that is not ours, which
+# is exactly the case `flash` exists for: bytes whoever built them.
+lamella-elf = { path = "../lamella-elf" }
 # Writing that image over a board's on-board debug probe. Its `microbit` feature is what pulls the
 # probe-SELECTION ladder: these helpers WRITE FLASH, so they resolve WHICH board rather than taking
 # the first `0d28:0204` the operating system offers -- a write to the wrong board succeeds and
 # reports nothing. The CLI consumes that ladder; it does not select a probe itself.
 lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", features = ["microbit"] }
+# Writing an RP2350 over a GENERAL-PURPOSE probe, by the chip's own bootrom flash API. The route
+# `--via probe` selects, and the only route to that part which reads the written flash back -- a
+# bootloader-volume write cannot be checked at all. Never a default: a person who owns no probe has
+# to be able to flash a new Pico, so the volume stays what the board takes unless asked otherwise.
+lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350" }
+# The UF2 container: emitting one, and RECOGNIZING one. Both verbs funnel through `write_image`,
+# which wraps a flat image for a volume route -- and must not wrap one that is already wrapped,
+# because a doubly-wrapped UF2 is a file the bootloader ignores without saying so.
+lamella-flash-format = { path = "../lamella-flash-format" }
 # Probe ENUMERATION -- for the interactive picker, so an ambiguous bench can be resolved by asking
 # rather than only by refusing, and for the `devices` listing.
 # `usbbulk` IS NOT OPTIONAL HERE. Without it this crate discovers CMSIS-DAP v1 (HID) probes only,
@@ -86,15 +115,3 @@ bake = [
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-# The layer below the memory seam: a dormant-state SWD wake, a Debug Port read that powers nothing
-# up, and an Access Port register addressed through a caller-supplied `SELECT`. None of that is
-# reachable through the memory-level probe seam, and a chip whose memory is unreachable is exactly
-# the case that needs it.
-lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["usbbulk"] }
-lamella-probe-core = { path = "../lamella-probe-core" }
-# The concrete USB-bulk transport a CMSIS-DAP v2 probe is reached over, named because a tool that
-# builds its own `Dap` holds the transport type rather than a boxed seam.
-lamella-usbbulk = { path = "../lamella-usbbulk" }
-

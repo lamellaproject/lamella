@@ -372,6 +372,28 @@ fn check_inst(
             use_value(func, defined, *index1, errors);
             use_value(func, defined, *value, errors);
         }
+        Inst::Array2DElemAddr {
+            array,
+            index0,
+            index1,
+            ..
+        } => {
+            use_value(func, defined, *array, errors);
+            use_value(func, defined, *index0, errors);
+            use_value(func, defined, *index1, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::ManagedPtr, r, errors);
+            }
+        }
+        Inst::ArrayMDElemAddr { array, indices, .. } => {
+            use_value(func, defined, *array, errors);
+            for &index in indices.iter() {
+                use_value(func, defined, index, errors);
+            }
+            if let Some(r) = result_ty {
+                expect(MirType::ManagedPtr, r, errors);
+            }
+        }
         Inst::AllocArrayMD { dims, .. } => {
             for &d in dims.iter() {
                 use_value(func, defined, d, errors);
@@ -402,6 +424,11 @@ fn check_inst(
         }
         Inst::StaticStore { value, .. } => {
             use_value(func, defined, *value, errors);
+        }
+        Inst::StaticAddr { .. } => {
+            if let Some(r) = result_ty {
+                expect(MirType::ManagedPtr, r, errors);
+            }
         }
     }
 }
